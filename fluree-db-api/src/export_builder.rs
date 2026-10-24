@@ -273,7 +273,6 @@ impl<'a> ExportBuilder<'a> {
                         to_t,
                         from_t: None,
                         reads: crate::retention::suppression::Reads::Everything,
-                        snapshot: &ledger.snapshot,
                         confirm_journal: true,
                     },
                 )

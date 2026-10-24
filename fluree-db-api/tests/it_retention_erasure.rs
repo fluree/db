@@ -2439,3 +2439,220 @@ async fn a_value_outside_the_leaves_is_purged_by_a_rebuild() {
         .await
         .is_empty());
 }
+
+/// `?o` of `s p ?o`, or `?s` of `?s p o`, read from `from` (to `to`, for a
+/// history range); `Err` when refused for suppressed history.
+async fn historical(
+    fluree: &Fluree,
+    ledger_id: &str,
+    from: String,
+    to: Option<String>,
+    pattern: JsonValue,
+) -> std::result::Result<Vec<JsonValue>, ApiError> {
+    let mut query = json!({"@context": ctx(), "from": from, "select": "?x", "where": pattern});
+    if let Some(to) = to {
+        query["to"] = json!(to);
+    }
+    let results = fluree.query_connection(&query).await?;
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let mut rows = results
+        .to_jsonld(&ledger.snapshot)
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    rows.sort_by_key(ToString::to_string);
+    Ok(rows)
+}
+
+/// Historical reads of `id` around Carol's erased like of Bob, asserted at
+/// `t1` and retracted by the removal at `removed_t`.
+async fn the_erased_like_refuses_only_its_own(
+    fluree: &Fluree,
+    id: &str,
+    t1: i64,
+    removed_t: i64,
+    stage: &str,
+) {
+    let refused = |r: &std::result::Result<Vec<JsonValue>, ApiError>| {
+        matches!(r, Err(ApiError::HistoryUnavailable(_)))
+    };
+    let at = |t: i64| format!("{id}@t:{t}");
+    let likes = |s: &str| json!({"@id": s, "ex:likes": "?x"});
+    let carol = historical(fluree, id, at(t1), None, likes("ex:carol")).await;
+    assert!(refused(&carol), "{stage}: Carol's likes: {carol:?}");
+    let erin = historical(fluree, id, at(t1), None, likes("ex:erin")).await;
+    assert_eq!(
+        erin.unwrap(),
+        vec![json!("ex:dave")],
+        "{stage}: Erin's likes"
+    );
+    let who = historical(
+        fluree,
+        id,
+        at(t1),
+        None,
+        json!({"@id": "?x", "ex:likes": {"@id": "ex:dave"}}),
+    )
+    .await;
+    assert!(refused(&who), "{stage}: who liked Dave: {who:?}");
+    // The same through SPARQL, which shares the check.
+    let sparql = |subject: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?x FROM <{id}@t:{t1}> WHERE {{ ex:{subject} ex:likes ?x }}"
+        )
+    };
+    let carol = fluree.query_connection_sparql(&sparql("carol")).await;
+    assert!(
+        matches!(carol, Err(ApiError::HistoryUnavailable(_))),
+        "{stage}: SPARQL, Carol's likes"
+    );
+    let erin = fluree.query_connection_sparql(&sparql("erin")).await;
+    assert!(
+        erin.is_ok(),
+        "{stage}: SPARQL, Erin's likes: {:?}",
+        erin.err()
+    );
+    let name = historical(
+        fluree,
+        id,
+        at(t1),
+        None,
+        json!({"@id": "ex:carol", "ex:name": "?x"}),
+    )
+    .await;
+    assert_eq!(name.unwrap(), vec![json!("Carol")], "{stage}: Carol's name");
+    // A point read at the retraction no longer sees the like; a range
+    // ending there lists the retraction, one starting after it does not.
+    // A copy made before the removal has no such point.
+    let head = fluree.ledger(id).await.unwrap().t();
+    if head < removed_t {
+        return;
+    }
+    let after = historical(fluree, id, at(removed_t), None, likes("ex:carol")).await;
+    assert_eq!(
+        after.unwrap(),
+        vec![json!("ex:dave")],
+        "{stage}: at the retraction"
+    );
+    let through = historical(fluree, id, at(t1), Some(at(removed_t)), likes("ex:carol")).await;
+    assert!(
+        refused(&through),
+        "{stage}: range to the retraction: {through:?}"
+    );
+    if head > removed_t {
+        let past = historical(
+            fluree,
+            id,
+            at(removed_t + 1),
+            Some(at(head)),
+            likes("ex:carol"),
+        )
+        .await;
+        assert!(past.is_ok(), "{stage}: range past the retraction: {past:?}");
+    }
+}
+
+/// A removal refuses the same historical reads however far the erasure
+/// that made it has come. Its subject is recorded with it, so neither the
+/// replacement (which no longer says whose the occurrence was), the purge,
+/// a restart nor a copy restored afterwards widens the refusal to every
+/// subject of the predicate. A removal of a commit the copy never held
+/// refuses nothing there.
+#[tokio::test]
+async fn an_erasure_refuses_the_same_history_at_every_stage() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-narrow").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:carol", "ex:name": "Carol",
+             "ex:likes": [{"@id": "ex:bob"}, {"@id": "ex:dave"}]},
+            {"@id": "ex:erin", "ex:likes": {"@id": "ex:dave"}}
+        ]}),
+    )
+    .await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:frank", "ex:name": "Frank"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    // After the archive: the copy restored from it never holds this.
+    let late = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:erin", "ex:likes": {"@id": "ex:gina"}}),
+    )
+    .await;
+    let like = |s: &str, o: &str| FactSelector {
+        subject: format!("http://example.org/{s}"),
+        predicate: "http://example.org/likes".into(),
+        graph: None,
+        object: Some(json!({"@id": format!("http://example.org/{o}")})),
+    };
+    let receipt = fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                matching: vec![like("carol", "bob"), like("erin", "gina")],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    let removed_t = receipt.removals[0].removal.retracted_t.expect("retracted");
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "removed").await;
+
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "published").await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "purged").await;
+
+    drop(fluree);
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    the_erased_like_refuses_only_its_own(&fluree, &id, t1, removed_t, "restarted").await;
+
+    let copy = fluree
+        .restore_ledger("it/erase-narrow-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    the_erased_like_refuses_only_its_own(&fluree, &copy, t1, removed_t, "restored").await;
+    let mut head = fluree.ledger(&copy).await.unwrap().t();
+    while head <= late {
+        head = insert(
+            &fluree,
+            &copy,
+            json!({"@context": ctx(), "@id": "ex:hank", "ex:n": head}),
+        )
+        .await;
+    }
+    let erin = historical(
+        &fluree,
+        &copy,
+        format!("{copy}@t:{late}"),
+        None,
+        json!({"@id": "ex:erin", "ex:likes": "?x"}),
+    )
+    .await;
+    assert_eq!(
+        erin.unwrap(),
+        vec![json!("ex:dave")],
+        "a removal the copy never held"
+    );
+}

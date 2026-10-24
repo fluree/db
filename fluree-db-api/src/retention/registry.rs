@@ -150,18 +150,22 @@ pub(crate) async fn inherit(
     let Some(source) = read(ns, source_id).await?.1 else {
         return Ok(());
     };
+    let mut conflict = None;
     update_fenced(ns, branch_id, fence, |current| {
         let mut next = current.cloned().unwrap_or_else(|| Registration {
             active_since_t: source.active_since_t,
             watermark_t: source.active_since_t - 1,
             ..Default::default()
         });
-        next.journal.merge(&source.journal);
+        if let Err(e) = next.journal.merge(&source.journal) {
+            conflict = Some(e);
+            return None;
+        }
         next.lineage = next.lineage.clone().or_else(|| source.lineage.clone());
         Some(next)
     })
-    .await
-    .map(|_| ())
+    .await?;
+    conflict.map_or(Ok(()), |e| Err(e.into()))
 }
 
 /// Register the branch as active from `since_t`, keeping an earlier boundary
@@ -243,7 +247,7 @@ pub(crate) async fn restore(
         .map(|a| a.journal.clone())
         .unwrap_or_default();
     if let Some(checkpoint) = &checkpoint {
-        journal.merge(checkpoint);
+        journal.merge(checkpoint)?;
     }
     let active_since_t = archived.as_ref().map_or(1, |a| a.active_since_t);
     let fresh = (archived.is_some() || !journal.is_empty()).then(|| Registration {
@@ -253,22 +257,31 @@ pub(crate) async fn restore(
         lineage: lineage.map(str::to_string),
         ..Default::default()
     });
-    update_fenced(
-        ns,
-        record.ledger_id.as_str(),
-        record.fence,
-        |current| match current {
-            Some(current) => {
-                let mut next = current.clone();
-                let merged = next.journal.merge(&journal);
-                let adopted = next.lineage.is_none() && lineage.is_some();
-                if adopted {
-                    next.lineage = lineage.map(str::to_string);
+    let mut conflict = None;
+    let registration =
+        update_fenced(
+            ns,
+            record.ledger_id.as_str(),
+            record.fence,
+            |current| match current {
+                Some(current) => {
+                    let mut next = current.clone();
+                    let merged = match next.journal.merge(&journal) {
+                        Ok(merged) => merged,
+                        Err(e) => {
+                            conflict = Some(e);
+                            return None;
+                        }
+                    };
+                    let adopted = next.lineage.is_none() && lineage.is_some();
+                    if adopted {
+                        next.lineage = lineage.map(str::to_string);
+                    }
+                    (merged || adopted).then_some(next)
                 }
-                (merged || adopted).then_some(next)
-            }
-            None => fresh.clone(),
-        },
-    )
-    .await
+                None => fresh.clone(),
+            },
+        )
+        .await?;
+    conflict.map_or(Ok(registration), |e| Err(e.into()))
 }

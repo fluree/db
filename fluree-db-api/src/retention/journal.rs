@@ -11,9 +11,46 @@
 //! retention registration), outside ledger content, so restoring or
 //! replaying the ledger does not roll it back, and a cluster replicates it
 //! with its other nameservice state. It records predicates, transaction
-//! ranges and occurrence positions — never the suppressed values.
+//! ranges, occurrence positions and a fingerprint of each removed
+//! occurrence's subject — never the suppressed values.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// A removed occurrence's subject as its journal entry records it: the
+/// expanded IRI hashed under a versioned domain tag. It matches reads by
+/// identity and keeps the IRI itself out of the journal; it does not hide
+/// an IRI that can be guessed.
+pub(crate) fn subject_fingerprint(iri: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"fluree:removal-subject:v1\0");
+    hash.update(iri.as_bytes());
+    format!("v1:{}", hex::encode(hash.finalize()))
+}
+
+/// Two entries for one occurrence that disagree on its subject: one of
+/// them is corrupt.
+#[derive(Debug)]
+pub(crate) struct SubjectConflict {
+    pub(crate) commit: String,
+    pub(crate) slot: u32,
+}
+
+impl std::fmt::Display for SubjectConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "removal journals disagree on the subject of operation {} of commit {}",
+            self.slot, self.commit
+        )
+    }
+}
+
+impl From<SubjectConflict> for crate::ApiError {
+    fn from(e: SubjectConflict) -> Self {
+        crate::ApiError::internal(e.to_string())
+    }
+}
 
 /// The removal journal.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +122,12 @@ pub struct Removal {
     pub until_t: Option<i64>,
     /// The head the request's scope was fixed at.
     pub scope_t: i64,
+    /// The [fingerprint](subject_fingerprint) of the occurrence's subject,
+    /// recorded with the removal: it stays when the occurrence's commit no
+    /// longer says (an erasure redacts the operation). `None` matches any
+    /// subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 impl Removal {
@@ -116,18 +159,34 @@ impl Journal {
     /// Add what `other` suppresses that this journal does not: every removal
     /// (by commit and slot) and every history rule (by predicate, graph and
     /// the commit that enabled it), an open rule winning over its closed
-    /// copy since coverage only grows. Returns whether anything was added;
+    /// copy since coverage only grows. A removal held without its subject
+    /// takes it from `other`'s copy. Returns whether anything was added;
     /// the generation then moves past both.
-    pub fn merge(&mut self, other: &Journal) -> bool {
+    pub(crate) fn merge(&mut self, other: &Journal) -> Result<bool, SubjectConflict> {
         let mut changed = false;
         for removal in &other.removals {
-            if !self
+            let held = self
                 .removals
-                .iter()
-                .any(|r| r.commit == removal.commit && r.slot == removal.slot)
-            {
-                self.removals.push(removal.clone());
-                changed = true;
+                .iter_mut()
+                .find(|r| r.commit == removal.commit && r.slot == removal.slot);
+            match held {
+                None => {
+                    self.removals.push(removal.clone());
+                    changed = true;
+                }
+                Some(held) => match (&held.subject, &removal.subject) {
+                    (None, Some(subject)) => {
+                        held.subject = Some(subject.clone());
+                        changed = true;
+                    }
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(SubjectConflict {
+                            commit: removal.commit.clone(),
+                            slot: removal.slot,
+                        })
+                    }
+                    _ => {}
+                },
             }
         }
         for rule in &other.history_rules {
@@ -153,23 +212,26 @@ impl Journal {
         if changed {
             self.generation = self.generation.max(other.generation) + 1;
         }
-        changed
+        Ok(changed)
     }
 
     /// What of this journal `base` lacks: the entries [`Self::merge`] would
-    /// add to it.
+    /// add to it, or the subjects it would add to them.
     pub fn missing_from(&self, base: &Journal) -> Journal {
-        let held: std::collections::HashSet<(&str, u32)> = base
+        let held: std::collections::HashMap<(&str, u32), bool> = base
             .removals
             .iter()
-            .map(|r| (r.commit.as_str(), r.slot))
+            .map(|r| ((r.commit.as_str(), r.slot), r.subject.is_some()))
             .collect();
         Journal {
             generation: self.generation,
             removals: self
                 .removals
                 .iter()
-                .filter(|r| !held.contains(&(r.commit.as_str(), r.slot)))
+                .filter(|r| match held.get(&(r.commit.as_str(), r.slot)) {
+                    None => true,
+                    Some(known) => !known && r.subject.is_some(),
+                })
                 .cloned()
                 .collect(),
             history_rules: self
@@ -308,6 +370,7 @@ mod tests {
             from_t: 1,
             until_t: Some(2),
             scope_t: 1,
+            subject: None,
         };
         let ours = Journal {
             generation: 4,
@@ -336,8 +399,49 @@ mod tests {
         // The open copy wins over the closed one; a closed copy adds nothing.
         assert_eq!(missing.history_rules, vec![rule(0, None)]);
         let mut merged = base.clone();
-        assert!(merged.merge(&missing));
+        assert!(merged.merge(&missing).unwrap());
         assert!(ours.missing_from(&merged).is_empty());
+    }
+
+    /// A removal held without its subject takes it from a copy that has it,
+    /// never the other way; two copies naming different subjects for one
+    /// occurrence are an error.
+    #[test]
+    fn a_known_subject_is_merged_in_and_never_lost() {
+        let removal = |subject: Option<&str>| Removal {
+            request_id: "r".into(),
+            commit: "bafy".into(),
+            slot: 3,
+            predicate: "ex:q".into(),
+            from_t: 1,
+            until_t: Some(2),
+            scope_t: 1,
+            subject: subject.map(str::to_string),
+        };
+        let journal = |subject| Journal {
+            generation: 1,
+            removals: vec![removal(subject)],
+            ..Default::default()
+        };
+        let (unknown, known) = (journal(None), journal(Some("v1:aa")));
+
+        assert_eq!(known.missing_from(&unknown).removals.len(), 1);
+        assert!(unknown.missing_from(&known).is_empty());
+        let mut merged = unknown.clone();
+        assert!(merged.merge(&known).unwrap());
+        assert_eq!(merged.removals[0].subject.as_deref(), Some("v1:aa"));
+        assert_eq!(merged.generation, 2);
+        assert!(!merged.merge(&unknown).unwrap());
+        assert_eq!(merged.removals[0].subject.as_deref(), Some("v1:aa"));
+        assert!(merged.merge(&journal(Some("v1:bb"))).is_err());
+    }
+
+    #[test]
+    fn a_fingerprint_is_versioned_and_matches_only_its_iri() {
+        let a = subject_fingerprint("http://example.org/carol");
+        assert!(a.starts_with("v1:") && a.len() == 3 + 64);
+        assert_eq!(a, subject_fingerprint("http://example.org/carol"));
+        assert_ne!(a, subject_fingerprint("http://example.org/erin"));
     }
 
     #[test]
@@ -353,6 +457,7 @@ mod tests {
                 from_t: 2,
                 until_t: Some(7),
                 scope_t: 6,
+                subject: Some(subject_fingerprint("http://example.org/carol")),
             }],
         };
         let back: Journal = serde_json::from_value(serde_json::to_value(&j).unwrap()).unwrap();

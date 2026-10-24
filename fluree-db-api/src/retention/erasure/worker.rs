@@ -597,7 +597,7 @@ impl Fluree {
                         ledger_id: task.ledger_id.clone(),
                         txn: None,
                         steps: Vec::new(),
-                        purged: Vec::new(),
+                        replaced_at: Vec::new(),
                     });
                     if erased.txn.is_none() {
                         let bytes = self

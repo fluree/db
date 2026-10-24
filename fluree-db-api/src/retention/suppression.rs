@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluree_db_core::{ContentId, LedgerSnapshot};
+use fluree_db_nameservice::NsRecord;
 use fluree_db_query::ir::{Pattern, Query, Ref};
 
 use super::journal::Journal;
@@ -32,16 +33,11 @@ pub(crate) enum Reads {
 }
 
 impl Reads {
-    fn touches(&self, subject: Option<&str>, predicate: &str) -> bool {
+    /// Whether the read could touch `predicate`, for any subject.
+    fn touches(&self, predicate: &str) -> bool {
         match self {
             Reads::Everything => true,
-            Reads::Facts(facts) => facts.iter().any(|(s, p)| {
-                p == predicate
-                    && match (s.as_deref(), subject) {
-                        (Some(s), Some(subject)) => s == subject,
-                        _ => true,
-                    }
-            }),
+            Reads::Facts(facts) => facts.iter().any(|(_, p)| p == predicate),
         }
     }
 }
@@ -166,36 +162,89 @@ pub(crate) fn search_sources(patterns: &[Pattern], out: &mut Vec<String>) {
 }
 
 /// A historical read of one ledger.
-pub(crate) struct HistoricalRead<'a> {
+pub(crate) struct HistoricalRead {
     /// As-of point (the end of a history range).
     pub(crate) to_t: i64,
     /// The start of a history range; `None` for a point-in-time read.
     pub(crate) from_t: Option<i64>,
     pub(crate) reads: Reads,
-    pub(crate) snapshot: &'a LedgerSnapshot,
     /// Whether a cluster replica first confirms its journal is current: a
     /// read as of an earlier point does, while a view merely behind a head
     /// this replica has applied is checked against the journal it holds.
     pub(crate) confirm_journal: bool,
 }
 
-/// A journal with the subjects of its removals read from their commits.
+/// A journal with the removals that apply to its branch looked up by what
+/// a read names.
 pub(crate) struct Suppression {
     pub(crate) journal: Journal,
-    /// Subject of each removal, by index, as its commit encodes it. Decoded
-    /// against the reading view's snapshot.
-    removal_subjects: Vec<RemovalSubject>,
+    /// The removals whose commit the branch holds, by predicate, as indexes
+    /// into the journal's removals. One whose commit the branch does not
+    /// hold (merged from another copy of the lineage) is left out.
+    removed: HashMap<String, RemovedOf>,
 }
 
-/// What a removed occurrence's commit says about its subject.
-#[derive(Clone)]
-enum RemovalSubject {
-    Known(fluree_db_core::Sid),
-    /// The commit could not be read: any subject may be the one.
-    Unknown,
-    /// The commit is not in this ledger, so neither is the occurrence (a
-    /// journal merged from another copy of the lineage).
-    Absent,
+/// The removals of one predicate that apply to a branch.
+#[derive(Default)]
+struct RemovedOf {
+    /// By their subject's fingerprint.
+    by_subject: HashMap<String, Vec<usize>>,
+    /// Those whose subject is not recorded, which any subject may be.
+    any_subject: Vec<usize>,
+}
+
+impl Suppression {
+    fn new(journal: Journal, applies: &[bool]) -> Self {
+        let mut removed: HashMap<String, RemovedOf> = HashMap::new();
+        for (i, removal) in journal.removals.iter().enumerate() {
+            if !applies.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let of = removed.entry(removal.predicate.clone()).or_default();
+            match &removal.subject {
+                Some(subject) => of.by_subject.entry(subject.clone()).or_default().push(i),
+                None => of.any_subject.push(i),
+            }
+        }
+        Suppression { journal, removed }
+    }
+
+    /// The predicate of a removal that a read of `reads`, as of `to` (or
+    /// over `[from, to]` when not a `point`), could need.
+    fn removal_needed(&self, reads: &Reads, from: i64, to: i64, point: bool) -> Option<&str> {
+        let covered = |i: &usize| {
+            let removal = &self.journal.removals[*i];
+            if point {
+                removal.covers(to)
+            } else {
+                removal.overlaps(from, to)
+            }
+        };
+        let any = |of: &RemovedOf| {
+            of.any_subject.iter().any(covered) || of.by_subject.values().flatten().any(covered)
+        };
+        match reads {
+            Reads::Everything => self
+                .removed
+                .iter()
+                .find(|(_, of)| any(of))
+                .map(|(p, _)| p.as_str()),
+            Reads::Facts(facts) => facts.iter().find_map(|(subject, predicate)| {
+                let (predicate, of) = self.removed.get_key_value(predicate)?;
+                let needed = match subject {
+                    None => any(of),
+                    Some(iri) => {
+                        of.any_subject.iter().any(covered)
+                            || of
+                                .by_subject
+                                .get(&super::journal::subject_fingerprint(iri))
+                                .is_some_and(|spans| spans.iter().any(covered))
+                    }
+                };
+                needed.then_some(predicate.as_str())
+            }),
+        }
+    }
 }
 
 /// How a view stands against its ledger's head.
@@ -311,11 +360,8 @@ impl Fluree {
                 return Ok(Some(Arc::clone(cached)));
             }
         }
-        let removal_subjects = self.removal_subjects(ledger_id, &journal).await;
-        let suppression = Arc::new(Suppression {
-            journal,
-            removal_subjects,
-        });
+        let applies = self.removals_applying(ledger_id, &journal).await;
+        let suppression = Arc::new(Suppression::new(journal, &applies));
         cache
             .by_ledger
             .lock()
@@ -323,57 +369,78 @@ impl Fluree {
         Ok(Some(suppression))
     }
 
-    /// The subject of each removed occurrence, read from its commit. Reads
-    /// only storage and the nameservice, never the cached ledger, so a query
-    /// issued inside a transaction can ask.
-    async fn removal_subjects(&self, ledger_id: &str, journal: &Journal) -> Vec<RemovalSubject> {
-        use fluree_db_core::ContentStore as _;
-        if journal.removals.is_empty() {
-            return Vec::new();
-        }
-        let unknown = || vec![RemovalSubject::Unknown; journal.removals.len()];
+    /// Whether each removal of `journal` applies to `ledger_id`: whether the
+    /// branch holds its commit. Reads only storage and the nameservice,
+    /// never the cached ledger, so a query issued inside a transaction can
+    /// ask. Whatever cannot be told applies.
+    async fn removals_applying(&self, ledger_id: &str, journal: &Journal) -> Vec<bool> {
+        let all = || vec![true; journal.removals.len()];
         let Ok(Some(record)) = self.nameservice().lookup(ledger_id).await else {
-            return unknown();
+            return all();
         };
         let Ok(store) = self
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
             .await
         else {
-            return unknown();
+            return all();
         };
+        let mut held: HashMap<&str, bool> = HashMap::new();
         let mut out = Vec::with_capacity(journal.removals.len());
-        let mut commits: HashMap<String, Option<Option<fluree_db_core::Commit>>> = HashMap::new();
         for removal in &journal.removals {
-            // `Some(None)`: not in this ledger; `None`: unreadable.
-            let commit = match commits.get(&removal.commit) {
-                Some(c) => c.clone(),
+            let applies = match held.get(removal.commit.as_str()) {
+                Some(applies) => *applies,
                 None => {
-                    let loaded = match removal.commit.parse::<ContentId>() {
-                        Ok(cid) => match store.has(&cid).await {
-                            Ok(false) => Some(None),
-                            Ok(true) => fluree_db_core::load_commit_by_id(store.as_ref(), &cid)
-                                .await
-                                .ok()
-                                .map(Some),
-                            Err(_) => None,
-                        },
-                        Err(_) => None,
+                    let applies = match removal.commit.parse::<ContentId>() {
+                        Ok(cid) => self
+                            .holds_commit(&record, store.as_ref(), &cid)
+                            .await
+                            .unwrap_or(true),
+                        Err(_) => true,
                     };
-                    commits.insert(removal.commit.clone(), loaded.clone());
-                    loaded
+                    held.insert(&removal.commit, applies);
+                    applies
                 }
             };
-            out.push(match commit {
-                Some(None) => RemovalSubject::Absent,
-                Some(Some(c)) => c
-                    .at_slot(removal.slot)
-                    .map_or(RemovalSubject::Unknown, |f| {
-                        RemovalSubject::Known(f.s.clone())
-                    }),
-                None => RemovalSubject::Unknown,
-            });
+            out.push(applies);
         }
         out
+    }
+
+    /// Whether `record`'s storage, or an ancestor branch's, holds `cid`.
+    /// A read of an erased commit returns its replacement wherever it is
+    /// made, so an erased one is held where its original's file is, or was
+    /// until a purge deleted it: erasing a commit does not change which
+    /// branches its removals apply to.
+    async fn holds_commit(
+        &self,
+        record: &NsRecord,
+        store: &dyn fluree_db_core::ContentStore,
+        cid: &ContentId,
+    ) -> Result<bool> {
+        #[cfg(feature = "native")]
+        if let Some(runtime) = self.retention.erasure.get() {
+            if runtime.index.erased(cid).await?.is_some() {
+                let mut next = Some(record.clone());
+                while let Some(branch) = next {
+                    if runtime
+                        .index
+                        .holds_original(&branch.storage_namespace(), cid)
+                        .await?
+                    {
+                        return Ok(true);
+                    }
+                    next = match &branch.source_branch {
+                        Some(source) => {
+                            let parent = fluree_db_core::format_ledger_id(&branch.name, source);
+                            self.nameservice().lookup(&parent).await?
+                        }
+                        None => None,
+                    };
+                }
+                return Ok(false);
+            }
+        }
+        Ok(store.has(cid).await?)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -463,7 +530,7 @@ impl Fluree {
     pub(crate) async fn refuse_suppressed_history(
         &self,
         ledger_id: &str,
-        read: HistoricalRead<'_>,
+        read: HistoricalRead,
     ) -> Result<()> {
         let Some(suppression) = self
             .suppression_with(ledger_id, read.confirm_journal)
@@ -490,7 +557,7 @@ impl Fluree {
             } else {
                 rule.overlaps(from, to)
             };
-            if covered && read.reads.touches(None, &rule.predicate) {
+            if covered && read.reads.touches(&rule.predicate) {
                 return Err(ApiError::HistoryUnavailable(format!(
                     "<{}> keeps no history (f:noHistory) on {ledger_id}; read it as of the \
                      current head",
@@ -498,28 +565,10 @@ impl Fluree {
                 )));
             }
         }
-        for (removal, subject) in suppression
-            .journal
-            .removals
-            .iter()
-            .zip(&suppression.removal_subjects)
-        {
-            let covered = if point {
-                removal.covers(to)
-            } else {
-                removal.overlaps(from, to)
-            };
-            let subject = match subject {
-                RemovalSubject::Absent => continue,
-                RemovalSubject::Unknown => None,
-                RemovalSubject::Known(s) => read.snapshot.decode_sid(s),
-            };
-            if covered && read.reads.touches(subject.as_deref(), &removal.predicate) {
-                return Err(ApiError::HistoryUnavailable(format!(
-                    "a removed occurrence of <{}> on {ledger_id} falls in the requested range",
-                    removal.predicate
-                )));
-            }
+        if let Some(predicate) = suppression.removal_needed(&read.reads, from, to, point) {
+            return Err(ApiError::HistoryUnavailable(format!(
+                "a removed occurrence of <{predicate}> on {ledger_id} falls in the requested range"
+            )));
         }
         Ok(())
     }
@@ -529,17 +578,82 @@ impl Fluree {
 mod tests {
     use super::*;
 
+    use super::super::journal::{subject_fingerprint, Removal};
+
+    fn removal(subject: Option<&str>, commit: &str) -> Removal {
+        Removal {
+            request_id: "r".into(),
+            commit: commit.into(),
+            slot: 0,
+            predicate: "ex:likes".into(),
+            from_t: 10,
+            until_t: Some(50),
+            scope_t: 49,
+            subject: subject.map(subject_fingerprint),
+        }
+    }
+
+    fn reads(facts: &[(Option<&str>, &str)]) -> Reads {
+        Reads::Facts(
+            facts
+                .iter()
+                .map(|(s, p)| (s.map(str::to_string), p.to_string()))
+                .collect(),
+        )
+    }
+
+    /// A removal whose subject is recorded refuses only reads that name it,
+    /// or no subject; one whose subject is not recorded refuses every read
+    /// of its predicate; one that does not apply refuses none.
     #[test]
-    fn a_constant_subject_narrows_what_a_read_touches() {
-        let reads = Reads::Facts(vec![
-            (Some("ex:a".into()), "ex:p".into()),
-            (None, "ex:q".into()),
-        ]);
-        assert!(reads.touches(Some("ex:a"), "ex:p"));
-        assert!(!reads.touches(Some("ex:b"), "ex:p"));
-        assert!(reads.touches(None, "ex:p"));
-        assert!(reads.touches(Some("ex:z"), "ex:q"));
-        assert!(!reads.touches(None, "ex:r"));
-        assert!(Reads::Everything.touches(None, "ex:r"));
+    fn a_removals_subject_narrows_the_reads_it_refuses() {
+        let journal = |removals| Journal {
+            removals,
+            ..Default::default()
+        };
+        let carol = Suppression::new(journal(vec![removal(Some("ex:carol"), "c1")]), &[true]);
+        let refuses = |s: &Suppression, r: Reads, t| s.removal_needed(&r, t, t, true).is_some();
+        assert!(refuses(
+            &carol,
+            reads(&[(Some("ex:carol"), "ex:likes")]),
+            30
+        ));
+        assert!(!refuses(
+            &carol,
+            reads(&[(Some("ex:erin"), "ex:likes")]),
+            30
+        ));
+        assert!(refuses(&carol, reads(&[(None, "ex:likes")]), 30));
+        assert!(!refuses(
+            &carol,
+            reads(&[(Some("ex:carol"), "ex:name")]),
+            30
+        ));
+        assert!(refuses(&carol, Reads::Everything, 30));
+        // The span is half-open for a point read.
+        assert!(!refuses(
+            &carol,
+            reads(&[(Some("ex:carol"), "ex:likes")]),
+            50
+        ));
+        assert!(!refuses(
+            &carol,
+            reads(&[(Some("ex:carol"), "ex:likes")]),
+            9
+        ));
+        // A history range lists the retraction that ended it.
+        let ranged = reads(&[(Some("ex:carol"), "ex:likes")]);
+        assert!(carol.removal_needed(&ranged, 50, 60, false).is_some());
+        assert!(carol.removal_needed(&ranged, 51, 60, false).is_none());
+
+        let unknown = Suppression::new(journal(vec![removal(None, "c1")]), &[true]);
+        assert!(refuses(
+            &unknown,
+            reads(&[(Some("ex:erin"), "ex:likes")]),
+            30
+        ));
+
+        let elsewhere = Suppression::new(journal(vec![removal(None, "c1")]), &[false]);
+        assert!(!refuses(&elsewhere, Reads::Everything, 30));
     }
 }

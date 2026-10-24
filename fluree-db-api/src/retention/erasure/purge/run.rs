@@ -267,7 +267,7 @@ impl Fluree {
         // same commit must find them.
         self.erasure_runtime()?
             .index
-            .record_purged(&plan.originals)
+            .record_replaced_at(&plan.originals)
             .await?;
         let originals: Vec<&String> = plan.originals.iter().collect();
         let deleted = self.delete_files(&originals).await?;

@@ -82,7 +82,7 @@ impl Fluree {
                 };
                 let part: Journal = serde_json::from_slice(&bytes)
                     .map_err(|e| unreadable(address, e.to_string()))?;
-                union.merge(&part);
+                union.merge(&part)?;
             }
             return Ok(Some((union, addresses)));
         }
@@ -149,7 +149,7 @@ impl Fluree {
         let missing = journal.missing_from(&held);
         if listed.len() >= COMPACT_AT {
             let mut union = held;
-            union.merge(&missing);
+            union.merge(&missing)?;
             let written = write_object(storage, &prefix, &union).await?;
             let stale: Vec<String> = listed.into_iter().filter(|a| *a != written).collect();
             for (address, e) in storage.delete_many(&stale).await {
@@ -331,6 +331,8 @@ impl Fluree {
                 from_t: asserted.t,
                 until_t: Some(receipt.t),
                 scope_t: receipt.t - 1,
+                // The same fact, so the same subject.
+                subject: removal.subject.clone(),
             })
         }));
         Ok((Some(receipt.t), entries))
@@ -361,6 +363,7 @@ async fn removed_spans<'a>(
             from_t: end.from_t,
             until_t: Some(end.t),
             scope_t: end.t - 1,
+            subject: end.by.subject.clone(),
         })
         .collect();
     Ok((ended, open))

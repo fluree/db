@@ -100,7 +100,7 @@ The removal is complete when the request returns: the journal records it and the
 After the removal:
 
 - Current queries no longer see the value, because it was retracted.
-- A historical read that could see a removed occurrence fails with `410` `err:db/HistoryUnavailable`. A read whose pattern has a different constant subject is still answered, as is one that never touches the predicate.
+- A historical read that could see a removed occurrence fails with `410` `err:db/HistoryUnavailable`. A read whose pattern has a different constant subject is still answered, as is one that never touches the predicate. This stays true after the occurrence's commit is [permanently erased](permanent-erasure.md), since the journal records the occurrence's subject itself.
 - Other occurrences of the fact are unaffected. So is the same value asserted again later: that is a new occurrence.
 
 ## Search indexes and exports
@@ -161,7 +161,8 @@ Such a replica refuses the ledger's history until it catches up.
           "predicate": "https://example.org/email",
           "fromT": 7,
           "untilT": 42,
-          "scopeT": 41
+          "scopeT": 41,
+          "subject": "v1:4f0c..."
         }
       ]
     },
@@ -171,7 +172,7 @@ Such a replica refuses the ledger's history until it catches up.
 }
 ```
 
-A history rule that has been turned off carries `untilT`, the config commit that ended it. The journal records predicates, transaction ranges and occurrence positions. It never records the removed values.
+A history rule that has been turned off carries `untilT`, the config commit that ended it. The journal records predicates, transaction ranges and occurrence positions, and for each removed occurrence a `subject`: a SHA-256 fingerprint of its subject's IRI, which reads are matched against. It never records the removed values. A fingerprint identifies the subject without spelling out its IRI, but anyone can hash a guessed IRI and compare.
 
 ## Limits
 

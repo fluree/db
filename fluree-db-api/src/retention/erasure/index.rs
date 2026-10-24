@@ -67,10 +67,11 @@ pub struct ErasedCommit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub txn: Option<String>,
     pub steps: Vec<ErasureStep>,
-    /// The addresses of its original's files a purge deleted: their folders
-    /// go on reading it, as its replacement.
+    /// Addresses of its original that hold no file but whose folders read
+    /// it, as its replacement: those a purge deleted, and those written
+    /// since publication, which are refused (a restored copy's).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub purged: Vec<String>,
+    pub replaced_at: Vec<String>,
 }
 
 impl ErasedCommit {
@@ -147,8 +148,8 @@ fn txn_digest(address: &str) -> Option<&str> {
 }
 
 /// What `incoming` makes of the erasure held for its commit: the longer of
-/// the two chains, with the files either names purged; `None` when it
-/// changes nothing, or diverges from the held chain.
+/// the two chains, with the addresses either names it replaced at; `None`
+/// when it changes nothing, or diverges from the held chain.
 fn merged(held: Option<&ErasedCommit>, incoming: ErasedCommit) -> Option<ErasedCommit> {
     let Some(current) = held else {
         return Some(incoming);
@@ -158,21 +159,21 @@ fn merged(held: Option<&ErasedCommit>, incoming: ErasedCommit) -> Option<ErasedC
         tracing::warn!(commit = %incoming.commit, "divergent erasures; keeping the first");
         return None;
     }
-    let mut purged = current.purged.clone();
-    for address in &incoming.purged {
-        if !purged.contains(address) {
-            purged.push(address.clone());
+    let mut replaced_at = current.replaced_at.clone();
+    for address in &incoming.replaced_at {
+        if !replaced_at.contains(address) {
+            replaced_at.push(address.clone());
         }
     }
     let longer = incoming.steps.len() > current.steps.len();
-    if !longer && purged.len() == current.purged.len() {
+    if !longer && replaced_at.len() == current.replaced_at.len() {
         return None;
     }
     let txn = incoming.txn.clone().or_else(|| current.txn.clone());
     let base = if longer { incoming } else { current.clone() };
     Some(ErasedCommit {
         txn,
-        purged,
+        replaced_at,
         ..base
     })
 }
@@ -351,7 +352,8 @@ impl ErasureIndex {
     }
 
     /// Whether `namespace` holds `original`'s own file, whatever its
-    /// erasure, or held it until a purge deleted it.
+    /// erasure, or reads it as its replacement without one: the file a
+    /// purge deleted, or one refused since publication.
     pub(crate) async fn holds_original(
         &self,
         namespace: &StorageNamespace,
@@ -369,12 +371,14 @@ impl ErasureIndex {
         Ok(self
             .erased(original)
             .await?
-            .is_some_and(|e| e.purged.contains(&address)))
+            .is_some_and(|e| e.replaced_at.contains(&address)))
     }
 
-    /// Record, before a purge deletes them, that `addresses` are erased
-    /// originals' files: [`Self::holds_original`] goes on finding them.
-    pub(crate) async fn record_purged(&self, addresses: &[String]) -> Result<()> {
+    /// Record that the erased originals at `addresses` are read there as
+    /// their replacements without a file: before a purge deletes them, or
+    /// when a write of one is refused. [`Self::holds_original`] goes on
+    /// finding them.
+    pub(crate) async fn record_replaced_at(&self, addresses: &[String]) -> Result<()> {
         self.load().await?;
         let mut changed: HashMap<String, ErasedCommit> = HashMap::new();
         {
@@ -383,13 +387,13 @@ impl ErasureIndex {
                 let Some(entry) = commit_digest(address).and_then(|d| entries.get(d)) else {
                     continue;
                 };
-                if entry.erased.purged.contains(address) {
+                if entry.erased.replaced_at.contains(address) {
                     continue;
                 }
                 changed
                     .entry(entry.erased.commit.clone())
                     .or_insert_with(|| entry.erased.clone())
-                    .purged
+                    .replaced_at
                     .push(address.clone());
             }
         }
@@ -550,6 +554,18 @@ pub(crate) struct ErasureStorage {
 }
 
 impl ErasureStorage {
+    /// A write of an erased original at `address` is refused: record that
+    /// its folder reads the commit all the same.
+    async fn refused(&self, address: &str) -> fluree_db_core::Result<()> {
+        if commit_digest(address).is_none() {
+            return Ok(());
+        }
+        self.index
+            .record_replaced_at(&[address.to_string()])
+            .await
+            .map_err(|e| fluree_db_core::Error::storage(e.to_string()))
+    }
+
     pub(crate) fn new(
         inner: Arc<dyn Storage>,
         index: Arc<ErasureIndex>,
@@ -709,7 +725,7 @@ impl StorageWrite for ErasureStorage {
     async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
         // The original is gone; the replacement stands for it.
         if self.erased_address(address).await? {
-            return Ok(());
+            return self.refused(address).await;
         }
         self.inner.write_bytes(address, bytes).await
     }
@@ -744,6 +760,7 @@ impl ContentAddressedWrite for ErasureStorage {
                 content_hash_hex,
             );
             if self.erased_address(&address).await? {
+                self.refused(&address).await?;
                 return Ok(ContentWriteResult {
                     address,
                     content_hash: content_hash_hex.to_string(),
@@ -800,7 +817,7 @@ mod tests {
             ledger_id: "l:main".into(),
             txn: None,
             steps: vec![step(&format!("r{n}"))],
-            purged: Vec::new(),
+            replaced_at: Vec::new(),
         }
     }
 
@@ -827,7 +844,7 @@ mod tests {
             ledger_id: "l:main".into(),
             txn: None,
             steps,
-            purged: Vec::new(),
+            replaced_at: Vec::new(),
         };
         let mut held = HashMap::new();
         merge(&mut held, erased(vec![step("a")]));
@@ -843,13 +860,13 @@ mod tests {
     }
 
     #[test]
-    fn purged_files_accumulate_whichever_chain_is_longer() {
-        let erased = |steps: &[&str], purged: &[&str]| ErasedCommit {
+    fn replaced_addresses_accumulate_whichever_chain_is_longer() {
+        let erased = |steps: &[&str], at: &[&str]| ErasedCommit {
             commit: "c".into(),
             ledger_id: "l:main".into(),
             txn: None,
             steps: steps.iter().map(|s| step(s)).collect(),
-            purged: purged.iter().map(ToString::to_string).collect(),
+            replaced_at: at.iter().map(ToString::to_string).collect(),
         };
         let mut held = HashMap::new();
         merge(&mut held, erased(&["a"], &[]));
@@ -857,6 +874,6 @@ mod tests {
         merge(&mut held, erased(&["a", "b"], &[]));
         merge(&mut held, erased(&["a"], &["f2"]));
         assert_eq!(held["c"].steps.len(), 2);
-        assert_eq!(held["c"].purged, ["f1", "f2"]);
+        assert_eq!(held["c"].replaced_at, ["f1", "f2"]);
     }
 }

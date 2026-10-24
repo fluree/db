@@ -389,6 +389,10 @@ impl Fluree {
                     from_t: *from,
                     until_t: until.or(retracted_t),
                     scope_t,
+                    subject: state
+                        .snapshot
+                        .decode_sid(&loc.flake.s)
+                        .map(|iri| super::journal::subject_fingerprint(&iri)),
                 })
                 .collect();
             // A ledger this registers keeps the retention input it already
@@ -398,32 +402,30 @@ impl Fluree {
                 .find(|(_, _, c)| super::engine::carries_retention_input(&c.txn_meta))
                 .map_or(scope_t + 1, |(t, _, _)| *t);
             self.retention.watch.journal_changing(&ledger_id);
+            let incoming = super::journal::Journal {
+                removals,
+                ..Default::default()
+            };
+            let mut conflict = None;
             let registration = registry::update(ns, &ledger_id, |current| {
                 let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
                     active_since_t: since,
                     watermark_t: since - 1,
                     ..Default::default()
                 });
-                let fresh: Vec<Removal> = removals
-                    .iter()
-                    .filter(|r| {
-                        !next
-                            .journal
-                            .removals
-                            .iter()
-                            .any(|e| e.commit == r.commit && e.slot == r.slot)
-                    })
-                    .cloned()
-                    .collect();
-                if fresh.is_empty() && current.is_some() {
-                    return None;
+                match next.journal.merge(&incoming) {
+                    Ok(changed) => (changed || current.is_none()).then_some(next),
+                    Err(e) => {
+                        conflict = Some(e);
+                        None
+                    }
                 }
-                next.journal.removals.extend(fresh);
-                next.journal.generation += 1;
-                Some(next)
             })
             .await?
             .unwrap_or_default();
+            if let Some(e) = conflict {
+                return Err(e.into());
+            }
             // A copy restored after this ledger is gone keeps the removal
             // only through the checkpoint; a retry publishes it.
             self.checkpoint_journal(&ledger_id).await.map_err(|e| {

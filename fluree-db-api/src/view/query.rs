@@ -1567,7 +1567,6 @@ impl Fluree {
                 to_t,
                 from_t,
                 reads,
-                snapshot: &db.snapshot,
                 confirm_journal: earlier_point,
             },
         )
