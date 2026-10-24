@@ -405,3 +405,68 @@ async fn a_list_and_an_annotated_value_share_a_predicate() {
         );
     }
 }
+
+/// Novelty holds each fact's whole lifecycle, and export writes a fact's
+/// latest state: a fact asserted and then deleted since the index was built
+/// is not exported, and neither are the members a SPARQL edit re-stored as
+/// triples. From a ledger with no index, and over one.
+#[tokio::test]
+async fn facts_deleted_since_the_index_are_not_exported() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for indexed in [false, true] {
+        let id = format!("it/export-lists/deleted-{indexed}:main");
+        fluree.create_ledger(&id).await.expect("create");
+        insert_text(
+            &fluree,
+            &id,
+            "@prefix ex: <http://example.org/> .
+             ex:s ex:name \"s\" ; ex:items ( \"a\" \"b\" ) .",
+        )
+        .await;
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        insert_jsonld(
+            &fluree,
+            &id,
+            &json!({"@context": ctx(), "@id": "ex:t", "ex:name": "t"}),
+        )
+        .await;
+        fluree
+            .graph(&id)
+            .transact()
+            .update(&json!({"@context": ctx(), "delete": {"@id": "ex:t", "ex:name": "t"}}))
+            .commit()
+            .await
+            .expect("delete");
+        fluree
+            .graph(&id)
+            .transact()
+            .sparql_update(
+                "PREFIX ex: <http://example.org/>
+                 INSERT { ?h ex:note \"x\" } WHERE { ex:s ex:items ?h }",
+            )
+            .commit()
+            .await
+            .expect("note the list's head");
+
+        for format in [
+            ExportFormat::NTriples,
+            ExportFormat::Turtle,
+            ExportFormat::JsonLd,
+        ] {
+            let text = export(&fluree, &id, format).await;
+            assert!(
+                !text.contains("example.org/t") && !text.contains("ex:t"),
+                "{indexed} {format:?}: {text}"
+            );
+            for member in ["\"a\"", "\"b\""] {
+                assert_eq!(
+                    text.matches(member).count(),
+                    1,
+                    "{indexed} {format:?}: {member} once, in the re-stored list: {text}"
+                );
+            }
+        }
+    }
+}
