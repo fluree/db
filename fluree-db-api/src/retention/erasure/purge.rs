@@ -313,5 +313,5 @@ mod sources;
 #[cfg(test)]
 mod tests;
 
-pub use run::PurgeReport;
+pub use run::{PurgeReport, PurgeTimings};
 pub use scan::PurgeScan;

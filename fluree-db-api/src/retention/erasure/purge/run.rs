@@ -4,7 +4,7 @@
 //! originals last — and check that it is gone.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fluree_db_core::{content_path, ContentId, ContentKind, ContentStore, LedgerId, LedgerName};
 use fluree_db_indexer::{plan_garbage, release_garbage_plan, siblings_of, CleanGarbageConfig};
@@ -49,6 +49,25 @@ pub struct PurgeReport {
     pub waiting: bool,
     /// Why it cannot go on, if it cannot.
     pub blocked: Option<String>,
+    /// Where its time went.
+    pub timings: PurgeTimings,
+}
+
+/// Where a purge pass's time went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeTimings {
+    /// Planning, and reading the erased facts.
+    pub plan: Duration,
+    /// Erasing the holders' indexes, or rebuilding them, and their
+    /// full-text and vector indexes.
+    pub index: Duration,
+    /// Releasing the older indexes and collecting the holders' garbage.
+    pub release: Duration,
+    /// Both scans.
+    pub scan: Duration,
+    /// Deleting, and making the deletes durable.
+    pub delete: Duration,
 }
 
 impl Fluree {
@@ -87,7 +106,9 @@ impl Fluree {
             report.waiting = true;
             return Ok(report);
         }
+        let clock = Instant::now();
         let plan = self.plan_purge(ledger).await?;
+        report.timings.plan += clock.elapsed();
         let stuck = self.unrebuildable_sources(&plan.sources).await?;
         let blocked = (!stuck.is_empty()).then_some(
             "full-text or vector indexes over a dropped ledger, or of a kind this build \
@@ -133,10 +154,13 @@ impl Fluree {
                     return self.block(&jobs, report, why).await;
                 }
             }
+            let clock = Instant::now();
             let captured = self.capture_erased(&plan).await?;
+            report.timings.plan += clock.elapsed();
             let rebuilt_ms = match progress(|p| p.rebuilt_ms) {
                 Some(ms) => ms,
                 None => {
+                    let clock = Instant::now();
                     for branch in &plan.rebuild {
                         let Some(record) = self.nameservice().lookup(branch).await? else {
                             continue;
@@ -151,6 +175,7 @@ impl Fluree {
                         }
                     }
                     report.sources += self.rebuild_sources(&plan.sources).await?;
+                    report.timings.index += clock.elapsed();
                     let ms = now_ms();
                     self.update_purge(&jobs, |p| p.rebuilt_ms = Some(ms))
                         .await?;
@@ -161,6 +186,7 @@ impl Fluree {
                 report.waiting = true;
                 return Ok(report);
             }
+            let clock = Instant::now();
             for branch in &plan.rebuild {
                 self.collapse_index(branch).await?;
             }
@@ -189,8 +215,11 @@ impl Fluree {
                     return Ok(report);
                 }
             }
+            report.timings.release += clock.elapsed();
 
+            let clock = Instant::now();
             let scan = self.scan_purge(&plan, &captured).await?;
+            report.timings.scan += clock.elapsed();
             if !scan.indexed.is_empty() || !scan.dictionary.is_empty() {
                 let why = format!(
                     "rebuilt indexes still hold erased values: {:?}",
@@ -208,12 +237,16 @@ impl Fluree {
                 );
                 return self.block(&jobs, report, why).await;
             }
+            let clock = Instant::now();
             report.deleted += self
                 .rewrite_schedules(&plan, &scan.schedules, &captured)
                 .await?;
             let files: Vec<&String> = plan.transactions.iter().chain(&plan.superseded).collect();
             report.deleted += self.delete_files(&files).await?;
+            report.timings.delete += clock.elapsed();
+            let clock = Instant::now();
             let scan = self.scan_purge(&plan, &captured).await?;
+            report.timings.scan += clock.elapsed();
             if !scan.clean() {
                 let why = "a scan after deleting still found erased values".to_string();
                 return self.block(&jobs, report, why).await;
@@ -229,6 +262,7 @@ impl Fluree {
             .await?;
         }
 
+        let clock = Instant::now();
         let originals: Vec<&String> = plan.originals.iter().collect();
         let deleted = self.delete_files(&originals).await?;
         report.deleted += deleted;
@@ -246,6 +280,7 @@ impl Fluree {
             }
         }
         report.deleted += self.make_deletes_durable(&plan).await?;
+        report.timings.delete += clock.elapsed();
         if let Some(manager) = &self.ledger_manager {
             for branch in &plan.rebuild {
                 if let Ok(id) = LedgerId::parse(branch) {

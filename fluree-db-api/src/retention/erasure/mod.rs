@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 pub use fluree_db_erasure::{Prover, ProverConfig, SubprocessProver, Verifier};
 pub use index::{ErasedCommit, ErasureStep};
-pub use purge::{PurgeInspection, PurgePlan, PurgeReport, PurgeScan};
+pub use purge::{PurgeInspection, PurgePlan, PurgeReport, PurgeScan, PurgeTimings};
 pub use request::{BranchRemoval, ErasureReceipt, ErasureRequest};
 use serde::{Deserialize, Serialize};
 pub use worker::ErasurePassReport;
