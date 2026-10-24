@@ -67,6 +67,10 @@ pub struct ErasedCommit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub txn: Option<String>,
     pub steps: Vec<ErasureStep>,
+    /// The addresses of its original's files a purge deleted: their folders
+    /// go on reading it, as its replacement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub purged: Vec<String>,
 }
 
 impl ErasedCommit {
@@ -142,9 +146,9 @@ fn txn_digest(address: &str) -> Option<&str> {
     (!digest.is_empty() && !digest.contains('/')).then_some(digest)
 }
 
-/// What `incoming` makes of the erasure held for its commit: itself when
-/// it extends (or is) the first one; `None` when it changes nothing, being
-/// a prefix of the held chain or diverging from it.
+/// What `incoming` makes of the erasure held for its commit: the longer of
+/// the two chains, with the files either names purged; `None` when it
+/// changes nothing, or diverges from the held chain.
 fn merged(held: Option<&ErasedCommit>, incoming: ErasedCommit) -> Option<ErasedCommit> {
     let Some(current) = held else {
         return Some(incoming);
@@ -154,9 +158,22 @@ fn merged(held: Option<&ErasedCommit>, incoming: ErasedCommit) -> Option<ErasedC
         tracing::warn!(commit = %incoming.commit, "divergent erasures; keeping the first");
         return None;
     }
-    (incoming.steps.len() > current.steps.len()).then(|| ErasedCommit {
-        txn: incoming.txn.clone().or_else(|| current.txn.clone()),
-        ..incoming
+    let mut purged = current.purged.clone();
+    for address in &incoming.purged {
+        if !purged.contains(address) {
+            purged.push(address.clone());
+        }
+    }
+    let longer = incoming.steps.len() > current.steps.len();
+    if !longer && purged.len() == current.purged.len() {
+        return None;
+    }
+    let txn = incoming.txn.clone().or_else(|| current.txn.clone());
+    let base = if longer { incoming } else { current.clone() };
+    Some(ErasedCommit {
+        txn,
+        purged,
+        ..base
     })
 }
 
@@ -333,7 +350,8 @@ impl ErasureIndex {
         Ok(self.any.load(Ordering::Acquire))
     }
 
-    /// Whether `namespace` holds `original`'s own file, whatever its erasure.
+    /// Whether `namespace` holds `original`'s own file, whatever its
+    /// erasure, or held it until a purge deleted it.
     pub(crate) async fn holds_original(
         &self,
         namespace: &StorageNamespace,
@@ -345,7 +363,40 @@ impl ErasureIndex {
             namespace,
             &original.address_digest(),
         );
-        Ok(self.storage.exists(&address).await?)
+        if self.storage.exists(&address).await? {
+            return Ok(true);
+        }
+        Ok(self
+            .erased(original)
+            .await?
+            .is_some_and(|e| e.purged.contains(&address)))
+    }
+
+    /// Record, before a purge deletes them, that `addresses` are erased
+    /// originals' files: [`Self::holds_original`] goes on finding them.
+    pub(crate) async fn record_purged(&self, addresses: &[String]) -> Result<()> {
+        self.load().await?;
+        let mut changed: HashMap<String, ErasedCommit> = HashMap::new();
+        {
+            let entries = self.entries.read();
+            for address in addresses {
+                let Some(entry) = commit_digest(address).and_then(|d| entries.get(d)) else {
+                    continue;
+                };
+                if entry.erased.purged.contains(address) {
+                    continue;
+                }
+                changed
+                    .entry(entry.erased.commit.clone())
+                    .or_insert_with(|| entry.erased.clone())
+                    .purged
+                    .push(address.clone());
+            }
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        self.publish(changed.into_values().collect()).await
     }
 
     /// `original`'s published erasure, if it has one.
@@ -749,6 +800,7 @@ mod tests {
             ledger_id: "l:main".into(),
             txn: None,
             steps: vec![step(&format!("r{n}"))],
+            purged: Vec::new(),
         }
     }
 
@@ -775,6 +827,7 @@ mod tests {
             ledger_id: "l:main".into(),
             txn: None,
             steps,
+            purged: Vec::new(),
         };
         let mut held = HashMap::new();
         merge(&mut held, erased(vec![step("a")]));
@@ -787,5 +840,23 @@ mod tests {
             held["c"].steps[1].request_id, "b",
             "a divergent chain is not taken"
         );
+    }
+
+    #[test]
+    fn purged_files_accumulate_whichever_chain_is_longer() {
+        let erased = |steps: &[&str], purged: &[&str]| ErasedCommit {
+            commit: "c".into(),
+            ledger_id: "l:main".into(),
+            txn: None,
+            steps: steps.iter().map(|s| step(s)).collect(),
+            purged: purged.iter().map(ToString::to_string).collect(),
+        };
+        let mut held = HashMap::new();
+        merge(&mut held, erased(&["a"], &[]));
+        merge(&mut held, erased(&["a"], &["f1"]));
+        merge(&mut held, erased(&["a", "b"], &[]));
+        merge(&mut held, erased(&["a"], &["f2"]));
+        assert_eq!(held["c"].steps.len(), 2);
+        assert_eq!(held["c"].purged, ["f1", "f2"]);
     }
 }

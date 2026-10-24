@@ -263,6 +263,12 @@ impl Fluree {
         }
 
         let clock = Instant::now();
+        // Their folders' histories still read them: a later erasure of the
+        // same commit must find them.
+        self.erasure_runtime()?
+            .index
+            .record_purged(&plan.originals)
+            .await?;
         let originals: Vec<&String> = plan.originals.iter().collect();
         let deleted = self.delete_files(&originals).await?;
         report.deleted += deleted;

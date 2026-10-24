@@ -1664,6 +1664,56 @@ async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
     }
 }
 
+/// A second erasure of a commit whose originals a purge already deleted
+/// still reaches the copies that held them: they read it as its
+/// replacement, holding what the second erasure removes.
+#[tokio::test]
+async fn a_second_erasure_after_a_purge_reaches_the_copies() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-twice").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@second"}
+        ]}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-twice-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    for (subject, value) in [("alice", "a@secret"), ("bob", "b@second")] {
+        fluree
+            .erase_occurrences(&id, email(subject, value), None)
+            .await
+            .expect("erase");
+        reindex(&fluree, &id).await;
+        reindex(&fluree, &copy).await;
+        assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert_eq!(report.purged, 1, "{report:?}");
+    }
+
+    assert!(objects(&fluree, &copy, "ex:bob", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        files_holding(dir.path(), "b@second"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
 /// A soft-dropped copy holding an erased commit, with a branch, both indexed
 /// over it: the purge releases the copy's indexes and dictionaries, marking
 /// its drop entry to rebuild them, and completes with no file anywhere
