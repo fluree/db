@@ -73,7 +73,9 @@ pub use orchestrator::{
 pub use stats::{IndexStatsHook, NoOpStatsHook, StatsArtifacts, StatsSummary};
 
 // Re-export build pipeline types
-pub use build::incremental::{erase_index_events, ErasedEvent};
+pub use build::incremental::{
+    erase_index_events, incremental_index_erasing, ErasedEvent, IndexErasure,
+};
 pub use build::types::{UploadedDicts, UploadedIndexes};
 
 // Re-export build pipeline types

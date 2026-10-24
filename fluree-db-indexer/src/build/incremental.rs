@@ -683,6 +683,58 @@ pub struct ErasedEvent {
     pub assert: bool,
 }
 
+/// What an erasure removes from an index whose facts are not all history:
+/// see [`incremental_index_erasing`].
+#[derive(Clone, Debug, Default)]
+pub struct IndexErasure {
+    /// Events whose history entries go.
+    pub events: Vec<ErasedEvent>,
+    /// Assertions still current, as their rows: the rows go, as a
+    /// retraction would take them, and leave no history.
+    pub current: Vec<RunRecordV2>,
+}
+
+/// `base` with `events` (record, assertion) left out of history too.
+fn with_erased_events(
+    base: Option<Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
+    events: impl IntoIterator<Item = (RunRecordV2, bool)>,
+) -> Option<Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>> {
+    use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
+    let mut events = events.into_iter().peekable();
+    events.peek()?;
+    let mut drop = base.map(|d| (*d).clone()).unwrap_or_default();
+    for (r, assert) in events {
+        drop.insert_event(&HistEntryV2 {
+            s_id: r.s_id,
+            p_id: r.p_id,
+            o_type: r.o_type,
+            o_key: r.o_key,
+            o_i: r.o_i,
+            t: r.t,
+            op: u8::from(assert),
+        });
+    }
+    Some(Arc::new(drop))
+}
+
+/// Empty from `root`'s dictionaries the strings `records` used that nothing
+/// it holds refers to any more. Returns the dictionary files replaced.
+async fn empty_erased_strings(
+    content_store: &dyn ContentStore,
+    root: &mut fluree_db_binary_index::IndexRoot,
+    records: impl Iterator<Item = &RunRecordV2>,
+) -> Result<Vec<ContentId>> {
+    let strings: std::collections::BTreeSet<u64> = records
+        .filter(|r| super::erase_dicts::string_typed(r.o_type))
+        .map(|r| r.o_key)
+        .collect();
+    let unused = super::erase_dicts::unused_strings(content_store, root, &strings).await?;
+    if unused.is_empty() {
+        return Ok(Vec::new());
+    }
+    super::erase_dicts::remove_strings(content_store, &mut root.dict_refs, &unused).await
+}
+
 /// Rewrite the index at `base_root_id` without the history of `events`. Only
 /// the leaves holding them are rewritten, in every order of their graphs, and
 /// a string only they used is emptied from the dictionaries; every other
@@ -695,8 +747,6 @@ pub async fn erase_index_events(
     events: &[ErasedEvent],
     config: &IndexerConfig,
 ) -> Result<IndexResult> {
-    use fluree_db_binary_index::format::history_sidecar::{HistEntryV2, HistoryDrop};
-
     let root_bytes = fetch_cached_index_bytes(
         content_store.as_ref(),
         base_root_id,
@@ -713,20 +763,8 @@ pub async fn erase_index_events(
     }
     let mut tasks = Vec::new();
     for (&g_id, events) in &by_graph {
-        let mut drop = HistoryDrop::default();
-        for event in events {
-            let r = &event.record;
-            drop.insert_event(&HistEntryV2 {
-                s_id: r.s_id,
-                p_id: r.p_id,
-                o_type: r.o_type,
-                o_key: r.o_key,
-                o_i: r.o_i,
-                t: r.t,
-                op: u8::from(event.assert),
-            });
-        }
-        let drop = Arc::new(drop);
+        let drop = with_erased_events(None, events.iter().map(|e| (e.record, e.assert)))
+            .expect("events to drop");
         for order in [
             RunSortOrder::Spot,
             RunSortOrder::Psot,
@@ -808,24 +846,14 @@ pub async fn erase_index_events(
         id: base_root_id.clone(),
     }));
     let (mut root, mut replaced_cids) = root_builder.build();
-    // Strings erased events used, which nothing left refers to.
-    let strings: std::collections::BTreeSet<u64> = events
-        .iter()
-        .filter(|e| super::erase_dicts::string_typed(e.record.o_type))
-        .map(|e| e.record.o_key)
-        .collect();
-    let unused =
-        super::erase_dicts::unused_strings(content_store.as_ref(), &root, &strings).await?;
-    if !unused.is_empty() {
-        replaced_cids.extend(
-            super::erase_dicts::remove_strings(
-                content_store.as_ref(),
-                &mut root.dict_refs,
-                &unused,
-            )
-            .await?,
-        );
-    }
+    replaced_cids.extend(
+        empty_erased_strings(
+            content_store.as_ref(),
+            &mut root,
+            events.iter().map(|e| &e.record),
+        )
+        .await?,
+    );
     super::root_assembly::attach_garbage_manifest(
         content_store.as_ref(),
         &mut root,
@@ -865,6 +893,41 @@ pub async fn incremental_index(
     ledger_id: &str,
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
+) -> Result<IndexResult> {
+    incremental_index_with(content_store, tracker, ledger_id, record, config, None).await
+}
+
+/// [`incremental_index`], also erasing `erasure` from the base index: each
+/// current row goes as a retraction would take it, so the statistics count
+/// it, and neither it nor any erased event is left in history. Strings only
+/// they used are emptied from the dictionaries. The new root's `index_t` is
+/// the base's, or the newest commit's.
+pub async fn incremental_index_erasing(
+    content_store: Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+    erasure: &IndexErasure,
+) -> Result<IndexResult> {
+    incremental_index_with(
+        content_store,
+        tracker,
+        ledger_id,
+        record,
+        config,
+        Some(erasure),
+    )
+    .await
+}
+
+async fn incremental_index_with(
+    content_store: Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+    erasure: Option<&IndexErasure>,
 ) -> Result<IndexResult> {
     let base_root_id = record.index_head_id.clone().ok_or(IndexerError::NoIndex)?;
     let head_commit_id = record
@@ -911,7 +974,48 @@ pub async fn incremental_index(
         e => IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")),
     })?;
 
-    if novelty.records.is_empty() {
+    // Each erased current row, retracted at the base's `t`: its assertion
+    // and that retraction both leave history.
+    let mut erased_events: std::collections::BTreeMap<u16, Vec<(RunRecordV2, bool)>> =
+        std::collections::BTreeMap::new();
+    if let Some(erasure) = erasure {
+        let base_t = u32::try_from(novelty.base_root.index_t)
+            .map_err(|_| IndexerError::StorageWrite("base index t out of range".into()))?;
+        let resolved: std::collections::HashSet<FactIdentityKey> =
+            novelty.records.iter().map(fact_identity_key).collect();
+        for row in &erasure.current {
+            if resolved.contains(&fact_identity_key(row)) {
+                return Err(IndexerError::StorageWrite(
+                    "an erased current fact changes in unindexed commits".into(),
+                ));
+            }
+            let retraction = RunRecordV2 { t: base_t, ..*row };
+            novelty.records.push(retraction);
+            novelty.ops.push(0);
+            let events = erased_events.entry(row.g_id).or_default();
+            events.push((*row, true));
+            events.push((retraction, false));
+        }
+        for event in &erasure.events {
+            erased_events
+                .entry(event.record.g_id)
+                .or_default()
+                .push((event.record, event.assert));
+        }
+        let mut order: Vec<usize> = (0..novelty.records.len()).collect();
+        let cmp = cmp_v2_for_order(RunSortOrder::Spot);
+        order.sort_by(|&a, &b| {
+            novelty.records[a]
+                .g_id
+                .cmp(&novelty.records[b].g_id)
+                .then_with(|| cmp(&novelty.records[a], &novelty.records[b]))
+        });
+        novelty.records = order.iter().map(|&i| novelty.records[i]).collect();
+        novelty.ops = order.iter().map(|&i| novelty.ops[i]).collect();
+        novelty.max_t = novelty.max_t.max(novelty.base_root.index_t);
+    }
+
+    if novelty.records.is_empty() && erased_events.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
         // fuel is filled in by the outer entry point from the tracker tally.
         return Ok(IndexResult {
@@ -967,6 +1071,9 @@ pub async fn incremental_index(
     );
 
     let concurrency = config.incremental_max_concurrency.max(1);
+    for g_id in erased_events.keys() {
+        by_graph.entry(*g_id).or_default();
+    }
     let mut graph_order: Vec<u16> = by_graph.keys().copied().collect();
     graph_order.sort_unstable_by_key(|&g_id| (u8::from(g_id == 0), g_id));
 
@@ -1025,6 +1132,16 @@ pub async fn incremental_index(
                 }
             };
 
+            let erased = erased_events.get(&g_id).map(Vec::as_slice).unwrap_or(&[]);
+            let mut sorted_erase: Vec<RunRecordV2> = erased.iter().map(|(r, _)| *r).collect();
+            sorted_erase.sort_unstable_by(cmp_v2_for_order(order));
+            let suppressed = novelty
+                .shared
+                .history_drop_for(&config.history_suppression, g_id);
+            let history_drop = match erased.is_empty() {
+                true => suppressed,
+                false => with_erased_events(suppressed, erased.iter().copied()),
+            };
             phase2_tasks.push(Phase2Task {
                 seq: phase2_tasks.len(),
                 g_id,
@@ -1033,11 +1150,9 @@ pub async fn incremental_index(
                 sorted_ops,
                 sorted_superseded,
                 sorted_superseded_ops,
-                sorted_erase: Vec::new(),
+                sorted_erase,
                 kind,
-                history_drop: novelty
-                    .shared
-                    .history_drop_for(&config.history_suppression, g_id),
+                history_drop,
             });
         }
     }
@@ -4131,7 +4246,7 @@ pub async fn incremental_index(
         id: base_root_id.clone(),
     }));
 
-    let (new_root, replaced_cids) = root_builder.build();
+    let (new_root, mut replaced_cids) = root_builder.build();
     tracing::debug!(
         replaced_cids = replaced_cids.len(),
         elapsed_ms = phase4_started.elapsed().as_millis() as u64,
@@ -4139,6 +4254,16 @@ pub async fn incremental_index(
     );
 
     let mut final_root = new_root;
+    if !erased_events.is_empty() {
+        replaced_cids.extend(
+            empty_erased_strings(
+                content_store.as_ref(),
+                &mut final_root,
+                erased_events.values().flatten().map(|(r, _)| r),
+            )
+            .await?,
+        );
+    }
     super::root_assembly::attach_garbage_manifest(
         content_store.as_ref(),
         &mut final_root,
