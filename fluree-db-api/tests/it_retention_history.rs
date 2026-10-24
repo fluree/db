@@ -683,7 +683,8 @@ async fn a_search_index_behind_a_removal_is_not_served() {
 
 /// A full-text index that reads none of a removal's properties cannot hold
 /// what it removed: it is served behind the removal, as of now and earlier.
-/// One whose indexing query may read anything (`*`) is refused.
+/// One whose indexing query may read anything (`*`, or reasoning, which
+/// infers from properties its patterns do not name) is refused.
 #[tokio::test]
 async fn a_search_index_that_never_read_a_removed_property_is_served() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -697,22 +698,27 @@ async fn a_search_index_that_never_read_a_removed_property_is_served() {
         ]}),
     )
     .await;
-    let index = |name: &str, select: JsonValue| {
+    let index = |name: &str, select: JsonValue, reasoning: &str| {
         fluree.create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
             name,
             &id,
             json!({
                 "@context": ctx(),
                 "where": [{"@id": "?x", "@type": "ex:Doc"}],
-                "select": {"?x": select}
+                "select": {"?x": select},
+                "reasoning": reasoning
             }),
         ))
     };
-    let bio = index("removal-bio", json!(["@id", "ex:bio"]))
+    let bio = index("removal-bio", json!(["@id", "ex:bio"]), "none")
         .await
         .expect("create index")
         .graph_source_id;
-    let everything = index("removal-everything", json!(["*"]))
+    let everything = index("removal-everything", json!(["*"]), "none")
+        .await
+        .expect("create index")
+        .graph_source_id;
+    let inferred = index("removal-inferred", json!(["@id", "ex:bio"]), "owl2rl")
         .await
         .expect("create index")
         .graph_source_id;
@@ -740,15 +746,17 @@ async fn a_search_index_that_never_read_a_removed_property_is_served() {
     for from in [json!(id), json!(format!("{id}@t:{t1}"))] {
         let result = fluree.query_connection(&search(&bio, from.clone())).await;
         assert_eq!(hits(result.expect("served")), 2, "{from}");
-        assert!(
-            matches!(
-                fluree
-                    .query_connection(&search(&everything, from.clone()))
-                    .await,
-                Err(ApiError::HistoryUnavailable(_))
-            ),
-            "{from}"
-        );
+        for refused in [&everything, &inferred] {
+            assert!(
+                matches!(
+                    fluree
+                        .query_connection(&search(refused, from.clone()))
+                        .await,
+                    Err(ApiError::HistoryUnavailable(_))
+                ),
+                "{refused} {from}"
+            );
+        }
     }
 }
 

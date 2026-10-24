@@ -111,7 +111,7 @@ Full-text (BM25) and vector graph sources index documents built from their sourc
 - it lags the head of a source ledger that has an `f:noHistory` rule;
 - it is read as of an earlier snapshot of a source ledger with either.
 
-Only removals and rules of properties the graph source reads count: its indexing query's properties and, for a vector index, its embedding property. An index of `ex:bio` is served behind a removal of `ex:email`. When the indexing query's properties cannot all be listed (a `*` select, a variable predicate, a `@path` alias, or patterns on another subject), every removal and rule counts.
+Only removals and rules of properties the graph source reads count: its indexing query's properties and, for a vector index, its embedding property. An index of `ex:bio` is served behind a removal of `ex:email`. When the indexing query's properties cannot all be listed (a `*` select, a variable predicate, a `@path` alias, patterns on another subject, or reasoning, which infers from properties the query does not name), every removal and rule counts.
 
 It is served again once it syncs. An export as of an earlier point is refused like a query that reads every predicate.
 
