@@ -305,7 +305,7 @@ pub fn parse_sync_transaction(
 /// Parsing is exactly insert parsing (same context handling, annotation
 /// lowering, txn-meta extraction) with `graph` as the root scope. Differences
 /// from insert:
-/// - an explicitly empty document (`"@graph": []`) parses to an empty
+/// - an empty document ([`is_empty_document`]) parses to an empty
 ///   transaction instead of an error;
 /// - a payload that addresses any other graph itself (a graph selector naming
 ///   another graph, or a named-graph object) is rejected: the scope is
@@ -317,18 +317,7 @@ pub fn parse_graph_insert(
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
 ) -> Result<Txn> {
-    // `{"@graph": []}`: an envelope with no nodes. (With an `@id` the same
-    // value is an empty JSON-LD named graph, which a graph write refuses.)
-    let explicitly_empty = json.as_object().is_some_and(|obj| {
-        matches!(
-            fluree_graph_json_ld::doc_shape(obj),
-            Ok(fluree_graph_json_ld::DocShape::Envelope)
-        ) && obj
-            .get("@graph")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    });
-    if explicitly_empty {
+    if is_empty_document(json) {
         let mut txn = Txn::insert().with_opts(opts);
         if let GraphName::Iri(iri) = request_graph_name(graph)? {
             txn.write_graphs.insert(iri.as_str().to_string());
@@ -345,6 +334,25 @@ pub fn parse_graph_insert(
         ledger_id,
         Some(graph),
     )
+}
+
+/// Whether a JSON-LD write document holds no nodes: `[]`, or an envelope
+/// whose `@graph` is `[]`. (With an `@id`, an empty `@graph` is an empty
+/// JSON-LD named graph, which a graph write refuses.)
+pub fn is_empty_document(json: &Value) -> bool {
+    match json {
+        Value::Array(nodes) => nodes.is_empty(),
+        Value::Object(obj) => {
+            matches!(
+                fluree_graph_json_ld::doc_shape(obj),
+                Ok(fluree_graph_json_ld::DocShape::Envelope)
+            ) && obj
+                .get("@graph")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        }
+        _ => false,
+    }
 }
 
 /// The graph a graph insert / sync request names, as a write-side name.
@@ -366,6 +374,16 @@ fn strict_compact_iri(opts: &TxnOpts, json: &Value) -> bool {
             json.as_object().and_then(parse_strict_compact_iri_opt)
         })
         .unwrap_or(true)
+}
+
+/// Whether an expanded document names a node with `@id`. When it yields no
+/// triples, such a node has only its `@id`.
+fn names_a_node(expanded: &Value) -> bool {
+    match expanded {
+        Value::Array(items) => items.iter().any(names_a_node),
+        Value::Object(obj) => obj.contains_key("@id") || obj.values().any(names_a_node),
+        _ => false,
+    }
 }
 
 /// Parse an insert or upsert document.
@@ -423,6 +441,11 @@ fn parse_data(
         }
     };
     if templates.is_empty() {
+        if !names_a_node(&expanded) {
+            return Err(TransactError::Parse(
+                "the payload has no triples; there is nothing to add".to_string(),
+            ));
+        }
         let (verb, noun) = match txn_type {
             TxnType::Upsert => ("Upsert", "upsert"),
             _ => ("Insert", "insert"),
@@ -736,12 +759,17 @@ fn parse_update_clauses(
         );
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
-            return Err(TransactError::Parse(
-                "insert must contain at least one predicate or @type (an object with only @id is not a valid insert)"
-                    .to_string(),
-            ));
+            // As with delete: `"insert": []` is a no-op, an empty node is not.
+            if matches!(insert_val, Value::Array(arr) if arr.is_empty()) {
+                Vec::new()
+            } else {
+                return Err(TransactError::Parse(
+                    "insert must contain at least one predicate or @type".to_string(),
+                ));
+            }
+        } else {
+            templates
         }
-        templates
     } else {
         Vec::new()
     };
@@ -1001,6 +1029,8 @@ fn expand_update_graph_iri(v: &Value, context: &ParsedContext, strict: bool) -> 
 #[derive(Debug, Default)]
 struct BlankIssuer {
     next: usize,
+    /// Lists issued, for [`TripleTemplate::list_id`].
+    lists: u32,
     /// Numbers of user `_:bN` labels to skip (the re-parse).
     skip: std::collections::HashSet<usize>,
     /// Numbers of the user `_:bN` labels seen in this parse.
@@ -1009,6 +1039,12 @@ struct BlankIssuer {
 }
 
 impl BlankIssuer {
+    /// A list id unique in the document.
+    fn issue_list(&mut self) -> u32 {
+        self.lists += 1;
+        self.lists - 1
+    }
+
     fn issue(&mut self) -> TemplateTerm {
         while self.skip.contains(&self.next) {
             self.next += 1;
@@ -1786,6 +1822,7 @@ fn parse_expanded_object_with_ctx(
                         object,
                         None,
                         None,
+                        None,
                     );
                 } else {
                     return Err(TransactError::Parse(format!(
@@ -1796,9 +1833,11 @@ fn parse_expanded_object_with_ctx(
             continue;
         }
 
-        if key == TYPE {
+        // `rdf:type` as a key writes types `@type` can't hold: an annotated
+        // one, or a list. A literal value would type the node with a string.
+        if key == TYPE && !holds_only_nodes(value) {
             return Err(TransactError::Parse(format!(
-                "\"{TYPE}\" is not a valid predicate IRI. Please use the JSON-LD \"@type\" keyword instead."
+                "\"{TYPE}\" takes node objects or a @list of them, not a literal. Please use the JSON-LD \"@type\" keyword instead."
             )));
         }
 
@@ -1819,6 +1858,7 @@ fn parse_expanded_object_with_ctx(
                 parsed_value.term,
                 parsed_value.dtc,
                 parsed_value.list_index,
+                parsed_value.list_id,
             );
         }
     }
@@ -1832,6 +1872,19 @@ fn parse_expanded_object_with_ctx(
     }
 
     Ok(subject)
+}
+
+/// Whether an expanded property value holds only node objects, directly or
+/// in a `@list`.
+fn holds_only_nodes(value: &Value) -> bool {
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    items.into_iter().all(|item| match item.get("@list") {
+        Some(list) => holds_only_nodes(list),
+        None => item.as_object().is_some_and(|m| !m.contains_key("@value")),
+    })
 }
 
 /// A key spelled like a JSON-LD keyword (`@` then letters). Keys that
@@ -1910,6 +1963,7 @@ fn parse_reverse_properties(
                     owner.clone(),
                     None,
                     None,
+                    None,
                 );
             }
         }
@@ -1982,6 +2036,8 @@ struct ParsedValue {
     term: TemplateTerm,
     dtc: Option<DatatypeConstraint>,
     list_index: Option<i32>,
+    /// The `@list` this value is a member of (see [`TripleTemplate::list_id`]).
+    list_id: Option<u32>,
 }
 
 impl ParsedValue {
@@ -1990,6 +2046,7 @@ impl ParsedValue {
             term,
             dtc: None,
             list_index: None,
+            list_id: None,
         }
     }
 
@@ -2399,6 +2456,7 @@ fn parse_list_value_with_ctx(
     let first = &items[0];
     let mut parsed = parse_single_list_item_with_ctx(first, scope, ctx, out)?;
     parsed.list_index = Some(0);
+    parsed.list_id = Some(ctx.blanks.issue_list());
     Ok(parsed)
 }
 
@@ -2430,10 +2488,12 @@ fn parse_list_values_with_ctx(
     }
 
     // Parse each item with its index
+    let list = ctx.blanks.issue_list();
     let mut results = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let mut parsed = parse_single_list_item_with_ctx(item, scope, ctx, out)?;
         parsed.list_index = Some(index as i32);
+        parsed.list_id = Some(list);
         results.push(parsed);
     }
 
@@ -2628,6 +2688,39 @@ mod tests {
 
         // Check that http://example.org/ was registered
         assert!(ns_registry.has_prefix("http://example.org/"));
+    }
+
+    /// `rdf:type` as a key writes the type `@type` would, also as a list,
+    /// and refuses a literal, which would type the node with a string.
+    #[test]
+    fn rdf_type_takes_nodes_but_not_literals() {
+        let ctx = json!({
+            "ex": "http://example.org/",
+            "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        });
+        let typed = |value: Value| {
+            parse_doc(
+                &json!({"@context": ctx, "@id": "ex:s", "rdf:type": value}),
+                TxnType::Insert,
+            )
+            .map(|txn| format!("{:?}", txn.insert_templates))
+        };
+        let keyword = parse_doc(
+            &json!({"@context": ctx, "@id": "ex:s", "@type": "ex:A"}),
+            TxnType::Insert,
+        )
+        .map(|txn| format!("{:?}", txn.insert_templates))
+        .unwrap();
+        assert_eq!(typed(json!({"@id": "ex:A"})).unwrap(), keyword);
+        assert!(typed(json!({"@list": [{"@id": "ex:A"}, {"@id": "ex:B"}]})).is_ok());
+        for literal in [
+            json!("ex:A"),
+            json!({"@list": ["ex:A"]}),
+            json!([{"@id": "ex:A"}, "ex:B"]),
+        ] {
+            let err = typed(literal.clone()).unwrap_err().to_string();
+            assert!(err.contains("\"@type\" keyword"), "{literal}: {err}");
+        }
     }
 
     #[test]

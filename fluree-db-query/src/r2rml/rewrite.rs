@@ -147,6 +147,7 @@ fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Ve
             // scope — see the doc comment. Listed exhaustively so a new pattern
             // variant that reads this view's index forces a decision here.
             Pattern::Triple(_)
+            | Pattern::ListView(_)
             | Pattern::Filter(_)
             | Pattern::Bind { .. }
             | Pattern::Unwind { .. }
@@ -363,6 +364,7 @@ pub fn rewrite_patterns_for_r2rml(
             // R2RML is undefined — left untouched here, not silently-empty in
             // the confirmed sense).
             Pattern::Filter(_)
+            | Pattern::ListView(_)
             | Pattern::Bind { .. }
             | Pattern::Unwind { .. }
             | Pattern::Values { .. }

@@ -124,10 +124,19 @@ frozen view that every query sees identically.
   result shows as a table. `single()` returns the one
   record and raises unless there is exactly one; `first()` returns the first
   record, or `None`.
+- An unbound variable, such as one an `OPTIONAL` didn't match, is `None`, and
+  its column is still in the record: `r.get("desc", "")` returns `None`.
+  `get`'s default applies only to a column the result doesn't have.
 - Literals are Python values (`int`, `float`, `Decimal`, `datetime`, `str`,
   ...); IRIs are `fluree.IRI` and language-tagged strings
   `fluree.LangString`, both `str` subclasses. A literal with no lossless
   Python type stays a `fluree.Literal`.
+- Dates and times come back as Fluree stores them
+  ([temporal values](https://fluree.github.io/db/reference/compatibility.html#sparql-11-query)):
+  an `xsd:dateTime` is a `datetime` in UTC whatever offset it was written
+  with, so `isoformat()` writes `+00:00` where the data said `Z`; an
+  `xsd:date` or `xsd:time` has no offset; and fractions of a second stop at
+  the microsecond.
 - SPARQL `ASK` returns a `bool`, `CONSTRUCT` a JSON-LD document; JSON-LD
   queries (a `dict`) return their JSON result as Python objects.
 - `select()` is `query()` for tables: it takes a SPARQL `SELECT` or a Cypher
