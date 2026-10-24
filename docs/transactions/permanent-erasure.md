@@ -9,10 +9,9 @@ stay as they were.
 commit log intact for audit. Erasure goes further: once an erasure is published, nothing reads the
 original commit again.
 
-**This release.** It runs the whole workflow through published, verified replacements, but the original
-commit files stay on disk. Deleting them, and the other copies listed under [Limits](#limits), is the
-next release. Until then, erasure stops every read path from serving the originals, but does not destroy
-them.
+Once an erasure is published, a [purge](#purge) deletes the original commit files and every other copy
+of what the request removed that this node's storage holds: transaction documents, index files,
+derived search indexes and scratch files.
 
 ## Scope
 
@@ -108,23 +107,57 @@ proofs chain back to the original commit.
 Replacements, receipts and the published mappings are kept under `@retention/erasure/` in storage. That
 is outside every ledger's folder, so ledger drops and backup restores do not touch them.
 
+## Purge
+
+After publication, the retention worker purges the erasure in the background, one pass at a time. A pass
+resumes where an interrupted one stopped.
+
+1. **Indexes.** Every branch that holds an erased commit has its index rewritten without the erased
+   events. Usually only the leaves that hold them are rewritten. The branch is rebuilt from the
+   replacements instead when an erased value lives outside the leaves (a big number, vector, geometry,
+   full-text value or triple term), or when an IRI it names would be left unused. Full-text (BM25) and
+   vector indexes over such a branch are rebuilt from scratch. A soft-dropped ledger that holds an erased
+   commit has its indexes deleted, and restoring it rebuilds them before it serves.
+2. **Grace.** The older indexes stay for 15 minutes (the index collector's minimum age), so queries
+   reading them can finish. They are then released.
+3. **Scan.** Every holding branch's history, index, dictionaries and TTL schedules are checked for the
+   erased values. A value that a surviving occurrence still uses stays.
+4. **Deletion.** TTL schedules holding an erased fact are rewritten. Next, the affected commits'
+   transaction documents and superseded replacements are deleted whole. The scan then runs again, and
+   last, the original commit files are deleted wherever they are stored. Each deletion is checked.
+5. **Durability.** The write-ahead log is checkpointed and every directory the pass deleted from is
+   flushed, so no deletion is undone by a power loss. Staging files left by crashed writes are removed,
+   and so are scratch files left by crashed index rebuilds, imports and proving steps.
+6. **Caches.** This process's caches are cleared.
+
+A pass that cannot go on records why in the job and tries again an hour later. The reasons are:
+
+- a full-text or vector index over a dropped ledger, which keeps its own copies (drop it first);
+- an instance that does not hold its storage's lock;
+- another process's write-ahead log under the storage;
+- a scan that finds something it cannot account for.
+
+A purged job lists, under `purge.unverified`, what this node cannot check. That is the memory of other
+processes reading the same storage, such as query peers. Restart them.
+
 ## Status
 
 `GET /v1/fluree/retention/<ledger>` lists the branch's erasure jobs under `registration.erasures`.
 
 | Field | Meaning |
 |---|---|
-| `stage` | `proving`, `indexing` (proved, waiting for an index of its commits), `published`, or `failed` |
+| `stage` | `proving`, `indexing` (proved, waiting for an index of its commits), `published`, `purging`, `purged`, or `failed` |
 | `commits[].proved` | Per commit, once this request proved it: the slots it removed, the replacement it redacted further (`base`, absent for the original), the replacement, the receipt hash, input and replacement sizes, cycles, segments, proving time. Absent when an earlier request's erasure already removes the commit's requested occurrences. |
 | `retries`, `retryAtMs`, `lastError` | Failed steps and when the next try runs |
 | `acceptedMs`, `publishedMs` | When the request was accepted and published |
+| `purge` | The purge's progress: `rebuiltMs`, `scannedMs`, `purgedMs`, files `deleted`, values left `inUse` by a surviving occurrence, `blocked` (why it cannot go on), `unverified` (what to restart) |
 
 ## Server configuration
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--erasure-prover <path>` | none | The `fluree-prover` binary. Without it, requests are refused. |
-| `--erasure-scratch-dir <dir>` | `<temp>/fluree-erasure` | The prover's temporary files. They hold the plaintext of commits being erased, and each step's directory is removed when the step ends. |
+| `--erasure-scratch-dir <dir>` | `<temp>/fluree-erasure` | The prover's temporary files. They hold the plaintext of commits being erased. Each step's directory is removed when the step ends, and a purge removes any that a crashed step left. |
 | `--erasure-prover-threads <n>` | every core | Proving threads. Fewer threads leave transactions their cores. |
 | `--erasure-prover-timeout-secs <n>` | 14400 | A step still running after this long is killed, with its process group, and retried. |
 
@@ -160,15 +193,12 @@ measurements.
 
 ## Limits
 
-- **Originals are retained in this release.** The original commit files remain on disk, and no read
-  path serves them.
+- **Until the purge completes**, the original commit files and index files built before publishing
+  remain on disk, and no read path serves them.
 - **Transaction documents are not redacted.** The stored transaction document of an affected commit
-  still holds the original request, and audit retrieval still serves it. The next release deletes such
-  documents whole.
-- **Index files built before publishing** still hold the erased values' history. The removal journal
-  refuses those reads, and a reindex rebuilds the index without them.
+  holds the original request, and audit retrieval serves it until the purge deletes it whole.
 - **Transfers are refused.** Push, pull, clone, `.flpack` archives and pack exports refuse a ledger's
   erased commits by name.
-- **Not covered:** copies outside this node's storage (backups, other clones, exports already made),
-  and values in the original CID itself (see [Signatures](#signatures)). A proof does not show that
-  every physical copy is gone.
+- **Not covered:** copies outside this node's storage (backups, other clones, exports already made), the
+  memory of other processes until they restart, and values in the original CID itself (see
+  [Signatures](#signatures)). Neither the proof nor the purge shows that copies elsewhere are gone.
