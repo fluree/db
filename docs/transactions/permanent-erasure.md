@@ -197,9 +197,15 @@ measurements.
 
 - **Until the purge completes**, the original commit files and index files built before publishing
   remain on disk, and no read path serves them.
-- **IRIs stay.** Erasing every fact about a subject, or a reference to a node, removes the facts. The
-  IRIs themselves stay in the index dictionaries, and their namespace prefixes stay in the ledger's
-  namespace table.
+- **IRIs stay in the index dictionaries.** Erasing every fact about a subject, or every reference to a
+  node, removes those facts from the commits and the index. The purge leaves the IRIs in the index's
+  dictionaries, though nothing else holds them once no fact uses them. Namespace prefixes stay in the
+  ledger's namespace table regardless. To remove the IRIs too, run a full reindex after the purge
+  (`POST /v1/fluree/reindex`). The new index is built from the replacements and does not hold them.
+  The index it replaces still does, until index garbage collection releases it. By default that waits
+  until five newer index versions exist and the old index is 15 minutes old (`--gc-max-old-indexes`,
+  `--gc-min-time-mins`). From Rust, a reindex whose `IndexerConfig` sets both to 0 releases it at
+  once, at the cost of queries still reading it.
 - **Transaction documents are not redacted.** The stored transaction document of an affected commit
   holds the original request, and audit retrieval serves it until the purge deletes it whole.
 - **Transfers are refused.** Push, pull, clone, `.flpack` archives and pack exports refuse a ledger's
