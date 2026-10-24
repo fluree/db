@@ -3,6 +3,7 @@
 //! dropped, the indexes of the live ones, and the files nothing references
 //! that are recorded as garbage under the live ones' ledgers.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
@@ -54,6 +55,16 @@ impl PurgeScan {
     }
 }
 
+/// The string `value` is interned as in the string dictionary, if any:
+/// strings, JSON and generic durations, as the binary index encodes them.
+fn dictionary_string(value: &FlakeValue) -> Option<Cow<'_, str>> {
+    match value {
+        FlakeValue::String(s) | FlakeValue::Json(s) => Some(Cow::Borrowed(s)),
+        FlakeValue::Duration(d) => Some(Cow::Owned(d.to_canonical_string())),
+        _ => None,
+    }
+}
+
 impl Fluree {
     /// Scan the holders of `plan`'s commits for `captured`.
     pub(crate) async fn scan_purge(
@@ -80,6 +91,14 @@ impl Fluree {
         // stored. What no history reaches is the garbage collector's.
         let mut in_use: Vec<&FlakeValue> = Vec::new();
         let mut facts_in_use: Vec<FactKey> = Vec::new();
+        // The dictionary strings of erased values, and those a surviving
+        // occurrence interns too, whatever its type.
+        let erased_strings: HashSet<String> = captured
+            .iter()
+            .filter_map(|c| dictionary_string(&c.flake.o))
+            .map(Cow::into_owned)
+            .collect();
+        let mut strings_in_use: HashSet<String> = HashSet::new();
         let mut seen = HashSet::new();
         for (record, store, _) in &holders {
             let mut next: Vec<ContentId> = record.commit_head_id.iter().cloned().collect();
@@ -90,6 +109,11 @@ impl Fluree {
                 let commit = load_commit_by_id(store.as_ref(), &cid).await?;
                 next.extend(commit.parents.iter().cloned());
                 for (_, flake) in commit.occurrences() {
+                    if let Some(string) = dictionary_string(&flake.o) {
+                        if erased_strings.contains(string.as_ref()) {
+                            strings_in_use.insert(string.into_owned());
+                        }
+                    }
                     let Some(c) = captured.iter().find(|c| c.flake.o == flake.o) else {
                         continue;
                     };
@@ -195,14 +219,12 @@ impl Fluree {
             else {
                 continue;
             };
-            for c in captured {
-                if let FlakeValue::String(value) = &c.flake.o {
-                    let held = store
-                        .find_string_id(value)
-                        .map_err(|e| ApiError::internal(format!("dictionary lookup: {e}")))?;
-                    if held.is_some() && !in_use.contains(&&c.flake.o) {
-                        dictionary.insert(record.ledger_id.to_string());
-                    }
+            for string in erased_strings.difference(&strings_in_use) {
+                let held = store
+                    .find_string_id(string)
+                    .map_err(|e| ApiError::internal(format!("dictionary lookup: {e}")))?;
+                if held.is_some() {
+                    dictionary.insert(record.ledger_id.to_string());
                 }
             }
         }

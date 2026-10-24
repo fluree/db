@@ -16,17 +16,15 @@ use fluree_db_binary_index::format::wire_helpers::DictRefs;
 use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
 use fluree_db_binary_index::read::column_types::ColumnProjection;
 use fluree_db_binary_index::IndexRoot;
-use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::o_type::OType;
 use fluree_db_core::{ContentId, ContentKind, ContentStore, DictKind, SubjectId};
 
 use crate::error::{IndexerError, Result};
 
-/// Whether objects of type `o_type` are string dictionary ids.
+/// Whether objects of type `o_type` are string dictionary ids: strings,
+/// JSON and generic durations.
 pub(crate) fn string_typed(o_type: u16) -> bool {
-    matches!(
-        OType::from_u16(o_type).decode_kind(),
-        DecodeKind::StringDict | DecodeKind::JsonArena
-    )
+    OType::from_u16(o_type).is_string_keyed()
 }
 
 /// Of the string ids `ids`, those no row or history entry of `root` refers

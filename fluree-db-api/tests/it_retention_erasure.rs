@@ -2397,6 +2397,52 @@ async fn a_string_a_surviving_occurrence_shares_does_not_block_the_purge() {
     );
 }
 
+/// A generic duration is interned as its lexical form, like a string: an
+/// erased string that a surviving duration spells the same keeps the entry
+/// the duration reads, and an erased duration nothing else spells leaves the
+/// dictionaries.
+#[tokio::test]
+async fn a_purge_treats_a_duration_s_lexical_form_as_a_string() {
+    use std::time::Duration;
+
+    let duration = |lexical: &str| json!({"@value": lexical, "@type": "http://www.w3.org/2001/XMLSchema#duration"});
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-duration").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "P1Y2M"},
+            {"@id": "ex:bob", "ex:period": duration("P1Y2M")},
+            {"@id": "ex:carol", "ex:period": duration("P2Y3M")}
+        ]}),
+    )
+    .await;
+    publish_erasure(&fluree, &id, email("alice", "P1Y2M")).await;
+    let carol = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/carol".into(),
+            predicate: "http://example.org/period".into(),
+            graph: None,
+            object: None,
+        }],
+        ..Default::default()
+    };
+    publish_erasure(&fluree, &id, carol).await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!((report.purged, report.leafwise), (2, 1), "{report:?}");
+    assert_eq!(
+        objects(&fluree, &id, "ex:bob", "ex:period").await,
+        vec![duration("P1Y2M")]
+    );
+    assert_eq!(
+        files_holding(dir.path(), "P2Y3M"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
 /// The empty string, erased where nothing else uses it, leaves the
 /// dictionaries like any other: the purge completes.
 #[tokio::test]
