@@ -1547,18 +1547,13 @@ fn sync_graph_commits_only_the_delta() {
         .stdout(predicate::str::contains("+2 asserted, -2 retracted (t=2)"));
 
     // Empty payload is refused without --allow-empty ...
-    fluree_cmd(&tmp)
-        .args([
-            "sync",
-            "syncdb",
-            "--graph",
-            graph,
-            "-e",
-            r#"{"@graph": []}"#,
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--allow-empty"));
+    for empty in [r#"{"@graph": []}"#, "[]"] {
+        fluree_cmd(&tmp)
+            .args(["sync", "syncdb", "--graph", graph, "-e", empty])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--allow-empty"));
+    }
     // ... and clears the graph with it.
     fluree_cmd(&tmp)
         .args([

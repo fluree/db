@@ -167,7 +167,7 @@ class Connection:
         """Create a ledger, optionally bulk-loading RDF files into it.
 
         ``source`` is a file or a directory of Turtle, TriG, N-Triples,
-        N-Quads, or JSON-LD files. Bulk loading needs a file-backed connection.
+        N-Quads, or JSON-LD files.
         """
         src = None if source is None else Path(source)
         return Ledger(self, self._native.create(ledger, src))
@@ -487,7 +487,8 @@ class Ledger:
 
         A path is read as a file, its format taken from the extension unless
         ``format`` is given. ``message`` is recorded with the commit, and
-        :meth:`log` shows it.
+        :meth:`log` shows it. Data with nothing to add, such as ``[]``, is
+        refused.
         """
         return self._transact("insert", *_rdf_payload(data, format), message)
 

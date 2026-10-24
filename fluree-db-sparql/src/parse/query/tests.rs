@@ -1603,6 +1603,36 @@ fn test_blank_node_property_list_label_no_user_collision() {
 }
 
 #[test]
+fn test_minted_blank_node_labels_start_with_a_dash() {
+    // The other half of the test above: every label the parser mints for a
+    // `[ … ]`, a `( … )` or a standalone `<< … >>` with no reifier starts
+    // with `-`.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         INSERT { _:b ex:p [ ex:q ?o ] ; ex:list ( ?o ?o ) } \
+         WHERE { ?s ex:p ?o . ?s ex:r [ ex:q ?x ] ; ex:list ( ?x ) . << ?s ex:p ?o >> . }",
+    );
+    let debug = format!("{ast:?}");
+    let labels: Vec<&str> = debug
+        .split("Labeled(\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    for kind in ["bnpl", "coll", "reif"] {
+        assert!(
+            labels.iter().any(|label| label.contains(kind)),
+            "no {kind} label minted: {labels:?}"
+        );
+    }
+    for label in labels {
+        assert!(
+            label == "b" || label.starts_with('-'),
+            "minted label {label} can lex as a user's label"
+        );
+    }
+}
+
+#[test]
 fn test_group_by_bare_builtin_does_not_desync() {
     // The bare-builtin GROUP BY fallback must not consume tokens when the
     // following token is not an expression — ORDER BY here must still parse.
