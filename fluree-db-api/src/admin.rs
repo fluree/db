@@ -650,6 +650,23 @@ impl crate::Fluree {
             return Ok(report);
         }
 
+        // A branch an earlier release let take a name the ledger-id grammar
+        // now refuses (one beginning with `/`, or with `@` or `#`) is listed,
+        // but the nameservice addresses no such id, so its record would
+        // outlive the files deleted below. Refuse before touching anything:
+        // the branch's record and files stay as the older release left them.
+        if let Some((legacy, refused)) = branches
+            .iter()
+            .find_map(|r| LedgerId::parse(r.ledger_id.as_str()).err().map(|e| (r, e)))
+        {
+            return Err(ApiError::Drop(format!(
+                "Cannot drop ledger '{ledger_name}': its branch '{}' has an id an \
+                 earlier release allowed and this one does not address ({refused}). \
+                 Nothing was dropped.",
+                legacy.ledger_id
+            )));
+        }
+
         // Aggregate status: AlreadyRetracted iff every branch was already
         // retracted; otherwise Dropped (matches per-branch semantics).
         report.status = if branches.iter().all(|r| r.retracted) {
