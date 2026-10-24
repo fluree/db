@@ -2434,7 +2434,7 @@ impl Operator for BinaryScanOperator {
                 && !self.pattern.s_bound()
                 && !self.mode.is_history()
                 && ctx.to_t >= store_ref.max_t()
-                && !crate::fast_path_common::overlay_has_novelty(ctx)
+                && !crate::fast_path_common::graph_has_novelty(ctx, self.g_id)
                 && !decimal_seeks_disabled()
             {
                 if let Some(p_id) = filter.p_id {
@@ -3335,7 +3335,7 @@ impl Operator for BinaryScanOperator {
             &self.inline_ops,
             &self.pattern,
             store_ref,
-            !crate::fast_path_common::overlay_has_novelty(ctx),
+            self.quad.is_some() || !crate::fast_path_common::graph_has_novelty(ctx, self.g_id),
         );
         self.encoded_pre_filters = encoded;
         self.inline_ops = pruned;

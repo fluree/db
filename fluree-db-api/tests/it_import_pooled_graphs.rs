@@ -2879,6 +2879,83 @@ ex:g3 { ex:c ex:refers ex:e2 ; ex:ctx ex:d3 . }
     assert_eq!(pending.1, indexed.1, "JSON-LD GROUP BY");
 }
 
+/// A decimal lookup, a string-prefix filter and a range filter on the
+/// default graph answer exactly with writes pending in a pooled graph, where
+/// they read the default graph's index as authoritative, and with writes
+/// pending in the default graph itself, where they must not.
+#[tokio::test]
+async fn value_lookups_answer_exactly_beside_another_graphs_pending_writes() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-pending-values:main";
+    let trig = r#"
+@prefix ex: <http://example.org/> .
+ex:a ex:price 1.5 ; ex:name "Alice" .
+ex:b ex:price 2.25 ; ex:name "Albert" .
+ex:c ex:price 3.5 ; ex:name "Bob" .
+ex:a ex:big "111111111111111111111111111111.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+ex:b ex:big "222222222222222222222222222222.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+ex:g1 { ex:d ex:price 1.5 ; ex:name "Alma" . }
+"#;
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, trig).await;
+    let queries = [
+        "SELECT ?s WHERE { ?s ex:price 1.5 }",
+        r#"SELECT ?s WHERE { ?s ex:name ?n FILTER(STRSTARTS(?n, "Al")) }"#,
+        "SELECT ?s WHERE { ?s ex:price ?p FILTER(?p > 2) }",
+        r#"SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:name ?n FILTER(STRSTARTS(?n, "Al")) } }"#,
+        "SELECT ?s WHERE { ?s ex:big 111111111111111111111111111111.5 }",
+        "SELECT ?s WHERE { ?s ex:big 2.5 }",
+    ];
+    let answers = |ledger: fluree_db_api::LedgerState| {
+        let fluree = &fluree;
+        async move {
+            let mut out = Vec::new();
+            for q in queries {
+                out.push(select(fluree, &ledger, &format!("{PREFIXES}{q}")).await);
+            }
+            out
+        }
+    };
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        r#"PREFIX ex: <http://example.org/>
+           INSERT DATA { GRAPH ex:g1 { ex:e ex:price 1.5 ; ex:name "Alfred" . } }"#,
+    )
+    .await;
+    let elsewhere = answers(fluree.ledger(ledger_id).await.unwrap()).await;
+    assert_eq!(elsewhere[0], ["s=http://example.org/a"]);
+    assert_eq!(
+        elsewhere[1],
+        ["s=http://example.org/a", "s=http://example.org/b"]
+    );
+    assert_eq!(
+        elsewhere[2],
+        ["s=http://example.org/b", "s=http://example.org/c"]
+    );
+    assert_eq!(elsewhere[4], ["s=http://example.org/a"]);
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        r#"PREFIX ex: <http://example.org/>
+           INSERT DATA { ex:f ex:price 1.5e0 ; ex:name "Alan" ; ex:big 2.5 . ex:h ex:price 4.0 . }"#,
+    )
+    .await;
+    let here = answers(fluree.ledger(ledger_id).await.unwrap()).await;
+    let (_, ledger) = index_and_reload(&fluree, ledger_id).await;
+    let indexed = answers(ledger).await;
+    for (q, (p, i)) in queries.iter().zip(here.iter().zip(&indexed)) {
+        assert_eq!(p, i, "{q}");
+    }
+    assert_eq!(
+        indexed[0],
+        ["s=http://example.org/a", "s=http://example.org/f"]
+    );
+    assert_eq!(indexed[5], ["s=http://example.org/f"]);
+}
+
 /// What the delta tests read: a value range (pooled POST), an object alone
 /// (pooled OPST), `GRAPH ?g` over every pooled order, and g2 at a past `t`.
 async fn pooled_answers(
