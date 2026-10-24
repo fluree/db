@@ -96,6 +96,8 @@ ex:claim1
     ex:confidence "0.8"^^xsd:decimal .
 ```
 
+JSON-LD's `@type` holds IRIs only, so an annotated type, like a list of types, is written as an `rdf:type` property: `"rdf:type": {"@id": "ex:A", "@annotation": {"@id": "ex:claim1"}}`. Fluree's JSON-LD insert reads it back as the same type.
+
 `--raw-reifies` restores the pre-4.2 output. That output only re-imports through `fluree create --from`; the insert and update surfaces reject hand-written `f:reifies*` triples.
 
 A ledger that has never carried an annotation pays nothing for any of this: export reads one flag on the snapshot and runs the scan it always ran.

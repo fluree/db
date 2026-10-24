@@ -1824,9 +1824,11 @@ fn parse_expanded_object_with_ctx(
             continue;
         }
 
-        if key == TYPE {
+        // `rdf:type` as a key writes types `@type` can't hold: an annotated
+        // one, or a list. A literal value would type the node with a string.
+        if key == TYPE && !holds_only_nodes(value) {
             return Err(TransactError::Parse(format!(
-                "\"{TYPE}\" is not a valid predicate IRI. Please use the JSON-LD \"@type\" keyword instead."
+                "\"{TYPE}\" takes node objects or a @list of them, not a literal. Please use the JSON-LD \"@type\" keyword instead."
             )));
         }
 
@@ -1860,6 +1862,19 @@ fn parse_expanded_object_with_ctx(
     }
 
     Ok(subject)
+}
+
+/// Whether an expanded property value holds only node objects, directly or
+/// in a `@list`.
+fn holds_only_nodes(value: &Value) -> bool {
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    items.into_iter().all(|item| match item.get("@list") {
+        Some(list) => holds_only_nodes(list),
+        None => item.as_object().is_some_and(|m| !m.contains_key("@value")),
+    })
 }
 
 /// A key spelled like a JSON-LD keyword (`@` then letters). Keys that
@@ -2656,6 +2671,39 @@ mod tests {
 
         // Check that http://example.org/ was registered
         assert!(ns_registry.has_prefix("http://example.org/"));
+    }
+
+    /// `rdf:type` as a key writes the type `@type` would, also as a list,
+    /// and refuses a literal, which would type the node with a string.
+    #[test]
+    fn rdf_type_takes_nodes_but_not_literals() {
+        let ctx = json!({
+            "ex": "http://example.org/",
+            "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        });
+        let typed = |value: Value| {
+            parse_doc(
+                &json!({"@context": ctx, "@id": "ex:s", "rdf:type": value}),
+                TxnType::Insert,
+            )
+            .map(|txn| format!("{:?}", txn.insert_templates))
+        };
+        let keyword = parse_doc(
+            &json!({"@context": ctx, "@id": "ex:s", "@type": "ex:A"}),
+            TxnType::Insert,
+        )
+        .map(|txn| format!("{:?}", txn.insert_templates))
+        .unwrap();
+        assert_eq!(typed(json!({"@id": "ex:A"})).unwrap(), keyword);
+        assert!(typed(json!({"@list": [{"@id": "ex:A"}, {"@id": "ex:B"}]})).is_ok());
+        for literal in [
+            json!("ex:A"),
+            json!({"@list": ["ex:A"]}),
+            json!([{"@id": "ex:A"}, "ex:B"]),
+        ] {
+            let err = typed(literal.clone()).unwrap_err().to_string();
+            assert!(err.contains("\"@type\" keyword"), "{literal}: {err}");
+        }
     }
 
     #[test]

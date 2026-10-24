@@ -136,10 +136,11 @@ fn subject_blocks(ttl: &str) -> Vec<String> {
 }
 
 /// Each format writes every list in stored order, and the Turtle, TriG and
-/// JSON-LD exports re-insert as ledgers holding the same lists — from novelty
-/// (where most rows miss V3 translation), from the index, and from novelty
-/// over an index, where one list mixes rows that translate with a decimal,
-/// which does not.
+/// JSON-LD exports re-insert as ledgers holding the same lists, types and
+/// annotations — from novelty (where most rows miss V3 translation), from the
+/// index, and from novelty over an index, where one list mixes rows that
+/// translate with a decimal, which does not. JSON-LD's `@type` holds IRIs
+/// only, so its export writes an annotated or list-valued type as `rdf:type`.
 #[tokio::test]
 async fn lists_export_in_order_and_reinsert_as_the_same_lists() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -162,8 +163,16 @@ async fn lists_export_in_order_and_reinsert_as_the_same_lists() {
         }),
     )
     .await;
+    insert_text(
+        &fluree,
+        source,
+        "@prefix ex: <http://example.org/> .
+         ex:w a ex:A ~ ex:r {| ex:since 2020 |} , ex:B , ( ex:C ex:D ) ;
+              ex:label \"w\" ~ ex:q {| ex:since 2021 |} .",
+    )
+    .await;
 
-    let mut subjects = vec!["ex:s", "ex:t", "ex:u"];
+    let mut subjects = vec!["ex:s", "ex:t", "ex:u", "ex:w", "ex:r", "ex:q"];
     for lane in ["novelty", "index", "overlay"] {
         match lane {
             "index" => support::rebuild_and_publish_index(&fluree, source).await,
