@@ -990,6 +990,13 @@ async fn whole_graph_counts_add_the_list_triples() {
     let ledger = indexed_ledger_with(&fluree, "whole-graph-counts", ttl).await;
 
     let (spans, _guard) = support::span_capture::init_test_tracing();
+    let outcomes = || -> Vec<String> {
+        spans
+            .find_events("fast-path outcome")
+            .iter()
+            .map(|e| format!("{:?} {:?}", e.fields.get("site"), e.fields.get("outcome")))
+            .collect()
+    };
     let proceeded = |site: &str| {
         spans.find_events("fast-path outcome").iter().any(|e| {
             e.fields.get("site").map(String::as_str) == Some(site)
@@ -997,13 +1004,18 @@ async fn whole_graph_counts_add_the_list_triples() {
         })
     };
     assert_eq!(rows(&fluree, &ledger, COUNT).await, [json!([8 + 5 + 2])]);
-    assert!(proceeded("triples COUNT"), "the count lane answered");
+    assert!(
+        proceeded("triples COUNT"),
+        "the count lane answered: {:?}",
+        outcomes()
+    );
     let mut grouped = rows(&fluree, &ledger, BY_PREDICATE).await;
     grouped.sort_by_key(ToString::to_string);
     assert_eq!(grouped, by_predicate(9 - 9 + 2 + 1, 1, 1, 5));
     assert!(
         proceeded("COUNT by predicate (directory)"),
-        "the per-predicate lane answered"
+        "the per-predicate lane answered: {:?}",
+        outcomes()
     );
 
     // A list in novelty: the lanes decline, and the generic plan counts it.
