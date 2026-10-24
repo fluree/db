@@ -271,7 +271,7 @@ fn lists_as_cells(dataset: &mut Dataset) {
             let this = cell();
             match open.insert(owner.clone(), this.clone()) {
                 Some(prev) if index != 0 => {
-                    added.push(Triple::new(prev, rest.clone(), this.clone()))
+                    added.push(Triple::new(prev, rest.clone(), this.clone()));
                 }
                 prev => {
                     if let Some(prev) = prev {
