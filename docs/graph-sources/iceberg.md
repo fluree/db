@@ -648,6 +648,12 @@ to the *same* subject IRI, and both classes remain queryable. (The "dedicated
 target" restriction under *Assumptions and limitations* applies only to
 latest-by-key mode, not to additive mode.)
 
+A Delta source read through its change data feed is the exception: in
+additive mode a deleted row's triples are removed, including any that another
+row or source also asserts, such as a shared class. Don't share a target's
+subjects between such a source and others whose triples must outlive its
+deletes. See [Delta → Materialization](delta.md#materialization).
+
 ### Change data capture: updates and deletes (latest-by-key)
 
 For a change-data-capture source — an append-only log where each change is a new

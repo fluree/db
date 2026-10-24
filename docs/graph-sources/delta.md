@@ -453,9 +453,13 @@ for the endpoints, templated targets and the shared state ledger.
 The first pass reads each table's latest version whole. Every later pass reads
 what changed since the version the last one applied, from the table's
 **change data feed**, so a table must have `delta.enableChangeDataFeed = true`
-for its updates and deletes to reach the target. Inserted rows and an update's
-new values assert their triples; deleted rows and an update's old values
-retract theirs. How a key's changes combine depends on the source's options:
+for its updates and deletes to reach the target. The feed is off by default.
+Without it, every pass after a change reads the table whole, so on a large
+table each such pass can reach `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` or the
+target's novelty ceiling, and logs the `warn` described below. Inserted rows
+and an update's new values assert their triples; deleted rows and an update's
+old values retract theirs. How a key's changes combine depends on the source's
+options:
 
 - **Additive** (the default): each triple takes its latest change in the
   window. An update replaces the values it changes and keeps the rest, a
