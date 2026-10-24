@@ -2100,7 +2100,18 @@ mod head_tests {
             .await
             .unwrap();
         let stale = fluree.load_bm25_manifest("search:main").await.unwrap();
+        // Over unchanged data a rebuild may write the very manifest it
+        // replaces, leaving the head where it was; a purge's rebuild leaves
+        // values out.
+        fluree
+            .graph("docs:main")
+            .transact()
+            .insert(&insert("gamma"))
+            .commit()
+            .await
+            .unwrap();
         let rebuilt = fluree.rebuild_full_text_index("search:main").await.unwrap();
+        assert_ne!(stale.loaded_from.as_ref(), Some(&rebuilt));
 
         let refused = fluree
             .publish_bm25_manifest("search:main", &stale, i64::MAX)
