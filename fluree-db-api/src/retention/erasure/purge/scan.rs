@@ -7,10 +7,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::commit::codec::read_commit;
 use fluree_db_core::{
-    load_commit_envelope_by_id, range, ContentId, ContentStore, FlakeValue, IndexType, RangeMatch,
-    RangeOptions, RangeTest,
+    load_commit_by_id, range, ContentId, ContentStore, FlakeValue, IndexType, RangeMatch,
+    RangeOptions, RangeTest, Sid,
 };
 use fluree_db_nameservice::NsRecord;
 use serde::{Deserialize, Serialize};
@@ -76,41 +75,46 @@ impl Fluree {
         for (record, store) in self.dropped_holders(&commits).await? {
             holders.push((record, store, false));
         }
-        let erased: HashSet<String> = plan
-            .commits
-            .iter()
-            .filter_map(|c| c.parse::<ContentId>().ok())
-            .map(|c| c.address_digest())
-            .collect();
-        let reachable = reachable_commits(&holders).await?;
+        // The IRIs the erased events name, which the subject dictionaries
+        // hold while anything uses them.
+        let mut iris: Vec<&Sid> = Vec::new();
+        for c in captured {
+            iris.push(&c.flake.s);
+            if let FlakeValue::Ref(o) = &c.flake.o {
+                iris.push(o);
+            }
+        }
+        iris.sort();
+        iris.dedup();
 
-        // The holders' commits and schedules, past the substitution.
-        let prefix = runtime.index.address_prefix();
-        let storage = self
-            .admin_storage()
-            .ok_or_else(|| ApiError::internal("a purge needs managed storage"))?;
+        // What survives in the holders' histories, an erased commit read as
+        // its replacement, whether or not its original's file is still
+        // stored. What no history reaches is the garbage collector's.
         let mut in_use: Vec<&FlakeValue> = Vec::new();
+        let mut iris_in_use: HashSet<&Sid> = HashSet::new();
         let mut facts_in_use: Vec<FactKey> = Vec::new();
-        let mut scheduled: Vec<(String, &Captured)> = Vec::new();
-        for (record, _, _) in &holders {
-            let folder = format!("{prefix}{}/", record.storage_namespace().branch_prefix());
-            for address in storage.list_prefix(&format!("{folder}commit/")).await? {
-                let Some(digest) = address
-                    .strip_prefix(&format!("{folder}commit/"))
-                    .and_then(|f| f.strip_suffix(".fcv2"))
-                else {
-                    continue;
-                };
-                // What no history reaches is the garbage collector's.
-                if erased.contains(digest) || !reachable.contains(digest) {
+        let mut seen = HashSet::new();
+        for (record, store, _) in &holders {
+            let mut next: Vec<ContentId> = record.commit_head_id.iter().cloned().collect();
+            while let Some(cid) = next.pop() {
+                if !seen.insert(cid.address_digest()) {
                     continue;
                 }
-                let Some(bytes) = runtime.index.read_raw(&address).await? else {
-                    continue;
-                };
-                let commit = read_commit(&bytes)
-                    .map_err(|e| ApiError::internal(format!("commit file {address}: {e}")))?;
+                let commit = load_commit_by_id(store.as_ref(), &cid).await?;
+                next.extend(commit.parents.iter().cloned());
                 for (_, flake) in commit.occurrences() {
+                    let named = [Some(&flake.s), Some(&flake.p), Some(&flake.dt)]
+                        .into_iter()
+                        .chain([flake.g.as_ref()])
+                        .chain([match &flake.o {
+                            FlakeValue::Ref(o) => Some(o),
+                            _ => None,
+                        }]);
+                    for sid in named.flatten() {
+                        if let Some(iri) = iris.iter().find(|i| **i == sid) {
+                            iris_in_use.insert(iri);
+                        }
+                    }
                     let Some(c) = captured.iter().find(|c| c.flake.o == flake.o) else {
                         continue;
                     };
@@ -125,6 +129,16 @@ impl Fluree {
                     }
                 }
             }
+        }
+
+        // The holders' schedules, past the substitution.
+        let prefix = runtime.index.address_prefix();
+        let storage = self
+            .admin_storage()
+            .ok_or_else(|| ApiError::internal("a purge needs managed storage"))?;
+        let mut scheduled: Vec<(String, &Captured)> = Vec::new();
+        for (record, _, _) in &holders {
+            let folder = format!("{prefix}{}/", record.storage_namespace().branch_prefix());
             for address in storage.list_prefix(&format!("{folder}retention/")).await? {
                 if !address.ends_with(".frs") {
                     continue;
@@ -216,6 +230,14 @@ impl Fluree {
                     }
                 }
             }
+            for iri in iris.iter().filter(|i| !iris_in_use.contains(*i)) {
+                let held = store
+                    .find_subject_id_by_parts(iri.namespace_code, &iri.name)
+                    .map_err(|e| ApiError::internal(format!("dictionary lookup: {e}")))?;
+                if held.is_some() {
+                    dictionary.insert(record.ledger_id.to_string());
+                }
+            }
         }
         Ok(PurgeScan {
             unreferenced: unreferenced.into_iter().collect(),
@@ -231,23 +253,4 @@ impl Fluree {
             in_use: in_use.len(),
         })
     }
-}
-
-/// The digests of the commits the holders' histories reach, through every
-/// parent of a merge.
-async fn reachable_commits(
-    holders: &[(NsRecord, Arc<dyn ContentStore>, bool)],
-) -> Result<HashSet<String>> {
-    let mut reachable = HashSet::new();
-    for (record, store, _) in holders {
-        let mut next: Vec<ContentId> = record.commit_head_id.iter().cloned().collect();
-        while let Some(cid) = next.pop() {
-            if !reachable.insert(cid.address_digest()) {
-                continue;
-            }
-            let envelope = load_commit_envelope_by_id(store.as_ref(), &cid).await?;
-            next.extend(envelope.parents);
-        }
-    }
-    Ok(reachable)
 }

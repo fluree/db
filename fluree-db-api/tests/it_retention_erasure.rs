@@ -1576,7 +1576,7 @@ async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
         .transact()
         .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
         .insert(&json!({"@context": ctx(), "@graph": [
-            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:alice", "ex:email": "a@secret", "ex:name": "Alice"},
             {"@id": "ex:bob", "ex:email": "b@kept"}
         ]}))
         .commit()
@@ -2250,6 +2250,94 @@ async fn the_worker_purges_a_published_erasure() {
     assert_eq!(
         files_holding(dir.path(), "a@secret"),
         Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A string the erased occurrence shares with one surviving in the same
+/// commit is in use there: the purge keeps it in the dictionary and
+/// completes. The erased occurrence's subject, used by nothing else, is
+/// gone from every file.
+#[tokio::test]
+async fn a_string_a_surviving_occurrence_shares_does_not_block_the_purge() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-shared").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:zephyr-ann", "ex:email": "shared@zephyr"},
+            {"@id": "ex:bob", "ex:email": "shared@zephyr"}
+        ]}),
+    )
+    .await;
+    publish_erasure(&fluree, &id, email("zephyr-ann", "shared@zephyr")).await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(dir.path(), "zephyr-ann"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        objects(&fluree, &id, "ex:bob", "ex:email").await,
+        vec![json!("shared@zephyr")]
+    );
+}
+
+/// Erase, index and publish `request` on `id`.
+async fn publish_erasure(fluree: &Fluree, id: &str, request: ErasureRequest) {
+    fluree
+        .erase_occurrences(id, request, None)
+        .await
+        .expect("erase");
+    reindex(fluree, id).await;
+    assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
+}
+
+/// An erased reference whose IRI nothing else uses leaves no trace of the
+/// IRI: not in the subject dictionary, which leaf by leaf erasure does not
+/// rewrite.
+#[tokio::test]
+async fn an_erased_references_iri_is_purged_from_the_dictionaries() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-iri").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice",
+               "ex:knows": {"@id": "ex:zephyr-contact"}}),
+    )
+    .await;
+    publish_erasure(
+        &fluree,
+        &id,
+        ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/knows".into(),
+                graph: None,
+                object: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(dir.path(), "zephyr-contact"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        objects(&fluree, &id, "ex:alice", "ex:name").await,
+        vec![json!("Alice")]
     );
 }
 

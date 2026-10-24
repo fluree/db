@@ -456,7 +456,9 @@ async fn erasing_leaf_by_leaf_reads_as_a_rebuild() {
         &fluree,
         id,
         json!({"@graph": [
-            {"@id": ex("alice"), ex("email"): "a@secret", ex("nick"): "ally", ex("age"): 41},
+            // Her name survives, so her IRI stays in use.
+            {"@id": ex("alice"), ex("email"): "a@secret", ex("nick"): "ally", ex("age"): 41,
+             ex("name"): "Alice"},
             {"@id": ex("bob"), ex("email"): "b@kept", ex("age"): 30}
         ]}),
     )
