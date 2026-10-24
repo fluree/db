@@ -213,6 +213,12 @@ pub struct CleanGarbageConfig {
 /// Result of garbage collection
 #[derive(Debug, Clone, Default)]
 pub struct CleanGarbageResult {
+    /// Versions left on the chain the pass walked: its length less
+    /// `indexes_cleaned`, the current version included. More than
+    /// `1 + max_old_indexes` means the pass stopped short of its target,
+    /// usually at the age guard, or failed to release a version. Versions
+    /// published while it ran are not counted.
+    pub retained: usize,
     /// Versions collected past `hard_max_old_indexes`, where the age guard was
     /// not applied. Non-zero means a query that was still reading one of them
     /// may have lost artifacts it needed.

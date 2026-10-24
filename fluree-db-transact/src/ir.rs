@@ -203,6 +203,13 @@ pub struct Txn {
     /// leave this empty.
     pub namespace_delta: std::collections::HashMap<u16, String>,
 
+    /// The transaction reads and writes lists as RDF does, as a SPARQL UPDATE
+    /// does: a list is its owner's edge to a head cell and a chain of
+    /// `rdf:first`/`rdf:rest` cells, not values of its property
+    /// (`fluree_db_query::list_view`). JSON-LD and Cypher writes keep
+    /// Fluree's view, where the members are the values.
+    pub rdf_list_view: bool,
+
     /// SPARQL graph-management directive (CLEAR/DROP/COPY/MOVE/ADD).
     ///
     /// When `Some`, this transaction retracts and/or re-homes whole graphs by
@@ -312,6 +319,7 @@ impl Txn {
             txn_meta: Vec::new(),
             write_graphs: BTreeSet::new(),
             namespace_delta: std::collections::HashMap::new(),
+            rdf_list_view: false,
             graph_mgmt: None,
             sync_graph: None,
         }
@@ -519,6 +527,11 @@ pub struct TripleTemplate {
     /// - `Some(i)`: list element at position `i`
     pub list_index: Option<i32>,
 
+    /// The list a member belongs to, unique among a transaction's insert
+    /// templates. A position names no list, so this is what tells two lists
+    /// on one subject and predicate apart (see [`crate::lists`]).
+    pub list_id: Option<u32>,
+
     /// The graph this template writes to.
     pub graph: TemplateGraph,
 }
@@ -532,6 +545,7 @@ impl TripleTemplate {
             object,
             dtc: None,
             list_index: None,
+            list_id: None,
             graph: TemplateGraph::Default,
         }
     }
@@ -545,6 +559,14 @@ impl TripleTemplate {
     /// Set the list index (for ordered collections / @list support)
     pub fn with_list_index(mut self, index: i32) -> Self {
         self.list_index = Some(index);
+        self
+    }
+
+    /// Make this template member `index` of list `list` (see
+    /// [`Self::list_id`]).
+    pub fn in_list(mut self, list: u32, index: i32) -> Self {
+        self.list_index = Some(index);
+        self.list_id = Some(list);
         self
     }
 
@@ -667,6 +689,7 @@ impl GraphScope {
         object: TemplateTerm,
         dtc: Option<DatatypeConstraint>,
         list_index: Option<i32>,
+        list_id: Option<u32>,
     ) {
         let anchor = match (&self.graph, &predicate) {
             (TemplateGraph::Default, _) => None,
@@ -684,6 +707,7 @@ impl GraphScope {
             object,
             dtc,
             list_index,
+            list_id,
             graph: self.graph.clone(),
         });
         if let (Some(reifier), Some(graph)) = (anchor_subject, anchor) {
@@ -696,6 +720,7 @@ impl GraphScope {
                 object: graph,
                 dtc: None,
                 list_index: None,
+                list_id: None,
                 graph: self.graph.clone(),
             });
         }

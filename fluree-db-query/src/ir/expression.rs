@@ -326,6 +326,57 @@ impl Expression {
             }
         }
     }
+
+    /// [`Self::for_each_embedded_patterns`], with each list given to `f` to
+    /// change.
+    pub fn for_each_embedded_patterns_mut(&mut self, f: &mut dyn FnMut(&mut Vec<Pattern>)) {
+        match self {
+            Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => {}
+            Expression::Call { args, .. } => {
+                for a in args {
+                    a.for_each_embedded_patterns_mut(f);
+                }
+            }
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.for_each_embedded_patterns_mut(f);
+                }
+            }
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.for_each_embedded_patterns_mut(f);
+                if let Some(x) = filter {
+                    x.for_each_embedded_patterns_mut(f);
+                }
+                if let Some(x) = map {
+                    x.for_each_embedded_patterns_mut(f);
+                }
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => {
+                init.for_each_embedded_patterns_mut(f);
+                list.for_each_embedded_patterns_mut(f);
+                body.for_each_embedded_patterns_mut(f);
+            }
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => {
+                list.for_each_embedded_patterns_mut(f);
+                predicate.for_each_embedded_patterns_mut(f);
+            }
+            Expression::Member { target, .. } => target.for_each_embedded_patterns_mut(f),
+            Expression::Exists { patterns, .. } => f(patterns),
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                f(patterns);
+                projection.for_each_embedded_patterns_mut(f);
+            }
+        }
+    }
 }
 
 // Manual PartialEq: Pattern doesn't implement PartialEq, so we can't derive.

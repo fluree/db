@@ -229,10 +229,11 @@ async fn list_ledger_hydrates_positions_across_base_and_novelty() {
             let ledger = fluree.ledger(ledger_id).await.unwrap();
 
             // Lifecycle over the base: retract `ex:base2`'s trailing "d"
-            // (a novelty retract of a base-indexed list row), then re-assert
+            // (a novelty retract of a base-indexed list row), then upsert
             // the whole list so "d" comes back at position 2 as a novelty
-            // assert. The merged base+overlay view must resolve that fact
-            // key to its newest op (live) when hydrating below.
+            // assert. (An insert would add a second list beside the stored
+            // one.) The merged base+overlay view must resolve that fact key
+            // to its newest op (live) when hydrating below.
             let retract_d = json!({
                 "@context": ctx(),
                 "where": [{"@id": "ex:base2", "ex:items": "d"}],
@@ -246,7 +247,7 @@ async fn list_ledger_hydrates_positions_across_base_and_novelty() {
             let ledger = fluree.ledger(ledger_id).await.unwrap();
             assert_eq!(list_values(&fluree, &ledger, "ex:base2").await, vec!["b", "b"]);
             let _ = fluree
-                .insert_with_opts(
+                .upsert_with_opts(
                     ledger,
                     &json!({"@context": ctx(), "@id": "ex:base2", "ex:items": {"@list": ["b", "b", "d"]}}),
                     TxnOpts::default(),

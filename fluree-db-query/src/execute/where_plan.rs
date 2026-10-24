@@ -107,6 +107,7 @@ pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
         Pattern::Subquery(sq) => pattern_tree_has_edge_annotation(&sq.patterns),
         Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
         Pattern::Triple(_)
+        | Pattern::ListView(_)
         | Pattern::PropertyPath(_)
         | Pattern::TermComponents(_)
         | Pattern::ShortestPath(_)
@@ -715,6 +716,12 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
+                Pattern::ListView(lv) => {
+                    for v in lv.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
                 Pattern::Values { vars: vs, .. } => {
                     for v in vs {
                         bump_count(counts, *v);
@@ -826,7 +833,20 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
-                _ => {}
+                // A variable one of these shares with a triple is a join
+                // variable like any other: missed, the triple stops emitting
+                // it and the join becomes a cartesian product.
+                Pattern::IndexSearch(_)
+                | Pattern::VectorSearch(_)
+                | Pattern::R2rml(_)
+                | Pattern::GeoSearch(_)
+                | Pattern::S2Search(_)
+                | Pattern::Service(_) => {
+                    for v in p.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
             }
         }
     }
@@ -1015,6 +1035,8 @@ pub struct InnerJoinBlock {
     pub binds: Vec<BindPattern>,
     /// FILTER patterns
     pub filters: Vec<FilterPattern>,
+    /// The triples a list view answers, among `triples`.
+    pub list_views: crate::list_view::BlockListViews,
 }
 
 #[derive(Default, Clone)]
@@ -1576,6 +1598,17 @@ fn build_single_pattern(
             // No chain context here: only a force-`On` override can fire the hash join.
             &HashJoinPlanner::new(None),
         )),
+        Pattern::ListView(lv) => Some(build_list_view_triple(
+            operator,
+            &lv.triple,
+            &lv.view,
+            &HashMap::new(),
+            None,
+            emit_mask_for_triple(&lv.triple, var_counts, protected_vars),
+            group_by,
+            planning,
+            &HashJoinPlanner::new(None),
+        )),
         _ => operator,
     }
 }
@@ -1810,6 +1843,8 @@ fn inline_chain(
 /// each logical call site and borrowing it is cheaper than threading seven
 /// individual references through every helper.
 pub(crate) struct TriplePlanContext<'a> {
+    /// The block's list-view triples (`build_list_view_triple`).
+    list_views: &'a crate::list_view::BlockListViews,
     required_where_vars: Option<&'a [VarId]>,
     var_counts: &'a HashMap<VarId, usize>,
     protected_vars: &'a HashSet<VarId>,
@@ -1901,10 +1936,14 @@ fn build_sequential_join_block(
         settled.unsettled = unsettled_vars(&triples[k + 1..], &folded[k + 1..], &guaranteed);
         let mut after = settled.clone();
         after.bound.extend(tp.produced_vars());
+        // A list-view triple's list triples join outside its scan, so nothing
+        // is evaluated inside the join: no fold, no inline FILTER or BIND.
+        // Pending ones apply above it, once their variables are bound.
+        let list_view = ctx.list_views.view_for(tp);
 
         // Later `?s <p> ?v . FILTER(range on ?v)` pairs answered as a semi-join
         // behind this step — see `RangeSemiJoinOperator`.
-        let folds = match base_vars.as_ref() {
+        let folds = match base_vars.as_ref().filter(|_| list_view.is_none()) {
             Some(base) => collect_range_semijoin_folds(
                 tp,
                 k,
@@ -1936,12 +1975,16 @@ fn build_sequential_join_block(
         // Build interleaved inline operators: eligible filters first, then binds
         // whose required vars are all available after this triple, interleaved
         // with the filters each bind unlocks.
-        let (inline_ops, remaining_binds, remaining_filters) = build_inline_ops(
-            pending_binds,
-            pending_filters,
-            after.clone(),
-            &pushdown.consumed_indices,
-        );
+        let (inline_ops, remaining_binds, remaining_filters) = if list_view.is_some() {
+            (Vec::new(), pending_binds, pending_filters)
+        } else {
+            build_inline_ops(
+                pending_binds,
+                pending_filters,
+                after.clone(),
+                &pushdown.consumed_indices,
+            )
+        };
         pending_binds = remaining_binds;
         pending_filters = remaining_filters;
 
@@ -2003,17 +2046,30 @@ fn build_sequential_join_block(
         });
 
         let emit = emit_mask_for_triple(tp, ctx.var_counts, ctx.protected_vars);
-        let op = build_scan_or_join(
-            operator,
-            tp,
-            &pushdown.object_bounds,
-            inline_ops,
-            join_live.as_deref(),
-            emit,
-            ctx.group_by,
-            ctx.planning,
-            &hash_planner,
-        );
+        let op = match list_view {
+            Some(view) => build_list_view_triple(
+                operator,
+                tp,
+                view,
+                &pushdown.object_bounds,
+                join_live.as_deref(),
+                emit,
+                ctx.group_by,
+                ctx.planning,
+                &hash_planner,
+            ),
+            None => build_scan_or_join(
+                operator,
+                tp,
+                &pushdown.object_bounds,
+                inline_ops,
+                join_live.as_deref(),
+                emit,
+                ctx.group_by,
+                ctx.planning,
+                &hash_planner,
+            ),
+        };
         let op: BoxedOperator = if folds.is_empty() {
             op
         } else {
@@ -2148,10 +2204,19 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
     let mut triples: Vec<TriplePattern> = Vec::new();
     let mut binds: Vec<BindPattern> = Vec::new();
     let mut filters: Vec<FilterPattern> = Vec::new();
+    let mut list_views = crate::list_view::BlockListViews::default();
     let mut bound_vars: HashSet<VarId> = HashSet::new();
 
     while i < patterns.len() {
         match &patterns[i] {
+            // Planned as its triple; its join hides list members and adds the
+            // list triples (`build_list_view_triple`).
+            Pattern::ListView(lv) => {
+                bound_vars.extend(lv.triple.produced_vars());
+                triples.push(lv.triple.clone());
+                list_views.push(lv);
+                i += 1;
+            }
             Pattern::Values { vars, rows } => {
                 // VALUES binds its vars immediately (join seed/constraint).
                 bound_vars.extend(vars.iter().copied());
@@ -2194,6 +2259,7 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
         triples,
         binds,
         filters,
+        list_views,
     }
 }
 
@@ -2746,7 +2812,10 @@ pub fn build_where_operators_seeded_with_needed(
     let mut i = 0;
     while i < patterns.len() {
         match &patterns[i] {
-            Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. } => {
+            Pattern::Triple(_)
+            | Pattern::ListView(_)
+            | Pattern::Values { .. }
+            | Pattern::Bind { .. } => {
                 let start = i;
                 for applied in &patterns[guaranteed_through..start] {
                     guaranteed.extend(must_bind_vars(applied, BindTargets::MayBeUnbound));
@@ -2803,6 +2872,7 @@ pub fn build_where_operators_seeded_with_needed(
                             });
                             triples.insert(0, driver);
                             let ctx = TriplePlanContext {
+                                list_views: &block.list_views,
                                 required_where_vars: augmented_rwv.as_deref(),
                                 var_counts: &var_counts,
                                 protected_vars: &protected_vars,
@@ -2860,6 +2930,7 @@ pub fn build_where_operators_seeded_with_needed(
                     let augmented_ref = augmented_rwv.as_deref();
 
                     let ctx = TriplePlanContext {
+                        list_views: &block.list_views,
                         required_where_vars: augmented_ref,
                         var_counts: &var_counts,
                         protected_vars: &protected_vars,
@@ -2888,8 +2959,25 @@ pub fn build_where_operators_seeded_with_needed(
                 // Push down range-safe filters into object bounds (when possible).
                 let filters_for_pushdown: Vec<Expression> =
                     pending_filters.iter().map(|f| f.expr.clone()).collect();
+                // A list-view triple's list triples bypass its scan, so a
+                // FILTER on its object stays a FILTER rather than a bound.
+                let list_view_objects: HashSet<VarId> = block
+                    .triples
+                    .iter()
+                    .filter(|tp| block.list_views.view_for(tp).is_some())
+                    .filter_map(|tp| tp.o.as_var())
+                    .collect();
+                let boundable: Vec<TriplePattern> = block
+                    .triples
+                    .iter()
+                    .filter(|tp| {
+                        tp.o.as_var()
+                            .is_none_or(|v| !list_view_objects.contains(&v))
+                    })
+                    .cloned()
+                    .collect();
                 let (object_bounds, consumed_indices) =
-                    extract_bounds_from_filters(&block.triples, &filters_for_pushdown);
+                    extract_bounds_from_filters(&boundable, &filters_for_pushdown);
                 let pushdown = FilterPushdown {
                     object_bounds,
                     consumed_indices,
@@ -3044,7 +3132,7 @@ pub fn build_where_operators_seeded_with_needed(
                     );
                 }
 
-                if property_join_plan.can_property_join {
+                if property_join_plan.can_property_join && block.list_views.is_empty() {
                     i = property_join_end;
                     let mut property_join_binds = pending_binds;
                     property_join_binds.extend(property_join_tail.binds);
@@ -3065,6 +3153,7 @@ pub fn build_where_operators_seeded_with_needed(
                     )?;
                 } else {
                     let ctx = TriplePlanContext {
+                        list_views: &block.list_views,
                         required_where_vars: augmented_ref,
                         var_counts: &var_counts,
                         protected_vars: &protected_vars,
@@ -3471,6 +3560,7 @@ fn make_first_scan(
     emit: EmitMask,
     group_by: &[VarId],
     planning: &PlanningContext,
+    hide_list_members: bool,
 ) -> BoxedOperator {
     let obj_bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
     let index_hint = scan_index_hint_for_triple(tp, group_by, &inline_ops);
@@ -3484,7 +3574,12 @@ fn make_first_scan(
     } else {
         emit
     };
-    Box::new(crate::dataset_operator::DatasetOperator::scan(
+    let scan = if hide_list_members {
+        crate::dataset_operator::DatasetOperator::scan_hiding_list_members
+    } else {
+        crate::dataset_operator::DatasetOperator::scan
+    };
+    Box::new(scan(
         tp.clone(),
         obj_bounds,
         inline_ops,
@@ -3517,8 +3612,93 @@ pub(crate) fn build_scan_or_join(
     planning: &PlanningContext,
     hash_planner: &HashJoinPlanner,
 ) -> BoxedOperator {
+    build_scan_or_join_with(
+        left,
+        tp,
+        object_bounds,
+        inline_ops,
+        downstream_vars,
+        emit,
+        group_by,
+        planning,
+        hash_planner,
+        false,
+    )
+}
+
+/// A list-view triple's scan or join (see [`crate::list_view`]): the operator
+/// [`build_scan_or_join`] picks, over the stored triples that are not list
+/// members, followed by the list triples matching the pattern. A tee under the
+/// join holds the input rows that may meet one.
+#[allow(clippy::too_many_arguments)]
+fn build_list_view_triple(
+    left: Option<BoxedOperator>,
+    tp: &TriplePattern,
+    view: &Arc<crate::list_view::ListView>,
+    object_bounds: &HashMap<VarId, ObjectBounds>,
+    downstream_vars: Option<&[VarId]>,
+    emit: EmitMask,
+    group_by: &[VarId],
+    planning: &PlanningContext,
+    hash_planner: &HashJoinPlanner,
+) -> BoxedOperator {
+    use crate::list_view::{HeldRows, ListAugmentOperator, ListTeeOperator};
+    let (left, held) = match left {
+        Some(left) => {
+            let held = HeldRows::default();
+            let tee: BoxedOperator = Box::new(ListTeeOperator::new(
+                left,
+                tp.clone(),
+                Arc::clone(view),
+                held.clone(),
+            ));
+            (Some(tee), Some(held))
+        }
+        None => (None, None),
+    };
+    let join = build_scan_or_join_with(
+        left,
+        tp,
+        object_bounds,
+        Vec::new(),
+        downstream_vars,
+        emit,
+        group_by,
+        planning,
+        hash_planner,
+        true,
+    );
+    Box::new(ListAugmentOperator::new(
+        join,
+        tp.clone(),
+        Arc::clone(view),
+        held,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_scan_or_join_with(
+    left: Option<BoxedOperator>,
+    tp: &TriplePattern,
+    object_bounds: &HashMap<VarId, ObjectBounds>,
+    inline_ops: Vec<InlineOperator>,
+    downstream_vars: Option<&[VarId]>,
+    emit: EmitMask,
+    group_by: &[VarId],
+    planning: &PlanningContext,
+    hash_planner: &HashJoinPlanner,
+    hide_list_members: bool,
+) -> BoxedOperator {
     match left {
-        None => make_first_scan(tp, object_bounds, inline_ops, emit, group_by, planning),
+        None => make_first_scan(
+            tp,
+            object_bounds,
+            inline_ops,
+            emit,
+            group_by,
+            planning,
+            hide_list_members,
+        ),
         Some(left) => {
             // Subsequent patterns: use NestedLoopJoinOperator with optional bounds pushdown
             let left_schema: Arc<[VarId]> = Arc::from(left.schema().to_vec().into_boxed_slice());
@@ -3534,7 +3714,7 @@ pub(crate) fn build_scan_or_join(
             // the build side is bounded AND the driving side is large enough
             // to amortize it; rows that do not fully ground the pattern keep
             // exact join semantics via a per-row fallback.
-            if bounds.is_none() && inline_ops.is_empty() {
+            if bounds.is_none() && inline_ops.is_empty() && !hide_list_members {
                 // The planner's running chain estimate — the same number the
                 // hash-join gate below is costed against and EXPLAIN reports as
                 // `driving-est` — with the operator's own estimate as the
@@ -3597,15 +3777,19 @@ pub(crate) fn build_scan_or_join(
             if let Some(d) = decision {
                 if d.chosen {
                     let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
-                    let probe: BoxedOperator =
-                        Box::new(crate::dataset_operator::DatasetOperator::scan(
-                            tp.clone(),
-                            None,
-                            Vec::new(),
-                            EmitMask::ALL,
-                            index_hint,
-                            planning.mode(),
-                        ));
+                    let scan = if hide_list_members {
+                        crate::dataset_operator::DatasetOperator::scan_hiding_list_members
+                    } else {
+                        crate::dataset_operator::DatasetOperator::scan
+                    };
+                    let probe: BoxedOperator = Box::new(scan(
+                        tp.clone(),
+                        None,
+                        Vec::new(),
+                        EmitMask::ALL,
+                        index_hint,
+                        planning.mode(),
+                    ));
                     return Box::new(
                         crate::hash_join::HashJoinOperator::new(
                             left,
@@ -3635,6 +3819,9 @@ pub(crate) fn build_scan_or_join(
             // A shape-eligible-but-rejected hash join attaches its reason; a
             // non-candidate (subject chain, bounds, etc.) attaches nothing.
             .with_hash_join_decision(decision);
+            if hide_list_members {
+                join = join.hiding_list_members();
+            }
             if let Some(goal) = planning.row_goal {
                 // This only sizes probe windows; it never truncates input.
                 join.set_row_budget(goal);
@@ -3831,17 +4018,30 @@ fn build_sequential_triple_chain(
         });
 
         let emit = emit_mask_for_triple(pattern, ctx.var_counts, ctx.protected_vars);
-        operator = Some(build_scan_or_join(
-            operator,
-            pattern,
-            object_bounds,
-            Vec::new(),
-            live_vars.as_deref(),
-            emit,
-            ctx.group_by,
-            ctx.planning,
-            &hash_planner,
-        ));
+        operator = Some(match ctx.list_views.view_for(pattern) {
+            Some(view) => build_list_view_triple(
+                operator,
+                pattern,
+                view,
+                object_bounds,
+                live_vars.as_deref(),
+                emit,
+                ctx.group_by,
+                ctx.planning,
+                &hash_planner,
+            ),
+            None => build_scan_or_join(
+                operator,
+                pattern,
+                object_bounds,
+                Vec::new(),
+                live_vars.as_deref(),
+                emit,
+                ctx.group_by,
+                ctx.planning,
+                &hash_planner,
+            ),
+        });
 
         // Retain the real VALUES join, including duplicates and wildcard cells.
         // Only move it past required triples, once ALL its variables are bound;
@@ -3960,7 +4160,7 @@ fn collect_range_semijoin_folds(
     let mut folds: Vec<RangeSemiJoinFold> = Vec::new();
     let mut subject: Option<VarId> = None;
     for (j, tj) in triples.iter().enumerate().skip(k + 1) {
-        if folded[j] || tj.dtc.is_some() || !tj.p_bound() {
+        if folded[j] || tj.dtc.is_some() || !tj.p_bound() || ctx.list_views.view_for(tj).is_some() {
             continue;
         }
         let (Ref::Var(s), Term::Var(v)) = (&tj.s, &tj.o) else {
@@ -4114,6 +4314,7 @@ pub fn build_triple_operators(
         && triples_for_exec.len() >= 2
         && property_join_analysis.eligible()
         && has_property_join_anchor
+        && ctx.list_views.is_empty()
     {
         // Use PropertyJoinOperator for multi-property patterns.
         //
@@ -4139,7 +4340,7 @@ pub fn build_triple_operators(
         return Ok(Box::new(pj));
     }
 
-    if existing.is_none() && object_bounds.is_empty() {
+    if existing.is_none() && object_bounds.is_empty() && ctx.list_views.is_empty() {
         if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, ctx.stats) {
             let fallback = build_sequential_triple_chain(
                 None,
@@ -4210,6 +4411,7 @@ mod tests {
             &needed,
         );
         let ctx = super::TriplePlanContext {
+            list_views: &crate::list_view::BlockListViews::default(),
             required_where_vars: None,
             var_counts: &counts,
             protected_vars: &protected,

@@ -874,16 +874,17 @@ impl GcPassContext {
             hard_max_old_indexes: self.config.gc_hard_max_old_indexes,
             ..Default::default()
         };
-        let Some(plan) = crate::gc::plan_garbage(store.as_ref(), root_id, &config).await? else {
-            return Ok(crate::gc::CleanGarbageResult::default());
-        };
+        let plan = crate::gc::plan_garbage(store.as_ref(), root_id, &config).await?;
+        if plan.is_empty() {
+            return Ok(plan.unreleased());
+        }
         let Some(_window) = open_release_window(gc, &self.maintenance, &self.tick, in_flight).await
         else {
             debug!(
                 ledger_id = %ledger_id,
                 "collector pass could not quiet the ledger; releasing nothing this pass"
             );
-            return Ok(crate::gc::CleanGarbageResult::default());
+            return Ok(plan.unreleased());
         };
         let siblings = self.sibling_candidates(gc, ledger_id).await;
         crate::gc::release_garbage_plan(

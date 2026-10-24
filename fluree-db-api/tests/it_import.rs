@@ -4038,3 +4038,74 @@ async fn import_trig_blocks_named_by_the_ledger_address() {
         .collect();
     assert_eq!(registered, ["http://example.org/g1"]);
 }
+
+/// Two lists on one property stay two lists through bulk import — in one
+/// chunk, and in two chunks parsed by different workers, which share the
+/// owners of the lists stored compactly.
+#[tokio::test]
+async fn import_keeps_two_lists_on_one_property_apart() {
+    use std::fmt::Write as _;
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let small = write_ttl(
+        data_dir.path(),
+        "small.ttl",
+        "@prefix ex: <http://example.org/> .\nex:s ex:p (1 2), (3 4) ; ex:q (1 2), (1 3) .\n",
+    );
+    fluree
+        .create("test/import-lists:main")
+        .import(&small)
+        .execute()
+        .await
+        .expect("import");
+    let ledger = fluree.ledger("test/import-lists:main").await.expect("load");
+    let lists = |p: &'static str| {
+        let ledger = &ledger;
+        async move {
+            support::stored_int_lists(
+                ledger,
+                "http://example.org/s",
+                &format!("http://example.org/{p}"),
+            )
+            .await
+        }
+    };
+    assert_eq!(lists("p").await, [[1, 2], [3, 4]]);
+    assert_eq!(lists("q").await, [[1, 2], [1, 3]]);
+
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\nex:s ex:p (1 2) .\n");
+    for i in 0..12_000 {
+        let _ = writeln!(
+            ttl,
+            "ex:filler{i} ex:description \"padding that puts the two lists in different import chunks\" ."
+        );
+    }
+    ttl.push_str("ex:s ex:p (3 4) .\n");
+    let big = write_ttl(data_dir.path(), "big.ttl", &ttl);
+    let result = fluree
+        .create("test/import-lists-chunks:main")
+        .import(&big)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("chunked import");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+    let ledger = fluree
+        .ledger("test/import-lists-chunks:main")
+        .await
+        .expect("load");
+    assert_eq!(
+        support::stored_int_lists(&ledger, "http://example.org/s", "http://example.org/p").await,
+        [[1, 2], [3, 4]]
+    );
+}

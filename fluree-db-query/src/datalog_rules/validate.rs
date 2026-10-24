@@ -237,6 +237,9 @@ fn walk_patterns(
             // Reads the ledger's own term dictionary.
             Pattern::TermComponents(_) => {}
             Pattern::R2rml(_) => return Err(non_local(rule, "an R2RML graph source")),
+            // Introduced just before planning a SPARQL request; a rule body
+            // never holds one.
+            Pattern::ListView(_) => {}
             Pattern::Service(_) => {
                 return Err(reject(
                     rule,

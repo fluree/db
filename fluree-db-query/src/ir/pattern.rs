@@ -362,6 +362,13 @@ pub enum Pattern {
     /// A basic triple pattern (subject, predicate, object)
     Triple(TriplePattern),
 
+    /// A triple pattern answered in SPARQL's view of RDF lists: its stored
+    /// triples that are not list members, and the list triples that match it
+    /// (see [`crate::list_view`]). Introduced by
+    /// [`crate::list_view::rewrite_patterns`] just before planning; no
+    /// lowering produces one.
+    ListView(crate::list_view::ListViewPattern),
+
     /// A filter expression to evaluate against each solution
     /// Positioned in where clause order for inline attachment
     Filter(Expression),
@@ -622,6 +629,7 @@ impl Pattern {
         };
         match self {
             Pattern::Triple(tp) => tp.substitute_var(old, new),
+            Pattern::ListView(lv) => lv.triple.substitute_var(old, new),
             Pattern::Filter(expr) => expr.substitute_var(old, new),
             Pattern::Bind { var, expr } => {
                 rename(var);
@@ -763,6 +771,7 @@ impl Pattern {
             }
             Pattern::PropertyPath(pp) => pp.referenced_vars(),
             Pattern::TermComponents(tc) => tc.referenced_vars(),
+            Pattern::ListView(lv) => lv.referenced_vars(),
             Pattern::ShortestPath(sp) => sp.referenced_vars(),
             Pattern::Subquery(sq) => sq.referenced_vars(),
             Pattern::IndexSearch(isp) => isp.referenced_vars(),
@@ -821,6 +830,7 @@ impl Pattern {
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
             Pattern::PropertyPath(pp) => pp.produced_vars(),
             Pattern::TermComponents(tc) => tc.produced_vars(),
+            Pattern::ListView(lv) => lv.produced_vars(),
             Pattern::ShortestPath(sp) => sp.produced_vars(),
             Pattern::Subquery(sq) => sq.produced_vars(),
             Pattern::IndexSearch(isp) => isp.produced_vars(),

@@ -207,10 +207,15 @@ async fn run_query(
     view: &fluree_db_api::GraphDb,
     query: &str,
 ) -> Vec<serde_json::Value> {
-    let result = fluree
-        .query(view, QueryInput::Sparql(query))
-        .await
-        .expect("query");
+    run_input(fluree, view, &QueryInput::Sparql(query)).await
+}
+
+async fn run_input(
+    fluree: &fluree_db_api::Fluree,
+    view: &fluree_db_api::GraphDb,
+    query: &QueryInput<'_>,
+) -> Vec<serde_json::Value> {
+    let result = fluree.query(view, *query).await.expect("query");
     let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
     normalize_rows(&jsonld)
 }
@@ -523,13 +528,30 @@ async fn batched_object_join_merges_novelty() {
         .await
         .expect("novelty asserts");
 
-    // (name, query, expected rows, must route through the batched-object lane)
-    let queries: &[(&str, &str, usize, bool)] = &[
+    // (name, query, expected rows, must route through the batched-object lane).
+    // The `@list` cases are JSON-LD queries, which read list entries as
+    // values; SPARQL reads a list's head and cells.
+    let list_probe = json!({
+        "@context": ctx(),
+        "select": ["?x"],
+        "values": ["?b", [{"@id": "ex:bob"}, {"@id": "ex:dave"}]],
+        "where": {"@id": "?x", "ex:authors": "?b"},
+        "orderBy": ["?x"]
+    });
+    let list_const = json!({
+        "@context": ctx(),
+        "select": ["?x"],
+        "where": {"@id": "?x", "ex:authors": {"@id": "ex:bob"}},
+        "orderBy": ["?x"]
+    });
+    let queries: &[(&str, QueryInput<'_>, usize, bool)] = &[
         (
             "object-probe-mixed",
-            r"PREFIX ex: <http://example.org/ns/>
+            QueryInput::Sparql(
+                r"PREFIX ex: <http://example.org/ns/>
               SELECT ?b ?x WHERE { ex:alice ex:knows ?b . ?x ex:author ?b }
               ORDER BY ?b ?x",
+            ),
             2, // (bob, b3 injected) + (grace novelty-only, b4 injected);
             // b2 retracted, b1/d1 authors not known by alice
             true,
@@ -540,9 +562,7 @@ async fn batched_object_join_merges_novelty() {
             // object position by the planner (`inline_singleton_values_objects`)
             // and takes the plain bound-object scan instead of this lane.
             // `ex:dave` has no `ex:authors` edge, so the answer is unchanged.
-            r"PREFIX ex: <http://example.org/ns/>
-              SELECT ?x WHERE { VALUES ?b { ex:bob ex:dave } ?x ex:authors ?b }
-              ORDER BY ?x",
+            QueryInput::from(&list_probe),
             1, // exactly ONE of the two o_i entries is retracted: the fate
             // check must discriminate the entries by o_i (a default-read o_i
             // would either resurrect both or drop both)
@@ -552,9 +572,7 @@ async fn batched_object_join_merges_novelty() {
             // The folded form of the same `@list` retraction, which is what a
             // one-row VALUES now plans as. Same answer, different lane.
             "object-const-list-retract",
-            r"PREFIX ex: <http://example.org/ns/>
-              SELECT ?x WHERE { ?x ex:authors ex:bob }
-              ORDER BY ?x",
+            QueryInput::from(&list_const),
             1,
             false,
         ),
@@ -564,7 +582,7 @@ async fn batched_object_join_merges_novelty() {
     let mut novelty_results = Vec::new();
     for (name, query, expected_len, expect_lane) in queries {
         let (spans, guard) = span_capture::init_test_tracing();
-        let rows = run_query(&fluree, &view, query).await;
+        let rows = run_input(&fluree, &view, query).await;
         drop(guard);
         assert_eq!(
             rows.len(),
@@ -591,7 +609,7 @@ async fn batched_object_join_merges_novelty() {
         .expect("reindex ground truth");
     let view = fluree.db(ledger_id).await.expect("indexed view");
     for ((name, query, _, _), novelty_rows) in queries.iter().zip(&novelty_results) {
-        let indexed_rows = run_query(&fluree, &view, query).await;
+        let indexed_rows = run_input(&fluree, &view, query).await;
         assert_eq!(
             &indexed_rows, novelty_rows,
             "{name}: novelty-merged object join != reindexed ground truth"

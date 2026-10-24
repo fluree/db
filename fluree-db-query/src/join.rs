@@ -378,8 +378,14 @@ fn make_right_scan(
     index_hint: Option<IndexType>,
     _ctx: &ExecutionContext<'_>,
     mode: crate::temporal_mode::TemporalMode,
+    hide_list_members: bool,
 ) -> Box<dyn Operator> {
-    Box::new(crate::dataset_operator::DatasetOperator::scan(
+    let scan = if hide_list_members {
+        crate::dataset_operator::DatasetOperator::scan_hiding_list_members
+    } else {
+        crate::dataset_operator::DatasetOperator::scan
+    };
+    Box::new(scan(
         pattern,
         object_bounds,
         inline_ops,
@@ -805,6 +811,10 @@ pub struct NestedLoopJoinOperator {
     object_bounds: Option<ObjectBounds>,
     wildcard_direction: Option<WildcardDirection>,
     wildcard_stream: Option<wildcard::WildcardJoin>,
+    /// Scan only the right pattern's rows that are not list members (see
+    /// [`crate::binary_scan::BinaryScanOperator::hiding_list_members`]); the
+    /// batched lanes, which read leaflets directly, are off.
+    hide_list_members: bool,
     /// Whether this join is eligible for batched subject join
     batched_eligible: bool,
     /// Whether this join is eligible for batched object join
@@ -1080,6 +1090,7 @@ impl NestedLoopJoinOperator {
             batched_eligible,
             batched_object_eligible,
             batched_exists_eligible,
+            hide_list_members: false,
             subject_left_col,
             object_left_col,
             batched_predicate,
@@ -1100,6 +1111,17 @@ impl NestedLoopJoinOperator {
             mode,
             hj_decision: None,
         }
+    }
+
+    /// Join only the right pattern's rows that are not list members (see
+    /// [`Self::hide_list_members`]).
+    pub fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self.batched_eligible = false;
+        self.batched_object_eligible = false;
+        self.batched_exists_eligible = false;
+        self.wildcard_direction = None;
+        self
     }
 
     /// Trim output to only the specified downstream variables.
@@ -1682,6 +1704,7 @@ impl Operator for NestedLoopJoinOperator {
                         self.right_index_hint,
                         ctx,
                         self.mode,
+                        self.hide_list_members,
                     );
                     right_scan.open(ctx).await?;
                     self.active_right_scan = Some(right_scan);
@@ -1721,6 +1744,7 @@ impl Operator for NestedLoopJoinOperator {
                     self.right_index_hint,
                     ctx,
                     self.mode,
+                    self.hide_list_members,
                 );
                 right_scan.open(ctx).await?;
                 self.active_right_scan = Some(right_scan);
@@ -1752,6 +1776,7 @@ impl Operator for NestedLoopJoinOperator {
                     self.right_index_hint,
                     ctx,
                     self.mode,
+                    self.hide_list_members,
                 );
                 right.open(ctx).await?;
                 let count = crate::operator::count_operator(right.as_mut(), ctx).await;

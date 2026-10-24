@@ -109,6 +109,10 @@ mod inner {
         ///
         /// Only ever set to `true`; the caller starts it `false` per import.
         pub saw_list_meta: Arc<std::sync::atomic::AtomicBool>,
+        /// The owners whose list some chunk has stored compactly, so a
+        /// second list on one property, in any chunk, is stored as a chain
+        /// (see [`crate::lists`]).
+        pub list_owners: crate::lists::ClaimedOwners,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish`] —
@@ -198,6 +202,8 @@ mod inner {
         saw_list_meta: bool,
         /// The shared sticky bit this chunk folds into at finish.
         saw_list_meta_shared: Arc<std::sync::atomic::AtomicBool>,
+        /// `SpoolConfig::list_owners`.
+        list_owners: crate::lists::ClaimedOwners,
     }
 
     impl SpoolContext {
@@ -233,6 +239,7 @@ mod inner {
                 g_id,
                 saw_list_meta: false,
                 saw_list_meta_shared: Arc::clone(&config.saw_list_meta),
+                list_owners: Arc::clone(&config.list_owners),
             })
         }
 
@@ -802,6 +809,15 @@ mod inner {
         prefix_map: HashMap<String, String>,
         /// Optional spool context for Tier 2 parallel pipeline.
         spool_ctx: Option<SpoolContext>,
+        /// Lists in the order begun: their members, compact, and the label
+        /// their chain's cells would be minted under. Written when the chunk
+        /// ends ([`Self::into_parts`]).
+        lists: Vec<(Vec<Flake>, String)>,
+        /// The list each subject and predicate is adding items to.
+        open_lists: HashMap<(Sid, Sid), usize>,
+        /// The owners whose list another chunk of the import has stored
+        /// compactly, when not the spool context's.
+        list_owners: Option<crate::lists::ClaimedOwners>,
         /// Each reifier's `f:reifies*` slots seen so far, when its triple
         /// arrives as slots (see [`Self::absorb_slot`]).
         pending_links: HashMap<Sid, PendingLink>,
@@ -843,6 +859,9 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                lists: Vec::new(),
+                open_lists: HashMap::new(),
+                list_owners: None,
                 pending_links: HashMap::new(),
             })
         }
@@ -867,6 +886,9 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                lists: Vec::new(),
+                open_lists: HashMap::new(),
+                list_owners: None,
                 pending_links: HashMap::new(),
             })
         }
@@ -907,10 +929,32 @@ mod inner {
             ),
             CommitCodecError,
         > {
-            if let Some(err) = self.encode_error {
+            let mut sink = self;
+            let lists: Vec<_> = std::mem::take(&mut sink.lists)
+                .into_iter()
+                .map(|(members, cells)| crate::lists::PendingList::new(members, cells))
+                .collect();
+            if !lists.is_empty() {
+                let owners = sink
+                    .list_owners
+                    .clone()
+                    .or_else(|| sink.spool_ctx.as_ref().map(|c| Arc::clone(&c.list_owners)))
+                    .unwrap_or_default();
+                for flake in crate::lists::store_lists_claiming(lists, &owners) {
+                    sink.write_flake(&flake);
+                }
+            }
+            if let Some(err) = sink.encode_error {
                 return Err(err);
             }
-            Ok((self.writer, self.prefix_map, self.spool_ctx))
+            Ok((sink.writer, sink.prefix_map, sink.spool_ctx))
+        }
+
+        /// Share `owners` — the owners whose list another chunk of this
+        /// import has stored compactly — with this chunk. A spooled chunk
+        /// shares its spool config's.
+        pub fn set_list_owners(&mut self, owners: crate::lists::ClaimedOwners) {
+            self.list_owners = Some(owners);
         }
 
         // -- helpers ---------------------------------------------------------
@@ -998,16 +1042,33 @@ mod inner {
                 return;
             }
 
-            let flake = Flake::new(
-                s.clone(),
-                p.clone(),
-                o.clone(),
-                dt.clone(),
-                self.t,
-                true,
-                meta,
-            );
-            if let Err(e) = self.writer.push_flake(&flake) {
+            let flake = Flake::new(s, p, o, dt, self.t, true, meta);
+            if list_index.is_none() {
+                self.write_flake(&flake);
+                return;
+            }
+            let owner = (flake.s.clone(), flake.p.clone());
+            let list = match self.open_lists.get(&owner) {
+                Some(&list) if list_index != Some(0) => list,
+                _ => {
+                    let cells = format!(
+                        "{}--l{}-{}-",
+                        self.skolem_base,
+                        self.sub_chunk,
+                        self.lists.len()
+                    );
+                    self.lists.push((Vec::new(), cells));
+                    let list = self.lists.len() - 1;
+                    self.open_lists.insert(owner, list);
+                    list
+                }
+            };
+            self.lists[list].0.push(flake);
+        }
+
+        /// Write `flake` to the commit, and to the spool once encoded.
+        fn write_flake(&mut self, flake: &Flake) {
+            if let Err(e) = self.writer.push_flake(flake) {
                 if self.encode_error.is_none() {
                     tracing::error!("ImportSink: flake encode failed: {}", e);
                     self.encode_error = Some(e);
@@ -1017,20 +1078,21 @@ mod inner {
 
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
-                if let FlakeValue::TripleTerm(term) = &o {
-                    if let Err(e) = ctx.write_term_record(&s, Some(&p), term, self.t) {
+                if let FlakeValue::TripleTerm(term) = &flake.o {
+                    if let Err(e) = ctx.write_term_record(&flake.s, Some(&flake.p), term, flake.t) {
                         self.encode_error.get_or_insert(e);
                     }
                     return;
                 }
+                let meta = flake.m.as_ref();
                 let written = ctx.write_record(FlakeRecord {
-                    s: &s,
-                    p: &p,
-                    o: &o,
-                    dt: &dt,
-                    lang: lang.as_deref(),
-                    list_index,
-                    t: self.t,
+                    s: &flake.s,
+                    p: &flake.p,
+                    o: &flake.o,
+                    dt: &flake.dt,
+                    lang: meta.and_then(|m| m.lang.as_deref()),
+                    list_index: meta.and_then(|m| m.i),
+                    t: flake.t,
                 });
                 if let Err(e) = written {
                     self.encode_error.get_or_insert(e);
@@ -1321,6 +1383,7 @@ mod inner {
                 ns_alloc: Arc::new(SharedNamespaceAllocator::from_registry(ns)),
                 decimal_encoding: fluree_db_core::DecimalEncoding::InlineWhenFits,
                 saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                list_owners: Default::default(),
             }
         }
 

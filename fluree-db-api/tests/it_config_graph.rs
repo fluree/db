@@ -2662,6 +2662,59 @@ async fn policy_defaults_apply() {
     );
 }
 
+/// `f:policyClass` written as an RDF list reads its members, whether the list
+/// is stored compactly (`( … )`) or as the `rdf:first`/`rdf:rest` triples it
+/// stands for — a chain head used to be read as one blank-node "class".
+#[tokio::test]
+async fn policy_class_list_reads_its_members_in_either_shape() {
+    for (name, list) in [
+        ("collection", "( ex:A ex:B )".to_string()),
+        (
+            "chain",
+            "_:c0 . _:c0 rdf:first ex:A ; rdf:rest _:c1 . _:c1 rdf:first ex:B ; rdf:rest rdf:nil"
+                .to_string(),
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/config-policy-class-{name}:main");
+        let ledger = genesis_ledger(&fluree, &ledger_id).await;
+        let config_iri = config_graph_iri(&ledger_id);
+        let trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex: <http://example.org/ns/> .
+
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:policyDefaults <urn:config:policy> .
+                <urn:config:policy> f:policyClass {list} .
+            }}
+        "
+        );
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&trig)
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{name}: config write: {e}"));
+
+        let view = fluree.db(&ledger_id).await.unwrap();
+        let config = view.ledger_config().expect("config should be attached");
+        let mut classes = config
+            .policy
+            .as_ref()
+            .and_then(|p| p.policy_class.clone())
+            .unwrap_or_default();
+        classes.sort();
+        assert_eq!(
+            classes,
+            ["http://example.org/ns/A", "http://example.org/ns/B"],
+            "{name}"
+        );
+    }
+}
+
 // =============================================================================
 // Test 5: reasoning defaults apply (RDFS subProperty)
 // =============================================================================

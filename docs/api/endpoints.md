@@ -3550,6 +3550,8 @@ POST {api_base_url}/delta/map
 | `oauth2_token_url`, `oauth2_scope` | string | Default to the workspace's own token endpoint and `all-apis` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+| `delete_column`, `delete_values` | string, array | Materialization: the column and values that mark a row as deleted, as on `/iceberg/map`. With either this or `order_by`, a key's latest change replaces its subject whole; a change feed's deletes retract in either mode. See [Delta → Materialization](../graph-sources/delta.md#materialization). |
+| `order_by` | string | Materialization: an integer, date or timestamp column that orders one key's rows within a table version, and the rows the table still holds for a key a delete touched |
 
 **Response:**
 
@@ -3698,7 +3700,7 @@ POST {api_base_url}/sql/map
 
 ### POST {api_base_url}/iceberg/materialize
 
-Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
+Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). The source may be an Iceberg or a Delta graph source; a Delta source is read through its change data feed (see [Delta → Materialization](../graph-sources/delta.md#materialization)). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
 
 **Request Body:**
 
@@ -3736,7 +3738,7 @@ The source is read with the same credentials a query of it would use, on full an
 
 ### POST {api_base_url}/iceberg/track
 
-Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. Admin-protected; `iceberg` feature only.
+Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. The source may be an Iceberg or a Delta graph source. Admin-protected; `iceberg` feature only.
 
 **Request Body:**
 
