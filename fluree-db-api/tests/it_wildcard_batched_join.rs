@@ -95,8 +95,7 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
         "@graph": [
             {"@id":"ex:a", "ex:name":"A",
              "ex:edge":{"@id":"ex:b", "@annotation":{"@id":"ex:ann", "ex:source":"paper"}},
-             "ex:label":[{"@value":"bonjour", "@language":"fr"}, {"@value":"hello", "@language":"en"}],
-             "ex:items":{"@list":[10,10,20]}},
+             "ex:label":[{"@value":"bonjour", "@language":"fr"}, {"@value":"hello", "@language":"en"}]},
             {"@id":"ex:b", "ex:name":"B", "ex:owner":{"@id":"ex:a"}},
             {"@id":"ex:c", "ex:edge":{"@id":"ex:a"}, "ex:other":{"@id":"ex:a"}}
         ]
@@ -108,17 +107,9 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
     let ledger = fluree.ledger(alias).await.unwrap();
     use Routing::*;
     let outgoing = "SELECT ?s ?p ?o WHERE { VALUES ?s { ex:a ex:a ex:b } ?s ?p ?o }";
-    let rows = check(&fluree, &ledger, outgoing, 16, MustFire).await;
-    // Two equal list values at different indices must survive, for each of
-    // the two duplicate driving rows. Language tags must survive too.
+    let rows = check(&fluree, &ledger, outgoing, 10, MustFire).await;
+    // Language tags must survive, for each of the two duplicate driving rows.
     let bindings = rows["results"]["bindings"].as_array().unwrap();
-    assert_eq!(
-        bindings
-            .iter()
-            .filter(|r| r["p"]["value"] == "http://example.org/items" && r["o"]["value"] == "10")
-            .count(),
-        4
-    );
     assert_eq!(
         bindings
             .iter()
@@ -146,7 +137,7 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
         &fluree,
         &ledger,
         "SELECT ?s WHERE { VALUES ?s { ex:a ex:a ex:b } ?s ?p ?o }",
-        16,
+        10,
         MustFire,
     )
     .await;
@@ -204,7 +195,7 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
         &fluree,
         &ledger,
         "SELECT ?s ?p ?o WHERE { VALUES ?s { ex:a UNDEF ex:b } ?s ?p ?o }",
-        22, // the UNDEF row's full scan includes the annotation's rdf:reifies link
+        16, // the UNDEF row's full scan includes the annotation's rdf:reifies link
         MustFire,
     )
     .await;
@@ -214,12 +205,12 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
         "SELECT ?p ?o WHERE {{ VALUES ?s {{ {} }} ?s ?p ?o }}",
         "ex:a ".repeat(2100)
     );
-    check(&fluree, &ledger, &many, 14700, MustFire).await;
+    check(&fluree, &ledger, &many, 8400, MustFire).await;
     check(
         &fluree,
         &ledger,
         "SELECT ?x WHERE { VALUES ?s { ex:a ex:b } ?s ?p ?o BIND(CONCAT(STR(?s), STR(?p)) AS ?x) }",
-        9,
+        6,
         MustFire,
     )
     .await;
@@ -336,7 +327,7 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
         .unwrap()
         .to_sparql_json(&ledger.snapshot)
         .unwrap();
-    assert_eq!(normalized(&hidden).len(), 13);
+    assert_eq!(normalized(&hidden).len(), 7);
     assert!(!spans.has_event(EVENT), "restricted policy must decline");
     assert!(hidden["results"]["bindings"]
         .as_array()
@@ -401,7 +392,7 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
         )
         .await
         .unwrap();
-    let rows = check(&fluree, &receipt.ledger, outgoing, 16, MustNotFire).await;
+    let rows = check(&fluree, &receipt.ledger, outgoing, 10, MustNotFire).await;
     assert!(rows["results"]["bindings"]
         .as_array()
         .unwrap()
@@ -442,8 +433,80 @@ async fn wildcard_joins_preserve_facts_multiplicity_and_fallbacks() {
         .unwrap()
         .to_sparql_json(&head.snapshot)
         .unwrap();
-    assert!(normalized(&history).len() > 16);
+    assert!(normalized(&history).len() > normalized(&twin).len());
     assert!(!spans.has_event(EVENT), "history range must decline");
+}
+
+/// A list's members are values of their predicate in JSON-LD, so the lane
+/// keeps two equal members at different positions for each duplicate driving
+/// row. SPARQL reads a list as its head and cells: on a ledger holding one, a
+/// variable predicate reads through the list view, which the batched lanes
+/// do not take yet (#2173).
+#[tokio::test(flavor = "current_thread")]
+async fn wildcard_joins_keep_list_members_in_json_ld() {
+    assert!(std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none());
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let alias = "wildcard/lists:main";
+    let ledger = fluree.create_ledger(alias).await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context":{"ex":"http://example.org/"},
+                "@id":"ex:a", "ex:name":"A", "ex:items":{"@list":[10,10,20]}}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .reindex(alias, ReindexOptions::default())
+        .await
+        .unwrap();
+    let ledger = fluree.ledger(alias).await.unwrap();
+    let query = json!({"@context":{"ex":"http://example.org/"},
+        "select":["?s","?p","?o"], "where":[{"@id":"?s", "?p":"?o"}],
+        "values":["?s", [
+            {"@value":"ex:a","@type":"@id"},
+            {"@value":"ex:a","@type":"@id"}]]});
+    let (spans, _guard) = support::span_capture::init_test_tracing();
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_sparql_json(&ledger.snapshot)
+        .unwrap();
+    assert!(spans.has_event(EVENT), "JSON-LD must engage the lane");
+    drop(_guard);
+    let bindings = rows["results"]["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 8);
+    assert_eq!(
+        bindings
+            .iter()
+            .filter(|r| r["p"]["value"] == "http://example.org/items" && r["o"]["value"] == "10")
+            .count(),
+        4
+    );
+    set_fast_paths_disabled(true);
+    let generic = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_sparql_json(&ledger.snapshot)
+        .unwrap();
+    set_fast_paths_disabled(false);
+    assert_eq!(normalized(&rows), normalized(&generic));
+
+    // SPARQL: the name and the list's head, for each driving row.
+    use Routing::*;
+    check(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?p ?o WHERE { VALUES ?s { ex:a ex:a } ?s ?p ?o }",
+        4,
+        MustNotFire,
+    )
+    .await;
 }
 
 /// Reproducible local A/B probe benchmark. Run separately in dev-fast/release;
