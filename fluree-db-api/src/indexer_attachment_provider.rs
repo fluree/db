@@ -456,8 +456,8 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
             // `f:reifiesSubject` row (the decoder returns `Missing`
             // otherwise), so `group_t` is the bundle's assertion time —
             // trustworthy on the arena's `t` axis without a separate
-            // f:reifiesSubject lookup. The arena builder applies
-            // (t, op) latest-wins across the emitted events.
+            // f:reifiesSubject lookup. The arena builder resolves the
+            // emitted events by `op_order` (`fluree_db_core::same_t`).
             let Ok(edge_key) = EdgeKey::from_reifies_facts(&bundle) else {
                 continue;
             };

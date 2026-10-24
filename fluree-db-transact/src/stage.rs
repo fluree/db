@@ -1395,7 +1395,7 @@ fn route_var_graphs(
 /// and the object's identity in the destination ([`FactIdentity`]). A fact
 /// the source and destination share, whatever term each holds it under, is
 /// left in place, so the destination's retraction and the source's
-/// assertion never land at one `t`, where storage keeps the retraction.
+/// assertion never land at one `t`, which a commit may not hold.
 type FlakeContent = (Sid, Sid, FactTerm);
 
 /// Default for [`whole_graph_scan_limit`]: ~2 GB peak at the accumulator's
