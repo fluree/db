@@ -1087,7 +1087,7 @@ impl IndexRoot {
 
         // Predicate SIDs
         let pred_count = read_u32_at(data, &mut pos)? as usize;
-        let mut predicate_sids = Vec::with_capacity(pred_count);
+        let mut predicate_sids = Vec::with_capacity(pred_count.min(data.len()));
         for _ in 0..pred_count {
             let ns_code = read_u16_at(data, &mut pos)?;
             let suffix = read_string(data, &mut pos)?;
@@ -1115,7 +1115,7 @@ impl IndexRoot {
 
         // Per-graph specialty arenas
         let arena_count = read_graph_width(data, &mut pos, wide)? as usize;
-        let mut graph_arenas = Vec::with_capacity(arena_count);
+        let mut graph_arenas = Vec::with_capacity(arena_count.min(data.len()));
         for _ in 0..arena_count {
             graph_arenas.push(read_graph_arenas_v5(data, &mut pos, wide)?);
         }
@@ -1172,7 +1172,7 @@ impl IndexRoot {
             let order = RunSortOrder::from_wire_id(order_id)
                 .ok_or_else(|| io_err(&format!("root v6: invalid order_id {order_id}")))?;
             let leaf_count = read_u32_at(data, &mut pos)? as usize;
-            let mut leaves = Vec::with_capacity(leaf_count);
+            let mut leaves = Vec::with_capacity(leaf_count.min(data.len()));
             for _ in 0..leaf_count {
                 let first_key = read_run_record_v2(data, &mut pos)?;
                 let last_key = read_run_record_v2(data, &mut pos)?;
@@ -1197,7 +1197,7 @@ impl IndexRoot {
 
         // Named graph routing
         let named_count = read_graph_width(data, &mut pos, wide)? as usize;
-        let mut named_graphs = Vec::with_capacity(named_count);
+        let mut named_graphs = Vec::with_capacity(named_count.min(data.len()));
         for _ in 0..named_count {
             let g_id = read_graph_width(data, &mut pos, wide)?;
             let ng_order_count = read_u8_at(data, &mut pos)? as usize;
