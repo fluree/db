@@ -1730,6 +1730,20 @@ mod tests {
     }
 
     #[test]
+    fn a_ttl_default_takes_a_typed_duration() {
+        let mut ns = NamespaceRegistry::new();
+        let result = extract_trig_txn_meta(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+             <http://example.org/s> <http://example.org/p> \"o\" .
+             GRAPH <#txn-meta> { <fluree:commit:this> f:ttl \"PT45S\"^^xsd:dayTimeDuration . }",
+            &mut ns,
+        )
+        .unwrap();
+        assert!(matches!(result.txn_meta[0].value, TxnMetaValue::Long(45)));
+    }
+
+    #[test]
     fn graph_block_check_matches_the_keyword_in_any_case() {
         for trig in [
             "<http://example.org/g> { <s> <p> <o> . }",

@@ -117,19 +117,20 @@ enum Lifetime {
 }
 
 impl Lifetime {
-    fn of_value(o: &FlakeValue) -> Option<Self> {
-        match o {
-            FlakeValue::Long(n) => u64::try_from(*n).ok().map(Lifetime::Seconds),
-            FlakeValue::DateTime(dt) => Some(Lifetime::At(dt.epoch_millis())),
+    /// The lifetime an `f:ttl` or `f:expiresAt` instruction states.
+    fn of_instruction(flake: &Flake) -> Option<Self> {
+        match (&*flake.p.name, &flake.o) {
+            (db::TTL, o) => fluree_db_transact::ttl_input::ttl_seconds_from_value(o)
+                .ok()
+                .map(Lifetime::Seconds),
+            (_, FlakeValue::DateTime(dt)) => Some(Lifetime::At(dt.epoch_millis())),
             _ => None,
         }
     }
 
     fn of_txn_meta(entry: &TxnMetaEntry) -> Option<Self> {
         match (&*entry.predicate_name, &entry.value) {
-            (db::TTL_SECONDS, TxnMetaValue::Long(n)) => {
-                u64::try_from(*n).ok().map(Lifetime::Seconds)
-            }
+            (db::TTL, TxnMetaValue::Long(n)) => u64::try_from(*n).ok().map(Lifetime::Seconds),
             (
                 db::EXPIRES_AT,
                 TxnMetaValue::TypedLiteral { value, .. } | TxnMetaValue::String(value),
@@ -174,7 +175,7 @@ pub(crate) fn carries_retention_input(txn_meta: &[TxnMetaEntry]) -> bool {
         e.predicate_ns == FLUREE_DB
             && matches!(
                 &*e.predicate_name,
-                db::RETENTION_CONTROL | db::TTL_SECONDS | db::EXPIRES_AT
+                db::RETENTION_CONTROL | db::TTL | db::EXPIRES_AT
             )
     })
 }
@@ -318,7 +319,7 @@ async fn discover_commit(
                 withdrawn.push((flake.g.clone(), flake.s.clone()));
                 continue;
             }
-            let Some(lifetime) = Lifetime::of_value(&flake.o) else {
+            let Some(lifetime) = Lifetime::of_instruction(flake) else {
                 schedule.note_problem(format!("t {t}: a TTL instruction with an invalid value"));
                 continue;
             };
@@ -1000,7 +1001,7 @@ mod tests {
 
     #[test]
     fn txn_meta_defaults_read_their_canonical_forms() {
-        let ttl = TxnMetaEntry::new(FLUREE_DB, db::TTL_SECONDS, TxnMetaValue::Long(30));
+        let ttl = TxnMetaEntry::new(FLUREE_DB, db::TTL, TxnMetaValue::Long(30));
         assert_eq!(Lifetime::of_txn_meta(&ttl), Some(Lifetime::Seconds(30)));
         let at = TxnMetaEntry::new(
             FLUREE_DB,

@@ -178,6 +178,8 @@ impl<'a> TemplateSink<'a> {
             return Err(e);
         }
         crate::parse::trig_meta::validate_limits(&self.txn_meta)?;
+        crate::ttl_input::normalize_txn_meta_ttl(&mut self.txn_meta)
+            .map_err(TransactError::Parse)?;
         // Each distinct statement once; nothing to scope without a blank node.
         let content_id = match self.statement_hashes.take() {
             Some(mut hashes) if self.blank_nodes => {

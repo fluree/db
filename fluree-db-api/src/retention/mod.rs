@@ -1,8 +1,8 @@
 //! Background retention: TTL expiration from committed policy and metadata.
 //!
 //! A ledger opts in by declaring `f:retentionDefaults` entries with
-//! `f:ttlSeconds` in its config graph, by committing per-value TTL
-//! instructions (an annotation carrying `f:ttlSeconds` or `f:expiresAt`), or
+//! `f:ttl` in its config graph, by committing per-value TTL
+//! instructions (an annotation carrying `f:ttl` or `f:expiresAt`), or
 //! by a transaction default in txn-meta. Nothing here runs on a write that
 //! carries none of these: the staged-config guard's existing pass over the
 //! staged flakes notices TTL instructions (see [`validate`]), and only those
@@ -135,9 +135,9 @@ impl Fluree {
 use fluree_vocab::db;
 use fluree_vocab::namespaces::FLUREE_DB;
 
-/// `f:ttlSeconds`.
-pub(crate) fn ttl_seconds_sid() -> Sid {
-    Sid::new(FLUREE_DB, db::TTL_SECONDS)
+/// `f:ttl`.
+pub(crate) fn ttl_sid() -> Sid {
+    Sid::new(FLUREE_DB, db::TTL)
 }
 
 /// `f:expiresAt`.
@@ -145,9 +145,9 @@ pub(crate) fn expires_at_sid() -> Sid {
     Sid::new(FLUREE_DB, db::EXPIRES_AT)
 }
 
-/// Whether `p` states a TTL instruction (`f:ttlSeconds` or `f:expiresAt`).
+/// Whether `p` states a TTL instruction (`f:ttl` or `f:expiresAt`).
 pub(crate) fn is_ttl_predicate(p: &Sid) -> bool {
-    p.namespace_code == FLUREE_DB && matches!(&*p.name, db::TTL_SECONDS | db::EXPIRES_AT)
+    p.namespace_code == FLUREE_DB && matches!(&*p.name, db::TTL | db::EXPIRES_AT)
 }
 
 /// The txn-meta marker on a commit carrying retention control input.

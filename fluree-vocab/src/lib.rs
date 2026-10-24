@@ -1844,10 +1844,10 @@ pub mod db {
     /// reconstruct revert provenance from the txn-meta graph.
     pub const REVERTS: &str = "reverts";
 
-    /// db:ttlSeconds - relative lifetime in whole seconds, from the commit
-    /// time of the assertion it governs. A TTL instruction on an annotation,
+    /// db:ttl - relative lifetime, whole seconds or a day/time duration,
+    /// from the commit time of the assertion it governs. A TTL instruction on an annotation,
     /// a transaction default in txn-meta, and a retention property field.
-    pub const TTL_SECONDS: &str = "ttlSeconds";
+    pub const TTL: &str = "ttl";
 
     /// db:expiresAt - absolute expiration instant (`xsd:dateTime` with a
     /// known offset). A TTL instruction on an annotation, or a transaction
@@ -1874,8 +1874,8 @@ pub mod db {
 
     /// The local names in this namespace that a user may set in a commit's
     /// txn-meta: `f:message`, `f:author`, and the transaction TTL default
-    /// (`f:ttlSeconds` or `f:expiresAt`).
-    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR, TTL_SECONDS, EXPIRES_AT];
+    /// (`f:ttl` or `f:expiresAt`).
+    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR, TTL, EXPIRES_AT];
 
     /// Every local name in this namespace a commit's txn-meta holds: the user
     /// claims ([`TXN_META_USER`]) and the entries the system writes
@@ -1884,7 +1884,7 @@ pub mod db {
     pub const TXN_META: &[&str] = &[
         MESSAGE,
         AUTHOR,
-        TTL_SECONDS,
+        TTL,
         EXPIRES_AT,
         IDENTITY,
         RECEIVED_AT,
@@ -2029,7 +2029,7 @@ pub mod txn_meta {
         fn users_set_only_their_claims_in_reserved_namespaces() {
             assert!(user_may_set(FLUREE_DB, db::MESSAGE));
             assert!(user_may_set(FLUREE_DB, db::AUTHOR));
-            assert!(user_may_set(FLUREE_DB, db::TTL_SECONDS));
+            assert!(user_may_set(FLUREE_DB, db::TTL));
             assert!(user_may_set(FLUREE_DB, db::EXPIRES_AT));
             assert!(!user_may_set(FLUREE_DB, db::IDENTITY));
             assert!(!user_may_set(FLUREE_DB, db::REVERTS));
@@ -2082,8 +2082,8 @@ pub mod reifies_iris {
 
 /// TTL instruction IRIs, as written on an annotation or in txn-meta.
 pub mod retention_iris {
-    /// `f:ttlSeconds` — relative lifetime in whole seconds.
-    pub const TTL_SECONDS: &str = "https://ns.flur.ee/db#ttlSeconds";
+    /// `f:ttl` — relative lifetime: whole seconds or a day/time duration.
+    pub const TTL: &str = "https://ns.flur.ee/db#ttl";
 
     /// `f:expiresAt` — absolute expiration instant (`xsd:dateTime`).
     pub const EXPIRES_AT: &str = "https://ns.flur.ee/db#expiresAt";
@@ -2534,10 +2534,10 @@ pub mod config_iris {
     /// assertions/retractions of the target are dropped from index history.
     pub const NO_HISTORY: &str = "https://ns.flur.ee/db#noHistory";
 
-    /// `f:ttlSeconds` — non-negative integer on a retention property entry:
-    /// the lifetime of the target's assertions, from their commit time.
+    /// `f:ttl` — whole seconds or a day/time duration on a retention
+    /// property entry: the lifetime of the target's assertions, from their commit time.
     /// `0` disables an inherited duration for future assertions.
-    pub const TTL_SECONDS: &str = "https://ns.flur.ee/db#ttlSeconds";
+    pub const TTL: &str = "https://ns.flur.ee/db#ttl";
 
     // ---- Serving defaults fields (ledger-scoped) ----
 

@@ -137,10 +137,7 @@ fn ttl_wrapper(value: &Expr) -> Result<Option<(&Expr, TtlInstruction)>, LowerCyp
         };
         let seconds = i64::try_from(seconds)
             .map_err(|_| LowerCypherError::rejected("TTL too large".to_string()))?;
-        (
-            fluree_vocab::retention_iris::TTL_SECONDS,
-            FlakeValue::Long(seconds),
-        )
+        (fluree_vocab::retention_iris::TTL, FlakeValue::Long(seconds))
     };
     Ok(Some((inner, instruction)))
 }

@@ -6,6 +6,8 @@ TTL is opt-in per ledger. A ledger that never writes a lifetime and never config
 
 ## Giving a value a lifetime
 
+A lifetime is named `ttl` and a deadline `expiresAt` everywhere: `@ttl` and `@expiresAt` in JSON-LD shorthand, `f:ttl` and `f:expiresAt` in annotations, transaction defaults and config, and `fluree.ttl` and `fluree.expiresAt` in Cypher. A lifetime is whole seconds or a fixed duration such as `"PT1H"` on every surface.
+
 ### JSON-LD: `@ttl` and `@expiresAt`
 
 On a value object (or a node reference), `@ttl` sets a relative lifetime and `@expiresAt` an absolute deadline:
@@ -22,24 +24,24 @@ On a value object (or a node reference), `@ttl` sets a relative lifetime and `@e
 }
 ```
 
-`@ttl` and `@expiresAt` are Fluree extensions, not JSON-LD 1.1 keywords. They are shorthand for a TTL instruction on the value's [annotation](../concepts/edge-annotations.md): the example's status is stored as `"online"` plus an annotation carrying `f:ttlSeconds 3600`. You can write that annotation yourself:
+`@ttl` and `@expiresAt` are Fluree extensions, not JSON-LD 1.1 keywords. They are shorthand for a TTL instruction on the value's [annotation](../concepts/edge-annotations.md): the example's status is stored as `"online"` plus an annotation carrying `f:ttl 3600`. You can write that annotation yourself:
 
 ```json
-{ "@value": "online", "@annotation": { "f:ttlSeconds": 3600 } }
+{ "@value": "online", "@annotation": { "f:ttl": 3600 } }
 ```
 
 Use one form per value, not both. The shorthand works in `insert`, in an update's `insert` clause, and in upsert; it is refused in a `delete`.
 
 ### SPARQL and Turtle: annotation blocks
 
-TTL uses the existing SPARQL 1.2 / RDF 1.2 annotation syntax with the `f:ttlSeconds` or `f:expiresAt` predicate:
+TTL uses the existing SPARQL 1.2 / RDF 1.2 annotation syntax with the `f:ttl` or `f:expiresAt` predicate:
 
 ```sparql
 PREFIX ex: <https://example.org/>
 PREFIX f: <https://ns.flur.ee/db#>
 
 INSERT DATA {
-  ex:device1 ex:status "online" {| f:ttlSeconds 3600 |} .
+  ex:device1 ex:status "online" {| f:ttl 3600 |} .
 }
 ```
 
@@ -50,14 +52,14 @@ PREFIX ex: <https://example.org/>
 PREFIX f: <https://ns.flur.ee/db#>
 
 DELETE { ex:device1 ex:status ?old . }
-INSERT { ex:device1 ex:status ?new {| f:ttlSeconds ?seconds |} . }
+INSERT { ex:device1 ex:status ?new {| f:ttl ?seconds |} . }
 WHERE {
   ex:device1 ex:status ?old .
   VALUES (?new ?seconds) { ("online" 3600) }
 }
 ```
 
-For a deadline, write `f:expiresAt "2026-10-21T12:00:00Z"^^xsd:dateTime`. Turtle and TriG ingest accept the same annotation blocks.
+A lifetime can also be a duration, `{| f:ttl "PT1H"^^xsd:dayTimeDuration |}`. For a deadline, write `f:expiresAt "2026-10-21T12:00:00Z"^^xsd:dateTime`. Turtle and TriG ingest accept the same annotation blocks.
 
 ### Cypher: `fluree.ttl` and `fluree.expiresAt`
 
@@ -82,11 +84,11 @@ A transaction can set a lifetime for every value it newly asserts, in its [txn-m
 {
   "@context": { "ex": "https://example.org/", "f": "https://ns.flur.ee/db#" },
   "@graph": [ { "@id": "ex:reading42", "ex:temp": 21.5 } ],
-  "f:ttlSeconds": 86400
+  "f:ttl": 86400
 }
 ```
 
-A TriG `GRAPH <#txn-meta>` block can set `f:ttlSeconds` or `f:expiresAt` the same way. The default applies to new data assertions in that commit only: not to retractions, not to config or txn-meta, and not to values that were already current.
+A TriG `GRAPH <#txn-meta>` block can set `f:ttl` or `f:expiresAt` the same way. The default applies to new data assertions in that commit only: not to retractions, not to config or txn-meta, and not to values that were already current.
 
 ### A property default
 
@@ -106,14 +108,14 @@ Declare a duration for every future assertion of a predicate in the ledger's con
         "@id": "urn:fluree:mydb:main:config:retention:reading",
         "@type": "f:RetentionProperty",
         "f:target": { "@id": "ex:reading" },
-        "f:ttlSeconds": 86400
+        "f:ttl": 86400
       }
     ]
   }
 }
 ```
 
-The policy applies to `ex:reading` values asserted in commits after the config commit. It does not reschedule values asserted earlier. A per-graph override (`f:graphOverrides` / `f:GraphConfig`) can change the duration for one graph; `f:ttlSeconds 0` there turns the inherited duration off for that graph.
+The policy applies to `ex:reading` values asserted in commits after the config commit. It does not reschedule values asserted earlier. A per-graph override (`f:graphOverrides` / `f:GraphConfig`) can change the duration for one graph; `f:ttl 0` there turns the inherited duration off for that graph.
 
 ## Which lifetime applies
 
@@ -121,7 +123,7 @@ For each newly asserted value, the first of these that is present decides:
 
 1. A TTL instruction on the value's own annotation.
 2. The transaction's default.
-3. The property's effective `f:ttlSeconds` for the value's graph.
+3. The property's effective `f:ttl` for the value's graph.
 4. Otherwise, no expiry.
 
 An explicit lifetime of `0` (or `PT0S`) means "no automatic expiry" and overrides the lower levels.
@@ -140,14 +142,14 @@ A relative lifetime starts at the persisted commit time of the commit that wrote
 
 | Form | Meaning | Rules |
 |---|---|---|
-| `@ttl: 3600`, `f:ttlSeconds 3600`, `fluree.ttl(v, 3600)` | Lifetime in seconds | A non-negative whole number |
-| `@ttl: "PT1H"`, `"P1DT2H"`, `fluree.ttl(v, "PT15M")` | A fixed day/time duration | Days, hours, minutes and whole seconds. Days are 86,400 seconds. Normalized to whole seconds before it is committed |
+| `@ttl: 3600`, `f:ttl 3600`, `fluree.ttl(v, 3600)` | Lifetime in seconds | A non-negative whole number |
+| `@ttl: "PT1H"`, `f:ttl "PT1H"^^xsd:dayTimeDuration`, `fluree.ttl(v, "PT15M")` | A fixed day/time duration | Days, hours, minutes and whole seconds. Days are 86,400 seconds. A string such as `"P1DT2H"` is accepted too |
 | `@expiresAt: "2026-10-21T12:00:00Z"` | Absolute deadline | RFC 3339 with `Z` or a numeric offset, normalized to UTC, at most microsecond precision |
 | `f:expiresAt` typed `xsd:dateTime`, `fluree.expiresAt(v, datetime(...))` | Absolute deadline | The same rules |
 
 These are refused, not guessed at: negative or fractional lifetimes; calendar durations such as `P1M` or `P1Y`; weeks; numeric strings such as `"3600"`; booleans and `null`; date-only values; date-times with no offset or with `-00:00`; and both a lifetime and a deadline on one value. A deadline already in the past is valid: the value expires at the next pass.
 
-A TTL instruction must sit on an annotation of exactly one triple. `f:ttlSeconds` written on an ordinary node is refused, as are two TTL instructions for the same value in one transaction.
+A TTL instruction must sit on an annotation of exactly one triple. `f:ttl` written on an ordinary node is refused, as are two TTL instructions for the same value in one transaction.
 
 ## Permissions
 
@@ -165,7 +167,7 @@ The retention worker runs on the node that owns background maintenance: the serv
 
 Expiration is **best-effort and eventual**. A value disappears after its deadline plus up to one interval plus processing time. Expiration commits use transaction capacity like any write, and they wait when the ledger's novelty is near its limit so that ordinary writes come first. If no maintenance owner is running, nothing expires and scheduled values become overdue.
 
-Commits and annotations written before a ledger's first TTL-aware write are not treated as instructions, even if they happen to use `f:ttlSeconds`.
+Commits and annotations written before a ledger's first TTL-aware write are not treated as instructions, even if they happen to use `f:ttl`.
 
 ### Status
 

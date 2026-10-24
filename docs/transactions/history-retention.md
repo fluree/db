@@ -44,7 +44,7 @@ A view of a ledger that has since been dropped, or replaced by a new ledger unde
 
 A historical query that never touches the predicate is still answered. The check is per query, on the predicates its patterns name. A pattern with a variable predicate, a wildcard path, a graph crawl or hydration (`select {"?s": ["*"]}`), or reasoning counts as touching every predicate. So do shortest paths, geo searches and `SERVICE`.
 
-The same `f:noHistory` entry can carry an `f:ttlSeconds` too: values expire, and their history is not served.
+The same `f:noHistory` entry can carry an `f:ttl` too: values expire, and their history is not served.
 
 ### Coverage
 

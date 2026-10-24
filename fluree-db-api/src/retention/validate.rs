@@ -61,7 +61,7 @@ fn is_retention_config_term(flake: &Flake) -> bool {
         let name = &*flake.p.name;
         return name == local(config_iris::RETENTION_DEFAULTS)
             || name == local(config_iris::NO_HISTORY)
-            || name == local(config_iris::TTL_SECONDS);
+            || name == local(config_iris::TTL);
     }
     fluree_db_core::is_rdf_type(&flake.p)
         && matches!(&flake.o, FlakeValue::Ref(c) if c.namespace_code == FLUREE_DB
@@ -178,7 +178,7 @@ async fn validate_ttl_instructions(
         let mut ttl_facts = staged(
             view,
             g_id,
-            RangeMatch::subject_predicate(reifier.clone(), super::ttl_seconds_sid()),
+            RangeMatch::subject_predicate(reifier.clone(), super::ttl_sid()),
         )
         .await?;
         ttl_facts.extend(
@@ -191,7 +191,7 @@ async fn validate_ttl_instructions(
         );
         if ttl_facts.len() > 1 {
             return Err(GuardError::Refused(
-                "an annotation carries one TTL instruction: f:ttlSeconds or f:expiresAt, \
+                "an annotation carries one TTL instruction: f:ttl or f:expiresAt, \
                  with one value"
                     .to_string(),
             ));
@@ -216,7 +216,7 @@ async fn validate_ttl_instructions(
             },
             [] => {
                 return Err(GuardError::Refused(
-                    "f:ttlSeconds / f:expiresAt is a TTL instruction only on an annotation \
+                    "f:ttl / f:expiresAt is a TTL instruction only on an annotation \
                      (@annotation, @ttl, {| ... |}); this node reifies no triple"
                         .to_string(),
                 ))
@@ -250,15 +250,13 @@ async fn validate_ttl_instructions(
     Ok(())
 }
 
-/// The value rules for a TTL instruction: `f:ttlSeconds` a non-negative
-/// whole number, `f:expiresAt` an `xsd:dateTime`.
+/// The value rules for a TTL instruction: `f:ttl` whole seconds or a
+/// day/time duration, `f:expiresAt` an `xsd:dateTime`.
 pub(crate) fn check_instruction_value(flake: &Flake) -> Result<(), String> {
-    if &*flake.p.name == fluree_vocab::db::TTL_SECONDS {
-        return match &flake.o {
-            FlakeValue::Long(n) if *n >= 0 => Ok(()),
-            FlakeValue::Long(_) => Err("f:ttlSeconds may not be negative".to_string()),
-            _ => Err("f:ttlSeconds must be a whole number of seconds".to_string()),
-        };
+    if &*flake.p.name == fluree_vocab::db::TTL {
+        return fluree_db_transact::ttl_input::ttl_seconds_from_value(&flake.o)
+            .map(|_| ())
+            .map_err(|e| format!("f:ttl: {e}"));
     }
     match &flake.o {
         FlakeValue::DateTime(_) => Ok(()),

@@ -132,7 +132,7 @@ async fn main() {
                <urn:fluree:{idle}:config:ledger> a f:LedgerConfig ;
                  f:retentionDefaults <urn:cfg:r> .
                <urn:cfg:r> f:property <urn:cfg:p> .
-               <urn:cfg:p> f:target ex:unused ; f:ttlSeconds 86400 .
+               <urn:cfg:p> f:target ex:unused ; f:ttl 86400 .
              }}"
         ))
         .commit()

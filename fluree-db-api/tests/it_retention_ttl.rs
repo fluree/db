@@ -213,7 +213,7 @@ async fn property_ttl_from_config_applies_to_later_assertions() {
                <urn:fluree:{id}:config:ledger> a f:LedgerConfig ;
                  f:retentionDefaults <urn:cfg:retention> .
                <urn:cfg:retention> a f:RetentionDefaults ; f:property <urn:cfg:reading> .
-               <urn:cfg:reading> a f:RetentionProperty ; f:target ex:reading ; f:ttlSeconds 60 .
+               <urn:cfg:reading> a f:RetentionProperty ; f:target ex:reading ; f:ttl 60 .
              }}"
         ))
         .commit()
@@ -335,7 +335,7 @@ async fn sparql_annotation_and_transaction_default_schedule_too() {
         .transact()
         .sparql_update(
             "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
-             INSERT DATA { ex:d ex:status \"online\" {| f:ttlSeconds 60 |} . }",
+             INSERT DATA { ex:d ex:status \"online\" {| f:ttl 60 |} . }",
         )
         .commit()
         .await
@@ -347,7 +347,7 @@ async fn sparql_annotation_and_transaction_default_schedule_too() {
         json!({
             "@context": ctx(),
             "@graph": [{"@id": "ex:e", "ex:temp": 21}],
-            "f:ttlSeconds": 120
+            "f:ttl": 120
         }),
     )
     .await;
@@ -370,6 +370,111 @@ async fn sparql_annotation_and_transaction_default_schedule_too() {
     assert!(objects(&fluree, &id, &id, "ex:e", "ex:temp")
         .await
         .is_empty());
+}
+
+/// `f:ttl` takes a duration on every surface: a property default, a SPARQL
+/// annotation and a transaction default. A value's own lifetime, longer,
+/// shorter or none, beats the property's.
+#[tokio::test]
+async fn a_lifetime_is_a_duration_anywhere_and_a_value_s_own_wins() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-durations").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+             GRAPH <urn:fluree:{id}#config> {{
+               <urn:fluree:{id}:config:ledger> a f:LedgerConfig ;
+                 f:retentionDefaults <urn:cfg:retention> .
+               <urn:cfg:retention> a f:RetentionDefaults ; f:property <urn:cfg:reading> .
+               <urn:cfg:reading> a f:RetentionProperty ; f:target ex:reading ;
+                 f:ttl \"PT1M\"^^xsd:dayTimeDuration .
+             }}"
+        ))
+        .commit()
+        .await
+        .expect("config");
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:plain", "ex:reading": 1},
+            {"@id": "ex:shorter", "ex:reading": {"@value": 2, "@ttl": "PT10S"}},
+            {"@id": "ex:longer", "ex:reading": {"@value": 3, "@ttl": 7200}},
+            {"@id": "ex:never", "ex:reading": {"@value": 4, "@ttl": 0}}
+        ]}),
+    )
+    .await;
+    fluree
+        .graph(&id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             INSERT DATA { ex:sparql ex:status \"on\" {| f:ttl \"PT30S\"^^xsd:dayTimeDuration |} . }",
+        )
+        .commit()
+        .await
+        .expect("sparql ttl");
+    fluree
+        .graph(&id)
+        .transact()
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> . @prefix f: <https://ns.flur.ee/db#> .
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+             ex:txn ex:status \"on\" .
+             GRAPH <#txn-meta> { <fluree:commit:this> f:ttl \"PT45S\"^^xsd:dayTimeDuration . }",
+        )
+        .commit()
+        .await
+        .expect("txn-meta ttl");
+
+    let start = now_ms();
+    let report = fluree.run_retention_at(&id, start).await.expect("pass");
+    assert_eq!(report.pending, 5, "{report:?}");
+    let remaining = |s: &'static str, p: &'static str| {
+        let fluree = &fluree;
+        let id = &id;
+        async move { !objects(fluree, id, id, s, p).await.is_empty() }
+    };
+    for (after_s, gone) in [
+        (11, "ex:shorter"),
+        (31, "ex:sparql"),
+        (46, "ex:txn"),
+        (61, "ex:plain"),
+        (7201, "ex:longer"),
+    ] {
+        let report = fluree
+            .run_retention_at(&id, start + after_s * 1000)
+            .await
+            .expect("pass");
+        assert_eq!(report.expired, 1, "{gone} at {after_s}s: {report:?}");
+        let p = if gone == "ex:sparql" || gone == "ex:txn" {
+            "ex:status"
+        } else {
+            "ex:reading"
+        };
+        assert!(!remaining(gone, p).await, "{gone}");
+    }
+    assert!(remaining("ex:never", "ex:reading").await);
+
+    // Refused there as in every other txn-meta form, not ignored.
+    for bad in ["-5", "\"3600\"", "\"P1M\"^^xsd:duration"] {
+        let refused = fluree
+            .graph(&id)
+            .transact()
+            .upsert_turtle(&format!(
+                "@prefix ex: <http://example.org/> . @prefix f: <https://ns.flur.ee/db#> .
+                 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+                 ex:bad ex:status \"on\" .
+                 GRAPH <#txn-meta> {{ <fluree:commit:this> f:ttl {bad} . }}"
+            ))
+            .commit()
+            .await;
+        assert!(refused.is_err(), "{bad}");
+    }
 }
 
 #[tokio::test]
@@ -456,7 +561,7 @@ async fn malformed_ttl_inputs_are_refused() {
         json!({"@value": "x", "@ttl": 60, "@expiresAt": "2030-01-01T00:00:00Z"}),
         json!({"@value": "x", "@expiresAt": "2030-01-01"}),
         json!({"@value": "x", "@expiresAt": "2030-01-01T00:00:00"}),
-        json!({"@value": "x", "@ttl": 60, "@annotation": {"f:ttlSeconds": 30}}),
+        json!({"@value": "x", "@ttl": 60, "@annotation": {"f:ttl": 30}}),
     ] {
         let result = fluree
             .graph(&id)
@@ -468,10 +573,10 @@ async fn malformed_ttl_inputs_are_refused() {
     }
     // Annotation form: wrong types, two instructions on one annotation.
     for bad in [
-        "{| f:ttlSeconds \"3600\" |}",
-        "{| f:ttlSeconds -5 |}",
-        "{| f:ttlSeconds 1.5 |}",
-        "{| f:ttlSeconds 60 ; f:expiresAt \"2030-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> |}",
+        "{| f:ttl \"3600\" |}",
+        "{| f:ttl -5 |}",
+        "{| f:ttl 1.5 |}",
+        "{| f:ttl 60 ; f:expiresAt \"2030-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> |}",
     ] {
         let result = fluree
             .graph(&id)
@@ -488,7 +593,7 @@ async fn malformed_ttl_inputs_are_refused() {
     let result = fluree
         .graph(&id)
         .transact()
-        .insert(&json!({"@context": ctx(), "@graph": [{"@id": "ex:s", "ex:v": 1}], "f:ttlSeconds": "P1Y"}))
+        .insert(&json!({"@context": ctx(), "@graph": [{"@id": "ex:s", "ex:v": 1}], "f:ttl": "P1Y"}))
         .commit()
         .await;
     assert!(result.is_err());
@@ -496,7 +601,7 @@ async fn malformed_ttl_inputs_are_refused() {
     let result = fluree
         .graph(&id)
         .transact()
-        .insert(&json!({"@context": ctx(), "@id": "ex:s", "f:ttlSeconds": 60}))
+        .insert(&json!({"@context": ctx(), "@id": "ex:s", "f:ttl": 60}))
         .commit()
         .await;
     assert!(result.is_err());
@@ -522,26 +627,26 @@ async fn retention_config_is_validated() {
             "invalid value",
         ),
         (
-            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttlSeconds -1 ] .",
+            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttl -1 ] .",
             "invalid value",
         ),
         (
-            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttlSeconds \"60\" ] .",
+            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttl \"60\" ] .",
             "invalid value",
         ),
         (
-            "f:property [ a f:RetentionProperty ; f:ttlSeconds 60 ] .",
+            "f:property [ a f:RetentionProperty ; f:ttl 60 ] .",
             "without an IRI f:target",
         ),
         (
-            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttlSeconds 60 ] , \
-             [ a f:RetentionProperty ; f:target ex:c ; f:ttlSeconds 30 ] .",
+            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttl 60 ] , \
+             [ a f:RetentionProperty ; f:target ex:c ; f:ttl 30 ] .",
             "several f:RetentionProperty entries",
         ),
         ("f:overrideControl f:OverrideNone .", "f:overrideControl"),
-        ("f:ttlSeconds 60 .", "belongs on an f:RetentionProperty"),
+        ("f:ttl 60 .", "belongs on an f:RetentionProperty"),
         (
-            "f:property [ a f:RetentionProperty ; f:target f:ttlSeconds ; f:ttlSeconds 60 ] .",
+            "f:property [ a f:RetentionProperty ; f:target f:ttl ; f:ttl 60 ] .",
             "system predicate",
         ),
     ] {
@@ -558,7 +663,7 @@ async fn retention_config_is_validated() {
         .graph(&id)
         .transact()
         .upsert_turtle(&config(
-            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttlSeconds 0 ; f:noHistory false ] .",
+            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttl 0 ; f:noHistory false ] .",
         ))
         .commit()
         .await
@@ -705,7 +810,7 @@ async fn annotations_written_before_the_activation_boundary_are_not_instructions
         &json!({
             "@context": ctx(),
             "@id": "ex:s",
-            "ex:v": {"@value": "old", "@annotation": {"f:ttlSeconds": 1}}
+            "ex:v": {"@value": "old", "@annotation": {"f:ttl": 1}}
         }),
     )
     .await;
@@ -758,7 +863,7 @@ async fn ttl_on_a_value_shared_by_several_annotations_is_refused() {
         .transact()
         .sparql_update(
             "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
-             INSERT DATA { ex:a ex:knows ex:b {| f:ttlSeconds 60 |} . }",
+             INSERT DATA { ex:a ex:knows ex:b {| f:ttl 60 |} . }",
         )
         .commit()
         .await
@@ -771,7 +876,7 @@ async fn ttl_on_a_value_shared_by_several_annotations_is_refused() {
         .transact()
         .sparql_update(
             "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
-             INSERT DATA { ex:a ex:likes ex:b {| ex:since 2020 ; f:ttlSeconds 60 |} . }",
+             INSERT DATA { ex:a ex:likes ex:b {| ex:since 2020 ; f:ttl 60 |} . }",
         )
         .commit()
         .await
@@ -918,7 +1023,7 @@ async fn setting_a_lifetime_needs_permission_to_retract_the_value() {
     let claim = json!({
         "@context": ctx(),
         "@id": "ex:claim",
-        "f:ttlSeconds": 1,
+        "f:ttl": 1,
         "@reifies": {"@id": "ex:victim", "ex:status": "online"}
     });
     let state = fluree.ledger(&id).await.unwrap();
@@ -1086,7 +1191,7 @@ async fn policy_changes_apply_to_later_assertions_only() {
                <urn:fluree:{id}:config:ledger> a f:LedgerConfig ;
                  f:retentionDefaults <urn:cfg:retention> .
                <urn:cfg:retention> a f:RetentionDefaults ; f:property <urn:cfg:p> .
-               <urn:cfg:p> a f:RetentionProperty ; f:target ex:reading ; f:ttlSeconds {ttl} .
+               <urn:cfg:p> a f:RetentionProperty ; f:target ex:reading ; f:ttl {ttl} .
              }}"
         )
     };
@@ -1142,7 +1247,7 @@ async fn sharing_that_appears_after_scheduling_leaves_the_value_in_place() {
         .transact()
         .sparql_update(
             "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
-             INSERT DATA { ex:a ex:knows ex:b {| ex:since 2020 ; f:ttlSeconds 60 |} . }",
+             INSERT DATA { ex:a ex:knows ex:b {| ex:since 2020 ; f:ttl 60 |} . }",
         )
         .commit()
         .await

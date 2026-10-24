@@ -400,7 +400,7 @@ Each `f:RetentionProperty` entry:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `f:target` | IRI (exactly one) | required | The predicate the entry governs |
-| `f:ttlSeconds` | non-negative integer | inherit | Lifetime from the commit time of each new assertion. `0` turns an inherited duration off for future assertions |
+| `f:ttl` | whole seconds, or a duration such as `"P1D"^^xsd:dayTimeDuration` | inherit | Lifetime from the commit time of each new assertion. `0` turns an inherited duration off for future assertions |
 | `f:noHistory` | boolean | inherit; system default `false` | `true` stops serving the predicate's superseded values: reads that need them fail with `410`, and the index drops them. See [History retention](../transactions/history-retention.md) |
 
 ```json
@@ -417,7 +417,7 @@ Each `f:RetentionProperty` entry:
         "@id": "urn:fluree:mydb:main:config:retention:counter",
         "@type": "f:RetentionProperty",
         "f:target": { "@id": "ex:reading" },
-        "f:ttlSeconds": 86400
+        "f:ttl": 86400
       }
     ]
   }
@@ -439,7 +439,7 @@ GRAPH <urn:fluree:mydb:main#config> {
     a f:GraphConfig ;
     f:targetGraph ex:auditedMetrics ;
     f:retentionDefaults [
-      f:property [ a f:RetentionProperty ; f:target ex:reading ; f:ttlSeconds 0 ]
+      f:property [ a f:RetentionProperty ; f:target ex:reading ; f:ttl 0 ]
     ]
   ] .
 }

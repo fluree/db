@@ -98,7 +98,7 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::GRAPH_REF_PROP,
     config_iris::FULL_TEXT_TARGET,
     config_iris::NO_HISTORY,
-    config_iris::TTL_SECONDS,
+    config_iris::TTL,
 ];
 
 /// Config predicates the reader takes several values of.
@@ -368,7 +368,7 @@ mod tests {
               <urn:c:ft> f:defaultLanguage \"en\" ; f:property <urn:c:ftp> .
               <urn:c:ftp> f:target ex:title .
               <urn:c:ret> f:property <urn:c:retp> .
-              <urn:c:retp> f:target ex:counter ; f:ttlSeconds 60 ; f:noHistory false .
+              <urn:c:retp> f:target ex:counter ; f:ttl 60 ; f:noHistory false .
               <urn:c:serving> f:serveQuery true ; f:serveBlocks true ; f:publicVisibility true .
               <urn:c:query> f:unionDefaultGraph true .
               <urn:c:g1> a f:GraphConfig ; f:targetGraph ex:g1 ; f:shaclDefaults <urn:c:shacl2> .

@@ -65,7 +65,7 @@ const EDGE_KEY: &str = "@edge";
 const REIFIES_KEY: &str = "@reifies";
 
 /// `@ttl` / `@expiresAt`: a value's lifetime, shorthand for a TTL
-/// instruction in its annotation (`f:ttlSeconds` / `f:expiresAt`).
+/// instruction in its annotation (`f:ttl` / `f:expiresAt`).
 const TTL_KEY: &str = "@ttl";
 const EXPIRES_AT_KEY: &str = "@expiresAt";
 
@@ -80,7 +80,7 @@ fn is_ttl_key(key: &str) -> bool {
 }
 
 /// Move a value's `@ttl` / `@expiresAt` into its annotation as the TTL
-/// instruction it stands for (`f:ttlSeconds` with whole seconds, or
+/// instruction it stands for (`f:ttl` with whole seconds, or
 /// `f:expiresAt` with a UTC `xsd:dateTime`), creating the annotation when
 /// the value has none.
 fn fold_ttl_shorthand(map: &mut Map<String, Value>) -> Result<()> {
@@ -96,7 +96,7 @@ fn fold_ttl_shorthand(map: &mut Map<String, Value>) -> Result<()> {
         (Some(ttl), None) => {
             let seconds = crate::ttl_input::ttl_seconds_from_json(&ttl)
                 .map_err(|e| TransactError::Parse(format!("@ttl: {e}")))?;
-            (fluree_vocab::retention_iris::TTL_SECONDS, json!(seconds))
+            (fluree_vocab::retention_iris::TTL, json!(seconds))
         }
         (None, Some(expires)) => {
             let Value::String(text) = &expires else {
@@ -127,14 +127,15 @@ fn fold_ttl_shorthand(map: &mut Map<String, Value>) -> Result<()> {
         ));
     };
     for spelled in [
-        "f:ttlSeconds",
+        "f:ttl",
         "f:expiresAt",
-        fluree_vocab::retention_iris::TTL_SECONDS,
+        fluree_vocab::retention_iris::TTL,
         fluree_vocab::retention_iris::EXPIRES_AT,
     ] {
         if block.contains_key(spelled) {
             return Err(TransactError::Parse(format!(
-                "a value takes one TTL instruction: @ttl / @expiresAt or {spelled} in its                  @annotation, not both"
+                "a value takes one TTL instruction: @ttl / @expiresAt or {spelled} in its \
+                 @annotation, not both"
             )));
         }
     }

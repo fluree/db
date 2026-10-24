@@ -1,9 +1,9 @@
 //! The accepted forms of a TTL instruction, shared by every write surface.
 //!
-//! A relative lifetime is whole seconds: a non-negative integer, or (in the
-//! JSON-LD and Cypher conveniences) a fixed day/time duration such as
-//! `"PT1H"` or `"P1DT2H"`, normalized to seconds before it is committed. An
-//! absolute deadline is an RFC 3339 timestamp with `Z` or a known numeric
+//! A relative lifetime (`@ttl`, `f:ttl`, `fluree.ttl`) is whole seconds: a
+//! non-negative integer, or a fixed day/time duration such as `"PT1H"` or
+//! `"P1DT2H"`, as a string or a typed `xsd:dayTimeDuration`. An absolute
+//! deadline is an RFC 3339 timestamp with `Z` or a known numeric
 //! offset, normalized to UTC. Anything else is refused rather than guessed:
 //! calendar durations (`P1M`, `P1Y`), negative or fractional lifetimes,
 //! numeric strings, date-only values and local date-times.
@@ -21,6 +21,21 @@ pub fn ttl_seconds_from_json(value: &serde_json::Value) -> Result<u64, String> {
         other => Err(format!(
             "a TTL is a whole number of seconds or a duration such as \"PT1H\", not {other}"
         )),
+    }
+}
+
+/// An RDF TTL value: a non-negative whole number of seconds, or a day/time
+/// duration as a string or a typed `xsd:dayTimeDuration` or `xsd:duration`.
+pub fn ttl_seconds_from_value(value: &fluree_db_core::FlakeValue) -> Result<u64, String> {
+    use fluree_db_core::FlakeValue;
+    match value {
+        FlakeValue::Long(n) => {
+            u64::try_from(*n).map_err(|_| format!("a TTL may not be negative, not {n}"))
+        }
+        FlakeValue::String(text) => duration_seconds(text),
+        FlakeValue::DayTimeDuration(d) => duration_seconds(&d.to_canonical_string()),
+        FlakeValue::Duration(d) => duration_seconds(&d.to_canonical_string()),
+        _ => Err("a TTL is a whole number of seconds or a duration such as \"PT1H\"".to_string()),
     }
 }
 
@@ -105,7 +120,7 @@ pub fn expires_at_lexical(instant: &DateTime<Utc>) -> String {
 }
 
 /// Validate and normalize a transaction's TTL default in its txn-meta: at
-/// most one `f:ttlSeconds` (whole seconds, or a duration string) or
+/// most one `f:ttl` (whole seconds, or a duration) or
 /// `f:expiresAt` (an RFC 3339 deadline, stored as a UTC `xsd:dateTime`).
 pub fn normalize_txn_meta_ttl(entries: &mut [fluree_db_core::TxnMetaEntry]) -> Result<(), String> {
     use fluree_db_core::TxnMetaValue;
@@ -116,21 +131,33 @@ pub fn normalize_txn_meta_ttl(entries: &mut [fluree_db_core::TxnMetaEntry]) -> R
         if entry.predicate_ns != FLUREE_DB {
             continue;
         }
-        if entry.predicate_name == db::TTL_SECONDS {
+        if entry.predicate_name == db::TTL {
             seen += 1;
             let seconds = match &entry.value {
                 TxnMetaValue::Long(n) => u64::try_from(*n)
-                    .map_err(|_| "txn-meta f:ttlSeconds may not be negative".to_string())?,
+                    .map_err(|_| "txn-meta f:ttl may not be negative".to_string())?,
                 TxnMetaValue::String(text) => duration_seconds(text)?,
+                TxnMetaValue::TypedLiteral {
+                    value,
+                    dt_ns,
+                    dt_name,
+                } if *dt_ns == XSD
+                    && matches!(
+                        dt_name.as_str(),
+                        fluree_vocab::xsd_names::DAY_TIME_DURATION
+                            | fluree_vocab::xsd_names::DURATION
+                    ) =>
+                {
+                    duration_seconds(value)?
+                }
                 _ => {
                     return Err(
-                        "txn-meta f:ttlSeconds is a whole number of seconds or a duration"
-                            .to_string(),
+                        "txn-meta f:ttl is a whole number of seconds or a duration".to_string()
                     )
                 }
             };
-            let seconds = i64::try_from(seconds)
-                .map_err(|_| "txn-meta f:ttlSeconds is too large".to_string())?;
+            let seconds =
+                i64::try_from(seconds).map_err(|_| "txn-meta f:ttl is too large".to_string())?;
             entry.value = TxnMetaValue::Long(seconds);
         } else if entry.predicate_name == db::EXPIRES_AT {
             seen += 1;
@@ -151,7 +178,7 @@ pub fn normalize_txn_meta_ttl(entries: &mut [fluree_db_core::TxnMetaEntry]) -> R
     }
     if seen > 1 {
         return Err(
-            "a transaction takes one TTL default: one f:ttlSeconds or one f:expiresAt".to_string(),
+            "a transaction takes one TTL default: one f:ttl or one f:expiresAt".to_string(),
         );
     }
     Ok(())
@@ -171,6 +198,36 @@ mod tests {
         assert_eq!(ttl_seconds_from_json(&json!("PT0S")).unwrap(), 0);
         assert_eq!(ttl_seconds_from_json(&json!("P2D")).unwrap(), 172_800);
         assert_eq!(ttl_seconds_from_json(&json!("PT1H30M15S")).unwrap(), 5_415);
+    }
+
+    #[test]
+    fn rdf_values_take_seconds_or_a_duration() {
+        use fluree_db_core::temporal::{DayTimeDuration, Duration};
+        use fluree_db_core::FlakeValue;
+        let day_time =
+            |s: &str| FlakeValue::DayTimeDuration(Box::new(DayTimeDuration::parse(s).unwrap()));
+        let generic = |s: &str| FlakeValue::Duration(Box::new(Duration::parse(s).unwrap()));
+        for (value, seconds) in [
+            (FlakeValue::Long(3600), 3600),
+            (FlakeValue::Long(0), 0),
+            (FlakeValue::String("PT1H".into()), 3600),
+            (day_time("P1DT2H"), 93_600),
+            (day_time("PT0S"), 0),
+            (generic("PT15M"), 900),
+        ] {
+            assert_eq!(ttl_seconds_from_value(&value), Ok(seconds), "{value:?}");
+        }
+        for bad in [
+            FlakeValue::Long(-1),
+            FlakeValue::String("3600".into()),
+            FlakeValue::Boolean(true),
+            day_time("-PT1H"),
+            day_time("PT1.5S"),
+            generic("P1Y"),
+            generic("P1M"),
+        ] {
+            assert!(ttl_seconds_from_value(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

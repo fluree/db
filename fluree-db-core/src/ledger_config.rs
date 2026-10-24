@@ -265,7 +265,7 @@ pub struct RetentionProperty {
     pub target: String,
     /// `f:noHistory` — `None` inherits; system default `false`.
     pub no_history: Option<bool>,
-    /// `f:ttlSeconds` — `None` inherits; `Some(0)` disables an inherited
+    /// `f:ttl` — `None` inherits; `Some(0)` disables an inherited
     /// duration for future assertions.
     pub ttl_seconds: Option<u64>,
 }

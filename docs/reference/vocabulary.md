@@ -196,11 +196,11 @@ These predicates live in the ledger's `#config` named graph and declare which pr
 
 ### Retention (TTL) predicates
 
-`f:ttlSeconds` and `f:expiresAt` are TTL instructions on a value's annotation or a transaction's txn-meta; `f:retentionDefaults` and its entries live in the `#config` graph. See [Time to live (TTL)](../transactions/ttl.md).
+`f:ttl` and `f:expiresAt` are TTL instructions on a value's annotation or a transaction's txn-meta; `f:retentionDefaults` and its entries live in the `#config` graph. See [Time to live (TTL)](../transactions/ttl.md).
 
 | Term | IRI | Description |
 |------|-----|-------------|
-| `f:ttlSeconds` | `https://ns.flur.ee/db#ttlSeconds` | Lifetime in whole seconds: on an annotation, in txn-meta, or on an `f:RetentionProperty` entry |
+| `f:ttl` | `https://ns.flur.ee/db#ttl` | Lifetime, in whole seconds or as a day/time duration: on an annotation, in txn-meta, or on an `f:RetentionProperty` entry |
 | `f:expiresAt` | `https://ns.flur.ee/db#expiresAt` | Absolute deadline (`xsd:dateTime` with an offset): on an annotation or in txn-meta |
 | `f:retentionDefaults` | `https://ns.flur.ee/db#retentionDefaults` | Setting group on `f:LedgerConfig` / `f:GraphConfig` |
 | `f:RetentionDefaults` | `https://ns.flur.ee/db#RetentionDefaults` | Class of the setting-group node |

@@ -2424,7 +2424,7 @@ async fn read_fulltext_fields(
 /// Read retention defaults from a parent subject (LedgerConfig or GraphConfig).
 ///
 /// `f:retentionDefaults` points to a group whose `f:property` entries each
-/// carry one `f:target` and optional `f:noHistory` / `f:ttlSeconds`. Unlike
+/// carry one `f:target` and optional `f:noHistory` / `f:ttl`. Unlike
 /// the other readers, a malformed entry is not skipped silently: it lands in
 /// [`RetentionDefaults::problems`], which blocks retention processing for the
 /// ledger instead of reading as "no policy". Returns `None` when the parent
@@ -2478,8 +2478,8 @@ async fn read_retention_fields(
             "f:noHistory belongs on an f:RetentionProperty entry, not on the group",
         ),
         (
-            config_iris::TTL_SECONDS,
-            "f:ttlSeconds belongs on an f:RetentionProperty entry, not on the group",
+            config_iris::TTL,
+            "f:ttl belongs on an f:RetentionProperty entry, not on the group",
         ),
     ] {
         if let Some(pred) = try_encode(snapshot, misplaced) {
@@ -2554,13 +2554,10 @@ async fn read_retention_fields(
             overlay,
             to_t,
             entry_sid,
-            config_iris::TTL_SECONDS,
+            config_iris::TTL,
             &target,
             &mut group.problems,
-            |v| match v {
-                fluree_db_core::FlakeValue::Long(n) => u64::try_from(*n).ok(),
-                _ => None,
-            },
+            |v| fluree_db_transact::ttl_input::ttl_seconds_from_value(v).ok(),
         )
         .await?;
         if target.starts_with(fluree_vocab::fluree::DB) || target == fluree_vocab::rdf::REIFIES {
