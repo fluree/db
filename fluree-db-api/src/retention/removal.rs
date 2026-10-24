@@ -391,11 +391,17 @@ impl Fluree {
                     scope_t,
                 })
                 .collect();
+            // A ledger this registers keeps the retention input it already
+            // holds, as the worker's activation would.
+            let since = commits
+                .iter()
+                .find(|(_, _, c)| super::engine::carries_retention_input(&c.txn_meta))
+                .map_or(scope_t + 1, |(t, _, _)| *t);
             self.retention.watch.journal_changing(&ledger_id);
             let registration = registry::update(ns, &ledger_id, |current| {
                 let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
-                    active_since_t: scope_t + 1,
-                    watermark_t: scope_t,
+                    active_since_t: since,
+                    watermark_t: since - 1,
                     ..Default::default()
                 });
                 let fresh: Vec<Removal> = removals

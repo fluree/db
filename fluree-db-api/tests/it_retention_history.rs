@@ -1971,3 +1971,51 @@ async fn a_recreated_ledger_honors_its_own_removals() {
         read(&fluree, &id, at_t1, "ex:alice", "ex:email").await
     ));
 }
+
+/// A removal made before any retention pass registers the ledger without
+/// passing over a `noHistory` policy already committed, even one already
+/// disabled: the pass after it still finds the policy's interval.
+#[tokio::test]
+async fn a_removal_before_the_first_pass_keeps_an_earlier_policy() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/nohist-removal-first").await;
+    let t1 = upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 1}),
+    )
+    .await;
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 2}),
+    )
+    .await;
+    set_no_history(&fluree, &id, "ex:count", false).await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+
+    fluree.run_retention(&id).await.expect("pass");
+    let status = fluree.retention_status(&id).await.unwrap();
+    let journal = &status.registration.as_ref().unwrap().journal;
+    assert_eq!(journal.history_rules.len(), 1, "{status:?}");
+    assert!(unavailable(
+        read(
+            &fluree,
+            &id,
+            json!(format!("{id}@t:{t1}")),
+            "ex:c",
+            "ex:count"
+        )
+        .await
+    ));
+}

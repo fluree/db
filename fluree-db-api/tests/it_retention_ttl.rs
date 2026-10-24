@@ -1271,3 +1271,47 @@ async fn recreated_ledgers_ttl_is_found(registered: bool) {
     let status = fluree.retention_status(&id).await.expect("status");
     assert!(gone, "not expired by the worker: {status:?}");
 }
+
+/// A removal made before any retention pass registers the ledger without
+/// passing over the retention input already committed: an earlier TTL
+/// still runs.
+#[tokio::test]
+async fn a_removal_before_the_first_pass_keeps_earlier_ttls() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-removal-first").await;
+    insert(
+        &fluree,
+        &id,
+        json!({
+            "@context": ctx(),
+            "@id": "ex:device1",
+            "ex:status": {"@value": "online", "@ttl": 3600},
+            "ex:email": "d@old"
+        }),
+    )
+    .await;
+    fluree
+        .remove_occurrences(
+            &id,
+            fluree_db_api::retention::RemovalRequest {
+                occurrences: vec![],
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/device1".into(),
+                    predicate: "http://example.org/email".into(),
+                    graph: None,
+                    object: Some(json!("d@old")),
+                }],
+            },
+        )
+        .await
+        .expect("remove");
+
+    let report = fluree
+        .run_retention_at(&id, now_ms() + HOUR_MS + 1_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert!(objects(&fluree, &id, &id, "ex:device1", "ex:status")
+        .await
+        .is_empty());
+}
