@@ -1624,6 +1624,9 @@ pub struct FlureeBuilder {
     /// How a file-backed instance proves permanent erasures.
     #[cfg(feature = "native")]
     erasure: Option<retention::erasure::ErasureConfig>,
+    /// How it checks erasure receipts without proving.
+    #[cfg(feature = "native")]
+    erasure_verifier: Option<Arc<retention::erasure::Verifier>>,
     /// Optional ledger cache configuration (enables LedgerManager)
     ledger_cache_config: Option<LedgerManagerConfig>,
     /// Optional background indexing configuration.
@@ -1924,6 +1927,8 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             erasure: None,
             #[cfg(feature = "native")]
+            erasure_verifier: None,
+            #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
@@ -1950,6 +1955,8 @@ impl FlureeBuilder {
             storage_wal_owner: None,
             #[cfg(feature = "native")]
             erasure: None,
+            #[cfg(feature = "native")]
+            erasure_verifier: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2033,6 +2040,8 @@ impl FlureeBuilder {
             storage_wal_owner: None,
             #[cfg(feature = "native")]
             erasure: None,
+            #[cfg(feature = "native")]
+            erasure_verifier: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2147,6 +2156,15 @@ impl FlureeBuilder {
     #[cfg(feature = "native")]
     pub fn with_erasure(mut self, config: retention::erasure::ErasureConfig) -> Self {
         self.erasure = Some(config);
+        self
+    }
+
+    /// Check the receipts of erasures this instance reads or receives with
+    /// `verifier`, without proving any (default: the pinned guest images).
+    /// A prover's configuration brings its own.
+    #[cfg(feature = "native")]
+    pub fn with_erasure_verifier(mut self, verifier: Arc<retention::erasure::Verifier>) -> Self {
+        self.erasure_verifier = Some(verifier);
         self
     }
 
@@ -2276,6 +2294,8 @@ impl FlureeBuilder {
             storage_wal_owner: None,
             #[cfg(feature = "native")]
             erasure: None,
+            #[cfg(feature = "native")]
+            erasure_verifier: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2887,9 +2907,11 @@ impl FlureeBuilder {
         pins: Option<Arc<fluree_db_core::BlobPins>>,
     ) -> (Arc<dyn Storage>, Arc<retention::erasure::ErasureRuntime>) {
         let config = self.erasure.take();
-        let verifier = config
-            .as_ref()
-            .map_or_else(Default::default, |c| c.verifier.clone());
+        let verifier = match (&config, self.erasure_verifier.take()) {
+            (Some(config), _) => config.verifier.clone(),
+            (None, Some(verifier)) => verifier,
+            (None, None) => Default::default(),
+        };
         let index = Arc::new(retention::erasure::index::ErasureIndex::new(
             stored.clone(),
             verifier,

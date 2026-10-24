@@ -21,6 +21,8 @@ A `.flpack` file is a binary stream of frames:
 
 Each data frame contains a CID (content identity) and the raw bytes of the object. On ingest, every frame is integrity-verified before being written to storage.
 
+A [permanently erased](../transactions/permanent-erasure.md#archives) commit is never a data frame: its replacement does not match its CID. It appears at its place among the commits as an Erasure frame (`0x04`, its erasure chain as JSON), preceded by the files it needs as Erasure artifact frames (`0x06`: its replacement, receipts and control commits) and by an Authorization frame (`0x05`) for each erasure request not yet sent. An archive with erased commits carries no index. Older decoders refuse these frame types, so no older restore silently drops an erasure.
+
 ### With or without indexes
 
 A pack can include just commits + txn blobs (compact, sufficient for full restore -- queries replay from commits), or it can also include binary index artifacts (larger, but the restored ledger is immediately queryable without reindexing).
@@ -182,6 +184,7 @@ The server's `POST /import/<ledger>` endpoint is exactly this: it adapts the req
 - **Integrity**: Every data frame is verified (SHA-256) before writing, and the manifest's commit/index head CIDs are checked to be present in the archive before the heads are set — a corrupted, truncated, or mismatched archive is rejected rather than creating a dangling head.
 - **Atomic on failure**: Any mid-stream error rolls back the half-created ledger, so a failed restore never leaves a live, partially-ingested ledger behind. The rollback removes only the ledger the restore created, and the restore can be retried under the same name.
 - **The name must be free**: Restore refuses a name that already holds a live ledger on any branch. Restoring `mydb:other` while `mydb:main` exists would put two unrelated ledgers under one name.
+- **Erased history**: An archive of a ledger with permanently erased commits restores on a file-backed single node, which checks every erasure first; see [Permanent erasure: Archives](../transactions/permanent-erasure.md#archives). `RestoreResult::erased_commits` counts them.
 - **Indexes are optional**: Without indexes, the restored ledger is functional but replays from commits (or reindexes) before queries are efficient. With indexes, it's queryable immediately.
 - **Default context preserved**: If the source ledger has a stored default JSON-LD context, its blob travels in the archive and the restored ledger keeps it — so queries that omit an inline `@context` and rely on the ledger's prefixes keep working. (Currently the local `archive_ledger` path; the remote `export --remote --format ledger` path does not yet carry it.)
 - **Storage-agnostic destination**: The restored ledger can live on file storage, S3, or any backend that implements the `Storage` trait — independent of where the archive's bytes came from.

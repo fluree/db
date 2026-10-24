@@ -183,7 +183,7 @@ impl Fluree {
         }
 
         let commits = self.commits_to_erase(&ledger_id, &found, &branches).await?;
-        let authorized_t = self
+        let (authorized_t, authorized_commit) = self
             .authorize_erasure(
                 writer,
                 &ledger_id,
@@ -197,6 +197,7 @@ impl Fluree {
             requester,
             accepted_ms: crate::retention::worker::now_ms(),
             authorized_t,
+            authorized_commit: Some(authorized_commit.to_string()),
             signatures: request.signatures,
             stage: ErasureStage::Proving,
             commits,
@@ -459,7 +460,8 @@ impl Fluree {
     }
 
     /// Commit the request's authorization on `ledger_id`: its id, its
-    /// requester and its manifest's hash, and no value. Returns its `t`.
+    /// requester and its manifest's hash, and no value. Returns its `t` and
+    /// id.
     async fn authorize_erasure(
         &self,
         writer: &dyn RetentionWriter,
@@ -467,7 +469,7 @@ impl Fluree {
         request_id: &str,
         requester: Option<&str>,
         manifest: &[OccurrenceRef],
-    ) -> Result<i64> {
+    ) -> Result<(i64, ContentId)> {
         let mut control = vec![
             TxnMetaEntry::new(
                 FLUREE_DB,
@@ -501,7 +503,7 @@ impl Fluree {
                 control: control.clone(),
             };
             match writer.submit(ledger_id.as_str(), batch).await? {
-                SubmitOutcome::Committed { t, .. } => return Ok(t),
+                SubmitOutcome::Committed { t, commit_id } => return Ok((t, commit_id)),
                 SubmitOutcome::HeadMoved => continue,
                 SubmitOutcome::Deferred => {
                     return Err(ApiError::Transact(
@@ -586,7 +588,7 @@ fn keep_recent_finished(jobs: &mut Vec<ErasureJob>) {
     });
 }
 
-fn manifest_hash(manifest: &[OccurrenceRef]) -> String {
+pub(super) fn manifest_hash(manifest: &[OccurrenceRef]) -> String {
     let mut hasher = Sha256::new();
     for occ in manifest {
         hasher.update(occ.commit.as_bytes());
@@ -629,6 +631,7 @@ mod tests {
             requester: None,
             accepted_ms: n as i64,
             authorized_t: 1,
+            authorized_commit: None,
             signatures: SignatureMode::Verify,
             stage,
             commits: Vec::new(),

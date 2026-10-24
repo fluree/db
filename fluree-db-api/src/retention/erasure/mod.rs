@@ -29,6 +29,7 @@
 pub(crate) mod index;
 pub(crate) mod purge;
 mod request;
+pub(crate) mod transfer;
 mod worker;
 
 use std::sync::atomic::AtomicBool;
@@ -189,6 +190,9 @@ pub struct ErasureJob {
     pub accepted_ms: i64,
     /// The control commit that records the request's authorization.
     pub authorized_t: i64,
+    /// That commit's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_commit: Option<String>,
     #[serde(default)]
     pub signatures: SignatureMode,
     pub stage: ErasureStage,

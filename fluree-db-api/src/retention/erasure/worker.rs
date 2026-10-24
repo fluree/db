@@ -634,6 +634,7 @@ impl Fluree {
                 .await;
         }
         if !published.is_empty() {
+            self.store_authorization(branch, job).await?;
             runtime.index.publish(published).await?;
         }
         drop(admission);
@@ -653,6 +654,46 @@ impl Fluree {
             j.last_error = None;
         })
         .await
+    }
+
+    /// Store what authorized `job`, requested on `branch`, for transfers of
+    /// its erasures to carry: its control commit and the occurrences its
+    /// manifest hash covers, with those joined since.
+    async fn store_authorization(&self, branch: &str, job: &ErasureJob) -> Result<()> {
+        let runtime = self.erasure_runtime()?;
+        let Some(control) = &job.authorized_commit else {
+            tracing::warn!(request = %job.request_id, "erasure: no control commit recorded; its erasures cannot be transferred");
+            return Ok(());
+        };
+        let bytes = self.commit_bytes(branch, &commit_id(control)?).await?;
+        let control_bytes = runtime
+            .index
+            .put_artifact(Artifact::Control, &bytes)
+            .await?;
+        let added: HashSet<&OccurrenceRef> = job.added.iter().collect();
+        let mut manifest: Vec<OccurrenceRef> = job
+            .commits
+            .iter()
+            .flat_map(|c| {
+                c.slots.iter().map(|slot| OccurrenceRef {
+                    commit: c.commit.clone(),
+                    slot: *slot,
+                })
+            })
+            .filter(|o| !added.contains(o))
+            .collect();
+        manifest.sort_by(|a, b| (&a.commit, a.slot).cmp(&(&b.commit, b.slot)));
+        runtime
+            .index
+            .put_authorization(&super::transfer::Authorization {
+                request_id: job.request_id.clone(),
+                ledger_id: branch.to_string(),
+                control: control.clone(),
+                control_bytes,
+                manifest,
+                added: job.added.clone(),
+            })
+            .await
     }
 
     /// Rebuild the index of `record`, a restored branch not yet visible

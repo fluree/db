@@ -107,6 +107,9 @@ pub struct RestoreResult {
     pub txn_blobs: usize,
     /// Index artifact blobs ingested (0 for a commits-only archive).
     pub index_artifacts: usize,
+    /// Permanently erased commits received as their erasures.
+    #[serde(default)]
+    pub erased_commits: usize,
     /// `t` of the restored commit head: the archive's, or the retraction
     /// of values the lineage has since removed.
     pub commit_t: i64,
@@ -2292,6 +2295,8 @@ impl Fluree {
         let mut ns_manifest: Option<serde_json::Value> = None;
         // The genesis commit, which keys the lineage's journal checkpoint.
         let mut lineage: Option<ContentId> = None;
+        #[cfg(feature = "native")]
+        let mut erasures = crate::retention::erasure::transfer::Received::default();
 
         // Concurrent CAS writer pool. Each future owns its `(cid, payload)` and
         // returns the byte count it frees on completion; errors propagate (and
@@ -2390,6 +2395,23 @@ impl Fluree {
                                         format!(".flpack contains error frame: {msg}"),
                                     ));
                                 }
+                                erasure @ (PackFrame::Erasure(_)
+                                | PackFrame::Authorization(_)
+                                | PackFrame::ErasureArtifact { .. }) => {
+                                    if !saw_header {
+                                        return Err(ApiError::http(
+                                            400,
+                                            "invalid .flpack: erasure frame before Header",
+                                        ));
+                                    }
+                                    #[cfg(feature = "native")]
+                                    self.take_erasure_frame(erasure, &mut erasures).await?;
+                                    #[cfg(not(feature = "native"))]
+                                    {
+                                        drop(erasure);
+                                        return Err(cannot_hold_erasures());
+                                    }
+                                }
                                 PackFrame::End => {
                                     ended = true;
                                     break 'read;
@@ -2453,6 +2475,21 @@ impl Fluree {
         let commit_cid: ContentId = commit_head_id
             .parse()
             .map_err(|e| ApiError::http(400, format!("invalid commit CID in manifest: {e}")))?;
+        // Erased commits read as their replacements once their erasures are
+        // in, which is before anything reads the history.
+        #[cfg(feature = "native")]
+        let erased_commits = erasures.count();
+        #[cfg(not(feature = "native"))]
+        let erased_commits = 0;
+        #[cfg(feature = "native")]
+        if erased_commits > 0 {
+            let genesis = self
+                .receive_erasures(erasures, &namespace, &commit_cid)
+                .await?;
+            if lineage.is_none() {
+                lineage = genesis;
+            }
+        }
         if !content.has(&commit_cid).await.unwrap_or(false) {
             return Err(ApiError::http(
                 400,
@@ -2595,6 +2632,7 @@ impl Fluree {
             commits,
             txn_blobs,
             index_artifacts,
+            erased_commits,
             commit_t: retracted_t.unwrap_or(commit_t),
             index_t: index_t_out,
         })
@@ -2807,6 +2845,15 @@ impl Fluree {
             indexing: indexing_status,
         })
     }
+}
+
+/// A transfer brought erased commits to an instance that cannot hold them.
+pub(crate) fn cannot_hold_erasures() -> ApiError {
+    ApiError::http(
+        501,
+        "the transfer holds permanently erased commits, which this instance cannot store: \
+         that needs a single node with file storage",
+    )
 }
 
 /// Transfers carry commits as stored, and an erased commit is stored as its

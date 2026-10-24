@@ -106,8 +106,10 @@ second of publication. A job reports `published` only after that second has pass
 A later request for the same commit adds a step: the prover redacts the current replacement, and the
 proofs chain back to the original commit.
 
-Replacements, receipts and the published mappings are kept under `@retention/erasure/` in storage. That
-is outside every ledger's folder, so ledger drops and backup restores do not touch them.
+Replacements, receipts, the published mappings and each published request's authorization (its
+control commit and the occurrences its manifest named, which [archives](#archives) carry) are kept
+under `@retention/erasure/` in storage. That is outside every ledger's folder, so ledger drops and
+backup restores do not touch them.
 
 ## Purge
 
@@ -146,6 +148,42 @@ A pass that cannot go on records why in the job and tries again an hour later. T
 
 A purged job lists, under `purge.unverified`, what this node cannot check. That is the memory of other
 processes reading the same storage, such as query peers. Restart them.
+
+## Archives
+
+A `.flpack` archive of a ledger with erased commits (`fluree export --format ledger`,
+`Fluree::archive_ledger`) carries each erased commit as its erasure, never as its original:
+
+- its chain: every step's request, slots, replacement and receipt hash;
+- its latest replacement and every step's receipt;
+- what authorized each step's request: the request's control commit and the occurrences its manifest
+  named, with the retractions joined at publication.
+
+An erased commit's transaction document is not archived, and neither is the ledger's index: an index
+may still hold an erased value. The restored ledger builds its own from the replacements.
+
+A restore (`fluree create --from`, `POST /import`, `Fluree::restore_ledger`) checks every erasure
+before anything reads the restored history. Each chain's receipts must verify against the pinned guest
+images, bound to the original commit and its slots, and the control commit must record the request and
+the hash of its manifest. Each step's slots must be among the occurrences that manifest names, or the
+retractions joined to it. The commit must be in the archive's history. The restored ledger then reads
+each erased commit as its replacement and refuses the history the archive's removal journal refuses. No
+prover is needed to restore.
+
+A proof shows that a commit was redacted correctly, and a control commit shows that a request was made.
+Neither shows who was allowed to make it: control commits are unsigned. A restore trusts the archive's
+erasures as it trusts the archive's data.
+
+A restore is refused, and leaves nothing behind, when:
+
+- an erasure fails a check;
+- an erasure differs from the one this storage holds for the same commit (a chain that is the same, or
+  one this storage has already extended, is accepted);
+- an erasure would newly erase a commit that a ledger on this storage, live or soft-dropped, holds as
+  its original. Erasing history held here on receipt is not supported yet; erase it with a request
+  here instead;
+- the instance cannot hold erased history: memory or S3 storage, or a cluster. Versions of Fluree
+  without erased history in archives refuse such an archive as malformed.
 
 ## Status
 
@@ -213,8 +251,9 @@ measurements.
   once, at the cost of queries still reading it.
 - **Transaction documents are not redacted.** The stored transaction document of an affected commit
   holds the original request, and audit retrieval serves it until the purge deletes it whole.
-- **Transfers are refused.** Push, pull, clone, `.flpack` archives and pack exports refuse a ledger's
-  erased commits by name.
+- **Most transfers are refused.** Push, pull, clone, pack exports and remote archives
+  (`fluree export --remote --format ledger`) refuse a ledger's erased commits by name. A local
+  `.flpack` archive carries them (see [Archives](#archives)).
 - **Not covered:** copies outside this node's storage (backups, other clones, exports already made), the
   memory of other processes until they restart, and values in the original CID itself (see
   [Signatures](#signatures)). Neither the proof nor the purge shows that copies elsewhere are gone.

@@ -24,6 +24,10 @@ use fluree_db_core::{ContentAddressedWrite, ContentId, ContentKind};
 use futures::StreamExt;
 use tracing::debug;
 
+/// A stream carrying erased history, which this client does not receive.
+const ERASED_HISTORY: &str = "the pack holds permanently erased commits, which a pull or clone \
+                              does not receive yet";
+
 /// Result of ingesting a pack stream into local storage.
 #[derive(Debug, Clone, Default)]
 pub struct PackIngestResult {
@@ -181,6 +185,11 @@ pub async fn ingest_pack_stream<S: ContentAddressedWrite>(
                             return Err(SyncError::PackProtocol(format!(
                                 "server error in pack stream: {msg}"
                             )));
+                        }
+                        PackFrame::Erasure(_)
+                        | PackFrame::Authorization(_)
+                        | PackFrame::ErasureArtifact { .. } => {
+                            return Err(SyncError::PackProtocol(ERASED_HISTORY.to_string()));
                         }
                         PackFrame::Manifest(manifest) => {
                             if !saw_header {
@@ -371,6 +380,11 @@ pub async fn ingest_pack_stream_with_header<S: ContentAddressedWrite>(
                     }
                     PackFrame::Manifest(manifest) => {
                         debug!(manifest = %manifest, "pack: received manifest");
+                    }
+                    PackFrame::Erasure(_)
+                    | PackFrame::Authorization(_)
+                    | PackFrame::ErasureArtifact { .. } => {
+                        return Err(SyncError::PackProtocol(ERASED_HISTORY.to_string()));
                     }
                     PackFrame::End => {
                         debug!(

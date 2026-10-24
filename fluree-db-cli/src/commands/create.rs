@@ -427,14 +427,19 @@ fn print_remote_import_summary(label: &str, ledger_id: &str, result: &serde_json
     let commits = result["commits"].as_u64().unwrap_or(0);
     let txn_blobs = result["txn_blobs"].as_u64().unwrap_or(0);
     let index_artifacts = result["index_artifacts"].as_u64().unwrap_or(0);
+    let erased = match result["erased_commits"].as_u64().unwrap_or(0) {
+        0 => String::new(),
+        n => format!(", {n} erased commits"),
+    };
     println!(
-        "{} Imported '{}' to {} — {} commits, {} txn blobs, {} index artifacts",
+        "{} Imported '{}' to {} — {} commits, {} txn blobs, {} index artifacts{}",
         "✓".green(),
         resolved,
         label,
         commits,
         txn_blobs,
         index_artifacts,
+        erased,
     );
 }
 
@@ -988,13 +993,18 @@ async fn run_flpack_import(
     config::write_active_ledger(dirs.data_dir(), ledger)?;
 
     let objects = result.commits + result.txn_blobs + result.index_artifacts;
+    let erased = match result.erased_commits {
+        0 => String::new(),
+        n => format!(", {n} erased commits"),
+    };
     println!(
-        "{} Imported '{}' — {} commits, {} txn blobs, {} index artifacts ({} objects)",
+        "{} Imported '{}' — {} commits, {} txn blobs, {} index artifacts{} ({} objects)",
         "✓".green(),
         result.ledger_id,
         result.commits,
         result.txn_blobs,
         result.index_artifacts,
+        erased,
         objects,
     );
 

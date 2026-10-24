@@ -18,7 +18,16 @@
 //! | Data     | `0x01`    | `cid_len:u16LE` + CID binary + `payload_len:u32LE` + raw  |
 //! | Error    | `0x02`    | `msg_len:u32LE` + UTF-8 message                           |
 //! | Manifest | `0x03`    | `payload_len:u32LE` + JSON bytes                          |
+//! | Erasure  | `0x04`    | `payload_len:u32LE` + JSON bytes (an erased commit)       |
+//! | Authorization | `0x05` | `payload_len:u32LE` + JSON bytes (an erasure request's)  |
+//! | Erasure artifact | `0x06` | `kind:u8` + `payload_len:u32LE` + raw                  |
 //! | End      | `0xFF`    | (no payload)                                              |
+//!
+//! A permanently erased commit travels as an Erasure frame at its place in
+//! the history, never as a Data frame: its replacement does not match its
+//! CID. Its replacement, proofs and authorization travel in the frames after
+//! `0x03`, which decoders older than them refuse, so no receiver drops an
+//! erasure unknowingly.
 //!
 //! ## Design
 //!
@@ -56,6 +65,9 @@ const FRAME_HEADER: u8 = 0x00;
 const FRAME_DATA: u8 = 0x01;
 const FRAME_ERROR: u8 = 0x02;
 const FRAME_MANIFEST: u8 = 0x03;
+const FRAME_ERASURE: u8 = 0x04;
+const FRAME_AUTHORIZATION: u8 = 0x05;
+const FRAME_ERASURE_ARTIFACT: u8 = 0x06;
 const FRAME_END: u8 = 0xFF;
 
 // ============================================================================
@@ -83,6 +95,10 @@ pub enum PackError {
     /// Unknown frame type byte.
     #[error("invalid frame type: 0x{0:02x}")]
     InvalidFrameType(u8),
+
+    /// Unknown erasure artifact kind.
+    #[error("invalid erasure artifact kind: {0}")]
+    InvalidArtifactKind(u8),
 
     /// Frame payload exceeds configured maximum.
     #[error("payload too large: {size} bytes (max {max})")]
@@ -171,6 +187,11 @@ pub struct PackHeader {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_artifact_count: Option<u32>,
 
+    /// Number of permanently erased commits, sent as Erasure frames rather
+    /// than counted in `commit_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erased_commit_count: Option<u32>,
+
     /// Estimated total transfer size in bytes (commits + indexes).
     ///
     /// This is a rough estimate based on object counts and average sizes,
@@ -198,8 +219,51 @@ pub enum PackFrame {
     /// Phase manifest (e.g., index phase metadata).
     Manifest(serde_json::Value),
 
+    /// A permanently erased commit, at its place in the history: its
+    /// erasure chain.
+    Erasure(serde_json::Value),
+
+    /// What authorized an erasure request the stream's erasures name.
+    Authorization(serde_json::Value),
+
+    /// A file an erasure needs, named by the SHA-256 of its bytes.
+    ErasureArtifact {
+        kind: ErasureArtifactKind,
+        payload: Vec<u8>,
+    },
+
     /// End-of-stream marker.
     End,
+}
+
+/// What an erasure artifact is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErasureArtifactKind {
+    /// An erased commit's latest replacement.
+    Replacement,
+    /// A step's proof receipt.
+    Receipt,
+    /// An erasure request's control commit.
+    Control,
+}
+
+impl ErasureArtifactKind {
+    fn to_byte(self) -> u8 {
+        match self {
+            ErasureArtifactKind::Replacement => 0,
+            ErasureArtifactKind::Receipt => 1,
+            ErasureArtifactKind::Control => 2,
+        }
+    }
+
+    fn from_byte(byte: u8) -> PackResult<Self> {
+        match byte {
+            0 => Ok(ErasureArtifactKind::Replacement),
+            1 => Ok(ErasureArtifactKind::Receipt),
+            2 => Ok(ErasureArtifactKind::Control),
+            other => Err(PackError::InvalidArtifactKind(other)),
+        }
+    }
 }
 
 // ============================================================================
@@ -244,8 +308,30 @@ pub fn encode_error_frame(message: &str, out: &mut Vec<u8>) {
 
 /// Encode a Manifest frame (arbitrary JSON metadata).
 pub fn encode_manifest_frame(manifest: &serde_json::Value, out: &mut Vec<u8>) {
-    let json = serde_json::to_vec(manifest).expect("Manifest serialization cannot fail");
-    out.push(FRAME_MANIFEST);
+    encode_json(FRAME_MANIFEST, manifest, out);
+}
+
+/// Encode an Erasure frame.
+pub fn encode_erasure_frame(erasure: &serde_json::Value, out: &mut Vec<u8>) {
+    encode_json(FRAME_ERASURE, erasure, out);
+}
+
+/// Encode an Authorization frame.
+pub fn encode_authorization_frame(authorization: &serde_json::Value, out: &mut Vec<u8>) {
+    encode_json(FRAME_AUTHORIZATION, authorization, out);
+}
+
+/// Encode an Erasure artifact frame.
+pub fn encode_erasure_artifact_frame(kind: ErasureArtifactKind, payload: &[u8], out: &mut Vec<u8>) {
+    out.push(FRAME_ERASURE_ARTIFACT);
+    out.push(kind.to_byte());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+}
+
+fn encode_json(frame: u8, value: &serde_json::Value, out: &mut Vec<u8>) {
+    let json = serde_json::to_vec(value).expect("JSON frame serialization cannot fail");
+    out.push(frame);
     out.extend_from_slice(&(json.len() as u32).to_le_bytes());
     out.extend_from_slice(&json);
 }
@@ -288,21 +374,19 @@ pub fn decode_frame(data: &[u8], max_payload: u32) -> PackResult<(PackFrame, usi
         return Err(PackError::Incomplete(1));
     }
     match data[0] {
-        FRAME_HEADER => decode_json_frame(data, max_payload, true),
+        FRAME_HEADER | FRAME_MANIFEST | FRAME_ERASURE | FRAME_AUTHORIZATION => {
+            decode_json_frame(data, max_payload)
+        }
         FRAME_DATA => decode_data_frame(data, max_payload),
         FRAME_ERROR => decode_error_frame(data, max_payload),
-        FRAME_MANIFEST => decode_json_frame(data, max_payload, false),
+        FRAME_ERASURE_ARTIFACT => decode_erasure_artifact_frame(data, max_payload),
         FRAME_END => Ok((PackFrame::End, 1)),
         other => Err(PackError::InvalidFrameType(other)),
     }
 }
 
-/// Decode a JSON-payload frame (Header or Manifest).
-fn decode_json_frame(
-    data: &[u8],
-    max_payload: u32,
-    is_header: bool,
-) -> PackResult<(PackFrame, usize)> {
+/// Decode a JSON-payload frame.
+fn decode_json_frame(data: &[u8], max_payload: u32) -> PackResult<(PackFrame, usize)> {
     // type(1) + payload_len(4)
     if data.len() < 5 {
         return Err(PackError::Incomplete(5));
@@ -315,13 +399,34 @@ fn decode_json_frame(
         return Err(PackError::Incomplete(total));
     }
     let json_bytes = &data[5..total];
-    if is_header {
+    if data[0] == FRAME_HEADER {
         let header: PackHeader = serde_json::from_slice(json_bytes)?;
-        Ok((PackFrame::Header(header), total))
-    } else {
-        let value: serde_json::Value = serde_json::from_slice(json_bytes)?;
-        Ok((PackFrame::Manifest(value), total))
+        return Ok((PackFrame::Header(header), total));
     }
+    let value: serde_json::Value = serde_json::from_slice(json_bytes)?;
+    let frame = match data[0] {
+        FRAME_ERASURE => PackFrame::Erasure(value),
+        FRAME_AUTHORIZATION => PackFrame::Authorization(value),
+        _ => PackFrame::Manifest(value),
+    };
+    Ok((frame, total))
+}
+
+/// Decode an Erasure artifact frame.
+fn decode_erasure_artifact_frame(data: &[u8], max_payload: u32) -> PackResult<(PackFrame, usize)> {
+    // type(1) + kind(1) + payload_len(4)
+    if data.len() < 6 {
+        return Err(PackError::Incomplete(6));
+    }
+    let kind = ErasureArtifactKind::from_byte(data[1])?;
+    let payload_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+    check_payload_size(payload_len, max_payload)?;
+    let total = 6 + payload_len as usize;
+    if data.len() < total {
+        return Err(PackError::Incomplete(total));
+    }
+    let payload = data[6..total].to_vec();
+    Ok((PackFrame::ErasureArtifact { kind, payload }, total))
 }
 
 /// Decode a Data frame.
@@ -485,6 +590,7 @@ impl PackHeader {
             server_max_frame_bytes: Some(DEFAULT_MAX_PAYLOAD),
             commit_count,
             index_artifact_count: None,
+            erased_commit_count: None,
             estimated_total_bytes: 0,
         }
     }
@@ -507,6 +613,7 @@ impl PackHeader {
             server_max_frame_bytes: Some(DEFAULT_MAX_PAYLOAD),
             commit_count,
             index_artifact_count,
+            erased_commit_count: None,
             estimated_total_bytes,
         }
     }
@@ -726,6 +833,38 @@ mod tests {
     }
 
     // --- End frame ---
+
+    #[test]
+    fn erasure_frames_roundtrip() {
+        let chain = serde_json::json!({"commit": "c", "steps": []});
+        let mut buf = Vec::new();
+        encode_erasure_frame(&chain, &mut buf);
+        encode_authorization_frame(&serde_json::json!({"requestId": "r"}), &mut buf);
+        encode_erasure_artifact_frame(ErasureArtifactKind::Receipt, b"receipt", &mut buf);
+        let (frame, used) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert!(matches!(frame, PackFrame::Erasure(v) if v == chain));
+        let rest = &buf[used..];
+        let (frame, used) = decode_frame(rest, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert!(matches!(frame, PackFrame::Authorization(v) if v["requestId"] == "r"));
+        let rest = &rest[used..];
+        let (frame, used) = decode_frame(rest, DEFAULT_MAX_PAYLOAD).unwrap();
+        assert!(matches!(
+            frame,
+            PackFrame::ErasureArtifact { kind: ErasureArtifactKind::Receipt, payload }
+                if payload == b"receipt"
+        ));
+        assert_eq!(used, rest.len());
+        assert!(matches!(
+            decode_frame(&rest[..3], DEFAULT_MAX_PAYLOAD),
+            Err(PackError::Incomplete(6))
+        ));
+        let mut unknown = rest.to_vec();
+        unknown[1] = 9;
+        assert!(matches!(
+            decode_frame(&unknown, DEFAULT_MAX_PAYLOAD),
+            Err(PackError::InvalidArtifactKind(9))
+        ));
+    }
 
     #[test]
     fn test_end_frame_roundtrip() {

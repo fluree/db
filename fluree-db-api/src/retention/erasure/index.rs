@@ -81,6 +81,14 @@ impl ErasedCommit {
         slots.sort_unstable();
         slots
     }
+
+    /// The chain's identity: the SHA-256 (hex) of its commit, signing
+    /// ledger and steps.
+    pub fn digest(&self) -> String {
+        let canonical = serde_json::to_vec(&(&self.commit, &self.ledger_id, &self.steps))
+            .expect("an erasure chain serializes");
+        sha256_hex(&canonical)
+    }
 }
 
 /// What an artifact is.
@@ -88,6 +96,8 @@ impl ErasedCommit {
 pub(crate) enum Artifact {
     Replacement,
     Proof,
+    /// An erasure request's control commit, kept for transfers to carry.
+    Control,
 }
 
 impl Artifact {
@@ -95,6 +105,7 @@ impl Artifact {
         match self {
             Artifact::Replacement => format!("replacement/{hex}.fcr"),
             Artifact::Proof => format!("proof/{hex}.receipt"),
+            Artifact::Control => format!("control/{hex}.fcv2"),
         }
     }
 }
@@ -359,12 +370,7 @@ impl ErasureIndex {
         namespace: &StorageNamespace,
         original: &ContentId,
     ) -> Result<bool> {
-        let address = content_address(
-            self.storage.storage_method(),
-            ContentKind::Commit,
-            namespace,
-            &original.address_digest(),
-        );
+        let address = self.commit_address(namespace, original);
         if self.storage.exists(&address).await? {
             return Ok(true);
         }
@@ -372,6 +378,16 @@ impl ErasureIndex {
             .erased(original)
             .await?
             .is_some_and(|e| e.replaced_at.contains(&address)))
+    }
+
+    /// Where `namespace` keeps commit `cid`.
+    pub(crate) fn commit_address(&self, namespace: &StorageNamespace, cid: &ContentId) -> String {
+        content_address(
+            self.storage.storage_method(),
+            ContentKind::Commit,
+            namespace,
+            &cid.address_digest(),
+        )
     }
 
     /// Record that the erased originals at `addresses` are read there as
@@ -431,7 +447,9 @@ impl ErasureIndex {
         )
     }
 
-    async fn verify(&self, erased: &ErasedCommit) -> Result<Arc<[u8]>> {
+    /// `erased`'s latest replacement, once its stored receipts verify it
+    /// against the pinned guest images, bound to the original and its slots.
+    pub(crate) async fn verify(&self, erased: &ErasedCommit) -> Result<Arc<[u8]>> {
         let last = erased.steps.last().ok_or_else(|| {
             ApiError::internal(format!("erasure of {} has no steps", erased.commit))
         })?;
@@ -505,6 +523,53 @@ impl ErasureIndex {
             )));
         }
         Ok(bytes)
+    }
+
+    /// What authorized erasure request `request_id`, as stored when it was
+    /// published here or received.
+    pub(crate) async fn authorization(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<super::transfer::Authorization>> {
+        let Some(bytes) = self
+            .read_raw(&self.authorization_address(request_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| ApiError::internal(format!("erasure authorization {request_id}: {e}")))
+    }
+
+    /// Store what authorized an erasure request. One held already must be
+    /// the same.
+    pub(crate) async fn put_authorization(
+        &self,
+        authorization: &super::transfer::Authorization,
+    ) -> Result<()> {
+        if let Some(held) = self.authorization(&authorization.request_id).await? {
+            if held == *authorization {
+                return Ok(());
+            }
+            return Err(ApiError::http(
+                409,
+                format!(
+                    "the authorization of erasure request {} differs from the one this storage \
+                     holds",
+                    authorization.request_id
+                ),
+            ));
+        }
+        let bytes =
+            serde_json::to_vec(authorization).map_err(|e| ApiError::internal(e.to_string()))?;
+        let address = self.authorization_address(&authorization.request_id);
+        self.storage.write_bytes(&address, &bytes).await?;
+        Ok(())
+    }
+
+    fn authorization_address(&self, request_id: &str) -> String {
+        self.address(&format!("authorization/{request_id}.json"))
     }
 
     /// Publish erasures: one immutable map object, then the index. From

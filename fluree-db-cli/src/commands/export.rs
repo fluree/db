@@ -249,13 +249,14 @@ async fn run_ledger_archive(
                 }
             };
             eprintln!(
-                "{} Archived '{}' → {} ({} commits, {} txn blobs, {} index artifacts)",
+                "{} Archived '{}' → {} ({} commits, {} txn blobs, {} index artifacts{})",
                 "✓".green(),
                 alias,
                 path.display(),
                 stats.commits_sent,
                 stats.txn_blobs_sent,
                 stats.index_artifacts_sent,
+                erased_note(&stats),
             );
         }
         None => {
@@ -272,16 +273,25 @@ async fn run_ledger_archive(
                 .await?;
             // stdout already owns its bytes; nothing to clean up on failure.
             eprintln!(
-                "{} Archived '{}' to stdout ({} commits, {} txn blobs, {} index artifacts)",
+                "{} Archived '{}' to stdout ({} commits, {} txn blobs, {} index artifacts{})",
                 "✓".green(),
                 alias,
                 stats.commits_sent,
                 stats.txn_blobs_sent,
                 stats.index_artifacts_sent,
+                erased_note(&stats),
             );
         }
     }
     Ok(())
+}
+
+/// Permanently erased commits travel as their erasures, and without an index.
+fn erased_note(stats: &fluree_db_api::pack::PackStreamResult) -> String {
+    match stats.erased_commits_sent {
+        0 => String::new(),
+        n => format!(", {n} erased commits; no index travels with erased history"),
+    }
 }
 
 /// Remote variant of `run_ledger_archive`.

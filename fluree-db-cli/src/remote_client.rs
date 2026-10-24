@@ -2970,7 +2970,12 @@ where
                             "remote pack error: {msg}"
                         )));
                     }
-                    PackFrame::Header(_) | PackFrame::Data { .. } | PackFrame::Manifest(_) => {
+                    PackFrame::Header(_)
+                    | PackFrame::Data { .. }
+                    | PackFrame::Manifest(_)
+                    | PackFrame::Erasure(_)
+                    | PackFrame::Authorization(_)
+                    | PackFrame::ErasureArtifact { .. } => {
                         writer.write_all(&buf[..consumed]).await.map_err(|e| {
                             RemoteLedgerError::Network(format!("archive write: {e}"))
                         })?;
@@ -3877,7 +3882,10 @@ mod tests {
                     frames_seen.push("end");
                     break;
                 }
-                PackFrame::Error(_) => panic!("unexpected error frame"),
+                PackFrame::Error(_)
+                | PackFrame::Erasure(_)
+                | PackFrame::Authorization(_)
+                | PackFrame::ErasureArtifact { .. } => panic!("unexpected frame"),
             }
         }
         assert_eq!(

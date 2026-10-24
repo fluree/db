@@ -399,7 +399,7 @@ async fn an_erasure_reaches_every_branch_holding_the_commit() {
 }
 
 #[tokio::test]
-async fn an_erased_commit_is_neither_written_back_nor_transferred() {
+async fn an_erased_commit_is_never_written_back() {
     let dir = tempfile::tempdir().unwrap();
     let fluree = erasing(&dir, Arc::new(NativeProver::default()));
     let id = ledger(&fluree, "it/erase-transfer").await;
@@ -426,13 +426,6 @@ async fn an_erased_commit_is_neither_written_back_nor_transferred() {
     store.put_with_id(&cid, &original).await.unwrap();
     assert!(!file.exists(), "the original was written back");
     assert!(is_replacement(&store.get(&cid).await.unwrap()));
-    // An archive would carry the replacement as the commit: refused.
-    let mut archive = Vec::new();
-    let refused = fluree.archive_ledger(&id, false, &mut archive).await;
-    assert!(
-        matches!(&refused, Err(e) if e.to_string().contains("permanently erased")),
-        "{refused:?}"
-    );
 }
 
 #[tokio::test]
@@ -3030,3 +3023,6 @@ async fn an_erasure_refuses_the_same_history_at_every_stage() {
         "a removal the copy never held"
     );
 }
+
+#[path = "it_retention_erasure_transfer.rs"]
+mod transfer;
