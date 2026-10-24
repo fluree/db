@@ -649,18 +649,6 @@ impl Fluree {
             else {
                 continue;
             };
-            if let Some(unindexed) = removal.flakes.iter().find(|f| f.t > removal.index_t) {
-                if let crate::IndexingMode::Background(handle) = &self.indexing_mode {
-                    drop(handle.trigger(&record.ledger_id, unindexed.t).await);
-                }
-                return Err(ApiError::http(
-                    503,
-                    format!(
-                        "{} has not indexed t={}, which the transfer erases; retry once it has",
-                        record.ledger_id, unindexed.t
-                    ),
-                ));
-            }
             prepared.holders.push(Holder {
                 record,
                 removal,
@@ -753,15 +741,19 @@ impl Fluree {
                 .collect();
             let scope_t = removal.scope_t;
             self.record_received_removal(removal).await?;
-            if self.erase_from_held_index(&record, &captured).await? == Erased::NeedsRebuild {
-                let store = self
+            // Its unindexed commits read as the erasures will have them.
+            let reading: Arc<dyn ContentStore> = Arc::new(Substituted {
+                inner: self
                     .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
-                    .await?;
-                let store: Arc<dyn ContentStore> = Arc::new(Substituted {
-                    inner: store,
-                    replacements: replacements.clone(),
-                });
-                self.rebuild_index_from(store, &record).await?;
+                    .await?,
+                replacements: replacements.clone(),
+            });
+            if self
+                .erase_from_held_index(&record, &captured, Some(reading.clone()))
+                .await?
+                == Erased::NeedsRebuild
+            {
+                self.rebuild_index_from(reading.clone(), &record).await?;
             }
             #[cfg(test)]
             hooks::stop(hooks::Stop::AfterHolder)?;
@@ -774,13 +766,9 @@ impl Fluree {
                 // From here on nothing current holds an erased value, and
                 // no transaction can retract one.
                 Some(guard) => {
-                    let store = self
-                        .content_store_for_record_or_id(
-                            Some(&current),
-                            &current.storage_namespace(),
-                        )
+                    let state = self
+                        .load_queryable_state_with_store(reading, current)
                         .await?;
-                    let state = self.load_queryable_state_with_store(store, current).await?;
                     guard.ledger().sync_binary_store_from_state(&state).await;
                     guard.replace(state);
                 }
@@ -815,6 +803,15 @@ impl Fluree {
             })
             .collect();
         index.publish(published).await?;
+        // Their cached states read through the substituting store until
+        // now; they read the published erasures from here on.
+        if let Some(manager) = &self.ledger_manager {
+            for ledger_id in &reconciled {
+                if let Ok(id) = fluree_db_core::LedgerId::parse(ledger_id) {
+                    manager.disconnect(&id).await;
+                }
+            }
+        }
         #[cfg(test)]
         hooks::stop(hooks::Stop::AfterPublish)?;
         let mut by_branch: BTreeMap<&str, Vec<super::ErasureJob>> = BTreeMap::new();

@@ -211,7 +211,6 @@ writes nothing to the ledgers here, when:
 - an erasure fails a check;
 - an erasure differs from the one this storage holds for the same commit (a chain that is the same, or
   one this storage has already extended, is accepted);
-- a ledger here holding an erased original has not indexed that commit yet (`503`; retry once it has);
 - a ledger here retracts an erased value in a commit of its own, which the archive does not erase
   (`409`; erase it there with a request);
 - a ledger here has a full-text or vector index that reads an erased property and that this instance

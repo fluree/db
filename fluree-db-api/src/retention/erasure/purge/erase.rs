@@ -37,7 +37,7 @@ impl Fluree {
         captured: &[Captured],
     ) -> Result<Erased> {
         let _maintenance = self.hold_indexing(&record.ledger_id).await?;
-        let erased = self.erase_from_held_index(record, captured).await?;
+        let erased = self.erase_from_held_index(record, captured, None).await?;
         if erased == Erased::Leafwise {
             if let Some(manager) = &self.ledger_manager {
                 manager.disconnect(&record.ledger_id).await;
@@ -62,11 +62,14 @@ impl Fluree {
     }
 
     /// [`Self::erase_from_index`], its indexing already held and its cached
-    /// state left to the caller.
+    /// state left to the caller. `reading` reads its commits, when a store
+    /// must substitute erasures not yet published: a build reads its
+    /// unindexed commits.
     pub(crate) async fn erase_from_held_index(
         &self,
         record: &NsRecord,
         captured: &[Captured],
+        reading: Option<std::sync::Arc<dyn fluree_db_core::ContentStore>>,
     ) -> Result<Erased> {
         // As the quiesced builds left it.
         let Some(record) = self.nameservice().lookup(&record.ledger_id).await? else {
@@ -76,9 +79,13 @@ impl Fluree {
         let Some(root_id) = record.index_head_id.clone() else {
             return Ok(Erased::Nothing);
         };
-        let store = self
-            .content_store_for_record_or_id(Some(record), &record.storage_namespace())
-            .await?;
+        let store = match reading {
+            Some(store) => store,
+            None => {
+                self.content_store_for_record_or_id(Some(record), &record.storage_namespace())
+                    .await?
+            }
+        };
         let state = self
             .load_queryable_state_with_store(store.clone(), record.clone())
             .await?;
@@ -136,7 +143,9 @@ impl Fluree {
                 let config = self
                     .rebuild_config(&record.ledger_id, Some(&state), Default::default())
                     .await?;
-                incremental_index_erasing(
+                // As the indexer does when an incremental build fails, a
+                // full one follows.
+                match incremental_index_erasing(
                     store,
                     fluree_db_core::tracking::Tracker::disabled(),
                     record.ledger_id.as_str(),
@@ -144,7 +153,14 @@ impl Fluree {
                     config,
                     &erasure,
                 )
-                .await?
+                .await
+                {
+                    Ok(built) => built,
+                    Err(e) => {
+                        tracing::warn!(ledger = %record.ledger_id, error = %e, "erasure: incremental erase failed, rebuilding");
+                        return Ok(Erased::NeedsRebuild);
+                    }
+                }
             }
         };
         self.publisher()?

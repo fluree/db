@@ -318,7 +318,6 @@ impl Fluree {
                 ledger_id,
                 since: read.since(),
                 scope_t: read.scope_t,
-                index_t: read.index_t,
                 removals,
                 flakes: found.located.into_iter().map(|l| l.flake).collect(),
             }));
@@ -377,7 +376,6 @@ impl Fluree {
         Ok(Some(History {
             ledger_id: ledger_id.to_string(),
             scope_t,
-            index_t: record.index_t,
             store,
             state,
             commits,
@@ -434,8 +432,6 @@ impl Fluree {
 struct History {
     ledger_id: String,
     scope_t: i64,
-    #[cfg_attr(not(feature = "native"), allow(dead_code))]
-    index_t: i64,
     store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
     state: fluree_db_ledger::LedgerState,
     /// Oldest first.
@@ -459,9 +455,8 @@ impl History {
 pub(crate) struct ReceivedRemoval {
     pub(crate) ledger_id: String,
     since: i64,
-    /// The ledger's head `t`, and its index's, when it was computed.
+    /// The ledger's head `t` when it was computed.
     pub(crate) scope_t: i64,
-    pub(crate) index_t: i64,
     pub(crate) removals: Vec<Removal>,
     /// The removed operations, as the ledger's history holds them.
     pub(crate) flakes: Vec<Flake>,

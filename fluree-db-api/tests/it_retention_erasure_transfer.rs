@@ -836,13 +836,63 @@ async fn a_restore_erases_history_a_ledger_here_holds() {
     );
 }
 
-/// A ledger here that cannot be made to read as an erasure does is a
-/// reason to refuse the restore, before anything is written there: one
-/// whose index does not cover the erased commit yet (retry once it does),
-/// and one whose own commit retracts the erased value, which only a prover
-/// could erase.
+/// A ledger here that has not indexed the erased commit reads as the erasure
+/// does all the same: its unindexed commits are read as their replacements.
 #[tokio::test]
-async fn a_restore_is_refused_where_a_ledger_here_cannot_follow() {
+async fn a_restore_reaches_a_ledger_that_has_not_indexed_the_commit() {
+    use std::time::Duration;
+
+    let (_dir, _source, _, t1, _, before, after) =
+        erased_between_archives("it/transfer-unindexed").await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/transfer-unindexed-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let record = receiver.nameservice().lookup(&held).await.unwrap().unwrap();
+    assert_eq!(record.index_head_id, None, "nothing indexed");
+    let restored = receiver
+        .restore_ledger("it/transfer-unindexed-again", &mut after.as_slice())
+        .await
+        .unwrap();
+    assert_eq!(restored.reconciled, [held.as_str()], "{restored:?}");
+    assert!(objects(&receiver, &held, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    let past = receiver
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{held}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+    reindex(&receiver, &held).await;
+    assert!(objects(&receiver, &held, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    let report = receiver
+        .run_purge_pass(&held, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A ledger here whose own commit retracts the erased value cannot be made to
+/// read as the erasure does: only a prover could erase that commit. The
+/// restore is refused before anything is written there.
+#[tokio::test]
+async fn a_restore_is_refused_where_a_ledger_here_retracted_the_value() {
     let (_dir, _source, _, _, _, before, after) =
         erased_between_archives("it/transfer-cannot").await;
     let here = tempfile::tempdir().unwrap();
@@ -852,34 +902,6 @@ async fn a_restore_is_refused_where_a_ledger_here_cannot_follow() {
         .await
         .unwrap()
         .ledger_id;
-    let untouched = |receiver: &Fluree| {
-        let receiver = receiver.clone();
-        let held = held.clone();
-        async move {
-            let journal = receiver
-                .retention_status(&held)
-                .await
-                .unwrap()
-                .registration
-                .map(|r| r.journal.removals.len());
-            assert_eq!(journal.unwrap_or(0), 0, "nothing journaled");
-        }
-    };
-
-    let refused = receiver
-        .restore_ledger("it/transfer-cannot-again", &mut after.as_slice())
-        .await
-        .expect_err("not indexed");
-    assert!(
-        refused.status_code() == 503 && refused.to_string().contains("has not indexed"),
-        "{refused}"
-    );
-    untouched(&receiver).await;
-    assert_eq!(
-        objects(&receiver, &held, "ex:alice", "ex:email").await,
-        vec![json!("a@secret")]
-    );
-
     receiver
         .graph(&held)
         .transact()
@@ -899,7 +921,13 @@ async fn a_restore_is_refused_where_a_ledger_here_cannot_follow() {
         refused.status_code() == 409 && refused.to_string().contains("without a prover"),
         "{refused}"
     );
-    untouched(&receiver).await;
+    let journal = receiver
+        .retention_status(&held)
+        .await
+        .unwrap()
+        .registration
+        .map(|r| r.journal.removals.len());
+    assert_eq!(journal.unwrap_or(0), 0, "nothing journaled");
 }
 
 /// A ledger's full-text index here that reads the erased property is
@@ -1282,4 +1310,77 @@ async fn a_restore_refused_for_its_manifest_changes_nothing_here() {
     ));
     let registration = receiver.retention_status(&held).await.unwrap().registration;
     assert!(registration.is_none(), "{registration:?}");
+}
+
+/// A ledger here whose index holds one erased value while another is in its
+/// unindexed commits loses both: the build that erases the indexed one reads
+/// the unindexed commits as their replacements.
+#[tokio::test]
+async fn a_restore_erases_indexed_and_unindexed_values_alike() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/transfer-mixed").await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    reindex(&source, &id).await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@secret"}),
+    )
+    .await;
+    let mut before = Vec::new();
+    source.archive_ledger(&id, true, &mut before).await.unwrap();
+    let both = ErasureRequest {
+        matching: ["alice", "carol"]
+            .into_iter()
+            .map(|who| FactSelector {
+                subject: format!("http://example.org/{who}"),
+                predicate: "http://example.org/email".into(),
+                graph: None,
+                object: None,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    erase_published(&source, &id, both).await;
+    let after = archive(&source, &id).await;
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/transfer-mixed-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let record = receiver.nameservice().lookup(&held).await.unwrap().unwrap();
+    assert_eq!((record.index_t, record.commit_t), (1, 2));
+    receiver
+        .restore_ledger("it/transfer-mixed-again", &mut after.as_slice())
+        .await
+        .unwrap();
+    for who in ["ex:alice", "ex:carol"] {
+        assert!(
+            objects(&receiver, &held, who, "ex:email").await.is_empty(),
+            "{who}"
+        );
+    }
+    let report = receiver
+        .run_purge_pass(&held, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    for secret in ["a@secret", "c@secret"] {
+        assert_eq!(
+            files_holding(here.path(), secret),
+            Vec::<std::path::PathBuf>::new(),
+            "{secret}"
+        );
+    }
 }
