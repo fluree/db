@@ -755,7 +755,8 @@ impl BinaryCursor {
             let r_ot = base.o_type.get_or(ri, 0);
             let r_ok = base.o_key.get(ri);
             let r_oi = base.o_i.get_or(ri, u32::MAX);
-            let r_g = base.g_id.get_or(ri, 0);
+            // Only the pooled tree has a graph column to compare.
+            let r_g = if pooled { base.g_id.get_or(ri, 0) } else { 0 };
 
             match cmp_row_vs_overlay(r_s, r_p, r_ot, r_ok, r_oi, r_g, ov, order) {
                 std::cmp::Ordering::Less => {
@@ -920,6 +921,8 @@ fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch, order: RunSortOrder)
     // outside the range have a different leading value, so they can't match a
     // filter that pins it — the output is identical to a full scan.
     let (start, end) = leading_bound_range(filter, batch, order);
+    // Only a scan of one pooled graph filters on the graph column.
+    let check_graph = filter.g_id.is_some();
     let mut matching: Vec<usize> = Vec::new();
     for i in start..end {
         let s_id = batch.s_id.get(i); // always present
@@ -928,7 +931,7 @@ fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch, order: RunSortOrder)
         let o_type = batch.o_type.get_or(i, 0);
         let o_i = batch.o_i.get_or(i, u32::MAX);
         if filter.matches(s_id, p_id, o_type, o_key, o_i)
-            && filter.matches_graph(batch.g_id.get_or(i, 0))
+            && (!check_graph || filter.matches_graph(batch.g_id.get_or(i, 0)))
         {
             matching.push(i);
         }
