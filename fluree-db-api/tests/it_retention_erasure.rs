@@ -2209,6 +2209,105 @@ async fn a_purge_rebuilds_a_full_text_index_over_a_holder() {
     assert!(index.term_idx("zephyr").is_none());
 }
 
+/// A purge rebuilds only the full-text indexes that read an erased
+/// property: one over another property never held the value.
+#[tokio::test]
+async fn a_purge_leaves_a_full_text_index_that_never_read_the_property() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-other-index").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice",
+               "ex:email": "confidential zephyr", "ex:bio": "ordinary note"}),
+    )
+    .await;
+    for (name, property) in [("it-email", "ex:email"), ("it-bio", "ex:bio")] {
+        fluree
+            .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+                name,
+                &id,
+                json!({
+                    "@context": ctx(),
+                    "where": [{"@id": "?x", "@type": "ex:Person"}],
+                    "select": {"?x": ["@id", property]}
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+    publish_erasure(&fluree, &id, email("alice", "confidential zephyr")).await;
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (1, 1), "only it-email is rebuilt");
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A full-text index dropped before the purge is no longer listed, but a
+/// soft drop leaves its files: the purge deletes them.
+#[tokio::test]
+async fn a_purge_deletes_what_a_dropped_full_text_index_left() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-dropped-index").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "confidential zephyr"}),
+    )
+    .await;
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-dropped-search",
+            &id,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Person"}],
+                "select": {"?x": ["@id", "ex:email"]}
+            }),
+        ))
+        .await
+        .unwrap();
+    publish_erasure(&fluree, &id, email("alice", "confidential zephyr")).await;
+    fluree
+        .drop_graph_source("it-dropped-search", None, fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    let mut purged = 0;
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!(purged, 1);
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
 /// The retention worker purges a published erasure by itself: its
 /// originals, and every file that held the value, are gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

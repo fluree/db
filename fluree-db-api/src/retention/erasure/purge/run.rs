@@ -190,7 +190,7 @@ impl Fluree {
             for branch in &plan.rebuild {
                 self.collapse_index(branch).await?;
             }
-            report.deleted += self.release_source_leftovers(&plan.sources).await?;
+            report.deleted += self.release_source_leftovers(&plan).await?;
             let ledgers: BTreeSet<LedgerName> = plan
                 .rebuild
                 .iter()
@@ -497,7 +497,7 @@ impl Fluree {
         for (record, _) in self.dropped_holders(&commits).await? {
             trees.insert(record.storage_namespace().root().as_str().to_string());
         }
-        for source in &plan.sources {
+        for source in plan.sources.iter().chain(&plan.dropped_sources) {
             if let Ok(namespace) = fluree_db_core::StorageNamespace::parse_graph_source(source) {
                 trees.insert(namespace.branch_prefix().to_string());
             }

@@ -214,7 +214,7 @@ impl Fluree {
             unreleased: {
                 let mut files = self.dropped_index_files(&plan.commits).await?;
                 files.extend(self.retracted_index_files(&plan.retracted).await?);
-                files.extend(self.source_leftovers(&plan.sources).await?);
+                files.extend(self.source_leftovers(plan).await?);
                 files
             },
             in_use: in_use.len(),

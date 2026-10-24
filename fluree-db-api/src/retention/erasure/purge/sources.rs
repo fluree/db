@@ -1,12 +1,14 @@
-//! The full-text and vector indexes over a purge's holders, which keep
-//! their own copies of what they index: rebuilt from the holders as they
-//! are, then every file of theirs but the head's released.
+//! The full-text and vector indexes over a purge's holders that may read
+//! an erased property, which keep their own copies of what they index:
+//! rebuilt from the holders as they are, then every file of theirs but the
+//! head's released, and every file of one dropped since.
 
 use std::collections::BTreeSet;
 
 use fluree_db_core::{content_address, ContentId, ContentKind, StorageNamespace};
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
 
+use super::PurgePlan;
 use crate::{ApiError, Fluree, Result};
 
 impl Fluree {
@@ -60,9 +62,10 @@ impl Fluree {
         Ok(sources.len())
     }
 
-    /// The files of `sources` their heads do not use: earlier manifests and
-    /// snapshots, which hold what the rebuild left out.
-    pub(super) async fn source_leftovers(&self, sources: &[String]) -> Result<Vec<String>> {
+    /// The files of `plan`'s sources their heads do not use: earlier
+    /// manifests and snapshots, which hold what the rebuild left out. A
+    /// dropped source uses none.
+    pub(super) async fn source_leftovers(&self, plan: &PurgePlan) -> Result<Vec<String>> {
         let runtime = self.erasure_runtime()?;
         let storage = runtime.index.address_prefix();
         let method = storage
@@ -71,13 +74,16 @@ impl Fluree {
             .unwrap_or("file")
             .to_string();
         let mut leftovers = Vec::new();
-        for id in sources {
+        for id in plan.sources.iter().chain(&plan.dropped_sources) {
             let Some(record) = self.nameservice().lookup_graph_source(id).await? else {
                 continue;
             };
             let namespace = StorageNamespace::parse_graph_source(id)
                 .map_err(|e| ApiError::internal(format!("{id}: {e}")))?;
-            let keep = self.kept_by_head(&record, &method, &namespace).await?;
+            let keep = match record.retracted {
+                true => BTreeSet::new(),
+                false => self.kept_by_head(&record, &method, &namespace).await?,
+            };
             for kind in [ContentKind::IndexRoot, ContentKind::GraphSourceSnapshot] {
                 let any = content_address(&method, kind, &namespace, "");
                 let Some((folder, _)) = any.rsplit_once('/') else {
@@ -94,10 +100,10 @@ impl Fluree {
     }
 
     /// Delete what [`Self::source_leftovers`] names. Returns how many.
-    pub(super) async fn release_source_leftovers(&self, sources: &[String]) -> Result<usize> {
+    pub(super) async fn release_source_leftovers(&self, plan: &PurgePlan) -> Result<usize> {
         let runtime = self.erasure_runtime()?;
         let mut deleted = 0;
-        for address in self.source_leftovers(sources).await? {
+        for address in self.source_leftovers(plan).await? {
             if runtime.index.delete_raw(&address).await? {
                 deleted += 1;
             }

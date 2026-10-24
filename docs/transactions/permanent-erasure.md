@@ -117,8 +117,10 @@ resumes where an interrupted one stopped.
 1. **Indexes.** Every branch that holds an erased commit has its index rewritten without the erased
    events. Usually only the leaves that hold them are rewritten. The branch is rebuilt from the
    replacements instead when an erased value lives outside the leaves (a big number, vector, geometry,
-   full-text value or triple term). Full-text (BM25) and vector indexes over such a branch are rebuilt
-   from scratch. A soft-dropped ledger that holds an erased
+   full-text value or triple term). Full-text (BM25) and vector indexes over a holding branch that read
+   an erased property are rebuilt from scratch; one that reads none of them never held the value and
+   is left alone. One dropped before the purge has every file it left deleted. A soft-dropped ledger
+   that holds an erased
    commit has its indexes deleted, and restoring it rebuilds them before it serves.
 2. **Grace.** The older indexes stay for 15 minutes (the index collector's minimum age), so queries
    reading them can finish. They are then released.
@@ -134,7 +136,8 @@ resumes where an interrupted one stopped.
 
 A pass that cannot go on records why in the job and tries again an hour later. The reasons are:
 
-- a full-text or vector index over a dropped ledger, which keeps its own copies (drop it first);
+- a full-text or vector index over a dropped ledger that reads an erased property, which keeps its own
+  copies (drop it first: the purge then deletes its files);
 - an instance that does not hold its storage's lock;
 - another process's write-ahead log under the storage;
 - a scan that finds something it cannot account for.
