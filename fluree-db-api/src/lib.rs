@@ -2869,7 +2869,9 @@ impl FlureeBuilder {
             self.secret_resolver,
         );
         // The storage root's lock keeps every other process out.
-        fluree.retention.watch.set_sole_writer();
+        if locked {
+            fluree.retention.watch.set_sole_writer();
+        }
         let _ = fluree.retention.erasure.set(erasure);
         fluree.root.pins = pins;
         fluree

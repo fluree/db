@@ -319,6 +319,38 @@ mod tests {
         assert_eq!(get(&watch), None);
     }
 
+    /// An instance holding its storage root's lock writes every journal
+    /// there; one opened without the lock may share the root with another.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn only_a_locked_root_makes_its_instance_the_sole_writer() {
+        for locked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut builder = crate::FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+                .without_indexing();
+            if !locked {
+                builder = builder.without_storage_lock();
+            }
+            let fluree = builder.build().unwrap();
+            fluree.create_ledger("w").await.unwrap();
+            let watch = &fluree.retention.watch;
+            let token = watch.token();
+            let record = fluree.nameservice().lookup("w:main").await.unwrap();
+            watch.learn("w:main", record.as_ref(), token);
+            fluree.suppression_for("w:main").await.unwrap();
+            assert_eq!(
+                matches!(
+                    get(watch),
+                    Some(Seen::Live {
+                        journal: Some(false),
+                        ..
+                    })
+                ),
+                locked
+            );
+        }
+    }
+
     #[test]
     fn a_journal_is_reported_only_to_its_sole_writer() {
         let watch = tracking();
