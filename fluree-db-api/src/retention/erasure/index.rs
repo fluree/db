@@ -572,6 +572,39 @@ impl ErasureIndex {
         self.address(&format!("authorization/{request_id}.json"))
     }
 
+    /// Record an activation of received erasures, before the first ledger
+    /// here changes for it, under `id`.
+    pub(crate) async fn put_pending(&self, id: &str, bytes: &[u8]) -> Result<()> {
+        self.storage
+            .write_bytes(&self.address(&format!("pending/{id}.json")), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Every activation recorded and not yet completed: (id, bytes).
+    pub(crate) async fn pending(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut pending = Vec::new();
+        for address in self.storage.list_prefix(&self.address("pending/")).await? {
+            let Some(id) = address
+                .rsplit_once('/')
+                .and_then(|(_, file)| file.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if let Some(bytes) = self.read_raw(&address).await? {
+                pending.push((id.to_string(), bytes));
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Forget a completed activation.
+    pub(crate) async fn complete_pending(&self, id: &str) -> Result<()> {
+        self.delete_raw(&self.address(&format!("pending/{id}.json")))
+            .await
+            .map(|_| ())
+    }
+
     /// Publish erasures: one immutable map object, then the index. From
     /// here on, this instance reads the originals as their replacements,
     /// and another on the same storage does within [`REFRESH`].

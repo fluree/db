@@ -5,7 +5,9 @@ use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{BinaryIndexStore, IndexRoot};
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::{ContentStore as _, Flake, FlakeValue, LedgerSnapshot, SubjectId};
-use fluree_db_indexer::{erase_index_events, ErasedEvent, IndexerConfig};
+use fluree_db_indexer::{
+    erase_index_events, incremental_index_erasing, ErasedEvent, IndexErasure, IndexerConfig,
+};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_query::binary_scan::encode_stored_object;
 
@@ -18,7 +20,8 @@ pub(crate) enum Erased {
     /// The index holds none of the events.
     Nothing,
     /// The leaves holding them, and the strings only they used, were
-    /// rewritten.
+    /// rewritten; a current row went as a retraction would take it, by an
+    /// incremental build.
     Leafwise,
     /// A value lives in a store leaf by leaf erasure does not rewrite: a
     /// numeric, vector, geometry or full-text arena, or a triple term.
@@ -34,7 +37,13 @@ impl Fluree {
         captured: &[Captured],
     ) -> Result<Erased> {
         let _maintenance = self.hold_indexing(&record.ledger_id).await?;
-        self.erase_from_held_index(record, captured).await
+        let erased = self.erase_from_held_index(record, captured).await?;
+        if erased == Erased::Leafwise {
+            if let Some(manager) = &self.ledger_manager {
+                manager.disconnect(&record.ledger_id).await;
+            }
+        }
+        Ok(erased)
     }
 
     /// Hold `ledger_id`'s indexing, as a reindex does: a build begun from a
@@ -52,7 +61,8 @@ impl Fluree {
         }
     }
 
-    /// [`Self::erase_from_index`], its indexing already held.
+    /// [`Self::erase_from_index`], its indexing already held and its cached
+    /// state left to the caller.
     pub(crate) async fn erase_from_held_index(
         &self,
         record: &NsRecord,
@@ -82,10 +92,11 @@ impl Fluree {
                 record.ledger_id
             )));
         };
-        let mut events = Vec::new();
+        let mut erasure = IndexErasure::default();
         for c in captured.iter().filter(|c| c.flake.t <= record.index_t) {
             match indexed_record(&state.snapshot, index, &c.flake)? {
-                Indexed::At(indexed) => events.push(ErasedEvent {
+                Indexed::At(indexed) if c.current => erasure.current.push(indexed),
+                Indexed::At(indexed) => erasure.events.push(ErasedEvent {
                     record: indexed,
                     assert: c.flake.op,
                 }),
@@ -94,23 +105,48 @@ impl Fluree {
                 Indexed::Unknown => return Ok(Erased::NeedsRebuild),
             }
         }
-        if events.is_empty() {
+        if erasure.events.is_empty() && erasure.current.is_empty() {
             return Ok(Erased::Nothing);
         }
         let root_bytes = store.get(&root_id).await?;
         let root = IndexRoot::decode(&root_bytes)
             .map_err(|e| ApiError::internal(format!("index root {root_id}: {e}")))?;
-        if events.iter().any(|e| !leafwise(&root, &e.record)) {
+        let records = erasure
+            .events
+            .iter()
+            .map(|e| &e.record)
+            .chain(&erasure.current);
+        if records.into_iter().any(|r| !leafwise(&root, r)) {
             return Ok(Erased::NeedsRebuild);
         }
-        let built = erase_index_events(
-            store,
-            record.ledger_id.as_str(),
-            &root_id,
-            &events,
-            &IndexerConfig::default(),
-        )
-        .await?;
+        let built = match erasure.current.is_empty() {
+            true => {
+                erase_index_events(
+                    store,
+                    record.ledger_id.as_str(),
+                    &root_id,
+                    &erasure.events,
+                    &IndexerConfig::default(),
+                )
+                .await?
+            }
+            // Its rows, and the statistics counting them, change as a
+            // retraction would change them.
+            false => {
+                let config = self
+                    .rebuild_config(&record.ledger_id, Some(&state), Default::default())
+                    .await?;
+                incremental_index_erasing(
+                    store,
+                    fluree_db_core::tracking::Tracker::disabled(),
+                    record.ledger_id.as_str(),
+                    record,
+                    config,
+                    &erasure,
+                )
+                .await?
+            }
+        };
         self.publisher()?
             .publish_index_allow_equal_fenced(
                 record.ledger_id.as_str(),
@@ -119,9 +155,6 @@ impl Fluree {
                 &built.root_id,
             )
             .await?;
-        if let Some(manager) = &self.ledger_manager {
-            manager.disconnect(&record.ledger_id).await;
-        }
         Ok(Erased::Leafwise)
     }
 }

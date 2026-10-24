@@ -180,7 +180,7 @@ impl Fluree {
         }
         let ledger_id = LedgerId::parse(ledger_id)?.to_string();
         for _ in 0..ATTEMPTS {
-            let Some(read) = self.read_history(&ledger_id).await? else {
+            let Some(read) = self.read_history(&ledger_id, None).await? else {
                 continue;
             };
             let Found {
@@ -284,12 +284,14 @@ impl Fluree {
     /// not recorded. Nothing is retracted: a retraction would hold the
     /// value, which this storage cannot erase without a prover; what is
     /// current leaves the ledger's index instead. `None` when its history
-    /// holds none of them.
+    /// holds none of them. `held` is the ledger's state under its write
+    /// lock, when the caller holds it.
     #[cfg(feature = "native")]
     pub(crate) async fn received_removal(
         &self,
         ledger_id: &str,
         occurrences: Vec<OccurrenceRef>,
+        held: Option<fluree_db_ledger::LedgerState>,
     ) -> Result<Option<ReceivedRemoval>> {
         let ledger_id = LedgerId::parse(ledger_id)?.to_string();
         let request = RemovalRequest {
@@ -302,7 +304,7 @@ impl Fluree {
             bounded: true,
         };
         for _ in 0..ATTEMPTS {
-            let Some(read) = self.read_history(&ledger_id).await? else {
+            let Some(read) = self.read_history(&ledger_id, held.clone()).await? else {
                 continue;
             };
             let found = match locate(&read, &request, widening) {
@@ -315,6 +317,7 @@ impl Fluree {
             return Ok(Some(ReceivedRemoval {
                 ledger_id,
                 since: read.since(),
+                scope_t: read.scope_t,
                 index_t: read.index_t,
                 removals,
                 flakes: found.located.into_iter().map(|l| l.flake).collect(),
@@ -335,8 +338,12 @@ impl Fluree {
     }
 
     /// `ledger_id`'s history, as of its head; `None` when the head moved
-    /// while it was read.
-    async fn read_history(&self, ledger_id: &str) -> Result<Option<History>> {
+    /// while it was read. `held` is its state, read under its write lock.
+    async fn read_history(
+        &self,
+        ledger_id: &str,
+        held: Option<fluree_db_ledger::LedgerState>,
+    ) -> Result<Option<History>> {
         let Some(record) = self.publisher()?.lookup(ledger_id).await? else {
             return Err(ApiError::NotFound(ledger_id.to_string()));
         };
@@ -347,7 +354,15 @@ impl Fluree {
         let store = self
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
             .await?;
-        let state = self.ledger(ledger_id).await?;
+        let state = match held {
+            Some(state) if state.t() != scope_t => {
+                return Err(ApiError::internal(format!(
+                    "{ledger_id}'s cached state is not at its head"
+                )))
+            }
+            Some(state) => state,
+            None => self.ledger(ledger_id).await?,
+        };
         if state.t() != scope_t {
             return Ok(None);
         }
@@ -444,7 +459,8 @@ impl History {
 pub(crate) struct ReceivedRemoval {
     pub(crate) ledger_id: String,
     since: i64,
-    /// The ledger's index `t` when it was computed.
+    /// The ledger's head `t`, and its index's, when it was computed.
+    pub(crate) scope_t: i64,
     pub(crate) index_t: i64,
     pub(crate) removals: Vec<Removal>,
     /// The removed operations, as the ledger's history holds them.

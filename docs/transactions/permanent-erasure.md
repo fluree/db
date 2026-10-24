@@ -180,18 +180,34 @@ branch read as the erasure does:
 
 - the erased occurrences are recorded in its removal journal, against its own history, so its history
   over them is refused;
-- they leave its index: leaf by leaf when they are only history there, or by a rebuild from the
-  replacements when a value is still current there (its rows and the index's statistics change);
+- they leave its index without a rebuild: leaf by leaf when they are only history there, and a value
+  still current there as a retraction would remove it, its row and the index's statistics included,
+  with no history left of it. A value outside the leaves (a big number, vector, geometry, full-text
+  value or triple term) is rebuilt from the replacements instead;
 - its full-text and vector indexes that read an erased property are rebuilt;
 - nothing is committed to it: a retraction would hold the value, and only a prover could erase it.
 
-`RestoreResult::reconciled` lists those branches. The restored ledger records a published job per
-request, and its [purge](#purge) deletes the originals and their transaction documents, with no
-prover. A soft-dropped ledger holding an original is left to that purge, which releases its indexes,
-and to its restore, which rebuilds them.
+Each such branch is write-locked from the checks until it no longer holds an erased value as current,
+so no transaction can retract the value in a commit only a prover could erase; its queries wait
+meanwhile. `RestoreResult::reconciled` lists those branches. Each holding ledger records a published
+job per request, and its [purge](#purge) deletes the originals and their transaction documents, with
+no prover. A soft-dropped ledger holding an original is left to the restored ledger's purge, which
+releases its indexes, and to its own restore, which rebuilds them.
 
-A restore is refused, and writes nothing to the ledgers here, when:
+The restore records the activation before the first ledger here changes. One stopped after that, by
+a crash or a failed step, completes when the retention worker next runs
+(`Fluree::resume_received_erasures` from Rust), even if the restored ledger itself was discarded.
+Without the ledger cache (`FlureeBuilder::without_ledger_caching`, as the CLI runs), nothing locks
+out a transaction: one committed on a holder meanwhile fails the activation, which then resumes the
+same way.
 
+The archive's manifest is checked in full before anything acts on it. A restore is refused, and
+writes nothing to the ledgers here, when:
+
+- the manifest names what the archive does not hold, or an archive with erased commits names an
+  index;
+- the archive's removal journal does not record every erased occurrence: the restored ledger would
+  serve its history as complete;
 - an erasure fails a check;
 - an erasure differs from the one this storage holds for the same commit (a chain that is the same, or
   one this storage has already extended, is accepted);
@@ -271,7 +287,8 @@ measurements.
   holds the original request, and audit retrieval serves it until the purge deletes it whole.
 - **Most transfers are refused.** Push, pull, clone, pack exports and remote archives
   (`fluree export --remote --format ledger`) refuse a ledger's erased commits by name. A local
-  `.flpack` archive carries them (see [Archives](#archives)).
+  `.flpack` archive carries them (see [Archives](#archives)). A pack of only new history, over erased
+  commits the receiver already has, carries no index: one built before the purge may hold the value.
 - **Not covered:** copies outside this node's storage (backups, other clones, exports already made), the
   memory of other processes until they restart, and values in the original CID itself (see
   [Signatures](#signatures)). Neither the proof nor the purge shows that copies elsewhere are gone.

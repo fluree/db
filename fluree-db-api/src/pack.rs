@@ -76,6 +76,9 @@ impl Erasures {
     async fn of(_: &crate::Fluree, _: &[ContentId]) -> Result<Self> {
         Ok(Erasures)
     }
+    async fn history_holds_erased(&self, _: &dyn ContentStore, _: &[ContentId]) -> Result<bool> {
+        Ok(false)
+    }
     fn count(&self) -> usize {
         0
     }
@@ -99,7 +102,7 @@ impl Erasures {
 /// Returns commit CIDs in oldest-first (topo) order, deduplicated. When
 /// multiple `want` heads are provided, they are sorted by `address_digest()`
 /// before walking for deterministic output.
-pub async fn compute_missing_commits<C: ContentStore>(
+pub async fn compute_missing_commits<C: ContentStore + ?Sized>(
     store: &C,
     want: &[ContentId],
     have: &HashSet<ContentId>,
@@ -452,9 +455,13 @@ async fn stream_pack_inner(
 
     // --- Compute missing index artifacts (if requested) ---
     // An index built before a purge may hold an erased value: none travels
-    // with erased history.
-    let include_indexes =
-        request.include_indexes && request.want_index_root_id.is_some() && erasures.count() == 0;
+    // with erased history, though the receiver has the erased commits.
+    let include_indexes = request.include_indexes
+        && request.want_index_root_id.is_some()
+        && !erasures
+            .history_holds_erased(content_store.as_ref(), &request.want)
+            .await
+            .map_err(|e| e.to_string())?;
     let missing_artifacts = if include_indexes {
         let want_root_id = request.want_index_root_id.as_ref().unwrap();
         let artifacts = compute_missing_index_artifacts(

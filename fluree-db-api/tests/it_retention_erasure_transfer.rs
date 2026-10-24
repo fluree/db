@@ -534,9 +534,10 @@ async fn a_restore_erases_what_a_ledger_here_holds() {
     );
     assert!(!files_holding(here.path(), "a@secret").is_empty());
 
-    let copy = restored.ledger_id;
+    // The purge is the holder's: a restore that failed after this point
+    // would leave it all the same.
     let job = receiver
-        .retention_status(&copy)
+        .retention_status(&held)
         .await
         .unwrap()
         .registration
@@ -545,7 +546,7 @@ async fn a_restore_erases_what_a_ledger_here_holds() {
     assert_eq!(job.len(), 1, "{job:?}");
     assert_eq!(job[0].stage, ErasureStage::Published);
     let report = receiver
-        .run_purge_pass(&copy, Duration::ZERO)
+        .run_purge_pass(&held, Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(report.purged, 1, "{report:?}");
@@ -1039,4 +1040,246 @@ async fn a_restore_extends_an_erasure_held_here() {
             .await
             .is_empty());
     }
+}
+
+/// A pack of only new history, over an erased commit the receiver already
+/// has, carries no index either: one built before a purge holds the value.
+#[tokio::test]
+async fn a_pack_over_erased_history_carries_no_index() {
+    let (_dir, fluree, id, _, _) = source("it/transfer-pack").await;
+    let have = chain(&fluree, &id).await[0].1.clone();
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:dave", "ex:email": "d@later"}),
+    )
+    .await;
+    let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let request = fluree_db_api::pack::PackRequest::with_indexes(
+        vec![record.commit_head_id.clone().unwrap()],
+        vec![have],
+        record
+            .index_head_id
+            .clone()
+            .expect("indexed before publication"),
+        None,
+    );
+    let handle = fluree.ledger_cached(&id).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let stats = fluree_db_api::pack::stream_pack(&fluree, &handle, &request, tx).await;
+    while rx.recv().await.is_some() {}
+    assert_eq!(stats.commits_sent, 1, "{stats:?}");
+    assert_eq!(stats.index_artifacts_sent, 0, "{stats:?}");
+}
+
+/// An archive's erasures come with the journal entries of every occurrence
+/// they erase: without them, the restored ledger would serve its history
+/// as complete when it is not.
+#[tokio::test]
+async fn a_restore_needs_the_journal_of_what_it_erases() {
+    let (_dir, fluree, id, _, _) = source("it/transfer-journaled").await;
+    let archive = archive(&fluree, &id).await;
+    let received = tempfile::tempdir().unwrap();
+    let receiver = receiving(&received);
+    let refused = |what: &'static str, archive: Vec<u8>| {
+        let receiver = &receiver;
+        async move {
+            match receiver
+                .restore_ledger("it/transfer-journaled-copy", &mut archive.as_slice())
+                .await
+            {
+                Ok(restored) => panic!("{what} accepted: {restored:?}"),
+                Err(e) => e.to_string(),
+            }
+        }
+    };
+    let unjournaled = rewritten(&archive, |frame| match frame {
+        PackFrame::Manifest(mut manifest) if manifest["phase"] == "nameservice" => {
+            manifest.as_object_mut().unwrap().remove("retention");
+            Some(PackFrame::Manifest(manifest))
+        }
+        frame => Some(frame),
+    });
+    let why = refused("unjournaled", unjournaled).await;
+    assert!(why.contains("does not record"), "{why}");
+    let partly = rewritten(&archive, |frame| match frame {
+        PackFrame::Manifest(mut manifest) if manifest["phase"] == "nameservice" => {
+            let removals = manifest["retention"]["journal"]["removals"]
+                .as_array_mut()
+                .unwrap();
+            assert!(removals.len() > 1);
+            removals.pop();
+            Some(PackFrame::Manifest(manifest))
+        }
+        frame => Some(frame),
+    });
+    let why = refused("partly journaled", partly).await;
+    assert!(why.contains("does not record"), "{why}");
+}
+
+/// How many `ex:email` values `ledger` serves: counted by the query engine,
+/// and listed.
+async fn emails(fluree: &Fluree, ledger: &str) -> (JsonValue, usize) {
+    let counted = fluree
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": ledger,
+            "select": ["(as (count ?o) ?n)"],
+            "where": {"@id": "?s", "ex:email": "?o"}
+        }))
+        .await
+        .unwrap();
+    let ledger_state = fluree.ledger(ledger).await.unwrap();
+    let counted = counted.to_jsonld(&ledger_state.snapshot).unwrap();
+    let listed = fluree
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": ledger,
+            "select": ["?s", "?o"],
+            "where": {"@id": "?s", "ex:email": "?o"}
+        }))
+        .await
+        .unwrap();
+    let listed = listed.to_jsonld(&ledger_state.snapshot).unwrap();
+    (counted, listed.as_array().map_or(0, Vec::len))
+}
+
+/// The index statistics' count of `ex:email` values in `ledger`.
+async fn email_stat(fluree: &Fluree, ledger: &str) -> i64 {
+    let info = fluree.ledger_info(ledger).execute().await.unwrap();
+    let info = serde_json::to_value(&info).unwrap();
+    let properties = info["stats"]["properties"].as_object().expect("stats");
+    properties
+        .iter()
+        .find(|(iri, _)| iri.ends_with("email"))
+        .and_then(|(_, stat)| stat["count"].as_i64())
+        .expect("an email count")
+}
+
+/// A value still current in a ledger here leaves it without a rebuild, as
+/// a retraction would have taken it: counts drop by one, another subject's
+/// occurrence of the same string stays, and history the journal does not
+/// cover reads as before, all as a full rebuild then finds them.
+#[tokio::test]
+async fn an_erased_current_value_leaves_counts_and_shared_values_right() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/transfer-counts").await;
+    let t1 = insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@kept"}
+        ]}),
+    )
+    .await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:dave", "ex:email": "d@kept"}),
+    )
+    .await;
+    let mut before = Vec::new();
+    source
+        .archive_ledger(&id, false, &mut before)
+        .await
+        .unwrap();
+    erase_published(&source, &id, email("alice", "a@secret")).await;
+    let after = archive(&source, &id).await;
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/transfer-counts-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&receiver, &held).await;
+    assert_eq!(emails(&receiver, &held).await, (json!([[4]]), 4));
+    assert_eq!(email_stat(&receiver, &held).await, 4);
+    let root_before = receiver
+        .nameservice()
+        .lookup(&held)
+        .await
+        .unwrap()
+        .unwrap()
+        .index_head_id;
+
+    let restored = receiver
+        .restore_ledger("it/transfer-counts-again", &mut after.as_slice())
+        .await
+        .unwrap();
+    assert_eq!(restored.reconciled, [held.as_str()], "{restored:?}");
+    let record = receiver.nameservice().lookup(&held).await.unwrap().unwrap();
+    assert_ne!(record.index_head_id, root_before);
+    assert_eq!(emails(&receiver, &held).await, (json!([[3]]), 3));
+    assert_eq!(email_stat(&receiver, &held).await, 3);
+    assert!(objects(&receiver, &held, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&receiver, &held, "ex:bob", "ex:email").await,
+        vec![json!("a@secret")]
+    );
+    let past = |subject: &str| {
+        json!({
+            "@context": ctx(),
+            "from": format!("{held}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": subject, "ex:email": "?o"}
+        })
+    };
+    let bob = receiver.query_connection(&past("ex:bob")).await.unwrap();
+    let state = receiver.ledger(&held).await.unwrap();
+    assert_eq!(bob.to_jsonld(&state.snapshot).unwrap(), json!(["a@secret"]));
+    assert!(matches!(
+        receiver.query_connection(&past("ex:alice")).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+
+    reindex(&receiver, &held).await;
+    assert_eq!(emails(&receiver, &held).await, (json!([[3]]), 3));
+    assert_eq!(email_stat(&receiver, &held).await, 3);
+    let bob = receiver.query_connection(&past("ex:bob")).await.unwrap();
+    let state = receiver.ledger(&held).await.unwrap();
+    assert_eq!(bob.to_jsonld(&state.snapshot).unwrap(), json!(["a@secret"]));
+}
+
+/// A restore refused for its manifest is refused before any ledger here
+/// changes for its erasures.
+#[tokio::test]
+async fn a_restore_refused_for_its_manifest_changes_nothing_here() {
+    let (_dir, _source, _, _, shared, before, after) =
+        erased_between_archives("it/transfer-manifest").await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/transfer-manifest-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&receiver, &held).await;
+    let broken = rewritten(&after, |frame| match frame {
+        PackFrame::Manifest(mut manifest) if manifest["phase"] == "nameservice" => {
+            manifest["default_context_id"] = json!(shared.to_string());
+            Some(PackFrame::Manifest(manifest))
+        }
+        frame => Some(frame),
+    });
+    let refused = receiver
+        .restore_ledger("it/transfer-manifest-again", &mut broken.as_slice())
+        .await
+        .expect_err("a default context the archive does not hold");
+    assert_eq!(refused.status_code(), 400, "{refused}");
+    assert_eq!(
+        objects(&receiver, &held, "ex:alice", "ex:email").await,
+        vec![json!("a@secret")]
+    );
+    assert!(!is_replacement(
+        &store_of(&receiver, &held).await.get(&shared).await.unwrap()
+    ));
+    let registration = receiver.retention_status(&held).await.unwrap().registration;
+    assert!(registration.is_none(), "{registration:?}");
 }

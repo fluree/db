@@ -219,6 +219,9 @@ impl Fluree {
         let Some(runtime) = self.retention.erasure.get() else {
             return;
         };
+        if let Err(e) = self.resume_received_erasures().await {
+            tracing::warn!(error = %e, "erasure: received erasures not resumed");
+        }
         self.purge_sweep(fluree, ledgers, purge_grace).await;
         let Some(config) = runtime.config.as_ref() else {
             return;

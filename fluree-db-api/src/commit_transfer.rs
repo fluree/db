@@ -2470,6 +2470,7 @@ impl Fluree {
         // Resolve the head CIDs from the manifest, then verify they were
         // actually ingested before pointing the nameservice at them — a
         // truncated or mismatched archive must not yield a dangling head.
+        // Every part of the manifest is checked before anything acts on it.
         let content = self.content_store(&namespace);
 
         let commit_head_id = manifest
@@ -2479,25 +2480,15 @@ impl Fluree {
         let commit_cid: ContentId = commit_head_id
             .parse()
             .map_err(|e| ApiError::http(400, format!("invalid commit CID in manifest: {e}")))?;
-        // Erased commits read as their replacements once their erasures are
-        // in, which is before anything reads the history.
         #[cfg(feature = "native")]
         let erased_commits = erasures.count();
         #[cfg(not(feature = "native"))]
         let erased_commits = 0;
         #[cfg(feature = "native")]
-        let received = match erased_commits {
-            0 => None,
-            _ => Some(
-                self.receive_erasures(erasures, &namespace, &commit_cid)
-                    .await?,
-            ),
-        };
-        #[cfg(feature = "native")]
-        if let Some(genesis) = received.as_ref().and_then(|r| r.genesis.clone()) {
-            lineage.get_or_insert(genesis);
-        }
-        if !content.has(&commit_cid).await.unwrap_or(false) {
+        let head_erased = erasures.holds(&commit_cid);
+        #[cfg(not(feature = "native"))]
+        let head_erased = false;
+        if !head_erased && !content.has(&commit_cid).await.unwrap_or(false) {
             return Err(ApiError::http(
                 400,
                 format!(".flpack manifest names commit head {commit_cid} that the archive did not contain"),
@@ -2507,6 +2498,80 @@ impl Fluree {
             .get("commit_t")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
+
+        let index_head = match manifest.get("index_head_id").and_then(|v| v.as_str()) {
+            Some(index_cid_str) => {
+                let index_cid: ContentId = index_cid_str.parse().map_err(|e| {
+                    ApiError::http(400, format!("invalid index CID in manifest: {e}"))
+                })?;
+                if erased_commits > 0 {
+                    return Err(ApiError::http(
+                        400,
+                        ".flpack with erased commits names an index, which may hold an erased value",
+                    ));
+                }
+                if !content.has(&index_cid).await.unwrap_or(false) {
+                    return Err(ApiError::http(
+                        400,
+                        format!(".flpack manifest names index head {index_cid} that the archive did not contain"),
+                    ));
+                }
+                let index_t = manifest
+                    .get("index_t")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                Some((index_cid, index_t))
+            }
+            None => None,
+        };
+
+        let default_context = match manifest.get("default_context_id").and_then(|v| v.as_str()) {
+            Some(ctx_cid_str) => {
+                let ctx_cid: ContentId = ctx_cid_str.parse().map_err(|e| {
+                    ApiError::http(400, format!("invalid default_context CID in manifest: {e}"))
+                })?;
+                if !content.has(&ctx_cid).await.unwrap_or(false) {
+                    return Err(ApiError::http(
+                        400,
+                        format!(".flpack manifest names default-context blob {ctx_cid} that the archive did not contain"),
+                    ));
+                }
+                let bytes = content.get(&ctx_cid).await.map_err(|e| {
+                    ApiError::internal(format!(
+                        "failed to read default context blob {ctx_cid}: {e}"
+                    ))
+                })?;
+                let ctx_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    ApiError::http(400, format!("default context blob is not valid JSON: {e}"))
+                })?;
+                Some(ctx_json)
+            }
+            None => None,
+        };
+
+        // The archive's journal, and what the lineage has suppressed since.
+        let archived = manifest
+            .get("retention")
+            .map(crate::retention::registry::ArchivedRetention::parse)
+            .transpose()?;
+
+        // Erased commits read as their replacements once their erasures are
+        // in, which is before anything reads the history.
+        #[cfg(feature = "native")]
+        let received = match erased_commits {
+            0 => None,
+            _ => {
+                let journal = archived.as_ref().map(|a| &a.journal);
+                Some(
+                    self.receive_erasures(erasures, &namespace, &commit_cid, journal)
+                        .await?,
+                )
+            }
+        };
+        #[cfg(feature = "native")]
+        if let Some(genesis) = received.as_ref().and_then(|r| r.genesis.clone()) {
+            lineage.get_or_insert(genesis);
+        }
 
         self.set_ref(
             new_ledger_id,
@@ -2518,21 +2583,7 @@ impl Fluree {
         .await?;
 
         let mut index_t_out = None;
-        if let Some(index_cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
-            let index_cid: ContentId = index_cid_str
-                .parse()
-                .map_err(|e| ApiError::http(400, format!("invalid index CID in manifest: {e}")))?;
-            if !content.has(&index_cid).await.unwrap_or(false) {
-                return Err(ApiError::http(
-                    400,
-                    format!(".flpack manifest names index head {index_cid} that the archive did not contain"),
-                ));
-            }
-            let index_t = manifest
-                .get("index_t")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-
+        if let Some((index_cid, index_t)) = index_head {
             // The FIR6 index root embeds the *source* ledger_id as an inline
             // identity field. Loading it under a new name trips
             // `apply_loaded_db`'s identity check ("Index ledger_id '<src>' does
@@ -2595,35 +2646,13 @@ impl Fluree {
         }
 
         // Restore the ledger's stored default JSON-LD context, if the archive
-        // carried one. The blob was ingested above; re-point the new ledger's
-        // config at it so queries that omit an inline @context keep working.
-        if let Some(ctx_cid_str) = manifest.get("default_context_id").and_then(|v| v.as_str()) {
-            let ctx_cid: ContentId = ctx_cid_str.parse().map_err(|e| {
-                ApiError::http(400, format!("invalid default_context CID in manifest: {e}"))
-            })?;
-            if !content.has(&ctx_cid).await.unwrap_or(false) {
-                return Err(ApiError::http(
-                    400,
-                    format!(".flpack manifest names default-context blob {ctx_cid} that the archive did not contain"),
-                ));
-            }
-            let bytes = content.get(&ctx_cid).await.map_err(|e| {
-                ApiError::internal(format!(
-                    "failed to read default context blob {ctx_cid}: {e}"
-                ))
-            })?;
-            let ctx_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-                ApiError::http(400, format!("default context blob is not valid JSON: {e}"))
-            })?;
-            // Re-points config + bumps configV via the standard CAS path; the
-            // re-put of the (content-addressed) blob is idempotent.
+        // carried one: re-point the new ledger's config at it so queries that
+        // omit an inline @context keep working. Re-points config + bumps
+        // configV via the standard CAS path; the re-put of the
+        // (content-addressed) blob is idempotent.
+        if let Some(ctx_json) = default_context {
             self.push_default_context(record, &ctx_json).await?;
         }
-        // The archive's journal, and what the lineage has suppressed since.
-        let archived = manifest
-            .get("retention")
-            .map(crate::retention::registry::ArchivedRetention::parse)
-            .transpose()?;
         let retracted_t = self
             .restore_retention(
                 record,

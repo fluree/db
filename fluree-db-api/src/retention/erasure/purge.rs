@@ -289,6 +289,7 @@ impl Fluree {
                 if let Some(flake) = decoded.at_slot(slot) {
                     captured.push(Captured {
                         flake: flake.clone(),
+                        current: false,
                     });
                 }
             }
@@ -344,6 +345,8 @@ pub(crate) struct SourceOver {
 #[derive(Clone, Debug)]
 pub(crate) struct Captured {
     pub(crate) flake: Flake,
+    /// An assertion the index still holds as current, not only in history.
+    pub(crate) current: bool,
 }
 
 /// The properties `jobs` erase; `None`, any property, when one does not
