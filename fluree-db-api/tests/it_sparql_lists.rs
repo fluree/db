@@ -1011,7 +1011,8 @@ async fn whole_graph_counts_add_the_list_triples() {
     );
     let mut grouped = rows(&fluree, &ledger, BY_PREDICATE).await;
     grouped.sort_by_key(ToString::to_string);
-    assert_eq!(grouped, by_predicate(9 - 9 + 2 + 1, 1, 1, 5));
+    // `ex:items`: five stored rows, less three members, plus one owner edge.
+    assert_eq!(grouped, by_predicate(5 - 3 + 1, 1, 1, 5));
     assert!(
         proceeded("COUNT by predicate (directory)"),
         "the per-predicate lane answered: {:?}",
