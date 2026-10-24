@@ -119,10 +119,11 @@ resumes where an interrupted one stopped.
    replacements instead when an erased value lives outside the leaves (a big number, vector, geometry,
    full-text value or triple term), or is a string, JSON value or duration in a ledger with triple
    terms, which may spell it too. Full-text (BM25) and vector indexes over a holding branch that read
-   an erased property are rebuilt from scratch; one that reads none of them never held the value and
-   is left alone. One dropped before the purge has every file it left deleted. A soft-dropped ledger
-   that holds an erased
-   commit has its indexes deleted, and restoring it rebuilds them before it serves.
+   an erased property (each request records the properties it erases when it is accepted) are rebuilt
+   from scratch; one that reads none of them never held the value and keeps its index. Every such
+   index loses the files its current index does not use, which an earlier index of the same name may
+   have left, and one dropped before the purge loses all of its files. A soft-dropped ledger that
+   holds an erased commit has its indexes deleted, and restoring it rebuilds them before it serves.
 2. **Grace.** The older indexes stay for 15 minutes (the index collector's minimum age), so queries
    reading them can finish. They are then released.
 3. **Scan.** Every holding branch's history, index, dictionaries and TTL schedules are checked for the

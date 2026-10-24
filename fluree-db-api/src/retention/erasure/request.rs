@@ -2,7 +2,7 @@
 //! that holds an occurrence, the control commit that authorizes it, and the
 //! job that tracks it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fluree_db_core::{
@@ -127,21 +127,17 @@ impl Fluree {
             occurrences: request.occurrences.clone(),
             matching: request.matching.clone(),
         };
-        let mut found = Found::new();
-        let mut removals = Vec::new();
-        self.remove_on(
-            writer,
-            &branches,
-            &removal_request,
-            true,
-            &mut found,
-            &mut removals,
-        )
-        .await?;
+        let mut removed = Accepted::default();
+        self.remove_on(writer, &branches, &removal_request, true, &mut removed)
+            .await?;
         // Other ledgers holding the same commits, such as copies restored
         // from an archive, read the replacements too: the occurrences found
         // are removed there as well, with what ends their spans there.
-        let commits: Vec<&str> = found.keys().map(|(commit, _)| commit.as_str()).collect();
+        let commits: Vec<&str> = removed
+            .found
+            .keys()
+            .map(|(commit, _)| commit.as_str())
+            .collect();
         let copies: Vec<String> = self
             .copies_holding(&ledger_id, &commits)
             .await?
@@ -150,7 +146,8 @@ impl Fluree {
             .collect();
         if !copies.is_empty() {
             let named = RemovalRequest {
-                occurrences: found
+                occurrences: removed
+                    .found
                     .keys()
                     .map(|(commit, slot)| OccurrenceRef {
                         commit: commit.clone(),
@@ -159,10 +156,15 @@ impl Fluree {
                     .collect(),
                 matching: Vec::new(),
             };
-            self.remove_on(writer, &copies, &named, false, &mut found, &mut removals)
+            self.remove_on(writer, &copies, &named, false, &mut removed)
                 .await?;
             branches.extend(copies);
         }
+        let Accepted {
+            found,
+            removals,
+            properties,
+        } = removed;
 
         let manifest: Vec<OccurrenceRef> = found
             .keys()
@@ -198,6 +200,10 @@ impl Fluree {
             signatures: request.signatures,
             stage: ErasureStage::Proving,
             commits,
+            properties: match properties.contains("") {
+                true => Vec::new(),
+                false => properties.into_iter().collect(),
+            },
             retries: 0,
             retry_at_ms: None,
             last_error: None,
@@ -236,9 +242,13 @@ impl Fluree {
         branches: &[String],
         request: &RemovalRequest,
         requested: bool,
-        found: &mut Found,
-        removals: &mut Vec<BranchRemoval>,
+        into: &mut Accepted,
     ) -> Result<()> {
+        let Accepted {
+            found,
+            removals,
+            properties,
+        } = into;
         for (i, branch) in branches.iter().enumerate() {
             let requested = requested && i == 0;
             let widening = Widening {
@@ -259,6 +269,7 @@ impl Fluree {
                     entry.1.push(branch.clone());
                 }
             }
+            properties.extend(removed.properties);
             removals.push(BranchRemoval {
                 ledger_id: branch.clone(),
                 removal: removed.receipt,
@@ -527,6 +538,16 @@ fn unsupported_commit(commit: &str, why: &str) -> ApiError {
 /// (commit, slot) -> (t, the branches holding it)
 pub(super) type Found = BTreeMap<(String, u32), (i64, Vec<String>)>;
 
+/// What a request's removals on its branches and copies did.
+#[derive(Default)]
+struct Accepted {
+    found: Found,
+    removals: Vec<BranchRemoval>,
+    /// Each removed occurrence's property IRI, empty where it did not
+    /// decode.
+    properties: BTreeSet<String>,
+}
+
 fn signing_ledger(
     bytes: &[u8],
     slots: &[u32],
@@ -611,6 +632,7 @@ mod tests {
             signatures: SignatureMode::Verify,
             stage,
             commits: Vec::new(),
+            properties: Vec::new(),
             retries: 0,
             retry_at_ms: None,
             last_error: None,

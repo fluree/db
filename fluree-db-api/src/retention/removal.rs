@@ -104,6 +104,8 @@ pub(crate) struct Widening {
 pub(crate) struct Removed {
     pub receipt: RemovalReceipt,
     pub manifest_t: Vec<i64>,
+    /// Each occurrence's property IRI, empty where it did not decode.
+    pub properties: Vec<String>,
 }
 
 /// One assertion or retraction of a fact: its commit `t`, whether it
@@ -401,6 +403,7 @@ impl Fluree {
                 .iter()
                 .find(|(_, _, c)| super::engine::carries_retention_input(&c.txn_meta))
                 .map_or(scope_t + 1, |(t, _, _)| *t);
+            let properties = removals.iter().map(|r| r.predicate.clone()).collect();
             self.retention.watch.journal_changing(&ledger_id);
             let incoming = super::journal::Journal {
                 removals,
@@ -448,6 +451,7 @@ impl Fluree {
                     unacknowledged_replicas,
                 },
                 manifest_t,
+                properties,
             });
         }
         Err(ApiError::commit_contention(

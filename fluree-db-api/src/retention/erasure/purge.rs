@@ -1,7 +1,7 @@
 //! Physical purge: what holds the values of a ledger's published erasures,
 //! inventoried before anything is deleted (DATA_ERASURE.md, 5B).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use fluree_db_core::commit::codec::{read_commit, read_commit_envelope};
 use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, Flake, LedgerId};
@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use super::index::{Artifact, ErasedCommit};
 use super::ErasureJob;
 use crate::graph_source::helpers::indexed_properties;
-use crate::retention::journal::Removal;
 use crate::retention::registry;
 use crate::{ApiError, Fluree, Result};
 
@@ -40,9 +39,14 @@ pub struct PurgePlan {
     /// history holds an erased commit: their index heads are cleared and
     /// their indexes released.
     pub retracted: Vec<String>,
-    /// Full-text and vector indexes over a holder that may read a property
-    /// the requests erased, which keep their own copies of what they index.
+    /// Full-text and vector indexes over a holder, which keep their own
+    /// copies of what they index: each loses every file its head does not
+    /// use, which an earlier index of the same name may have left.
     pub sources: Vec<String>,
+    /// Of `sources`, those that may read a property the requests erased,
+    /// rebuilt first.
+    #[serde(default)]
+    pub rebuilt_sources: Vec<String>,
     /// Such indexes dropped since, whose files a drop may have left: all of
     /// them are deleted.
     #[serde(default)]
@@ -60,7 +64,6 @@ impl Fluree {
         let mut erased = BTreeSet::new();
         let mut rebuild = BTreeSet::new();
         let mut jobs = Vec::new();
-        let mut removed = Vec::new();
         for record in self.nameservice().list_branches(name.name()).await? {
             if record.retracted {
                 continue;
@@ -70,7 +73,6 @@ impl Fluree {
                 continue;
             };
             jobs.extend(registration.erasures.iter().cloned());
-            removed.extend(registration.journal.removals);
             for job in registration.erasures.iter().filter(|j| j.purge_pending()) {
                 plan.requests.push(job.request_id.clone());
                 erased.extend(job.commits.iter().map(|c| c.commit.clone()));
@@ -165,9 +167,8 @@ impl Fluree {
             .await?;
         let holders: BTreeSet<&String> = plan.rebuild.iter().chain(&plan.release).collect();
         let pending: Vec<&ErasureJob> = jobs.iter().filter(|j| j.purge_pending()).collect();
-        let erased_properties = erased_properties(&pending, &removed);
+        let erased_properties = erased_properties(&pending);
         for source in self.nameservice().all_graph_source_records().await? {
-            let indexed = indexed_properties(&source);
             let over_holder = matches!(
                 source.source_type,
                 GraphSourceType::Bm25 | GraphSourceType::Vector | GraphSourceType::Geo
@@ -176,18 +177,24 @@ impl Fluree {
                 && source.dependencies.iter().any(|d| {
                     LedgerId::parse(d).is_ok_and(|id| holders.contains(&id.to_string()))
                 });
-            let may_hold = erased_properties
-                .as_ref()
-                .is_none_or(|properties| properties.iter().any(|p| indexed.may_read(p)));
-            if !(over_holder && may_hold) {
+            if !over_holder {
                 continue;
             }
+            // Its files may be an earlier index's of the same name, which
+            // read other properties: they go whatever this one reads.
             let id = source.graph_source_id.to_string();
             if source.retracted {
                 plan.dropped_sources.push(id);
-            } else {
-                plan.sources.push(id);
+                continue;
             }
+            let indexed = indexed_properties(&source);
+            if erased_properties
+                .as_ref()
+                .is_none_or(|properties| properties.iter().any(|p| indexed.may_read(p)))
+            {
+                plan.rebuilt_sources.push(id.clone());
+            }
+            plan.sources.push(id);
         }
         Ok(plan)
     }
@@ -314,28 +321,15 @@ pub(crate) struct Captured {
     pub(crate) flake: Flake,
 }
 
-/// The properties `jobs` erase, from the removals that journaled their
-/// occurrences. An erased retraction with none ends a journaled assertion's
-/// span, so has its property. `None`, any property, when a job's
-/// occurrences have none or a property did not decode.
-fn erased_properties(jobs: &[&ErasureJob], removed: &[Removal]) -> Option<BTreeSet<String>> {
-    let journaled: HashMap<(&str, u32), &str> = removed
-        .iter()
-        .map(|r| ((r.commit.as_str(), r.slot), r.predicate.as_str()))
-        .collect();
+/// The properties `jobs` erase; `None`, any property, when one does not
+/// know its own.
+fn erased_properties<'a>(jobs: &[&'a ErasureJob]) -> Option<BTreeSet<&'a str>> {
     let mut properties = BTreeSet::new();
     for job in jobs {
-        let occurrences = job
-            .commits
-            .iter()
-            .flat_map(|c| c.slots.iter().map(|slot| (c.commit.as_str(), *slot)));
-        let found: Vec<&str> = occurrences
-            .filter_map(|o| journaled.get(&o).copied())
-            .collect();
-        if found.is_empty() || found.contains(&"") {
+        if job.properties.is_empty() {
             return None;
         }
-        properties.extend(found.into_iter().map(str::to_string));
+        properties.extend(job.properties.iter().map(String::as_str));
     }
     Some(properties)
 }

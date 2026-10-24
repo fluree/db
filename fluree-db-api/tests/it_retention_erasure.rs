@@ -2308,6 +2308,155 @@ async fn a_purge_deletes_what_a_dropped_full_text_index_left() {
     );
 }
 
+/// A full-text index recreated under a dropped one's name, over another
+/// property, shares its folder: the purge releases what the earlier index
+/// left there without rebuilding the new one.
+#[tokio::test]
+async fn a_purge_releases_what_an_earlier_index_of_the_name_left() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-reused-index").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice",
+               "ex:email": "confidential zephyr", "ex:bio": "ordinary note"}),
+    )
+    .await;
+    let index = |property: &str| {
+        fluree.create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-reused",
+            &id,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Person"}],
+                "select": {"?x": ["@id", property]}
+            }),
+        ))
+    };
+    index("ex:email").await.unwrap();
+    fluree
+        .drop_graph_source("it-reused", None, fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    index("ex:bio").await.unwrap();
+    publish_erasure(&fluree, &id, email("alice", "confidential zephyr")).await;
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (0, 1), "the bio index is not rebuilt");
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// An erasure keeps the properties it erases from acceptance: one whose
+/// occurrence only a branch held still counts once the branch is dropped,
+/// so a copy's index of it is rebuilt.
+#[tokio::test]
+async fn an_erasure_keeps_a_dropped_branch_s_property() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-branch-props").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .create_branch("it/purge-branch-props", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = "it/purge-branch-props:dev";
+    insert(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:bio": "zephyr biography"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(dev, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-branch-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-copy-bio",
+            &copy,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Person"}],
+                "select": {"?x": ["@id", "ex:bio"]}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                matching: [("email", "a@secret"), ("bio", "zephyr biography")]
+                    .map(|(p, o)| FactSelector {
+                        subject: "http://example.org/alice".into(),
+                        predicate: format!("http://example.org/{p}"),
+                        graph: None,
+                        object: Some(json!(o)),
+                    })
+                    .to_vec(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    for ledger in [id.as_str(), dev, copy.as_str()] {
+        reindex(&fluree, ledger).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    fluree
+        .drop_branch("it/purge-branch-props", "dev")
+        .await
+        .unwrap();
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (1, 1));
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
 /// The retention worker purges a published erasure by itself: its
 /// originals, and every file that held the value, are gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2441,6 +2590,86 @@ async fn a_purge_treats_a_duration_s_lexical_form_as_a_string() {
         files_holding(dir.path(), "P2Y3M"),
         Vec::<std::path::PathBuf>::new()
     );
+}
+
+/// A triple term names its literal's dictionary entry too: an erased
+/// duration or string a surviving triple term spells the same keeps it.
+#[tokio::test]
+async fn an_erased_value_a_triple_term_spells_keeps_its_entry() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    // Each on a ledger of its own: erasing a string alone already sends a
+    // holder with a triple-term dictionary to a rebuild.
+    for (name, property, turtle, value) in [
+        (
+            "it/purge-term-duration",
+            "period",
+            "\"P1Y2M\"^^xsd:duration",
+            json!({"@value": "P1Y2M", "@type": "http://www.w3.org/2001/XMLSchema#duration"}),
+        ),
+        (
+            "it/purge-term-string",
+            "email",
+            "\"zephyr-term\"",
+            json!("zephyr-term"),
+        ),
+    ] {
+        let id = ledger(&fluree, name).await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:alice", format!("ex:{property}"): value}),
+        )
+        .await;
+        fluree
+            .graph(&id)
+            .transact()
+            .sparql_update(&format!(
+                "PREFIX ex: <http://example.org/>\n\
+                 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+                 INSERT DATA {{ ex:doc ex:mentions <<( ex:bob ex:{property} {turtle} )>> }}"
+            ))
+            .commit()
+            .await
+            .expect("insert triple term");
+        let mentioned = || async {
+            let result = fluree
+                .query_connection_sparql(&format!(
+                    "PREFIX ex: <http://example.org/>\n\
+                     SELECT ?o FROM <{id}> WHERE {{ ex:doc ex:mentions <<( ex:bob ?p ?o )>> }}"
+                ))
+                .await
+                .expect("query");
+            let ledger = fluree.ledger(&id).await.unwrap();
+            result.to_jsonld(&ledger.snapshot).unwrap()
+        };
+        let before = mentioned().await;
+        assert_eq!(before, json!([[value]]), "{name}");
+        publish_erasure(
+            &fluree,
+            &id,
+            ErasureRequest {
+                matching: vec![FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: format!("http://example.org/{property}"),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert_eq!(
+            (report.purged, report.rebuilt),
+            (1, 1),
+            "{name}: {report:?}"
+        );
+        assert_eq!(mentioned().await, before, "{name}");
+    }
 }
 
 /// The empty string, erased where nothing else uses it, leaves the
@@ -2592,86 +2821,6 @@ async fn historical(
     ledger_id: &str,
     from: String,
     to: Option<String>,
-/// A triple term names its literal's dictionary entry too: an erased
-/// duration or string a surviving triple term spells the same keeps it.
-#[tokio::test]
-async fn an_erased_value_a_triple_term_spells_keeps_its_entry() {
-    use std::time::Duration;
-
-    let dir = tempfile::tempdir().unwrap();
-    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
-    // Each on a ledger of its own: erasing a string alone already sends a
-    // holder with a triple-term dictionary to a rebuild.
-    for (name, property, turtle, value) in [
-        (
-            "it/purge-term-duration",
-            "period",
-            "\"P1Y2M\"^^xsd:duration",
-            json!({"@value": "P1Y2M", "@type": "http://www.w3.org/2001/XMLSchema#duration"}),
-        ),
-        (
-            "it/purge-term-string",
-            "email",
-            "\"zephyr-term\"",
-            json!("zephyr-term"),
-        ),
-    ] {
-        let id = ledger(&fluree, name).await;
-        insert(
-            &fluree,
-            &id,
-            json!({"@context": ctx(), "@id": "ex:alice", format!("ex:{property}"): value}),
-        )
-        .await;
-        fluree
-            .graph(&id)
-            .transact()
-            .sparql_update(&format!(
-                "PREFIX ex: <http://example.org/>\n\
-                 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
-                 INSERT DATA {{ ex:doc ex:mentions <<( ex:bob ex:{property} {turtle} )>> }}"
-            ))
-            .commit()
-            .await
-            .expect("insert triple term");
-        let mentioned = || async {
-            let result = fluree
-                .query_connection_sparql(&format!(
-                    "PREFIX ex: <http://example.org/>\n\
-                     SELECT ?o FROM <{id}> WHERE {{ ex:doc ex:mentions <<( ex:bob ?p ?o )>> }}"
-                ))
-                .await
-                .expect("query");
-            let ledger = fluree.ledger(&id).await.unwrap();
-            result.to_jsonld(&ledger.snapshot).unwrap()
-        };
-        let before = mentioned().await;
-        assert_eq!(before, json!([[value]]), "{name}");
-        publish_erasure(
-            &fluree,
-            &id,
-            ErasureRequest {
-                matching: vec![FactSelector {
-                    subject: "http://example.org/alice".into(),
-                    predicate: format!("http://example.org/{property}"),
-                    graph: None,
-                    object: None,
-                }],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
-        assert_eq!(
-            (report.purged, report.rebuilt),
-            (1, 1),
-            "{name}: {report:?}"
-        );
-        assert_eq!(mentioned().await, before, "{name}");
-    }
-}
-
     pattern: JsonValue,
 ) -> std::result::Result<Vec<JsonValue>, ApiError> {
     let mut query = json!({"@context": ctx(), "from": from, "select": "?x", "where": pattern});

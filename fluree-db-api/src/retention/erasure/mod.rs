@@ -193,6 +193,11 @@ pub struct ErasureJob {
     pub signatures: SignatureMode,
     pub stage: ErasureStage,
     pub commits: Vec<CommitErasure>,
+    /// The properties (IRIs) of the occurrences it erases, as each branch
+    /// that held one decoded it. Empty when one did not decode, or for a job
+    /// recorded before they were kept: it may erase any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<String>,
     /// Prover attempts that failed and will be retried.
     #[serde(default)]
     pub retries: u32,

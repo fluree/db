@@ -109,7 +109,7 @@ impl Fluree {
         let clock = Instant::now();
         let plan = self.plan_purge(ledger).await?;
         report.timings.plan += clock.elapsed();
-        let stuck = self.unrebuildable_sources(&plan.sources).await?;
+        let stuck = self.unrebuildable_sources(&plan.rebuilt_sources).await?;
         let blocked = (!stuck.is_empty()).then_some(
             "full-text or vector indexes over a dropped ledger, or of a kind this build \
              cannot rebuild, keep their own copies: drop them first",
@@ -174,7 +174,7 @@ impl Fluree {
                             Erased::Nothing => {}
                         }
                     }
-                    report.sources += self.rebuild_sources(&plan.sources).await?;
+                    report.sources += self.rebuild_sources(&plan.rebuilt_sources).await?;
                     report.timings.index += clock.elapsed();
                     let ms = now_ms();
                     self.update_purge(&jobs, |p| p.rebuilt_ms = Some(ms))

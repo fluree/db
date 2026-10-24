@@ -1,7 +1,7 @@
-//! The full-text and vector indexes over a purge's holders that may read
-//! an erased property, which keep their own copies of what they index:
-//! rebuilt from the holders as they are, then every file of theirs but the
-//! head's released, and every file of one dropped since.
+//! The full-text and vector indexes over a purge's holders, which keep
+//! their own copies of what they index: those that may read an erased
+//! property rebuilt from the holders as they are, then every file of each
+//! but its head's released, and every file of one dropped since.
 
 use std::collections::BTreeSet;
 
