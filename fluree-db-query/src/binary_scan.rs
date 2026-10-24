@@ -1409,6 +1409,14 @@ impl BinaryScanOperator {
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // Decided per batch: a leaflet holding no list rows loads its
+        // position column as the constant "none".
+        let hide_members = self.hide_list_members
+            && !matches!(
+                batch.o_i,
+                fluree_db_binary_index::ColumnData::Const(u32::MAX)
+                    | fluree_db_binary_index::ColumnData::AbsentDefault
+            );
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
@@ -1426,7 +1434,7 @@ impl BinaryScanOperator {
             if self.is_internal_predicate(p_id) {
                 continue;
             }
-            if self.hide_list_members && o_i != u32::MAX {
+            if hide_members && o_i != u32::MAX {
                 continue;
             }
 
