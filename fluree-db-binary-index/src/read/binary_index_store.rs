@@ -418,7 +418,7 @@ pub struct BinaryIndexStore {
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
     /// The predicates with list rows, built on first use. See
     /// [`Self::list_predicate_ids`].
-    list_predicate_ids: OnceLock<Arc<std::collections::HashSet<u32>>>,
+    list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
     /// Per SPOT leaf, the subjects with list rows, sorted. See
     /// [`Self::subject_holds_lists`].
     leaf_list_subjects: RwLock<HashMap<ContentId, Arc<[u64]>>>,
@@ -502,7 +502,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
-            list_predicate_ids: OnceLock::new(),
+            list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
         }
@@ -690,7 +690,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
-            list_predicate_ids: OnceLock::new(),
+            list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
         })
