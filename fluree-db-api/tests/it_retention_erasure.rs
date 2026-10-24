@@ -2592,6 +2592,86 @@ async fn historical(
     ledger_id: &str,
     from: String,
     to: Option<String>,
+/// A triple term names its literal's dictionary entry too: an erased
+/// duration or string a surviving triple term spells the same keeps it.
+#[tokio::test]
+async fn an_erased_value_a_triple_term_spells_keeps_its_entry() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    // Each on a ledger of its own: erasing a string alone already sends a
+    // holder with a triple-term dictionary to a rebuild.
+    for (name, property, turtle, value) in [
+        (
+            "it/purge-term-duration",
+            "period",
+            "\"P1Y2M\"^^xsd:duration",
+            json!({"@value": "P1Y2M", "@type": "http://www.w3.org/2001/XMLSchema#duration"}),
+        ),
+        (
+            "it/purge-term-string",
+            "email",
+            "\"zephyr-term\"",
+            json!("zephyr-term"),
+        ),
+    ] {
+        let id = ledger(&fluree, name).await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:alice", format!("ex:{property}"): value}),
+        )
+        .await;
+        fluree
+            .graph(&id)
+            .transact()
+            .sparql_update(&format!(
+                "PREFIX ex: <http://example.org/>\n\
+                 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+                 INSERT DATA {{ ex:doc ex:mentions <<( ex:bob ex:{property} {turtle} )>> }}"
+            ))
+            .commit()
+            .await
+            .expect("insert triple term");
+        let mentioned = || async {
+            let result = fluree
+                .query_connection_sparql(&format!(
+                    "PREFIX ex: <http://example.org/>\n\
+                     SELECT ?o FROM <{id}> WHERE {{ ex:doc ex:mentions <<( ex:bob ?p ?o )>> }}"
+                ))
+                .await
+                .expect("query");
+            let ledger = fluree.ledger(&id).await.unwrap();
+            result.to_jsonld(&ledger.snapshot).unwrap()
+        };
+        let before = mentioned().await;
+        assert_eq!(before, json!([[value]]), "{name}");
+        publish_erasure(
+            &fluree,
+            &id,
+            ErasureRequest {
+                matching: vec![FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: format!("http://example.org/{property}"),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert_eq!(
+            (report.purged, report.rebuilt),
+            (1, 1),
+            "{name}: {report:?}"
+        );
+        assert_eq!(mentioned().await, before, "{name}");
+    }
+}
+
     pattern: JsonValue,
 ) -> std::result::Result<Vec<JsonValue>, ApiError> {
     let mut query = json!({"@context": ctx(), "from": from, "select": "?x", "where": pattern});

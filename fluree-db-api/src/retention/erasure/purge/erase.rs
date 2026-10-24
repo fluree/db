@@ -124,7 +124,7 @@ fn leafwise(root: &IndexRoot, event: &RunRecordV2) -> bool {
         | DecodeKind::SpatialArena
         | DecodeKind::TripleTermDict => false,
         // A triple term may name the string, and a full-text arena indexes it.
-        DecodeKind::StringDict | DecodeKind::JsonArena => root.term_dict.is_none() && !full_text,
+        _ if o_type.is_string_keyed() => root.term_dict.is_none() && !full_text,
         _ => true,
     }
 }

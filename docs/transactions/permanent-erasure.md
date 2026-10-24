@@ -117,7 +117,8 @@ resumes where an interrupted one stopped.
 1. **Indexes.** Every branch that holds an erased commit has its index rewritten without the erased
    events. Usually only the leaves that hold them are rewritten. The branch is rebuilt from the
    replacements instead when an erased value lives outside the leaves (a big number, vector, geometry,
-   full-text value or triple term). Full-text (BM25) and vector indexes over a holding branch that read
+   full-text value or triple term), or is a string, JSON value or duration in a ledger with triple
+   terms, which may spell it too. Full-text (BM25) and vector indexes over a holding branch that read
    an erased property are rebuilt from scratch; one that reads none of them never held the value and
    is left alone. One dropped before the purge has every file it left deleted. A soft-dropped ledger
    that holds an erased

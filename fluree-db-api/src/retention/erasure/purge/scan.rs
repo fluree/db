@@ -56,11 +56,13 @@ impl PurgeScan {
 }
 
 /// The string `value` is interned as in the string dictionary, if any:
-/// strings, JSON and generic durations, as the binary index encodes them.
+/// strings, JSON and generic durations, as the binary index encodes them,
+/// and a triple term's literal.
 fn dictionary_string(value: &FlakeValue) -> Option<Cow<'_, str>> {
     match value {
         FlakeValue::String(s) | FlakeValue::Json(s) => Some(Cow::Borrowed(s)),
         FlakeValue::Duration(d) => Some(Cow::Owned(d.to_canonical_string())),
+        FlakeValue::TripleTerm(term) => dictionary_string(&term.o),
         _ => None,
     }
 }
