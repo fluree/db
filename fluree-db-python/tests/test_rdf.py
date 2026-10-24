@@ -239,17 +239,31 @@ def test_quads_write_to_a_ledger():
 
 def test_a_collection_writes_to_a_ledger_as_its_text_does():
     """Quads holding a collection write to a ledger as the document's own
-    ``( … )`` does: as a list, not as ``rdf:first``/``rdf:rest`` triples."""
+    ``( … )`` does: as a list, whose members JSON-LD reads as values of the
+    predicate, not as ``rdf:first``/``rdf:rest`` triples."""
     doc = PREFIXES + "ex:s ex:list ( 1 2 ) . ex:g { ex:s ex:list ( ex:a ex:b ) }"
+    context = {"ex": EX}
     with fluree.connect(":memory:") as conn:
         text, quads = conn.create("text"), conn.create("quads")
         text.insert(doc, format="trig")
         quads.insert(fluree.parse(doc, "trig"))
         for ledger in (text, quads):
-            values = ledger.query(PREFIXES + "SELECT ?o WHERE { ex:s ex:list ?o }")
-            assert sorted(row.o for row in values) == [1, 2]
-            in_g = ledger.query(PREFIXES + "SELECT ?o WHERE { GRAPH ex:g { ex:s ex:list ?o } }")
-            assert sorted(row.o for row in in_g) == [ex("a"), ex("b")]
+            members = ledger.query({"@context": context, "select": "?o", "where": {"@id": "ex:s", "ex:list": "?o"}})
+            assert sorted(members) == [1, 2]
+            in_g = ledger.query(
+                {
+                    "@context": context,
+                    "select": "?o",
+                    "where": [["graph", EX + "g", {"@id": "ex:s", "ex:list": "?o"}]],
+                }
+            )
+            assert sorted(in_g) == ["ex:a", "ex:b"]
+            items = ledger.query(
+                PREFIXES
+                + "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n"
+                + "SELECT ?o WHERE { ex:s ex:list/rdf:rest*/rdf:first ?o }"
+            )
+            assert sorted(row.o for row in items) == [1, 2]
         text_out, quads_out = (
             fluree.parse(ledger.export(format="nquads", all_graphs=True), "nquads") for ledger in (text, quads)
         )
