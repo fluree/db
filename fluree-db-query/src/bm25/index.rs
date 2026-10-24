@@ -456,6 +456,12 @@ impl PropertyDepsAnalysis {
     pub fn is_complete(&self) -> bool {
         self.incomplete.is_none()
     }
+
+    /// Whether the query may read `iri`: any property when the analysis is
+    /// not complete.
+    pub fn may_read(&self, iri: &str) -> bool {
+        self.incomplete.is_some() || self.deps.contains(iri)
+    }
 }
 
 /// Where-clause forms that only group other patterns.

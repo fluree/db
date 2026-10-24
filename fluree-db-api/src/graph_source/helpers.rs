@@ -2,6 +2,8 @@
 //!
 //! These utilities handle common tasks like IRI expansion and prefix mapping.
 
+use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
+use fluree_db_query::bm25::{PropertyDeps, PropertyDepsAnalysis};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
@@ -138,6 +140,41 @@ pub fn expand_prefixed_iri(iri: &str, prefix_map: &HashMap<String, String>) -> O
     }
 
     None
+}
+
+/// The properties a full-text or vector index reads from its source
+/// ledger, judged as its incremental sync judges them: its indexing query's
+/// and, for a vector index, its embedding property. Any other kind of graph
+/// source, or a config that does not parse, may read anything.
+pub(crate) fn indexed_properties(record: &GraphSourceRecord) -> PropertyDepsAnalysis {
+    let unknown = |why: String| PropertyDepsAnalysis {
+        incomplete: Some(why),
+        ..Default::default()
+    };
+    let config: JsonValue = match serde_json::from_str(&record.config) {
+        Ok(config) => config,
+        Err(e) => return unknown(format!("its config does not parse: {e}")),
+    };
+    let query = config.get("query").cloned().unwrap_or(JsonValue::Null);
+    match record.source_type {
+        GraphSourceType::Bm25 => PropertyDeps::analyze(&query),
+        GraphSourceType::Vector => {
+            let Some(embedding) = config.get("embedding_property").and_then(JsonValue::as_str)
+            else {
+                return unknown("it names no embedding property".to_string());
+            };
+            let context = query
+                .get("@context")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let embedding = expand_prefixed_iri(embedding, &extract_prefix_map(&context))
+                .unwrap_or_else(|| embedding.to_string());
+            let mut analysis = PropertyDeps::analyze(&query);
+            analysis.deps.add(embedding);
+            analysis
+        }
+        ref other => unknown(format!("it is a {other:?} graph source")),
+    }
 }
 
 #[cfg(test)]

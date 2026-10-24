@@ -462,7 +462,7 @@ impl crate::Fluree {
 
     async fn sync_vector_index_once(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
         use fluree_db_core::trace_first_parent_commits_by_id;
-        use fluree_db_query::bm25::{CompiledPropertyDeps, PropertyDeps};
+        use fluree_db_query::bm25::CompiledPropertyDeps;
         use fluree_db_query::vector::usearch::deserialize;
         use futures::StreamExt;
         let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
@@ -550,7 +550,7 @@ impl crate::Fluree {
         //    `sync_bm25_index`. The embedding property is a dependency whether
         //    or not the query selects it, exactly as `VectorPropertyDeps::from_query`
         //    records it at build time.
-        let analysis = PropertyDeps::analyze(&query);
+        let analysis = crate::graph_source::helpers::indexed_properties(&record);
         if let Some(reason) = &analysis.incomplete {
             warn!(
                 graph_source_id = %graph_source_id,
@@ -563,14 +563,13 @@ impl crate::Fluree {
             );
             return self.resync_vector_index(graph_source_id).await;
         }
-        let mut query_deps = analysis.deps;
-        query_deps.add(index.property_deps.embedding_property.clone());
 
         // Compiled against the ledger at `ledger_t`, and sound for the reason
         // given at the matching step in `sync_bm25_index`: namespaces are
         // append-only, so a predicate with a flake in the window encodes here.
-        let compiled_deps =
-            CompiledPropertyDeps::compile(&query_deps, |iri: &str| ledger.snapshot.encode_iri(iri));
+        let compiled_deps = CompiledPropertyDeps::compile(&analysis.deps, |iri: &str| {
+            ledger.snapshot.encode_iri(iri)
+        });
 
         // 6. Trace commits and collect affected subjects. Branch-aware
         //    store so the walk can resolve pre-fork ancestors when the

@@ -1261,7 +1261,7 @@ impl crate::Fluree {
         // read off the snapshot so the verdict and the predicate set come from
         // the same analysis, and so an index built by an older extractor is
         // judged by the current one.
-        let analysis = PropertyDeps::analyze(&query);
+        let analysis = crate::graph_source::helpers::indexed_properties(&record);
         if let Some(reason) = &analysis.incomplete {
             warn!(
                 graph_source_id = %graph_source_id,

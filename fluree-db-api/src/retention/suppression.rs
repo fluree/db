@@ -17,7 +17,7 @@ use fluree_db_core::{ContentId, LedgerSnapshot};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_query::ir::{Pattern, Query, Ref};
 
-use super::journal::Journal;
+use super::journal::{HistoryRule, Journal, Removal};
 use super::registry;
 use super::watch::{Check, Seen};
 use crate::{ApiError, Fluree, Result};
@@ -471,7 +471,8 @@ impl Fluree {
     /// source ledger's retention suppressed: one built before a removal it
     /// has not yet indexed, one lagging the head of a ledger with
     /// `f:noHistory` (a value it holds may since have been superseded), or
-    /// any earlier snapshot of it (`historical`).
+    /// any earlier snapshot of it (`historical`). Only removals and rules of
+    /// properties the index may read count.
     pub(crate) async fn refuse_stale_search_sources(
         &self,
         query: &Query,
@@ -488,6 +489,7 @@ impl Fluree {
             let Some(record) = self.nameservice().lookup_graph_source(&id).await? else {
                 continue;
             };
+            let indexed = crate::graph_source::helpers::indexed_properties(&record);
             for ledger_id in &record.dependencies {
                 let Ok(ledger_id) = fluree_db_core::LedgerId::parse(ledger_id) else {
                     continue;
@@ -496,20 +498,32 @@ impl Fluree {
                 let Some(suppression) = self.suppression_for(&ledger_id).await? else {
                     continue;
                 };
+                let journal = &suppression.journal;
+                let removals: Vec<&Removal> = journal
+                    .removals
+                    .iter()
+                    .filter(|r| indexed.may_read(&r.predicate))
+                    .collect();
+                let rules: Vec<&HistoryRule> = journal
+                    .history_rules
+                    .iter()
+                    .filter(|r| indexed.may_read(&r.predicate))
+                    .collect();
+                if removals.is_empty() && rules.is_empty() {
+                    continue;
+                }
                 if historical {
                     return Err(ApiError::HistoryUnavailable(format!(
                         "search index {id} is read as of an earlier point, and {ledger_id} \
                          suppresses history; search it as of the current head"
                     )));
                 }
-                let journal = &suppression.journal;
-                let removed_through = journal
-                    .removals
+                let removed_through = removals
                     .iter()
                     .map(|r| r.until_t.unwrap_or(r.scope_t))
                     .max();
                 let lagging_removal = removed_through.filter(|t| record.index_t < *t);
-                let lagging_rules = journal.history_rules.iter().any(|r| r.until_t.is_none())
+                let lagging_rules = rules.iter().any(|r| r.until_t.is_none())
                     && match self.nameservice().lookup(&ledger_id).await? {
                         Some(head) => record.index_t < head.commit_t,
                         None => false,

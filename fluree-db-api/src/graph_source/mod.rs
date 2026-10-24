@@ -190,7 +190,7 @@ mod config;
 // The maintenance workers are native-only.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod dependency_index;
-mod helpers;
+pub(crate) mod helpers;
 mod provider;
 mod result;
 mod source_instance;
