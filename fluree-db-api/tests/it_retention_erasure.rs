@@ -2287,6 +2287,30 @@ async fn a_string_a_surviving_occurrence_shares_does_not_block_the_purge() {
     );
 }
 
+/// The empty string, erased where nothing else uses it, leaves the
+/// dictionaries like any other: the purge completes.
+#[tokio::test]
+async fn an_erased_empty_string_does_not_block_the_purge() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-empty").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice", "ex:email": ""}),
+    )
+    .await;
+    publish_erasure(&fluree, &id, email("alice", "")).await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!((report.purged, report.leafwise), (1, 1), "{report:?}");
+    assert!(objects(&fluree, &id, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
 /// Erase, index and publish `request` on `id`.
 async fn publish_erasure(fluree: &Fluree, id: &str, request: ErasureRequest) {
     fluree
