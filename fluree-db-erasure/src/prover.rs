@@ -26,6 +26,13 @@ pub enum ProverError {
 #[async_trait::async_trait]
 pub trait Prover: Send + Sync + std::fmt::Debug {
     async fn prove(&self, request: &ProveRequest) -> Result<ProveResponse, ProverError>;
+
+    /// Remove what steps of processes no longer running left in scratch:
+    /// a crash mid-step leaves files that hold the commit being proved.
+    /// Returns how many steps' it removed.
+    fn clear_residue(&self) -> std::io::Result<usize> {
+        Ok(0)
+    }
 }
 
 /// How Fluree runs the prover binary.
@@ -76,6 +83,50 @@ impl Prover for SubprocessProver {
             tracing::warn!(dir = %scratch.display(), error = %e, "prover scratch not removed");
         }
         outcome
+    }
+
+    fn clear_residue(&self) -> std::io::Result<usize> {
+        let entries = match std::fs::read_dir(&self.config.scratch_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let pid = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("step-"))
+                .and_then(|n| n.split_once('-'))
+                .and_then(|(pid, _)| pid.parse::<u32>().ok());
+            if pid.is_some_and(|pid| !running(pid)) {
+                std::fs::remove_dir_all(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Whether process `pid` is running on this host: a step it runs may still
+/// be using its directory.
+fn running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -184,4 +235,34 @@ async fn run(
         });
     }
     ProveResponse::decode(&out).map_err(|e| ProverError::Failed(format!("its response: {e}")))
+}
+
+#[cfg(all(test, unix))]
+mod residue_tests {
+    use super::{Prover, ProverConfig, SubprocessProver};
+
+    /// A step's scratch is residue once its process has ended; this
+    /// process's steps stay.
+    #[test]
+    fn only_steps_of_ended_processes_are_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let ended = child.id();
+        child.wait().unwrap();
+        let dead = dir.path().join(format!("step-{ended}-1"));
+        let ours = dir.path().join(format!("step-{}-2", std::process::id()));
+        for d in [&dead, &ours] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let prover = SubprocessProver::new(ProverConfig {
+            command: "fluree-prover".into(),
+            scratch_dir: dir.path().to_path_buf(),
+            threads: None,
+            niceness: 0,
+            timeout: std::time::Duration::from_secs(1),
+        });
+
+        assert_eq!(prover.clear_residue().unwrap(), 1);
+        assert!(!dead.exists() && ours.exists());
+    }
 }

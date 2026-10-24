@@ -1070,6 +1070,8 @@ pub struct IndexerHandle {
     trigger: TriggerHandle,
     housekeeping: HousekeepingSlot,
     build_observer: BuildObserverSlot,
+    /// Where the worker's builds spill: [`IndexerConfig::data_dir`].
+    data_dir: Option<std::path::PathBuf>,
     /// Holding this Arc bumps the shutdown trigger's strong count;
     /// dropping the last clone fires the worker's `shutdown_rx`.
     _shutdown: Arc<ShutdownTrigger>,
@@ -1456,6 +1458,11 @@ impl TriggerHandle {
 }
 
 impl IndexerHandle {
+    /// Where the worker's builds spill: [`IndexerConfig::data_dir`].
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.data_dir.as_deref()
+    }
+
     /// Run `housekeeping` on this worker's catch-up ticks, replacing any
     /// installed before. A worker that does not own catch-up never runs it.
     /// Run `observer` before each background build, replacing any observer
@@ -1711,6 +1718,7 @@ impl BackgroundIndexerWorker {
             trigger: trigger.clone(),
             housekeeping: Arc::clone(&housekeeping),
             build_observer: Arc::clone(&build_observer),
+            data_dir: config.data_dir.clone(),
             _shutdown: shutdown,
         };
 

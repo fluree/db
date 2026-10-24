@@ -445,12 +445,36 @@ impl Fluree {
             .filter_map(|k| k.rsplit_once("/commit/").map(|(folder, _)| folder))
             .filter_map(|folder| folder.rsplit_once('/').map(|(root, _)| root.to_string()))
             .collect();
+        // Scratch outside the storage: what crashed rebuilds of the holders,
+        // and crashed proving steps, left.
+        let data_dir = match &self.indexing_mode {
+            IndexingMode::Background(handle) => handle.data_dir().map(std::path::Path::to_path_buf),
+            IndexingMode::Disabled => None,
+        };
+        let holders = plan.rebuild.clone();
+        let prover = self
+            .erasure_runtime()?
+            .config
+            .as_ref()
+            .map(|c| std::sync::Arc::clone(&c.prover));
         let swept = tokio::task::spawn_blocking(move || {
             let mut swept = 0;
             for ledger in &ledgers {
                 swept += fluree_db_core::FileStorage::sweep_foreign_staging(
                     std::path::Path::new(root.as_ref()).join(ledger),
                 );
+            }
+            let scratch = |e: std::io::Error| fluree_db_core::Error::io(format!("scratch: {e}"));
+            for holder in &holders {
+                // The default spill directory, and the indexer's own.
+                swept += fluree_db_indexer::clear_rebuild_residue(None, holder).map_err(scratch)?;
+                if let Some(dir) = &data_dir {
+                    swept += fluree_db_indexer::clear_rebuild_residue(Some(dir), holder)
+                        .map_err(scratch)?;
+                }
+            }
+            if let Some(prover) = &prover {
+                swept += prover.clear_residue().map_err(scratch)?;
             }
             fluree_db_core::FileStorage::checkpoint_wal(root.as_ref())?;
             fluree_db_core::FileStorage::sync_parent_dirs(root.as_ref(), &keys)?;

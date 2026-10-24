@@ -1814,8 +1814,8 @@ async fn a_purge_under_the_write_ahead_log_leaves_no_file_holding_the_value() {
 }
 
 /// A staging file a crashed write of another process left in the ledger's
-/// folder may hold an original's bytes: the purge removes it, whatever its
-/// age.
+/// folder may hold an original's bytes, as may a crashed rebuild's spill:
+/// the purge removes both, whatever their age.
 #[tokio::test]
 async fn a_purge_removes_staging_files_crashed_writes_left() {
     let dir = tempfile::tempdir().unwrap();
@@ -1838,6 +1838,19 @@ async fn a_purge_removes_staging_files_crashed_writes_left() {
         .join(fluree.storage_namespace(&id).await.unwrap().branch_prefix());
     let staging = folder.join("commit/0011.fcv2.4242.00000000deadbeef.1.tmp");
     std::fs::write(&staging, b"{\"email\": \"a@secret\"}").unwrap();
+    // A rebuild of the ledger by a process that has since ended, which
+    // spilled its runs to the default scratch directory.
+    let ended = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+    let session = std::env::temp_dir()
+        .join("fluree-index/it/purge-staging/main/tmp_import")
+        .join(format!("{ended}-crashed"));
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::write(session.join("run.bin"), b"a@secret").unwrap();
 
     let report = fluree
         .run_purge_pass(&id, std::time::Duration::ZERO)
@@ -1845,6 +1858,7 @@ async fn a_purge_removes_staging_files_crashed_writes_left() {
         .unwrap();
     assert_eq!(report.purged, 1, "{report:?}");
     assert!(!staging.exists());
+    assert!(!session.exists());
     assert_eq!(
         files_holding(dir.path(), "a@secret"),
         Vec::<std::path::PathBuf>::new()

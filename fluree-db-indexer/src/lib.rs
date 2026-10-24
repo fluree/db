@@ -28,6 +28,7 @@
 //! - [`build::commit_chain`]: Commit chain walking
 
 mod build;
+pub use build::rebuild::clear_rebuild_residue;
 pub mod config;
 pub mod drop;
 pub mod error;
