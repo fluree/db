@@ -33,9 +33,9 @@ use crate::{Fluree, Result};
 pub(crate) struct RetentionRuntime {
     /// Branches known to be registered.
     active: parking_lot::Mutex<HashSet<String>>,
-    /// Unregistered branches, with the commit `t` their chain was probed
-    /// through.
-    probed: parking_lot::Mutex<HashMap<String, i64>>,
+    /// Unregistered branches, with the incarnation whose chain was probed
+    /// and the commit `t` it was probed through.
+    probed: parking_lot::Mutex<HashMap<String, (Incarnation, i64)>>,
     /// Wakes the worker.
     pub(crate) nudge: Arc<Notify>,
     /// A worker runs in this process.
@@ -55,6 +55,20 @@ pub(crate) struct RetentionRuntime {
     /// Set on a file-backed instance.
     #[cfg(feature = "native")]
     pub(crate) erasure: std::sync::OnceLock<Arc<super::erasure::ErasureRuntime>>,
+}
+
+/// Which ledger a record under a name is: one created again under a
+/// dropped one's name has another fence and storage root.
+type Incarnation = (Option<fluree_db_nameservice::Fence>, Option<u128>);
+
+fn incarnation(record: &NsRecord) -> Incarnation {
+    (
+        record.fence,
+        record
+            .storage_root
+            .as_ref()
+            .and_then(fluree_db_core::StorageRoot::instance_bits),
+    )
 }
 
 impl RetentionRuntime {
@@ -419,9 +433,11 @@ impl Fluree {
         let Some(head) = record.commit_head_id.clone() else {
             return Ok(());
         };
-        let from = record
-            .index_t
-            .max(self.retention.probed.lock().get(&id).copied().unwrap_or(0));
+        let probed = match self.retention.probed.lock().get(&id) {
+            Some((probed, t)) if *probed == incarnation(record) => *t,
+            _ => 0,
+        };
+        let from = record.index_t.max(probed);
         if record.commit_t <= from {
             return Ok(());
         }
@@ -442,7 +458,10 @@ impl Fluree {
                 self.retention.mark_active(&id);
             }
             None => {
-                self.retention.probed.lock().insert(id, record.commit_t);
+                self.retention
+                    .probed
+                    .lock()
+                    .insert(id, (incarnation(record), record.commit_t));
             }
         }
         Ok(())

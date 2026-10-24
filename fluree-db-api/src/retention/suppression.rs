@@ -207,10 +207,12 @@ pub(crate) enum Freshness {
     Behind { journal: Option<bool> },
 }
 
-/// Suppressions held between reads, by branch and journal generation.
+/// Suppressions held between reads, by branch. One is reused only for an
+/// equal journal: a ledger created again under a dropped one's name starts
+/// its generations over.
 #[derive(Default)]
 pub(crate) struct SuppressionCache {
-    by_ledger: parking_lot::Mutex<HashMap<String, (u64, Arc<Suppression>)>>,
+    by_ledger: parking_lot::Mutex<HashMap<String, Arc<Suppression>>>,
 }
 
 impl Fluree {
@@ -304,8 +306,8 @@ impl Fluree {
             return Ok(None);
         };
         let cache = &self.retention.suppressions;
-        if let Some((generation, cached)) = cache.by_ledger.lock().get(ledger_id) {
-            if *generation == journal.generation {
+        if let Some(cached) = cache.by_ledger.lock().get(ledger_id) {
+            if cached.journal == journal {
                 return Ok(Some(Arc::clone(cached)));
             }
         }
@@ -314,10 +316,10 @@ impl Fluree {
             journal,
             removal_subjects,
         });
-        cache.by_ledger.lock().insert(
-            ledger_id.to_string(),
-            (suppression.journal.generation, Arc::clone(&suppression)),
-        );
+        cache
+            .by_ledger
+            .lock()
+            .insert(ledger_id.to_string(), Arc::clone(&suppression));
         Ok(Some(suppression))
     }
 

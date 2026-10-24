@@ -1191,3 +1191,83 @@ async fn expiry_keeps_the_commit_log() {
     let log = fluree.commit_log(&id, None).await.expect("commit log");
     assert_eq!(log.0.len() as i64, t, "every commit is still in the log");
 }
+
+/// A ledger dropped and created again under its name has its own commits
+/// probed for retention input, from its first: not only past where the
+/// dropped ledger's were, and whether or not the dropped one was
+/// registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recreated_ledgers_ttl_is_found_from_its_first_commit() {
+    recreated_ledgers_ttl_is_found(false).await;
+    recreated_ledgers_ttl_is_found(true).await;
+}
+
+async fn recreated_ledgers_ttl_is_found(registered: bool) {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_millis(200))
+            .build()
+            .expect("fluree"),
+    );
+    assert!(fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            ..Default::default()
+        })
+    ));
+    let name = "it/ttl-recreated";
+    let id = ledger(&fluree, name).await;
+    let mut last = 0;
+    for i in 0..5 {
+        let value = if registered && i == 0 {
+            json!({"@value": "x", "@ttl": 86_400})
+        } else {
+            json!("plain")
+        };
+        last = insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": format!("ex:s{i}"), "ex:k": value}),
+        )
+        .await;
+    }
+    // Indexed, so its chain is probed through `last` and found to hold none.
+    for _ in 0..300 {
+        let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+        if record.index_t >= last {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fluree.retention_status(&id).await.expect("status").active,
+        registered
+    );
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop");
+
+    let id = ledger(&fluree, name).await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 1}, "ex:k": "kept"}),
+    )
+    .await;
+    let mut gone = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if objects(&fluree, &id, &id, "ex:s", "ex:v").await.is_empty() {
+            gone = true;
+            break;
+        }
+    }
+    let status = fluree.retention_status(&id).await.expect("status");
+    assert!(gone, "not expired by the worker: {status:?}");
+}

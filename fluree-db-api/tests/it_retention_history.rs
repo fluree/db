@@ -1924,3 +1924,50 @@ async fn a_restored_ledger_journals_its_own_retraction_of_a_removed_value() {
         read(&fluree, &source, at_t2, "ex:alice", "ex:email").await
     ));
 }
+
+/// A ledger dropped and created again under its name is answered from its
+/// own removal journal, not one held for the dropped ledger at the same
+/// generation.
+#[tokio::test]
+async fn a_recreated_ledger_honors_its_own_removals() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let name = "it/removal-recreated";
+    let id = ledger(&fluree, name).await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@old"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("bob", Some(json!("b@old"))))
+        .await
+        .expect("remove");
+    let at_t1 = json!(format!("{id}@t:{t1}"));
+    assert!(unavailable(
+        read(&fluree, &id, at_t1.clone(), "ex:bob", "ex:email").await
+    ));
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop");
+
+    let id = ledger(&fluree, name).await;
+    let again = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    assert_eq!(again, t1);
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    assert!(unavailable(
+        read(&fluree, &id, at_t1, "ex:alice", "ex:email").await
+    ));
+}
