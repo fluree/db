@@ -175,6 +175,12 @@ impl BinaryCursor {
         }
     }
 
+    /// The number of leaves this cursor routes: those its key range can
+    /// reach, each opened as the cursor passes it.
+    pub fn leaf_count(&self) -> usize {
+        self.leaf_range.len()
+    }
+
     /// Restrict a batched probe to leaflets that can hold one of `keys`
     /// (sorted, deduplicated), by [`crate::format::leaf::LeafletDirEntryV3::may_hold_keys`] under
     /// the filter's predicate. A gap between wanted keys then costs a directory-key

@@ -811,7 +811,8 @@ fn binary_range_eq_v3(
         object_slice_filters(order, filter, &object_slices)
             .into_iter()
             .map(|filter| {
-                let use_range = filter.s_id.is_some()
+                let use_range = filter.g_id.is_some()
+                    || filter.s_id.is_some()
                     || filter.p_id.is_some()
                     || filter.o_type.is_some()
                     || filter.o_key.is_some();

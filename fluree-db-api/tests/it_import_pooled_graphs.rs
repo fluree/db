@@ -1828,6 +1828,82 @@ async fn pooled_leaves_hold_one_leaflet() {
     );
 }
 
+/// A whole read of one pooled graph routes the GSPO leaves holding that
+/// graph's rows, not every leaf of the pool: GSPO leads with the graph.
+#[tokio::test(flavor = "current_thread")]
+async fn a_whole_pooled_graph_read_routes_its_own_leaves() {
+    const LEAFLET: usize = 20;
+    let trig: String = (0..200)
+        .map(|g| {
+            let quads: String = (0..5)
+                .map(|i| format!("ex:s{g}_{i} ex:val {i} . "))
+                .collect();
+            format!("ex:g{g} {{ {quads}}}\n")
+        })
+        .collect();
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-whole-graph:main";
+    let dir = data_dir.path().join("import");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("part-00.trig"),
+        format!("@prefix ex: <http://example.org/> .\n{trig}"),
+    )
+    .unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create(ledger_id)
+        .import(&dir)
+        .threads(1)
+        .leaflet_rows(LEAFLET)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let root = latest_root(db_dir.path());
+    assert!(dedicated_user_graphs(&root).is_empty());
+    let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+    let (_, gspo) = root
+        .pool
+        .as_ref()
+        .expect("a pool")
+        .orders
+        .iter()
+        .find(|(order, _)| *order == fluree_db_binary_index::RunSortOrder::Gspo)
+        .expect("a pooled GSPO");
+    let pool_leaves = fluree_db_binary_index::format::branch::read_branch_from_bytes(
+        &store.get(gspo).await.expect("branch"),
+    )
+    .expect("decode branch")
+    .leaves
+    .len();
+    assert!(pool_leaves > 10, "pooled GSPO leaves: {pool_leaves}");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    for sparql in [
+        "SELECT ?s ?p ?o WHERE { GRAPH ex:g100 { ?s ?p ?o } }",
+        "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g100 { ?s ?p ?o } }",
+        "SELECT ?s ?p ?o FROM <http://example.org/g100> WHERE { ?s ?p ?o }",
+    ] {
+        let (spans, guard) = support::span_capture::init_test_tracing();
+        let rows = select(&fluree, &ledger, &format!("{PREFIXES}{sparql}")).await;
+        drop(guard);
+        assert!(rows == ["n=5"] || rows.len() == 5, "{sparql}: {rows:?}");
+        let leaves: Vec<usize> = spans
+            .find_events("BinaryScanOperator::open")
+            .iter()
+            .filter_map(|e| e.fields.get("leaves")?.parse().ok())
+            .collect();
+        assert!(
+            !leaves.is_empty() && leaves.iter().all(|&n| n <= 2),
+            "{sparql}: leaves routed per scan {leaves:?} of {pool_leaves}"
+        );
+    }
+}
+
 /// A pooled graph's indexed lists read as RDF lists in SPARQL, for a bound
 /// owner and inside `GRAPH ?g`, and as members of their predicate in JSON-LD:
 /// the list view finds their predicates and owners in the pool.

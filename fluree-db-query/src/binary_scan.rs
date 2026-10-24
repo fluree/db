@@ -2921,8 +2921,11 @@ impl Operator for BinaryScanOperator {
             }
         }
 
+        // A pooled graph's rows are contiguous in the pooled GSPO, so the
+        // graph alone narrows the leaves a scan of it routes.
         let use_range = |filter: &BinaryFilter| {
-            filter.s_id.is_some()
+            filter.g_id.is_some()
+                || filter.s_id.is_some()
                 || filter.p_id.is_some()
                 || filter.o_type.is_some()
                 || filter.o_key.is_some()
@@ -3342,6 +3345,12 @@ impl Operator for BinaryScanOperator {
             order = ?order,
             g_id = self.g_id,
             pattern = ?self.pattern,
+            leaves = self
+                .cursor
+                .iter()
+                .chain(&self.pending_cursors)
+                .map(BinaryCursor::leaf_count)
+                .sum::<usize>(),
             "BinaryScanOperator::open"
         );
 
