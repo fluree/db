@@ -345,7 +345,7 @@ pub fn query_has_list_view(query: &crate::ir::Query) -> bool {
     has_list_view(&query.patterns) || modifiers_have_list_view(&query.grouping, &query.order_binds)
 }
 
-fn modifiers_have_list_view(
+pub(crate) fn modifiers_have_list_view(
     grouping: &Option<crate::ir::Grouping>,
     order_binds: &[(VarId, crate::ir::Expression)],
 ) -> bool {

@@ -422,6 +422,16 @@ pub struct BinaryIndexStore {
     /// Per SPOT leaf, the subjects with list rows, sorted. See
     /// [`Self::subject_holds_lists`].
     leaf_list_subjects: RwLock<HashMap<ContentId, Arc<[u64]>>>,
+    /// Per graph, its list census. See [`Self::list_census`].
+    list_census: RwLock<HashMap<GraphId, Arc<HashMap<u32, ListCensus>>>>,
+}
+
+/// One predicate's compactly stored lists in a graph's index: the subjects
+/// holding members under it (one list each) and the members.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCensus {
+    pub lists: u64,
+    pub members: u64,
 }
 
 /// Lowercase the root's language tags, preserving position.
@@ -494,6 +504,7 @@ impl BinaryIndexStore {
             decimal_only_proofs: RwLock::new(HashMap::new()),
             list_predicate_ids: OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         }
     }
 
@@ -681,6 +692,7 @@ impl BinaryIndexStore {
             decimal_only_proofs: RwLock::new(HashMap::new()),
             list_predicate_ids: OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         })
     }
 
@@ -2589,6 +2601,77 @@ impl BinaryIndexStore {
         let ids = Arc::new(ids);
         let _ = self.list_predicate_ids.set(Arc::clone(&ids));
         Ok(ids)
+    }
+
+    /// Graph `g_id`'s compactly stored lists, per predicate holding them, as
+    /// of the index: read once per graph for the store's life from the PSOT
+    /// leaflets of [`Self::list_predicate_ids`] flagged as holding list rows.
+    /// PSOT sorts a predicate's rows by subject, so each run of a subject's
+    /// members is one list.
+    pub fn list_census(&self, g_id: GraphId) -> io::Result<Arc<HashMap<u32, ListCensus>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(census) = self.list_census.read().get(&g_id) {
+            return Ok(Arc::clone(census));
+        }
+        let mut census: HashMap<u32, ListCensus> = HashMap::new();
+        if let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Psot) {
+            let mut columns = ColumnSet::EMPTY;
+            for column in [ColumnId::SId, ColumnId::PId, ColumnId::OI] {
+                columns.insert(column);
+            }
+            let projection = ColumnProjection {
+                output: columns,
+                internal: ColumnSet::EMPTY,
+            };
+            for &p_id in self.list_predicate_ids()?.iter() {
+                let mut found = ListCensus::default();
+                let mut last_owner = None;
+                let leaves = branch
+                    .leaves
+                    .iter()
+                    .filter(|leaf| leaf.first_key.p_id <= p_id && p_id <= leaf.last_key.p_id);
+                for leaf in leaves {
+                    let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                    let mut handle = None;
+                    for (idx, entry) in dir.entries.iter().enumerate() {
+                        if entry.row_count == 0
+                            || entry.flags & HAS_O_I == 0
+                            || entry.p_const.is_some_and(|p| p != p_id)
+                        {
+                            continue;
+                        }
+                        let handle = match &mut handle {
+                            Some(handle) => handle,
+                            None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                        };
+                        let batch = handle.load_columns(idx, &projection, RunSortOrder::Psot)?;
+                        for row in 0..batch.row_count {
+                            if batch.p_id.get_or(row, p_id) != p_id
+                                || batch.o_i.get_or(row, LIST_INDEX_NONE) == LIST_INDEX_NONE
+                            {
+                                continue;
+                            }
+                            found.members += 1;
+                            let owner = batch.s_id.get(row);
+                            if last_owner != Some(owner) {
+                                found.lists += 1;
+                                last_owner = Some(owner);
+                            }
+                        }
+                    }
+                }
+                if found.members > 0 {
+                    census.insert(p_id, found);
+                }
+            }
+        }
+        let census = Arc::new(census);
+        self.list_census.write().insert(g_id, Arc::clone(&census));
+        Ok(census)
     }
 
     /// Whether subject `s_id` has list rows in graph `g_id`'s index. Reads

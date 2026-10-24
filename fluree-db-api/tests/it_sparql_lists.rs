@@ -961,3 +961,62 @@ async fn a_post_state_condition_reads_a_list_stored_again() {
         allowed.err()
     );
 }
+
+/// The fast `?s ?p ?o` counts read stored rows, so over the index they add
+/// the list view's triples: each list's owner edge in place of its members,
+/// and an `rdf:first` and an `rdf:rest` per member. Hand-counted: stored rows
+/// are `9`, three and two members, `ex:name` and the empty list's `rdf:nil`.
+/// With a list in novelty the lanes decline and the generic plan answers.
+#[tokio::test]
+async fn whole_graph_counts_add_the_list_triples() {
+    const COUNT: &str = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }";
+    const BY_PREDICATE: &str = "SELECT ?p (COUNT(?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p";
+    let ttl = "ex:s ex:items (1 2 3) ; ex:items 9 .
+               ex:t ex:tags (ex:a ex:b) .
+               ex:u ex:name \"u\" .
+               ex:v ex:items () .";
+    let by_predicate = |items: i64, tags: i64, name: i64, cells: i64| {
+        let mut rows = vec![
+            json!(["ex:items", items]),
+            json!(["ex:name", name]),
+            json!(["ex:tags", tags]),
+            json!(["rdf:first", cells]),
+            json!(["rdf:rest", cells]),
+        ];
+        rows.sort_by_key(ToString::to_string);
+        rows
+    };
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = indexed_ledger_with(&fluree, "whole-graph-counts", ttl).await;
+
+    let (spans, _guard) = support::span_capture::init_test_tracing();
+    let proceeded = |site: &str| {
+        spans.find_events("fast-path outcome").iter().any(|e| {
+            e.fields.get("site").map(String::as_str) == Some(site)
+                && e.fields.get("outcome").map(String::as_str) == Some("proceed")
+        })
+    };
+    assert_eq!(rows(&fluree, &ledger, COUNT).await, [json!([8 + 5 + 2])]);
+    assert!(proceeded("triples COUNT"), "the count lane answered");
+    let mut grouped = rows(&fluree, &ledger, BY_PREDICATE).await;
+    grouped.sort_by_key(ToString::to_string);
+    assert_eq!(grouped, by_predicate(9 - 9 + 2 + 1, 1, 1, 5));
+    assert!(
+        proceeded("COUNT by predicate (directory)"),
+        "the per-predicate lane answered"
+    );
+
+    // A list in novelty: the lanes decline, and the generic plan counts it.
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\nex:w ex:tags (ex:c) .",
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    assert_eq!(rows(&fluree, &ledger, COUNT).await, [json!([15 + 3])]);
+    let mut grouped = rows(&fluree, &ledger, BY_PREDICATE).await;
+    grouped.sort_by_key(ToString::to_string);
+    assert_eq!(grouped, by_predicate(3, 2, 1, 6));
+}
