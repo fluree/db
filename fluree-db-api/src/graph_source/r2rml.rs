@@ -2080,13 +2080,15 @@ impl<'a> FlureeR2rmlProvider<'a> {
         to_snapshot_id: Option<i64>,
         from_sequence: Option<i64>,
     ) -> QueryResult<MaterializeScan> {
+        // A pinned read is never cut, on every path and for every source. `0`
+        // is the disabled budget: neither Iceberg full-read cut takes a prefix
+        // under it, the incremental cap is skipped for a pin outright, and a
+        // Delta change feed reads its whole window.
+        let pinned = to_snapshot_id.is_some();
+        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
+
         #[cfg(feature = "delta")]
         if let Some(delta) = self.delta_source(graph_source_id).await? {
-            let budget_rows = if to_snapshot_id.is_some() {
-                0
-            } else {
-                self.pass_row_budget()
-            };
             return delta
                 .materialize_scan(
                     self.fluree,
@@ -2107,7 +2109,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
         } else {
             table_name
         };
-        let pinned = to_snapshot_id.is_some();
         let to_snapshot = match to_snapshot_id {
             // A caller's pin must resolve — typed error, never fall-forward
             // (see the doc comment).
@@ -2165,11 +2166,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
                  stopped for longer than retention."
             ),
         }
-
-        // A pinned read is never cut, on every path. `0` is the disabled budget:
-        // neither full-read cut below takes a prefix under it, and the
-        // incremental cap is skipped for a pin outright.
-        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
 
         // An UNPINNED incremental window is read in bounded steps.
         //
