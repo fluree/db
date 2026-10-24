@@ -189,7 +189,7 @@ mod inner {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, chunk_prefix_map, spool_ctx) = sink
                 .into_parts()
-                .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+                .map_err(crate::import_sink::encode_failure)?;
             state.prefix_map.extend(chunk_prefix_map);
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
@@ -354,7 +354,7 @@ mod inner {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, _chunk_prefix_map, spool_ctx) = sink
                 .into_parts()
-                .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+                .map_err(crate::import_sink::encode_failure)?;
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
             let op_count = writer.op_count();
@@ -544,7 +544,7 @@ mod inner {
         // The spool is finished only after the named-graph loop completes.
         let (mut writer, chunk_prefix_map, mut spool_ctx) = sink
             .into_parts()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         state.prefix_map.extend(chunk_prefix_map);
         let mut op_count = writer.op_count();
 
@@ -686,6 +686,7 @@ mod inner {
                     if let Some(sc) = spool_ctx.as_mut() {
                         sc.push_named_graph_record(
                             g_id,
+                            &block.iri,
                             crate::import_sink::FlakeRecord {
                                 s: &s,
                                 p: &p,
@@ -751,6 +752,7 @@ mod inner {
                     if let Some(sc) = spool_ctx.as_mut() {
                         sc.push_named_graph_record(
                             g_id,
+                            &block.iri,
                             crate::import_sink::FlakeRecord {
                                 s: &flake.s,
                                 p: &flake.p,
@@ -1047,7 +1049,7 @@ mod inner {
 
         let (writer, prefix_map, spool_ctx) = sink
             .into_parts()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
@@ -1122,7 +1124,7 @@ mod inner {
 
         let (writer, _prefix_map, spool_ctx) = sink
             .into_parts()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
@@ -1283,7 +1285,7 @@ mod inner {
 
         let (writer, prefix_map, spool_ctx) = sink
             .into_parts()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 

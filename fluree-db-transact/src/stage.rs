@@ -669,6 +669,10 @@ pub async fn stage_with_graph_delta(
     NamespaceRegistry,
     rustc_hash::FxHashMap<u16, String>,
 )> {
+    // Staging reads the ledger's index (WHERE, upsert, graph management), so
+    // refuse before the first read if this process has not loaded it.
+    crate::check_index_loaded(&ledger.snapshot)?;
+
     // SPARQL graph-management verbs (CLEAR/DROP/COPY/MOVE/ADD) execute by a
     // whole-graph scan + retract/re-home at staging time rather than by the
     // template/WHERE pipeline below. Dispatch before any hot-path setup so the
@@ -2314,6 +2318,9 @@ pub async fn stage_flakes(
 ) -> Result<StagedLedger> {
     let span = tracing::debug_span!("stage_flakes", flake_count = flakes.len());
     async move {
+        // Policy and SHACL read the ledger's index; see `stage_with_graph_delta`.
+        crate::check_index_loaded(&ledger.snapshot)?;
+
         // 1. Backpressure check
         if let Some(config) = options.index_config {
             if ledger.at_max_novelty(config) {

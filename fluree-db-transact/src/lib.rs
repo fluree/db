@@ -50,6 +50,7 @@ pub mod stage;
 pub mod staged_dicts;
 pub mod template_sink;
 pub mod value_convert;
+pub mod vector_dims;
 
 #[cfg(feature = "import")]
 pub mod import;
@@ -62,7 +63,8 @@ pub use fluree_graph_turtle::splitter as turtle_splitter;
 // Re-exports
 pub use address::parse_commit_id;
 pub use commit::{
-    build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
+    build_commit, check_index_loaded, commit, CommitOpts, CommitOptsRequest, CommitReceipt,
+    StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{
