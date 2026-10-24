@@ -1167,7 +1167,21 @@ impl BinaryIndexStore {
         if self.residency_mode() {
             return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
         }
-        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay)
+        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay, self.remote_leaf_fetch)
+    }
+
+    /// [`Self::open_leaf_handle`] for reading a few leaflets' columns: a
+    /// remote leaf is range-read whatever [`RemoteLeafFetch`] the store uses,
+    /// so a walk that reads one leaflet in many leaves fetches no whole leaf.
+    pub fn open_leaf_handle_ranged(
+        &self,
+        leaf_cid: &ContentId,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self.open_resident_leaf_handle(leaf_cid, None, false);
+        }
+        self.open_leaf_handle_native(leaf_cid, None, false, RemoteLeafFetch::Ranged)
     }
 
     /// Residency-mode leaf open: whole leaf (and sidecar when replaying)
@@ -1201,6 +1215,7 @@ impl BinaryIndexStore {
         leaf_cid: &ContentId,
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
+        remote_fetch: RemoteLeafFetch,
     ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
         use super::leaf_access::{
             fetch_header_and_directory, FullBlobLeafHandle, RangeReadLeafHandle,
@@ -1251,7 +1266,7 @@ impl BinaryIndexStore {
             }
         }
 
-        if self.remote_leaf_fetch == RemoteLeafFetch::Whole {
+        if remote_fetch == RemoteLeafFetch::Whole {
             tracing::debug!(leaf = %leaf_cid, need_replay, source = "remote_whole", "binary leaf open");
             let bytes = self.fetch_remote_leaf_whole(cs, leaf_cid)?;
             return self.leaf_handle_from_resident(bytes.into(), leaf_id, sidecar_cid, need_replay);
@@ -2517,8 +2532,10 @@ impl BinaryIndexStore {
 
     /// The predicates with list rows (`o_i`, an RDF-list position) in any
     /// graph, read from POST leaflet directories once per store: the index is
-    /// immutable, so the set holds for the store's lifetime. A leaflet that
-    /// spans several predicates has its predicate and position columns read.
+    /// immutable, so the set holds for the store's lifetime. Only directories
+    /// are read, except that a list-bearing leaflet spanning several
+    /// predicates has its predicate and position columns range-read; no whole
+    /// leaf is fetched. Concurrent first callers may each walk the branch.
     pub fn list_predicate_ids(&self) -> io::Result<Arc<std::collections::HashSet<u32>>> {
         use crate::format::column_block::ColumnId;
         use crate::format::leaflet::flags::HAS_O_I;
@@ -2541,9 +2558,9 @@ impl BinaryIndexStore {
                 continue;
             };
             for leaf in &branch.leaves {
-                let handle =
-                    self.open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)?;
-                for (idx, entry) in handle.dir().entries.iter().enumerate() {
+                let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                let mut handle = None;
+                for (idx, entry) in dir.entries.iter().enumerate() {
                     if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
                         continue;
                     }
@@ -2551,6 +2568,10 @@ impl BinaryIndexStore {
                         ids.insert(p_id);
                         continue;
                     }
+                    let handle = match &mut handle {
+                        Some(handle) => handle,
+                        None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                    };
                     let batch = handle.load_columns(idx, &projection, RunSortOrder::Post)?;
                     for row in 0..batch.row_count {
                         if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
@@ -4919,6 +4940,76 @@ pub(crate) mod tests {
         }
         assert_eq!((store.get_calls(), store.range_calls()), (1, 1));
 
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// List predicates come from POST leaflet directories alone: no whole
+    /// leaf is fetched, even under the `Whole` policy.
+    #[test]
+    fn list_predicates_are_read_without_fetching_a_whole_leaf() {
+        let member = |s: u64, p: u32, o: u64, i: u32| RunRecordV2 {
+            o_i: i,
+            ..make_rec(s, p, OType::XSD_INTEGER.as_u16(), o, 1)
+        };
+        // One leaf holding a plain predicate and a list predicate, one
+        // leaflet each, and one holding a list predicate alone.
+        let spanning = [
+            make_rec(1, 5, OType::XSD_INTEGER.as_u16(), 10, 1),
+            make_rec(2, 5, OType::XSD_INTEGER.as_u16(), 20, 1),
+            member(3, 6, 30, 0),
+            member(3, 6, 40, 1),
+        ];
+        let single = [member(4, 7, 50, 0), member(4, 7, 60, 1)];
+        let store = CountingContentStore::new();
+        let mut leaves = Vec::new();
+        for records in [&spanning[..], &single[..]] {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            for rec in records {
+                writer.push_record(*rec).unwrap();
+            }
+            let info = writer.finish().unwrap().remove(0);
+            let leaf_cid = run_sync_on_runtime({
+                let store = store.clone();
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("store leaf bytes");
+            leaves.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid,
+                sidecar_cid: None,
+            });
+        }
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        binary_store.graph_indexes.insert(
+            0,
+            GraphIndex {
+                orders: HashMap::from([(
+                    RunSortOrder::Post,
+                    Arc::new(crate::format::branch::BranchManifest { leaves }),
+                )]),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            },
+        );
+
+        let ids = binary_store.list_predicate_ids().expect("list predicates");
+        assert_eq!(*ids, std::collections::HashSet::from([6, 7]));
+        assert_eq!(store.get_calls(), 0, "no whole-leaf GET");
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
