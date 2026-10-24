@@ -24,6 +24,7 @@ use tracing::{info, warn};
 
 use super::catalog_session::IcebergCatalogSession;
 use super::config::R2rmlMappingInput;
+use super::r2rml::MaterializeScan;
 
 /// Registration request for a Delta graph source.
 #[derive(Debug, Clone)]
@@ -43,6 +44,12 @@ pub struct DeltaCreateConfig {
     /// Model ledger supplying policy and schema.
     pub model: Option<String>,
     pub default_allow: Option<bool>,
+    /// Materialization: rows a column marks as deleted; see
+    /// [`DeltaGsConfig::delete`].
+    pub delete: Option<fluree_db_iceberg::DeleteConvention>,
+    /// Materialization: the column that orders a key's rows; see
+    /// [`DeltaGsConfig::order_by`].
+    pub order_by: Option<String>,
 }
 
 /// The flat Azure service-principal fields the CLI and HTTP surfaces accept.
@@ -189,6 +196,8 @@ impl DeltaCreateConfig {
             mapping_media_type: None,
             model: None,
             default_allow: None,
+            delete: None,
+            order_by: None,
         }
     }
 
@@ -202,6 +211,21 @@ impl DeltaCreateConfig {
         config.root = None;
         config.unity = Some(unity);
         config
+    }
+
+    /// Mark deleted rows by a column's values when materializing.
+    pub fn with_delete_convention(
+        mut self,
+        convention: fluree_db_iceberg::DeleteConvention,
+    ) -> Self {
+        self.delete = Some(convention);
+        self
+    }
+
+    /// Order one key's rows by `column` when materializing.
+    pub fn with_order_by(mut self, column: impl Into<String>) -> Self {
+        self.order_by = Some(column.into());
+        self
     }
 
     pub fn effective_branch(&self) -> &str {
@@ -228,6 +252,8 @@ impl DeltaCreateConfig {
                 source: mapping_address.to_string(),
                 media_type: Some(media_type),
             }),
+            delete: self.delete.clone(),
+            order_by: self.order_by.clone(),
             model: self.model.clone(),
             default_allow: self.default_allow,
         }
@@ -528,7 +554,11 @@ impl DeltaSource {
         version_id(table_name, snapshot.version())
     }
 
-    /// `table_name` at `version` (`None` = latest), read whole.
+    /// One materialize window of `table_name`, ending at version `to` (`None` =
+    /// latest): the changes after `from` from the table's change data feed, or
+    /// the `to` version whole when there is no `from` or the feed cannot serve
+    /// the window. `row_budget` (`0` = none) cuts a change window at a commit
+    /// boundary; see [`MaterializeScan::stopped_at`].
     ///
     /// Not through [`Self::snapshot`]: a materialize consumer reads one table at
     /// several versions through one provider, and that memo would answer every
@@ -538,17 +568,103 @@ impl DeltaSource {
         fluree: &crate::Fluree,
         table_name: &str,
         projection: &[String],
-        version: Option<i64>,
-    ) -> QueryResult<super::r2rml::MaterializeScan> {
-        let pin = version.map(SourceTime::SnapshotId);
+        from: Option<i64>,
+        to: Option<i64>,
+        row_budget: i64,
+    ) -> QueryResult<MaterializeScan> {
+        let pin = to.map(SourceTime::SnapshotId);
         let (_, _, snapshot) = self.replay(fluree, table_name, pin).await?;
-        Ok(super::r2rml::MaterializeScan {
-            to_snapshot_id: Some(version_id(table_name, snapshot.version())?),
-            incremental: false,
-            window_age_ms: None,
-            to_sequence: None,
-            stream: self.stream(&snapshot, table_name, projection, &[])?,
-        })
+        let head = snapshot.version();
+        let to_snapshot_id = Some(version_id(table_name, head)?);
+        let whole = |reason: Option<&str>| -> QueryResult<MaterializeScan> {
+            if let Some(reason) = reason {
+                warn!(
+                    graph_source_id = %self.graph_source_id,
+                    table = %table_name,
+                    from_version = ?from,
+                    to_version = head,
+                    reason,
+                    "materialize: reading the Delta table version whole. Deletes made since \
+                     the watermark do not reach the target on a whole read; enable the \
+                     table's change data feed (delta.enableChangeDataFeed) for them to"
+                );
+            }
+            Ok(MaterializeScan {
+                to_snapshot_id,
+                incremental: false,
+                window_age_ms: None,
+                to_sequence: None,
+                change_feed: false,
+                stopped_at: None,
+                stream: self.stream(&snapshot, table_name, projection, &[])?,
+            })
+        };
+        let Some(from) = from else {
+            return whole(None);
+        };
+        let Ok(after) = u64::try_from(from) else {
+            return whole(Some("the watermark is not a Delta version"));
+        };
+        match after.cmp(&head) {
+            std::cmp::Ordering::Equal => {
+                return Ok(MaterializeScan {
+                    to_snapshot_id,
+                    incremental: true,
+                    window_age_ms: Some(0),
+                    to_sequence: None,
+                    change_feed: true,
+                    stopped_at: None,
+                    stream: Box::pin(futures::stream::empty()),
+                });
+            }
+            std::cmp::Ordering::Greater => {
+                return whole(Some(
+                    "the watermark is past the table's version: the table was replaced or \
+                     restored",
+                ));
+            }
+            std::cmp::Ordering::Less => {}
+        }
+        let budget = u64::try_from(row_budget).ok().filter(|rows| *rows > 0);
+        match snapshot.changes_since(after, projection, budget).await {
+            Ok(changes) => {
+                info!(
+                    graph_source_id = %self.graph_source_id,
+                    table = %table_name,
+                    from_version = after,
+                    to_version = head,
+                    row_budget = ?budget,
+                    "materialize: reading the Delta change data feed"
+                );
+                Ok(MaterializeScan {
+                    to_snapshot_id,
+                    incremental: true,
+                    // Every version the feed moves past is persisted, so the
+                    // watermark never trails the log far enough to be cleaned.
+                    window_age_ms: None,
+                    to_sequence: None,
+                    change_feed: true,
+                    stopped_at: Some(changes.stopped_at),
+                    stream: self.query_stream(changes.stream, table_name, head),
+                })
+            }
+            Err(DeltaError::ChangeFeedUnavailable { reason, .. }) => whole(Some(&reason)),
+            Err(e) => Err(self.query_error(table_name, e)),
+        }
+    }
+
+    /// The rows `table_name` holds at `version`, narrowed by `filters` where
+    /// the reader can state them exactly.
+    pub(crate) async fn rows_at(
+        &self,
+        fluree: &crate::Fluree,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
+        let pin = Some(SourceTime::SnapshotId(version));
+        let (_, _, snapshot) = self.replay(fluree, table_name, pin).await?;
+        self.stream(&snapshot, table_name, &[], filters)
     }
 
     /// The pinned version's row count from the log, when it provably equals a
@@ -600,10 +716,20 @@ impl DeltaSource {
         let stream = snapshot
             .scan(projection, &filters)
             .map_err(|e| self.query_error(table_name, e))?;
+        Ok(self.query_stream(stream, table_name, snapshot.version()))
+    }
+
+    /// A reader stream in query errors, naming `version` when a file it needs
+    /// has been removed.
+    fn query_stream(
+        &self,
+        stream: fluree_db_delta::DeltaBatchStream,
+        table_name: &str,
+        version: u64,
+    ) -> ColumnBatchStream {
         let graph_source_id = self.graph_source_id.clone();
         let table = table_name.to_string();
-        let version = snapshot.version();
-        Ok(Box::pin(stream.map(move |batch| {
+        Box::pin(stream.map(move |batch| {
             batch.map_err(|e| {
                 // The log replayed, so the version exists; its data does not.
                 if e.is_missing_file() {
@@ -615,7 +741,7 @@ impl DeltaSource {
                 }
                 delta_query_error(&graph_source_id, &table, e)
             })
-        })))
+        }))
     }
 
     fn query_error(&self, table_name: &str, error: DeltaError) -> QueryError {
