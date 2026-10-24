@@ -714,6 +714,12 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
+                Pattern::ListView(lv) => {
+                    for v in lv.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
                 Pattern::Values { vars: vs, .. } => {
                     for v in vs {
                         bump_count(counts, *v);
@@ -819,7 +825,20 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
-                _ => {}
+                // A variable one of these shares with a triple is a join
+                // variable like any other: missed, the triple stops emitting
+                // it and the join becomes a cartesian product.
+                Pattern::IndexSearch(_)
+                | Pattern::VectorSearch(_)
+                | Pattern::R2rml(_)
+                | Pattern::GeoSearch(_)
+                | Pattern::S2Search(_)
+                | Pattern::Service(_) => {
+                    for v in p.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
             }
         }
     }

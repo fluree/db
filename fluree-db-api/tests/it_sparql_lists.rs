@@ -93,6 +93,107 @@ async fn a_list_is_its_head_and_cells() {
     assert_eq!(count, [json!([8])]);
 }
 
+/// A ledger holding `ttl`, read from its index alone: the list view's
+/// predicates come from the index store, not from novelty.
+async fn indexed_ledger_with(fluree: &fluree_db_api::Fluree, name: &str, ttl: &str) -> LedgerState {
+    let id = format!("it/sparql-lists/{name}:main");
+    let ledger = fluree.create_ledger(&id).await.expect("create");
+    fluree
+        .insert_turtle(
+            ledger,
+            &format!("@prefix ex: <http://example.org/> .\n{ttl}"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("insert: {e}"));
+    support::rebuild_and_publish_index(fluree, &id).await;
+    let ledger = fluree.ledger(&id).await.expect("reload");
+    assert!(
+        !ledger.novelty.has_list_meta,
+        "{name}: novelty holds no list"
+    );
+    ledger
+}
+
+#[tokio::test]
+async fn an_indexed_list_is_its_head_and_cells() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = indexed_ledger_with(
+        &fluree,
+        "indexed-head",
+        "ex:s ex:items (1 2 3) ; ex:items 9 .",
+    )
+    .await;
+
+    let values = rows(&fluree, &ledger, "SELECT ?o WHERE { ex:s ex:items ?o }").await;
+    assert_eq!(values.len(), 2, "the head and the plain value: {values:?}");
+    assert!(values.contains(&json!([9])), "{values:?}");
+    assert!(values.iter().any(is_blank), "{values:?}");
+    let first = rows(
+        &fluree,
+        &ledger,
+        "SELECT ?x WHERE { ex:s ex:items ?l . ?l rdf:first ?x }",
+    )
+    .await;
+    assert_eq!(first, [json!([1])]);
+    let cells = rows(&fluree, &ledger, "SELECT ?x WHERE { ?l rdf:first ?x }").await;
+    assert_eq!(cells, [json!([1]), json!([2]), json!([3])]);
+}
+
+/// A variable a plain triple shares with a list-view pattern joins them, from
+/// novelty and from the index, on a ledger whose only list is unrelated.
+#[tokio::test]
+async fn a_shared_variable_joins_a_triple_into_the_list_view() {
+    let ttl = "ex:n0 ex:name \"n0\" ; ex:knows ex:n1 ; ex:likes ex:config .
+               ex:n1 ex:name \"n1\" ; ex:knows ex:n2 .
+               ex:n2 ex:name \"n2\" ; ex:knows ex:n0 .
+               ex:config ex:order (ex:a ex:b) .";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let novelty = ledger_with(&fluree, "join-novelty", ttl).await;
+    let indexed = indexed_ledger_with(&fluree, "join-indexed", ttl).await;
+    let friend = [json!(["ex:knows", "ex:n2"]), json!(["ex:name", "n1"])];
+    for (lane, ledger) in [("novelty", &novelty), ("index", &indexed)] {
+        for body in [
+            "SELECT ?p ?o WHERE { ex:n0 ex:knows ?f . ?f ?p ?o }",
+            "SELECT ?p ?o WHERE { ?f ?p ?o . ex:n0 ex:knows ?f }",
+            "SELECT ?p ?o WHERE { ex:n0 ex:knows ?f OPTIONAL { ?f ?p ?o } }",
+        ] {
+            assert_eq!(rows(&fluree, ledger, body).await, friend, "{lane}: {body}");
+        }
+        assert_eq!(
+            rows(
+                &fluree,
+                ledger,
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:knows ?f . ?f ?p ?o }",
+            )
+            .await,
+            [json!([2 + 2 + 3])],
+            "{lane}: the triples of ex:n1, ex:n2 and ex:n0"
+        );
+        assert!(
+            rows(
+                &fluree,
+                ledger,
+                "SELECT ?x WHERE { ex:n0 ex:knows ?f . ?f rdf:first ?x }"
+            )
+            .await
+            .is_empty(),
+            "{lane}: a friend is no cell"
+        );
+        let liked = rows(
+            &fluree,
+            ledger,
+            "SELECT ?p ?o WHERE { ex:n0 ex:likes ?f . ?f ?p ?o }",
+        )
+        .await;
+        assert_eq!(liked.len(), 1, "{lane}: the owner edge alone: {liked:?}");
+        assert_eq!(liked[0][0], json!("ex:order"), "{lane}: {liked:?}");
+        assert!(
+            liked[0][1].as_str().is_some_and(|o| o.starts_with("_:")),
+            "{lane}: the list's head: {liked:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn jsonld_queries_keep_the_members() {
     let fluree = FlureeBuilder::memory().build_memory();
