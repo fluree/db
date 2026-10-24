@@ -273,6 +273,41 @@ async fn property_chain_in_every_list_encoding() {
     .await;
 }
 
+/// A chain is read in member order: `hasParent` then `hasBrother` is an
+/// uncle, where the reverse would be a sibling's parent.
+#[tokio::test]
+async fn property_chain_order_in_every_list_encoding() {
+    check(
+        "chain-order",
+        Axiom {
+            turtle: "ex:uncle owl:propertyChainAxiom LIST .",
+            jsonld: json!({
+                "@context": ctx(),
+                "@id": "ex:uncle",
+                "owl:propertyChainAxiom": "LIST"
+            }),
+            members: &["ex:hasParent", "ex:hasBrother"],
+        },
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:person-a", "ex:hasParent": {"@id": "ex:dad"}, "ex:hasBrother": {"@id": "ex:sib"}},
+                {"@id": "ex:dad", "ex:hasBrother": {"@id": "ex:uncle-bob"}},
+                {"@id": "ex:sib", "ex:hasParent": {"@id": "ex:other"}}
+            ]
+        }),
+        json!({
+            "@context": ctx(),
+            "select": "?u",
+            "where": {"@id": "ex:person-a", "ex:uncle": "?u"},
+            "reasoning": "owl2rl"
+        }),
+        &["ex:uncle-bob"],
+        &["ex:other"],
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn has_key_in_every_list_encoding() {
     check(
