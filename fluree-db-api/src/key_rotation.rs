@@ -237,6 +237,15 @@ impl Throttle {
 }
 
 impl Fluree {
+    /// The lock a purge pass holds, where erasures are purged.
+    fn purge_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        #[cfg(feature = "native")]
+        if let Some(runtime) = self.retention.erasure.get() {
+            return Some(runtime.purging.clone());
+        }
+        None
+    }
+
     /// The key ids this instance's storage holds, current first, and the id
     /// of the current key; `None` when the storage does not encrypt at rest.
     /// A permanent (IPFS) backend has no admin storage and is never
@@ -491,7 +500,7 @@ impl Fluree {
             Arc::clone(&control),
             Arc::clone(&shared),
             opts.max_bytes_per_sec,
-            self.retention.erasure.get().cloned(),
+            self.purge_lock(),
         ));
         *active = Some(ActiveJob {
             control,
@@ -705,7 +714,7 @@ async fn run_sweep(
     control: Arc<Control>,
     shared: Arc<parking_lot::RwLock<KeyRotationProgress>>,
     max_bytes_per_sec: Option<u64>,
-    purging: Option<Arc<crate::retention::erasure::ErasureRuntime>>,
+    purging: Option<Arc<tokio::sync::Mutex<()>>>,
 ) {
     let mut progress = shared.read().clone();
     let dry_run = progress.dry_run;
@@ -801,7 +810,7 @@ async fn run_sweep(
                         // A purge pass deletes what it purges between its
                         // checks: a rewrite in between would put it back.
                         let _purge = match &purging {
-                            Some(runtime) => Some(runtime.purging.lock().await),
+                            Some(lock) => Some(lock.lock().await),
                             None => None,
                         };
                         match admin.reencrypt(&address).await {

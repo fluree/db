@@ -413,7 +413,7 @@ impl Fluree {
     /// branches its removals apply to.
     async fn holds_commit(
         &self,
-        record: &NsRecord,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] record: &NsRecord,
         store: &dyn fluree_db_core::ContentStore,
         cid: &ContentId,
     ) -> Result<bool> {

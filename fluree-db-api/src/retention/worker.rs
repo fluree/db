@@ -96,6 +96,7 @@ pub struct RetentionOptions {
     pub limits: RetentionLimits,
     /// How long a purge leaves the indexes it rebuilt over before releasing
     /// them, for readers to finish: the index collector's minimum age.
+    #[cfg(feature = "native")]
     pub purge_grace: Duration,
 }
 
@@ -105,6 +106,7 @@ impl Default for RetentionOptions {
             interval: Duration::from_secs(15),
             rescan_interval: Duration::from_secs(600),
             limits: RetentionLimits::default(),
+            #[cfg(feature = "native")]
             purge_grace: Duration::from_secs(
                 60 * u64::from(fluree_db_indexer::IndexerConfig::default().gc_min_time_mins),
             ),

@@ -6,8 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fluree_db_core::{
-    BranchedContentStore, ContentId, ContentStore, HashAlgorithm, LedgerId, TxnMetaEntry,
-    TxnMetaValue,
+    ContentId, ContentStore, HashAlgorithm, LedgerId, TxnMetaEntry, TxnMetaValue,
 };
 use fluree_vocab::{db, namespaces::FLUREE_DB};
 use serde::{Deserialize, Serialize};
@@ -361,26 +360,6 @@ impl Fluree {
             }
         }
         Ok(holders)
-    }
-
-    /// `record`'s store, with its ancestors found among `records`: the
-    /// branches of a dropped ledger, which lookups do not see.
-    pub(crate) fn store_among(
-        &self,
-        records: &[NsRecord],
-        record: &NsRecord,
-    ) -> BranchedContentStore {
-        let own = self.backend.content_store(&record.storage_namespace());
-        let parent = record
-            .source_branch
-            .as_deref()
-            .and_then(|source| records.iter().find(|r| r.branch == source));
-        match parent {
-            Some(parent) => {
-                BranchedContentStore::with_parents(own, vec![self.store_among(records, parent)])
-            }
-            None => BranchedContentStore::leaf(own),
-        }
     }
 
     pub(crate) fn erasure_runtime(&self) -> Result<&std::sync::Arc<super::ErasureRuntime>> {

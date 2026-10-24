@@ -641,6 +641,7 @@ impl crate::Fluree {
     /// value: a fresh index, unlike a resync, which keeps every term it ever
     /// held, published as the only snapshot of a new manifest and replacing
     /// the head even at the same `t`. Returns the head it published.
+    #[cfg(feature = "native")]
     pub(crate) async fn rebuild_full_text_index(&self, graph_source_id: &str) -> Result<ContentId> {
         let id = crate::LedgerId::parse(graph_source_id)?;
         let record = self.syncable_graph_source(&id).await?;
@@ -695,10 +696,11 @@ impl crate::Fluree {
     /// Held to publish a full-text or vector index's head where a purge may
     /// rebuild it: see [`crate::retention::erasure::ErasureRuntime`].
     pub(crate) async fn source_heads_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-        match self.retention.erasure.get() {
-            Some(runtime) => Some(runtime.source_heads.lock().await),
-            None => None,
+        #[cfg(feature = "native")]
+        if let Some(runtime) = self.retention.erasure.get() {
+            return Some(runtime.source_heads.lock().await);
         }
+        None
     }
 }
 

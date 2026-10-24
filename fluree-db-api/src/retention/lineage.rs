@@ -18,7 +18,8 @@
 use std::collections::HashMap;
 
 use fluree_db_core::{
-    collect_first_parent_cids, load_commit_by_id, ContentId, ContentStore, Flake, Storage,
+    collect_first_parent_cids, load_commit_by_id, BranchedContentStore, ContentId, ContentStore,
+    Flake, Storage,
 };
 use fluree_db_nameservice::NsRecord;
 use sha2::{Digest, Sha256};
@@ -188,7 +189,7 @@ impl Fluree {
         archived: Option<registry::ArchivedRetention>,
         lineage: Option<&ContentId>,
         branches: &[NsRecord],
-        rebuilt: bool,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] rebuilt: bool,
     ) -> Result<Option<i64>> {
         let checkpoint = match lineage {
             Some(lineage) => self.journal_checkpoint(lineage).await?,
@@ -235,6 +236,7 @@ impl Fluree {
     /// The lineage of a ledger restored from a drop, not yet visible: the
     /// one a restored branch's registration records, or its root branch's
     /// genesis commit.
+    #[cfg(feature = "native")]
     pub(crate) async fn restored_lineage(
         &self,
         records: &[NsRecord],
@@ -251,6 +253,26 @@ impl Fluree {
         match records.iter().find(|r| r.branch == root_branch) {
             Some(root) => self.ledger_lineage(root, &Registration::default()).await,
             None => Ok(None),
+        }
+    }
+
+    /// `record`'s store, with its ancestors found among `records`: the
+    /// branches of a dropped ledger, which lookups do not see.
+    pub(crate) fn store_among(
+        &self,
+        records: &[NsRecord],
+        record: &NsRecord,
+    ) -> BranchedContentStore {
+        let own = self.backend.content_store(&record.storage_namespace());
+        let parent = record
+            .source_branch
+            .as_deref()
+            .and_then(|source| records.iter().find(|r| r.branch == source));
+        match parent {
+            Some(parent) => {
+                BranchedContentStore::with_parents(own, vec![self.store_among(records, parent)])
+            }
+            None => BranchedContentStore::leaf(own),
         }
     }
 

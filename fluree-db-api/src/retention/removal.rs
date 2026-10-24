@@ -103,8 +103,11 @@ pub(crate) struct Widening {
 /// A removal and the `t` of each manifest occurrence's commit.
 pub(crate) struct Removed {
     pub receipt: RemovalReceipt,
+    // Read by permanent erasure, which needs file storage.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub manifest_t: Vec<i64>,
     /// Each occurrence's property IRI, empty where it did not decode.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub properties: Vec<String>,
 }
 

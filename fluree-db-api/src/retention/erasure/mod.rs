@@ -22,7 +22,8 @@
 //! overlapping request waits for the one ahead of it, and proves what that
 //! one does not publish.
 //!
-//! Originals are retained in this release; purging them is the next step.
+//! A purge then deletes the originals and every other copy of what the
+//! erasure removed (see [`purge`]).
 //! Supported: a single node with file storage, v4 commits with SHA2-256
 //! CIDs. Requests elsewhere are refused.
 
@@ -77,8 +78,9 @@ pub(crate) struct ErasureRuntime {
     /// Held to accept or publish an erasure, and to create a branch: the
     /// branches an erasure reaches are the branches as they are then.
     pub(crate) admission: tokio::sync::Mutex<()>,
-    /// Held by a purge pass: one at a time.
-    pub(crate) purging: tokio::sync::Mutex<()>,
+    /// Held by a purge pass: one at a time. Shared with key rotation, whose
+    /// rewrites a purge's deletions must not interleave with.
+    pub(crate) purging: Arc<tokio::sync::Mutex<()>>,
     /// Held to publish a full-text index's head: a purge's rebuild, and a
     /// sync's check that the head it built on is still the head.
     pub(crate) source_heads: tokio::sync::Mutex<()>,
@@ -95,7 +97,7 @@ impl ErasureRuntime {
             in_flight: AtomicBool::new(false),
             purge_in_flight: AtomicBool::new(false),
             admission: tokio::sync::Mutex::new(()),
-            purging: tokio::sync::Mutex::new(()),
+            purging: Default::default(),
             source_heads: tokio::sync::Mutex::new(()),
             rebuilt_on_restore: Default::default(),
         }
