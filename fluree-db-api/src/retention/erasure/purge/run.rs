@@ -500,12 +500,13 @@ impl Fluree {
             .map(|c| std::sync::Arc::clone(&c.prover));
         let swept = tokio::task::spawn_blocking(move || {
             let mut swept = 0;
+            let scratch = |e: std::io::Error| fluree_db_core::Error::io(format!("scratch: {e}"));
             for ledger in &ledgers {
                 swept += fluree_db_core::FileStorage::sweep_foreign_staging(
                     std::path::Path::new(root.as_ref()).join(ledger),
-                );
+                )
+                .map_err(scratch)?;
             }
-            let scratch = |e: std::io::Error| fluree_db_core::Error::io(format!("scratch: {e}"));
             for holder in &holders {
                 swept += crate::import::clear_import_residue(holder).map_err(scratch)?;
                 // The default spill directory, and the indexer's own.

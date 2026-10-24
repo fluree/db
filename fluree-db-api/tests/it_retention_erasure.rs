@@ -1888,6 +1888,15 @@ async fn a_purge_removes_staging_files_crashed_writes_left() {
         .join(fluree.storage_namespace(&id).await.unwrap().branch_prefix());
     let staging = folder.join("commit/0011.fcv2.4242.00000000deadbeef.1.tmp");
     std::fs::write(&staging, b"{\"email\": \"a@secret\"}").unwrap();
+    // One whose writer's clock ran ahead: dated tomorrow.
+    let ahead = folder.join("commit/0012.fcv2.4242.00000000deadbeef.2.tmp");
+    std::fs::write(&ahead, b"{\"email\": \"a@secret\"}").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&ahead)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(86_400))
+        .unwrap();
     // A rebuild of the ledger by a process that has since ended, which
     // spilled its runs to the default scratch directory.
     let ended = {
@@ -1913,7 +1922,7 @@ async fn a_purge_removes_staging_files_crashed_writes_left() {
         .await
         .unwrap();
     assert_eq!(report.purged, 1, "{report:?}");
-    assert!(!staging.exists());
+    assert!(!staging.exists() && !ahead.exists());
     assert!(!session.exists());
     assert!(!import.exists());
     assert_eq!(

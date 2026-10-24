@@ -227,6 +227,9 @@ struct StagingSweep {
     /// Staging files deliberately left alone — this process's own, too young,
     /// or refusing to be removed.
     kept: usize,
+    /// Of those, the ones old enough to go that could not be removed, and
+    /// directories that could not be read.
+    refused: usize,
     /// The entry budget ran out before the walk finished, so part of the tree
     /// was never looked at.
     truncated: bool,
@@ -285,6 +288,16 @@ fn sweep_orphaned_staging_files(
     older_than: std::time::Duration,
     budget: usize,
 ) -> StagingSweep {
+    sweep_staging(base, Some(older_than), budget)
+}
+
+/// [`sweep_orphaned_staging_files`]; with no `older_than`, rule 2 is off and
+/// every other process's file goes, whatever its mtime.
+fn sweep_staging(
+    base: &Path,
+    older_than: Option<std::time::Duration>,
+    budget: usize,
+) -> StagingSweep {
     let mut sweep = StagingSweep::default();
     let own_token = format!("{:016x}", process_token());
     let now = std::time::SystemTime::now();
@@ -292,8 +305,14 @@ fn sweep_orphaned_staging_files(
     let mut dirs = vec![base.to_path_buf()];
 
     while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    sweep.refused += 1;
+                }
+                continue;
+            }
         };
         for entry in entries.flatten() {
             if budget == 0 {
@@ -342,12 +361,14 @@ fn sweep_orphaned_staging_files(
             // mtime we cannot read, or one in the future, counts as young —
             // `duration_since` fails on a future timestamp, and a clock the
             // sweep does not understand is not grounds for deleting data.
-            let stale = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .is_some_and(|age| age >= older_than);
+            let stale = older_than.is_none_or(|older_than| {
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .is_some_and(|age| age >= older_than)
+            });
             if !stale {
                 sweep.kept += 1;
                 continue;
@@ -355,10 +376,15 @@ fn sweep_orphaned_staging_files(
 
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => sweep.reclaimed += 1,
-                // Someone else got there first, or the platform refuses to
-                // unlink a file another process still holds open (Windows).
-                // Both are fine outcomes for a best-effort reclaim.
-                Err(_) => sweep.kept += 1,
+                // Someone else got there first.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Or the platform refuses to unlink a file another process
+                // still holds open (Windows): fine for a best-effort reclaim,
+                // reported for a strict one.
+                Err(_) => {
+                    sweep.kept += 1;
+                    sweep.refused += 1;
+                }
             }
         }
     }
@@ -800,12 +826,22 @@ impl FileStorage {
     }
 
     /// Unlink, under `dir`, every staging file another process left,
-    /// whatever its age, keeping this process's own; returns how many it
-    /// unlinked. Only for a root this process holds the lock on: no other
+    /// whatever its age or mtime, keeping this process's own; returns how
+    /// many it unlinked, or an error when one could not be, or a directory
+    /// read. Only for a root this process holds the lock on: no other
     /// process writes there, so another's staging file is a crashed write's.
     /// Blocking, and unbounded.
-    pub fn sweep_foreign_staging(dir: impl AsRef<Path>) -> usize {
-        sweep_orphaned_staging_files(dir.as_ref(), std::time::Duration::ZERO, usize::MAX).reclaimed
+    pub fn sweep_foreign_staging(dir: impl AsRef<Path>) -> std::io::Result<usize> {
+        let dir = dir.as_ref();
+        let sweep = sweep_staging(dir, None, usize::MAX);
+        if sweep.refused > 0 {
+            return Err(std::io::Error::other(format!(
+                "{} staging files or directories under {} could not be removed or read",
+                sweep.refused,
+                dir.display()
+            )));
+        }
+        Ok(sweep.reclaimed)
     }
 
     /// The walk itself, plus what it reports.
@@ -3052,6 +3088,33 @@ mod tests {
 
         assert!(path.exists(), "a future-dated staging file was reclaimed");
         assert_eq!((sweep.reclaimed, sweep.kept), (0, 1));
+    }
+
+    /// The purge's sweep takes every other process's staging file, a
+    /// future-dated one too, and reports one it could not remove.
+    #[cfg(unix)]
+    #[test]
+    fn the_strict_sweep_takes_every_foreign_file_or_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ahead = dir
+            .path()
+            .join(format!("ahead.json.7.cccccccccccccccc.0{TMP_SUFFIX}"));
+        std::fs::File::create(&ahead)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(86_400))
+            .unwrap();
+        let ours = plant_staging_file(dir.path(), "mine.json", &own_token(), Duration::ZERO);
+        assert_eq!(FileStorage::sweep_foreign_staging(dir.path()).unwrap(), 1);
+        assert!(!ahead.exists() && ours.exists());
+
+        let locked = dir.path().join("locked");
+        let stuck = plant_staging_file(&locked, "stuck.json", "dddddddddddddddd", Duration::ZERO);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let swept = FileStorage::sweep_foreign_staging(dir.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(swept.is_err() && stuck.exists(), "{swept:?}");
     }
 
     /// Content is not staging debris. The sweep must not touch a real object
