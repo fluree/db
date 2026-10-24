@@ -53,12 +53,13 @@ use serde_json::{json, Map, Value as JsonValue};
 
 use fluree_db_iceberg::io::ColumnBatch;
 use fluree_db_iceberg::DeleteConvention;
-use fluree_db_query::r2rml::R2rmlProvider;
+use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, ScanCmpOp, ScanFilter, ScanValue};
 use fluree_db_r2rml::mapping::{ObjectMap, TermType, TriplesMap};
 use fluree_db_r2rml::materialize::{
     batch_has_column, column_is_orderable, column_sort_key, column_string, emit_row_terms,
     expand_template_from_batch, materialize_graph_from_batch, materialize_subject_from_batch,
-    MaterializeStats, ParentIndexSet, RdfTerm, TmEmitContext, TripleObserver,
+    reverse_subject_template, MaterializeStats, ParentIndexSet, RdfTerm, TmEmitContext,
+    TripleObserver,
 };
 use fluree_vocab::UnresolvedDatatypeConstraint;
 
@@ -254,6 +255,17 @@ pub trait MaterializeSource: Send + Sync {
         from_snapshot_id: Option<i64>,
         from_sequence: Option<i64>,
     ) -> Result<MaterializeScan>;
+
+    /// The rows `table_name` holds at `version`, narrowed by `filters` where the
+    /// source can apply them, so the caller still tests every row. Asked only of
+    /// a source whose window was a change feed.
+    async fn rows_at(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> Result<ColumnBatchStream>;
 }
 
 /// The production implementation: straight delegation to [`FlureeR2rmlProvider`], so the
@@ -286,6 +298,18 @@ impl MaterializeSource for FlureeR2rmlProvider<'_> {
                 None,
                 from_sequence,
             )
+            .await?)
+    }
+
+    async fn rows_at(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> Result<ColumnBatchStream> {
+        Ok(self
+            .rows_at_version(graph_source_id, table_name, version, filters)
             .await?)
     }
 }
@@ -625,6 +649,30 @@ impl Fluree {
                     }
                     None => head,
                 };
+                // A change feed retraction says a row went, not that its key
+                // did: a table holding several rows per key, such as a revision
+                // log pruned of superseded rows, can still hold the key. Each
+                // key one won is settled by the table as of the window's end.
+                if change_feed && latest_by_key {
+                    let deleted = accum.take_feed_deletes();
+                    if !deleted.is_empty() {
+                        let (held, rows) = read_back(
+                            provider,
+                            source_graph_source_id,
+                            table_name,
+                            to,
+                            &tm_ctxs[0],
+                            &deleted,
+                            target_ledger_id,
+                            delete_convention.as_ref(),
+                            order_by.as_deref(),
+                            &parents,
+                        )
+                        .await?;
+                        rows_read += rows;
+                        accum.settle_feed_deletes(held);
+                    }
+                }
                 any_table = true;
                 incremental_all = incremental_all && incremental;
                 table_watermarks.push(TableWindow {
@@ -1695,6 +1743,9 @@ struct MaterializeAccum {
     /// Additive passes over a change feed: each subject's triples as the
     /// window's rows leave them.
     changes: BTreeMap<AccumKey, TripleChanges>,
+    /// Latest-by-key keys a change feed retraction has won since the last
+    /// [`take_feed_deletes`](Self::take_feed_deletes).
+    feed_deletes: BTreeSet<AccumKey>,
     /// Estimated resident bytes: Σ per-entry (key + payload + overhead).
     bytes: usize,
 }
@@ -1821,6 +1872,9 @@ impl MaterializeAccum {
         node: Option<SubjectNode>,
     ) {
         let key = (target, graph, subject_iri);
+        if rank.change.is_some_and(|(_, asserts)| !asserts) {
+            self.feed_deletes.insert(key.clone());
+        }
         match self.keys.get_mut(&key) {
             Some(existing) if rank < existing.rank => {} // older row: ignore
             Some(existing) => {
@@ -1845,6 +1899,32 @@ impl MaterializeAccum {
                         bytes: new_bytes,
                     },
                 );
+            }
+        }
+    }
+
+    /// The keys whose latest change is a change feed retraction, recorded
+    /// since the last call.
+    fn take_feed_deletes(&mut self) -> BTreeSet<AccumKey> {
+        let mut deleted = std::mem::take(&mut self.feed_deletes);
+        deleted.retain(|key| {
+            self.keys
+                .get(key)
+                .is_some_and(|state| state.rank.change.is_some_and(|(_, asserts)| !asserts))
+        });
+        deleted
+    }
+
+    /// Settle keys a change feed retraction won by what their table still
+    /// holds: `held` has each such key's winning row there, and a key it lacks
+    /// stays deleted.
+    fn settle_feed_deletes(&mut self, held: MaterializeAccum) {
+        for (key, state) in held.keys {
+            if let Some(existing) = self.keys.get_mut(&key) {
+                let new_bytes = Self::state_bytes(&existing.rank, &state.node);
+                self.bytes = self.bytes - existing.bytes + new_bytes;
+                existing.node = state.node;
+                existing.bytes = new_bytes;
             }
         }
     }
@@ -2879,6 +2959,108 @@ fn resolve_target_ledger(target: &str, batch: &ColumnBatch, row: usize) -> Optio
     expand_template_from_batch(target, batch, row).ok()
 }
 
+/// Each of `deleted`'s keys as `table_name` holds it at `version`: its winning
+/// row by latest-by-key rules, or no entry when the table holds none. Returns
+/// the rows read too.
+#[allow(clippy::too_many_arguments)]
+async fn read_back(
+    provider: &dyn MaterializeSource,
+    graph_source_id: &str,
+    table_name: &str,
+    version: i64,
+    ctx: &TmEmitContext<'_>,
+    deleted: &BTreeSet<AccumKey>,
+    target_ledger_id: &str,
+    convention: Option<&DeleteConvention>,
+    order_by: Option<&str>,
+    parents: &ParentIndexSet,
+) -> Result<(MaterializeAccum, usize)> {
+    let filters = key_filters(ctx.tm().subject_map.template.as_deref(), deleted);
+    let mut stream = provider
+        .rows_at(graph_source_id, table_name, version, &filters)
+        .await?;
+    // These rows' emit counts were taken when the window read them.
+    let mut stats = MaterializeStats::default();
+    let mut held = MaterializeAccum::default();
+    let mut rows = 0;
+    while let Some(batch) = stream.next().await {
+        let batch = &batch?;
+        for row in 0..batch.num_rows {
+            rows += 1;
+            let Some(target) = resolve_target_ledger(target_ledger_id, batch, row) else {
+                continue;
+            };
+            let Some((subject, graph)) = row_subject(ctx.tm(), batch, row)? else {
+                continue;
+            };
+            if !deleted.contains(&(target.clone(), graph, subject)) {
+                continue;
+            }
+            materialize_row_into(
+                ctx, batch, row, target, None, convention, order_by, true, parents, &mut stats,
+                &mut held,
+            )?;
+        }
+    }
+    Ok((held, rows))
+}
+
+/// Scan filters selecting the rows of `keys`' subjects, one `In` per column of
+/// `template`: exact for a one-column key, wider for several. None when a
+/// subject cannot be reversed through the template, and the table is read
+/// whole.
+fn key_filters(template: Option<&str>, keys: &BTreeSet<AccumKey>) -> Vec<ScanFilter> {
+    let Some(template) = template else {
+        return Vec::new();
+    };
+    let mut columns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (_, _, subject) in keys {
+        let Some(values) = reverse_subject_template(template, subject) else {
+            return Vec::new();
+        };
+        for (column, raw) in values {
+            columns.entry(column).or_default().insert(raw);
+        }
+    }
+    columns
+        .into_iter()
+        .map(|(column, raws)| ScanFilter {
+            column,
+            op: ScanCmpOp::In,
+            value: ScanValue::Set(raws.into_iter().map(ScanValue::TemplateKey).collect()),
+        })
+        .collect()
+}
+
+/// A row's subject IRI and named graph, or `None` for a row with no subject to
+/// upsert.
+fn row_subject(
+    tm: &TriplesMap,
+    batch: &ColumnBatch,
+    row: usize,
+) -> Result<Option<(String, Option<String>)>> {
+    let subject_term = materialize_subject_from_batch(&tm.subject_map, batch, row)
+        .map_err(|e| ApiError::Internal(format!("R2RML subject materialization failed: {e}")))?;
+    let subject_iri = match subject_term {
+        Some(RdfTerm::Iri(iri)) => iri,
+        // Null subject column (skip), blank-node subjects (no stable identity to
+        // upsert), or a literal (term.rs already rejects this) -> skip the row.
+        Some(RdfTerm::BlankNode(_) | RdfTerm::Literal { .. }) | None => return Ok(None),
+    };
+
+    // Resolve the row's named graph from the subject-map-level graph map (R2RML
+    // rr:graph / rr:graphMap). `None` = the default graph (the common case). A
+    // per-row template (e.g. one graph per tenant/user) routes each row into its
+    // own graph so the same subject IRI holds independent per-graph statements.
+    // A null graph value materializes to `None` -> default graph (never dropped).
+    let graph_iri = match &tm.subject_map.graph_map {
+        Some(gm) => materialize_graph_from_batch(gm, batch, row)
+            .map_err(|e| ApiError::Internal(format!("R2RML graph materialization failed: {e}")))?,
+        None => None,
+    };
+    Ok(Some((subject_iri, graph_iri)))
+}
+
 /// Expand one source row through a triples map into the accumulator. The subject
 /// IRI is built by the exact `term.rs` materializer (so live and tombstone rows
 /// for the same key produce the same IRI).
@@ -2903,25 +3085,8 @@ fn materialize_row_into(
     stats: &mut MaterializeStats,
     accum: &mut MaterializeAccum,
 ) -> Result<()> {
-    let tm = ctx.tm();
-    let subject_term = materialize_subject_from_batch(&tm.subject_map, batch, row)
-        .map_err(|e| ApiError::Internal(format!("R2RML subject materialization failed: {e}")))?;
-    let subject_iri = match subject_term {
-        Some(RdfTerm::Iri(iri)) => iri,
-        // Null subject column (skip), blank-node subjects (no stable identity to
-        // upsert), or a literal (term.rs already rejects this) -> skip the row.
-        Some(RdfTerm::BlankNode(_) | RdfTerm::Literal { .. }) | None => return Ok(()),
-    };
-
-    // Resolve the row's named graph from the subject-map-level graph map (R2RML
-    // rr:graph / rr:graphMap). `None` = the default graph (the common case). A
-    // per-row template (e.g. one graph per tenant/user) routes each row into its
-    // own graph so the same subject IRI holds independent per-graph statements.
-    // A null graph value materializes to `None` -> default graph (never dropped).
-    let graph_iri = match &tm.subject_map.graph_map {
-        Some(gm) => materialize_graph_from_batch(gm, batch, row)
-            .map_err(|e| ApiError::Internal(format!("R2RML graph materialization failed: {e}")))?,
-        None => None,
+    let Some((subject_iri, graph_iri)) = row_subject(ctx.tm(), batch, row)? else {
+        return Ok(());
     };
 
     if !latest_by_key {
@@ -4100,6 +4265,9 @@ mod engine_tests {
         Arc::new(CompiledR2rmlMapping::new(vec![tm]))
     }
 
+    /// A `rows_at` request: the version, and each filter's column and values.
+    type ReadBack = (i64, Vec<(String, Vec<String>)>);
+
     /// A [`MaterializeSource`] backed by in-memory batches. Records how many scan windows
     /// were requested, so a test can prove the engine actually pulled from it — the guard
     /// against a fixture that silently reaches nothing.
@@ -4125,6 +4293,11 @@ mod engine_tests {
         /// Where the next scan reports its change feed stopped, as a budget cut
         /// would.
         stopped_at: std::sync::Mutex<Option<u64>>,
+        /// The table's rows as of the window's end, which [`MaterializeSource::rows_at`]
+        /// answers with.
+        table: Vec<ColumnBatch>,
+        /// Each `rows_at` asked, in order.
+        read_backs: std::sync::Mutex<Vec<ReadBack>>,
         /// Re-present the same batches on every scan instead of draining them.
         ///
         /// Draining is the right default — it catches a fixture that gets pulled twice
@@ -4149,6 +4322,8 @@ mod engine_tests {
                 scans: std::sync::atomic::AtomicUsize::new(0),
                 change_feed: false,
                 stopped_at: std::sync::Mutex::new(None),
+                table: Vec::new(),
+                read_backs: std::sync::Mutex::new(Vec::new()),
                 repeat: false,
             }
         }
@@ -4174,6 +4349,9 @@ mod engine_tests {
         }
         fn windows(&self) -> Vec<(Option<i64>, Option<i64>)> {
             self.windows.lock().unwrap().clone()
+        }
+        fn read_backs(&self) -> Vec<ReadBack> {
+            self.read_backs.lock().unwrap().clone()
         }
     }
 
@@ -4216,6 +4394,33 @@ mod engine_tests {
                 }),
                 stream: Box::pin(futures::stream::iter(taken.into_iter().map(Ok))),
             })
+        }
+        async fn rows_at(
+            &self,
+            _gs: &str,
+            _table: &str,
+            version: i64,
+            filters: &[ScanFilter],
+        ) -> Result<ColumnBatchStream> {
+            let filters = filters
+                .iter()
+                .map(|f| {
+                    let ScanValue::Set(members) = &f.value else {
+                        panic!("a key filter is a set: {f:?}");
+                    };
+                    let values = members
+                        .iter()
+                        .map(|m| match m {
+                            ScanValue::TemplateKey(raw) => raw.clone(),
+                            other => panic!("a key value is a template key: {other:?}"),
+                        })
+                        .collect();
+                    (f.column.clone(), values)
+                })
+                .collect();
+            self.read_backs.lock().unwrap().push((version, filters));
+            let rows = self.table.clone();
+            Ok(Box::pin(futures::stream::iter(rows.into_iter().map(Ok))))
         }
     }
 
@@ -4803,6 +5008,29 @@ mod engine_tests {
         ColumnBatch::new(Arc::new(schema), cols).expect("change batch")
     }
 
+    /// `people` table rows: `(id, name, seq)`.
+    fn table_batch(rows: &[(&str, &str, i64)]) -> ColumnBatch {
+        let field = |name: &str, field_type, id| FieldInfo {
+            name: name.to_string(),
+            field_type,
+            nullable: false,
+            field_id: id,
+        };
+        let schema = BatchSchema::new(vec![
+            field("id", FieldType::String, 1),
+            field("name", FieldType::String, 2),
+            field("seq", FieldType::Int64, 3),
+        ]);
+        let text =
+            |of: Vec<&str>| Column::String(of.into_iter().map(|v| Some(v.to_string())).collect());
+        let cols = vec![
+            text(rows.iter().map(|r| r.0).collect()),
+            text(rows.iter().map(|r| r.1).collect()),
+            Column::Int64(rows.iter().map(|r| Some(r.2)).collect()),
+        ];
+        ColumnBatch::new(Arc::new(schema), cols).expect("table batch")
+    }
+
     /// `(person id, name)` pairs, and the ids typed `Person`, in the target.
     async fn people_in(fluree: &Fluree, target: &str) -> (Vec<(String, String)>, Vec<String>) {
         let ledger = fluree.ledger(target).await.expect("target");
@@ -4988,7 +5216,7 @@ mod engine_tests {
             ..FakeSource::new(
                 people_mapping(),
                 vec![change_batch(&[
-                    ("1", "a", "delete", 9, 0),
+                    ("1", "a1", "delete", 9, 0),
                     ("1", "a1", "insert", 8, 0),
                     ("2", "b2", "insert", 10, 0),
                     ("2", "b", "delete", 10, 0),
@@ -5002,6 +5230,16 @@ mod engine_tests {
             )
         }
         .change_feed();
+        let changes = FakeSource {
+            table: vec![table_batch(&[
+                ("2", "b2", 0),
+                ("3", "c2", 0),
+                ("4", "d-early", 1),
+                ("4", "d-late", 2),
+                ("6", "e", 0),
+            ])],
+            ..changes
+        };
         let result = fluree
             .materialize_from_source(&changes, gs, target, false, None, None)
             .await
@@ -5010,6 +5248,14 @@ mod engine_tests {
             result.subjects_retracted, 2,
             "id 1's latest change is a delete, and id 5's an update away from it"
         );
+        assert_eq!(
+            changes.read_backs(),
+            [(
+                12,
+                vec![("id".to_string(), vec!["1".to_string(), "5".to_string()])]
+            )],
+            "the table, as of the window's end, is asked for the keys a retraction won"
+        );
 
         let (names, people) = people_in(&fluree, target).await;
         assert_eq!(
@@ -5017,6 +5263,74 @@ mod engine_tests {
             pairs(&[("2", "b2"), ("3", "c2"), ("4", "d-late"), ("6", "e")])
         );
         assert_eq!(people, ["2", "3", "4", "6"]);
+    }
+
+    /// A change feed delete removes a row, not necessarily its key. A table
+    /// that keeps several revisions per key and prunes superseded ones keeps
+    /// the key, so latest-by-key settles each key a retraction won by what the
+    /// table holds at the window's end: here, where the row budget cut it.
+    /// Its latest remaining revision wins; a key with none is retracted.
+    #[tokio::test]
+    async fn a_latest_by_key_delete_keeps_a_key_the_table_still_holds() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let (gs, target) = ("people:main", "people_native:main");
+        let initial = FakeSource {
+            order_by: Some("seq".to_string()),
+            to_snapshot_id: Some(2),
+            ..FakeSource::new(
+                people_mapping(),
+                vec![change_batch(&[
+                    ("1", "a-old", "insert", 1, 1),
+                    ("2", "b", "insert", 1, 1),
+                    ("3", "c-old", "insert", 1, 1),
+                    ("1", "a-new", "insert", 2, 2),
+                ])],
+            )
+        }
+        .change_feed();
+        fluree
+            .materialize_from_source(&initial, gs, target, false, None, None)
+            .await
+            .expect("initial pass");
+
+        let changes = FakeSource {
+            order_by: Some("seq".to_string()),
+            to_snapshot_id: Some(9),
+            table: vec![table_batch(&[("1", "a-new", 2), ("3", "c-new", 2)])],
+            ..FakeSource::new(
+                people_mapping(),
+                vec![change_batch(&[
+                    ("1", "a-old", "delete", 3, 1),
+                    ("2", "b", "delete", 4, 1),
+                    ("3", "c-new", "insert", 5, 2),
+                    ("3", "c-old", "delete", 6, 1),
+                ])],
+            )
+        }
+        .change_feed();
+        changes.set_stopped_at(Some(7));
+        let result = fluree
+            .materialize_from_source(&changes, gs, target, false, None, None)
+            .await
+            .expect("change pass");
+        assert_eq!(
+            result.subjects_retracted, 1,
+            "only id 2 is gone from the table"
+        );
+        assert_eq!(
+            changes.read_backs(),
+            [(
+                7,
+                vec![(
+                    "id".to_string(),
+                    vec!["1".to_string(), "2".to_string(), "3".to_string()]
+                )]
+            )]
+        );
+
+        let (names, people) = people_in(&fluree, target).await;
+        assert_eq!(names, pairs(&[("1", "a-new"), ("3", "c-new")]));
+        assert_eq!(people, ["1", "3"]);
     }
 
     /// A change feed the row budget cut short ends its window where it

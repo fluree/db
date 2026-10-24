@@ -70,6 +70,7 @@ pub mod prefix_trie;
 pub mod query_bounds;
 pub mod range;
 pub mod range_provider;
+pub mod rdf_list;
 pub mod runtime_small_dicts;
 pub mod schema_hierarchy;
 pub mod serde;

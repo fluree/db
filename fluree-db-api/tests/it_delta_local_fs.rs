@@ -11,6 +11,7 @@ use fluree_db_api::{
     ApiError, DeltaCreateConfig, Fluree, FlureeBuilder, FlureeR2rmlProvider, TimeSpec,
 };
 use fluree_db_query::error::QueryError;
+use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
 use futures::TryStreamExt;
 use serde_json::{json, Value};
 
@@ -788,6 +789,44 @@ async fn a_change_feed_backlog_drains_in_bounded_passes() {
             (7, "g", 700),
         ])
     );
+}
+
+/// A version is read back by key: an `id` set narrows the read to those rows,
+/// with each key value read as the column's own type, so a key the version no
+/// longer holds comes back with nothing.
+#[tokio::test]
+async fn a_version_is_read_back_by_key() {
+    let staged = Staged::new("change_feed", 5);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = feed_source(&fluree, "readback", "change_feed", &staged.root(), true).await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let keys = ScanFilter {
+        column: "id".to_string(),
+        op: ScanCmpOp::In,
+        value: ScanValue::Set(
+            ["1", "4", "6"]
+                .map(|id| ScanValue::TemplateKey(id.to_string()))
+                .to_vec(),
+        ),
+    };
+    for (version, ids) in [(2, vec![1]), (5, vec![4, 6])] {
+        let batches: Vec<_> = provider
+            .rows_at_version(&gs, "change_feed", version, std::slice::from_ref(&keys))
+            .await
+            .expect("read back")
+            .try_collect()
+            .await
+            .expect("stream");
+        let mut read: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let column = b.column_by_name("id").expect("id column");
+                (0..b.num_rows).map(|row| column.get_i64(row).expect("id"))
+            })
+            .collect();
+        read.sort();
+        assert_eq!(read, ids, "version {version}");
+    }
 }
 
 /// Registration checks each table for the columns its maps project: a column

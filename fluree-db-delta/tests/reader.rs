@@ -1503,6 +1503,51 @@ async fn a_range_the_feed_does_not_cover_is_refused() {
     );
 }
 
+/// A column added inside a range is reported as a schema change, which Kernel
+/// states only as a message, not as a log that no longer reaches the range's
+/// start.
+#[tokio::test]
+async fn a_schema_change_inside_a_range_is_named_as_such() {
+    allow_roots();
+    let staged = tempfile::tempdir().unwrap();
+    let dir = staged.path().join("change_feed");
+    copy_dir_all(&fixtures().join("change_feed"), &dir);
+    let log = dir.join("_delta_log");
+    let first = std::fs::read_to_string(log.join("00000000000000000000.json")).unwrap();
+    let mut metadata = first
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|action| action.get("metaData").is_some())
+        .expect("a metaData action");
+    let mut schema: serde_json::Value =
+        serde_json::from_str(metadata["metaData"]["schemaString"].as_str().unwrap()).unwrap();
+    schema["fields"].as_array_mut().unwrap().push(
+        serde_json::json!({"name": "note", "type": "string", "nullable": true, "metadata": {}}),
+    );
+    metadata["metaData"]["schemaString"] = schema.to_string().into();
+    std::fs::write(
+        log.join("00000000000000000006.json"),
+        format!("{metadata}\n"),
+    )
+    .unwrap();
+
+    let table = DeltaTable::open(
+        "change_feed",
+        dir.to_str().unwrap(),
+        &DeltaIoConfig::default(),
+    )
+    .expect("open table");
+    let latest = table.snapshot(VersionSelector::Latest).await.unwrap();
+    assert_eq!(latest.version(), 6);
+    match latest.changes_since(0, &[], None).await {
+        Err(DeltaError::ChangeFeedUnavailable { reason, .. }) => {
+            assert_eq!(reason, "the schema changed inside the range");
+        }
+        Err(other) => panic!("expected ChangeFeedUnavailable, got {other}"),
+        Ok(_) => panic!("a range across a schema change must be refused"),
+    }
+}
+
 /// Kernel opens a range after checking its two ends, so a version inside it
 /// fails only once rows are flowing. Here the change file of the MERGE at
 /// version 4 is gone.

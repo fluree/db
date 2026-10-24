@@ -380,11 +380,15 @@ pub struct MaterializeOptions {
 /// from a positional return, and dropping it reintroduces the watermark-staleness
 /// failure it exists to prevent.
 pub struct MaterializeScan {
-    /// The source's current snapshot — the new watermark to persist. `None` when
-    /// the table has no snapshots at all (nothing to materialize). A pinned read
-    /// reports its pin, and a Delta read the table version it read.
+    /// The source's current snapshot — the new watermark to persist, unless
+    /// [`Self::stopped_at`] is set, which then is. `None` when the table has no
+    /// snapshots at all (nothing to materialize). A pinned read reports its
+    /// pin, and a Delta read the table version it read.
     pub to_snapshot_id: Option<i64>,
-    /// Whether an added-files scan was used, rather than a full read.
+    /// Whether the pass read only what changed after its window start, rather
+    /// than the table whole: an Iceberg added-files scan, whose rows are all
+    /// additions, or a Delta change feed, whose rows also retract. Check
+    /// [`Self::change_feed`] before treating every row as an addition.
     pub incremental: bool,
     /// Wall-clock span of the window, from Iceberg snapshot timestamps: how far the
     /// stored watermark now lags the current snapshot. `None` on a first run (no
@@ -2076,13 +2080,15 @@ impl<'a> FlureeR2rmlProvider<'a> {
         to_snapshot_id: Option<i64>,
         from_sequence: Option<i64>,
     ) -> QueryResult<MaterializeScan> {
+        // A pinned read is never cut, on every path and for every source. `0`
+        // is the disabled budget: neither Iceberg full-read cut takes a prefix
+        // under it, the incremental cap is skipped for a pin outright, and a
+        // Delta change feed reads its whole window.
+        let pinned = to_snapshot_id.is_some();
+        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
+
         #[cfg(feature = "delta")]
         if let Some(delta) = self.delta_source(graph_source_id).await? {
-            let budget_rows = if to_snapshot_id.is_some() {
-                0
-            } else {
-                self.pass_row_budget()
-            };
             return delta
                 .materialize_scan(
                     self.fluree,
@@ -2103,7 +2109,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
         } else {
             table_name
         };
-        let pinned = to_snapshot_id.is_some();
         let to_snapshot = match to_snapshot_id {
             // A caller's pin must resolve — typed error, never fall-forward
             // (see the doc comment).
@@ -2161,11 +2166,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
                  stopped for longer than retention."
             ),
         }
-
-        // A pinned read is read whole, on every path. `0` is the disabled budget:
-        // neither full-read cut below takes a prefix under it, and the
-        // incremental cap is skipped for a pin outright.
-        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
 
         // An UNPINNED incremental window is read in bounded steps.
         //
@@ -2478,6 +2478,30 @@ impl<'a> FlureeR2rmlProvider<'a> {
             stopped_at: None,
             stream,
         })
+    }
+
+    /// The rows a change feed source's table holds at `version`, narrowed by
+    /// `filters` where the reader can state them exactly; the caller still
+    /// tests every row. Latest-by-key materialization reads a key back this
+    /// way when a change feed retraction leaves its fate to the table. Only a
+    /// Delta source has a change feed.
+    pub async fn rows_at_version(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .rows_at(self.fluree, table_name, version, filters)
+                .await;
+        }
+        let _ = (table_name, version, filters);
+        Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' has no change data feed"
+        )))
     }
 }
 
