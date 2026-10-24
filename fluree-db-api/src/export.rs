@@ -6,7 +6,7 @@
 use crate::export_annotations::AnnotationProbe;
 use fluree_db_binary_index::format::branch::BranchManifest;
 use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
-use fluree_db_binary_index::read::types::sort_overlay_ops;
+use fluree_db_binary_index::read::types::{resolve_overlay_ops, sort_overlay_ops};
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
@@ -161,6 +161,11 @@ fn apply_time_travel(
         );
         if !ops.is_empty() {
             sort_overlay_ops(&mut ops, RunSortOrder::Spot);
+            // Novelty holds a fact's whole lifecycle — an assert and a later
+            // retract both — and the cursor merges one op per fact: the
+            // latest. Unresolved, a fact asserted and then deleted since the
+            // index was built was exported.
+            resolve_overlay_ops(&mut ops);
             cursor.set_overlay_ops(ops.into());
         }
         (ephemeral_preds, surviving_untranslated(untranslated))

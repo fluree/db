@@ -416,6 +416,22 @@ pub struct BinaryIndexStore {
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
+    /// The predicates with list rows, built on first use. See
+    /// [`Self::list_predicate_ids`].
+    list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
+    /// Per SPOT leaf, the subjects with list rows, sorted. See
+    /// [`Self::subject_holds_lists`].
+    leaf_list_subjects: RwLock<HashMap<ContentId, Arc<[u64]>>>,
+    /// Per graph, its list census. See [`Self::list_census`].
+    list_census: RwLock<HashMap<GraphId, Arc<HashMap<u32, ListCensus>>>>,
+}
+
+/// One predicate's compactly stored lists in a graph's index: the subjects
+/// holding members under it (one list each) and the members.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCensus {
+    pub lists: u64,
+    pub members: u64,
 }
 
 /// Lowercase the root's language tags, preserving position.
@@ -486,6 +502,9 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         }
     }
 
@@ -671,6 +690,9 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1162,7 +1184,21 @@ impl BinaryIndexStore {
         if self.residency_mode() {
             return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
         }
-        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay)
+        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay, self.remote_leaf_fetch)
+    }
+
+    /// [`Self::open_leaf_handle`] for reading a few leaflets' columns: a
+    /// remote leaf is range-read whatever [`RemoteLeafFetch`] the store uses,
+    /// so a walk that reads one leaflet in many leaves fetches no whole leaf.
+    pub fn open_leaf_handle_ranged(
+        &self,
+        leaf_cid: &ContentId,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self.open_resident_leaf_handle(leaf_cid, None, false);
+        }
+        self.open_leaf_handle_native(leaf_cid, None, false, RemoteLeafFetch::Ranged)
     }
 
     /// Residency-mode leaf open: whole leaf (and sidecar when replaying)
@@ -1196,6 +1232,7 @@ impl BinaryIndexStore {
         leaf_cid: &ContentId,
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
+        remote_fetch: RemoteLeafFetch,
     ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
         use super::leaf_access::{
             fetch_header_and_directory, FullBlobLeafHandle, RangeReadLeafHandle,
@@ -1246,7 +1283,7 @@ impl BinaryIndexStore {
             }
         }
 
-        if self.remote_leaf_fetch == RemoteLeafFetch::Whole {
+        if remote_fetch == RemoteLeafFetch::Whole {
             tracing::debug!(leaf = %leaf_cid, need_replay, source = "remote_whole", "binary leaf open");
             let bytes = self.fetch_remote_leaf_whole(cs, leaf_cid)?;
             return self.leaf_handle_from_resident(bytes.into(), leaf_id, sidecar_cid, need_replay);
@@ -2508,6 +2545,196 @@ impl BinaryIndexStore {
             .write()
             .insert((g_id, p_id), proven);
         Some(proven)
+    }
+
+    /// The predicates with list rows (`o_i`, an RDF-list position) in any
+    /// graph, read from POST leaflet directories once per store: the index is
+    /// immutable, so the set holds for the store's lifetime. Only directories
+    /// are read, except that a list-bearing leaflet spanning several
+    /// predicates has its predicate and position columns range-read; no whole
+    /// leaf is fetched. Concurrent first callers may each walk the branch.
+    pub fn list_predicate_ids(&self) -> io::Result<Arc<std::collections::HashSet<u32>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(ids) = self.list_predicate_ids.get() {
+            return Ok(Arc::clone(ids));
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut columns = ColumnSet::EMPTY;
+        columns.insert(ColumnId::PId);
+        columns.insert(ColumnId::OI);
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        for g_id in self.graph_ids() {
+            let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Post) else {
+                continue;
+            };
+            for leaf in &branch.leaves {
+                let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                let mut handle = None;
+                for (idx, entry) in dir.entries.iter().enumerate() {
+                    if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
+                        continue;
+                    }
+                    if let Some(p_id) = entry.p_const {
+                        ids.insert(p_id);
+                        continue;
+                    }
+                    let handle = match &mut handle {
+                        Some(handle) => handle,
+                        None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                    };
+                    let batch = handle.load_columns(idx, &projection, RunSortOrder::Post)?;
+                    for row in 0..batch.row_count {
+                        if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                            ids.insert(batch.p_id.get_or(row, 0));
+                        }
+                    }
+                }
+            }
+        }
+        let ids = Arc::new(ids);
+        let _ = self.list_predicate_ids.set(Arc::clone(&ids));
+        Ok(ids)
+    }
+
+    /// Graph `g_id`'s compactly stored lists, per predicate holding them, as
+    /// of the index: read once per graph for the store's life from the PSOT
+    /// leaflets of [`Self::list_predicate_ids`] flagged as holding list rows.
+    /// PSOT sorts a predicate's rows by subject, so each run of a subject's
+    /// members is one list.
+    pub fn list_census(&self, g_id: GraphId) -> io::Result<Arc<HashMap<u32, ListCensus>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(census) = self.list_census.read().get(&g_id) {
+            return Ok(Arc::clone(census));
+        }
+        let mut census: HashMap<u32, ListCensus> = HashMap::new();
+        if let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Psot) {
+            let mut columns = ColumnSet::EMPTY;
+            for column in [ColumnId::SId, ColumnId::PId, ColumnId::OI] {
+                columns.insert(column);
+            }
+            let projection = ColumnProjection {
+                output: columns,
+                internal: ColumnSet::EMPTY,
+            };
+            for &p_id in self.list_predicate_ids()?.iter() {
+                let mut found = ListCensus::default();
+                let mut last_owner = None;
+                let leaves = branch
+                    .leaves
+                    .iter()
+                    .filter(|leaf| leaf.first_key.p_id <= p_id && p_id <= leaf.last_key.p_id);
+                for leaf in leaves {
+                    let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                    let mut handle = None;
+                    for (idx, entry) in dir.entries.iter().enumerate() {
+                        if entry.row_count == 0
+                            || entry.flags & HAS_O_I == 0
+                            || entry.p_const.is_some_and(|p| p != p_id)
+                        {
+                            continue;
+                        }
+                        let handle = match &mut handle {
+                            Some(handle) => handle,
+                            None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                        };
+                        let batch = handle.load_columns(idx, &projection, RunSortOrder::Psot)?;
+                        for row in 0..batch.row_count {
+                            if batch.p_id.get_or(row, p_id) != p_id
+                                || batch.o_i.get_or(row, LIST_INDEX_NONE) == LIST_INDEX_NONE
+                            {
+                                continue;
+                            }
+                            found.members += 1;
+                            let owner = batch.s_id.get(row);
+                            if last_owner != Some(owner) {
+                                found.lists += 1;
+                                last_owner = Some(owner);
+                            }
+                        }
+                    }
+                }
+                if found.members > 0 {
+                    census.insert(p_id, found);
+                }
+            }
+        }
+        let census = Arc::new(census);
+        self.list_census.write().insert(g_id, Arc::clone(&census));
+        Ok(census)
+    }
+
+    /// Whether subject `s_id` has list rows in graph `g_id`'s index. Reads
+    /// the directories of the SPOT leaves holding its rows and, once per leaf
+    /// for the store's life, the subject and position columns of a leaflet
+    /// flagged as holding list rows.
+    pub fn subject_holds_lists(&self, g_id: GraphId, s_id: u64) -> io::Result<bool> {
+        let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Spot) else {
+            return Ok(false);
+        };
+        for leaf in &branch.leaves[branch.find_leaves_for_subject(s_id)] {
+            if self.leaf_list_subjects(leaf)?.binary_search(&s_id).is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The subjects with list rows in SPOT leaf `leaf`, sorted.
+    fn leaf_list_subjects(
+        &self,
+        leaf: &crate::format::branch::LeafEntry,
+    ) -> io::Result<Arc<[u64]>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(subjects) = self.leaf_list_subjects.read().get(&leaf.leaf_cid) {
+            return Ok(Arc::clone(subjects));
+        }
+        let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+        let mut columns = ColumnSet::EMPTY;
+        columns.insert(ColumnId::SId);
+        columns.insert(ColumnId::OI);
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        let mut subjects = Vec::new();
+        let mut handle = None;
+        for (idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
+                continue;
+            }
+            let handle = match &mut handle {
+                Some(handle) => handle,
+                None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+            };
+            let batch = handle.load_columns(idx, &projection, RunSortOrder::Spot)?;
+            for row in 0..batch.row_count {
+                if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                    subjects.push(batch.s_id.get(row));
+                }
+            }
+        }
+        subjects.sort_unstable();
+        subjects.dedup();
+        let subjects: Arc<[u64]> = subjects.into();
+        self.leaf_list_subjects
+            .write()
+            .insert(leaf.leaf_cid.clone(), Arc::clone(&subjects));
+        Ok(subjects)
     }
 
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
@@ -4864,6 +5091,144 @@ pub(crate) mod tests {
         }
         assert_eq!((store.get_calls(), store.range_calls()), (1, 1));
 
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// List predicates come from POST leaflet directories alone: no whole
+    /// leaf is fetched, even under the `Whole` policy.
+    #[test]
+    fn list_predicates_are_read_without_fetching_a_whole_leaf() {
+        let member = |s: u64, p: u32, o: u64, i: u32| RunRecordV2 {
+            o_i: i,
+            ..make_rec(s, p, OType::XSD_INTEGER.as_u16(), o, 1)
+        };
+        // One leaf holding a plain predicate and a list predicate, one
+        // leaflet each, and one holding a list predicate alone.
+        let spanning = [
+            make_rec(1, 5, OType::XSD_INTEGER.as_u16(), 10, 1),
+            make_rec(2, 5, OType::XSD_INTEGER.as_u16(), 20, 1),
+            member(3, 6, 30, 0),
+            member(3, 6, 40, 1),
+        ];
+        let single = [member(4, 7, 50, 0), member(4, 7, 60, 1)];
+        let store = CountingContentStore::new();
+        let mut leaves = Vec::new();
+        for records in [&spanning[..], &single[..]] {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            for rec in records {
+                writer.push_record(*rec).unwrap();
+            }
+            let info = writer.finish().unwrap().remove(0);
+            let leaf_cid = run_sync_on_runtime({
+                let store = store.clone();
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("store leaf bytes");
+            leaves.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid,
+                sidecar_cid: None,
+            });
+        }
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        binary_store.graph_indexes.insert(
+            0,
+            GraphIndex {
+                orders: HashMap::from([(
+                    RunSortOrder::Post,
+                    Arc::new(crate::format::branch::BranchManifest { leaves }),
+                )]),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            },
+        );
+
+        let ids = binary_store.list_predicate_ids().expect("list predicates");
+        assert_eq!(*ids, std::collections::HashSet::from([6, 7]));
+        assert_eq!(store.get_calls(), 0, "no whole-leaf GET");
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// A subject's list rows are found exactly: a neighbor sharing the
+    /// list-bearing leaflet holds none, and no whole leaf is fetched.
+    #[test]
+    fn a_subjects_list_rows_are_found_exactly() {
+        let member = |s: u64, o: u64, i: u32| RunRecordV2 {
+            o_i: i,
+            ..make_rec(s, 7, OType::XSD_INTEGER.as_u16(), o, 1)
+        };
+        // Subjects 1 and 3 hold plain rows; subject 2 owns a list. One leaflet.
+        let records = [
+            make_rec(1, 5, OType::XSD_INTEGER.as_u16(), 10, 1),
+            member(2, 30, 0),
+            member(2, 40, 1),
+            make_rec(3, 5, OType::XSD_INTEGER.as_u16(), 20, 1),
+        ];
+        let store = CountingContentStore::new();
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 1000, 1);
+        writer.set_skip_history(true);
+        for rec in records {
+            writer.push_record(rec).unwrap();
+        }
+        let info = writer.finish().unwrap().remove(0);
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let bytes = info.leaf_bytes.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        let leaf = crate::format::branch::LeafEntry {
+            first_key: info.first_key,
+            last_key: info.last_key,
+            row_count: info.total_rows,
+            leaf_cid,
+            sidecar_cid: None,
+        };
+        binary_store.graph_indexes.insert(
+            0,
+            GraphIndex {
+                orders: HashMap::from([(
+                    RunSortOrder::Spot,
+                    Arc::new(crate::format::branch::BranchManifest { leaves: vec![leaf] }),
+                )]),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            },
+        );
+
+        let holds = |s_id| binary_store.subject_holds_lists(0, s_id).unwrap();
+        assert_eq!(
+            (holds(1), holds(2), holds(3), holds(9)),
+            (false, true, false, false)
+        );
+        assert_eq!(store.get_calls(), 0, "no whole-leaf GET");
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 

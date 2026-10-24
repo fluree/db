@@ -4,6 +4,9 @@
 //! implement a fast, benchmark-friendly interpretation:
 //! - Identify resources to describe (variables from WHERE results and/or explicit IRIs)
 //! - For each resource, return all outgoing triples: `?res ?p ?o`
+//! - For each blank-node object, its own outgoing triples, and when it heads a
+//!   list, those of every cell after it: a label the result alone names would
+//!   otherwise describe nothing
 //!
 //! This is lowered into the common query IR as a CONSTRUCT-like query with:
 //! - A synthetic `?__describe` variable bound to resources
@@ -15,8 +18,8 @@ use crate::SourceSpan;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Expression, Function, Pattern, Query, QueryOutput,
-    SubqueryPattern,
+    ConstructTemplate as QueryConstructTemplate, Expression, Function, PathModifier, Pattern,
+    PropertyPathPattern, Query, QueryOutput, SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
@@ -44,13 +47,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let describe_var = self.vars.get_or_insert("?__describe");
         let p_var = self.vars.get_or_insert("?__describe_p");
         let o_var = self.vars.get_or_insert("?__describe_o");
+        let cell_var = self.vars.get_or_insert("?__describe_cell");
+        let cell_p_var = self.vars.get_or_insert("?__describe_cell_p");
+        let cell_o_var = self.vars.get_or_insert("?__describe_cell_o");
 
-        // CONSTRUCT template: { ?__describe ?__describe_p ?__describe_o }
-        let template = QueryConstructTemplate::new(vec![TriplePattern::new(
-            Ref::Var(describe_var),
-            Ref::Var(p_var),
-            Term::Var(o_var),
-        )]);
+        // CONSTRUCT template: { ?__describe ?__describe_p ?__describe_o .
+        //                       ?__describe_cell ?__describe_cell_p ?__describe_cell_o }
+        let template = QueryConstructTemplate::new(vec![
+            TriplePattern::new(Ref::Var(describe_var), Ref::Var(p_var), Term::Var(o_var)),
+            TriplePattern::new(
+                Ref::Var(cell_var),
+                Ref::Var(cell_p_var),
+                Term::Var(cell_o_var),
+            ),
+        ]);
 
         // Build branches that bind ?__describe:
         // - Explicit IRIs become VALUES rows
@@ -165,6 +175,26 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             Ref::Var(p_var),
             Term::Var(o_var),
         )));
+        // OPTIONAL { FILTER(isBlank(?o)) ?o rdf:rest* ?cell . ?cell ?cp ?co }
+        if let Some(rest) = self.encoder.encode_iri(fluree_vocab::rdf::REST) {
+            patterns.push(Pattern::Optional(vec![
+                Pattern::Filter(Expression::Call {
+                    func: Function::IsBlank,
+                    args: vec![Expression::Var(o_var)],
+                }),
+                Pattern::PropertyPath(PropertyPathPattern::new(
+                    Ref::Var(o_var),
+                    rest,
+                    PathModifier::ZeroOrMore,
+                    Ref::Var(cell_var),
+                )),
+                Pattern::Triple(TriplePattern::new(
+                    Ref::Var(cell_var),
+                    Ref::Var(cell_p_var),
+                    Term::Var(cell_o_var),
+                )),
+            ]));
+        }
 
         Ok(Query {
             context: ctx,
@@ -182,6 +212,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         })
     }
 

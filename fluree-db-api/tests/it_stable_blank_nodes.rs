@@ -441,10 +441,11 @@ fn sorted_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// Every blank node a SPARQL UPDATE mints — for `[ … ]`, `( … )`, a template
-/// `[]` and an annotation without `~` — exports as Turtle and N-Triples that
-/// Fluree reads back, and re-inserting either export into another ledger keeps
-/// each node's stored id, from novelty and from the index.
+/// Every blank node a SPARQL UPDATE mints — for `[ … ]`, a template `[]` and
+/// an annotation without `~` — exports as Turtle and N-Triples that Fluree
+/// reads back, and re-inserting either export into another ledger keeps each
+/// node's stored id, from novelty and from the index. A `( … )` mints none:
+/// it is stored as the list it is, and read back as one from either export.
 #[tokio::test]
 async fn sparql_update_blank_nodes_export_and_reinsert_as_the_same_nodes() {
     use fluree_db_api::export::ExportFormat;
@@ -474,7 +475,7 @@ async fn sparql_update_blank_nodes_export_and_reinsert_as_the_same_nodes() {
         let ntriples = export(&fluree, source, ExportFormat::NTriples).await;
         let expected = sorted_lines(&ntriples);
         assert!(
-            expected.iter().filter(|l| l.contains("_:fdb-")).count() >= 6,
+            expected.iter().filter(|l| l.contains("_:fdb-")).count() >= 5,
             "{lane}: the minted blank nodes are exported: {ntriples}"
         );
         for (name, format) in [
