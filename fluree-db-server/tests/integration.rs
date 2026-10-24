@@ -4501,6 +4501,11 @@ async fn sync_route_contract() {
             "application/json",
         ),
         (
+            format!("/v1/fluree/sync/sync:test?graph={graph}"),
+            "[]".to_string(),
+            "application/json",
+        ),
+        (
             "/v1/fluree/sync/sync:test?graph=relative%2Fgraph".to_string(),
             v1.clone(),
             "application/json",

@@ -272,6 +272,15 @@ Old index snapshots are retained for time-travel safety and concurrent query saf
 
 Both must be satisfied, so the slower of the two wins. Under a sustained publish rate that is the age guard: a ledger publishing every few seconds holds far more than `gc_max_old_indexes` versions inside the 15-minute window, and the count bounds nothing. Retention becomes "however many versions fit in the window", which grows with publish rate and per-version size. Every one of those versions is still reachable and still on disk.
 
+Each pass reports what it left at `INFO`:
+
+- `retained`: the versions left on the chain, the current one included.
+- `retention_target`: `1 + gc_max_old_indexes`.
+- `past_target`: how many of the retained versions are beyond the target.
+- `stopped_by`: present when the pass stopped before the oldest version. `age_guard` means a version was inside `gc_min_time_mins`. `unreadable_manifest` means a garbage manifest could not be read.
+
+A pass that releases something logs `Garbage collection complete`. A pass that releases nothing while versions are past the target logs `Garbage collection released nothing`, so a ledger held entirely by the age guard is still visible.
+
 - `IndexerConfig.gc_hard_max_old_indexes` (`--gc-hard-max-old-indexes` / `FLUREE_GC_HARD_MAX_OLD_INDEXES`, unset by default): a ceiling past which versions are collected regardless of age.
 
 The ceiling is opt-in because the age guard is what protects a query that started against an older version: until the guard expires, that version's leaves are still in storage. Past the ceiling they are released regardless, and a query still reading them fails or reads a torn version. Set it well above the number of versions the ledger publishes during your longest query. Each GC pass reports how many versions it collected past the ceiling (`age_guard_overridden` in the completion log line), so an override that is firing is visible at the default log level.

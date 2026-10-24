@@ -4221,13 +4221,21 @@ impl crate::Fluree {
             tracing::debug_span!("turtle_parse_to_flakes", turtle_bytes = turtle.len());
         let parsed = {
             let _g = parse_span.enter();
-            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id);
-            fluree_graph_turtle::parse(turtle, &mut sink).map(|()| sink.into_flakes())
+            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id.clone());
+            fluree_graph_turtle::parse(turtle, &mut sink).map(|()| sink.into_flakes_and_lists())
         };
         let flakes = match parsed {
-            Ok(flakes) => {
+            Ok(parts) => {
                 stamp_fast_path(TURTLE_INSERT_SITE, FastPathOutcome::Proceed);
-                flakes.map_err(ApiError::from)?
+                let (mut flakes, lists) = parts.map_err(ApiError::from)?;
+                // An insert retracts nothing, so every list member the ledger
+                // holds survives it.
+                flakes.extend(
+                    fluree_db_transact::lists::store_lists(&ledger, lists, &txn_id, |_| false)
+                        .await
+                        .map_err(ApiError::from)?,
+                );
+                flakes
             }
             Err(turtle_err) => {
                 return self

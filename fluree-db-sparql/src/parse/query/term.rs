@@ -174,10 +174,10 @@ impl super::Parser<'_> {
             Some(ReifierId::BlankNode(b)) => SubjectTerm::BlankNode(b),
             Some(ReifierId::Var(v)) => SubjectTerm::Var(v),
             None => {
-                // `#` is outside PN_CHARS, so this synthetic label can
-                // never collide with a user-written `_:…` label (same
-                // scheme as `#bnpl…` / `#coll…`).
-                let label = format!("#reif{}", self.bnode_counter);
+                // A label can't start with `-`, so this synthetic one never
+                // collides with a user-written `_:…` label (same scheme as
+                // `-bnpl…` / `-coll…`).
+                let label = format!("-reif{}", self.bnode_counter);
                 self.bnode_counter += 1;
                 SubjectTerm::BlankNode(BlankNode::labeled(&label, span))
             }
@@ -552,10 +552,11 @@ impl super::Parser<'_> {
     }
 
     fn parse_blank_node_property_list_inner(&mut self, start: SourceSpan) -> Option<BlankNode> {
-        // `#` is not a valid blank-node-label character (it is outside PN_CHARS),
-        // so the lexer can never produce this label — a user-written `_:…` can
-        // never collide with it and be accidentally joined to the synthetic node.
-        let label = format!("#bnpl{}", self.bnode_counter);
+        // `BLANK_NODE_LABEL` can't start with `-`, so the lexer never produces
+        // this label: a user-written `_:…` can't collide with it and be joined
+        // to the synthetic node. Mid-label `-` is legal, so the skolemized
+        // `fdb-…--bnpl{N}` a write stores serializes as written.
+        let label = format!("-bnpl{}", self.bnode_counter);
         self.bnode_counter += 1;
         let subject = SubjectTerm::BlankNode(BlankNode::labeled(&label, start));
 
@@ -669,12 +670,12 @@ impl super::Parser<'_> {
             return Some(Term::Iri(Iri::rdf_nil(span)));
         }
 
-        // Mint the list-cell blank nodes. `#` is outside PN_CHARS, so a
-        // user-written `_:…` label can never collide with these (same
-        // scheme as the `#bnpl…` property-list labels).
+        // Mint the list-cell blank nodes. A label can't start with `-`, so a
+        // user-written `_:…` label never collides with these (same scheme as
+        // the `-bnpl…` property-list labels).
         let cells: Vec<String> = (0..items.len())
             .map(|_| {
-                let label = format!("#coll{}", self.bnode_counter);
+                let label = format!("-coll{}", self.bnode_counter);
                 self.bnode_counter += 1;
                 label
             })

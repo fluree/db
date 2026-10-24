@@ -330,9 +330,9 @@ fn row_blank(
     }
     // Reserved `cst` (construct-solution-template) prefix keeps minted labels
     // disjoint from every SANCTIONED blank-node producer: stored/import blanks
-    // (`fdb-…`), the graph-ir sink's unlabeled blanks (`b{n}`), and `BNODE()`
-    // (`_:fdb-{uuid}` no-arg / `_:b{hex}` with a label) are all prefix-disjoint
-    // from `cst`. A remote SERVICE blank is passed through verbatim and so is NOT
+    // (`fdb-…`), the graph-ir sink's unlabeled blanks (`b{n}`), SPARQL's list
+    // cells (`l{n}-{k}`), and `BNODE()` (`_:fdb-{uuid}` no-arg / `_:b{hex}`
+    // with a label) are all prefix-disjoint from `cst`. A remote SERVICE blank is passed through verbatim and so is NOT
     // disjoint by construction — but in practice it cannot carry a `cst…` label:
     // external SPARQL endpoints are rejected (`fluree-db-query` service.rs) and
     // Fluree-to-Fluree remotes only ever emit `fdb-` blanks, so that one case is

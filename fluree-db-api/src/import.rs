@@ -4499,6 +4499,7 @@ where
         // read once at root assembly (after every worker has joined) to
         // record `IndexRoot.has_list_meta` exactly.
         saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        list_owners: Default::default(),
     });
 
     // Pre-insert rdf:type so we know the predicate ID before Phase A begins.

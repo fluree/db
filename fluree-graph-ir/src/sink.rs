@@ -180,6 +180,10 @@ pub trait GraphSink {
     /// The `index` is the 0-based position in the list for this (subject, predicate).
     /// List items will be formatted as `{"@list": [...]}` in JSON-LD output.
     ///
+    /// A list's items are emitted in order from position 0, and position 0
+    /// begins a new list: two lists on one subject and predicate are two runs
+    /// from 0. Another list's items may come between a list's items.
+    ///
     /// Default implementation falls back to `emit_triple` (ignoring index).
     fn emit_list_item(
         &mut self,

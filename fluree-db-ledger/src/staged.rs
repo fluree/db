@@ -12,6 +12,7 @@ use crate::LedgerState;
 use fluree_db_core::{Flake, GraphDbRef, GraphId, IndexType, OverlayProvider, Sid};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Index into [`StagedStore`]'s own contiguous arena.
 ///
@@ -211,6 +212,9 @@ pub struct StagedLedger {
     /// dictionaries know nothing of subjects and strings this transaction is
     /// introducing.
     dicts_cover_staged: bool,
+    /// [`OverlayProvider::list_predicates`]: the base novelty's and the
+    /// staged flakes'.
+    list_predicates: Option<Arc<std::collections::HashSet<Sid>>>,
 }
 
 impl StagedLedger {
@@ -236,6 +240,17 @@ impl StagedLedger {
     ) -> Result<Self, LedgerError> {
         let staged_epoch = base.novelty.epoch + 1;
         let staged_t = base.t() + 1;
+        let mut list_predicates = base.novelty.list_predicates();
+        if let Some(predicates) = &mut list_predicates {
+            for flake in flakes
+                .iter()
+                .filter(|f| f.m.as_ref().is_some_and(|m| m.i.is_some()))
+            {
+                if !predicates.contains(&flake.p) {
+                    Arc::make_mut(predicates).insert(flake.p.clone());
+                }
+            }
+        }
         let staged = StagedOverlay::from_flakes(flakes, staged_t, reverse_graph)?;
         let links = base.novelty.links_for(
             staged
@@ -249,6 +264,7 @@ impl StagedLedger {
             staged_epoch,
             content_version: fluree_db_core::overlay::next_overlay_content_version(),
             dicts_cover_staged: false,
+            list_predicates,
             base,
         })
     }
@@ -351,6 +367,10 @@ impl StagedLedger {
 impl OverlayProvider for StagedLedger {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn list_predicates(&self) -> Option<Arc<std::collections::HashSet<Sid>>> {
+        self.list_predicates.clone()
     }
 
     fn epoch(&self) -> u64 {

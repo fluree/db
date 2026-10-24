@@ -1338,6 +1338,22 @@ impl<'a> HydrationFormatter<'a> {
                     pred_flakes.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i).unwrap_or(i32::MAX));
                 }
 
+                // A list stored as an `rdf:first`/`rdf:rest` chain, not
+                // compactly, reads as its members, as a compact list does.
+                let chains = self.stored_list_members(&pred_flakes).await?;
+                let pred_flakes: Vec<&Flake> = if chains.is_empty() {
+                    pred_flakes
+                } else {
+                    pred_flakes
+                        .into_iter()
+                        .enumerate()
+                        .flat_map(|(k, f)| match chains.iter().find(|(at, _)| *at == k) {
+                            Some((_, members)) => members.iter().collect(),
+                            None => vec![f],
+                        })
+                        .collect()
+                };
+
                 let pred_ctx = PredicateContext {
                     pred: &pred,
                     flakes: &pred_flakes,
@@ -2376,6 +2392,40 @@ impl<'a> HydrationFormatter<'a> {
         }
 
         Ok(flakes)
+    }
+
+    /// The members of each of `flakes` that names a list stored as an
+    /// `rdf:first`/`rdf:rest` chain, with the flake's position. A list any of
+    /// whose members the view policy hides is left as its head.
+    async fn stored_list_members(&self, flakes: &[&Flake]) -> Result<Vec<(usize, Vec<Flake>)>> {
+        let mut out = Vec::new();
+        for (k, flake) in flakes.iter().enumerate() {
+            let FlakeValue::Ref(head) = &flake.o else {
+                continue;
+            };
+            if head.namespace_code != BLANK_NODE {
+                continue;
+            }
+            let members = fluree_db_core::rdf_list::chain_members(self.db, head)
+                .await
+                .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
+            let Some(members) = members else {
+                continue;
+            };
+            let members = match self.policy {
+                Some(policy_ctx) if !policy_ctx.wrapper().is_root() => {
+                    let count = members.len();
+                    let visible = self.filter_flakes_by_policy(members, policy_ctx).await?;
+                    if visible.len() != count {
+                        continue;
+                    }
+                    visible
+                }
+                _ => members,
+            };
+            out.push((k, members));
+        }
+        Ok(out)
     }
 
     /// Fetch one `(subject, predicate)` pair via the SPOT index.

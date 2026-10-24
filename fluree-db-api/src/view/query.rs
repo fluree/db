@@ -890,6 +890,7 @@ impl Fluree {
         let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_sparql_for_view(
             &db.snapshot,
+            db.overlay.as_ref(),
             sparql,
             db.default_context.as_ref(),
             params,

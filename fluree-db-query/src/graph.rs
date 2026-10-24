@@ -446,7 +446,7 @@ impl GraphOperator {
             // Rewrite triple patterns to R2RML patterns
             let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
             let rewrite_result = rewrite_patterns_for_r2rml(
-                &self.inner_patterns,
+                &crate::list_view::without_list_view(&self.inner_patterns),
                 &graph_iri,
                 ctx.active_snapshot,
                 mapping.as_deref(),
@@ -663,7 +663,7 @@ impl GraphOperator {
 
         let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
         let rewrite_result = rewrite_patterns_for_r2rml(
-            &self.inner_patterns,
+            &crate::list_view::without_list_view(&self.inner_patterns),
             &graph_iri,
             ctx.active_snapshot,
             mapping.as_deref(),

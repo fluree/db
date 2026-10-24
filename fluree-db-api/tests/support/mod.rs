@@ -1076,3 +1076,65 @@ pub async fn commit_legacy_bundle(
         .expect("commit the legacy bundle")
         .1
 }
+
+/// The RDF lists `subject predicate` holds in `ledger`'s default graph, each
+/// as its members' integer values, sorted. Read through the shared list
+/// reader, so a list reads the same whether it is stored as positioned
+/// members or as an explicit `rdf:first`/`rdf:rest` chain.
+#[allow(dead_code)]
+pub async fn stored_int_lists(
+    ledger: &LedgerState,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    stored_int_lists_in(ledger, 0, subject, predicate).await
+}
+
+/// [`stored_int_lists`] in graph `g_id`.
+#[allow(dead_code)]
+pub async fn stored_int_lists_in(
+    ledger: &LedgerState,
+    g_id: fluree_db_core::GraphId,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+    use fluree_db_core::FlakeValue;
+    let snapshot = &ledger.snapshot;
+    let (Some(s), Some(p)) = (snapshot.encode_iri(subject), snapshot.encode_iri(predicate)) else {
+        return Vec::new();
+    };
+    let db = ledger.as_graph_db_ref(g_id);
+    let values = db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s),
+                p: Some(p),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("range");
+    let read = fluree_db_core::rdf_list::read_lists(db, &values)
+        .await
+        .expect("read lists");
+    assert!(read.malformed == 0 && read.values.is_empty(), "{read:?}");
+    let mut lists: Vec<Vec<i64>> = read
+        .lists
+        .into_iter()
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|m| match m {
+                    FlakeValue::Long(n) => n,
+                    other => panic!("integer member expected, got {other:?}"),
+                })
+                .collect()
+        })
+        .collect();
+    lists.sort();
+    lists
+}

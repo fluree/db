@@ -2953,11 +2953,10 @@ impl crate::Fluree {
                         Some(handle) => Some(handle.hold_gc(&gc_ledger_id.ledger_name()).await),
                         None => None,
                     };
-                    let Some(plan) =
-                        plan_garbage(gc_store.as_ref(), &gc_root_id, &gc_config).await?
-                    else {
+                    let plan = plan_garbage(gc_store.as_ref(), &gc_root_id, &gc_config).await?;
+                    if plan.is_empty() {
                         return Ok(());
-                    };
+                    }
                     let _window = match (&gc_handle, &gc_guard) {
                         (Some(handle), Some(guard)) => {
                             match handle.open_release_window(guard).await {

@@ -418,3 +418,143 @@ async fn sparql_delete_where_stable_blank_node() {
     .await;
     assert_eq!(refs, vec![bnode]);
 }
+
+// ============================================================================
+// Export round-trip
+// ============================================================================
+
+async fn export(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    format: fluree_db_api::export::ExportFormat,
+) -> String {
+    let mut out = Vec::new();
+    fluree
+        .export(ledger_id)
+        .format(format)
+        .write_to(&mut out)
+        .await
+        .expect("export");
+    String::from_utf8(out).expect("UTF-8 export")
+}
+
+fn sorted_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// Every blank node a SPARQL UPDATE mints — for `[ … ]`, a template `[]` and
+/// an annotation without `~` — exports as Turtle and N-Triples that Fluree
+/// reads back, and re-inserting either export into another ledger keeps each
+/// node's stored id, from novelty and from the index. A `( … )` mints none:
+/// it is stored as the list it is, and read back as one from either export.
+#[tokio::test]
+async fn sparql_update_blank_nodes_export_and_reinsert_as_the_same_nodes() {
+    use fluree_db_api::export::ExportFormat;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let source = "it/stable-bnodes/export-source:main";
+    fluree.create_ledger(source).await.expect("create");
+    fluree
+        .graph(source)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA {
+               ex:s ex:param [ ex:name \"q\" ] ;
+                    ex:items ( \"a\" \"b\" ) .
+               [] ex:tag \"t\" .
+               ex:a ex:knows ex:b {| ex:since 2020 |} .
+             }",
+        )
+        .commit()
+        .await
+        .expect("SPARQL UPDATE");
+
+    for lane in ["novelty", "index"] {
+        if lane == "index" {
+            support::rebuild_and_publish_index(&fluree, source).await;
+        }
+        let ntriples = export(&fluree, source, ExportFormat::NTriples).await;
+        let expected = sorted_lines(&ntriples);
+        assert!(
+            expected.iter().filter(|l| l.contains("_:fdb-")).count() >= 5,
+            "{lane}: the minted blank nodes are exported: {ntriples}"
+        );
+        for (name, format) in [
+            ("ttl", ExportFormat::Turtle),
+            ("nt", ExportFormat::NTriples),
+        ] {
+            let text = export(&fluree, source, format).await;
+            let copy = format!("it/stable-bnodes/export-copy-{lane}-{name}:main");
+            fluree.create_ledger(&copy).await.expect("create copy");
+            fluree
+                .graph(&copy)
+                .transact()
+                .insert_turtle(&text)
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{lane} {name}: re-insert: {e}\n{text}"));
+            let copied = export(&fluree, &copy, ExportFormat::NTriples).await;
+            assert_eq!(sorted_lines(&copied), expected, "{lane} {name}");
+        }
+    }
+}
+
+/// A stored label the Turtle grammar rejects, as SPARQL UPDATE used to mint,
+/// exports escaped: the export parses, and re-inserting it gives a new blank
+/// node with the same properties and links.
+#[tokio::test]
+async fn a_stored_label_turtle_rejects_exports_escaped() {
+    use fluree_db_api::export::ExportFormat;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let source = "it/stable-bnodes/legacy-label:main";
+    fluree.create_ledger(source).await.expect("create");
+    let legacy = "_:fdb-1a-0-#bnpl0";
+    fluree
+        .graph(source)
+        .transact()
+        .insert(&json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:s", "ex:param": {"@id": legacy}},
+                {"@id": legacy, "ex:name": "q"}
+            ]
+        }))
+        .commit()
+        .await
+        .expect("insert");
+
+    for (name, format) in [
+        ("ttl", ExportFormat::Turtle),
+        ("nt", ExportFormat::NTriples),
+    ] {
+        let text = export(&fluree, source, format).await;
+        assert!(!text.contains("#bnpl0"), "{name}: {text}");
+        assert!(
+            text.contains("_:x6664622d"),
+            "{name}: escaped label: {text}"
+        );
+        let copy = format!("it/stable-bnodes/legacy-copy-{name}:main");
+        fluree.create_ledger(&copy).await.expect("create copy");
+        fluree
+            .graph(&copy)
+            .transact()
+            .insert_turtle(&text)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{name}: re-insert: {e}\n{text}"));
+        let ledger = fluree.ledger(&copy).await.expect("load copy");
+        let names = select_strings(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": ctx(),
+                "select": "?n",
+                "where": [{"@id": "ex:s", "ex:param": "?p"}, {"@id": "?p", "ex:name": "?n"}]
+            }),
+        )
+        .await;
+        assert_eq!(names, ["q"], "{name}");
+    }
+}

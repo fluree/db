@@ -487,18 +487,23 @@ fn chain_closure_request(max_seconds: u64) -> Value {
 
 /// Replays run under the reasoning budget as the run's rule bodies do: one
 /// that outlasts it stops, and the explanation says it is incomplete.
+///
+/// The budget also bounds the materialization the explanation starts with,
+/// so it sits between the two costs: the replay costs about thirty times
+/// what the materialization does, and a budget close to the materialization
+/// caps the run before it derives the fact on a loaded machine.
 #[tokio::test]
 async fn a_replay_stops_at_the_reasoning_deadline() {
     let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
     let ledger = chain_closure_ledger(&fluree, "datalog/explain-deadline:main").await;
     let started = std::time::Instant::now();
-    let explanation = explain_with(&fluree, &ledger, chain_closure_request(2)).await;
+    let explanation = explain_with(&fluree, &ledger, chain_closure_request(8)).await;
     let elapsed = started.elapsed();
     assert_eq!(explanation.facts.len(), 1, "the run derives the fact");
     assert!(!explanation.complete, "the replay was stopped");
     assert!(
-        elapsed < std::time::Duration::from_secs(8),
-        "a 2s budget, the explanation ran {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(20),
+        "an 8s budget, the explanation ran {elapsed:?}"
     );
 }
 

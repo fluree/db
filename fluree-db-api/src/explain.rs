@@ -6,7 +6,7 @@
 use crate::error::{ApiError, Result};
 use crate::format::iri::IriCompactor;
 use crate::query::helpers::{parse_jsonld_query, parse_sparql_to_ir};
-use fluree_db_core::{is_rdf_type, StatsView};
+use fluree_db_core::{is_rdf_type, NoOverlay, StatsView};
 use fluree_db_query::{
     expand_edge_annotation_patterns_for, explain_execution_hints, parse_query, ExplainPlan,
     OptimizationStatus, Pattern, Query, Ref, Term, TriplePattern, VarId, VarRegistry,
@@ -169,6 +169,13 @@ fn logical_node(
             node.insert(
                 "pattern".into(),
                 triple_pattern_to_user_object(tp, vars, compactor),
+            );
+        }
+        Pattern::ListView(lv) => {
+            node.insert("kind".into(), json!("list-view"));
+            node.insert(
+                "pattern".into(),
+                triple_pattern_to_user_object(&lv.triple, vars, compactor),
             );
         }
         Pattern::Optional(inner) => {
@@ -657,7 +664,7 @@ pub async fn explain_sparql(
     snapshot: &fluree_db_core::LedgerSnapshot,
     sparql: &str,
 ) -> Result<JsonValue> {
-    explain_sparql_for_view(snapshot, sparql, None, None, false)
+    explain_sparql_for_view(snapshot, &NoOverlay, sparql, None, None, false)
 }
 
 /// Explain an openCypher query against a LedgerSnapshot.
@@ -710,17 +717,21 @@ pub async fn explain_sparql_with_default_context(
     sparql: &str,
     default_context: Option<&JsonValue>,
 ) -> Result<JsonValue> {
-    explain_sparql_for_view(snapshot, sparql, default_context, None, false)
+    explain_sparql_for_view(snapshot, &NoOverlay, sparql, default_context, None, false)
 }
 
 pub(crate) fn explain_sparql_for_view(
     snapshot: &fluree_db_core::LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
     sparql: &str,
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_sparql::ParamMap>,
     allow_semantic_elision: bool,
 ) -> Result<JsonValue> {
-    let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, default_context, params)?;
+    let (vars, mut parsed) = parse_sparql_to_ir(sparql, snapshot, default_context, params)?;
+    if parsed.rdf_list_view {
+        fluree_db_query::list_view::apply(&mut parsed, snapshot, overlay, None)?;
+    }
 
     explain_from_parsed(
         snapshot,

@@ -21,7 +21,9 @@ pub use read::batched_lookup::{
     batched_lookup_inbound_refs, batched_lookup_predicate_refs, batched_lookup_subject_properties,
 };
 pub use read::binary_cursor::BinaryCursor;
-pub use read::binary_index_store::{BinaryGraphView, BinaryIndexStore, GraphTree, RemoteLeafFetch};
+pub use read::binary_index_store::{
+    BinaryGraphView, BinaryIndexStore, GraphTree, ListCensus, RemoteLeafFetch,
+};
 pub use read::cached_units::{unit_memo_hits, UnitMemoScope};
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 pub use read::graph_names::HeadGraphNames;

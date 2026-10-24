@@ -661,6 +661,10 @@ name = "glue_onboarding"
 required-features = ["iceberg"]
 
 [[bench]]
+name = "query_hot_list_view"
+harness = false
+
+[[bench]]
 name = "vector_query"
 harness = false
 

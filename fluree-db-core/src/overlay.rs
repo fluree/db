@@ -37,6 +37,7 @@
 use crate::comparator::IndexType;
 use crate::flake::Flake;
 use crate::ids::GraphId;
+use crate::sid::Sid;
 use std::any::Any;
 use std::collections::HashMap;
 
@@ -126,6 +127,13 @@ pub trait OverlayProvider: Send + Sync {
     /// default keeps unknown overlays on merge-correct paths.
     fn is_effectively_empty(&self) -> bool {
         false
+    }
+
+    /// The predicates of this overlay's flakes that carry an RDF-list
+    /// position (`m.i`), when the overlay tracks them; `None` when it does
+    /// not, and any predicate may.
+    fn list_predicates(&self) -> Option<std::sync::Arc<std::collections::HashSet<Sid>>> {
+        None
     }
 
     /// Globally-unique version stamp of this overlay's current content, for
@@ -260,6 +268,10 @@ impl OverlayProvider for NoOverlay {
 
     fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
         Some(Vec::new())
+    }
+
+    fn list_predicates(&self) -> Option<std::sync::Arc<std::collections::HashSet<Sid>>> {
+        Some(Default::default())
     }
 
     /// `0` is the stamp every never-mutated novelty reports; sharing it is

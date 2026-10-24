@@ -248,6 +248,8 @@ fn create_config(
         mapping_media_type: mapping_media_type(source),
         model: None,
         default_allow: None,
+        delete: None,
+        order_by: None,
     })
 }
 

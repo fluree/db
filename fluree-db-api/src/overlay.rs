@@ -44,6 +44,16 @@ impl OverlayProvider for CompositeOverlay {
         self
     }
 
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        let mut all = std::collections::HashSet::new();
+        for overlay in &self.overlays {
+            all.extend(overlay.list_predicates()?.iter().cloned());
+        }
+        Some(std::sync::Arc::new(all))
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
     }

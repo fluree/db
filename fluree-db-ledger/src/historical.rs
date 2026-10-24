@@ -487,6 +487,15 @@ impl OverlayProvider for HistoricalLedgerView {
         self
     }
 
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        match &self.overlay {
+            Some(novelty) => novelty.list_predicates(),
+            None => Some(Default::default()),
+        }
+    }
+
     fn epoch(&self) -> u64 {
         self.overlay.as_ref().map(|n| n.epoch).unwrap_or(0)
     }
