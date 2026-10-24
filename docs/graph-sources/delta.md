@@ -468,10 +468,14 @@ retract theirs. How a key's changes combine depends on the source's options:
   or use latest-by-key.
 - **Latest-by-key** (`delete_column` and `delete_values`, or `order_by`, set on
   [`/delta/map`](../api/endpoints.md#post-api_base_urldeltamap)): a key's
-  latest change replaces its subject whole. A delete removes the subject, and
-  so does an update that moves its row to another subject, graph or target
-  ledger. Changes are ordered by version; `order_by` orders a key's rows
-  within one version.
+  latest change replaces its subject whole. Changes are ordered by version;
+  `order_by` orders a key's rows within one version. A delete, or an update
+  that moves a row to another subject, graph or target ledger, removes a row
+  but not necessarily its key, so the pass reads such a key back from the
+  table as of the version it ends on. The key's latest remaining row, by
+  `order_by`, replaces the subject, and a key with no row left is removed. A
+  table that keeps several revisions per key can therefore prune superseded
+  revisions without losing the key.
 
 A pass applies at most `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` changed rows (by
 default derived from the novelty ceiling; see
@@ -490,8 +494,11 @@ server remembers it until restart, and the next pass reads the table whole.
 
 From Rust, `FlureeR2rmlProvider::current_snapshot_id` returns a table's latest
 version, and `scan_for_materialize_stream` reads the changes after a version,
-or the version it is given whole. Change rows carry `_change_type` and
-`_commit_version`.
+or the version it is given whole. A scan whose `change_feed` is set yields
+change rows, which carry `_change_type` and `_commit_version` and can retract,
+and one whose `stopped_at` is set ends at that version. `rows_at_version`
+reads a version's rows narrowed by key filters, as latest-by-key reads a key
+back.
 
 ## Limitations
 

@@ -653,6 +653,20 @@ impl DeltaSource {
         }
     }
 
+    /// The rows `table_name` holds at `version`, narrowed by `filters` where
+    /// the reader can state them exactly.
+    pub(crate) async fn rows_at(
+        &self,
+        fluree: &crate::Fluree,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
+        let pin = Some(SourceTime::SnapshotId(version));
+        let (_, _, snapshot) = self.replay(fluree, table_name, pin).await?;
+        self.stream(&snapshot, table_name, &[], filters)
+    }
+
     /// The pinned version's row count from the log, when it provably equals a
     /// scan's; see [`DeltaSnapshot::exact_row_count`].
     pub(crate) async fn row_count(

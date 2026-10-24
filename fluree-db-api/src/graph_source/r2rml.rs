@@ -2479,6 +2479,30 @@ impl<'a> FlureeR2rmlProvider<'a> {
             stream,
         })
     }
+
+    /// The rows a change feed source's table holds at `version`, narrowed by
+    /// `filters` where the reader can state them exactly; the caller still
+    /// tests every row. Latest-by-key materialization reads a key back this
+    /// way when a change feed retraction leaves its fate to the table. Only a
+    /// Delta source has a change feed.
+    pub async fn rows_at_version(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .rows_at(self.fluree, table_name, version, filters)
+                .await;
+        }
+        let _ = (table_name, version, filters);
+        Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' has no change data feed"
+        )))
+    }
 }
 
 impl std::fmt::Debug for FlureeR2rmlProvider<'_> {
