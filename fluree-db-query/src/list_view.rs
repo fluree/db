@@ -433,6 +433,21 @@ fn rewrite_pattern(
     }
 }
 
+/// `patterns` with each list-view pattern its triple again, for a graph that
+/// holds no RDF lists, such as an R2RML graph source.
+pub fn without_list_view(patterns: &[Pattern]) -> Vec<Pattern> {
+    patterns.iter().cloned().map(without_list_view_in).collect()
+}
+
+fn without_list_view_in(pattern: Pattern) -> Pattern {
+    match pattern {
+        Pattern::ListView(lv) => Pattern::Triple(lv.triple),
+        other => {
+            other.map_subpatterns(&mut |xs| xs.into_iter().map(without_list_view_in).collect())
+        }
+    }
+}
+
 /// Whether `pp` can step along a list triple in `view`.
 pub(crate) fn walks_lists(pp: &crate::ir::PropertyPathPattern, view: &ListView) -> bool {
     let steps = pp
