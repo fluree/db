@@ -1828,6 +1828,93 @@ async fn pooled_leaves_hold_one_leaflet() {
     );
 }
 
+/// A pooled graph's indexed lists read as RDF lists in SPARQL, for a bound
+/// owner and inside `GRAPH ?g`, and as members of their predicate in JSON-LD:
+/// the list view finds their predicates and owners in the pool.
+#[tokio::test]
+async fn pooled_lists_read_as_rdf_lists() {
+    const LISTS: &str = "
+@prefix ex: <http://example.org/> .
+ex:g1 { ex:s ex:items ( 1 2 ) . }
+ex:g2 { ex:t ex:items ( 3 ) . }
+";
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-lists:main";
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    // Import refuses a collection inside a GRAPH block; a transaction stores
+    // it as a list.
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .insert_turtle(LISTS)
+        .index_config(fluree_db_api::IndexConfig {
+            reindex_min_bytes: usize::MAX,
+            reindex_max_bytes: usize::MAX,
+        })
+        .commit()
+        .await
+        .expect("insert lists");
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    assert!(dedicated_user_graphs(&root).is_empty());
+    assert!(pooled_size(&root, "g1").is_some() && pooled_size(&root, "g2").is_some());
+
+    let rdf = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n";
+    let heads = select(
+        &fluree,
+        &ledger,
+        &format!("{PREFIXES}SELECT ?o WHERE {{ GRAPH ex:g1 {{ ex:s ex:items ?o }} }}"),
+    )
+    .await;
+    assert!(
+        heads.len() == 1 && !["o=1", "o=2"].contains(&heads[0].as_str()),
+        "the owner's edge reaches the list's first cell: {heads:?}"
+    );
+    let items = select(
+        &fluree,
+        &ledger,
+        &format!(
+            "{PREFIXES}{rdf}SELECT ?o WHERE {{ GRAPH ex:g1 {{ ex:s ex:items/rdf:rest*/rdf:first ?o }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(items, ["o=1", "o=2"]);
+    let firsts = select(
+        &fluree,
+        &ledger,
+        &format!(
+            "{PREFIXES}{rdf}SELECT ?g ?o WHERE {{ GRAPH ?g {{ ?s ex:items ?l . ?l rdf:first ?o }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        firsts,
+        ["g=http://example.org/g1 o=1", "g=http://example.org/g2 o=3"]
+    );
+
+    let members = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?o",
+            "where": [["graph", "http://example.org/g1", {"@id": "ex:s", "ex:items": "?o"}]]
+        }),
+    )
+    .await
+    .expect("JSON-LD query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("JSON-LD rows");
+    let mut members: Vec<i64> = members
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|v| v.as_i64().expect("an integer member"))
+        .collect();
+    members.sort_unstable();
+    assert_eq!(members, [1, 2]);
+}
+
 /// `GRAPH ?g` over pooled graphs: rows of `sparql` with the quad path open,
 /// whether it engaged, and the rows with it (and every fast path) off.
 async fn quad_and_per_graph(
