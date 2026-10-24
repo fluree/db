@@ -3404,7 +3404,7 @@ POST {api_base_url}/delta/map
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
 | `delete_column`, `delete_values` | string, array | Materialization: the column and values that mark a row as deleted, as on `/iceberg/map`. With either this or `order_by`, a key's latest change replaces its subject whole; a change feed's deletes retract in either mode. See [Delta → Materialization](../graph-sources/delta.md#materialization). |
-| `order_by` | string | Materialization: an integer, date or timestamp column that orders one key's rows within a table version |
+| `order_by` | string | Materialization: an integer, date or timestamp column that orders one key's rows within a table version, and the rows the table still holds for a key a delete touched |
 
 **Response:**
 

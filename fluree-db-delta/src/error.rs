@@ -125,6 +125,11 @@ pub(crate) fn change_feed_refusal(error: &delta_kernel::Error) -> Option<String>
         K::ChangeDataFeedIncompatibleSchema(..) => {
             Some("the schema changed inside the range".to_string())
         }
+        // Kernel reports a change data feed range whose two ends have different
+        // schemas as a plain message, not as the variant above.
+        K::Generic(message) if message.contains("Start and end version schemas are different") => {
+            Some("the schema changed inside the range".to_string())
+        }
         K::Unsupported(message) => Some(format!("Kernel cannot read its change feed: {message}")),
         other if kernel_is_not_found(other) => {
             Some("a file the range needs is no longer in storage".to_string())

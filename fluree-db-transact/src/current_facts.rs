@@ -216,9 +216,12 @@ impl RetractIntent {
         Self { flake, witnessed }
     }
 
-    #[cfg(test)]
     pub(crate) fn flake(&self) -> &Flake {
         &self.flake
+    }
+
+    pub(crate) fn into_flake(self) -> Flake {
+        self.flake
     }
 }
 
@@ -1055,6 +1058,9 @@ pub(crate) struct DeleteResolver<'l> {
     narrow_slot: usize,
     /// A fixed [`Self::point_bound`] for tests (`Some(0)`: never).
     point_bound_override: Option<usize>,
+    /// The intents name RDF triples, which list members are not
+    /// (`fluree_db_query::list_view`): an intent never names one.
+    hide_list_members: bool,
 }
 
 impl<'l> DeleteResolver<'l> {
@@ -1069,7 +1075,15 @@ impl<'l> DeleteResolver<'l> {
             taken: HashMap::new(),
             narrow_slot: NARROW_SLOT,
             point_bound_override: None,
+            hide_list_members: false,
         }
+    }
+
+    /// With `hide`, intents never name a list member: a SPARQL write's
+    /// `s p o` is the RDF triple, and a member is no value of `p`.
+    pub(crate) fn hiding_list_members(mut self, hide: bool) -> Self {
+        self.hide_list_members = hide;
+        self
     }
 
     /// For each slot this batch reads (`at`'s `Read` places), the values
@@ -1248,7 +1262,12 @@ impl<'l> DeleteResolver<'l> {
                 },
             );
         }
-        let read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
+        let mut read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
+        if self.hide_list_members {
+            for facts in &mut read_facts {
+                facts.retain(|f| f.flake().m.as_ref().and_then(|m| m.i).is_none());
+            }
+        }
         let mut read: Vec<ReadSlot> = Vec::with_capacity(to_read.len());
         let mut narrow: Vec<(SlotKey, SlotFacts)> = Vec::with_capacity(to_read.len());
         for ((slot, facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {

@@ -648,6 +648,12 @@ to the *same* subject IRI, and both classes remain queryable. (The "dedicated
 target" restriction under *Assumptions and limitations* applies only to
 latest-by-key mode, not to additive mode.)
 
+A Delta source read through its change data feed is the exception: in
+additive mode a deleted row's triples are removed, including any that another
+row or source also asserts, such as a shared class. Don't share a target's
+subjects between such a source and others whose triples must outlive its
+deletes. See [Delta → Materialization](delta.md#materialization).
+
 ### Change data capture: updates and deletes (latest-by-key)
 
 For a change-data-capture source — an append-only log where each change is a new
@@ -751,8 +757,9 @@ target. The materializer enforces what it can and documents the rest:
 - **A pinned read is never cut.** Both bounds pace the tracking worker, which
   reads to the head. A read pinned to a snapshot — in Rust,
   `FlureeR2rmlProvider::scan_for_materialize_stream` with an explicit `to`, after
-  `current_snapshot_id` — returns that snapshot whole and reports the pin as its
-  `to`.
+  `current_snapshot_id` — is never cut by either bound and reports the pin as
+  its `to`: a pinned full read returns that snapshot whole, and a pinned window
+  returns the whole window.
 - **A window's working memory is budgeted, not unbounded.** The pass retains one
   node per distinct subject in the window; a window whose estimated accumulator
   exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)

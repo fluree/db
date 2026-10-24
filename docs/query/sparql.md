@@ -111,7 +111,7 @@ PREFIX ex: <http://example.org/ns/>
 DESCRIBE ex:alice
 ```
 
-Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`).
+Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`), plus the outgoing triples of each blank node it points to, and of every cell of a [list](#rdf-lists) it points to.
 
 ## Basic Graph Patterns
 
@@ -274,6 +274,24 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 #### Not Yet Supported
 
 A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
+
+### RDF Lists
+
+A list — Turtle `( … )`, JSON-LD `{"@list": [...]}` — is, as RDF, its owner's edge to a head cell and a chain of cells, each with an `rdf:first` (the member) and an `rdf:rest` (the next cell, or `rdf:nil`). SPARQL sees that graph, however the list was written:
+
+```sparql
+# data: ex:s ex:items (ex:a ex:b ex:c) .
+
+SELECT ?x WHERE { ex:s ex:items/rdf:rest*/rdf:first ?x }  # ex:a, ex:b, ex:c
+SELECT ?x WHERE { ex:s ex:items/rdf:rest/rdf:first ?x }   # ex:b
+SELECT ?x ?y ?z WHERE { ex:s ex:items (?x ?y ?z) }        # one solution
+```
+
+- `ex:s ex:items ?o` binds `?o` to the head cell, a blank node, not to the members; `?s ?p ?o` and `COUNT(*)` count the owner edge and two triples per member.
+- A cell's blank node (`_:l0-0`, …) names it only within the result that returned it.
+- CONSTRUCT, DESCRIBE and a Graph Store `GET` write a list as `( … )` in Turtle and as `{"@list": [...]}` in JSON-LD, so a graph read and written back is unchanged.
+- JSON-LD queries keep Fluree's view, where the members are the values of their property: `{"@id": "ex:s", "ex:items": "?x"}` binds each member. For a list stored as its triples (see [Lists](#lists) in updates), a JSON-LD crawl shows the members, but a `where` clause binds the list's head.
+- A query over a dataset spanning several ledgers, and a history query, see the members as values.
 
 ## Query Modifiers
 
@@ -1331,6 +1349,37 @@ INSERT DATA {
   _:newPerson ex:age 25 .
 }
 ```
+
+### Lists
+
+An update reads and writes lists as [RDF lists](#rdf-lists): a `( … )` in a template writes one, and a WHERE that binds a list's cells lets the templates change them.
+
+```sparql
+# data: ex:s ex:items (1 2 3) .
+
+# Replace a member
+DELETE { ?c rdf:first 2 } INSERT { ?c rdf:first 20 }
+WHERE  { ex:s ex:items/rdf:rest ?c . ?c rdf:first 2 }
+
+# Append
+DELETE { ?last rdf:rest rdf:nil } INSERT { ?last rdf:rest ( 4 ) }
+WHERE  { ex:s ex:items/rdf:rest* ?last . ?last rdf:rest rdf:nil }
+
+# Move the list to another subject
+DELETE { ex:s ex:items ?l } INSERT { ex:t ex:items ?l }
+WHERE  { ex:s ex:items ?l }
+```
+
+- `ex:s ex:items 2` is no triple of the list: `DELETE DATA { ex:s ex:items 2 }` leaves the member, and `INSERT DATA { ex:s ex:items 2 }` adds a value beside the list.
+- Deleting a list's edge from its owner leaves its cells, as it does for any RDF list, and `DELETE WHERE { ex:s ?p ?o }` deletes the edge alone. To delete a list with its cells:
+
+  ```sparql
+  DELETE { ex:s ex:items ?l . ?c ?p ?o }
+  WHERE  { ex:s ex:items ?l . ?l rdf:rest* ?c . ?c ?p ?o }
+  ```
+- After `ADD` or `COPY`, a list is in both graphs as the same list, with the same cells.
+- Under a policy, a change to a list's cells is judged as a change to its owner's property, however the list is stored.
+- A list whose cells something else names, or that carries other triples, is stored as its triples; it reads the same. So is a second list on one subject and property, and a list `ADD` or `COPY` leaves in two graphs.
 
 ### Typed Literals
 

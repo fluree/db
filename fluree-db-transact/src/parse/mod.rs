@@ -48,7 +48,9 @@ pub(crate) const RESERVED_TXN_KEYS: &[&str] = &[
 /// never stripped.
 pub(crate) const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert", "values"];
 
-pub use jsonld::{parse_graph_insert, parse_sync_transaction, parse_transaction};
+pub use jsonld::{
+    is_empty_document, parse_graph_insert, parse_sync_transaction, parse_transaction,
+};
 pub use nquads::nquads_to_trig;
 pub use rdf_text::{
     has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, ContentIdentity,
