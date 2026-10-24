@@ -1089,7 +1089,6 @@ impl NestedLoopJoinOperator {
         }
     }
 
-    /// Trim output to only the specified downstream variables.
     /// Join only the right pattern's rows that are not list members (see
     /// [`Self::hide_list_members`]).
     pub fn hiding_list_members(mut self) -> Self {
@@ -1100,6 +1099,7 @@ impl NestedLoopJoinOperator {
         self
     }
 
+    /// Trim output to only the specified downstream variables.
     pub fn with_out_schema(mut self, downstream_vars: Option<&[VarId]>) -> Self {
         self.out_schema = compute_trimmed_vars(&self.combined_schema, downstream_vars);
         self

@@ -2061,6 +2061,9 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // Over a dataset spanning ledgers the list view is not applied, and a
+        // member is a value of its predicate.
+        self.hide_list_members &= !ctx.is_multi_ledger();
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
         // hiding it would defeat the point of inspecting a history

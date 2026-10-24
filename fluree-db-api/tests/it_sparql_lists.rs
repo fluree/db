@@ -323,7 +323,7 @@ async fn explain_shows_the_list_view() {
     let plan = fluree.explain_sparql(&view, &query).await.expect("explain");
     let physical = plan["plan"]["physical"].to_string();
     assert_eq!(
-        physical.matches("ListViewOperator").count(),
+        physical.matches("ListAugmentOperator").count(),
         2,
         "{physical}"
     );

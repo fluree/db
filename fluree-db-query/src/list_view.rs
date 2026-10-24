@@ -20,15 +20,12 @@
 //! Over a dataset spanning ledgers the view is not applied: their subjects are
 //! not comparable, so such a query sees the members as values.
 
-use crate::binary_scan::{BinaryScanOperator, EmitMask};
+use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding};
 use crate::context::{ExecutionContext, PathGraph};
 use crate::error::{QueryError, Result};
 use crate::ir::{Pattern, Ref, Term, TriplePattern};
-use crate::join::NestedLoopJoinOperator;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::seed::BatchSeedOperator;
-use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
@@ -59,6 +56,17 @@ pub struct ListView {
     /// The lists each read of this request found, so a walk along a list's
     /// cells reads it once.
     reads: Mutex<HashMap<ListRead, Arc<[List]>>>,
+    /// Whether each subject this request asked about may own a list, per
+    /// graph and `t` ([`Self::may_meet`]).
+    subjects: Mutex<HashMap<(GraphId, i64, Subject), bool>>,
+}
+
+/// A subject [`ListView::may_meet`] is asked about.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Subject {
+    /// An index subject id; such bindings arise only over an empty overlay.
+    Id(u64),
+    Node(Sid),
 }
 
 #[derive(Debug, Default)]
@@ -102,7 +110,58 @@ impl ListView {
             predicates,
             lists: Mutex::new(ListTable::default()),
             reads: Mutex::new(HashMap::new()),
+            subjects: Mutex::new(HashMap::new()),
         })))
+    }
+
+    /// Whether a list triple can have `subject` as its subject in `graphs`:
+    /// an unbound subject, a cell this request named, or a node with a list
+    /// row in novelty or in the index. A `false` is exact.
+    fn may_meet(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        graphs: &[PathGraph<'_>],
+        subject: &Binding,
+    ) -> Result<bool> {
+        let subject = match subject {
+            Binding::Unbound => return Ok(true),
+            Binding::EncodedSid { s_id, .. } => Subject::Id(*s_id),
+            Binding::Sid { sid, .. }
+            | Binding::IriMatch {
+                primary_sid: sid, ..
+            } => {
+                if self.decode(sid).is_some() {
+                    return Ok(true);
+                }
+                Subject::Node(sid.clone())
+            }
+            Binding::Iri(iri) => match ctx.active_snapshot.encode_iri(iri) {
+                Some(sid) => Subject::Node(sid),
+                None => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        let known = || {
+            self.subjects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        for graph in graphs {
+            let key = (graph.g_id, graph.to_t, subject.clone());
+            let cached = known().get(&key).copied();
+            let held = match cached {
+                Some(held) => held,
+                None => {
+                    let held = subject_may_hold_lists(graph, &subject)?;
+                    known().insert(key, held);
+                    held
+                }
+            };
+            if held {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The predicates holding list members, when known.
@@ -188,6 +247,32 @@ impl ListViewPattern {
 
     pub fn produced_vars(&self) -> Vec<VarId> {
         self.triple.produced_vars()
+    }
+}
+
+/// The triples of an inner-join block that a [`ListView`] answers. They are
+/// planned with the block like any triple, and their joins wrapped to hide
+/// list members and add list triples.
+#[derive(Debug, Clone, Default)]
+pub struct BlockListViews {
+    view: Option<Arc<ListView>>,
+    triples: Vec<TriplePattern>,
+}
+
+impl BlockListViews {
+    pub fn push(&mut self, lv: &ListViewPattern) {
+        self.view.get_or_insert_with(|| Arc::clone(&lv.view));
+        self.triples.push(lv.triple.clone());
+    }
+
+    /// The view answering `tp`, when it is one of the block's list-view
+    /// triples.
+    pub fn view_for(&self, tp: &TriplePattern) -> Option<&Arc<ListView>> {
+        self.view.as_ref().filter(|_| self.triples.contains(tp))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.triples.is_empty()
     }
 }
 
@@ -395,219 +480,286 @@ pub fn has_list_view(patterns: &[Pattern]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Operator
+// Operators
 // ---------------------------------------------------------------------------
 
-/// Joins its child with a [`ListViewPattern`]: the pattern's stored triples
-/// that are not list members, through a nested-loop join that hides them,
-/// and the list triples that match it, computed here.
-pub struct ListViewOperator {
-    child: BoxedOperator,
-    pattern: ListViewPattern,
-    mode: TemporalMode,
-    schema: Arc<[VarId]>,
-    state: OperatorState,
-    /// The input batch being joined, and the join of its stored triples,
-    /// drained before its list triples are computed.
-    current: Option<(Batch, NestedLoopJoinOperator)>,
+/// The input rows a list-view triple's join pulled whose subject may meet a
+/// list triple, held by a [`ListTeeOperator`] for the [`ListAugmentOperator`]
+/// above the join.
+#[derive(Clone, Default)]
+pub struct HeldRows(Arc<Mutex<Vec<Batch>>>);
+
+impl HeldRows {
+    fn push(&self, batch: Batch) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(batch);
+    }
+
+    fn take(&self) -> Vec<Batch> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
-impl ListViewOperator {
-    pub fn new(child: BoxedOperator, pattern: ListViewPattern, mode: TemporalMode) -> Self {
-        let mut schema: Vec<VarId> = child.schema().to_vec();
-        let t = &pattern.triple;
-        for v in [t.s.as_var(), t.p.as_var(), t.o.as_var()]
-            .into_iter()
-            .flatten()
-        {
-            if !schema.contains(&v) {
-                schema.push(v);
-            }
-        }
+/// Feeds a list-view triple's join its input unchanged, holding the rows
+/// whose subject may meet a list triple of the pattern
+/// ([`ListView::may_meet`]).
+pub struct ListTeeOperator {
+    child: BoxedOperator,
+    pattern: TriplePattern,
+    view: Arc<ListView>,
+    held: HeldRows,
+}
+
+impl ListTeeOperator {
+    pub fn new(
+        child: BoxedOperator,
+        pattern: TriplePattern,
+        view: Arc<ListView>,
+        held: HeldRows,
+    ) -> Self {
         Self {
             child,
             pattern,
-            mode,
-            schema: schema.into(),
+            view,
+            held,
+        }
+    }
+}
+
+/// A list-view triple's join, which reads the stored triples that are not
+/// list members, followed by the list triples that match the pattern: for
+/// the input rows a [`ListTeeOperator`] held, or, for a pattern with no
+/// input, for the empty solution once.
+pub struct ListAugmentOperator {
+    join: BoxedOperator,
+    pattern: TriplePattern,
+    view: Arc<ListView>,
+    /// `None` for a pattern with no input.
+    held: Option<HeldRows>,
+    schema: Arc<[VarId]>,
+    inputs: std::collections::VecDeque<Batch>,
+    joined: bool,
+    unit_done: bool,
+    state: OperatorState,
+}
+
+impl ListAugmentOperator {
+    pub fn new(
+        join: BoxedOperator,
+        pattern: TriplePattern,
+        view: Arc<ListView>,
+        held: Option<HeldRows>,
+    ) -> Self {
+        let schema: Arc<[VarId]> = Arc::from(join.schema());
+        Self {
+            join,
+            pattern,
+            view,
+            held,
+            schema,
+            inputs: std::collections::VecDeque::new(),
+            joined: false,
+            unit_done: false,
             state: OperatorState::Created,
-            current: None,
         }
     }
 
-    /// `input` joined with the pattern's stored triples that are not list
-    /// members, opened.
-    async fn stored(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        input: &Batch,
-    ) -> Result<NestedLoopJoinOperator> {
-        let seed = BatchSeedOperator::from_batch(input.clone());
-        let mut join = NestedLoopJoinOperator::new(
-            Box::new(seed),
-            input.schema_arc(),
-            self.pattern.triple.clone(),
-            None,
-            Vec::new(),
-            EmitMask::ALL,
-            self.mode,
-        );
-        if !ctx.is_multi_ledger() {
-            join = join.hiding_list_members();
-        }
-        join.open(ctx).await?;
-        Ok(join)
-    }
-
-    /// `input` joined with the list triples that match the pattern.
-    async fn lists(&self, ctx: &ExecutionContext<'_>, input: &Batch) -> Result<Option<Batch>> {
+    /// The next batch of list triples, joined with the inputs waiting.
+    async fn next_list_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         if ctx.is_multi_ledger() {
             return Ok(None);
         }
-        let graphs = ctx.path_graphs()?;
-        let t = &self.pattern.triple;
-        let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); self.schema.len()];
-        let mut rows = 0;
-        let mut cache: HashMap<(Want, Want, ObjectWant), Vec<ListTriple>> = HashMap::new();
-        for row in 0..input.len() {
-            let bound = |var: Option<VarId>| var.and_then(|v| input.get(row, v));
-            let s = node_want(ctx, bound(t.s.as_var()), &t.s);
-            let p = node_want(ctx, bound(t.p.as_var()), &t.p);
-            let o = object_want(ctx, bound(t.o.as_var()), &t.o, t.dtc.as_ref());
-            let key = (s.clone(), p.clone(), o.clone());
-            if !cache.contains_key(&key) {
-                let found = self.list_triples(ctx, &graphs, &s, &p, &o).await?;
-                cache.insert(key.clone(), found);
-            }
-            let width = input.schema().len();
-            for triple in cache[&key].iter().filter(|triple| repeats_agree(t, triple)) {
-                let mut values: Vec<Binding> = (0..width)
-                    .map(|c| input.get_by_col(row, c).clone())
-                    .collect();
-                for (var, value) in [
-                    (t.s.as_var(), Binding::sid(triple.s.clone())),
-                    (t.p.as_var(), Binding::sid(triple.p.clone())),
-                    (t.o.as_var(), triple.o.clone()),
-                ] {
-                    let Some(var) = var else {
-                        continue;
-                    };
-                    let col = self
-                        .schema
-                        .iter()
-                        .position(|v| *v == var)
-                        .expect("in schema");
-                    if col < width {
-                        // The input's value, which the triple was found by;
-                        // an unbound one takes the triple's.
-                        if values[col] == Binding::Unbound {
-                            values[col] = value;
-                        }
-                    } else if col == values.len() {
-                        values.push(value);
+        loop {
+            if self.inputs.is_empty() {
+                match &self.held {
+                    Some(held) => self.inputs.extend(held.take()),
+                    // After the stored rows, so a LIMIT they meet reads no list.
+                    None if self.joined && !self.unit_done => {
+                        self.unit_done = true;
+                        self.inputs.push_back(Batch::single_empty());
                     }
+                    None => {}
                 }
-                for (col, value) in columns.iter_mut().zip(values) {
-                    col.push(value);
-                }
-                rows += 1;
+            }
+            let Some(input) = self.inputs.pop_front() else {
+                return Ok(None);
+            };
+            ctx.check_cancelled()?;
+            if let Some(batch) =
+                list_rows(ctx, &self.view, &self.pattern, &self.schema, &input).await?
+            {
+                return Ok(Some(batch));
             }
         }
-        if rows == 0 {
-            return Ok(None);
-        }
-        Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?))
     }
+}
 
-    /// The list triples matching `s p o` in `graphs`.
-    async fn list_triples(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        graphs: &[PathGraph<'_>],
-        s: &Want,
-        p: &Want,
-        o: &ObjectWant,
-    ) -> Result<Vec<ListTriple>> {
-        let view = &self.pattern.view;
-        if matches!(s, Want::Nothing) || matches!(p, Want::Nothing) {
-            return Ok(Vec::new());
+/// `rows` of `batch`, in order.
+fn select_rows(batch: &Batch, rows: &[usize]) -> Result<Batch> {
+    if batch.schema().is_empty() {
+        return Ok(Batch::empty_schema_with_len(rows.len()));
+    }
+    let columns = (0..batch.schema().len())
+        .map(|col| {
+            rows.iter()
+                .map(|&row| batch.get_by_col(row, col).clone())
+                .collect()
+        })
+        .collect();
+    Ok(Batch::new(batch.schema_arc(), columns)?)
+}
+
+/// `input` joined with the list triples that match `t`, in `schema`.
+async fn list_rows(
+    ctx: &ExecutionContext<'_>,
+    view: &ListView,
+    t: &TriplePattern,
+    schema: &Arc<[VarId]>,
+    input: &Batch,
+) -> Result<Option<Batch>> {
+    let graphs = ctx.path_graphs()?;
+    // Which triple position each output column takes, when not the input's.
+    let positions: Vec<Option<usize>> = schema
+        .iter()
+        .map(|v| {
+            [t.s.as_var(), t.p.as_var(), t.o.as_var()]
+                .iter()
+                .position(|pv| *pv == Some(*v))
+        })
+        .collect();
+    let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); schema.len()];
+    let mut rows = 0;
+    let mut cache: HashMap<(Want, Want, ObjectWant), Vec<ListTriple>> = HashMap::new();
+    for row in 0..input.len() {
+        let bound = |var: Option<VarId>| var.and_then(|v| input.get(row, v));
+        let s = node_want(ctx, bound(t.s.as_var()), &t.s);
+        let p = node_want(ctx, bound(t.p.as_var()), &t.p);
+        let o = object_want(ctx, bound(t.o.as_var()), &t.o, t.dtc.as_ref());
+        let key = (s.clone(), p.clone(), o.clone());
+        if !cache.contains_key(&key) {
+            let found = list_triples(ctx, view, &graphs, &s, &p, &o).await?;
+            cache.insert(key.clone(), found);
         }
-        let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
-        let cell = match s {
-            Want::Node(sid) => view.decode(sid),
-            _ => None,
+        for triple in cache[&key].iter().filter(|triple| repeats_agree(t, triple)) {
+            for ((var, position), column) in schema.iter().zip(&positions).zip(&mut columns) {
+                // The input's value, which the triple was found by; an unbound
+                // one takes the triple's.
+                let value = match (input.get(row, *var), position) {
+                    (Some(b), _) if *b != Binding::Unbound => b.clone(),
+                    (_, Some(0)) => Binding::sid(triple.s.clone()),
+                    (_, Some(1)) => Binding::sid(triple.p.clone()),
+                    (_, Some(_)) => triple.o.clone(),
+                    (b, None) => b.cloned().unwrap_or(Binding::Unbound),
+                };
+                column.push(value);
+            }
+            rows += 1;
+        }
+    }
+    if rows == 0 {
+        return Ok(None);
+    }
+    if schema.is_empty() {
+        return Ok(Some(Batch::empty_schema_with_len(rows)));
+    }
+    Ok(Some(Batch::new(Arc::clone(schema), columns)?))
+}
+
+/// The list triples matching `s p o` in `graphs`.
+async fn list_triples(
+    ctx: &ExecutionContext<'_>,
+    view: &ListView,
+    graphs: &[PathGraph<'_>],
+    s: &Want,
+    p: &Want,
+    o: &ObjectWant,
+) -> Result<Vec<ListTriple>> {
+    if matches!(s, Want::Nothing) || matches!(p, Want::Nothing) {
+        return Ok(Vec::new());
+    }
+    let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
+    let cell = match s {
+        Want::Node(sid) => view.decode(sid),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for graph in graphs {
+        // Owner edges: `s p head`, for a subject that is not a cell.
+        let owner_edges = match p {
+            Want::Any => true,
+            Want::Node(p) => view.may_hold_lists(p),
+            Want::Nothing => false,
         };
-        let mut out = Vec::new();
-        for graph in graphs {
-            // Owner edges: `s p head`, for a subject that is not a cell.
-            let owner_edges = match p {
-                Want::Any => true,
-                Want::Node(p) => view.may_hold_lists(p),
-                Want::Nothing => false,
+        if owner_edges && cell.is_none() {
+            for (owner, _) in lists_in(ctx, graph, view, s, p).await?.iter() {
+                let head = view.cell(owner, 0);
+                out.push(ListTriple {
+                    s: owner.1.clone(),
+                    p: owner.2.clone(),
+                    o: Binding::sid(head),
+                });
+            }
+        }
+        // Cells: `cellK rdf:first memberK ; rdf:rest next`.
+        let (want_first, want_rest) = match p {
+            Want::Any => (true, true),
+            Want::Node(p) => (is_rdf_first(p), is_rdf_rest(p)),
+            Want::Nothing => (false, false),
+        };
+        if !(want_first || want_rest) {
+            continue;
+        }
+        let lists = match (s, &cell) {
+            (_, Some((owner, _))) => {
+                if owner.0 != graph.g_id {
+                    continue;
+                }
+                let at = Want::Node(owner.1.clone());
+                let of = Want::Node(owner.2.clone());
+                lists_in(ctx, graph, view, &at, &of).await?
+            }
+            (Want::Node(_), None) => continue,
+            _ => lists_in(ctx, graph, view, &Want::Any, &Want::Any).await?,
+        };
+        for (owner, members) in lists.iter() {
+            let positions = match &cell {
+                Some((_, k)) => *k..members.len().min(k + 1),
+                None => 0..members.len(),
             };
-            if owner_edges && cell.is_none() {
-                for (owner, _) in lists_in(ctx, graph, view, s, p).await?.iter() {
-                    let head = view.cell(owner, 0);
+            for k in positions {
+                let member = &members[k];
+                let here = view.cell(owner, k);
+                if want_first {
                     out.push(ListTriple {
-                        s: owner.1.clone(),
-                        p: owner.2.clone(),
-                        o: Binding::sid(head),
+                        s: here.clone(),
+                        p: first.clone(),
+                        o: member_binding(member),
+                    });
+                }
+                if want_rest {
+                    let next = if k + 1 == members.len() {
+                        Sid::new(RDF, RDF_NIL)
+                    } else {
+                        view.cell(owner, k + 1)
+                    };
+                    out.push(ListTriple {
+                        s: here,
+                        p: rest.clone(),
+                        o: Binding::sid(next),
                     });
                 }
             }
-            // Cells: `cellK rdf:first memberK ; rdf:rest next`.
-            let (want_first, want_rest) = match p {
-                Want::Any => (true, true),
-                Want::Node(p) => (is_rdf_first(p), is_rdf_rest(p)),
-                Want::Nothing => (false, false),
-            };
-            if !(want_first || want_rest) {
-                continue;
-            }
-            let lists = match (s, &cell) {
-                (_, Some((owner, _))) => {
-                    if owner.0 != graph.g_id {
-                        continue;
-                    }
-                    let at = Want::Node(owner.1.clone());
-                    let of = Want::Node(owner.2.clone());
-                    lists_in(ctx, graph, view, &at, &of).await?
-                }
-                (Want::Node(_), None) => continue,
-                _ => lists_in(ctx, graph, view, &Want::Any, &Want::Any).await?,
-            };
-            for (owner, members) in lists.iter() {
-                let positions = match &cell {
-                    Some((_, k)) => *k..members.len().min(k + 1),
-                    None => 0..members.len(),
-                };
-                for k in positions {
-                    let member = &members[k];
-                    let here = view.cell(owner, k);
-                    if want_first {
-                        out.push(ListTriple {
-                            s: here.clone(),
-                            p: first.clone(),
-                            o: member_binding(member),
-                        });
-                    }
-                    if want_rest {
-                        let next = if k + 1 == members.len() {
-                            Sid::new(RDF, RDF_NIL)
-                        } else {
-                            view.cell(owner, k + 1)
-                        };
-                        out.push(ListTriple {
-                            s: here,
-                            p: rest.clone(),
-                            o: Binding::sid(next),
-                        });
-                    }
-                }
-            }
         }
-        out.retain(|t| o.matches(&t.o));
-        Ok(out)
     }
+    out.retain(|t| o.matches(&t.o));
+    Ok(out)
 }
 
 /// Whether `triple` gives each variable `t` repeats (`?x ?p ?x`) one term.
@@ -873,6 +1025,50 @@ pub(crate) async fn cell_nodes(
     Ok(out)
 }
 
+/// Whether `subject` may have a list row in `graph`: in its novelty, or in
+/// the index ([`BinaryIndexStore::subject_holds_lists`]), or, read before the
+/// index's own `t`, in either.
+fn subject_may_hold_lists(graph: &PathGraph<'_>, subject: &Subject) -> Result<bool> {
+    let io = |e| QueryError::from_io("list view subject", e);
+    if let Subject::Node(sid) = subject {
+        let (first, last) = (
+            Flake::min_for_subject(sid.clone()),
+            Flake::max_for_subject(sid.clone()),
+        );
+        let mut found = false;
+        graph.overlay.for_each_overlay_flake(
+            graph.g_id,
+            IndexType::Spot,
+            Some(&first),
+            Some(&last),
+            false,
+            graph.to_t,
+            &mut |flake| found |= is_member(flake),
+        );
+        if found {
+            return Ok(true);
+        }
+    }
+    let Some(store) = ExecutionContext::extract_binary_store(graph.snapshot) else {
+        return Ok(false);
+    };
+    // Read as of a `t` before the index's own, a member a later commit
+    // retracted is history, which leaflet flags do not cover.
+    if graph.to_t < store.max_t() {
+        return Ok(true);
+    }
+    let s_id = match subject {
+        Subject::Id(s_id) => Some(*s_id),
+        Subject::Node(sid) => store
+            .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+            .map_err(io)?,
+    };
+    match s_id {
+        Some(s_id) => store.subject_holds_lists(graph.g_id, s_id).map_err(io),
+        None => Ok(false),
+    }
+}
+
 /// Whether `flake` is a list member a view hides from its predicate.
 pub(crate) fn is_member(flake: &Flake) -> bool {
     flake.m.as_ref().is_some_and(|m| m.i.is_some())
@@ -922,9 +1118,18 @@ async fn read_lists_in(
                     .with_predicate(p.clone()),
             )]
         }
-        (Want::Node(s), Want::Any) => {
-            vec![(IndexType::Spot, RangeMatch::new().with_subject(s.clone()))]
-        }
+        (Want::Node(s), Want::Any) => match &view.predicates {
+            Some(predicates) => predicates
+                .iter()
+                .map(|p| {
+                    let at = RangeMatch::new()
+                        .with_subject(s.clone())
+                        .with_predicate(p.clone());
+                    (IndexType::Spot, at)
+                })
+                .collect(),
+            None => vec![(IndexType::Spot, RangeMatch::new().with_subject(s.clone()))],
+        },
         (Want::Any, Want::Node(p)) => {
             if !view.may_hold_lists(p) {
                 return Ok(Vec::new());
@@ -985,9 +1190,57 @@ async fn read_lists_in(
 }
 
 #[async_trait]
-impl Operator for ListViewOperator {
+impl Operator for ListTeeOperator {
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
+
+    fn schema(&self) -> &[VarId] {
+        self.child.schema()
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.child.open(ctx).await
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        let Some(batch) = self.child.next_batch(ctx).await? else {
+            return Ok(None);
+        };
+        if batch.is_empty() || ctx.is_multi_ledger() {
+            return Ok(Some(batch));
+        }
+        let graphs = ctx.path_graphs()?;
+        let mut rows = Vec::new();
+        for row in 0..batch.len() {
+            let subject = match &self.pattern.s {
+                Ref::Var(v) => batch.get(row, *v).cloned().unwrap_or(Binding::Unbound),
+                Ref::Sid(sid) => Binding::sid(sid.clone()),
+                Ref::Iri(iri) => Binding::Iri(iri.clone()),
+            };
+            if self.view.may_meet(ctx, &graphs, &subject)? {
+                rows.push(row);
+            }
+        }
+        if !rows.is_empty() {
+            self.held.push(select_rows(&batch, &rows)?);
+        }
+        Ok(Some(batch))
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        self.child.estimated_rows()
+    }
+}
+
+#[async_trait]
+impl Operator for ListAugmentOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.join.as_ref())]
     }
 
     fn schema(&self) -> &[VarId] {
@@ -995,49 +1248,40 @@ impl Operator for ListViewOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        self.child.open(ctx).await?;
+        self.join.open(ctx).await?;
+        self.inputs.clear();
+        self.joined = false;
+        self.unit_done = false;
         self.state = OperatorState::Open;
-        self.current = None;
         Ok(())
     }
 
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         loop {
-            if let Some((_, join)) = self.current.as_mut() {
-                match join.next_batch(ctx).await? {
-                    Some(batch) if batch.is_empty() => continue,
-                    Some(batch) => return Ok(Some(batch)),
-                    None => {
-                        let (input, mut join) = self.current.take().expect("current");
-                        join.close();
-                        if let Some(lists) = self.lists(ctx, &input).await? {
-                            return Ok(Some(lists));
-                        }
-                        continue;
-                    }
-                }
-            }
             if self.state != OperatorState::Open {
                 return Ok(None);
             }
-            let Some(input) = self.child.next_batch(ctx).await? else {
+            if let Some(batch) = self.next_list_batch(ctx).await? {
+                return Ok(Some(batch));
+            }
+            if self.joined {
                 self.state = OperatorState::Exhausted;
                 return Ok(None);
-            };
-            if input.is_empty() {
-                continue;
             }
-            ctx.check_cancelled()?;
-            let join = self.stored(ctx, &input).await?;
-            self.current = Some((input, join));
+            match self.join.next_batch(ctx).await? {
+                Some(batch) => return Ok(Some(batch)),
+                None => self.joined = true,
+            }
         }
     }
 
     fn close(&mut self) {
-        if let Some((_, mut join)) = self.current.take() {
-            join.close();
-        }
-        self.child.close();
+        self.join.close();
+        self.inputs.clear();
         self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        self.join.estimated_rows()
     }
 }
