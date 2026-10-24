@@ -479,13 +479,29 @@ impl Fluree {
             .chain(&plan.superseded)
             .filter_map(|a| a.strip_prefix(&prefix).map(str::to_string))
             .collect();
-        // Each original's ledger folder: `{name}/@{instance}/{branch}/commit/…`
-        // up to its root, or a legacy name root.
-        let ledgers: BTreeSet<String> = keys
+        // Every tree the pass deleted from: each original's ledger folder
+        // (`{name}/@{instance}/{branch}/commit/…` up to its root, or a legacy
+        // name root), every holder's, live, retracted or dropped, and the
+        // folders of the indexes over them.
+        let mut trees: BTreeSet<String> = keys
             .iter()
             .filter_map(|k| k.rsplit_once("/commit/").map(|(folder, _)| folder))
             .filter_map(|folder| folder.rsplit_once('/').map(|(root, _)| root.to_string()))
             .collect();
+        for branch in plan.rebuild.iter().chain(&plan.retracted) {
+            if let Some(record) = self.nameservice().lookup(branch).await? {
+                trees.insert(record.storage_namespace().root().as_str().to_string());
+            }
+        }
+        let commits: Vec<&str> = plan.commits.iter().map(String::as_str).collect();
+        for (record, _) in self.dropped_holders(&commits).await? {
+            trees.insert(record.storage_namespace().root().as_str().to_string());
+        }
+        for source in &plan.sources {
+            if let Ok(namespace) = fluree_db_core::StorageNamespace::parse_graph_source(source) {
+                trees.insert(namespace.branch_prefix().to_string());
+            }
+        }
         // Scratch outside the storage: what crashed imports and rebuilds of
         // the holders, and crashed proving steps, left.
         let data_dir = match &self.indexing_mode {
@@ -501,9 +517,9 @@ impl Fluree {
         let swept = tokio::task::spawn_blocking(move || {
             let mut swept = 0;
             let scratch = |e: std::io::Error| fluree_db_core::Error::io(format!("scratch: {e}"));
-            for ledger in &ledgers {
+            for tree in &trees {
                 swept += fluree_db_core::FileStorage::sweep_foreign_staging(
-                    std::path::Path::new(root.as_ref()).join(ledger),
+                    std::path::Path::new(root.as_ref()).join(tree),
                 )
                 .map_err(scratch)?;
             }
@@ -521,6 +537,8 @@ impl Fluree {
             }
             fluree_db_core::FileStorage::checkpoint_wal(root.as_ref())?;
             fluree_db_core::FileStorage::sync_parent_dirs(root.as_ref(), &keys)?;
+            let trees: Vec<String> = trees.into_iter().collect();
+            fluree_db_core::FileStorage::sync_dirs_under(root.as_ref(), &trees)?;
             Ok::<_, fluree_db_core::Error>(swept)
         })
         .await

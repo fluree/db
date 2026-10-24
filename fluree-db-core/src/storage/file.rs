@@ -1215,6 +1215,66 @@ impl FileStorage {
         Ok(flushed)
     }
 
+    /// Flush every directory under `root` at each of `prefixes`, and the one
+    /// holding each, so the unlinks made anywhere in those trees survive
+    /// power loss. Returns how many it flushed.
+    pub fn sync_dirs_under(root: impl AsRef<Path>, prefixes: &[String]) -> Result<usize> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for prefix in prefixes {
+            let Some(top) = wal::key_path(root.as_ref(), prefix.trim_end_matches('/')) else {
+                continue;
+            };
+            if let Some(parent) = top.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+            let mut next = vec![top];
+            while let Some(dir) = next.pop() {
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(entries) => entries,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(crate::error::Error::io(format!(
+                            "read {}: {e}",
+                            dir.display()
+                        )))
+                    }
+                };
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        crate::error::Error::io(format!("read {}: {e}", dir.display()))
+                    })?;
+                    if entry.file_type().is_ok_and(|t| t.is_dir()) && entry.file_name() != WAL_DIR {
+                        next.push(entry.path());
+                    }
+                }
+                dirs.insert(dir);
+            }
+        }
+        let keys: Vec<PathBuf> = dirs.into_iter().collect();
+        let mut flushed = 0;
+        for dir in keys {
+            #[cfg(not(unix))]
+            let _ = dir;
+            #[cfg(unix)]
+            match std::fs::File::open(&dir) {
+                Ok(handle) => {
+                    handle.sync_all().map_err(|e| {
+                        crate::error::Error::io(format!("flush {}: {e}", dir.display()))
+                    })?;
+                    flushed += 1;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(crate::error::Error::io(format!(
+                        "open {}: {e}",
+                        dir.display()
+                    )))
+                }
+            }
+        }
+        Ok(flushed)
+    }
+
     /// Abandon the WAL without flushing, as a crash would, so a test can
     /// reopen the root and exercise replay within one process.
     #[doc(hidden)]
@@ -3115,6 +3175,18 @@ mod tests {
         let swept = FileStorage::sweep_foreign_staging(dir.path());
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(swept.is_err() && stuck.exists(), "{swept:?}");
+    }
+
+    /// Every directory under a prefix is flushed, and the one holding it.
+    #[cfg(unix)]
+    #[test]
+    fn every_directory_under_a_prefix_is_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("l/@i/main/index/spot")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        let flushed = FileStorage::sync_dirs_under(dir.path(), &["l/@i".to_string()]).unwrap();
+        // `l`, `l/@i`, `main`, `index` and `spot`; not `other`.
+        assert_eq!(flushed, 5);
     }
 
     /// Content is not staging debris. The sweep must not touch a real object
