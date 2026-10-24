@@ -254,6 +254,7 @@ impl Fluree {
             let widening = Widening {
                 pair_spans: true,
                 skip_foreign: !requested,
+                bounded: false,
             };
             let removed = match self.remove_widened(writer, branch, request, widening).await {
                 Ok(removed) => removed,
@@ -285,13 +286,23 @@ impl Fluree {
         ledger_id: &LedgerId,
         commits: &[&str],
     ) -> Result<Vec<NsRecord>> {
-        let runtime = self.erasure_runtime()?;
         let mut cids: Vec<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
         cids.sort();
         cids.dedup();
+        self.ledgers_holding(&cids, Some(ledger_id.name())).await
+    }
+
+    /// The live branches of the ledgers, but `except`, one of whose
+    /// branches holds the original of one of `cids` in its own folder.
+    pub(crate) async fn ledgers_holding(
+        &self,
+        cids: &[ContentId],
+        except: Option<&str>,
+    ) -> Result<Vec<NsRecord>> {
+        let runtime = self.erasure_runtime()?;
         let mut ledgers: BTreeMap<String, Vec<NsRecord>> = BTreeMap::new();
         for record in self.nameservice().all_records().await? {
-            if !record.retracted && record.ledger_id.name() != ledger_id.name() {
+            if !record.retracted && Some(record.ledger_id.name()) != except {
                 ledgers
                     .entry(record.ledger_id.name().to_string())
                     .or_default()
@@ -301,7 +312,7 @@ impl Fluree {
         let mut copies = Vec::new();
         for records in ledgers.into_values() {
             'ledger: for record in &records {
-                for cid in &cids {
+                for cid in cids {
                     if runtime
                         .index
                         .holds_original(&record.storage_namespace(), cid)

@@ -174,14 +174,32 @@ A proof shows that a commit was redacted correctly, and a control commit shows t
 Neither shows who was allowed to make it: control commits are unsigned. A restore trusts the archive's
 erasures as it trusts the archive's data.
 
-A restore is refused, and leaves nothing behind, when:
+A ledger on this storage may already hold the original of a commit the archive erases: a copy restored
+earlier, or a branch of one. Before the restored ledger becomes visible, the restore makes each such
+branch read as the erasure does:
+
+- the erased occurrences are recorded in its removal journal, against its own history, so its history
+  over them is refused;
+- they leave its index: leaf by leaf when they are only history there, or by a rebuild from the
+  replacements when a value is still current there (its rows and the index's statistics change);
+- its full-text and vector indexes that read an erased property are rebuilt;
+- nothing is committed to it: a retraction would hold the value, and only a prover could erase it.
+
+`RestoreResult::reconciled` lists those branches. The restored ledger records a published job per
+request, and its [purge](#purge) deletes the originals and their transaction documents, with no
+prover. A soft-dropped ledger holding an original is left to that purge, which releases its indexes,
+and to its restore, which rebuilds them.
+
+A restore is refused, and writes nothing to the ledgers here, when:
 
 - an erasure fails a check;
 - an erasure differs from the one this storage holds for the same commit (a chain that is the same, or
   one this storage has already extended, is accepted);
-- an erasure would newly erase a commit that a ledger on this storage, live or soft-dropped, holds as
-  its original. Erasing history held here on receipt is not supported yet; erase it with a request
-  here instead;
+- a ledger here holding an erased original has not indexed that commit yet (`503`; retry once it has);
+- a ledger here retracts an erased value in a commit of its own, which the archive does not erase
+  (`409`; erase it there with a request);
+- a ledger here has a full-text or vector index that reads an erased property and that this instance
+  cannot rebuild (`409`; drop it first);
 - the instance cannot hold erased history: memory or S3 storage, or a cluster. Versions of Fluree
   without erased history in archives refuse such an archive as malformed.
 

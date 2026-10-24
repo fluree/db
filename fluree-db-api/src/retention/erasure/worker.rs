@@ -9,7 +9,6 @@ use std::sync::Weak;
 use std::time::Instant;
 
 use fluree_db_core::commit::codec::read_commit_envelope;
-use fluree_db_core::tracking::Tracker;
 use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, LedgerId};
 use fluree_db_erasure::{ProveRequest, ProverError};
 use fluree_db_nameservice::NsRecord;
@@ -731,29 +730,7 @@ impl Fluree {
         if !covers_erased {
             return Ok(());
         }
-        let state = self
-            .load_unlisted_state(store.clone(), record.clone())
-            .await
-            .ok();
-        let config = self
-            .rebuild_config(&record.ledger_id, state.as_ref(), Default::default())
-            .await?;
-        let built = fluree_db_indexer::rebuild_index_from_commits_with_tracker(
-            store,
-            Tracker::disabled(),
-            record.ledger_id.as_str(),
-            record,
-            config,
-        )
-        .await?;
-        self.publisher()?
-            .publish_index_allow_equal_fenced(
-                record.ledger_id.as_str(),
-                record.fence,
-                built.index_t,
-                &built.root_id,
-            )
-            .await?;
+        self.rebuild_index_from(store, record).await?;
         // The indexes it replaces hold the erased values: released once the
         // ledger is visible, which releasing needs (see `sweep_after_restore`).
         runtime

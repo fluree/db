@@ -98,6 +98,10 @@ pub(crate) struct Widening {
     /// Named occurrences outside this branch's history are skipped rather
     /// than refused: the request is another branch's.
     pub skip_foreign: bool,
+    /// Each occurrence bounding a named one's span must be named too, or the
+    /// removal is refused: an erasure received from elsewhere cannot widen
+    /// here, where nothing proves an erasure.
+    pub bounded: bool,
 }
 
 /// A removal and the `t` of each manifest occurrence's commit.
@@ -176,151 +180,15 @@ impl Fluree {
         }
         let ledger_id = LedgerId::parse(ledger_id)?.to_string();
         for _ in 0..ATTEMPTS {
-            let ns = self.publisher()?;
-            let Some(record) = ns.lookup(&ledger_id).await? else {
-                return Err(ApiError::NotFound(ledger_id));
-            };
-            let Some(head) = record.commit_head_id.clone() else {
-                return Err(ApiError::http(400, "the ledger has no commits"));
-            };
-            let scope_t = record.commit_t;
-            let store = self
-                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
-                .await?;
-            let state = self.ledger(&ledger_id).await?;
-            if state.t() != scope_t {
+            let Some(read) = self.read_history(&ledger_id).await? else {
                 continue;
-            }
-
-            // Every commit up to the head, oldest first, with its flakes.
-            let mut cids = collect_first_parent_cids(store.as_ref(), &head, 0).await?;
-            cids.reverse();
-            let mut commits: Vec<(i64, ContentId, fluree_db_core::Commit)> =
-                Vec::with_capacity(cids.len());
-            for (t, cid) in cids {
-                let commit = load_commit_by_id(store.as_ref(), &cid).await?;
-                commits.push((t, cid, commit));
-            }
-
-            let selectors: Vec<(Option<Sid>, Sid, Sid, Option<FlakeValue>)> = request
-                .matching
-                .iter()
-                .map(|sel| selector_terms(&state.snapshot, sel))
-                .collect::<Result<_>>()?;
-            let mut located: Vec<Located> = Vec::new();
-            for occ in &request.occurrences {
-                let cid: ContentId = occ
-                    .commit
-                    .parse()
-                    .map_err(|_| ApiError::http(400, format!("not a commit id: {}", occ.commit)))?;
-                let Some((t, _, commit)) = commits.iter().find(|(_, c, _)| *c == cid) else {
-                    if widening.skip_foreign {
-                        continue;
-                    }
-                    return Err(ApiError::CommitNotFound(format!(
-                        "commit {} is not in {ledger_id}'s history",
-                        occ.commit
-                    )));
-                };
-                let Some(flake) = commit.at_slot(occ.slot) else {
-                    return Err(ApiError::http(
-                        400,
-                        format!("commit {} has no operation {}", occ.commit, occ.slot),
-                    ));
-                };
-                located.push(Located {
-                    occurrence: occ.clone(),
-                    flake: flake.clone(),
-                    t: *t,
-                });
-            }
-            for (t, cid, commit) in &commits {
-                for (slot, flake) in commit.occurrences() {
-                    if selectors.iter().any(|(g, s, p, o)| {
-                        flake.g == *g
-                            && flake.s == *s
-                            && flake.p == *p
-                            && o.as_ref().is_none_or(|o| flake.o == *o)
-                    }) {
-                        located.push(Located {
-                            occurrence: OccurrenceRef {
-                                commit: cid.to_string(),
-                                slot,
-                            },
-                            flake: flake.clone(),
-                            t: *t,
-                        });
-                    }
-                }
-            }
-            let events = fact_events(&commits);
-            if widening.pair_spans {
-                let mut pairs = Vec::new();
-                for loc in &located {
-                    let timeline = events
-                        .get(&FactKey::of(&loc.flake))
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    let pair = if loc.flake.op {
-                        timeline.iter().find(|e| e.t > loc.t && !e.op)
-                    } else {
-                        timeline.iter().rev().find(|e| e.t < loc.t && e.op)
-                    };
-                    if let Some(e) = pair {
-                        let (t, cid, commit) = &commits[e.commit];
-                        if let Some(flake) = commit.at_slot(e.slot) {
-                            pairs.push(Located {
-                                occurrence: OccurrenceRef {
-                                    commit: cid.to_string(),
-                                    slot: e.slot,
-                                },
-                                flake: flake.clone(),
-                                t: *t,
-                            });
-                        }
-                    }
-                }
-                located.extend(pairs);
-            }
-            located.sort_by(|a, b| {
-                a.occurrence
-                    .commit
-                    .cmp(&b.occurrence.commit)
-                    .then(a.occurrence.slot.cmp(&b.occurrence.slot))
-            });
-            located.dedup_by(|a, b| a.occurrence == b.occurrence);
-            if located.is_empty() {
-                return Err(ApiError::http(
-                    404,
-                    "nothing in the ledger's history matches the removal",
-                ));
-            }
-
-            // The span of each occurrence: an assertion runs to the fact's
-            // next retraction; a retraction ends the assertion before it.
-            let mut spans: Vec<(i64, Option<i64>)> = Vec::with_capacity(located.len());
-            let mut current: Vec<Flake> = Vec::new();
-            for loc in &located {
-                let key = FactKey::of(&loc.flake);
-                let timeline = events.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-                if loc.flake.op {
-                    let until = timeline
-                        .iter()
-                        .find(|e| e.t > loc.flake.t && !e.op)
-                        .map(|e| e.t);
-                    if until.is_none() {
-                        current.push(loc.flake.clone());
-                    }
-                    spans.push((loc.flake.t, until));
-                } else {
-                    let from = timeline
-                        .iter()
-                        .rev()
-                        .find(|e| e.t < loc.flake.t && e.op)
-                        .map_or(0, |e| e.t);
-                    spans.push((from, Some(loc.flake.t)));
-                }
-            }
+            };
+            let Found {
+                mut located,
+                mut spans,
+                current,
+            } = locate(&read, request, widening)?;
+            let scope_t = read.scope_t;
 
             // Retract what is still current, against the head the scope
             // was fixed at.
@@ -336,7 +204,7 @@ impl Fluree {
                     .collect::<Vec<_>>();
                 let mut stored = Vec::new();
                 for f in &retractions {
-                    stored.extend(stored_terms(&state, f).await?);
+                    stored.extend(stored_terms(&read.state, f).await?);
                 }
                 let batch = RetentionBatch {
                     expected_t: scope_t,
@@ -354,7 +222,7 @@ impl Fluree {
                         retracted_t = Some(t);
                         // The retractions just made are occurrences of the
                         // removed facts too.
-                        let commit = load_commit_by_id(store.as_ref(), &commit_id).await?;
+                        let commit = load_commit_by_id(read.store.as_ref(), &commit_id).await?;
                         for (slot, flake) in commit.occurrences() {
                             if let Some(from) = current
                                 .iter()
@@ -383,63 +251,11 @@ impl Fluree {
             }
 
             let request_id = request_id(&ledger_id, scope_t, &located);
-            let removals: Vec<Removal> = located
-                .iter()
-                .zip(&spans)
-                .map(|(loc, (from, until))| Removal {
-                    request_id: request_id.clone(),
-                    commit: loc.occurrence.commit.clone(),
-                    slot: loc.occurrence.slot,
-                    predicate: state.snapshot.decode_sid(&loc.flake.p).unwrap_or_default(),
-                    from_t: *from,
-                    until_t: until.or(retracted_t),
-                    scope_t,
-                    subject: state
-                        .snapshot
-                        .decode_sid(&loc.flake.s)
-                        .map(|iri| super::journal::subject_fingerprint(&iri)),
-                })
-                .collect();
-            // A ledger this registers keeps the retention input it already
-            // holds, as the worker's activation would.
-            let since = commits
-                .iter()
-                .find(|(_, _, c)| super::engine::carries_retention_input(&c.txn_meta))
-                .map_or(scope_t + 1, |(t, _, _)| *t);
+            let removals = entries(&read, &request_id, &located, &spans, retracted_t);
             let properties = removals.iter().map(|r| r.predicate.clone()).collect();
-            self.retention.watch.journal_changing(&ledger_id);
-            let incoming = super::journal::Journal {
-                removals,
-                ..Default::default()
-            };
-            let mut conflict = None;
-            let registration = registry::update(ns, &ledger_id, |current| {
-                let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
-                    active_since_t: since,
-                    watermark_t: since - 1,
-                    ..Default::default()
-                });
-                match next.journal.merge(&incoming) {
-                    Ok(changed) => (changed || current.is_none()).then_some(next),
-                    Err(e) => {
-                        conflict = Some(e);
-                        None
-                    }
-                }
-            })
-            .await?
-            .unwrap_or_default();
-            if let Some(e) = conflict {
-                return Err(e.into());
-            }
-            // A copy restored after this ledger is gone keeps the removal
-            // only through the checkpoint; a retry publishes it.
-            self.checkpoint_journal(&ledger_id).await.map_err(|e| {
-                ApiError::internal(format!(
-                    "the removal is recorded on {ledger_id}, but its lineage checkpoint \
-                     could not be published ({e}); retry the request"
-                ))
-            })?;
+            let registration = self
+                .record_removals(&ledger_id, read.since(), removals)
+                .await?;
             let unacknowledged_replicas = self
                 .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
                 .await;
@@ -462,6 +278,363 @@ impl Fluree {
             ApiError::internal("the head kept moving during the removal"),
         ))
     }
+
+    /// The removal that erasing `occurrences`, received from elsewhere,
+    /// makes on `ledger_id`, which holds some of their commits: computed,
+    /// not recorded. Nothing is retracted: a retraction would hold the
+    /// value, which this storage cannot erase without a prover; what is
+    /// current leaves the ledger's index instead. `None` when its history
+    /// holds none of them.
+    #[cfg(feature = "native")]
+    pub(crate) async fn received_removal(
+        &self,
+        ledger_id: &str,
+        occurrences: Vec<OccurrenceRef>,
+    ) -> Result<Option<ReceivedRemoval>> {
+        let ledger_id = LedgerId::parse(ledger_id)?.to_string();
+        let request = RemovalRequest {
+            occurrences,
+            matching: Vec::new(),
+        };
+        let widening = Widening {
+            pair_spans: false,
+            skip_foreign: true,
+            bounded: true,
+        };
+        for _ in 0..ATTEMPTS {
+            let Some(read) = self.read_history(&ledger_id).await? else {
+                continue;
+            };
+            let found = match locate(&read, &request, widening) {
+                Ok(found) => found,
+                Err(e) if e.status_code() == 404 => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let request_id = request_id(&ledger_id, read.scope_t, &found.located);
+            let removals = entries(&read, &request_id, &found.located, &found.spans, None);
+            return Ok(Some(ReceivedRemoval {
+                ledger_id,
+                since: read.since(),
+                index_t: read.index_t,
+                removals,
+                flakes: found.located.into_iter().map(|l| l.flake).collect(),
+            }));
+        }
+        Err(ApiError::commit_contention(
+            ATTEMPTS,
+            ApiError::internal("the head kept moving while reading the history"),
+        ))
+    }
+
+    /// Record a removal [`Self::received_removal`] computed.
+    #[cfg(feature = "native")]
+    pub(crate) async fn record_received_removal(&self, removal: ReceivedRemoval) -> Result<()> {
+        self.record_removals(&removal.ledger_id, removal.since, removal.removals)
+            .await
+            .map(|_| ())
+    }
+
+    /// `ledger_id`'s history, as of its head; `None` when the head moved
+    /// while it was read.
+    async fn read_history(&self, ledger_id: &str) -> Result<Option<History>> {
+        let Some(record) = self.publisher()?.lookup(ledger_id).await? else {
+            return Err(ApiError::NotFound(ledger_id.to_string()));
+        };
+        let Some(head) = record.commit_head_id.clone() else {
+            return Err(ApiError::http(400, "the ledger has no commits"));
+        };
+        let scope_t = record.commit_t;
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+            .await?;
+        let state = self.ledger(ledger_id).await?;
+        if state.t() != scope_t {
+            return Ok(None);
+        }
+        // Every commit up to the head, oldest first, with its flakes.
+        let mut cids = collect_first_parent_cids(store.as_ref(), &head, 0).await?;
+        cids.reverse();
+        let mut commits = Vec::with_capacity(cids.len());
+        for (t, cid) in cids {
+            let commit = load_commit_by_id(store.as_ref(), &cid).await?;
+            commits.push((t, cid, commit));
+        }
+        Ok(Some(History {
+            ledger_id: ledger_id.to_string(),
+            scope_t,
+            index_t: record.index_t,
+            store,
+            state,
+            commits,
+        }))
+    }
+
+    /// Add `removals` to `ledger_id`'s journal and its lineage's checkpoint.
+    async fn record_removals(
+        &self,
+        ledger_id: &str,
+        since: i64,
+        removals: Vec<Removal>,
+    ) -> Result<registry::Registration> {
+        // A ledger this registers keeps the retention input it already
+        // holds, as the worker's activation would.
+        self.retention.watch.journal_changing(ledger_id);
+        let incoming = super::journal::Journal {
+            removals,
+            ..Default::default()
+        };
+        let mut conflict = None;
+        let registration = registry::update(self.publisher()?, ledger_id, |current| {
+            let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
+                active_since_t: since,
+                watermark_t: since - 1,
+                ..Default::default()
+            });
+            match next.journal.merge(&incoming) {
+                Ok(changed) => (changed || current.is_none()).then_some(next),
+                Err(e) => {
+                    conflict = Some(e);
+                    None
+                }
+            }
+        })
+        .await?
+        .unwrap_or_default();
+        if let Some(e) = conflict {
+            return Err(e.into());
+        }
+        // A copy restored after this ledger is gone keeps the removal
+        // only through the checkpoint; a retry publishes it.
+        self.checkpoint_journal(ledger_id).await.map_err(|e| {
+            ApiError::internal(format!(
+                "the removal is recorded on {ledger_id}, but its lineage checkpoint \
+                 could not be published ({e}); retry the request"
+            ))
+        })?;
+        Ok(registration)
+    }
+}
+
+/// A ledger's history as a removal reads it, as of its head.
+struct History {
+    ledger_id: String,
+    scope_t: i64,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    index_t: i64,
+    store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+    state: fluree_db_ledger::LedgerState,
+    /// Oldest first.
+    commits: Vec<(i64, ContentId, fluree_db_core::Commit)>,
+}
+
+impl History {
+    /// Where a registration this removal makes starts: at the first commit
+    /// carrying retention input, as the worker's activation would.
+    fn since(&self) -> i64 {
+        self.commits
+            .iter()
+            .find(|(_, _, c)| super::engine::carries_retention_input(&c.txn_meta))
+            .map_or(self.scope_t + 1, |(t, _, _)| *t)
+    }
+}
+
+/// A removal an erasure received from elsewhere makes on a ledger holding
+/// its commits: see [`Fluree::received_removal`].
+#[cfg(feature = "native")]
+pub(crate) struct ReceivedRemoval {
+    pub(crate) ledger_id: String,
+    since: i64,
+    /// The ledger's index `t` when it was computed.
+    pub(crate) index_t: i64,
+    pub(crate) removals: Vec<Removal>,
+    /// The removed operations, as the ledger's history holds them.
+    pub(crate) flakes: Vec<Flake>,
+}
+
+/// What a removal finds in a history: the occurrences it names, widened,
+/// each with its span (asserted at, retracted at), and those still current.
+struct Found {
+    located: Vec<Located>,
+    spans: Vec<(i64, Option<i64>)>,
+    current: Vec<Flake>,
+}
+
+/// Find what `request` names in `read`'s history, widened as `widening`
+/// says.
+fn locate(read: &History, request: &RemovalRequest, widening: Widening) -> Result<Found> {
+    let commits = &read.commits;
+    let selectors: Vec<(Option<Sid>, Sid, Sid, Option<FlakeValue>)> = request
+        .matching
+        .iter()
+        .map(|sel| selector_terms(&read.state.snapshot, sel))
+        .collect::<Result<_>>()?;
+    let mut located: Vec<Located> = Vec::new();
+    for occ in &request.occurrences {
+        let cid: ContentId = occ
+            .commit
+            .parse()
+            .map_err(|_| ApiError::http(400, format!("not a commit id: {}", occ.commit)))?;
+        let Some((t, _, commit)) = commits.iter().find(|(_, c, _)| *c == cid) else {
+            if widening.skip_foreign {
+                continue;
+            }
+            return Err(ApiError::CommitNotFound(format!(
+                "commit {} is not in {}'s history",
+                occ.commit, read.ledger_id
+            )));
+        };
+        let Some(flake) = commit.at_slot(occ.slot) else {
+            return Err(ApiError::http(
+                400,
+                format!("commit {} has no operation {}", occ.commit, occ.slot),
+            ));
+        };
+        located.push(Located {
+            occurrence: occ.clone(),
+            flake: flake.clone(),
+            t: *t,
+        });
+    }
+    for (t, cid, commit) in commits {
+        for (slot, flake) in commit.occurrences() {
+            if selectors.iter().any(|(g, s, p, o)| {
+                flake.g == *g
+                    && flake.s == *s
+                    && flake.p == *p
+                    && o.as_ref().is_none_or(|o| flake.o == *o)
+            }) {
+                located.push(Located {
+                    occurrence: OccurrenceRef {
+                        commit: cid.to_string(),
+                        slot,
+                    },
+                    flake: flake.clone(),
+                    t: *t,
+                });
+            }
+        }
+    }
+    let events = fact_events(commits);
+    if widening.pair_spans {
+        let pairs: Vec<Located> = located
+            .iter()
+            .filter_map(|loc| span_pair(loc, &events, commits))
+            .collect();
+        located.extend(pairs);
+    }
+    located.sort_by(|a, b| {
+        a.occurrence
+            .commit
+            .cmp(&b.occurrence.commit)
+            .then(a.occurrence.slot.cmp(&b.occurrence.slot))
+    });
+    located.dedup_by(|a, b| a.occurrence == b.occurrence);
+    if located.is_empty() {
+        return Err(ApiError::http(
+            404,
+            "nothing in the ledger's history matches the removal",
+        ));
+    }
+    if widening.bounded {
+        for loc in &located {
+            let Some(pair) = span_pair(loc, &events, commits) else {
+                continue;
+            };
+            if !located.iter().any(|l| l.occurrence == pair.occurrence) {
+                return Err(ApiError::http(
+                    409,
+                    format!(
+                        "commit {} of {} holds a value erased in commit {}, and is not \
+                         erased with it; this storage cannot erase it without a prover",
+                        pair.occurrence.commit, read.ledger_id, loc.occurrence.commit
+                    ),
+                ));
+            }
+        }
+    }
+
+    // The span of each occurrence: an assertion runs to the fact's
+    // next retraction; a retraction ends the assertion before it.
+    let mut spans: Vec<(i64, Option<i64>)> = Vec::with_capacity(located.len());
+    let mut current: Vec<Flake> = Vec::new();
+    for loc in &located {
+        let key = FactKey::of(&loc.flake);
+        let timeline = events.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        if loc.flake.op {
+            let until = timeline
+                .iter()
+                .find(|e| e.t > loc.flake.t && !e.op)
+                .map(|e| e.t);
+            if until.is_none() {
+                current.push(loc.flake.clone());
+            }
+            spans.push((loc.flake.t, until));
+        } else {
+            let from = timeline
+                .iter()
+                .rev()
+                .find(|e| e.t < loc.flake.t && e.op)
+                .map_or(0, |e| e.t);
+            spans.push((from, Some(loc.flake.t)));
+        }
+    }
+    Ok(Found {
+        located,
+        spans,
+        current,
+    })
+}
+
+/// The occurrence bounding `loc`'s span in `commits`: an assertion's
+/// retraction, a retraction's assertion.
+fn span_pair(
+    loc: &Located,
+    events: &HashMap<FactKey, Vec<Event>>,
+    commits: &[(i64, ContentId, fluree_db_core::Commit)],
+) -> Option<Located> {
+    let timeline = events.get(&FactKey::of(&loc.flake))?;
+    let pair = if loc.flake.op {
+        timeline.iter().find(|e| e.t > loc.t && !e.op)
+    } else {
+        timeline.iter().rev().find(|e| e.t < loc.t && e.op)
+    }?;
+    let (t, cid, commit) = &commits[pair.commit];
+    Some(Located {
+        occurrence: OccurrenceRef {
+            commit: cid.to_string(),
+            slot: pair.slot,
+        },
+        flake: commit.at_slot(pair.slot)?.clone(),
+        t: *t,
+    })
+}
+
+/// The journal entries recording `located`, each with its span; a span
+/// still open ends at `retracted_t` when the removal retracted it.
+fn entries(
+    read: &History,
+    request_id: &str,
+    located: &[Located],
+    spans: &[(i64, Option<i64>)],
+    retracted_t: Option<i64>,
+) -> Vec<Removal> {
+    let snapshot = &read.state.snapshot;
+    located
+        .iter()
+        .zip(spans)
+        .map(|(loc, (from, until))| Removal {
+            request_id: request_id.to_string(),
+            commit: loc.occurrence.commit.clone(),
+            slot: loc.occurrence.slot,
+            predicate: snapshot.decode_sid(&loc.flake.p).unwrap_or_default(),
+            from_t: *from,
+            until_t: until.or(retracted_t),
+            scope_t: read.scope_t,
+            subject: snapshot
+                .decode_sid(&loc.flake.s)
+                .map(|iri| super::journal::subject_fingerprint(&iri)),
+        })
+        .collect()
 }
 
 /// Each fact's assertions and retractions, in commit order.

@@ -33,14 +33,31 @@ impl Fluree {
         record: &NsRecord,
         captured: &[Captured],
     ) -> Result<Erased> {
-        // Held against indexing, as a reindex is: a build begun from the
-        // root being erased would publish its events again over this one.
-        let _maintenance = match &self.indexing_mode {
-            IndexingMode::Background(handle) => {
-                Some(crate::admin::hold_branch_quiesced(handle, &record.ledger_id).await?)
-            }
-            IndexingMode::Disabled => None,
-        };
+        let _maintenance = self.hold_indexing(&record.ledger_id).await?;
+        self.erase_from_held_index(record, captured).await
+    }
+
+    /// Hold `ledger_id`'s indexing, as a reindex does: a build begun from a
+    /// root being erased would publish its events again over it. `None`
+    /// without background indexing.
+    pub(crate) async fn hold_indexing(
+        &self,
+        ledger_id: &fluree_db_core::LedgerId,
+    ) -> Result<Option<fluree_db_indexer::MaintenanceGuard>> {
+        match &self.indexing_mode {
+            IndexingMode::Background(handle) => Ok(Some(
+                crate::admin::hold_branch_quiesced(handle, ledger_id).await?,
+            )),
+            IndexingMode::Disabled => Ok(None),
+        }
+    }
+
+    /// [`Self::erase_from_index`], its indexing already held.
+    pub(crate) async fn erase_from_held_index(
+        &self,
+        record: &NsRecord,
+        captured: &[Captured],
+    ) -> Result<Erased> {
         // As the quiesced builds left it.
         let Some(record) = self.nameservice().lookup(&record.ledger_id).await? else {
             return Ok(Erased::Nothing);
@@ -106,6 +123,41 @@ impl Fluree {
             manager.disconnect(&record.ledger_id).await;
         }
         Ok(Erased::Leafwise)
+    }
+}
+
+impl Fluree {
+    /// Rebuild `record`'s index from its commits as `store` reads them, and
+    /// publish it.
+    pub(crate) async fn rebuild_index_from(
+        &self,
+        store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+        record: &NsRecord,
+    ) -> Result<()> {
+        let state = self
+            .load_unlisted_state(store.clone(), record.clone())
+            .await
+            .ok();
+        let config = self
+            .rebuild_config(&record.ledger_id, state.as_ref(), Default::default())
+            .await?;
+        let built = fluree_db_indexer::rebuild_index_from_commits_with_tracker(
+            store,
+            fluree_db_core::tracking::Tracker::disabled(),
+            record.ledger_id.as_str(),
+            record,
+            config,
+        )
+        .await?;
+        self.publisher()?
+            .publish_index_allow_equal_fenced(
+                record.ledger_id.as_str(),
+                record.fence,
+                built.index_t,
+                &built.root_id,
+            )
+            .await?;
+        Ok(())
     }
 }
 

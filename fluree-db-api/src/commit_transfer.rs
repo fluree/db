@@ -110,6 +110,10 @@ pub struct RestoreResult {
     /// Permanently erased commits received as their erasures.
     #[serde(default)]
     pub erased_commits: usize,
+    /// Branches of other ledgers on this storage that held an original
+    /// those erasures erase, and were made to read as the erasures do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconciled: Vec<String>,
     /// `t` of the restored commit head: the archive's, or the retraction
     /// of values the lineage has since removed.
     pub commit_t: i64,
@@ -2482,13 +2486,16 @@ impl Fluree {
         #[cfg(not(feature = "native"))]
         let erased_commits = 0;
         #[cfg(feature = "native")]
-        if erased_commits > 0 {
-            let genesis = self
-                .receive_erasures(erasures, &namespace, &commit_cid)
-                .await?;
-            if lineage.is_none() {
-                lineage = genesis;
-            }
+        let received = match erased_commits {
+            0 => None,
+            _ => Some(
+                self.receive_erasures(erasures, &namespace, &commit_cid)
+                    .await?,
+            ),
+        };
+        #[cfg(feature = "native")]
+        if let Some(genesis) = received.as_ref().and_then(|r| r.genesis.clone()) {
+            lineage.get_or_insert(genesis);
         }
         if !content.has(&commit_cid).await.unwrap_or(false) {
             return Err(ApiError::http(
@@ -2626,6 +2633,18 @@ impl Fluree {
                 false,
             )
             .await?;
+        #[cfg(feature = "native")]
+        let reconciled = match received {
+            Some(received) => {
+                let head_t = retracted_t.unwrap_or(commit_t);
+                self.record_received_jobs(record, head_t, received.jobs)
+                    .await?;
+                received.reconciled
+            }
+            None => Vec::new(),
+        };
+        #[cfg(not(feature = "native"))]
+        let reconciled = Vec::new();
 
         Ok(RestoreResult {
             ledger_id: new_ledger_id.to_string(),
@@ -2633,6 +2652,7 @@ impl Fluree {
             txn_blobs,
             index_artifacts,
             erased_commits,
+            reconciled,
             commit_t: retracted_t.unwrap_or(commit_t),
             index_t: index_t_out,
         })

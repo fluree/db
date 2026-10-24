@@ -167,7 +167,33 @@ impl Fluree {
             .await?;
         let holders: BTreeSet<&String> = plan.rebuild.iter().chain(&plan.release).collect();
         let pending: Vec<&ErasureJob> = jobs.iter().filter(|j| j.purge_pending()).collect();
-        let erased_properties = erased_properties(&pending);
+        for source in self
+            .sources_over(&holders, erased_properties(&pending).as_ref())
+            .await?
+        {
+            // Its files may be an earlier index's of the same name, which
+            // read other properties: they go whatever this one reads.
+            if source.dropped {
+                plan.dropped_sources.push(source.id);
+                continue;
+            }
+            if source.reads_erased {
+                plan.rebuilt_sources.push(source.id.clone());
+            }
+            plan.sources.push(source.id);
+        }
+        Ok(plan)
+    }
+
+    /// The full-text, vector and geo indexes over one of `holders` (branch
+    /// ids), each with whether it may read one of `properties` (any, when
+    /// `None`).
+    pub(crate) async fn sources_over(
+        &self,
+        holders: &BTreeSet<&String>,
+        properties: Option<&BTreeSet<&str>>,
+    ) -> Result<Vec<SourceOver>> {
+        let mut over = Vec::new();
         for source in self.nameservice().all_graph_source_records().await? {
             let over_holder = matches!(
                 source.source_type,
@@ -180,23 +206,14 @@ impl Fluree {
             if !over_holder {
                 continue;
             }
-            // Its files may be an earlier index's of the same name, which
-            // read other properties: they go whatever this one reads.
-            let id = source.graph_source_id.to_string();
-            if source.retracted {
-                plan.dropped_sources.push(id);
-                continue;
-            }
             let indexed = indexed_properties(&source);
-            if erased_properties
-                .as_ref()
-                .is_none_or(|properties| properties.iter().any(|p| indexed.may_read(p)))
-            {
-                plan.rebuilt_sources.push(id.clone());
-            }
-            plan.sources.push(id);
+            over.push(SourceOver {
+                id: source.graph_source_id.to_string(),
+                dropped: source.retracted,
+                reads_erased: properties.is_none_or(|p| p.iter().any(|p| indexed.may_read(p))),
+            });
         }
-        Ok(plan)
+        Ok(over)
     }
 
     /// The retracted branches, of `name`'s ledger and of the ledgers of
@@ -315,6 +332,14 @@ pub struct PurgeInspection {
     pub scan: PurgeScan,
 }
 
+/// A full-text, vector or geo index over a holder of erased commits.
+pub(crate) struct SourceOver {
+    pub(crate) id: String,
+    pub(crate) dropped: bool,
+    /// It may read a property an erasure removed.
+    pub(crate) reads_erased: bool,
+}
+
 /// An erased occurrence, read from bytes that still hold it.
 #[derive(Clone, Debug)]
 pub(crate) struct Captured {
@@ -340,7 +365,7 @@ fn commit_id(commit: &str) -> Result<ContentId> {
         .map_err(|_| ApiError::internal(format!("not a commit id: {commit}")))
 }
 
-mod erase;
+pub(crate) mod erase;
 pub(crate) mod release;
 mod run;
 mod scan;

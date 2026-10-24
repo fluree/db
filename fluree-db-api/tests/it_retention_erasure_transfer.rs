@@ -424,18 +424,33 @@ async fn a_restore_takes_an_authorization_made_on_another_branch() {
     );
 }
 
-/// A restore never erases history this storage holds as its original, nor
-/// takes an erasure that differs from the one it holds of a commit: both
-/// are refused, leaving the copy here reading as before.
-#[tokio::test]
-async fn a_restore_refuses_erasures_of_history_held_here() {
+/// A ledger erasing alice's email at t1, with archives from before and
+/// after: `(dir, source, id, t1, commit at t1, before, after)`.
+async fn erased_between_archives(
+    name: &str,
+) -> (
+    tempfile::TempDir,
+    Fluree,
+    String,
+    i64,
+    ContentId,
+    Vec<u8>,
+    Vec<u8>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let fluree = erasing(&dir, Arc::new(NativeProver::default()));
-    let id = ledger(&fluree, "it/transfer-held").await;
-    let t1 = insert(
+    let id = ledger(&fluree, name).await;
+    let t1 = insert_kept(
         &fluree,
         &id,
-        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret", "ex:name": "Alice"}),
+        json!({"@context": ctx(), "@id": "ex:alice", "@type": "ex:Doc",
+               "ex:email": "a@secret", "ex:name": "Alice"}),
+    )
+    .await;
+    insert_kept(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@kept"}),
     )
     .await;
     let shared = commit_at(&fluree, &id, t1).await;
@@ -446,29 +461,116 @@ async fn a_restore_refuses_erasures_of_history_held_here() {
         .unwrap();
     erase_published(&fluree, &id, email("alice", "a@secret")).await;
     let after = archive(&fluree, &id).await;
+    (dir, fluree, id, t1, shared, before, after)
+}
 
+/// A ledger here holding the original of a commit a restore erases, the
+/// value still current in its index, reads as the erasure does once the
+/// restore returns: no current value, its history refused, the commit read
+/// as its replacement. No retraction is committed there, and the restored
+/// ledger's purge deletes the original, without a prover.
+#[tokio::test]
+async fn a_restore_erases_what_a_ledger_here_holds() {
+    use std::time::Duration;
+
+    let (_dir, _source, _, t1, shared, before, after) =
+        erased_between_archives("it/transfer-held").await;
     let here = tempfile::tempdir().unwrap();
-    let receiver = erasing(&here, Arc::new(NativeProver::default()));
+    let receiver = receiving(&here);
     let held = receiver
         .restore_ledger("it/transfer-held-copy", &mut before.as_slice())
         .await
         .unwrap()
         .ledger_id;
-    let refused = receiver
-        .restore_ledger("it/transfer-held-again", &mut after.as_slice())
+    receiver
+        .create_branch("it/transfer-held-copy", "dev", None, None)
         .await
-        .expect_err("held here");
-    assert!(
-        refused.to_string().contains(&format!("{shared}"))
-            && refused.to_string().contains("holds on this storage"),
-        "{refused}"
-    );
+        .unwrap();
+    let dev = "it/transfer-held-copy:dev".to_string();
+    reindex(&receiver, &held).await;
+    reindex(&receiver, &dev).await;
+    let head_before = chain(&receiver, &held).await;
     assert_eq!(
         objects(&receiver, &held, "ex:alice", "ex:email").await,
-        vec![json!("a@secret")],
-        "nothing was published"
+        vec![json!("a@secret")]
     );
 
+    let restored = receiver
+        .restore_ledger("it/transfer-held-again", &mut after.as_slice())
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.reconciled,
+        [dev.clone(), held.clone()],
+        "{restored:?}"
+    );
+    assert_eq!(
+        chain(&receiver, &held).await,
+        head_before,
+        "nothing committed"
+    );
+    for branch in [&held, &dev] {
+        assert!(objects(&receiver, branch, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+    }
+    assert_eq!(
+        objects(&receiver, &held, "ex:alice", "ex:name").await,
+        vec![json!("Alice")]
+    );
+    let read = store_of(&receiver, &held).await.get(&shared).await.unwrap();
+    assert!(is_replacement(&read));
+    let past = receiver
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{held}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+    assert!(!files_holding(here.path(), "a@secret").is_empty());
+
+    let copy = restored.ledger_id;
+    let job = receiver
+        .retention_status(&copy)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures;
+    assert_eq!(job.len(), 1, "{job:?}");
+    assert_eq!(job[0].stage, ErasureStage::Published);
+    let report = receiver
+        .run_purge_pass(&copy, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert!(objects(&receiver, &held, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// An erasure that differs from the one this storage holds of a commit is
+/// refused, leaving the copy here as it was.
+#[tokio::test]
+async fn a_restore_refuses_a_divergent_erasure() {
+    let (_dir, _source, _, _, shared, before, after) =
+        erased_between_archives("it/transfer-divergent").await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = erasing(&here, Arc::new(NativeProver::default()));
+    let held = receiver
+        .restore_ledger("it/transfer-divergent-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
     // Here, the same commit loses another value: one step each, apart.
     let name = ErasureRequest {
         matching: vec![FactSelector {
@@ -481,7 +583,7 @@ async fn a_restore_refuses_erasures_of_history_held_here() {
     };
     erase_published(&receiver, &held, name).await;
     let refused = receiver
-        .restore_ledger("it/transfer-held-again", &mut after.as_slice())
+        .restore_ledger("it/transfer-divergent-again", &mut after.as_slice())
         .await
         .expect_err("divergent");
     assert!(
@@ -663,4 +765,278 @@ async fn a_restore_takes_what_its_lineage_removed_since() {
     assert!(objects(&receiver, &second, "ex:bob", "ex:email")
         .await
         .is_empty());
+}
+
+/// A value only a ledger's history holds here, retracted in a commit the
+/// transfer erases too, leaves its index leaf by leaf: its history entries
+/// go, and reads of that history are refused.
+#[tokio::test]
+async fn a_restore_erases_history_a_ledger_here_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/transfer-history").await;
+    let t1 = insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    source
+        .graph(&id)
+        .transact()
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@kept"}),
+    )
+    .await;
+    let before = archive(&source, &id).await;
+    erase_published(&source, &id, email("alice", "a@secret")).await;
+    let after = archive(&source, &id).await;
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/transfer-history-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&receiver, &held).await;
+    let entries = indexed_history_entries(&receiver, &held).await;
+    let past = json!({
+        "@context": ctx(),
+        "from": format!("{held}@t:{t1}"),
+        "select": "?o",
+        "where": {"@id": "ex:alice", "ex:email": "?o"}
+    });
+    assert!(receiver.query_connection(&past).await.is_ok());
+
+    let restored = receiver
+        .restore_ledger("it/transfer-history-again", &mut after.as_slice())
+        .await
+        .unwrap();
+    assert_eq!(restored.reconciled, [held.as_str()], "{restored:?}");
+    assert!(indexed_history_entries(&receiver, &held).await < entries);
+    let refused = receiver.query_connection(&past).await;
+    assert!(
+        matches!(refused, Err(ApiError::HistoryUnavailable(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        objects(&receiver, &held, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+}
+
+/// A ledger here that cannot be made to read as an erasure does is a
+/// reason to refuse the restore, before anything is written there: one
+/// whose index does not cover the erased commit yet (retry once it does),
+/// and one whose own commit retracts the erased value, which only a prover
+/// could erase.
+#[tokio::test]
+async fn a_restore_is_refused_where_a_ledger_here_cannot_follow() {
+    let (_dir, _source, _, _, _, before, after) =
+        erased_between_archives("it/transfer-cannot").await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/transfer-cannot-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let untouched = |receiver: &Fluree| {
+        let receiver = receiver.clone();
+        let held = held.clone();
+        async move {
+            let journal = receiver
+                .retention_status(&held)
+                .await
+                .unwrap()
+                .registration
+                .map(|r| r.journal.removals.len());
+            assert_eq!(journal.unwrap_or(0), 0, "nothing journaled");
+        }
+    };
+
+    let refused = receiver
+        .restore_ledger("it/transfer-cannot-again", &mut after.as_slice())
+        .await
+        .expect_err("not indexed");
+    assert!(
+        refused.status_code() == 503 && refused.to_string().contains("has not indexed"),
+        "{refused}"
+    );
+    untouched(&receiver).await;
+    assert_eq!(
+        objects(&receiver, &held, "ex:alice", "ex:email").await,
+        vec![json!("a@secret")]
+    );
+
+    receiver
+        .graph(&held)
+        .transact()
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    reindex(&receiver, &held).await;
+    let refused = receiver
+        .restore_ledger("it/transfer-cannot-again", &mut after.as_slice())
+        .await
+        .expect_err("a retraction here");
+    assert!(
+        refused.status_code() == 409 && refused.to_string().contains("without a prover"),
+        "{refused}"
+    );
+    untouched(&receiver).await;
+}
+
+/// A ledger's full-text index here that reads the erased property is
+/// rebuilt before the restore returns, and serves without the value; one
+/// that never read it keeps its index.
+#[tokio::test]
+async fn a_restore_rebuilds_a_search_index_that_read_the_value() {
+    let (_dir, _source, _, _, _, before, after) =
+        erased_between_archives("it/transfer-search").await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let held = receiver
+        .restore_ledger("it/transfer-search-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&receiver, &held).await;
+    let index = |name: &str, property: &str| {
+        receiver.create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            name,
+            &held,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Doc"}],
+                "select": {"?x": ["@id", property]}
+            }),
+        ))
+    };
+    let emails = index("transfer-emails", "ex:email")
+        .await
+        .unwrap()
+        .graph_source_id;
+    let names = index("transfer-names", "ex:name")
+        .await
+        .unwrap()
+        .graph_source_id;
+    let search = |source: &str, text: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+            "from": held,
+            "where": [{
+                "f:graphSource": source,
+                "f:searchText": text,
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc"}
+            }],
+            "select": ["?doc"]
+        })
+    };
+    let hits = |result: fluree_db_api::QueryResult| -> usize {
+        result.batches.iter().map(fluree_db_api::Batch::len).sum()
+    };
+    let head = |id: &str| {
+        let receiver = &receiver;
+        let id = id.to_string();
+        async move {
+            receiver
+                .nameservice()
+                .lookup_graph_source(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .index_id
+        }
+    };
+    let found = receiver
+        .query_connection(&search(&emails, "secret"))
+        .await
+        .unwrap();
+    assert_eq!(hits(found), 1);
+    // Not yet synced into either: a rebuild would take it in.
+    insert(
+        &receiver,
+        &held,
+        json!({"@context": ctx(), "@id": "ex:carol", "@type": "ex:Doc", "ex:name": "Carol"}),
+    )
+    .await;
+    let (emails_before, names_before) = (head(&emails).await, head(&names).await);
+
+    receiver
+        .restore_ledger("it/transfer-search-again", &mut after.as_slice())
+        .await
+        .unwrap();
+    assert_ne!(head(&emails).await, emails_before);
+    assert_eq!(head(&names).await, names_before);
+    let found = receiver
+        .query_connection(&search(&emails, "secret"))
+        .await
+        .expect("served");
+    assert_eq!(hits(found), 0);
+    let found = receiver
+        .query_connection(&search(&names, "Alice"))
+        .await
+        .expect("served");
+    assert_eq!(hits(found), 1);
+}
+
+/// A chain that extends the one this storage holds erases the further
+/// slots from the copies reading the shorter one, though they hold no file
+/// of the commit.
+#[tokio::test]
+async fn a_restore_extends_an_erasure_held_here() {
+    let (_dir, source, id, _, shared, _, first) =
+        erased_between_archives("it/transfer-extended").await;
+    let name = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/name".into(),
+            graph: None,
+            object: None,
+        }],
+        ..Default::default()
+    };
+    erase_published(&source, &id, name).await;
+    let second = archive(&source, &id).await;
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let earlier = receiver
+        .restore_ledger("it/transfer-extended-copy", &mut first.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&receiver, &earlier).await;
+    assert!(commit_file(here.path(), &shared).is_none());
+    assert_eq!(
+        objects(&receiver, &earlier, "ex:alice", "ex:name").await,
+        vec![json!("Alice")]
+    );
+
+    let restored = receiver
+        .restore_ledger("it/transfer-extended-again", &mut second.as_slice())
+        .await
+        .unwrap();
+    assert_eq!(restored.reconciled, [earlier.as_str()], "{restored:?}");
+    for copy in [&earlier, &restored.ledger_id] {
+        assert!(objects(&receiver, copy, "ex:alice", "ex:name")
+            .await
+            .is_empty());
+    }
 }

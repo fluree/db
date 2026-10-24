@@ -14,7 +14,7 @@ use crate::{ApiError, Fluree, Result};
 impl Fluree {
     /// Of `sources`, those whose ledger cannot be loaded to rebuild them
     /// from, as a soft-dropped one.
-    pub(super) async fn unrebuildable_sources(&self, sources: &[String]) -> Result<Vec<String>> {
+    pub(crate) async fn unrebuildable_sources(&self, sources: &[String]) -> Result<Vec<String>> {
         let mut stuck = Vec::new();
         for id in sources {
             let Some(record) = self.nameservice().lookup_graph_source(id).await? else {
@@ -39,7 +39,7 @@ impl Fluree {
 
     /// Rebuild each of `sources` from its ledger as it is now. Returns how
     /// many it rebuilt.
-    pub(super) async fn rebuild_sources(&self, sources: &[String]) -> Result<usize> {
+    pub(crate) async fn rebuild_sources(&self, sources: &[String]) -> Result<usize> {
         for id in sources {
             let Some(record) = self.nameservice().lookup_graph_source(id).await? else {
                 continue;

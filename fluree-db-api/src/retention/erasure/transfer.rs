@@ -6,7 +6,7 @@
 //! against its authorization, and publishes the chain in its own storage,
 //! where the commit then reads as its replacement.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use fluree_db_core::commit::codec::{commit_blob_matches, read_commit_envelope};
@@ -19,7 +19,10 @@ use fluree_vocab::{db, namespaces::FLUREE_DB};
 use serde::{Deserialize, Serialize};
 
 use super::index::{Artifact, ErasedCommit, ErasureIndex, ErasureStep};
+use super::purge::erase::Erased;
+use super::purge::Captured;
 use super::request::manifest_hash;
+use crate::retention::registry;
 use crate::retention::removal::OccurrenceRef;
 use crate::{ApiError, Fluree, Result};
 
@@ -82,8 +85,9 @@ pub(crate) struct Authorization {
 }
 
 impl Authorization {
-    /// Why `bytes` are not this request's control commit, if they are not.
-    fn check_control(&self, bytes: &[u8]) -> std::result::Result<(), String> {
+    /// Why `bytes` are not this request's control commit, if they are not;
+    /// its id and `t` if they are.
+    fn check_control(&self, bytes: &[u8]) -> std::result::Result<(ContentId, i64), String> {
         let control: ContentId = self
             .control
             .parse()
@@ -110,7 +114,7 @@ impl Authorization {
         if recorded(db::ERASURE_MANIFEST) != Some(manifest_hash(&self.manifest).as_str()) {
             return Err(format!("{control} records another manifest"));
         }
-        Ok(())
+        Ok((control, envelope.t))
     }
 
     /// Whether it authorizes removing `slots` of `commit`.
@@ -338,8 +342,8 @@ enum Standing {
     New,
     /// The same, or a prefix of it: the receiver is ahead.
     Held,
-    /// It extends the held chain.
-    Extends,
+    /// It extends the held chain, from step `from` on.
+    Extends { from: usize },
 }
 
 fn standing(held: Option<&ErasedCommit>, chain: &Chain) -> Result<Standing> {
@@ -357,7 +361,9 @@ fn standing(held: Option<&ErasedCommit>, chain: &Chain) -> Result<Standing> {
         ));
     }
     Ok(if chain.steps.len() > held.steps.len() {
-        Standing::Extends
+        Standing::Extends {
+            from: held.steps.len(),
+        }
     } else {
         Standing::Held
     })
@@ -387,23 +393,23 @@ impl Fluree {
 
     /// Take the erasures a restore brought into the ledger at `namespace`,
     /// whose history `head` names, before anything reads that history:
-    /// verify each chain and check each step against its authorization;
-    /// refuse a chain that differs from one this storage holds, or one
-    /// that would newly erase an original some ledger here holds; then
-    /// publish them, `namespace` reading each commit as its replacement.
-    /// Returns the history's genesis commit when it is erased.
+    /// verify each chain and check each step against its authorization,
+    /// refusing a chain that differs from one this storage holds; reconcile
+    /// every ledger here holding a newly erased original (see
+    /// [`Self::reconcile_holders`]); then publish the chains, `namespace`
+    /// reading each commit as its replacement.
     pub(crate) async fn receive_erasures(
         &self,
         received: Received,
         namespace: &StorageNamespace,
         head: &ContentId,
-    ) -> Result<Option<ContentId>> {
+    ) -> Result<ReceivedErasures> {
         let runtime = self.erasure_runtime()?;
         let index = &runtime.index;
-        let mut controls: HashSet<&str> = HashSet::new();
+        let mut controls: HashMap<&str, (ContentId, i64)> = HashMap::new();
         let mut parents: HashMap<ContentId, Vec<ContentId>> = HashMap::new();
         let mut genesis = None;
-        let mut newly_erased = Vec::new();
+        let mut newly = Vec::new();
         for chain in received.chains.values() {
             let cid: ContentId = chain.commit.parse().map_err(|_| {
                 bad(format!(
@@ -419,26 +425,13 @@ impl Fluree {
                         .ok_or_else(|| {
                             bad(format!(
                                 "the erasure of {} names request {}, whose authorization the \
-                             transfer does not carry",
+                                 transfer does not carry",
                                 chain.commit, step.request_id
                             ))
                         })?;
-                if controls.insert(&step.request_id) {
-                    let bytes = index
-                        .artifact(Artifact::Control, &authorization.control_bytes)
-                        .await
-                        .map_err(|e| {
-                            bad(format!(
-                                "the control commit of erasure request {}: {e}",
-                                step.request_id
-                            ))
-                        })?;
-                    authorization.check_control(&bytes).map_err(|why| {
-                        bad(format!(
-                            "erasure request {} is not authorized: {why}",
-                            step.request_id
-                        ))
-                    })?;
+                if !controls.contains_key(step.request_id.as_str()) {
+                    let control = self.check_authorization(index, authorization).await?;
+                    controls.insert(&step.request_id, control);
                 }
                 if !authorization.covers(&chain.commit, &step.slots) {
                     return Err(bad(format!(
@@ -464,24 +457,26 @@ impl Fluree {
                 genesis = Some(cid.clone());
             }
             parents.insert(cid.clone(), envelope.parents);
-            if standing(index.erased(&cid).await?.as_ref(), chain)? != Standing::Held {
-                newly_erased.push(cid);
-            }
+            let from = match standing(index.erased(&cid).await?.as_ref(), chain)? {
+                Standing::New => 0,
+                Standing::Extends { from } => from,
+                Standing::Held => continue,
+            };
+            newly.push(Newly {
+                cid,
+                t: envelope.t,
+                chain,
+                from,
+                replacement,
+            });
         }
         self.check_erasures_in_history(namespace, head, &parents)
             .await?;
-        if let Some((cid, holder)) = self.first_holder(&newly_erased).await? {
-            return Err(ApiError::http(
-                409,
-                format!(
-                    "the transfer erases commit {cid}, which {holder} holds on this storage; \
-                     receiving an erasure of history held here is not supported yet"
-                ),
-            ));
-        }
-        for request in controls {
+
+        let holders = self.reconcile_holders(&newly).await?;
+        for request in controls.keys() {
             index
-                .put_authorization(&received.authorizations[request])
+                .put_authorization(&received.authorizations[*request])
                 .await?;
         }
         let published = received
@@ -493,7 +488,228 @@ impl Fluree {
             })
             .collect();
         index.publish(published).await?;
-        Ok(genesis)
+        let jobs = match holders.reconciled.is_empty() && holders.dropped.is_empty() {
+            true => Vec::new(),
+            false => received_jobs(&newly, &controls, &holders),
+        };
+        Ok(ReceivedErasures {
+            genesis,
+            reconciled: holders
+                .reconciled
+                .iter()
+                .map(|h| h.ledger_id.to_string())
+                .collect(),
+            jobs,
+        })
+    }
+
+    /// Check that `authorization`'s control commit, stored as an artifact,
+    /// records its request and manifest, and that this storage holds no
+    /// other authorization of the request. Returns the control commit's id
+    /// and `t`.
+    async fn check_authorization(
+        &self,
+        index: &ErasureIndex,
+        authorization: &Authorization,
+    ) -> Result<(ContentId, i64)> {
+        let request = &authorization.request_id;
+        let bytes = index
+            .artifact(Artifact::Control, &authorization.control_bytes)
+            .await
+            .map_err(|e| {
+                bad(format!(
+                    "the control commit of erasure request {request}: {e}"
+                ))
+            })?;
+        let control = authorization.check_control(&bytes).map_err(|why| {
+            bad(format!(
+                "erasure request {request} is not authorized: {why}"
+            ))
+        })?;
+        if index
+            .authorization(request)
+            .await?
+            .is_some_and(|held| held != *authorization)
+        {
+            return Err(ApiError::http(
+                409,
+                format!(
+                    "the authorization of erasure request {request} differs from the one this \
+                     storage holds"
+                ),
+            ));
+        }
+        Ok(control)
+    }
+
+    /// Make every ledger here holding an original `newly` erases read as it
+    /// will once the erasures are published, before they are: no current
+    /// state, history or search index of it serves an erased value.
+    ///
+    /// Each live branch whose history holds one has the occurrences
+    /// recorded in its removal journal, against its own history, and their
+    /// events erased from its index: leaf by leaf when they are history
+    /// there, by a rebuild reading the received replacements when one is
+    /// still current or lives outside the leaves. Its full-text and vector
+    /// indexes that may read an erased property are rebuilt from it. Nothing is retracted: a
+    /// retraction would hold the value, which this storage cannot erase
+    /// without a prover. Every check runs before anything is written, and
+    /// the branches' indexing stays held until the caller publishes.
+    /// Soft-dropped holders are left to the purge, which releases their
+    /// indexes, and to their restore, which rebuilds them.
+    async fn reconcile_holders(&self, newly: &[Newly<'_>]) -> Result<Holders> {
+        let cids: Vec<ContentId> = newly.iter().map(|n| n.cid.clone()).collect();
+        let commits: Vec<String> = cids.iter().map(ToString::to_string).collect();
+        let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
+        let mut holders = Holders {
+            dropped: self
+                .dropped_holders(&commits)
+                .await?
+                .into_iter()
+                .map(|(r, _)| r.ledger_id.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        if newly.is_empty() {
+            return Ok(holders);
+        }
+        let occurrences: Vec<OccurrenceRef> = newly
+            .iter()
+            .flat_map(|n| {
+                n.chain.steps[n.from..].iter().flat_map(|step| {
+                    step.slots.iter().map(|slot| OccurrenceRef {
+                        commit: n.chain.commit.clone(),
+                        slot: *slot,
+                    })
+                })
+            })
+            .collect();
+        let mut removals = Vec::new();
+        for record in self.ledgers_holding(&cids, None).await? {
+            let Some(removal) = self
+                .received_removal(record.ledger_id.as_str(), occurrences.clone())
+                .await?
+            else {
+                continue;
+            };
+            if let Some(unindexed) = removal.flakes.iter().find(|f| f.t > removal.index_t) {
+                if let crate::IndexingMode::Background(handle) = &self.indexing_mode {
+                    drop(handle.trigger(&record.ledger_id, unindexed.t).await);
+                }
+                return Err(ApiError::http(
+                    503,
+                    format!(
+                        "{} has not indexed t={}, which the transfer erases; retry once it has",
+                        record.ledger_id, unindexed.t
+                    ),
+                ));
+            }
+            removals.push((record, removal));
+        }
+        let branches: BTreeSet<String> = removals
+            .iter()
+            .map(|(r, _)| r.ledger_id.to_string())
+            .collect();
+        let properties: BTreeSet<&str> = removals
+            .iter()
+            .flat_map(|(_, r)| r.removals.iter().map(|r| r.predicate.as_str()))
+            .collect();
+        holders.properties = properties.iter().map(ToString::to_string).collect();
+        let known = (!properties.contains("")).then_some(&properties);
+        let sources: Vec<String> = self
+            .sources_over(&branches.iter().collect(), known)
+            .await?
+            .into_iter()
+            .filter(|s| !s.dropped && s.reads_erased)
+            .map(|s| s.id)
+            .collect();
+        if let Some(stuck) = self.unrebuildable_sources(&sources).await?.first() {
+            return Err(ApiError::http(
+                409,
+                format!(
+                    "{stuck} indexes a ledger here that holds an erased value and cannot be \
+                     rebuilt from it; drop it first"
+                ),
+            ));
+        }
+        for (record, _) in &removals {
+            holders
+                .guards
+                .extend(self.hold_indexing(&record.ledger_id).await?);
+        }
+
+        let replacements: Arc<HashMap<ContentId, Arc<[u8]>>> = Arc::new(
+            newly
+                .iter()
+                .map(|n| (n.cid.clone(), n.replacement.clone()))
+                .collect(),
+        );
+        for (record, removal) in removals {
+            let captured: Vec<Captured> = removal
+                .flakes
+                .iter()
+                .map(|flake| Captured {
+                    flake: flake.clone(),
+                })
+                .collect();
+            // A value still current here has a row, and counts in the
+            // index's statistics, which only a build changes: erasing leaf
+            // by leaf drops history alone.
+            let current = removal.removals.iter().any(|r| r.until_t.is_none());
+            self.record_received_removal(removal).await?;
+            if current
+                || self.erase_from_held_index(&record, &captured).await? == Erased::NeedsRebuild
+            {
+                let store = self
+                    .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                    .await?;
+                let store: Arc<dyn ContentStore> = Arc::new(Substituted {
+                    inner: store,
+                    replacements: replacements.clone(),
+                });
+                self.rebuild_index_from(store, &record).await?;
+                if let Some(manager) = &self.ledger_manager {
+                    manager.disconnect(&record.ledger_id).await;
+                }
+            }
+            holders.reconciled.push(record);
+        }
+        self.rebuild_sources(&sources).await?;
+        Ok(holders)
+    }
+
+    /// Record `jobs` in the registration of `record`, a restored ledger not
+    /// yet visible whose head is at `head_t`, for its purge.
+    pub(crate) async fn record_received_jobs(
+        &self,
+        record: &fluree_db_nameservice::NsRecord,
+        head_t: i64,
+        jobs: Vec<super::ErasureJob>,
+    ) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        registry::update_fenced(
+            self.publisher()?,
+            record.ledger_id.as_str(),
+            record.fence,
+            |current| {
+                let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
+                    active_since_t: head_t + 1,
+                    watermark_t: head_t,
+                    ..Default::default()
+                });
+                for job in &jobs {
+                    if !next.erasures.iter().any(|j| j.request_id == job.request_id) {
+                        next.erasures.push(job.clone());
+                    }
+                }
+                Some(next)
+            },
+        )
+        .await?;
+        self.retention.mark_active(record.ledger_id.as_str());
+        Ok(())
     }
 
     /// Refuse erasures of commits the history `head` names in `namespace`
@@ -529,43 +745,152 @@ impl Fluree {
             None => Ok(()),
         }
     }
+}
 
-    /// The first of `originals` a ledger on this storage, live or
-    /// soft-dropped, holds in its own folder, with that ledger.
-    async fn first_holder(&self, originals: &[ContentId]) -> Result<Option<(ContentId, String)>> {
-        if originals.is_empty() {
-            return Ok(None);
+/// A received chain that erases more of its commit than this storage has.
+struct Newly<'a> {
+    cid: ContentId,
+    t: i64,
+    chain: &'a Chain,
+    /// Its first step this storage does not hold.
+    from: usize,
+    /// Its latest replacement, verified.
+    replacement: Arc<[u8]>,
+}
+
+/// The ledgers here holding newly erased originals.
+#[derive(Default)]
+struct Holders {
+    /// Live branches made to read as the erasures will.
+    reconciled: Vec<fluree_db_nameservice::NsRecord>,
+    /// Branches of soft-dropped ledgers, left to the purge.
+    dropped: Vec<String>,
+    /// The properties (IRIs) of the occurrences erased there; one empty
+    /// where a predicate did not decode.
+    properties: Vec<String>,
+    /// Their indexing, held until the erasures are published.
+    guards: Vec<fluree_db_indexer::MaintenanceGuard>,
+}
+
+/// What a restore's erasures did here.
+pub(crate) struct ReceivedErasures {
+    /// The history's genesis commit, when it is erased.
+    pub(crate) genesis: Option<ContentId>,
+    /// Branches of other ledgers here made to read as the erasures do.
+    pub(crate) reconciled: Vec<String>,
+    /// A published job per request whose originals are held here, for the
+    /// restored ledger's registration: its purge deletes them.
+    pub(crate) jobs: Vec<super::ErasureJob>,
+}
+
+/// A published job per request of `newly`, its holders' indexes already
+/// rebuilt, for the purge to delete their originals.
+fn received_jobs(
+    newly: &[Newly<'_>],
+    controls: &HashMap<&str, (ContentId, i64)>,
+    holders: &Holders,
+) -> Vec<super::ErasureJob> {
+    let now = crate::retention::worker::now_ms();
+    let branches: Vec<String> = holders
+        .reconciled
+        .iter()
+        .map(|r| r.ledger_id.to_string())
+        .chain(holders.dropped.iter().cloned())
+        .collect();
+    let mut jobs: BTreeMap<&str, super::ErasureJob> = BTreeMap::new();
+    for n in newly {
+        for step in &n.chain.steps[n.from..] {
+            let (control, authorized_t) = &controls[step.request_id.as_str()];
+            let job = jobs
+                .entry(step.request_id.as_str())
+                .or_insert_with(|| super::ErasureJob {
+                    request_id: step.request_id.clone(),
+                    requester: None,
+                    accepted_ms: now,
+                    authorized_t: *authorized_t,
+                    authorized_commit: Some(control.to_string()),
+                    signatures: Default::default(),
+                    stage: super::ErasureStage::Published,
+                    commits: Vec::new(),
+                    properties: match holders.properties.iter().any(String::is_empty) {
+                        true => Vec::new(),
+                        false => holders.properties.clone(),
+                    },
+                    retries: 0,
+                    retry_at_ms: None,
+                    last_error: None,
+                    published_ms: Some(now),
+                    added: Vec::new(),
+                    purge: Some(super::PurgeProgress {
+                        rebuilt_ms: Some(now),
+                        ..Default::default()
+                    }),
+                });
+            job.commits.push(super::CommitErasure {
+                commit: n.chain.commit.clone(),
+                t: n.t,
+                slots: step.slots.clone(),
+                ledger_id: n.chain.ledger_id.clone(),
+                branches: branches.clone(),
+                proved: None,
+            });
         }
-        let index = &self.erasure_runtime()?.index;
-        for record in self.nameservice().all_records().await? {
-            if record.retracted {
-                continue;
-            }
-            for cid in originals {
-                if index
-                    .holds_original(&record.storage_namespace(), cid)
-                    .await?
-                {
-                    return Ok(Some((cid.clone(), record.ledger_id.to_string())));
-                }
-            }
+    }
+    jobs.into_values().collect()
+}
+
+/// A store reading received replacements in place of their originals, for
+/// a rebuild before the erasures are published.
+#[derive(Debug)]
+struct Substituted {
+    inner: Arc<dyn ContentStore>,
+    replacements: Arc<HashMap<ContentId, Arc<[u8]>>>,
+}
+
+#[async_trait::async_trait]
+impl ContentStore for Substituted {
+    async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+        match self.replacements.contains_key(id) {
+            true => Ok(true),
+            false => self.inner.has(id).await,
         }
-        let commits: Vec<String> = originals.iter().map(ToString::to_string).collect();
-        let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
-        for (record, _) in self.dropped_holders(&commits).await? {
-            for cid in originals {
-                if index
-                    .holds_original(&record.storage_namespace(), cid)
-                    .await?
-                {
-                    return Ok(Some((
-                        cid.clone(),
-                        format!("dropped ledger {}", record.ledger_id),
-                    )));
-                }
-            }
+    }
+
+    async fn get(&self, id: &ContentId) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
+        match self.replacements.get(id) {
+            Some(bytes) => Ok(bytes.clone().into()),
+            None => self.inner.get(id).await,
         }
-        Ok(None)
+    }
+
+    async fn put(
+        &self,
+        kind: fluree_db_core::ContentKind,
+        bytes: &[u8],
+    ) -> fluree_db_core::Result<ContentId> {
+        self.inner.put(kind, bytes).await
+    }
+
+    async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+        self.inner.put_with_id(id, bytes).await
+    }
+
+    fn blob_pinner(&self) -> Option<fluree_db_core::storage::pins::BlobPinner> {
+        self.inner.blob_pinner()
+    }
+
+    fn get_local(
+        &self,
+        id: &ContentId,
+    ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
+        match self.replacements.contains_key(id) {
+            true => Ok(None),
+            false => self.inner.get_local(id),
+        }
+    }
+
+    async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+        self.inner.release(id).await
     }
 }
 
@@ -606,7 +931,7 @@ mod tests {
         );
         assert_eq!(
             standing(Some(&held), &chain(&["a", "b", "c"])).unwrap(),
-            Standing::Extends
+            Standing::Extends { from: 2 }
         );
         let divergent = standing(Some(&held), &chain(&["a", "x"])).unwrap_err();
         assert_eq!(divergent.status_code(), 409);
