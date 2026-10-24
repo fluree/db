@@ -72,8 +72,8 @@ pub async fn read_lists(db: GraphDbRef<'_>, values: &[Flake]) -> Result<Lists> {
             continue;
         }
         match &flake.o {
-            FlakeValue::Ref(head) => match walk_chain(db, head).await? {
-                Chain::List(items) => out.lists.push(items),
+            FlakeValue::Ref(head) => match walk_chain(db, head, true).await? {
+                Chain::List(items) => out.lists.push(items.into_iter().map(|f| f.o).collect()),
                 Chain::Malformed => out.malformed += 1,
                 Chain::NotAList => out.values.push(flake.o.clone()),
             },
@@ -83,14 +83,27 @@ pub async fn read_lists(db: GraphDbRef<'_>, values: &[Flake]) -> Result<Lists> {
     Ok(out)
 }
 
+/// The `rdf:first` flakes of the well-formed list `head` names, in order,
+/// or `None` when `head` heads no list or a malformed one. `rdf:nil` is the
+/// empty list.
+pub async fn chain_members(db: GraphDbRef<'_>, head: &Sid) -> Result<Option<Vec<Flake>>> {
+    Ok(match walk_chain(db, head, false).await? {
+        Chain::List(items) => Some(items),
+        Chain::Malformed | Chain::NotAList => None,
+    })
+}
+
 enum Chain {
-    List(Vec<FlakeValue>),
+    /// The `rdf:first` flakes, in order.
+    List(Vec<Flake>),
     Malformed,
     NotAList,
 }
 
 /// Follow `rdf:rest` from `head` to `rdf:nil`, collecting each `rdf:first`.
-async fn walk_chain(db: GraphDbRef<'_>, head: &Sid) -> Result<Chain> {
+/// A head with no `rdf:first` is no list; with `classify`, one that has an
+/// `rdf:rest` is told apart as malformed, at the price of a second read.
+async fn walk_chain(db: GraphDbRef<'_>, head: &Sid, classify: bool) -> Result<Chain> {
     let first = Sid::new(RDF, RDF_FIRST);
     let rest = Sid::new(RDF, RDF_REST);
     let mut items = Vec::new();
@@ -103,12 +116,23 @@ async fn walk_chain(db: GraphDbRef<'_>, head: &Sid) -> Result<Chain> {
         if !seen.insert(cell.clone()) || items.len() >= MAX_CHAIN_LEN {
             return Ok(Chain::Malformed);
         }
-        let firsts = objects(db, &cell, &first).await?;
+        let mut firsts = objects(db, &cell, &first).await?;
+        if firsts.is_empty() && items.is_empty() && !classify {
+            return Ok(Chain::NotAList);
+        }
         let rests = objects(db, &cell, &rest).await?;
-        match (firsts.as_slice(), rests.as_slice()) {
-            ([], []) if items.is_empty() => return Ok(Chain::NotAList),
-            ([item], [FlakeValue::Ref(next)]) => {
-                items.push(item.clone());
+        if firsts.is_empty() && items.is_empty() && rests.is_empty() {
+            return Ok(Chain::NotAList);
+        }
+        match (firsts.len(), rests.as_slice()) {
+            (
+                1,
+                [Flake {
+                    o: FlakeValue::Ref(next),
+                    ..
+                }],
+            ) => {
+                items.push(firsts.pop().expect("one rdf:first"));
                 cell = next.clone();
             }
             _ => return Ok(Chain::Malformed),
@@ -116,7 +140,7 @@ async fn walk_chain(db: GraphDbRef<'_>, head: &Sid) -> Result<Chain> {
     }
 }
 
-async fn objects(db: GraphDbRef<'_>, s: &Sid, p: &Sid) -> Result<Vec<FlakeValue>> {
+async fn objects(db: GraphDbRef<'_>, s: &Sid, p: &Sid) -> Result<Vec<Flake>> {
     Ok(db
         .range(
             IndexType::Spot,
@@ -130,7 +154,6 @@ async fn objects(db: GraphDbRef<'_>, s: &Sid, p: &Sid) -> Result<Vec<FlakeValue>
         .await?
         .into_iter()
         .filter(|f| f.op)
-        .map(|f| f.o)
         .collect())
 }
 

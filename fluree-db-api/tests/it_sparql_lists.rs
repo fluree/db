@@ -1033,3 +1033,64 @@ async fn whole_graph_counts_add_the_list_triples() {
     grouped.sort_by_key(ToString::to_string);
     assert_eq!(grouped, by_predicate(3, 2, 1, 6));
 }
+
+/// A JSON-LD crawl reads a list stored as `rdf:first`/`rdf:rest` triples as
+/// its members, as it reads a compact list: after a SPARQL edit gives the
+/// list's head a property, and for a second list on the property.
+#[tokio::test]
+async fn jsonld_reads_a_list_stored_as_triples_as_its_members() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/sparql-lists/stored-as-triples:main";
+    let ctx = json!({"ex": "http://example.org/"});
+    let list = |items: &[&str]| {
+        let items: Vec<JsonValue> = items.iter().map(|i| json!({"@id": i})).collect();
+        json!({"@context": ctx, "@id": "ex:c", "ex:items": {"@list": items}})
+    };
+    let items = |ledger: LedgerState| {
+        let fluree = &fluree;
+        let ctx = ctx.clone();
+        async move {
+            support::query_jsonld(
+                fluree,
+                &ledger,
+                &json!({"@context": ctx, "selectOne": {"ex:c": ["*"]}}),
+            )
+            .await
+            .expect("crawl")
+            .to_jsonld_async(ledger.as_graph_db_ref(0))
+            .await
+            .expect("to_jsonld")["ex:items"]
+                .clone()
+        }
+    };
+    let ids = |ids: &[&str]| json!(ids.iter().map(|i| json!({"@id": i})).collect::<Vec<_>>());
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    let _ = fluree
+        .insert(ledger, &list(&["ex:A", "ex:B", "ex:C"]))
+        .await
+        .expect("insert");
+    fluree
+        .graph(id)
+        .transact()
+        .sparql_update(&format!(
+            "{PREFIXES}INSERT {{ ?h ex:note \"x\" }} WHERE {{ ex:c ex:items ?h }}"
+        ))
+        .commit()
+        .await
+        .expect("note the head");
+    let ledger = fluree.ledger(id).await.expect("load");
+    assert_eq!(items(ledger.clone()).await, ids(&["ex:A", "ex:B", "ex:C"]));
+
+    // Each list in its order; two lists on a property in no set order.
+    let ledger = fluree
+        .insert(ledger, &list(&["ex:X", "ex:Y"]))
+        .await
+        .expect("insert")
+        .ledger;
+    let got = items(ledger).await;
+    assert!(
+        got == ids(&["ex:A", "ex:B", "ex:C", "ex:X", "ex:Y"])
+            || got == ids(&["ex:X", "ex:Y", "ex:A", "ex:B", "ex:C"]),
+        "{got}"
+    );
+}

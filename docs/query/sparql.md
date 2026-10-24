@@ -290,7 +290,7 @@ SELECT ?x ?y ?z WHERE { ex:s ex:items (?x ?y ?z) }        # one solution
 - `ex:s ex:items ?o` binds `?o` to the head cell, a blank node, not to the members; `?s ?p ?o` and `COUNT(*)` count the owner edge and two triples per member.
 - A cell's blank node (`_:l0-0`, …) names it only within the result that returned it.
 - CONSTRUCT, DESCRIBE and a Graph Store `GET` write a list as `( … )` in Turtle and as `{"@list": [...]}` in JSON-LD, so a graph read and written back is unchanged.
-- JSON-LD queries keep Fluree's view, where the members are the values of their property: `{"@id": "ex:s", "ex:items": "?x"}` binds each member.
+- JSON-LD queries keep Fluree's view, where the members are the values of their property: `{"@id": "ex:s", "ex:items": "?x"}` binds each member. For a list stored as its triples (see [Lists](#lists) in updates), a JSON-LD crawl shows the members, but a `where` clause binds the list's head.
 - A query over a dataset spanning several ledgers, and a history query, see the members as values.
 
 ## Query Modifiers
