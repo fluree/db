@@ -90,9 +90,9 @@ pub use parse::{
     Placement, RdfText, RdfTextSummary,
 };
 pub use parse::{
-    might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,
-    parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta,
-    RawTriple, TrigPhase1Result,
+    is_empty_document, might_contain_graph_block, parse_graph_insert, parse_sync_transaction,
+    parse_transaction, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm,
+    RawTrigMeta, RawTriple, TrigPhase1Result,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{

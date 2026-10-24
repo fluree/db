@@ -23,6 +23,8 @@ mod it_export_lists;
 mod it_jsonld_empty_list;
 #[path = "it_list_identity.rs"]
 mod it_list_identity;
+#[path = "it_overflow_iri_delete_index.rs"]
+mod it_overflow_iri_delete_index;
 #[path = "it_raw_txn_parallel_upload.rs"]
 mod it_raw_txn_parallel_upload;
 #[path = "it_rdf_text_parity.rs"]
