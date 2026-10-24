@@ -380,11 +380,15 @@ pub struct MaterializeOptions {
 /// from a positional return, and dropping it reintroduces the watermark-staleness
 /// failure it exists to prevent.
 pub struct MaterializeScan {
-    /// The source's current snapshot — the new watermark to persist. `None` when
-    /// the table has no snapshots at all (nothing to materialize). A pinned read
-    /// reports its pin, and a Delta read the table version it read.
+    /// The source's current snapshot — the new watermark to persist, unless
+    /// [`Self::stopped_at`] is set, which then is. `None` when the table has no
+    /// snapshots at all (nothing to materialize). A pinned read reports its
+    /// pin, and a Delta read the table version it read.
     pub to_snapshot_id: Option<i64>,
-    /// Whether an added-files scan was used, rather than a full read.
+    /// Whether the pass read only what changed after its window start, rather
+    /// than the table whole: an Iceberg added-files scan, whose rows are all
+    /// additions, or a Delta change feed, whose rows also retract. Check
+    /// [`Self::change_feed`] before treating every row as an addition.
     pub incremental: bool,
     /// Wall-clock span of the window, from Iceberg snapshot timestamps: how far the
     /// stored watermark now lags the current snapshot. `None` on a first run (no
