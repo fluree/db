@@ -86,19 +86,12 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
     cpus.min(num_files.max(1)).clamp(1, 32)
 }
 
-/// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
-/// catalog client cache. A config *edit* (including a secret written inline)
-/// yields a new fingerprint and a freshly built client. Note this hashes the raw
-/// JSON only: a secret referenced by env var / secret store is stored as that
-/// reference, so rotating the underlying secret leaves the fingerprint unchanged
-/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
-/// fingerprint, is what bounds staleness in that case.
-/// The R2RML mapping reference carried by a mapped graph-source record, per
-/// source family. `None` for a non-mapped type, an unparseable config, or a
-/// record registered without a mapping.
-/// The Iceberg-only paths (snapshot pinning, incremental materialization,
-/// tracking) parse the record as `IcebergGsConfig`; a SQL record would fail
-/// that parse with a misleading message. Refuse it by name instead.
+/// The Iceberg-only paths (materialization, tracking, the collecting
+/// incremental scan) parse the record as `IcebergGsConfig`; a SQL or Delta
+/// record would fail that parse with a misleading message. Refuse it by name
+/// instead. A Delta source is pinned and read whole before reaching these: see
+/// [`FlureeR2rmlProvider::current_snapshot_id`] and
+/// [`FlureeR2rmlProvider::scan_for_materialize_stream`].
 fn require_iceberg_backed(
     record: &fluree_db_nameservice::GraphSourceRecord,
     graph_source_id: &str,
@@ -122,6 +115,9 @@ fn require_iceberg_backed(
     Ok(())
 }
 
+/// The R2RML mapping reference carried by a mapped graph-source record, per
+/// source family. `None` for a non-mapped type, an unparseable config, or a
+/// record registered without a mapping.
 pub(crate) fn mapping_source_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> Option<fluree_db_iceberg::config::MappingSource> {
@@ -209,6 +205,13 @@ pub(crate) fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> 
     Ok(())
 }
 
+/// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
+/// catalog client cache. A config *edit* (including a secret written inline)
+/// yields a new fingerprint and a freshly built client. Note this hashes the raw
+/// JSON only: a secret referenced by env var / secret store is stored as that
+/// reference, so rotating the underlying secret leaves the fingerprint unchanged
+/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
+/// fingerprint, is what bounds staleness in that case.
 fn config_fingerprint(config: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -365,7 +368,8 @@ fn int_pushdown_literal(
 /// failure it exists to prevent.
 pub struct MaterializeScan {
     /// The source's current snapshot — the new watermark to persist. `None` when
-    /// the table has no snapshots at all (nothing to materialize).
+    /// the table has no snapshots at all (nothing to materialize). A pinned read
+    /// reports its pin, and a Delta read the table version it read.
     pub to_snapshot_id: Option<i64>,
     /// Whether an added-files scan was used, rather than a full read.
     pub incremental: bool,
@@ -375,7 +379,8 @@ pub struct MaterializeScan {
     /// both of which mean "persist regardless".
     pub window_age_ms: Option<i64>,
     /// The highest source COMMIT SEQUENCE this pass covers, when the pass was cut
-    /// short by the row budget — and `None` when it covers the whole plan.
+    /// short by the row budget — and `None` when it covers the whole plan, which
+    /// a pinned read always does.
     ///
     /// That distinction is the point of the field, and inverting it is silent data
     /// loss. `Some(s)` means the target will hold only a PREFIX of the window, so
@@ -1793,12 +1798,20 @@ impl<'a> FlureeR2rmlProvider<'a> {
     }
 
     /// The source table's current snapshot id (the materialization "to" point),
-    /// or `None` if the table has no snapshots yet.
+    /// or `None` if the table has no snapshots yet. For a Delta source, the
+    /// table's latest version.
     pub async fn current_snapshot_id(
         &self,
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<Option<i64>> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .latest_version(self.fluree, table_name)
+                .await
+                .map(Some);
+        }
         let (_storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
@@ -1954,14 +1967,22 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// **never** a fall-forward: the from-side fall-forward below is a
     /// deliberate freshness/correctness trade a sync-to-head consumer wants,
     /// but silently moving a caller's `to` pin would change what the caller
-    /// asked to read.
+    /// asked to read. For the same reason a pinned read is never cut by the
+    /// per-pass row budget: that budget paces the tracking worker's unpinned
+    /// passes, and a prefix of a pin is a state the caller did not ask for.
     ///
-    /// Returns `(to_snapshot_id, incremental, batches)`:
+    /// **Delta sources** read the selected table version whole (`to` names a
+    /// version, `None` the latest), ignoring `from_snapshot_id` and
+    /// `from_sequence`: there is no incremental Delta read yet, and a full read
+    /// is correct for any window.
+    ///
+    /// Returns a [`MaterializeScan`]:
     /// - `to_snapshot_id` — the resolved snapshot id of this read (the new
     ///   watermark to persist), or `None` if the table has no snapshots yet
     ///   (nothing to materialize; only possible when the caller didn't pin).
     /// - `incremental` — whether an added-files-only scan was used (vs a full
     ///   read of the live table state).
+    /// - `to_sequence` — set only when an unpinned pass was cut short.
     ///
     /// An incremental scan is used when `from_snapshot_id` is set **and** the
     /// window `(from, to]` is incremental-safe — only `append`/`replace`
@@ -2003,6 +2024,12 @@ impl<'a> FlureeR2rmlProvider<'a> {
         to_snapshot_id: Option<i64>,
         from_sequence: Option<i64>,
     ) -> QueryResult<MaterializeScan> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .materialize_scan(self.fluree, table_name, projection, to_snapshot_id)
+                .await;
+        }
         let (storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
@@ -2069,7 +2096,10 @@ impl<'a> FlureeR2rmlProvider<'a> {
             ),
         }
 
-        let budget_rows = self.pass_row_budget();
+        // A pinned read is never cut, on every path. `0` is the disabled budget:
+        // neither full-read cut below takes a prefix under it, and the
+        // incremental cap is skipped for a pin outright.
+        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
 
         // An UNPINNED incremental window is read in bounded steps.
         //

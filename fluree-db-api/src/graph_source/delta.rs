@@ -3,7 +3,8 @@
 //! Registration stores the mapping and publishes a `GraphSourceType::Delta`
 //! record; at query time [`DeltaSource`] serves the R2RML provider's scans. A
 //! table is resolved to one version the first time a query touches it and
-//! every later scan or count in that query reads the same version.
+//! every later scan or count in that query reads the same version. A
+//! materialize read resolves its own version on every call.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -427,13 +428,6 @@ impl DeltaSource {
         table_name: &str,
         pin: Option<SourceTime>,
     ) -> QueryResult<DeltaSnapshot> {
-        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
-            return Err(QueryError::InvalidQuery(format!(
-                "Graph source '{}': rr:sqlQuery logical tables are only supported by SQL \
-                 graph sources",
-                self.graph_source_id
-            )));
-        }
         let cell = Arc::clone(
             self.snapshots
                 .lock()
@@ -471,6 +465,38 @@ impl DeltaSource {
         table_name: &str,
         pin: Option<SourceTime>,
     ) -> QueryResult<DeltaSnapshot> {
+        let (placement, table, snapshot) = self.replay(fluree, table_name, pin).await?;
+        let located = match &placement {
+            Placement::Path(location) => location.as_str(),
+            Placement::Unity(_) => table.location(),
+        };
+
+        session.record_snapshot(
+            IcebergCatalogSession::snapshot_key(&self.graph_source_id, table_name),
+            TableWatermark {
+                metadata_location: format!("{}@v{}", located, snapshot.version()),
+                snapshot_id: i64::try_from(snapshot.version()).ok(),
+                sequence_number: None,
+            },
+        );
+        Ok(snapshot)
+    }
+
+    /// `table_name` replayed to `pin`, outside the per-query memo that
+    /// [`Self::snapshot`] keeps.
+    async fn replay(
+        &self,
+        fluree: &crate::Fluree,
+        table_name: &str,
+        pin: Option<SourceTime>,
+    ) -> QueryResult<(Placement, DeltaTable, DeltaSnapshot)> {
+        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Err(QueryError::InvalidQuery(format!(
+                "Graph source '{}': rr:sqlQuery logical tables are only supported by SQL \
+                 graph sources",
+                self.graph_source_id
+            )));
+        }
         let placement = self
             .config
             .placement(table_name)
@@ -489,20 +515,40 @@ impl DeltaSource {
             .snapshot(version_selector(table_name, pin)?)
             .await
             .map_err(|e| self.query_error(table_name, e))?;
-        let located = match &placement {
-            Placement::Path(location) => location.as_str(),
-            Placement::Unity(_) => table.location(),
-        };
+        Ok((placement, table, snapshot))
+    }
 
-        session.record_snapshot(
-            IcebergCatalogSession::snapshot_key(&self.graph_source_id, table_name),
-            TableWatermark {
-                metadata_location: format!("{}@v{}", located, snapshot.version()),
-                snapshot_id: i64::try_from(snapshot.version()).ok(),
-                sequence_number: None,
-            },
-        );
-        Ok(snapshot)
+    /// The latest version of `table_name`, as a materialize consumer's pin.
+    pub(crate) async fn latest_version(
+        &self,
+        fluree: &crate::Fluree,
+        table_name: &str,
+    ) -> QueryResult<i64> {
+        let (_, _, snapshot) = self.replay(fluree, table_name, None).await?;
+        version_id(table_name, snapshot.version())
+    }
+
+    /// `table_name` at `version` (`None` = latest), read whole.
+    ///
+    /// Not through [`Self::snapshot`]: a materialize consumer reads one table at
+    /// several versions through one provider, and that memo would answer every
+    /// later pin with the first version resolved.
+    pub(crate) async fn materialize_scan(
+        &self,
+        fluree: &crate::Fluree,
+        table_name: &str,
+        projection: &[String],
+        version: Option<i64>,
+    ) -> QueryResult<super::r2rml::MaterializeScan> {
+        let pin = version.map(SourceTime::SnapshotId);
+        let (_, _, snapshot) = self.replay(fluree, table_name, pin).await?;
+        Ok(super::r2rml::MaterializeScan {
+            to_snapshot_id: Some(version_id(table_name, snapshot.version())?),
+            incremental: false,
+            window_age_ms: None,
+            to_sequence: None,
+            stream: self.stream(&snapshot, table_name, projection, &[])?,
+        })
     }
 
     /// The pinned version's row count from the log, when it provably equals a
@@ -532,6 +578,16 @@ impl DeltaSource {
         pin: Option<SourceTime>,
     ) -> QueryResult<ColumnBatchStream> {
         let snapshot = self.snapshot(fluree, session, table_name, pin).await?;
+        self.stream(&snapshot, table_name, projection, filters)
+    }
+
+    fn stream(
+        &self,
+        snapshot: &DeltaSnapshot,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
         let filters: Vec<ColumnFilter> = filters.iter().filter_map(column_filter).collect();
         info!(
             graph_source_id = %self.graph_source_id,
@@ -622,6 +678,15 @@ fn version_selector(
                 }
             })?)
         }
+    })
+}
+
+/// A Delta version as the snapshot id the materialize API carries.
+fn version_id(table_name: &str, version: u64) -> QueryResult<i64> {
+    i64::try_from(version).map_err(|_| {
+        QueryError::Internal(format!(
+            "Delta table '{table_name}': version {version} does not fit a snapshot id"
+        ))
     })
 }
 

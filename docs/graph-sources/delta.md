@@ -448,7 +448,10 @@ source at two different states in one query is rejected, as for
   local filesystem. Azure sovereign clouds are not addressable.
 - **`ORDER BY … LIMIT`** is not pushed down; see [Performance](#performance).
 - **Materialization and tracking** (`fluree materialize`, `fluree track`) are
-  not available for Delta sources.
+  not available for Delta sources. In Rust, a table can be pinned and read
+  whole as for Iceberg: `FlureeR2rmlProvider::current_snapshot_id` returns its
+  latest version, and `scan_for_materialize_stream` reads the version it is
+  given. There is no incremental read yet, so every such read is a whole one.
 - **Nested types** cannot be mapped.
 - **Catalogs**: Unity Catalog is the catalog that is browsed and generated
   from. Tables addressed by path have no catalog to list; a mapping over them
