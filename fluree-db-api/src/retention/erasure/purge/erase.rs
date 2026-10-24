@@ -15,7 +15,7 @@ use fluree_db_nameservice::NsRecord;
 use fluree_db_query::binary_scan::encode_stored_object;
 
 use super::Captured;
-use crate::{ApiError, Fluree, Result};
+use crate::{ApiError, Fluree, IndexingMode, Result};
 
 /// What erasing leaf by leaf did.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +39,19 @@ impl Fluree {
         record: &NsRecord,
         captured: &[Captured],
     ) -> Result<Erased> {
+        // Held against indexing, as a reindex is: a build begun from the
+        // root being erased would publish its events again over this one.
+        let _maintenance = match &self.indexing_mode {
+            IndexingMode::Background(handle) => {
+                Some(crate::admin::hold_branch_quiesced(handle, &record.ledger_id).await?)
+            }
+            IndexingMode::Disabled => None,
+        };
+        // As the quiesced builds left it.
+        let Some(record) = self.nameservice().lookup(&record.ledger_id).await? else {
+            return Ok(Erased::Nothing);
+        };
+        let record = &record;
         let Some(root_id) = record.index_head_id.clone() else {
             return Ok(Erased::Nothing);
         };

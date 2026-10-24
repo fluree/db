@@ -3056,7 +3056,7 @@ mod tests {
 
 /// Take an exclusive maintenance hold on one branch, reporting a conflict
 /// rather than blocking when another operation already holds it.
-async fn hold_branch_quiesced<'a>(
+pub(crate) async fn hold_branch_quiesced<'a>(
     handle: &'a fluree_db_indexer::IndexerHandle,
     ledger_id: &'a LedgerId,
 ) -> Result<MaintenanceGuard> {

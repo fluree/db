@@ -560,3 +560,59 @@ async fn erasing_leaf_by_leaf_reads_as_a_rebuild() {
     let rebuilt = reads(&fluree).await;
     assert_eq!(leafwise, rebuilt);
 }
+
+/// Erasing leaf by leaf holds the branch against indexing, as a reindex
+/// does, so no build begun from the root being erased publishes over it:
+/// with the branch held by another maintenance operation, it refuses.
+#[tokio::test]
+async fn erasing_leaf_by_leaf_holds_the_branch_against_indexing() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .with_erasure(ErasureConfig {
+            prover: Arc::new(NativeProver::default()),
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build()
+        .unwrap();
+    fluree.create_ledger("t/held").await.unwrap();
+    let id = "t/held:main";
+    let ex = |s: &str| format!("http://example.org/{s}");
+    insert(
+        &fluree,
+        id,
+        json!({"@id": ex("alice"), ex("email"): "a@secret", ex("name"): "Alice"}),
+    )
+    .await;
+    erase(
+        &fluree,
+        id,
+        ErasureRequest {
+            matching: vec![FactSelector {
+                subject: ex("alice"),
+                predicate: ex("email"),
+                graph: None,
+                object: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    let plan = fluree.plan_purge(id).await.unwrap();
+    let captured = fluree.capture_erased(&plan).await.unwrap();
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let crate::IndexingMode::Background(handle) = &fluree.indexing_mode else {
+        panic!("background indexing");
+    };
+    let held = handle.hold_quiesced(&record.ledger_id).await.unwrap();
+    let refused = fluree.erase_from_index(&record, &captured).await;
+    assert!(
+        matches!(refused, Err(crate::ApiError::BranchConflict(_))),
+        "{refused:?}"
+    );
+    drop(held);
+    assert_eq!(
+        fluree.erase_from_index(&record, &captured).await.unwrap(),
+        super::erase::Erased::Leafwise
+    );
+}
