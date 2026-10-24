@@ -21,6 +21,7 @@
 //! assert_eq!(text.lines().count(), 3);
 //! ```
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -28,7 +29,7 @@ use fluree_graph_format::{
     format_jsonld_dataset, format_nquads, format_ntriples, format_trig, format_turtle,
     BlankNodePolicy, ContextPolicy, JsonLdFormatConfig, TypeHandling,
 };
-use fluree_graph_ir::GraphCollectorSink;
+use fluree_graph_ir::{GraphCollectorSink, Triple};
 use fluree_graph_turtle::{
     parse_nquads, parse_ntriples, parse_with_prefixes_base_options, Dialect, ParserOptions,
     TurtleError,
@@ -182,7 +183,8 @@ pub fn parse(text: &str, format: RdfFormat, base: Option<&str>) -> Result<Datase
         RdfFormat::NQuads => parse_nquads(text, &mut sink),
         RdfFormat::JsonLd => {
             read_jsonld(text, base, &mut sink)?;
-            let dataset = sink.into_dataset();
+            let mut dataset = sink.into_dataset();
+            lists_as_cells(&mut dataset);
             check_absolute(&dataset)?;
             return Ok(dataset);
         }
@@ -220,6 +222,82 @@ fn read_jsonld(
     }
     .map_err(|e| invalid(&e))?;
     fluree_graph_json_ld::adapter::to_graph_events(&expanded, sink).map_err(|e| invalid(&e))
+}
+
+/// JSON-LD reads a `@list` as positioned members, the form Fluree ingests.
+/// As RDF a list is a chain of `rdf:first`/`rdf:rest` cells, which the
+/// conformant Turtle reader produces for `( … )`, so each list is rewritten
+/// as its cells, labeled `bN` apart from the dataset's own blank nodes.
+fn lists_as_cells(dataset: &mut Dataset) {
+    use fluree_vocab::rdf;
+    let mut used = HashSet::new();
+    for (name, graph) in dataset.graphs() {
+        name.into_iter().for_each(|n| blank_labels(n, &mut used));
+        for t in graph.iter() {
+            blank_labels(&t.s, &mut used);
+            blank_labels(&t.o, &mut used);
+        }
+        for r in graph.reifications() {
+            blank_labels(&r.reifier, &mut used);
+            blank_labels(&r.triple.s, &mut used);
+            blank_labels(&r.triple.o, &mut used);
+        }
+    }
+    let mut n = 0;
+    let mut cell = || loop {
+        n += 1;
+        let label = format!("b{n}");
+        if used.insert(label.clone()) {
+            return Term::blank(label);
+        }
+    };
+    let (first, rest, nil) = (
+        Term::iri(rdf::FIRST),
+        Term::iri(rdf::REST),
+        Term::iri(rdf::NIL),
+    );
+    for graph in std::iter::once(&mut dataset.default).chain(dataset.named.values_mut()) {
+        if graph.iter().all(|t| t.list_index.is_none()) {
+            continue;
+        }
+        // Each owner's last cell; position 0 begins a list.
+        let mut open: HashMap<(Term, Term), Term> = HashMap::new();
+        let mut added = Vec::new();
+        for t in graph.iter_mut() {
+            let Some(index) = t.list_index.take() else {
+                continue;
+            };
+            let owner = (t.s.clone(), t.p.clone());
+            let this = cell();
+            match open.insert(owner.clone(), this.clone()) {
+                Some(prev) if index != 0 => {
+                    added.push(Triple::new(prev, rest.clone(), this.clone()))
+                }
+                prev => {
+                    if let Some(prev) = prev {
+                        added.push(Triple::new(prev, rest.clone(), nil.clone()));
+                    }
+                    added.push(Triple::new(owner.0, owner.1, this.clone()));
+                }
+            }
+            t.s = this;
+            t.p = first.clone();
+        }
+        for (_, last) in open {
+            added.push(Triple::new(last, rest.clone(), nil.clone()));
+        }
+        added.into_iter().for_each(|t| graph.add(t));
+    }
+}
+
+fn blank_labels(term: &Term, out: &mut HashSet<String>) {
+    match term {
+        Term::BlankNode(id) => {
+            out.insert(id.as_str().to_string());
+        }
+        Term::TripleTerm(parts) => parts.iter().for_each(|part| blank_labels(part, out)),
+        _ => {}
+    }
 }
 
 /// Refuse an IRI that JSON-LD expansion left relative: no RDF syntax can
@@ -456,8 +534,8 @@ mod tests {
             let text = serialize(&dataset, RdfFormat::JsonLd, &prefixes).unwrap();
             let mut again = parse(&text, RdfFormat::JsonLd, None).unwrap();
             again.canonicalize();
-            let nquads = |d: &Dataset| serialize(d, RdfFormat::NQuads, &PrefixMap::default());
-            assert_eq!(nquads(&again).unwrap(), nquads(&dataset).unwrap(), "{text}");
+            // A list written as `@list` keeps no labels for its cells.
+            assert!(isomorphic(&again, &dataset), "{text}");
         }
     }
 
