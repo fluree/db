@@ -398,8 +398,10 @@ performance, never query results.
 
 Under `f:PlacementAuto`, small named graphs share one set of index trees,
 which keeps the index compact and makes queries across many graphs fast. A
-graph that grows large, or builds up a long history of changes, moves to
-trees of its own.
+graph that grows past 4,096 live rows, or past 16,384 history entries, moves
+to trees of its own at the next index build. The `FLUREE_POOL_MAX_GRAPH_ROWS`
+and `FLUREE_POOL_MAX_GRAPH_HISTORY` environment variables change those
+bounds (see [Configuration](../operations/configuration.md)).
 
 Writes to shared graphs keep one of those trees current at every build; the
 others take the build's changes as a small delta and fold it in periodically,
