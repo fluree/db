@@ -1094,3 +1094,56 @@ async fn jsonld_reads_a_list_stored_as_triples_as_its_members() {
         "{got}"
     );
 }
+
+/// A FILTER or BIND in the group of a list-view pattern applies to its list
+/// triples too, and its stored triples still hide the members: the block is
+/// planned with the FILTER, not as a plain triple. From novelty and the index.
+#[tokio::test]
+async fn a_filter_or_bind_beside_a_list_view_pattern() {
+    let ttl = "ex:s ex:name \"s\" ; ex:items (10 20 30) ; ex:items 1 .";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let novelty = ledger_with(&fluree, "filter-novelty", ttl).await;
+    let indexed = indexed_ledger_with(&fluree, "filter-indexed", ttl).await;
+    for (lane, ledger) in [("novelty", &novelty), ("index", &indexed)] {
+        assert_eq!(
+            rows(
+                &fluree,
+                ledger,
+                "SELECT ?x WHERE { ex:s ex:items ?l . ?l rdf:first ?x FILTER(?x != 0) }"
+            )
+            .await,
+            [json!([10])],
+            "{lane}: a cell walk under a FILTER"
+        );
+        assert_eq!(
+            rows(
+                &fluree,
+                ledger,
+                "SELECT ?o WHERE { ex:s ex:items ?o FILTER(isLiteral(?o)) }"
+            )
+            .await,
+            [json!([1])],
+            "{lane}: the members are no values of their property"
+        );
+        assert_eq!(
+            rows(
+                &fluree,
+                ledger,
+                "SELECT ?y WHERE { ex:s ex:items ?l . ?l rdf:first ?x . BIND(?x + 1 AS ?y) }"
+            )
+            .await,
+            [json!([11])],
+            "{lane}: a BIND over a cell's member"
+        );
+        assert!(
+            rows(
+                &fluree,
+                ledger,
+                "SELECT DISTINCT ?s WHERE { ?s ex:name ?n . ?s ex:items ?o FILTER(?o > 5) }"
+            )
+            .await
+            .is_empty(),
+            "{lane}: a range FILTER on the list's property sees no member"
+        );
+    }
+}

@@ -1590,6 +1590,17 @@ fn build_single_pattern(
             // No chain context here: only a force-`On` override can fire the hash join.
             &HashJoinPlanner::new(None),
         )),
+        Pattern::ListView(lv) => Some(build_list_view_triple(
+            operator,
+            &lv.triple,
+            &lv.view,
+            &HashMap::new(),
+            None,
+            emit_mask_for_triple(&lv.triple, var_counts, protected_vars),
+            group_by,
+            planning,
+            &HashJoinPlanner::new(None),
+        )),
         _ => operator,
     }
 }
@@ -1917,10 +1928,14 @@ fn build_sequential_join_block(
         settled.unsettled = unsettled_vars(&triples[k + 1..], &folded[k + 1..], &guaranteed);
         let mut after = settled.clone();
         after.bound.extend(tp.produced_vars());
+        // A list-view triple's list triples join outside its scan, so nothing
+        // is evaluated inside the join: no fold, no inline FILTER or BIND.
+        // Pending ones apply above it, once their variables are bound.
+        let list_view = ctx.list_views.view_for(tp);
 
         // Later `?s <p> ?v . FILTER(range on ?v)` pairs answered as a semi-join
         // behind this step — see `RangeSemiJoinOperator`.
-        let folds = match base_vars.as_ref() {
+        let folds = match base_vars.as_ref().filter(|_| list_view.is_none()) {
             Some(base) => collect_range_semijoin_folds(
                 tp,
                 k,
@@ -1952,12 +1967,16 @@ fn build_sequential_join_block(
         // Build interleaved inline operators: eligible filters first, then binds
         // whose required vars are all available after this triple, interleaved
         // with the filters each bind unlocks.
-        let (inline_ops, remaining_binds, remaining_filters) = build_inline_ops(
-            pending_binds,
-            pending_filters,
-            after.clone(),
-            &pushdown.consumed_indices,
-        );
+        let (inline_ops, remaining_binds, remaining_filters) = if list_view.is_some() {
+            (Vec::new(), pending_binds, pending_filters)
+        } else {
+            build_inline_ops(
+                pending_binds,
+                pending_filters,
+                after.clone(),
+                &pushdown.consumed_indices,
+            )
+        };
         pending_binds = remaining_binds;
         pending_filters = remaining_filters;
 
@@ -2011,17 +2030,30 @@ fn build_sequential_join_block(
         });
 
         let emit = emit_mask_for_triple(tp, ctx.var_counts, ctx.protected_vars);
-        let op = build_scan_or_join(
-            operator,
-            tp,
-            &pushdown.object_bounds,
-            inline_ops,
-            join_live.as_deref(),
-            emit,
-            ctx.group_by,
-            ctx.planning,
-            &hash_planner,
-        );
+        let op = match list_view {
+            Some(view) => build_list_view_triple(
+                operator,
+                tp,
+                view,
+                &pushdown.object_bounds,
+                join_live.as_deref(),
+                emit,
+                ctx.group_by,
+                ctx.planning,
+                &hash_planner,
+            ),
+            None => build_scan_or_join(
+                operator,
+                tp,
+                &pushdown.object_bounds,
+                inline_ops,
+                join_live.as_deref(),
+                emit,
+                ctx.group_by,
+                ctx.planning,
+                &hash_planner,
+            ),
+        };
         let op: BoxedOperator = if folds.is_empty() {
             op
         } else {
@@ -4049,7 +4081,7 @@ fn collect_range_semijoin_folds(
     let mut folds: Vec<RangeSemiJoinFold> = Vec::new();
     let mut subject: Option<VarId> = None;
     for (j, tj) in triples.iter().enumerate().skip(k + 1) {
-        if folded[j] || tj.dtc.is_some() || !tj.p_bound() {
+        if folded[j] || tj.dtc.is_some() || !tj.p_bound() || ctx.list_views.view_for(tj).is_some() {
             continue;
         }
         let (Ref::Var(s), Term::Var(v)) = (&tj.s, &tj.o) else {
