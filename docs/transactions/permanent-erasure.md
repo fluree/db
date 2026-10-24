@@ -21,6 +21,8 @@ derived search indexes and scratch files.
   refused with `422`.
 - **What can be erased:** a commit's operations (assertions and retractions). Transaction metadata and
   the stored transaction documents cannot be redacted (see [Limits](#limits)).
+- **What is not erased:** IRIs. They are identifiers, so keep personal data out of them and use opaque
+  ids (`ex:user-8f3a…`, not `mailto:alice@example.org`). See [Limits](#limits).
 
 ## Requesting an erasure
 
@@ -115,8 +117,8 @@ resumes where an interrupted one stopped.
 1. **Indexes.** Every branch that holds an erased commit has its index rewritten without the erased
    events. Usually only the leaves that hold them are rewritten. The branch is rebuilt from the
    replacements instead when an erased value lives outside the leaves (a big number, vector, geometry,
-   full-text value or triple term), or when an IRI it names would be left unused. Full-text (BM25) and
-   vector indexes over such a branch are rebuilt from scratch. A soft-dropped ledger that holds an erased
+   full-text value or triple term). Full-text (BM25) and vector indexes over such a branch are rebuilt
+   from scratch. A soft-dropped ledger that holds an erased
    commit has its indexes deleted, and restoring it rebuilds them before it serves.
 2. **Grace.** The older indexes stay for 15 minutes (the index collector's minimum age), so queries
    reading them can finish. They are then released.
@@ -195,6 +197,9 @@ measurements.
 
 - **Until the purge completes**, the original commit files and index files built before publishing
   remain on disk, and no read path serves them.
+- **IRIs stay.** Erasing every fact about a subject, or a reference to a node, removes the facts. The
+  IRIs themselves stay in the index dictionaries, and their namespace prefixes stay in the ledger's
+  namespace table.
 - **Transaction documents are not redacted.** The stored transaction document of an affected commit
   holds the original request, and audit retrieval serves it until the purge deletes it whole.
 - **Transfers are refused.** Push, pull, clone, `.flpack` archives and pack exports refuse a ledger's

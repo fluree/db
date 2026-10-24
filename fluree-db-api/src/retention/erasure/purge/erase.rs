@@ -1,15 +1,10 @@
 //! Erasing from an index leaf by leaf: the erased events' history entries
 //! are dropped from the leaves holding them, and every other artifact kept.
 
-use std::collections::BTreeSet;
-
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{BinaryIndexStore, IndexRoot};
 use fluree_db_core::o_type::{DecodeKind, OType};
-use fluree_db_core::{
-    range, ContentStore as _, Flake, FlakeValue, IndexType, LedgerSnapshot, RangeMatch,
-    RangeOptions, RangeTest, Sid, SubjectId,
-};
+use fluree_db_core::{ContentStore as _, Flake, FlakeValue, LedgerSnapshot, SubjectId};
 use fluree_db_indexer::{erase_index_events, ErasedEvent, IndexerConfig};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_query::binary_scan::encode_stored_object;
@@ -26,8 +21,7 @@ pub(crate) enum Erased {
     /// rewritten.
     Leafwise,
     /// A value lives in a store leaf by leaf erasure does not rewrite: a
-    /// numeric, vector, geometry or full-text arena, a triple term, or the
-    /// subject dictionaries.
+    /// numeric, vector, geometry or full-text arena, or a triple term.
     NeedsRebuild,
 }
 
@@ -86,9 +80,6 @@ impl Fluree {
         if events.is_empty() {
             return Ok(Erased::Nothing);
         }
-        if orphans_an_iri(&state.snapshot, captured, record.index_t).await? {
-            return Ok(Erased::NeedsRebuild);
-        }
         let root_bytes = store.get(&root_id).await?;
         let root = IndexRoot::decode(&root_bytes)
             .map_err(|e| ApiError::internal(format!("index root {root_id}: {e}")))?;
@@ -136,71 +127,6 @@ fn leafwise(root: &IndexRoot, event: &RunRecordV2) -> bool {
         DecodeKind::StringDict | DecodeKind::JsonArena => root.term_dict.is_none() && !full_text,
         _ => true,
     }
-}
-
-/// Whether an erased event names an IRI, as its subject or its object, that
-/// no other indexed event uses: the subject dictionaries keep it.
-async fn orphans_an_iri(
-    snapshot: &LedgerSnapshot,
-    captured: &[Captured],
-    index_t: i64,
-) -> Result<bool> {
-    let erased: Vec<&Flake> = captured
-        .iter()
-        .map(|c| &c.flake)
-        .filter(|f| f.t <= index_t)
-        .collect();
-    let mut iris: Vec<&Sid> = Vec::new();
-    for flake in &erased {
-        iris.push(&flake.s);
-        if let FlakeValue::Ref(o) = &flake.o {
-            iris.push(o);
-        }
-    }
-    iris.sort();
-    iris.dedup();
-    let graphs: BTreeSet<u16> = std::iter::once(0)
-        .chain(snapshot.graph_registry.iter_entries().map(|(g, _)| g))
-        .collect();
-    // An event of another graph taken for an erased one only sends the
-    // holder to a rebuild.
-    let same = |a: &Flake, b: &Flake| {
-        (a.t, a.op) == (b.t, b.op) && a.s == b.s && a.p == b.p && a.o == b.o && a.dt == b.dt
-    };
-    for iri in iris {
-        let mut used = false;
-        'graphs: for &g_id in &graphs {
-            let uses = [
-                (IndexType::Spot, RangeMatch::subject(iri.clone())),
-                (
-                    IndexType::Opst,
-                    RangeMatch::new().with_object(FlakeValue::Ref(iri.clone())),
-                ),
-            ];
-            for (index, matching) in uses {
-                let found = range(
-                    snapshot,
-                    g_id,
-                    index,
-                    RangeTest::Eq,
-                    matching,
-                    RangeOptions {
-                        history_mode: true,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-                if found.iter().any(|f| !erased.iter().any(|e| same(e, f))) {
-                    used = true;
-                    break 'graphs;
-                }
-            }
-        }
-        if !used {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Where `flake` is in an index.

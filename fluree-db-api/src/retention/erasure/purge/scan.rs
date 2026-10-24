@@ -9,7 +9,7 @@ use std::sync::Arc;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{
     load_commit_by_id, range, ContentId, ContentStore, FlakeValue, IndexType, RangeMatch,
-    RangeOptions, RangeTest, Sid,
+    RangeOptions, RangeTest,
 };
 use fluree_db_nameservice::NsRecord;
 use serde::{Deserialize, Serialize};
@@ -75,23 +75,10 @@ impl Fluree {
         for (record, store) in self.dropped_holders(&commits).await? {
             holders.push((record, store, false));
         }
-        // The IRIs the erased events name, which the subject dictionaries
-        // hold while anything uses them.
-        let mut iris: Vec<&Sid> = Vec::new();
-        for c in captured {
-            iris.push(&c.flake.s);
-            if let FlakeValue::Ref(o) = &c.flake.o {
-                iris.push(o);
-            }
-        }
-        iris.sort();
-        iris.dedup();
-
         // What survives in the holders' histories, an erased commit read as
         // its replacement, whether or not its original's file is still
         // stored. What no history reaches is the garbage collector's.
         let mut in_use: Vec<&FlakeValue> = Vec::new();
-        let mut iris_in_use: HashSet<&Sid> = HashSet::new();
         let mut facts_in_use: Vec<FactKey> = Vec::new();
         let mut seen = HashSet::new();
         for (record, store, _) in &holders {
@@ -103,18 +90,6 @@ impl Fluree {
                 let commit = load_commit_by_id(store.as_ref(), &cid).await?;
                 next.extend(commit.parents.iter().cloned());
                 for (_, flake) in commit.occurrences() {
-                    let named = [Some(&flake.s), Some(&flake.p), Some(&flake.dt)]
-                        .into_iter()
-                        .chain([flake.g.as_ref()])
-                        .chain([match &flake.o {
-                            FlakeValue::Ref(o) => Some(o),
-                            _ => None,
-                        }]);
-                    for sid in named.flatten() {
-                        if let Some(iri) = iris.iter().find(|i| **i == sid) {
-                            iris_in_use.insert(iri);
-                        }
-                    }
                     let Some(c) = captured.iter().find(|c| c.flake.o == flake.o) else {
                         continue;
                     };
@@ -228,14 +203,6 @@ impl Fluree {
                     if held.is_some() && !in_use.contains(&&c.flake.o) {
                         dictionary.insert(record.ledger_id.to_string());
                     }
-                }
-            }
-            for iri in iris.iter().filter(|i| !iris_in_use.contains(*i)) {
-                let held = store
-                    .find_subject_id_by_parts(iri.namespace_code, &iri.name)
-                    .map_err(|e| ApiError::internal(format!("dictionary lookup: {e}")))?;
-                if held.is_some() {
-                    dictionary.insert(record.ledger_id.to_string());
                 }
             }
         }
