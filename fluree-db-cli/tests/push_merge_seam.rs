@@ -8,7 +8,8 @@
 //! complete commit history.
 //!
 //! The same harness checks that `fluree info` of a tracked ledger shows the
-//! config diagnostics the server reports.
+//! config diagnostics the server reports, and that `fluree pull` takes what
+//! a remote's journal gained without a commit.
 //!
 //! Like `track_headers_seam.rs`, this compiles only with the `server`
 //! feature, which is a default feature of this crate.
@@ -29,11 +30,52 @@ struct Server {
 }
 
 async fn start_server() -> Server {
+    serve(false).await
+}
+
+/// A server whose storage a token with `fluree.storage.all` replicates, as
+/// clone and pull do, and such a token, which may also read the raw
+/// commits of a ledger that suppresses history.
+async fn start_replicating_server() -> (Server, String) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use fluree_db_credential::{did_from_pubkey, sign_ed25519, SigningKey};
+
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let pubkey = key.verifying_key().to_bytes();
+    let header = json!({
+        "alg": "EdDSA",
+        "jwk": { "kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(pubkey) }
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let payload = json!({
+        "iss": did_from_pubkey(&pubkey),
+        "sub": "replica@example.com",
+        "exp": now + 3600,
+        "iat": now,
+        "fluree.storage.all": true,
+        "fluree.ledger.audit.all": true,
+        "fluree.identity": "ex:Replica"
+    });
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(payload.to_string())
+    );
+    let signature = URL_SAFE_NO_PAD.encode(sign_ed25519(&key, signing_input.as_bytes()));
+    (serve(true).await, format!("{signing_input}.{signature}"))
+}
+
+async fn serve(replicating: bool) -> Server {
     let storage = tempfile::tempdir().expect("tempdir");
     let cfg = ServerConfig {
         cors_enabled: false,
         indexing_enabled: false,
         storage_path: Some(storage.path().to_path_buf()),
+        storage_proxy_enabled: replicating,
+        storage_proxy_insecure_accept_any_issuer: replicating,
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
@@ -71,6 +113,29 @@ async fn fluree(home: &TempDir, args: &[&str]) -> String {
             String::from_utf8_lossy(&output.stderr),
         );
         String::from_utf8_lossy(&output.stdout).into_owned()
+    })
+    .await
+    .expect("join")
+}
+
+/// Run the CLI in `home` and assert that it fails. Returns its stderr.
+async fn fluree_fails(home: &TempDir, args: &[&str]) -> String {
+    let dir = home.path().to_path_buf();
+    let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+    tokio::task::spawn_blocking(move || {
+        let output = cargo_bin_cmd!("fluree")
+            .current_dir(&dir)
+            .env("HOME", &dir)
+            .env("NO_COLOR", "1")
+            .args(&args)
+            .output()
+            .expect("run fluree");
+        assert!(
+            !output.status.success(),
+            "fluree {args:?} succeeded\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
     })
     .await
     .expect("join")
@@ -207,4 +272,73 @@ async fn info_of_a_tracked_ledger_prints_config_diagnostics() {
     let info = fluree(&home, &["info", "mydb"]).await;
     assert!(info.contains("Config diagnostics:"), "{info}");
     assert!(info.contains("shapes present"), "{info}");
+}
+
+/// A pull from a remote whose commits the clone already has still takes
+/// what the remote's journal gained since, which no commit records: history
+/// the remote removed is refused here too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_with_no_new_commits_takes_the_journal() {
+    let (server, token) = start_replicating_server().await;
+    let client = reqwest::Client::new();
+    let ctx = json!({ "ex": "http://example.org/" });
+    for (path, body) in [
+        ("create", json!({ "ledger": "mydb" })),
+        (
+            "insert/mydb:main",
+            json!({ "@context": ctx, "@id": "ex:alice", "ex:email": "a@old" }),
+        ),
+        (
+            "upsert/mydb:main",
+            json!({ "@context": ctx, "@id": "ex:alice", "ex:email": "a@new" }),
+        ),
+    ] {
+        let response = client
+            .post(format!("{}/v1/fluree/{path}", server.url))
+            .json(&body)
+            .send()
+            .await
+            .expect(path);
+        assert!(response.status().is_success(), "{path} failed");
+    }
+    let remote = &server.state.fluree;
+    // A remote's ledger info reports its index's `t`.
+    remote
+        .reindex("mydb:main", fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+
+    let home = TempDir::new().unwrap();
+    fluree(&home, &["init"]).await;
+    fluree(
+        &home,
+        &["remote", "add", "origin", &server.url, "--token", &token],
+    )
+    .await;
+    fluree(&home, &["clone", "origin", "mydb"]).await;
+    let past = "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/email> ?o }";
+    let served = fluree(&home, &["query", "mydb", past, "--at", "1"]).await;
+    assert!(served.contains("a@old"), "{served}");
+
+    let removal = fluree_db_api::retention::RemovalRequest {
+        matching: vec![fluree_db_api::retention::FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(json!("a@old")),
+        }],
+        ..Default::default()
+    };
+    let before = remote.ledger("mydb:main").await.unwrap().t();
+    let receipt = remote
+        .remove_occurrences("mydb:main", removal)
+        .await
+        .unwrap();
+    assert_eq!(receipt.retracted_t, None, "no longer current: no commit");
+    assert_eq!(remote.ledger("mydb:main").await.unwrap().t(), before);
+
+    let pulled = fluree(&home, &["pull", "mydb"]).await;
+    assert!(pulled.contains("already up to date"), "{pulled}");
+    let refused = fluree_fails(&home, &["query", "mydb", past, "--at", "1"]).await;
+    assert!(refused.contains("history"), "{refused}");
 }

@@ -289,7 +289,7 @@ impl Fluree {
                 if let Some(flake) = decoded.at_slot(slot) {
                     captured.push(Captured {
                         flake: flake.clone(),
-                        current: false,
+                        current_until: None,
                     });
                 }
             }
@@ -345,8 +345,10 @@ pub(crate) struct SourceOver {
 #[derive(Clone, Debug)]
 pub(crate) struct Captured {
     pub(crate) flake: Flake,
-    /// An assertion the index still holds as current, not only in history.
-    pub(crate) current: bool,
+    /// For an assertion a holder had not retracted before its index: the
+    /// `t` of the retraction that ended it (`i64::MAX` while current). An
+    /// index built before then holds it as current, not only in history.
+    pub(crate) current_until: Option<i64>,
 }
 
 /// The properties `jobs` erase; `None`, any property, when one does not

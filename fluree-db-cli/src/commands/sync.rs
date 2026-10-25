@@ -70,22 +70,47 @@ async fn accept_pack(
         })
 }
 
-/// Refuses the erasures an origin's pack carries, which no designation
-/// covers, and remembers that it did: that history must not then be
-/// fetched object by object, past what it erases.
-#[derive(Default)]
-struct OriginReception {
+/// Takes an origin's pack journal, and refuses its erasures, which no
+/// designation covers, remembering that it did: that history must not then
+/// be fetched object by object, past what it erases.
+struct OriginReception<'a> {
+    fluree: &'a fluree_db_api::Fluree,
+    taken: fluree_db_api::retention::erasure::PackReception,
     refused: bool,
 }
 
+impl<'a> OriginReception<'a> {
+    fn new(fluree: &'a fluree_db_api::Fluree) -> Self {
+        OriginReception {
+            fluree,
+            taken: Default::default(),
+            refused: false,
+        }
+    }
+
+    /// Ready `ledger_id` for `head`, before it moves there: merge the
+    /// origin's journal into its own.
+    async fn accept(&mut self, ledger_id: &str, head: &fluree_db_core::ContentId) -> CliResult<()> {
+        self.fluree
+            .accept_pack(ledger_id, std::mem::take(&mut self.taken), head, false)
+            .await
+            .map(|_| ())
+            .map_err(|e| CliError::Config(format!("the pack's journal was not accepted: {e}")))
+    }
+}
+
 #[async_trait::async_trait]
-impl PackSink for OriginReception {
+impl PackSink for OriginReception<'_> {
     async fn frame(
         &mut self,
         frame: fluree_db_core::pack::PackFrame,
     ) -> std::result::Result<(), String> {
         if matches!(frame, fluree_db_core::pack::PackFrame::Manifest(_)) {
-            return Ok(());
+            return self
+                .fluree
+                .receive_pack_frame(&mut self.taken, frame)
+                .await
+                .map_err(|e| e.to_string());
         }
         self.refused = true;
         Err(
@@ -94,6 +119,62 @@ impl PackSink for OriginReception {
                 .to_string(),
         )
     }
+}
+
+/// What `remote`'s history gained, without a commit, since this copy has
+/// all of its commits: erasures, and its journal. A pack of no commits,
+/// whose head is the remote's, which must be in this copy's history.
+/// Returns the erased commits it brought.
+async fn pull_without_commits(
+    fluree: &fluree_db_api::Fluree,
+    client: &crate::remote_client::RemoteLedgerClient,
+    remote_ledger_id: &str,
+    ledger_id: &str,
+    local_head: &fluree_db_nameservice::RefValue,
+    remote: &fluree_db_nameservice_sync::RemoteConfig,
+    (storage, namespace): (
+        &Arc<dyn fluree_db_core::storage::Storage>,
+        &fluree_db_core::StorageNamespace,
+    ),
+) -> CliResult<usize> {
+    let failed = |e: String| CliError::Config(format!("pull failed (journal and erasures): {e}"));
+    let Some(head) = client
+        .fetch_ns_record(remote_ledger_id)
+        .await
+        .map_err(|e| failed(e.to_string()))?
+        .and_then(|ns| ns.commit_head_id)
+    else {
+        return Ok(0);
+    };
+    let held_here = local_head.id.as_ref() == Some(&head)
+        || fluree
+            .content_store(namespace)
+            .has(&head)
+            .await
+            .unwrap_or(false);
+    if !held_here {
+        return Ok(0);
+    }
+    let held = fluree
+        .held_erasure_digests()
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    let request = PackRequest::commits(vec![head.clone()], vec![head.clone()]).with_erasures(held);
+    // A server without packs has nothing to add.
+    let Some(response) = client
+        .fetch_pack_response(remote_ledger_id, &request)
+        .await
+        .map_err(|e| failed(e.to_string()))?
+    else {
+        return Ok(0);
+    };
+    let mut reception = Reception::new(fluree);
+    ingest_pack_stream_into(response, storage, namespace, Some(&mut reception))
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    Ok(accept_pack(fluree, ledger_id, reception, &head, remote)
+        .await?
+        .erased_commits)
 }
 
 /// Finish what an interrupted clone or pull left of its erasures.
@@ -415,7 +496,22 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     let _garbage_hold = hold_garbage(&fluree, &ledger_id).await?;
 
     if remote_t <= local_ref.t {
-        println!("{} '{}' is already up to date", "✓".green(), ledger_id);
+        let erased = pull_without_commits(
+            &fluree,
+            &client,
+            remote_ledger_id.as_str(),
+            ledger_id.as_str(),
+            &local_ref,
+            &remote_cfg,
+            (&storage, &namespace),
+        )
+        .await?;
+        println!(
+            "{} '{}' is already up to date{}",
+            "✓".green(),
+            ledger_id,
+            erased_note(erased)
+        );
         context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
         return Ok(());
     }
@@ -1707,7 +1803,7 @@ pub async fn run_clone_origin(
         .await
         .map_err(|e| CliError::Config(e.to_string()))?;
     let pack_request = pack_request.with_erasures(held.clone());
-    let mut reception = OriginReception::default();
+    let mut reception = OriginReception::new(&fluree);
     let used_pack = match fetcher.fetch_pack_response(&ledger_id, &pack_request).await {
         Ok(Some(response)) => {
             let mut body_stream = response.bytes_stream();
@@ -1766,6 +1862,7 @@ pub async fn run_clone_origin(
 
                     match ingest_result {
                         Ok(result) => {
+                            reception.accept(local_id.as_str(), &head_cid).await?;
                             commits_fetched = result.commits_stored;
                             index_artifacts_fetched = result.index_artifacts_stored;
                             let objects = result.commits_stored
@@ -2082,6 +2179,30 @@ async fn run_pull_via_origins(
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
 
     if remote_t <= local_ref.t {
+        // Its journal may have changed without a commit: a pack of none.
+        let held_here = local_ref.id.as_ref() == Some(&remote_head_cid)
+            || content_store.has(&remote_head_cid).await.unwrap_or(false);
+        let held = fluree
+            .held_erasure_digests()
+            .await
+            .map_err(|e| CliError::Config(e.to_string()))?;
+        let request =
+            PackRequest::commits(vec![remote_head_cid.clone()], vec![remote_head_cid.clone()])
+                .with_erasures(held);
+        let response = match held_here {
+            true => fetcher
+                .fetch_pack_response(ledger_id, &request)
+                .await
+                .map_err(|e| CliError::Config(format!("pull failed (journal since): {e}")))?,
+            false => None,
+        };
+        if let Some(response) = response {
+            let mut reception = OriginReception::new(&fluree);
+            ingest_pack_stream_into(response, &storage, &namespace, Some(&mut reception))
+                .await
+                .map_err(|e| CliError::Config(format!("pull failed (journal since): {e}")))?;
+            reception.accept(ledger_id, &remote_head_cid).await?;
+        }
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
         return Ok(());
     }
@@ -2121,7 +2242,7 @@ async fn run_pull_via_origins(
         PackRequest::commits(vec![remote_head_cid.clone()], have)
     }
     .with_erasures(held.clone());
-    let mut reception = OriginReception::default();
+    let mut reception = OriginReception::new(&fluree);
     match fetcher.fetch_pack_response(ledger_id, &pack_request).await {
         Ok(Some(response)) => {
             let mut body_stream = response.bytes_stream();
@@ -2179,6 +2300,7 @@ async fn run_pull_via_origins(
 
                     match ingest_result {
                         Ok(result) => {
+                            reception.accept(ledger_id, &remote_head_cid).await?;
                             let count = result.commits_stored;
                             let idx_count = result.index_artifacts_stored;
                             let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
@@ -2439,5 +2561,114 @@ mod tests {
         let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
         assert_eq!(bytes_of(to_import), [c2, c3]);
         assert!(merged.is_empty());
+    }
+
+    /// An origin's pack carries its journal, which the copy takes before its
+    /// head moves: history the origin removed is refused there too. An
+    /// erasure frame is refused, and remembered as refused.
+    #[tokio::test]
+    async fn an_origin_reception_takes_the_journal_and_refuses_erasures() {
+        use fluree_db_api::retention::{FactSelector, RemovalRequest};
+        use fluree_db_api::{ApiError, FlureeBuilder};
+        use fluree_db_core::pack::{decode_frame, read_stream_preamble, PackFrame};
+        use serde_json::json;
+
+        let ctx = json!({"ex": "http://example.org/"});
+        let there = tempfile::tempdir().unwrap();
+        let origin = FlureeBuilder::file(there.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        origin.create_ledger("t/origin").await.unwrap();
+        let id = "t/origin:main";
+        let t1 = origin
+            .graph(id)
+            .transact()
+            .insert(&json!({"@context": ctx, "@id": "ex:alice", "ex:email": "a@old"}))
+            .commit()
+            .await
+            .unwrap()
+            .receipt
+            .t;
+        origin
+            .graph(id)
+            .transact()
+            .upsert(&json!({"@context": ctx, "@id": "ex:alice", "ex:email": "a@new"}))
+            .commit()
+            .await
+            .unwrap();
+        let old = RemovalRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/email".into(),
+                graph: None,
+                object: Some(json!("a@old")),
+            }],
+            ..Default::default()
+        };
+        origin.remove_occurrences(id, old).await.unwrap();
+        let record = origin.nameservice().lookup(id).await.unwrap().unwrap();
+        let head = record.commit_head_id.clone().unwrap();
+        let handle = origin.ledger_cached(id).await.unwrap();
+        let request = PackRequest::commits(vec![head.clone()], vec![]).with_erasures(Vec::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        fluree_db_api::pack::stream_pack(&origin, &handle, &request, tx).await;
+        let mut pack = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            pack.extend(chunk.unwrap());
+        }
+
+        let here = tempfile::tempdir().unwrap();
+        let copy = FlureeBuilder::file(here.path().to_string_lossy().to_string())
+            .without_indexing()
+            .without_ledger_caching()
+            .build()
+            .unwrap();
+        copy.create_ledger("t/origin-copy").await.unwrap();
+        let copy_id = "t/origin-copy:main";
+        let namespace = local_namespace(&copy, copy_id).await.unwrap();
+        let storage = copy.backend().admin_storage_cloned().unwrap();
+        let mut reception = OriginReception::new(&copy);
+        let mut pos = read_stream_preamble(&pack).unwrap();
+        loop {
+            let (frame, used) =
+                decode_frame(&pack[pos..], fluree_db_core::pack::DEFAULT_MAX_PAYLOAD).unwrap();
+            pos += used;
+            match frame {
+                PackFrame::End => break,
+                PackFrame::Header(_) => {}
+                PackFrame::Data { cid, payload } => {
+                    fluree_db_nameservice_sync::ingest_pack_frame(
+                        &cid, &payload, &storage, &namespace,
+                    )
+                    .await
+                    .unwrap();
+                }
+                frame => reception.frame(frame).await.unwrap(),
+            }
+        }
+        reception.accept(copy_id, &head).await.unwrap();
+        let handle = copy.ledger_cached(copy_id).await.unwrap();
+        copy.set_commit_head(&handle, &head, record.commit_t)
+            .await
+            .unwrap();
+        let past = copy
+            .query_connection(&json!({
+                "@context": ctx,
+                "from": format!("{copy_id}@t:{t1}"),
+                "select": "?o",
+                "where": {"@id": "ex:alice", "ex:email": "?o"}
+            }))
+            .await;
+        assert!(
+            matches!(past, Err(ApiError::HistoryUnavailable(_))),
+            "{past:?}"
+        );
+
+        assert!(reception
+            .frame(PackFrame::Erasure(json!({})))
+            .await
+            .is_err());
+        assert!(reception.refused);
     }
 }

@@ -1401,7 +1401,8 @@ async fn packed(source: &Fluree, id: &str, request: &fluree_db_api::pack::PackRe
 }
 
 /// What a clone or pull does with a pack: store its objects in `ledger`'s
-/// folder, take its erasures and journal, then move the head to `head`.
+/// folder, take its erasures and journal, then move the head to `head`,
+/// unless it is there.
 async fn take_pack(
     receiver: &Fluree,
     ledger: &str,
@@ -1435,8 +1436,10 @@ async fn take_pack(
     let accepted = receiver
         .accept_pack(ledger, reception, head.0, erasure_authority)
         .await?;
-    let handle = receiver.ledger_cached(ledger).await?;
-    receiver.set_commit_head(&handle, head.0, head.1).await?;
+    if record.commit_head_id.as_ref() != Some(head.0) {
+        let handle = receiver.ledger_cached(ledger).await?;
+        receiver.set_commit_head(&handle, head.0, head.1).await?;
+    }
     Ok(accepted)
 }
 
@@ -1630,4 +1633,251 @@ async fn erased_history_needs_a_pack_that_takes_it() {
         .await
         .expect_err("a paginated export of erased history");
     assert_eq!(refused.status_code(), 501, "{refused}");
+}
+
+/// `source`'s pack of `id` from `want`, for a receiver at `have` holding the
+/// chains it holds, taken as a pull takes one, the head moving to `want`.
+async fn pull_to(
+    source: &Fluree,
+    id: &str,
+    receiver: &Fluree,
+    copy: &str,
+    want: (&ContentId, i64),
+    have: Vec<ContentId>,
+) -> fluree_db_api::retention::erasure::AcceptedPack {
+    let request = fluree_db_api::pack::PackRequest::commits(vec![want.0.clone()], have)
+        .with_erasures(receiver.held_erasure_digests().await.unwrap());
+    let pack = packed(source, id, &request).await;
+    take_pack(receiver, copy, &pack, want, true).await.unwrap()
+}
+
+/// A copy whose index holds a value as current, retracted in a commit it
+/// has not indexed, loses it when both are erased: the erased retraction no
+/// longer hides the indexed assertion, which goes as a retraction would
+/// take it, counts and all. Its purge then deletes the originals.
+#[tokio::test]
+async fn a_pull_erases_an_indexed_value_its_unindexed_retraction_hid() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/pull-hidden").await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = pulling(&here);
+    receiver.create_ledger("it/pull-hidden-copy").await.unwrap();
+    let copy = "it/pull-hidden-copy:main";
+    let (head, head_t) = head_of(&source, &id).await;
+    pull_to(&source, &id, &receiver, copy, (&head, head_t), Vec::new()).await;
+    reindex(&receiver, copy).await;
+
+    source
+        .graph(&id)
+        .transact()
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    let have = vec![head];
+    let (head, head_t) = head_of(&source, &id).await;
+    pull_to(&source, &id, &receiver, copy, (&head, head_t), have).await;
+    let record = receiver.nameservice().lookup(copy).await.unwrap().unwrap();
+    assert_eq!((record.index_t, record.commit_t), (1, 2));
+    assert!(objects(&receiver, copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+
+    erase_published(&source, &id, email("alice", "a@secret")).await;
+    let have = vec![head];
+    let (head, head_t) = head_of(&source, &id).await;
+    let accepted = pull_to(&source, &id, &receiver, copy, (&head, head_t), have).await;
+    assert_eq!(accepted.reconciled, [copy], "{accepted:?}");
+    assert!(objects(&receiver, copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&receiver, copy, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+    assert_eq!(email_stat(&receiver, copy).await, 1);
+    let report = receiver.run_purge_pass(copy, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A request's erasures can arrive a part at a time: a pull of history up
+/// to a commit brings the erasure of the commits before it, a later pull
+/// the rest. The job the first part made, already purged, takes the rest
+/// and purges again, deleting the originals a ledger here holds of them.
+#[tokio::test]
+async fn a_request_received_in_parts_purges_every_part() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/parts-source").await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let t2 = insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:name": "Carol"}),
+    )
+    .await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "b@secret"}),
+    )
+    .await;
+    let mut before = Vec::new();
+    source
+        .archive_ledger(&id, false, &mut before)
+        .await
+        .unwrap();
+    let alice = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: None,
+        }],
+        ..Default::default()
+    };
+    erase_published(&source, &id, alice).await;
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = pulling(&here);
+    let held = receiver
+        .restore_ledger("it/parts-held", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&receiver, &held).await;
+    receiver.create_ledger("it/parts-copy").await.unwrap();
+    let copy = "it/parts-copy:main";
+
+    let middle = chain(&source, &id)
+        .await
+        .into_iter()
+        .find(|(t, _)| *t == t2)
+        .unwrap()
+        .1;
+    let first = pull_to(&source, &id, &receiver, copy, (&middle, t2), Vec::new()).await;
+    assert_eq!(first.erased_commits, 1, "{first:?}");
+    assert_eq!(first.reconciled, [held.as_str()], "{first:?}");
+    let report = receiver
+        .run_purge_pass(&held, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+
+    let (head, head_t) = head_of(&source, &id).await;
+    let rest = pull_to(&source, &id, &receiver, copy, (&head, head_t), vec![middle]).await;
+    assert_eq!(rest.reconciled, [held.as_str()], "{rest:?}");
+    assert!(objects(&receiver, &held, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    let report = receiver
+        .run_purge_pass(&held, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "b@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// An erasure published after a copy has every commit of the history,
+/// which takes no new commit, reaches the copy by a pack of none: the
+/// copy pulled the request's commits while it was being proved, and the
+/// pack to the head it has brings the erasures of the commits it holds.
+#[tokio::test]
+async fn a_pack_of_no_commits_brings_erasures_published_since() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/since-source").await;
+    let t1 = insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = pulling(&here);
+    receiver.create_ledger("it/since-copy").await.unwrap();
+    let copy = "it/since-copy:main";
+    let (head, head_t) = head_of(&source, &id).await;
+    pull_to(&source, &id, &receiver, copy, (&head, head_t), Vec::new()).await;
+    reindex(&receiver, copy).await;
+
+    source
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    let have = vec![head];
+    let (head, head_t) = head_of(&source, &id).await;
+    pull_to(&source, &id, &receiver, copy, (&head, head_t), have).await;
+    reindex(&source, &id).await;
+    assert_eq!(source.run_erasure_pass(&id).await.unwrap().published, 1);
+    assert_eq!(head_of(&source, &id).await, (head.clone(), head_t));
+
+    let since = pull_to(
+        &source,
+        &id,
+        &receiver,
+        copy,
+        (&head, head_t),
+        vec![head.clone()],
+    )
+    .await;
+    // The assertion, and the removal's retraction.
+    assert_eq!(since.erased_commits, 2, "{since:?}");
+    assert_eq!(since.reconciled, [copy], "{since:?}");
+    let past = receiver
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{copy}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+    let report = receiver.run_purge_pass(copy, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
 }

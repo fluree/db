@@ -88,6 +88,20 @@ pub(crate) struct ErasureRuntime {
     /// Branches a restore rebuilt over an erased commit, whose replaced
     /// indexes are released once the ledger is visible.
     pub(crate) rebuilt_on_restore: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Per branch: held by a commit from its check until it publishes, and
+    /// exclusively by a reconciliation with received erasures.
+    fences:
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::RwLock<Reconciled>>>>,
+    /// Keys [`Reconciled`]'s hashes, so they do not stand for the values.
+    fact_keys: std::collections::hash_map::RandomState,
+}
+
+/// What reconciling a branch with received erasures took out of its
+/// current state, as keyed hashes, and the head it did so at.
+#[derive(Debug, Default)]
+pub(crate) struct Reconciled {
+    pub(crate) head: Option<fluree_db_core::ContentId>,
+    pub(crate) facts: std::collections::HashSet<u64>,
 }
 
 impl ErasureRuntime {
@@ -101,7 +115,23 @@ impl ErasureRuntime {
             purging: Default::default(),
             source_heads: tokio::sync::Mutex::new(()),
             rebuilt_on_restore: Default::default(),
+            fences: Default::default(),
+            fact_keys: Default::default(),
         }
+    }
+
+    pub(crate) fn fence(&self, branch: &str) -> Arc<tokio::sync::RwLock<Reconciled>> {
+        let mut fences = self.fences.lock();
+        if let Some(fence) = fences.get(branch) {
+            return fence.clone();
+        }
+        fences.entry(branch.to_string()).or_default().clone()
+    }
+
+    pub(crate) fn fact_hash(&self, flake: &fluree_db_core::Flake) -> u64 {
+        use std::hash::BuildHasher;
+        self.fact_keys
+            .hash_one(crate::retention::state::FactKey::of(flake))
     }
 }
 

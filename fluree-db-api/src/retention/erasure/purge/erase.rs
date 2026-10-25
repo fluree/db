@@ -102,7 +102,11 @@ impl Fluree {
         let mut erasure = IndexErasure::default();
         for c in captured.iter().filter(|c| c.flake.t <= record.index_t) {
             match indexed_record(&state.snapshot, index, &c.flake)? {
-                Indexed::At(indexed) if c.current => erasure.current.push(indexed),
+                Indexed::At(indexed)
+                    if c.current_until.is_some_and(|until| record.index_t < until) =>
+                {
+                    erasure.current.push(indexed);
+                }
                 Indexed::At(indexed) => erasure.events.push(ErasedEvent {
                     record: indexed,
                     assert: c.flake.op,

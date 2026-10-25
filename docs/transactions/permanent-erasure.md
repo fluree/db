@@ -231,7 +231,16 @@ The receiver takes them as a restore does ([Archives](#archives)): it checks the
 holding an original read as they do (the pulled ledger among them, with its own journal, index and
 search indexes, and nothing committed), then publishes them before the head moves. A pack request
 that does not ask for erasures is refused once the history holds one, so an older client never pulls
-past an erasure of history it holds.
+past an erasure of history it holds. A pull with no new commits still asks for a pack of none, so an
+erasure published after the receiver has every commit reaches it too.
+
+A transaction staged on a holder before an activation, and committed after it, is refused (`409`)
+when it retracts a value the activation took out of the current state: its commit would hold the
+value again. Commits wait while an activation checks and changes a holder. A request's erasures may
+arrive a part at a time, a fork's before its source's: the job the first part made takes the rest,
+and its purge runs again. With only soft-dropped ledgers holding the originals, the receiving
+ledger's purge deletes them; if a restore fails after publishing the erasures, that purge stays owed
+until the same ledger is restored again, or until no soft-dropped ledger holds an original.
 
 A clone or pull that stops partway completes at the next clone or pull from the CLI, or when a
 server on this storage next runs its retention worker. Without a ledger cache, as the CLI runs, a

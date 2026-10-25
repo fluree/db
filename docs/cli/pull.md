@@ -20,7 +20,7 @@ fluree pull [OPTIONS] [LEDGER]
 Downloads new commits from the configured upstream and applies them to the local ledger:
 
 1. Queries the remote for its current head (`t` and commit ContentId)
-2. Compares with the local head; exits early if already up to date
+2. Compares with the local head. When the local ledger already has every commit, it still asks the pack protocol for what the remote gained without a commit (its removal journal, and erasures of history the ledger holds), then exits
 3. Attempts bulk download of missing commits (and by default **index artifacts**) via the **pack protocol** (single streaming request)
 4. Falls back to paginated JSON export if the server does not support pack. The export sends the branch's first-parent line and, separately, the commits its merges brought in. A server too old to export that way can still serve a history without merges.
 5. Stores all commit and transaction blobs to local CAS
@@ -44,9 +44,11 @@ storage already holds; the remote sends every other erasure of the history, incl
 commits this ledger already has. Before the local head moves, the ledger (and any other ledger here
 holding the originals) reads as the erasures do: the values leave its index and history, with nothing
 committed to it, and its purge later deletes the originals. A pull that stops partway completes at the
-next clone or pull, or when a server on this storage next runs its retention worker. The paginated
-export and an origin-based pull refuse erased history. The ledger's removal journal arrives with any
-pack.
+next clone or pull, or when a server on this storage next runs its retention worker. An erasure
+published after the ledger has every commit arrives with the next pull all the same, since a pull with
+no new commits still asks for one. The paginated export and an origin-based pull refuse erased
+history. The ledger's removal journal arrives with any pack, an origin's included; the object-by-object
+fallback of an origin-based pull carries none.
 
 ### Origin-based pull
 

@@ -2572,6 +2572,7 @@ impl Fluree {
                 Some(
                     self.receive_erasures(
                         erasures,
+                        crate::retention::erasure::transfer::Receiver::Restored(new_ledger_id),
                         &namespace,
                         content.as_ref(),
                         &commit_cid,
@@ -2679,7 +2680,7 @@ impl Fluree {
         let reconciled = match received {
             Some(received) => {
                 let head_t = retracted_t.unwrap_or(commit_t);
-                self.record_received_jobs(record, head_t, received.jobs)
+                self.record_received_jobs(record, head_t, received.jobs, received.pending)
                     .await?;
                 received.reconciled
             }

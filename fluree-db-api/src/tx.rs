@@ -3938,6 +3938,8 @@ impl crate::Fluree {
                 .map_err(fluree_db_transact::TransactError::from)?;
         }
 
+        #[cfg(feature = "native")]
+        let _reconciliation = self.hold_against_reconciliation(&view).await?;
         let content_store = self.content_store(&view.base().storage_namespace());
         let publisher = self.publisher()?;
         let (receipt, ledger) = commit_txn(

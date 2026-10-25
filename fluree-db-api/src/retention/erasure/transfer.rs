@@ -435,20 +435,13 @@ impl Fluree {
             let received = self
                 .receive_erasures(
                     received,
+                    Receiver::Live(ledger_id.as_str()),
                     &record.storage_namespace(),
                     history.as_ref(),
                     head,
                     journal.as_ref().map(|j| &j.journal),
                 )
                 .await?;
-            if !received.jobs.is_empty() {
-                registry::update(self.publisher()?, ledger_id.as_str(), |current| {
-                    let mut next = current.cloned().unwrap_or_default();
-                    add_jobs(&mut next, &received.jobs).then_some(next)
-                })
-                .await?;
-                self.retention.mark_active(ledger_id.as_str());
-            }
             accepted.reconciled = received.reconciled;
         }
         if let Some(journal) = journal {
@@ -461,6 +454,38 @@ impl Fluree {
 }
 
 impl Fluree {
+    /// Hold `view`'s branch against reconciliation with received erasures
+    /// until its commit publishes. Refused: a transaction staged before one,
+    /// at the head it left, that retracts a value it took out of the current
+    /// state; its commit would hold the erased value again.
+    pub(crate) async fn hold_against_reconciliation(
+        &self,
+        view: &fluree_db_ledger::StagedLedger,
+    ) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<super::Reconciled>>> {
+        let Some(runtime) = self.retention.erasure.get() else {
+            return Ok(None);
+        };
+        let base = view.base();
+        let held = runtime.fence(base.ledger_id().as_str()).read_owned().await;
+        if held.head.is_some()
+            && held.head == base.head_commit_id
+            && view
+                .staged_flakes()
+                .iter()
+                .any(|f| !f.op && held.facts.contains(&runtime.fact_hash(f)))
+        {
+            return Err(ApiError::http(
+                409,
+                format!(
+                    "this transaction was staged before {} received an erasure of a value \
+                     it retracts; stage it again",
+                    base.ledger_id()
+                ),
+            ));
+        }
+        Ok(Some(held))
+    }
+
     /// Refuse to export, page by page, a history holding an erased commit:
     /// only a pack carries erasures, and a receiver already holding one of
     /// those commits would go on serving what it erased.
@@ -636,11 +661,14 @@ impl Fluree {
     /// verify each chain and check each step against its authorization,
     /// refusing a chain that differs from one this storage holds; reconcile
     /// every ledger here holding a newly erased original (see
-    /// [`Self::reconcile_holders`]); then publish the chains, `namespace`
-    /// reading each commit as its replacement.
+    /// [`Self::activate`]); then publish the chains, `namespace` reading
+    /// each commit as its replacement. `receiver`, the ledger the history
+    /// goes to, takes their purge when only soft-dropped ledgers here hold
+    /// the originals.
     pub(crate) async fn receive_erasures(
         &self,
         received: Received,
+        receiver: Receiver<'_>,
         namespace: &StorageNamespace,
         history: &dyn ContentStore,
         head: &ContentId,
@@ -723,31 +751,28 @@ impl Fluree {
         }
         let prepared = self.prepare_holders(&newly).await?;
         let jobs = received_jobs(&newly, &controls, &prepared);
-        // Ledgers here change before the erasures publish: an activation
-        // that stops between completes from its record. One whose only
-        // holders are soft-dropped changes nothing here, and its jobs go to
-        // the restored ledger.
-        let (activation, restored_jobs) = match prepared.holders.is_empty() {
-            true => (Activation::new(&received, Vec::new()), jobs),
-            false => {
-                // Each holding ledger's purge, run from its root branch when
-                // that holds one.
-                let mut ledgers: BTreeMap<&str, &fluree_db_nameservice::NsRecord> = BTreeMap::new();
-                for holder in &prepared.holders {
-                    let record = &holder.record;
-                    let chosen = ledgers.entry(record.ledger_id.name()).or_insert(record);
-                    if record.source_branch.is_none() {
-                        *chosen = record;
-                    }
-                }
-                let placed = ledgers
-                    .values()
-                    .flat_map(|r| jobs.iter().map(|j| (r.ledger_id.to_string(), j.clone())))
-                    .collect();
-                (Activation::new(&received, placed), Vec::new())
+        // Each holding ledger's purge, run from its root branch when that
+        // holds one; with only soft-dropped ledgers holding the originals,
+        // the receiver's.
+        let mut hosts: BTreeMap<&str, &str> = BTreeMap::new();
+        for holder in &prepared.holders {
+            let id = &holder.record.ledger_id;
+            let chosen = hosts.entry(id.name()).or_insert(id.as_str());
+            if holder.record.source_branch.is_none() {
+                *chosen = id.as_str();
             }
-        };
-        let pending = match prepared.holders.is_empty() {
+        }
+        if hosts.is_empty() {
+            hosts.insert("", receiver.ledger_id());
+        }
+        let placed = hosts
+            .values()
+            .flat_map(|host| jobs.iter().map(|j| (host.to_string(), j.clone())))
+            .collect();
+        let activation = Activation::new(&received, placed);
+        // Ledgers here change, and the erasures publish, only once this is
+        // recorded: an activation that stops completes from it.
+        let pending = match prepared.holders.is_empty() && activation.jobs.is_empty() {
             true => None,
             false => {
                 let id = activation.id();
@@ -757,6 +782,10 @@ impl Fluree {
                 Some(id)
             }
         };
+        let deferred = match receiver {
+            Receiver::Restored(id) => Some(id),
+            Receiver::Live(_) => None,
+        };
         let reconciled = self
             .activate(
                 prepared,
@@ -764,12 +793,20 @@ impl Fluree {
                 &activation,
                 Some(namespace),
                 pending.as_deref(),
+                deferred,
             )
             .await?;
+        let jobs: Vec<_> = activation
+            .jobs
+            .into_iter()
+            .filter(|(host, _)| Some(host.as_str()) == deferred)
+            .map(|(_, job)| job)
+            .collect();
         Ok(ReceivedErasures {
             genesis,
             reconciled,
-            jobs: restored_jobs,
+            pending: pending.filter(|_| !jobs.is_empty()),
+            jobs,
         })
     }
 
@@ -815,14 +852,14 @@ impl Fluree {
     /// Lock and check every ledger here holding an original `newly` erases,
     /// writing nothing: see [`Self::activate`].
     ///
-    /// Each live branch whose history holds one is write-locked from here
-    /// until its index no longer holds an erased value as current: a
+    /// Each live branch whose history holds one is locked against commits
+    /// from here until it no longer holds an erased value as current: a
     /// transaction meanwhile could retract one, in a commit holding the
-    /// value that no prover here could erase. Refused: a branch whose
-    /// index does not cover the erased commits yet (retry once it does),
-    /// one whose own commit bounds an erased span, and one with a full-text
-    /// or vector index reading an erased property that cannot be rebuilt.
+    /// value that no prover here could erase. Refused: a branch whose own
+    /// commit bounds an erased span, and one with a full-text or vector
+    /// index reading an erased property that cannot be rebuilt.
     async fn prepare_holders(&self, newly: &[Newly<'_>]) -> Result<Prepared> {
+        let runtime = self.erasure_runtime()?;
         let cids: Vec<ContentId> = newly.iter().map(|n| n.cid.clone()).collect();
         let commits: Vec<String> = cids.iter().map(ToString::to_string).collect();
         let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
@@ -849,8 +886,14 @@ impl Fluree {
                 })
             })
             .collect();
-        for record in self.ledgers_holding(&cids, None).await? {
-            let guard = self.lock_ledger(&record.ledger_id).await?;
+        for listed in self.ledgers_holding(&cids, None).await? {
+            // The cache's lock first, as a commit through the cache takes
+            // them.
+            let guard = self.lock_ledger(&listed.ledger_id).await?;
+            let fence = runtime.fence(listed.ledger_id.as_str()).write_owned().await;
+            let Some(record) = self.nameservice().lookup(&listed.ledger_id).await? else {
+                continue;
+            };
             let held = guard
                 .as_ref()
                 .map(crate::ledger_manager::LedgerWriteGuard::clone_state);
@@ -864,6 +907,7 @@ impl Fluree {
                 record,
                 removal,
                 guard,
+                fence,
             });
         }
         let branches: BTreeSet<String> = prepared
@@ -915,8 +959,14 @@ impl Fluree {
     /// history of it; a value outside the leaves by a rebuild reading the
     /// received replacements. Its full-text and vector indexes that may read
     /// an erased property are rebuilt. Nothing is committed to it: a
-    /// retraction would hold the value. `pending`, the activation's record,
-    /// is deleted once it is complete.
+    /// retraction would hold the value. A transaction staged there before
+    /// is refused if it retracts a value it no longer holds as current (see
+    /// [`Self::hold_against_reconciliation`]).
+    ///
+    /// `pending`, the activation's record, is deleted once it is complete:
+    /// once every job is recorded, but those of `deferred`, a restored
+    /// ledger not yet visible, whose restore records them and then deletes
+    /// it.
     async fn activate(
         &self,
         prepared: Prepared,
@@ -924,8 +974,10 @@ impl Fluree {
         activation: &Activation,
         restoring: Option<&StorageNamespace>,
         pending: Option<&str>,
+        deferred: Option<&str>,
     ) -> Result<Vec<String>> {
-        let index = &self.erasure_runtime()?.index;
+        let runtime = self.erasure_runtime()?;
+        let index = &runtime.index;
         #[cfg(test)]
         hooks::stop(hooks::Stop::BeforeHolders)?;
         let replacements: Arc<HashMap<ContentId, Arc<[u8]>>> = Arc::new(
@@ -940,14 +992,29 @@ impl Fluree {
                 record,
                 removal,
                 mut guard,
+                mut fence,
             } = holder;
+            if fence.head != record.commit_head_id {
+                fence.head = record.commit_head_id.clone();
+                fence.facts.clear();
+            }
+            fence.facts.extend(
+                removal
+                    .flakes
+                    .iter()
+                    .zip(&removal.removals)
+                    .filter(|(flake, entry)| flake.op && entry.until_t.is_none())
+                    .map(|(flake, _)| runtime.fact_hash(flake)),
+            );
             let captured: Vec<Captured> = removal
                 .flakes
                 .iter()
                 .zip(&removal.removals)
                 .map(|(flake, entry)| Captured {
                     flake: flake.clone(),
-                    current: entry.until_t.is_none(),
+                    // Retracted since its index, an assertion is current
+                    // there: the erased retraction no longer hides it.
+                    current_until: flake.op.then(|| entry.until_t.unwrap_or(i64::MAX)),
                 })
                 .collect();
             let scope_t = removal.scope_t;
@@ -998,6 +1065,7 @@ impl Fluree {
                 None => {}
             }
             drop(guard);
+            drop(fence);
             reconciled.push(record.ledger_id.to_string());
         }
         self.rebuild_sources(&prepared.sources).await?;
@@ -1023,25 +1091,58 @@ impl Fluree {
                 }
             }
         }
+        // A purge, which recording a job may wait for, holds indexing.
+        drop(prepared.indexing);
         #[cfg(test)]
         hooks::stop(hooks::Stop::AfterPublish)?;
         let mut by_branch: BTreeMap<&str, Vec<super::ErasureJob>> = BTreeMap::new();
         for (branch, job) in &activation.jobs {
             by_branch.entry(branch).or_default().push(job.clone());
         }
+        let deferring = deferred.is_some_and(|d| by_branch.remove(d).is_some());
         for (branch, jobs) in by_branch {
-            registry::update(self.publisher()?, branch, |current| {
-                let mut next = current.cloned().unwrap_or_default();
-                add_jobs(&mut next, &jobs).then_some(next)
-            })
-            .await?;
-            self.retention.mark_active(branch);
+            self.record_jobs(branch, &jobs).await?;
         }
-        if let Some(id) = pending {
+        if let Some(id) = pending.filter(|_| !deferring) {
             index.complete_pending(id).await?;
         }
-        drop(prepared.indexing);
         Ok(reconciled)
+    }
+
+    /// Record `jobs` in `branch`'s registration (see [`add_jobs`]). A branch
+    /// gone since, a restored ledger whose restore failed after publishing,
+    /// takes none, once no soft-dropped ledger holds an original they purge.
+    async fn record_jobs(&self, branch: &str, jobs: &[super::ErasureJob]) -> Result<()> {
+        // A pass under way would mark a job that grew purged.
+        let _purging = self.erasure_runtime()?.purging.lock().await;
+        let recorded = registry::update(self.publisher()?, branch, |current| {
+            let mut next = current.cloned().unwrap_or_default();
+            add_jobs(&mut next, jobs).then_some(next)
+        })
+        .await;
+        match recorded {
+            Ok(_) => {
+                self.retention.mark_active(branch);
+                Ok(())
+            }
+            Err(ApiError::NotFound(_)) => {
+                let commits: Vec<&str> = jobs
+                    .iter()
+                    .flat_map(|j| j.commits.iter().map(|c| c.commit.as_str()))
+                    .collect();
+                match self.dropped_holders(&commits).await?.is_empty() {
+                    true => Ok(()),
+                    false => Err(ApiError::http(
+                        409,
+                        format!(
+                            "{branch}, which was to purge received erasures, is gone, and \
+                             soft-dropped ledgers still hold their originals"
+                        ),
+                    )),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Complete the activations of received erasures that a restore
@@ -1058,7 +1159,7 @@ impl Fluree {
                     .map_err(|e| ApiError::internal(format!("erasure activation {id}: {e}")))?;
                 let newly = self.newly_of(&activation.chains).await?;
                 let prepared = self.prepare_holders(&newly).await?;
-                self.activate(prepared, &newly, &activation, None, Some(&id))
+                self.activate(prepared, &newly, &activation, None, Some(&id), None)
                     .await
             };
             match resumed.await {
@@ -1102,12 +1203,14 @@ impl Fluree {
     }
 
     /// Record `jobs` in the registration of `record`, a restored ledger not
-    /// yet visible whose head is at `head_t`, for its purge.
+    /// yet visible whose head is at `head_t`, for its purge; then complete
+    /// `pending`, the activation that deferred them.
     pub(crate) async fn record_received_jobs(
         &self,
         record: &fluree_db_nameservice::NsRecord,
         head_t: i64,
         jobs: Vec<super::ErasureJob>,
+        pending: Option<String>,
     ) -> Result<()> {
         if jobs.is_empty() {
             return Ok(());
@@ -1127,6 +1230,9 @@ impl Fluree {
         )
         .await?;
         self.retention.mark_active(record.ledger_id.as_str());
+        if let Some(id) = pending {
+            self.erasure_runtime()?.index.complete_pending(&id).await?;
+        }
         Ok(())
     }
 
@@ -1230,6 +1336,25 @@ struct Holder {
     removal: crate::retention::removal::ReceivedRemoval,
     /// Its write lock, when this instance caches ledgers.
     guard: Option<crate::ledger_manager::LedgerWriteGuard>,
+    /// Held against every commit to it.
+    fence: tokio::sync::OwnedRwLockWriteGuard<super::Reconciled>,
+}
+
+/// The ledger a transfer brings erased history to.
+#[derive(Clone, Copy)]
+pub(crate) enum Receiver<'a> {
+    /// A visible one: a pull's.
+    Live(&'a str),
+    /// One a restore makes, visible once it completes.
+    Restored(&'a str),
+}
+
+impl Receiver<'_> {
+    fn ledger_id(&self) -> &str {
+        match self {
+            Receiver::Live(id) | Receiver::Restored(id) => id,
+        }
+    }
 }
 
 /// Received erasures being activated, recorded before the first ledger
@@ -1271,22 +1396,78 @@ pub(crate) struct ReceivedErasures {
     /// Published jobs for the restored ledger's registration, when only
     /// soft-dropped ledgers here hold the originals: its purge deletes them.
     pub(crate) jobs: Vec<super::ErasureJob>,
+    /// The activation to complete once they are recorded.
+    pub(crate) pending: Option<String>,
 }
 
-/// Add `jobs` a registration lacks. Whether it changed.
+/// Add `jobs` to a registration. A published job of the same request takes
+/// the commits, slots, branches and properties it lacks, and is purged
+/// again when it grows: a transfer can bring a request's erasures a part at
+/// a time, a fork's before its source's. Whether it changed.
 fn add_jobs(registration: &mut registry::Registration, jobs: &[super::ErasureJob]) -> bool {
     let mut changed = false;
     for job in jobs {
-        if !registration
+        let Some(held) = registration
             .erasures
-            .iter()
-            .any(|j| j.request_id == job.request_id)
-        {
+            .iter_mut()
+            .find(|j| j.request_id == job.request_id)
+        else {
             registration.erasures.push(job.clone());
             changed = true;
+            continue;
+        };
+        // Still being proved here, or refused: its own publication covers it.
+        if held.pending() || held.stage == super::ErasureStage::Failed || !merge_job(held, job) {
+            continue;
         }
+        let deleted = held.purge.as_ref().map_or(0, |p| p.deleted);
+        held.purge = Some(super::PurgeProgress {
+            deleted,
+            ..job.purge.clone().unwrap_or_default()
+        });
+        held.stage = super::ErasureStage::Published;
+        changed = true;
     }
     changed
+}
+
+/// Merge into `held` what `job`, of the same request, adds. Whether it grew.
+fn merge_job(held: &mut super::ErasureJob, job: &super::ErasureJob) -> bool {
+    let mut grew = false;
+    for commit in &job.commits {
+        let Some(at) = held.commits.iter_mut().find(|c| c.commit == commit.commit) else {
+            held.commits.push(commit.clone());
+            grew = true;
+            continue;
+        };
+        for slot in &commit.slots {
+            if !at.slots.contains(slot) {
+                at.slots.push(*slot);
+                grew = true;
+            }
+        }
+        at.slots.sort_unstable();
+        for branch in &commit.branches {
+            if !at.branches.contains(branch) {
+                at.branches.push(branch.clone());
+                grew = true;
+            }
+        }
+    }
+    // None listed is any property.
+    if !held.properties.is_empty() {
+        if job.properties.is_empty() {
+            held.properties.clear();
+            grew = true;
+        }
+        for property in &job.properties {
+            if !held.properties.contains(property) {
+                held.properties.push(property.clone());
+                grew = true;
+            }
+        }
+    }
+    grew
 }
 
 /// A published job per request of `newly`, its holders' indexes already
