@@ -1083,6 +1083,7 @@ async fn a_pack_over_erased_history_carries_no_index() {
     )
     .await;
     let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    // From a receiver holding the erasures already: none is sent.
     let request = fluree_db_api::pack::PackRequest::with_indexes(
         vec![record.commit_head_id.clone().unwrap()],
         vec![have],
@@ -1091,12 +1092,14 @@ async fn a_pack_over_erased_history_carries_no_index() {
             .clone()
             .expect("indexed before publication"),
         None,
-    );
+    )
+    .with_erasures(fluree.held_erasure_digests().await.unwrap());
     let handle = fluree.ledger_cached(&id).await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let stats = fluree_db_api::pack::stream_pack(&fluree, &handle, &request, tx).await;
     while rx.recv().await.is_some() {}
     assert_eq!(stats.commits_sent, 1, "{stats:?}");
+    assert_eq!(stats.erased_commits_sent, 0, "{stats:?}");
     assert_eq!(stats.index_artifacts_sent, 0, "{stats:?}");
 }
 
@@ -1383,4 +1386,248 @@ async fn a_restore_erases_indexed_and_unindexed_values_alike() {
             "{secret}"
         );
     }
+}
+
+/// `source`'s pack of `request` for `id`, as its pack endpoint streams it.
+async fn packed(source: &Fluree, id: &str, request: &fluree_db_api::pack::PackRequest) -> Vec<u8> {
+    let handle = source.ledger_cached(id).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    fluree_db_api::pack::stream_pack(source, &handle, request, tx).await;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        bytes.extend(chunk.unwrap());
+    }
+    bytes
+}
+
+/// What a clone or pull does with a pack: store its objects in `ledger`'s
+/// folder, take its erasures and journal, then move the head to `head`.
+async fn take_pack(
+    receiver: &Fluree,
+    ledger: &str,
+    pack: &[u8],
+    head: (&ContentId, i64),
+    erasure_authority: bool,
+) -> fluree_db_api::Result<fluree_db_api::retention::erasure::AcceptedPack> {
+    let record = receiver.nameservice().lookup(ledger).await?.unwrap();
+    let storage = receiver.backend().admin_storage_cloned().unwrap();
+    let mut reception = fluree_db_api::retention::erasure::PackReception::default();
+    let mut pos = read_stream_preamble(pack).unwrap();
+    loop {
+        let (frame, used) = decode_frame(&pack[pos..], DEFAULT_MAX_PAYLOAD).unwrap();
+        pos += used;
+        match frame {
+            PackFrame::End => break,
+            PackFrame::Error(e) => panic!("pack error: {e}"),
+            PackFrame::Data { cid, payload } => {
+                fluree_db_nameservice_sync::ingest_pack_frame(
+                    &cid,
+                    &payload,
+                    &storage,
+                    &record.storage_namespace(),
+                )
+                .await
+                .unwrap();
+            }
+            frame => receiver.receive_pack_frame(&mut reception, frame).await?,
+        }
+    }
+    let accepted = receiver
+        .accept_pack(ledger, reception, head.0, erasure_authority)
+        .await?;
+    let handle = receiver.ledger_cached(ledger).await?;
+    receiver.set_commit_head(&handle, head.0, head.1).await?;
+    Ok(accepted)
+}
+
+/// A receiver as the CLI runs one: no prover, and no ledger cache.
+fn pulling(dir: &tempfile::TempDir) -> Fluree {
+    FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .without_ledger_caching()
+        .with_erasure_verifier(Arc::new(Verifier::accepting_dev_receipts()))
+        .build()
+        .unwrap()
+}
+
+/// `id`'s head in `fluree`.
+async fn head_of(fluree: &Fluree, id: &str) -> (ContentId, i64) {
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    (record.commit_head_id.unwrap(), record.commit_t)
+}
+
+/// A clone takes erased history from a remote designated an erasure
+/// authority, as a restore does, with the journal that refuses its history;
+/// from any other remote, it takes none of it.
+#[tokio::test]
+async fn a_clone_takes_erased_history_from_an_erasure_authority() {
+    let (_dir, source, id, erased, t1) = source("it/clone-source").await;
+    let (head, head_t) = head_of(&source, &id).await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = pulling(&here);
+
+    receiver.create_ledger("it/clone-refused").await.unwrap();
+    let request = fluree_db_api::pack::PackRequest::commits(vec![head.clone()], vec![])
+        .with_erasures(receiver.held_erasure_digests().await.unwrap());
+    let pack = packed(&source, &id, &request).await;
+    let refused = take_pack(
+        &receiver,
+        "it/clone-refused:main",
+        &pack,
+        (&head, head_t),
+        false,
+    )
+    .await
+    .expect_err("not an erasure authority");
+    assert_eq!(refused.status_code(), 403, "{refused}");
+    assert!(receiver.held_erasure_digests().await.unwrap().is_empty());
+
+    receiver.create_ledger("it/clone-copy").await.unwrap();
+    let accepted = take_pack(
+        &receiver,
+        "it/clone-copy:main",
+        &pack,
+        (&head, head_t),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.erased_commits, 2, "{accepted:?}");
+    received_without(&receiver, "it/clone-copy:main", &erased, t1).await;
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// The case pulling only new history would get wrong: a copy holding a
+/// current, indexed value its source then retracts and erases. The pull
+/// brings the erasure of the commit the copy already has before the new
+/// commits, and the copy loses the value, its counts and its history,
+/// with nothing committed to it and no rebuild; its purge then deletes the
+/// original. A later pull sends no chain the copy holds.
+#[tokio::test]
+async fn a_pull_erases_what_the_copy_already_holds() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/pull-source").await;
+    let t1 = insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = pulling(&here);
+    receiver.create_ledger("it/pull-copy").await.unwrap();
+    let copy = "it/pull-copy:main";
+    let (head, head_t) = head_of(&source, &id).await;
+    let request = fluree_db_api::pack::PackRequest::commits(vec![head.clone()], vec![])
+        .with_erasures(Vec::new());
+    take_pack(
+        &receiver,
+        copy,
+        &packed(&source, &id, &request).await,
+        (&head, head_t),
+        true,
+    )
+    .await
+    .unwrap();
+    reindex(&receiver, copy).await;
+    assert_eq!(email_stat(&receiver, copy).await, 2);
+    let copied = head;
+
+    erase_published(&source, &id, email("alice", "a@secret")).await;
+    insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:name": "Carol"}),
+    )
+    .await;
+    let (head, head_t) = head_of(&source, &id).await;
+    let request = fluree_db_api::pack::PackRequest::commits(vec![head.clone()], vec![copied])
+        .with_erasures(receiver.held_erasure_digests().await.unwrap());
+    let pack = packed(&source, &id, &request).await;
+    let accepted = take_pack(&receiver, copy, &pack, (&head, head_t), true)
+        .await
+        .unwrap();
+    // The commit the copy had, and the removal's retraction it did not.
+    assert_eq!(accepted.erased_commits, 2, "{accepted:?}");
+    assert_eq!(accepted.reconciled, [copy], "{accepted:?}");
+
+    assert!(objects(&receiver, copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&receiver, copy, "ex:carol", "ex:name").await,
+        vec![json!("Carol")]
+    );
+    assert_eq!(email_stat(&receiver, copy).await, 1);
+    let past = receiver
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{copy}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+    let report = receiver.run_purge_pass(copy, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+
+    let again = fluree_db_api::pack::PackRequest::commits(vec![head.clone()], vec![head])
+        .with_erasures(receiver.held_erasure_digests().await.unwrap());
+    let handle = source.ledger_cached(&id).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let sent = fluree_db_api::pack::stream_pack(&source, &handle, &again, tx).await;
+    while rx.recv().await.is_some() {}
+    assert_eq!(sent.erased_commits_sent, 0, "{sent:?}");
+}
+
+/// A pack that does not take erasures is refused once the history holds
+/// one, even one the receiver already has, which it would go on serving;
+/// so is a paginated export of that history.
+#[tokio::test]
+async fn erased_history_needs_a_pack_that_takes_it() {
+    let (_dir, source, id, _, _) = source("it/pull-old-client").await;
+    insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:dave", "ex:email": "d@later"}),
+    )
+    .await;
+    let chain = chain(&source, &id).await;
+    let (head, have) = (chain[0].1.clone(), chain[1].1.clone());
+    let request = fluree_db_api::pack::PackRequest::commits(vec![head], vec![have]);
+    let pack = packed(&source, &id, &request).await;
+    assert!(
+        contains(&pack, "permanently erased"),
+        "{}",
+        String::from_utf8_lossy(&pack)
+    );
+
+    // A first page short of the erased commit, as a pull's that stops at
+    // its own head would be.
+    let handle = source.ledger_cached(&id).await.unwrap();
+    let first_page = fluree_db_api::ExportCommitsRequest {
+        limit: Some(1),
+        ..Default::default()
+    };
+    let refused = source
+        .export_commit_range(&handle, &first_page)
+        .await
+        .expect_err("a paginated export of erased history");
+    assert_eq!(refused.status_code(), 501, "{refused}");
 }

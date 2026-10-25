@@ -41,6 +41,7 @@ pub use index::{ErasedCommit, ErasureStep};
 pub use purge::{PurgeInspection, PurgePlan, PurgeReport, PurgeScan, PurgeTimings};
 pub use request::{BranchRemoval, ErasureReceipt, ErasureRequest};
 use serde::{Deserialize, Serialize};
+pub use transfer::{AcceptedPack, PackReception};
 pub use worker::ErasurePassReport;
 
 /// How this instance proves erasures.

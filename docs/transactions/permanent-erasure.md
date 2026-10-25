@@ -218,6 +218,25 @@ writes nothing to the ledgers here, when:
 - the instance cannot hold erased history: memory or S3 storage, or a cluster. Versions of Fluree
   without erased history in archives refuse such an archive as malformed.
 
+## Clones and pulls
+
+`fluree clone` and `fluree pull` carry erased history through the pack protocol, to a CLI that takes
+it from a remote designated an erasure authority (`fluree remote erasure-authority <name> true`).
+The pack carries each erased commit as an archive does, and the source's removal journal; it carries
+no index when the requested history holds an erased commit, even one the receiver already has.
+
+A pull's request lists the erasure chains the receiver holds. The source sends the chain of every
+other erased commit of the history, those the receiver already has included, before the new commits.
+The receiver takes them as a restore does ([Archives](#archives)): it checks them, makes every ledger
+holding an original read as they do (the pulled ledger among them, with its own journal, index and
+search indexes, and nothing committed), then publishes them before the head moves. A pack request
+that does not ask for erasures is refused once the history holds one, so an older client never pulls
+past an erasure of history it holds.
+
+A clone or pull that stops partway completes at the next clone or pull from the CLI, or when a
+server on this storage next runs its retention worker. Without a ledger cache, as the CLI runs, a
+transaction committed on a holder during the activation fails it, and it resumes the same way.
+
 ## Status
 
 `GET /v1/fluree/retention/<ledger>` lists the branch's erasure jobs under `registration.erasures`.
@@ -284,10 +303,11 @@ measurements.
   once, at the cost of queries still reading it.
 - **Transaction documents are not redacted.** The stored transaction document of an affected commit
   holds the original request, and audit retrieval serves it until the purge deletes it whole.
-- **Most transfers are refused.** Push, pull, clone, pack exports and remote archives
-  (`fluree export --remote --format ledger`) refuse a ledger's erased commits by name. A local
-  `.flpack` archive carries them (see [Archives](#archives)). A pack of only new history, over erased
-  commits the receiver already has, carries no index: one built before the purge may hold the value.
+- **Push and some transfers are refused.** Push refuses erased commits by name. The paginated
+  commit export, origin-based clones and pulls, and remote archives (`fluree export --remote --format
+  ledger`) refuse a ledger whose history holds an erased commit. A local `.flpack` archive carries erased history (see
+  [Archives](#archives)), and so do clone and pull through the pack protocol (see
+  [Clones and pulls](#clones-and-pulls)).
 - **Not covered:** copies outside this node's storage (backups, other clones, exports already made), the
   memory of other processes until they restart, and values in the original CID itself (see
   [Signatures](#signatures)). Neither the proof nor the purge shows that copies elsewhere are gone.

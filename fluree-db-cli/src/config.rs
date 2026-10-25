@@ -528,6 +528,8 @@ struct RemoteConfigToml {
     #[serde(default)]
     auth: RemoteAuth,
     fetch_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    erasure_authority: bool,
 }
 
 impl From<RemoteConfig> for RemoteConfigToml {
@@ -537,6 +539,7 @@ impl From<RemoteConfig> for RemoteConfigToml {
             endpoint: c.endpoint,
             auth: c.auth,
             fetch_interval_secs: c.fetch_interval_secs,
+            erasure_authority: c.erasure_authority,
         }
     }
 }
@@ -548,6 +551,7 @@ impl From<RemoteConfigToml> for RemoteConfig {
             endpoint: c.endpoint,
             auth: c.auth,
             fetch_interval_secs: c.fetch_interval_secs,
+            erasure_authority: c.erasure_authority,
         }
     }
 }
@@ -742,6 +746,9 @@ impl TomlSyncConfigStore {
 
             if let Some(interval) = remote.fetch_interval_secs {
                 table.insert("fetch_interval_secs", Value::from(interval as i64).into());
+            }
+            if remote.erasure_authority {
+                table.insert("erasure_authority", Value::from(true).into());
             }
 
             remotes_aot.push(table);
@@ -1119,6 +1126,7 @@ mod tests {
                 },
                 auth: auth.clone(),
                 fetch_interval_secs: Some(30),
+                erasure_authority: false,
             })
             .await
             .unwrap();

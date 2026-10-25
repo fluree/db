@@ -24,9 +24,16 @@ use fluree_db_core::{ContentAddressedWrite, ContentId, ContentKind};
 use futures::StreamExt;
 use tracing::debug;
 
-/// A stream carrying erased history, which this client does not receive.
-const ERASED_HISTORY: &str = "the pack holds permanently erased commits, which a pull or clone \
-                              does not receive yet";
+/// A stream carrying erased history to a caller that takes none.
+const ERASED_HISTORY: &str = "the pack holds permanently erased commits, which this transfer \
+                              does not take";
+
+/// Where a pack's frames that are not stored objects go: erasure frames,
+/// and manifests.
+#[async_trait::async_trait]
+pub trait PackSink: Send {
+    async fn frame(&mut self, frame: PackFrame) -> std::result::Result<(), String>;
+}
 
 /// Result of ingesting a pack stream into local storage.
 #[derive(Debug, Clone, Default)]
@@ -111,6 +118,17 @@ pub async fn ingest_pack_stream<S: ContentAddressedWrite>(
     storage: &S,
     namespace: &fluree_db_core::StorageNamespace,
 ) -> Result<PackIngestResult> {
+    ingest_pack_stream_into(response, storage, namespace, None).await
+}
+
+/// [`ingest_pack_stream`], passing erasure frames and manifests to `sink`.
+/// Without one, a stream carrying erasures is refused.
+pub async fn ingest_pack_stream_into<S: ContentAddressedWrite>(
+    response: reqwest::Response,
+    storage: &S,
+    namespace: &fluree_db_core::StorageNamespace,
+    mut sink: Option<&mut (dyn PackSink + '_)>,
+) -> Result<PackIngestResult> {
     let mut stream = response.bytes_stream();
     let mut buf = BytesMut::new();
     let mut result = PackIngestResult::default();
@@ -186,10 +204,10 @@ pub async fn ingest_pack_stream<S: ContentAddressedWrite>(
                                 "server error in pack stream: {msg}"
                             )));
                         }
-                        PackFrame::Erasure(_)
+                        frame @ (PackFrame::Erasure(_)
                         | PackFrame::Authorization(_)
-                        | PackFrame::ErasureArtifact { .. } => {
-                            return Err(SyncError::PackProtocol(ERASED_HISTORY.to_string()));
+                        | PackFrame::ErasureArtifact { .. }) => {
+                            to_sink(sink.as_deref_mut(), frame, true).await?;
                         }
                         PackFrame::Manifest(manifest) => {
                             if !saw_header {
@@ -198,6 +216,8 @@ pub async fn ingest_pack_stream<S: ContentAddressedWrite>(
                                 ));
                             }
                             debug!(manifest = %manifest, "pack: received manifest");
+                            to_sink(sink.as_deref_mut(), PackFrame::Manifest(manifest), false)
+                                .await?;
                         }
                         PackFrame::End => {
                             if !saw_header {
@@ -327,6 +347,19 @@ pub async fn peek_pack_header(
     }
 }
 
+/// Pass `frame` to `sink`; without one, refuse it when `required`.
+async fn to_sink(
+    sink: Option<&mut (dyn PackSink + '_)>,
+    frame: PackFrame,
+    required: bool,
+) -> Result<()> {
+    match sink {
+        Some(sink) => sink.frame(frame).await.map_err(SyncError::PackProtocol),
+        None if required => Err(SyncError::PackProtocol(ERASED_HISTORY.to_string())),
+        None => Ok(()),
+    }
+}
+
 /// Ingest a pack stream with a pre-parsed header.
 ///
 /// Like [`ingest_pack_stream`], but skips preamble and header parsing — uses
@@ -340,6 +373,20 @@ pub async fn ingest_pack_stream_with_header<S: ContentAddressedWrite>(
               + Unpin),
     storage: &S,
     namespace: &fluree_db_core::StorageNamespace,
+) -> Result<PackIngestResult> {
+    ingest_pack_stream_with_header_into(header, initial_buf, stream, storage, namespace, None).await
+}
+
+/// [`ingest_pack_stream_with_header`], passing erasure frames and manifests
+/// to `sink`. Without one, a stream carrying erasures is refused.
+pub async fn ingest_pack_stream_with_header_into<S: ContentAddressedWrite>(
+    header: &PackHeader,
+    initial_buf: BytesMut,
+    stream: &mut (impl futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>
+              + Unpin),
+    storage: &S,
+    namespace: &fluree_db_core::StorageNamespace,
+    mut sink: Option<&mut (dyn PackSink + '_)>,
 ) -> Result<PackIngestResult> {
     let mut buf = initial_buf;
     let mut result = PackIngestResult::default();
@@ -380,11 +427,12 @@ pub async fn ingest_pack_stream_with_header<S: ContentAddressedWrite>(
                     }
                     PackFrame::Manifest(manifest) => {
                         debug!(manifest = %manifest, "pack: received manifest");
+                        to_sink(sink.as_deref_mut(), PackFrame::Manifest(manifest), false).await?;
                     }
-                    PackFrame::Erasure(_)
+                    frame @ (PackFrame::Erasure(_)
                     | PackFrame::Authorization(_)
-                    | PackFrame::ErasureArtifact { .. } => {
-                        return Err(SyncError::PackProtocol(ERASED_HISTORY.to_string()));
+                    | PackFrame::ErasureArtifact { .. }) => {
+                        to_sink(sink.as_deref_mut(), frame, true).await?;
                     }
                     PackFrame::End => {
                         debug!(
@@ -501,6 +549,66 @@ mod tests {
         // Verify preamble
         assert_eq!(&buf[..4], b"FPK1");
         assert_eq!(buf[4], 1); // version
+    }
+
+    /// Erasure frames and manifests go to the sink, objects to storage; with
+    /// no sink, a stream carrying an erasure is refused.
+    #[tokio::test]
+    async fn erasure_frames_go_to_the_sink_or_refuse_the_stream() {
+        use fluree_db_core::pack::{
+            encode_data_frame, encode_erasure_frame, encode_manifest_frame,
+        };
+
+        struct Taken(Vec<PackFrame>);
+        #[async_trait::async_trait]
+        impl PackSink for Taken {
+            async fn frame(&mut self, frame: PackFrame) -> std::result::Result<(), String> {
+                self.0.push(frame);
+                Ok(())
+            }
+        }
+
+        let txn = b"a transaction";
+        let cid = ContentId::new(ContentKind::Txn, txn);
+        let mut frames = Vec::new();
+        encode_manifest_frame(&serde_json::json!({"phase": "retention"}), &mut frames);
+        encode_erasure_frame(&serde_json::json!({"commit": "c"}), &mut frames);
+        encode_data_frame(&cid, txn, &mut frames);
+        encode_end_frame(&mut frames);
+        let header = PackHeader::commits_only(Some(0), true);
+        let stream = |bytes: Vec<u8>| {
+            futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(bytes))])
+        };
+        let namespace = fluree_db_core::StorageNamespace::parse_graph_source("t:main").unwrap();
+
+        let storage = fluree_db_core::MemoryStorage::new();
+        let mut taken = Taken(Vec::new());
+        let result = ingest_pack_stream_with_header_into(
+            &header,
+            BytesMut::new(),
+            &mut stream(frames.clone()),
+            &storage,
+            &namespace,
+            Some(&mut taken),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.txn_blobs_stored, 1);
+        assert!(matches!(
+            taken.0.as_slice(),
+            [PackFrame::Manifest(_), PackFrame::Erasure(_)]
+        ));
+
+        let refused = ingest_pack_stream_with_header(
+            &header,
+            BytesMut::new(),
+            &mut stream(frames),
+            &fluree_db_core::MemoryStorage::new(),
+            &namespace,
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.to_string().contains("erased"), "{refused}");
     }
 
     #[test]

@@ -35,6 +35,19 @@ As with [clone](clone.md#index-transfer), pull uses the pack protocol to request
 
 Pull uses the same pack protocol as clone -- see [clone: Transport](clone.md#transport) for details.
 
+### Erased history
+
+When the remote's history holds [permanently erased](../transactions/permanent-erasure.md#clones-and-pulls)
+commits, pull goes through the pack protocol only, and only from a remote designated an erasure
+authority (`fluree remote erasure-authority <name> true`). The request lists the erasures the local
+storage already holds; the remote sends every other erasure of the history, including those of
+commits this ledger already has. Before the local head moves, the ledger (and any other ledger here
+holding the originals) reads as the erasures do: the values leave its index and history, with nothing
+committed to it, and its purge later deletes the originals. A pull that stops partway completes at the
+next clone or pull, or when a server on this storage next runs its retention worker. The paginated
+export and an origin-based pull refuse erased history. The ledger's removal journal arrives with any
+pack.
+
 ### Origin-based pull
 
 When no upstream remote is configured, pull falls back to **origin-based fetching** if a LedgerConfig with origins is set on the ledger (see `fluree config set-origins`). This uses the same pack-first / CID-walk-fallback transport as `fluree clone --origin`.

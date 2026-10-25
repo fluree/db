@@ -1754,6 +1754,13 @@ impl Fluree {
             ))
         })?;
 
+        // A first page answers for the whole history.
+        #[cfg(feature = "native")]
+        if request.cursor_id.is_none() && request.cursor.is_none() {
+            self.refuse_erased_history(content_store.as_ref(), &head_commit_id)
+                .await?;
+        }
+
         // Determine start cursor CID.
         let start_cid: ContentId = if let Some(cid) = &request.cursor_id {
             cid.clone()
@@ -2563,8 +2570,14 @@ impl Fluree {
             _ => {
                 let journal = archived.as_ref().map(|a| &a.journal);
                 Some(
-                    self.receive_erasures(erasures, &namespace, &commit_cid, journal)
-                        .await?,
+                    self.receive_erasures(
+                        erasures,
+                        &namespace,
+                        content.as_ref(),
+                        &commit_cid,
+                        journal,
+                    )
+                    .await?,
                 )
             }
         };

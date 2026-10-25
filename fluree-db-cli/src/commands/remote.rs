@@ -16,7 +16,15 @@ pub async fn run(action: RemoteAction, dirs: &FlureeDir) -> CliResult<()> {
     let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
 
     match action {
-        RemoteAction::Add { name, url, token } => run_add(&store, &name, &url, token).await,
+        RemoteAction::Add {
+            name,
+            url,
+            token,
+            erasure_authority,
+        } => run_add(&store, &name, &url, token, erasure_authority).await,
+        RemoteAction::ErasureAuthority { name, enabled } => {
+            run_erasure_authority(&store, &name, enabled).await
+        }
         RemoteAction::Remove { name } => run_remove(&store, &name).await,
         RemoteAction::List => run_list(&store).await,
         RemoteAction::Show { name } => run_show(&store, &name).await,
@@ -168,6 +176,7 @@ async fn run_add(
     name: &str,
     url: &str,
     token: Option<String>,
+    erasure_authority: bool,
 ) -> CliResult<()> {
     // Remote names cannot contain '/' — reserved as the delimiter in
     // compound `remote/ledger` syntax (e.g., `fluree query origin/mydb ...`).
@@ -264,6 +273,7 @@ async fn run_add(
         endpoint: RemoteEndpoint::Http { base_url },
         auth,
         fetch_interval_secs: None,
+        erasure_authority,
     };
 
     store
@@ -563,7 +573,40 @@ async fn run_show(store: &TomlSyncConfigStore, name: &str) -> CliResult<()> {
     if let Some(interval) = remote.fetch_interval_secs {
         println!("  Fetch interval: {interval}s");
     }
+    if remote.erasure_authority {
+        println!("  Erasures: {}", "accepted".yellow());
+    }
 
+    Ok(())
+}
+
+async fn run_erasure_authority(
+    store: &TomlSyncConfigStore,
+    name: &str,
+    enabled: bool,
+) -> CliResult<()> {
+    let remote = store
+        .get_remote(&RemoteName::new(name))
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .ok_or_else(|| CliError::NotFound(format!("remote '{name}' not found")))?;
+    store
+        .set_remote(&RemoteConfig {
+            erasure_authority: enabled,
+            ..remote
+        })
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?;
+    match enabled {
+        true => println!(
+            "{} clone and pull accept the permanent erasures of '{name}'",
+            "✓".green()
+        ),
+        false => println!(
+            "{} clone and pull refuse the permanent erasures of '{name}'",
+            "✓".green()
+        ),
+    }
     Ok(())
 }
 

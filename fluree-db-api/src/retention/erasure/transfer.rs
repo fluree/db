@@ -144,64 +144,79 @@ fn frame(encode: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     buf
 }
 
-/// The erasures of the commits a stream sends, and what it has sent.
+/// The erasures of the history a stream sends, and what it has sent.
 pub(crate) struct Sender {
     index: Option<Arc<ErasureIndex>>,
+    /// Erased commits among those sent, each sent at its place.
     erased: HashMap<ContentId, ErasedCommit>,
+    /// Erased commits the receiver has already, whose chains it lacks: sent
+    /// before the commits, so it erases them too.
+    held: Vec<ErasedCommit>,
+    /// The history holds an erased commit, sent or not.
+    history_erased: bool,
     authorizations: HashSet<String>,
     artifacts: HashSet<String>,
 }
 
 impl Sender {
-    /// The erasures among `commits`.
-    pub(crate) async fn of(fluree: &Fluree, commits: &[ContentId]) -> Result<Self> {
-        let index = fluree.retention.erasure.get().map(|r| r.index.clone());
-        let mut erased = HashMap::new();
-        if let Some(index) = index.as_ref().filter(|_| !commits.is_empty()) {
-            if index.any_erased().await? {
-                for cid in commits {
-                    if let Some(e) = index.erased(cid).await? {
-                        erased.insert(cid.clone(), e);
-                    }
-                }
-            }
-        }
-        Ok(Sender {
-            index,
-            erased,
-            authorizations: HashSet::new(),
-            artifacts: HashSet::new(),
-        })
-    }
-
-    /// Whether the history `want` names, whatever the receiver already
-    /// has of it, holds an erased commit.
-    pub(crate) async fn history_holds_erased(
-        &self,
+    /// The erasures of the history `want` names in `store`, for a receiver
+    /// lacking `missing` of it (the history a pack sends: all of it when
+    /// `have` is empty) and holding the chains `held` (digests).
+    pub(crate) async fn of(
+        fluree: &Fluree,
         store: &dyn ContentStore,
         want: &[ContentId],
-    ) -> Result<bool> {
-        if !self.erased.is_empty() {
-            return Ok(true);
-        }
-        let Some(index) = &self.index else {
-            return Ok(false);
+        have: &[ContentId],
+        missing: &[ContentId],
+        held: &[String],
+    ) -> Result<Self> {
+        let index = fluree.retention.erasure.get().map(|r| r.index.clone());
+        let mut sender = Sender {
+            index: index.clone(),
+            erased: HashMap::new(),
+            held: Vec::new(),
+            history_erased: false,
+            authorizations: HashSet::new(),
+            artifacts: HashSet::new(),
         };
-        if !index.any_erased().await? {
-            return Ok(false);
+        let Some(index) = index else {
+            return Ok(sender);
+        };
+        if want.is_empty() || !index.any_erased().await? {
+            return Ok(sender);
         }
-        let all = crate::pack::compute_missing_commits(store, want, &HashSet::new()).await?;
-        for cid in &all {
-            if index.erased(cid).await?.is_some() {
-                return Ok(true);
+        let history = match have.is_empty() {
+            true => missing.to_vec(),
+            false => crate::pack::compute_missing_commits(store, want, &HashSet::new()).await?,
+        };
+        let missing: HashSet<&ContentId> = missing.iter().collect();
+        for cid in &history {
+            let Some(erased) = index.erased(cid).await? else {
+                continue;
+            };
+            sender.history_erased = true;
+            if missing.contains(cid) {
+                sender.erased.insert(cid.clone(), erased);
+            } else if !held.contains(&erased.digest()) {
+                sender.held.push(erased);
             }
         }
-        Ok(false)
+        Ok(sender)
     }
 
-    /// Erased commits among those sent.
-    pub(crate) fn count(&self) -> usize {
+    /// Whether the history holds an erased commit, sent or not.
+    pub(crate) fn history_erased(&self) -> bool {
+        self.history_erased
+    }
+
+    /// Erased commits among those sent, at their places.
+    pub(crate) fn positions(&self) -> usize {
         self.erased.len()
+    }
+
+    /// Erasure chains sent.
+    pub(crate) fn count(&self) -> usize {
+        self.erased.len() + self.held.len()
     }
 
     /// Artifacts sent so far.
@@ -209,27 +224,55 @@ impl Sender {
         self.artifacts.len()
     }
 
-    /// Refuse a stream whose receiver does not take erased history.
+    /// Refuse a stream whose receiver does not take erased history: its
+    /// commits, or those it may hold already, which it would go on serving.
     pub(crate) fn refuse(&self) -> Result<()> {
-        match self.erased.keys().min() {
-            Some(cid) => Err(ApiError::http(
-                501,
-                format!(
-                    "commit {cid} is permanently erased; this transfer does not carry erased \
-                     commits yet"
-                ),
-            )),
-            None => Ok(()),
+        if !self.history_erased {
+            return Ok(());
         }
+        let first = self
+            .erased
+            .keys()
+            .map(ToString::to_string)
+            .chain(self.held.iter().map(|e| e.commit.clone()))
+            .min()
+            .unwrap_or_default();
+        Err(ApiError::http(
+            501,
+            format!(
+                "commit {first} is permanently erased; this transfer does not carry erased \
+                 commits, which a client must ask for"
+            ),
+        ))
+    }
+
+    /// The frames of the chains the receiver lacks for commits it already
+    /// has, to send before the commits.
+    pub(crate) async fn held_frames(&mut self) -> Result<Vec<Vec<u8>>> {
+        let mut frames = Vec::new();
+        for erased in self.held.clone() {
+            frames.extend(self.chain_frames(&erased).await?);
+        }
+        Ok(frames)
     }
 
     /// The frames carrying `commit` when it is erased: the authorizations
     /// not sent yet, its latest replacement and receipts, then its chain.
     pub(crate) async fn frames(&mut self, commit: &ContentId) -> Result<Option<Vec<Vec<u8>>>> {
-        let (Some(index), Some(erased)) = (self.index.clone(), self.erased.get(commit).cloned())
-        else {
-            return Ok(None);
-        };
+        match self.erased.get(commit).cloned() {
+            Some(erased) => self.chain_frames(&erased).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The frames carrying `erased`: the authorizations not sent yet, its
+    /// latest replacement and receipts, then its chain.
+    async fn chain_frames(&mut self, erased: &ErasedCommit) -> Result<Vec<Vec<u8>>> {
+        let index = self
+            .index
+            .clone()
+            .ok_or_else(|| ApiError::internal("no erasure index"))?;
+        let commit = &erased.commit;
         let mut frames = Vec::new();
         for step in &erased.steps {
             if self.authorizations.contains(&step.request_id) {
@@ -279,10 +322,177 @@ impl Sender {
                 }));
             }
         }
-        let json = serde_json::to_value(Chain::of(&erased))
+        let json = serde_json::to_value(Chain::of(erased))
             .map_err(|e| ApiError::internal(e.to_string()))?;
         frames.push(frame(|b| encode_erasure_frame(&json, b)));
-        Ok(Some(frames))
+        Ok(frames)
+    }
+}
+
+/// What a pack brings besides the objects it stores: the erasures of its
+/// history, staged as their frames arrive (see [`Fluree::receive_pack_frame`]),
+/// and its source's removal journal.
+#[derive(Default)]
+pub struct PackReception {
+    received: Received,
+    journal: Option<crate::retention::registry::ArchivedRetention>,
+}
+
+impl PackReception {
+    /// Erased commits received.
+    pub fn erased_commits(&self) -> usize {
+        self.received.count()
+    }
+}
+
+/// What [`Fluree::accept_pack`] did.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedPack {
+    /// Erased commits received.
+    pub erased_commits: usize,
+    /// Branches here, the receiving ledger's among them, made to read as the
+    /// erasures do.
+    pub reconciled: Vec<String>,
+}
+
+impl Fluree {
+    /// Take a pack frame that is not a stored object: an erasure's, staged,
+    /// or a `phase: "retention"` manifest. Other frames are ignored.
+    pub async fn receive_pack_frame(
+        &self,
+        reception: &mut PackReception,
+        frame: PackFrame,
+    ) -> Result<()> {
+        match frame {
+            PackFrame::Manifest(json) if json["phase"] == "retention" => {
+                reception.journal =
+                    Some(crate::retention::registry::ArchivedRetention::parse(&json)?);
+                Ok(())
+            }
+            frame @ (PackFrame::Erasure(_)
+            | PackFrame::Authorization(_)
+            | PackFrame::ErasureArtifact { .. }) => {
+                self.take_erasure_frame(frame, &mut reception.received)
+                    .await
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The digests of the erasure chains this storage holds, for a pack
+    /// request: the source sends the erased commits of a history whose
+    /// chains are not among them.
+    pub async fn held_erasure_digests(&self) -> Result<Vec<String>> {
+        match self.retention.erasure.get() {
+            Some(runtime) => runtime.index.digests().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Ready `ledger_id` for `head`, a head a pack brought it, before it
+    /// moves there: take the pack's erasures as a restore does, every ledger
+    /// here holding an original they erase (`ledger_id` among them, for a
+    /// pull) made to read as they do, and merge the source's journal into
+    /// `ledger_id`'s. `erasure_authority`: the source is designated one;
+    /// erasures from any other are refused.
+    pub async fn accept_pack(
+        &self,
+        ledger_id: &str,
+        reception: PackReception,
+        head: &ContentId,
+        erasure_authority: bool,
+    ) -> Result<AcceptedPack> {
+        let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?;
+        let record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+        let PackReception { received, journal } = reception;
+        let mut accepted = AcceptedPack {
+            erased_commits: received.count(),
+            ..Default::default()
+        };
+        if accepted.erased_commits > 0 {
+            if !erasure_authority {
+                return Err(ApiError::http(
+                    403,
+                    "the pack holds permanently erased history, and its source is not \
+                     designated an erasure authority here",
+                ));
+            }
+            let runtime = match self.retention.erasure.get() {
+                Some(runtime) if self.retention.replicas.get().is_none() => runtime,
+                _ => return Err(crate::commit_transfer::cannot_hold_erasures()),
+            };
+            // An erasure accepted or published meanwhile would miss what
+            // this one changes.
+            let _admission = runtime.admission.lock().await;
+            let history = self
+                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                .await?;
+            let received = self
+                .receive_erasures(
+                    received,
+                    &record.storage_namespace(),
+                    history.as_ref(),
+                    head,
+                    journal.as_ref().map(|j| &j.journal),
+                )
+                .await?;
+            if !received.jobs.is_empty() {
+                registry::update(self.publisher()?, ledger_id.as_str(), |current| {
+                    let mut next = current.cloned().unwrap_or_default();
+                    add_jobs(&mut next, &received.jobs).then_some(next)
+                })
+                .await?;
+                self.retention.mark_active(ledger_id.as_str());
+            }
+            accepted.reconciled = received.reconciled;
+        }
+        if let Some(journal) = journal {
+            registry::restore(self.publisher()?, &record, Some(journal), None, None).await?;
+            self.checkpoint_journal(ledger_id.as_str()).await?;
+            self.retention.mark_active(ledger_id.as_str());
+        }
+        Ok(accepted)
+    }
+}
+
+impl Fluree {
+    /// Refuse to export, page by page, a history holding an erased commit:
+    /// only a pack carries erasures, and a receiver already holding one of
+    /// those commits would go on serving what it erased.
+    pub(crate) async fn refuse_erased_history(
+        &self,
+        store: &dyn ContentStore,
+        head: &ContentId,
+    ) -> Result<()> {
+        let Some(runtime) = self.retention.erasure.get() else {
+            return Ok(());
+        };
+        if !runtime.index.any_erased().await? {
+            return Ok(());
+        }
+        let history = crate::pack::compute_missing_commits(
+            store,
+            std::slice::from_ref(head),
+            &HashSet::new(),
+        )
+        .await?;
+        for cid in &history {
+            if runtime.index.erased(cid).await?.is_some() {
+                return Err(ApiError::http(
+                    501,
+                    format!(
+                        "commit {cid} of this history is permanently erased; only a pack \
+                         carries erased history"
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -432,6 +642,7 @@ impl Fluree {
         &self,
         received: Received,
         namespace: &StorageNamespace,
+        history: &dyn ContentStore,
         head: &ContentId,
         journal: Option<&crate::retention::journal::Journal>,
     ) -> Result<ReceivedErasures> {
@@ -501,7 +712,7 @@ impl Fluree {
                 replacement,
             });
         }
-        self.check_erasures_in_history(namespace, head, &parents)
+        self.check_erasures_in_history(history, head, &parents)
             .await?;
         check_journal_covers(&received, journal)?;
 
@@ -836,7 +1047,9 @@ impl Fluree {
     /// Complete the activations of received erasures that a restore
     /// recorded and did not finish. Returns how many completed.
     pub async fn resume_received_erasures(&self) -> Result<usize> {
-        let runtime = self.erasure_runtime()?;
+        let Some(runtime) = self.retention.erasure.get() else {
+            return Ok(0);
+        };
         let _admission = runtime.admission.lock().await;
         let mut completed = 0;
         for (id, bytes) in runtime.index.pending().await? {
@@ -917,15 +1130,14 @@ impl Fluree {
         Ok(())
     }
 
-    /// Refuse erasures of commits the history `head` names in `namespace`
-    /// does not hold; `parents` are the erased commits' own.
+    /// Refuse erasures of commits the history `head` names in `store` does
+    /// not hold; `parents` are the erased commits' own.
     async fn check_erasures_in_history(
         &self,
-        namespace: &StorageNamespace,
+        store: &dyn ContentStore,
         head: &ContentId,
         parents: &HashMap<ContentId, Vec<ContentId>>,
     ) -> Result<()> {
-        let store = self.content_store(namespace);
         let mut seen = HashSet::new();
         let mut frontier = vec![head.clone()];
         while let Some(cid) = frontier.pop() {

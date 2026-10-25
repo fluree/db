@@ -3165,6 +3165,23 @@ pub enum RemoteAction {
         /// Authentication token (or @filepath to read from file)
         #[arg(long)]
         token: Option<String>,
+
+        /// Accept the permanent erasures this remote's history carries, on
+        /// clone and pull (see `remote erasure-authority`)
+        #[arg(long)]
+        erasure_authority: bool,
+    },
+
+    /// Whether clone and pull accept the permanent erasures a remote's
+    /// history carries. They remove values from history held here too, which
+    /// nothing undoes: designate only a remote trusted to authorize them.
+    ErasureAuthority {
+        /// Remote name
+        name: String,
+
+        /// `true` to accept its erasures, `false` to refuse them
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
     },
 
     /// Remove a remote

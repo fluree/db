@@ -63,6 +63,16 @@ If the remote server does not support the pack endpoint (returns 404, 405, 406, 
 
 This fallback is transparent -- no user action is required.
 
+### Erased history
+
+A ledger with [permanently erased](../transactions/permanent-erasure.md#clones-and-pulls) commits
+clones through the pack protocol only, from a remote designated an erasure authority
+(`fluree remote erasure-authority <name> true`, or `--erasure-authority` on `remote add`). Each erased
+commit arrives as its erasure, which the CLI checks before setting the head; the original and its
+transaction document never arrive, and neither does an index. The ledger's removal journal arrives with
+any pack, so the clone refuses the history its source refuses. From an undesignated remote, the clone
+is refused, naming the setting. The paginated export and an origin-based clone refuse erased history.
+
 ### Origin-based clone
 
 The `--origin` flag enables CID-based clone from a server URL without pre-configuring a named remote:

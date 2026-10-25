@@ -4269,3 +4269,142 @@ async fn test_proxy_peer_forwards_removal_and_erasure() {
     assert_eq!(registration.erasures.len(), 1, "{registration:?}");
     server_handle.abort();
 }
+
+/// A storage-proxy token carrying `claims` besides the issuer's.
+fn token_with_claims(signing_key: &SigningKey, claims: serde_json::Value) -> String {
+    let pubkey = signing_key.verifying_key().to_bytes();
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "jwk": {"kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(pubkey)}
+    });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut payload = serde_json::json!({
+        "iss": did_from_pubkey(&pubkey),
+        "sub": "test-peer@example.com",
+        "exp": now + 3600,
+        "iat": now,
+    });
+    for (claim, value) in claims.as_object().unwrap() {
+        payload[claim] = value.clone();
+    }
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+    let signature = signing_key.sign(format!("{header_b64}.{payload_b64}").as_bytes());
+    format!(
+        "{header_b64}.{payload_b64}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
+}
+
+/// `POST /pack` streams a decodable pack: a client's erasure opt-in is
+/// accepted, and the ledger's removal journal travels after the header, so
+/// a copy refuses the history its source refuses. A ledger with a journal
+/// needs audit access.
+#[tokio::test]
+async fn test_pack_streams_commits_and_the_removal_journal() {
+    use fluree_db_core::pack::{
+        decode_frame, read_stream_preamble, PackFrame, PackRequest, DEFAULT_MAX_PAYLOAD,
+    };
+
+    let (_tmp, state) = tx_server_state().await;
+    state.fluree.create_ledger("packed").await.unwrap();
+    state
+        .fluree
+        .graph("packed:main")
+        .transact()
+        .insert(&serde_json::json!({
+            "@id": "http://example.org/alice",
+            "http://example.org/email": "a@old"
+        }))
+        .commit()
+        .await
+        .unwrap();
+    state
+        .fluree
+        .remove_occurrences(
+            "packed:main",
+            fluree_db_api::retention::RemovalRequest {
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/email".into(),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let head = state
+        .fluree
+        .nameservice()
+        .lookup("packed:main")
+        .await
+        .unwrap()
+        .unwrap()
+        .commit_head_id
+        .unwrap();
+    let request =
+        serde_json::to_vec(&PackRequest::commits(vec![head], vec![]).with_erasures(Vec::new()))
+            .unwrap();
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let post = |token: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/pack/packed:main")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(request.clone()))
+            .unwrap()
+    };
+
+    let storage_only = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true}),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(storage_only))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let auditor = token_with_claims(
+        &signing_key,
+        serde_json::json!({"fluree.storage.all": true, "fluree.ledger.audit.all": true}),
+    );
+    let resp = build_router(state.clone())
+        .oneshot(post(auditor))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let mut pos = read_stream_preamble(&body).unwrap();
+    let mut frames = Vec::new();
+    loop {
+        let (frame, used) = decode_frame(&body[pos..], DEFAULT_MAX_PAYLOAD).unwrap();
+        pos += used;
+        let end = matches!(frame, PackFrame::End);
+        frames.push(frame);
+        if end {
+            break;
+        }
+    }
+    assert!(matches!(frames[0], PackFrame::Header(_)));
+    let PackFrame::Manifest(journal) = &frames[1] else {
+        panic!("the journal follows the header: {:?}", frames[1]);
+    };
+    assert_eq!(journal["phase"], "retention");
+    assert_eq!(
+        journal["journal"]["removals"].as_array().map(Vec::len),
+        Some(2),
+        "the assertion and the removal's retraction: {journal}"
+    );
+    let commits = frames
+        .iter()
+        .filter(|f| matches!(f, PackFrame::Data { cid, .. } if cid.content_kind() == Some(fluree_db_core::ContentKind::Commit)))
+        .count();
+    assert_eq!(commits, 2, "the insert and the removal's retraction");
+}

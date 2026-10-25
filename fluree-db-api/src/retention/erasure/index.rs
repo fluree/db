@@ -419,6 +419,17 @@ impl ErasureIndex {
         self.publish(changed.into_values().collect()).await
     }
 
+    /// The digest of every erasure chain this storage holds.
+    pub(crate) async fn digests(&self) -> Result<Vec<String>> {
+        self.load().await?;
+        Ok(self
+            .entries
+            .read()
+            .values()
+            .map(|e| e.erased.digest())
+            .collect())
+    }
+
     /// `original`'s published erasure, if it has one.
     pub(crate) async fn erased(&self, original: &ContentId) -> Result<Option<ErasedCommit>> {
         self.load().await?;

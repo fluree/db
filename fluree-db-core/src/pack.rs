@@ -161,6 +161,19 @@ pub struct PackRequest {
     /// on the client. Use this to dramatically shrink clones when only the
     /// materialized ledger state matters.
     pub include_txns: bool,
+
+    /// The client takes permanently erased history: each erased commit
+    /// travels as its erasure (see the module docs). Without it, a request
+    /// whose history holds one is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub erasures: bool,
+
+    /// Digests of the erasure chains the client holds. The server sends,
+    /// before the commits, the chain of every erased commit in the
+    /// requested history that the client already has and whose chain is
+    /// not among these, so the client erases it too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_erasures: Vec<String>,
 }
 
 /// Server response header, the mandatory first frame in the pack stream.
@@ -531,6 +544,8 @@ impl PackRequest {
             have_index_root_id: None,
             include_indexes: false,
             include_txns: true,
+            erasures: false,
+            held_erasures: Vec::new(),
         }
     }
 
@@ -544,6 +559,8 @@ impl PackRequest {
             have_index_root_id: None,
             include_indexes: false,
             include_txns: false,
+            erasures: false,
+            held_erasures: Vec::new(),
         }
     }
 
@@ -562,10 +579,19 @@ impl PackRequest {
             have_index_root_id,
             include_indexes: true,
             include_txns: true,
+            erasures: false,
+            held_erasures: Vec::new(),
         }
     }
 
     /// Disable txn-blob transfer on an existing request. Returns `self` for chaining.
+    /// Take erased history, holding the erasure chains `held` (digests).
+    pub fn with_erasures(mut self, held: Vec<String>) -> Self {
+        self.erasures = true;
+        self.held_erasures = held;
+        self
+    }
+
     pub fn without_txns(mut self) -> Self {
         self.include_txns = false;
         self

@@ -10,6 +10,7 @@ Manage remote servers for syncing ledgers.
 | `remove` | Remove a remote |
 | `list` | List all configured remotes |
 | `show` | Show details for a remote |
+| `erasure-authority` | Whether clone and pull accept a remote's permanent erasures |
 
 ---
 
@@ -35,6 +36,7 @@ fluree remote add <NAME> <URL> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--token <TOKEN>` | Authentication token (or `@filepath` to read from file) |
+| `--erasure-authority` | Accept the [permanent erasures](../transactions/permanent-erasure.md#clones-and-pulls) this remote's history carries |
 
 ### Examples
 
@@ -143,6 +145,19 @@ orders:main       17         17        query
 
 Track one for peer-mode local querying with
 `fluree track add <ledger> --remote <name> --mode peer` (see [track](track.md)).
+
+## fluree remote erasure-authority
+
+Whether `clone` and `pull` accept the permanent erasures a remote's history carries.
+
+```bash
+fluree remote erasure-authority <NAME> <true|false>
+```
+
+An erasure received from a designated remote removes values from history this storage already holds,
+which nothing undoes. Designate only a remote trusted to authorize erasures: its proofs show a value
+was removed correctly, not who was allowed to remove it. Off by default; a clone or pull that brings
+erasures from an undesignated remote is refused.
 
 ## See Also
 
