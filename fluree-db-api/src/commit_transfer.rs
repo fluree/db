@@ -1374,6 +1374,12 @@ fn apply_pushed_commits_to_state(
     decoded: &[PushCommitDecoded],
     stored_commits: &[StoredCommit],
 ) -> std::result::Result<LedgerState, PushError> {
+    // The txn-meta graph as the callers stamped the commits' metadata flakes.
+    // A commit writing one of the ledger's own graphs (its config) registers
+    // their namespace, after which the graph encodes otherwise.
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
+    let stamped_txn_meta = base.snapshot.encode_iri(&txn_meta_iri);
+
     // Extract namespace deltas and graph IRIs from the decoded commits,
     // then apply to the snapshot so that build_reverse_graph() has complete data.
     {
@@ -1416,8 +1422,10 @@ fn apply_pushed_commits_to_state(
         HashMap::new()
     });
     // Ensure txn-meta graph is always routable for commit metadata flakes.
-    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
-    if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
+    for g_sid in [stamped_txn_meta, base.snapshot.encode_iri(&txn_meta_iri)]
+        .into_iter()
+        .flatten()
+    {
         reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
     }
 
