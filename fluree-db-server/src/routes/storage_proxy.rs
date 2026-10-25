@@ -871,6 +871,37 @@ pub async fn get_object_by_cid(
         .await?;
     }
 
+    // 3c'. A permanently erased commit is answered with its erasure, which
+    //      can grow, so never revalidated against the CID; its transaction
+    //      document is not served.
+    match state
+        .fluree
+        .erased_object(effective_ledger.as_str(), &id)
+        .await
+        .map_err(ServerError::Api)?
+    {
+        Some(fluree_db_api::retention::erasure::ErasedObject::Chain(frames)) => {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    fluree_db_core::pack::ERASURE_CONTENT_TYPE,
+                )
+                .header(
+                    "X-Fluree-Content-Kind",
+                    fluree_db_core::pack::ERASURE_CONTENT_KIND,
+                )
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(header::VARY, OBJECT_VARY)
+                .body(Body::from(frames))
+                .map_err(|e| ServerError::internal(e.to_string()));
+        }
+        Some(fluree_db_api::retention::erasure::ErasedObject::Withheld) => {
+            return Err(ServerError::not_found("Object not found"));
+        }
+        None => {}
+    }
+
     // 3d. Conditional GET: the CID is the entity tag (content-addressed, so
     //     the representation can never change under it). Checked only after
     //     the authorization and serving gates above so a 304 can't become an

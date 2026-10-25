@@ -30,7 +30,7 @@ when the API is hosted under `/v1/fluree` or on a separate `data` subdomain).
 
 Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes` incl. `multipart-put`, `direct_max_bytes`, multipart hints) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
 
-Implementations MAY also return a `push` block. `"push": {"merged_commits": true}` advertises [`POST /push-merges/*ledger`](#post-push-mergesledger). The CLI refuses to push a history containing a merge to a server that does not advertise it.
+Implementations MAY also return a `push` block. `"push": {"merged_commits": true}` advertises [`POST /push-merges/*ledger`](#post-push-mergesledger). The CLI refuses to push a history containing a merge to a server that does not advertise it. `"erasures": true` advertises that a push may carry [permanently erased](../transactions/permanent-erasure.md#pushes) commits (see `erasure_frames` below); a single server on file storage takes them. The CLI refuses to push erased history to a server that does not advertise it.
 
 ### GET {api_base_url}/whoami
 
@@ -414,12 +414,16 @@ JSON object:
 - `blobs` (optional): map of `{ cid: base64Bytes }` for referenced blobs (currently: `commit.txn` when present). Provided blobs must hash-verify against their CID. A referenced txn blob that is *not* provided is accepted with a warning — the source may itself have a provenance gap (see `missing_blobs` on export), and the commit's flakes do not depend on it.
 - `missing_blobs` (optional): array of CID strings the sender knows it cannot supply. Mirrors `missing_blobs` on the export response, so a sender declares a provenance gap instead of leaving the receiver to infer it from an absent `blobs` key. Undeclared gaps are still accepted today (a sender predating this field cannot declare one) but are logged at `warn` rather than `debug`.
 - `merged_commits`: must be absent or empty on this endpoint. A push that carries merged commits goes to [`POST /push-merges/*ledger`](#post-push-mergesledger). This endpoint refuses one with `400`.
+- `commit_ids` / `merged_commit_ids` (optional): the CIDs of `commits` / `merged_commits`, in order.
+- `erasure_frames` (optional): base64-encoded pack frames (erasure, authorization and erasure-artifact frames, as [`POST /pack`](#post-packledger) sends them) carrying [permanently erased](../transactions/permanent-erasure.md#pushes) commits. An erased commit among `commits` or `merged_commits` is sent as empty bytes, named in `commit_ids`, with its chain here; nothing of its original or its transaction document travels. Taking them needs the authority `POST /erase` needs.
+- `base_erasures` (optional): `{commit, digest, steps}` for each erased commit of the history the server already has. When the server holds the original of one but not its erasure (or a shorter chain), it answers `409` with a message that ends with `this server holds erased commits whose erasures it lacks: ` and a JSON array of their CIDs; the sender pushes again with their chains in `erasure_frames`.
+- `retention` (optional): the sender's retention section for the ledger, as a `.flpack` archive carries it. Its removal journal is merged into the server's. Removals the server's journal lacks need the authority `POST /remove` needs.
 
 **Chain rules:**
 
 - Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
-- A commit with no flakes is rejected unless it is a merge commit. A merge records the merge even when its conflict strategy resolved every flake away.
+- A commit with no flakes is rejected unless it is a merge commit, records transaction metadata (an erasure's authorization), or is erased. A merge records the merge even when its conflict strategy resolved every flake away; an erasure may remove every operation of a commit.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
@@ -455,7 +459,9 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 **Error Responses:**
 
 - `400 Bad Request`: the body carries `merged_commits`
-- `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
+- `403 Forbidden`: the push carries erasures, or removals the server's journal lacks, without the authority to make them
+- `409 Conflict`: head changed / diverged / first commit `t` did not match next-t; or the server asks for the erasures of commits it already has (see `base_erasures`)
+- `501 Not Implemented`: the push carries erased commits, which this server cannot store (memory or S3 storage, a cluster)
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
 - `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
 
@@ -1052,9 +1058,13 @@ The server verifies the hash of the stored bytes against the CID before returnin
 
 If verification fails, the server returns `500 Internal Server Error` — this indicates storage corruption.
 
+**Erased commits:**
+
+A [permanently erased](../transactions/permanent-erasure.md#object-requests) commit is answered with its erasure instead of its bytes: `200 OK` with `X-Fluree-Content-Kind: erasure`, `Content-Type: application/x-fluree-erasure` and `Cache-Control: no-store`. The body is pack frames without a preamble: the ledger's retention section as a `phase: "retention"` manifest, then the commit's chain with its latest replacement, receipts and authorizations, as [`POST /pack`](#post-packledger) sends them. The answer is never `304`, since an erasure can gain steps. The transaction document of an erased commit answers `404`.
+
 **Status Codes:**
 
-- `200 OK`: Object found and integrity verified
+- `200 OK`: Object found and integrity verified, or an erased commit's erasure
 - `400 Bad Request`: Invalid CID string
 - `404 Not Found`: Object not found, disallowed kind, not authorized, or storage proxy disabled
 - `500 Internal Server Error`: Hash verification failed (storage corruption)

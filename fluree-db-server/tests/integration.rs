@@ -1124,6 +1124,7 @@ async fn push_endpoint_accepts_single_commit_and_advances_head() {
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
 
     let resp = app
@@ -1225,6 +1226,7 @@ async fn merge_push_fixture_on(
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
     let resp = app
         .oneshot(
@@ -1252,6 +1254,7 @@ async fn merge_push_fixture_on(
         merged_commits: vec![fluree_db_api::Base64Bytes(side)],
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
     (tmp, state, request)
 }
@@ -1339,6 +1342,7 @@ async fn push_rejects_first_commit_t_mismatch_with_409() {
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
 
     let resp = app
@@ -1389,6 +1393,7 @@ async fn push_rejects_retraction_without_existing_assertion_with_422() {
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
 
     let resp = app
@@ -1451,6 +1456,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
     let resp = app
         .clone()
@@ -1483,6 +1489,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
     let resp = app
         .oneshot(
@@ -3538,6 +3545,8 @@ async fn discovery_advertises_pushing_merged_commits() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["push"]["merged_commits"], true);
+    // A single server on file storage holds erased history.
+    assert_eq!(json["push"]["erasures"], true);
 }
 
 #[tokio::test]
@@ -3725,6 +3734,7 @@ async fn create_and_push_commits(
             merged_commits: Vec::new(),
             commit_ids: Vec::new(),
             merged_commit_ids: Vec::new(),
+            ..Default::default()
         };
 
         let resp = app
@@ -3871,6 +3881,7 @@ async fn commits_endpoint_cursor_stability() {
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
     let resp = app
         .clone()

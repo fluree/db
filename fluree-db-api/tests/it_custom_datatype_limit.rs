@@ -489,6 +489,7 @@ async fn push(
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     };
     let index_config = IndexConfig {
         reindex_min_bytes: 100_000,

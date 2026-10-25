@@ -1039,6 +1039,7 @@ impl Worker {
             merged_commits,
             commit_ids: commit_cids,
             merged_commit_ids: merged_commit_cids,
+            ..Default::default()
         };
         let StagedPush {
             accepted,

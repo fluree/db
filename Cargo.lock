@@ -3546,6 +3546,7 @@ dependencies = [
  "fluree-db-credential",
  "fluree-db-doc",
  "fluree-db-docs",
+ "fluree-db-erasure",
  "fluree-db-graphql",
  "fluree-db-indexer",
  "fluree-db-mcp",

@@ -246,6 +246,35 @@ A clone or pull that stops partway completes at the next clone or pull from the 
 server on this storage next runs its retention worker. Without a ledger cache, as the CLI runs, a
 transaction committed on a holder during the activation fails it, and it resumes the same way.
 
+An origin is no named remote: `fluree clone --origin` and a pull from a ledger's origins take erased
+history only with `--erasure-authority`, which designates the origin for that transfer.
+
+## Pushes
+
+`fluree push` and `fluree publish` carry erased history to a server that advertises `push.erasures`
+(a single server on file storage), from a principal with the authority erasing needs there (the
+admin token `POST /erase` takes, when the server requires one). Each erased commit among those pushed
+travels as its erasure: empty bytes under its CID, with its chain, replacement, receipts and
+authorizations; its original and transaction document stay behind. The push also lists the chain
+digest of every erased commit of the history the server already has. A server that holds the original
+of one but not its erasure answers `409`, naming the commits whose erasures it needs, and the CLI
+pushes once more with them.
+
+The server takes the erasures as a pull does, before it validates the pushed commits: it checks them,
+makes every ledger it holds with an original read as they do (the pushed ledger among them), and
+publishes them. An erased commit is then validated as its replacement, whose surviving operations
+are staged like any pushed commit's, and stored as nothing. The push carries the ledger's removal
+journal too; see [History retention](history-retention.md). A cluster refuses a push of erased
+commits (`501`).
+
+## Object requests
+
+`GET /storage/objects/:cid`, which an origin-based clone walks when no pack is served, answers an
+erased commit with its erasure: the ledger's journal and the commit's chain, as pack frames, under
+`X-Fluree-Content-Kind: erasure`. It never answers with the replacement, which the CID does not
+match, nor with `304`, since a chain can gain steps. The transaction document of an erased commit is
+not served (`404`). A clone takes the erasures, with `--erasure-authority`, as it takes a pack's.
+
 ## Status
 
 `GET /v1/fluree/retention/<ledger>` lists the branch's erasure jobs under `registration.erasures`.
@@ -312,11 +341,12 @@ measurements.
   once, at the cost of queries still reading it.
 - **Transaction documents are not redacted.** The stored transaction document of an affected commit
   holds the original request, and audit retrieval serves it until the purge deletes it whole.
-- **Push and some transfers are refused.** Push refuses erased commits by name. The paginated
-  commit export, origin-based clones and pulls, and remote archives (`fluree export --remote --format
-  ledger`) refuse a ledger whose history holds an erased commit. A local `.flpack` archive carries erased history (see
-  [Archives](#archives)), and so do clone and pull through the pack protocol (see
-  [Clones and pulls](#clones-and-pulls)).
+- **Some transfers refuse erased history.** The paginated commit export refuses a ledger whose
+  history holds an erased commit, and so does an origin-based pull's object-by-object fallback, which
+  walks only new commits. Archives, local or remote (`fluree export --remote --format ledger`), carry
+  erased history (see [Archives](#archives)); so do clone and pull through the pack protocol (see
+  [Clones and pulls](#clones-and-pulls)), an origin-based clone's object walk, and push (see
+  [Pushes](#pushes)), each to a receiver that takes erasures from that source.
 - **Not covered:** copies outside this node's storage (backups, other clones, exports already made), the
   memory of other processes until they restart, and values in the original CID itself (see
   [Signatures](#signatures)). Neither the proof nor the purge shows that copies elsewhere are gone.

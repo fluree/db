@@ -4787,6 +4787,7 @@ async fn newest_commits(
         merged_commits: Vec::new(),
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     }
 }
 

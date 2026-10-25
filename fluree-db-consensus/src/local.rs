@@ -385,6 +385,10 @@ impl Committer for LocalCommitter {
             commit_ids,
             merged_commit_ids,
             governance,
+            erasure_frames,
+            base_erasures,
+            retention,
+            authority,
         } = request;
 
         let payload = PushCommitsRequest {
@@ -399,11 +403,20 @@ impl Committer for LocalCommitter {
             merged_commits: merged_commits.into_iter().map(Base64Bytes).collect(),
             commit_ids,
             merged_commit_ids,
+            erasure_frames: erasure_frames.into_iter().map(Base64Bytes).collect(),
+            base_erasures,
+            retention,
         };
 
         let response = self
             .fluree
-            .push_commits(&ledger_id, payload, &governance, &self.index_config)
+            .push_commits_with(
+                &ledger_id,
+                payload,
+                &governance,
+                &self.index_config,
+                authority,
+            )
             .await
             .map_err(execution_failure)?;
 

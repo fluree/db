@@ -14,6 +14,7 @@ fluree pull [OPTIONS] [LEDGER]
 |----------|-------------|
 | `[LEDGER]` | Ledger name (defaults to active ledger) |
 | `--no-indexes` | Skip pulling binary index data; only transfer new commits and txn blobs (local index may lag until you run `fluree reindex`) |
+| `--erasure-authority` | For a pull from the ledger's origins: accept the permanent erasures they carry, for this pull. With a named upstream it is refused; designate the remote with `fluree remote erasure-authority` instead. |
 
 ## Description
 
@@ -49,6 +50,12 @@ published after the ledger has every commit arrives with the next pull all the s
 no new commits still asks for one. The paginated export and an origin-based pull refuse erased
 history. The ledger's removal journal arrives with any pack, an origin's included; the object-by-object
 fallback of an origin-based pull carries none.
+
+An origin-based pull takes erased history only with `--erasure-authority`, which designates the
+ledger's origins an erasure authority for that pull, and only through the pack: the object-by-object
+fallback walks only the new commits, so it cannot bring the erasures of commits this ledger already
+has, and it refuses an erased commit. With a named upstream, the flag is refused; designate the remote
+instead.
 
 ### Origin-based pull
 

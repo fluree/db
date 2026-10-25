@@ -1665,6 +1665,14 @@ impl RemoteLedgerClient {
             .unwrap_or(false)
     }
 
+    /// Whether the server takes permanently erased commits in a push.
+    pub async fn supports_push_erasures(&self) -> bool {
+        self.fetch_discovery()
+            .await
+            .and_then(|doc| doc["push"]["erasures"].as_bool())
+            .unwrap_or(false)
+    }
+
     /// Read the server's `.flpack` import capabilities from discovery.
     ///
     /// Best-effort: any failure (old server, no discovery, parse error) yields
@@ -2924,6 +2932,8 @@ where
     let mut preamble_consumed = false;
     let mut frames_forwarded: usize = 0;
     let mut end_seen = false;
+    // No index travels with erased history, whatever the request asked.
+    let mut erased = false;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| RemoteLedgerError::Network(format!("pack stream: {e}")))?;
@@ -2970,12 +2980,13 @@ where
                             "remote pack error: {msg}"
                         )));
                     }
-                    PackFrame::Header(_)
+                    frame @ (PackFrame::Header(_)
                     | PackFrame::Data { .. }
                     | PackFrame::Manifest(_)
                     | PackFrame::Erasure(_)
                     | PackFrame::Authorization(_)
-                    | PackFrame::ErasureArtifact { .. } => {
+                    | PackFrame::ErasureArtifact { .. }) => {
+                        erased |= matches!(frame, PackFrame::Erasure(_));
                         writer.write_all(&buf[..consumed]).await.map_err(|e| {
                             RemoteLedgerError::Network(format!("archive write: {e}"))
                         })?;
@@ -2999,8 +3010,15 @@ where
         ));
     }
 
+    let mut manifest = manifest_frame.clone();
+    if erased {
+        if let Some(fields) = manifest.as_object_mut() {
+            fields.remove("index_head_id");
+            fields.remove("index_t");
+        }
+    }
     let mut tail = Vec::with_capacity(512);
-    encode_manifest_frame(manifest_frame, &mut tail);
+    encode_manifest_frame(&manifest, &mut tail);
     encode_end_frame(&mut tail);
     writer
         .write_all(&tail)
@@ -3182,6 +3200,35 @@ fn push_idempotency_key(ledger: &str, request: &fluree_db_api::PushCommitsReques
         for commit in &request.merged_commits {
             hasher.update((commit.0.len() as u64).to_be_bytes());
             hasher.update(&commit.0);
+        }
+    }
+    // Likewise; a push sent again with the erasures its receiver asked for
+    // is another push.
+    if !request.erasure_frames.is_empty() {
+        hasher.update(b"erasures\0");
+        for frame in &request.erasure_frames {
+            hasher.update((frame.0.len() as u64).to_be_bytes());
+            hasher.update(&frame.0);
+        }
+    }
+    for (tag, json) in [
+        (
+            &b"base-erasures\0"[..],
+            (!request.base_erasures.is_empty())
+                .then(|| serde_json::to_vec(&request.base_erasures).unwrap_or_default()),
+        ),
+        (
+            &b"retention\0"[..],
+            request
+                .retention
+                .as_ref()
+                .map(|r| serde_json::to_vec(r).unwrap_or_default()),
+        ),
+    ] {
+        if let Some(json) = json {
+            hasher.update(tag);
+            hasher.update((json.len() as u64).to_be_bytes());
+            hasher.update(json);
         }
     }
 
@@ -3668,6 +3715,26 @@ mod tests {
     /// Two pushes that differ only in their merged commits must not share
     /// an idempotency key. A server would replay the first one's response.
     #[test]
+    fn push_idempotency_key_covers_erasures() {
+        let plain = fluree_db_api::PushCommitsRequest {
+            commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
+            ..Default::default()
+        };
+        let with_erasures = fluree_db_api::PushCommitsRequest {
+            erasure_frames: vec![fluree_db_api::Base64Bytes(b"chain".to_vec())],
+            ..plain.clone()
+        };
+        let with_journal = fluree_db_api::PushCommitsRequest {
+            retention: Some(serde_json::json!({"activeSinceT": 1})),
+            ..plain.clone()
+        };
+        let keys = [&plain, &with_erasures, &with_journal]
+            .map(|request| push_idempotency_key("mydb:main", request));
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+    }
+
+    #[test]
     fn push_idempotency_key_covers_merged_commits() {
         let plain = fluree_db_api::PushCommitsRequest {
             commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
@@ -3913,6 +3980,33 @@ mod tests {
 
         assert_eq!(frames_one, frames_many);
         assert_eq!(output_one, output_many);
+    }
+
+    /// A pack carrying erased history carries no index, so the archive's
+    /// manifest names none, though the request asked for one.
+    #[test]
+    fn splice_omits_index_fields_from_erased_history() {
+        let mut pack = Vec::new();
+        write_stream_preamble(&mut pack);
+        encode_header_frame(&PackHeader::commits_only(Some(0), true), &mut pack);
+        fluree_db_core::pack::encode_erasure_frame(&serde_json::json!({"commit": "c"}), &mut pack);
+        encode_end_frame(&mut pack);
+        let manifest = build_archive_manifest(&sample_ns_record(), true);
+        assert!(manifest.get("index_head_id").is_some());
+
+        let (_, output) = drive_splice(vec![pack], manifest).unwrap();
+        let mut pos = read_stream_preamble(&output).unwrap();
+        let mut named = None;
+        loop {
+            let (frame, consumed) = decode_frame(&output[pos..], DEFAULT_MAX_PAYLOAD).unwrap();
+            pos += consumed;
+            match frame {
+                PackFrame::Manifest(json) => named = Some(json.get("index_head_id").cloned()),
+                PackFrame::End => break,
+                _ => {}
+            }
+        }
+        assert_eq!(named, Some(None));
     }
 
     #[test]

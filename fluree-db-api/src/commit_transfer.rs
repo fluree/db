@@ -226,6 +226,52 @@ pub struct PushCommitsRequest {
     /// The CIDs of `merged_commits`, likewise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged_commit_ids: Vec<ContentId>,
+    /// Pack frames carrying permanently erased commits: their chains,
+    /// latest replacements, receipts and authorizations. An erased commit
+    /// of `commits` or `merged_commits` travels as empty bytes under its
+    /// named CID, and its chain here; so does the chain of an erased commit
+    /// the receiver holds, when it asked for it (see [`ERASURES_NEEDED`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub erasure_frames: Vec<Base64Bytes>,
+    /// Every erased commit of the history the receiver already has, with
+    /// its chain's digest: the receiver asks for the chains it lacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_erasures: Vec<BaseErasure>,
+    /// The sender's retention section for the ledger (its removal journal),
+    /// merged into the receiver's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<serde_json::Value>,
+}
+
+/// An erased commit a push's receiver already has, as the sender holds its
+/// erasure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseErasure {
+    pub commit: ContentId,
+    /// SHA-256 digest of the chain.
+    pub digest: String,
+    /// The chain's step count: a receiver holding as many is not behind.
+    pub steps: usize,
+}
+
+/// What the principal behind a push may do beyond pushing commits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PushAuthority {
+    /// It may erase (what `POST /erase` needs): push erasures, and removals
+    /// the receiver's journal lacks.
+    pub erasures: bool,
+}
+
+/// How a push's receiver asks for erasure chains it lacks, in the message
+/// of its `409`: this prefix, then a JSON array of the commits' CIDs. A
+/// sender pushes again with their chains (see [`erasures_needed`]).
+pub const ERASURES_NEEDED: &str = "this server holds erased commits whose erasures it lacks: ";
+
+/// The commits a push's `409` asks erasure chains for, if it does.
+pub fn erasures_needed(message: &str) -> Option<Vec<ContentId>> {
+    let listed = &message[message.find(ERASURES_NEEDED)? + ERASURES_NEEDED.len()..];
+    let end = listed.find(']')?;
+    serde_json::from_str(&listed[..=end]).ok()
 }
 
 /// Response body for a successful push.
@@ -304,8 +350,27 @@ impl Fluree {
         opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<PushCommitsResponse> {
+        self.push_commits_with(
+            ledger_id,
+            request,
+            opts,
+            index_config,
+            PushAuthority::default(),
+        )
+        .await
+    }
+
+    /// [`Self::push_commits`], by a principal with `authority`.
+    pub async fn push_commits_with(
+        &self,
+        ledger_id: &str,
+        request: PushCommitsRequest,
+        opts: &GovernanceOptions,
+        index_config: &IndexConfig,
+        authority: PushAuthority,
+    ) -> Result<PushCommitsResponse> {
         let staged = self
-            .prepare_push(ledger_id, request, opts, index_config)
+            .prepare_push_with(ledger_id, request, opts, index_config, authority)
             .await?;
         self.apply_push(staged).await
     }
@@ -339,10 +404,36 @@ impl Fluree {
         opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<StagedPush> {
+        self.prepare_push_with(
+            ledger_id,
+            request,
+            opts,
+            index_config,
+            PushAuthority::default(),
+        )
+        .await
+    }
+
+    /// [`Self::prepare_push`], by a principal with `authority`. Erased
+    /// history the push carries is taken first, as a pull takes it (see
+    /// [`Self::receive_pushed_erasures`]); the erased commits it brings are
+    /// then validated as their replacements, stored as nothing.
+    pub async fn prepare_push_with(
+        &self,
+        ledger_id: &str,
+        mut request: PushCommitsRequest,
+        opts: &GovernanceOptions,
+        index_config: &IndexConfig,
+        authority: PushAuthority,
+    ) -> Result<StagedPush> {
         if request.commits.is_empty() {
             return Err(ApiError::http(400, "missing required field 'commits'"));
         }
         let ledger_id = &LedgerId::parse(ledger_id)?;
+        // Before the ledger's write lock: reconciling it takes that lock.
+        let erased = self
+            .receive_pushed_erasures(ledger_id, &mut request, authority)
+            .await?;
 
         // 0) Lock ledger state for write (serialize with transactions).
         let guard = self
@@ -371,7 +462,7 @@ impl Fluree {
         let rollback_snapshot = NsRecordSnapshot::from_record(&current_record);
 
         // 2) Decode commits and preflight strict sequencing.
-        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
+        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request, &erased)
             .map_err(PushError::into_api_error)?;
 
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
@@ -379,7 +470,7 @@ impl Fluree {
 
         // 2.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
-        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        let merged = decode_merged_commits(&request, &erased).map_err(PushError::into_api_error)?;
         admit_bundle_hashes(self, decoded.iter().chain(&merged), &request.blobs)
             .map_err(PushError::into_api_error)?;
         validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
@@ -795,6 +886,9 @@ struct PushCommitDecoded {
     id: ContentId,
     /// The commit's address digest (its CID's, algorithm included).
     digest_hex: String,
+    /// Permanently erased: `bytes` are its replacement, which a published
+    /// erasure stands for, and nothing is stored for it.
+    erased: bool,
 }
 
 /// The CID of a pushed commit: the one the sender names, checked against the
@@ -976,6 +1070,7 @@ fn reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, Grap
 fn decode_and_validate_commit_chain(
     _ledger_id: &str,
     request: &PushCommitsRequest,
+    erased: &HashSet<ContentId>,
 ) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
     let mut out = Vec::with_capacity(request.commits.len());
 
@@ -988,17 +1083,30 @@ fn decode_and_validate_commit_chain(
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
 
+        let named = ids.map(|ids| &ids[idx]);
+        let is_erased = named.is_some_and(|id| erased.contains(id));
+
         // Reject empty commits (no flakes) - keep semantics clear. A merge
         // commit is exempt: it records the merge even when the strategy
         // resolved every flake away, and dropping it would let the same
-        // branch be merged again.
-        if commit.flakes.is_empty() && commit.parents.len() < 2 {
+        // branch be merged again. So is a commit recording only transaction
+        // metadata (an erasure's authorization), and an erased commit, all
+        // of whose operations an erasure may have removed.
+        if commit.flakes.is_empty()
+            && commit.txn_meta.is_empty()
+            && commit.parents.len() < 2
+            && !is_erased
+        {
             return Err(PushError::Invalid(format!(
                 "invalid commit[{idx}]: empty commit (no flakes)"
             )));
         }
 
-        let id = pushed_commit_id(ids.map(|ids| &ids[idx]), &bytes, &format!("commit[{idx}]"))?;
+        let id = match named {
+            // Its replacement, read from the published erasure.
+            Some(id) if is_erased => id.clone(),
+            _ => pushed_commit_id(named, &bytes, &format!("commit[{idx}]"))?,
+        };
         let digest_hex = id.address_digest();
 
         // Note: commit blobs are applied to the server-selected `ledger_id` via CAS.
@@ -1041,6 +1149,7 @@ fn decode_and_validate_commit_chain(
             bytes,
             id,
             digest_hex,
+            erased: is_erased,
         });
     }
 
@@ -1055,6 +1164,7 @@ fn decode_and_validate_commit_chain(
 /// them.
 fn decode_merged_commits(
     request: &PushCommitsRequest,
+    erased: &HashSet<ContentId>,
 ) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
     let ids = named_ids(
         &request.merged_commit_ids,
@@ -1069,17 +1179,19 @@ fn decode_merged_commits(
             let bytes = b64.0.clone();
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
-            let id = pushed_commit_id(
-                ids.map(|ids| &ids[idx]),
-                &bytes,
-                &format!("merged_commits[{idx}]"),
-            )?;
+            let named = ids.map(|ids| &ids[idx]);
+            let is_erased = named.is_some_and(|id| erased.contains(id));
+            let id = match named {
+                Some(id) if is_erased => id.clone(),
+                _ => pushed_commit_id(named, &bytes, &format!("merged_commits[{idx}]"))?,
+            };
             let digest_hex = id.address_digest();
             Ok(PushCommitDecoded {
                 commit,
                 bytes,
                 id,
                 digest_hex,
+                erased: is_erased,
             })
         })
         .collect()
@@ -1243,7 +1355,8 @@ fn validate_required_blobs(
     Ok(())
 }
 
-/// The txn blob CIDs a bundle's commits reference.
+/// The txn blob CIDs a bundle's commits reference. An erased commit's
+/// travels with nothing: it holds what the erasure removed.
 fn required_txn_cids(
     decoded: &[PushCommitDecoded],
     merged: &[PushCommitDecoded],
@@ -1251,6 +1364,7 @@ fn required_txn_cids(
     decoded
         .iter()
         .chain(merged)
+        .filter(|c| !c.erased)
         .filter_map(|c| c.commit.txn.as_ref().map(ToString::to_string))
         .collect()
 }
@@ -1431,6 +1545,14 @@ async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + 
         .map(|p| BlobPinner::new(p, namespace.clone()));
     let mut stored = Vec::with_capacity(decoded.len());
     for (idx, c) in decoded.iter().enumerate() {
+        // Its published erasure stands for it.
+        if c.erased {
+            stored.push(StoredCommit {
+                t: c.commit.t,
+                commit_id: c.id.clone(),
+            });
+            continue;
+        }
         if let Some(id) = ContentId::from_address_digest(CODEC_FLUREE_COMMIT, &c.digest_hex) {
             pins.pin(pinner.as_ref(), &id).await;
         }
@@ -2720,7 +2842,7 @@ impl Fluree {
             merged_commits,
             commit_ids,
             merged_commit_ids,
-            missing_blobs: _,
+            ..
         } = bundle;
         if commits.is_empty() {
             return Err(ApiError::http(400, "no commits to import"));
@@ -2753,10 +2875,12 @@ impl Fluree {
             merged_commits,
             commit_ids,
             merged_commit_ids,
+            ..Default::default()
         };
 
-        // 3) Decode and validate chain.
-        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
+        // 3) Decode and validate chain. The export carries no erased commit.
+        let none = HashSet::new();
+        let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request, &none)
             .map_err(PushError::into_api_error)?;
 
         // 4) Ancestry preflight: verify first commit's parent matches local head.
@@ -2765,7 +2889,7 @@ impl Fluree {
 
         // 4.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
-        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        let merged = decode_merged_commits(&request, &none).map_err(PushError::into_api_error)?;
         admit_bundle_hashes(self, decoded.iter().chain(&merged), &request.blobs)
             .map_err(PushError::into_api_error)?;
         validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
@@ -2907,6 +3031,42 @@ impl Fluree {
             head_commit_id: final_head.commit_id.clone(),
             indexing: indexing_status,
         })
+    }
+}
+
+#[cfg(not(feature = "native"))]
+impl Fluree {
+    /// Without erasure, a push carrying erased commits is refused.
+    async fn receive_pushed_erasures(
+        &self,
+        _ledger_id: &LedgerId,
+        request: &mut PushCommitsRequest,
+        _authority: PushAuthority,
+    ) -> Result<HashSet<ContentId>> {
+        let erased_commit = request
+            .commits
+            .iter()
+            .chain(&request.merged_commits)
+            .any(|c| c.0.is_empty());
+        if erased_commit || !request.erasure_frames.is_empty() {
+            return Err(cannot_hold_erasures());
+        }
+        Ok(HashSet::new())
+    }
+}
+
+impl Fluree {
+    /// Whether a transfer may bring this instance permanently erased
+    /// commits: a single node with file storage holds them.
+    pub fn can_hold_erasures(&self) -> bool {
+        #[cfg(feature = "native")]
+        {
+            self.retention.erasure.get().is_some() && self.retention.replicas.get().is_none()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
     }
 }
 

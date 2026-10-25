@@ -296,7 +296,7 @@ impl ErasureIndex {
     }
 
     /// Whether the transaction document at `digest` is an erased commit's.
-    async fn is_erased_txn(&self, digest: &str) -> Result<bool> {
+    pub(crate) async fn is_erased_txn(&self, digest: &str) -> Result<bool> {
         if self.fresh() && !self.any.load(Ordering::Acquire) {
             return Ok(false);
         }

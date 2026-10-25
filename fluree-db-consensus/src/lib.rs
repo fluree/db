@@ -798,6 +798,13 @@ pub struct PushRequest {
     pub commit_ids: Vec<fluree_db_core::ContentId>,
     pub merged_commit_ids: Vec<fluree_db_core::ContentId>,
     pub governance: GovernanceOptions,
+    /// Erased history and retention the push carries (see
+    /// [`fluree_db_api::PushCommitsRequest::erasure_frames`]).
+    pub erasure_frames: Vec<Vec<u8>>,
+    pub base_erasures: Vec<fluree_db_api::BaseErasure>,
+    pub retention: Option<serde_json::Value>,
+    /// What the principal may do beyond pushing commits.
+    pub authority: fluree_db_api::PushAuthority,
 }
 
 /// Receipt returned once a push is durably accepted.

@@ -21,6 +21,7 @@ fluree clone --origin <URI> [--token <TOKEN>] [OPTIONS] <LEDGER>
 | `--origin <URI>` | Bootstrap URI for CID-based clone (replaces `<REMOTE>`) |
 | `--token <TOKEN>` | Auth token for origin server (with `--origin` only) |
 | `--no-indexes` | Skip pulling binary index data; only transfer commits and txn blobs (queries will replay from commits until you run `fluree reindex`) |
+| `--erasure-authority` | With `--origin`: accept the permanent erasures the origin's history carries, for this clone. A named remote is designated with `fluree remote erasure-authority` instead. |
 | `--no-txns` | Skip pulling original transaction payloads. Commits still transfer (chain remains valid and verifiable), but the raw JSON-LD / SPARQL requests that produced each commit are not downloaded. Use for read-only clones of large ledgers. See [Transaction transfer](#transaction-transfer). |
 
 ## Description
@@ -71,7 +72,12 @@ clones through the pack protocol only, from a remote designated an erasure autho
 commit arrives as its erasure, which the CLI checks before setting the head; the original and its
 transaction document never arrive, and neither does an index. The ledger's removal journal arrives with
 any pack, so the clone refuses the history its source refuses. From an undesignated remote, the clone
-is refused, naming the setting. The paginated export and an origin-based clone refuse erased history.
+is refused, naming the setting. The paginated export refuses erased history.
+
+An origin is no named remote, so an origin-based clone takes erased history only with
+`--erasure-authority`, which designates the origin an erasure authority for that clone. It takes it
+through the pack, or, when the origin serves none, object by object: the origin answers an erased
+commit with its erasure and the ledger's journal, and the clone takes them before setting the head.
 
 ### Origin-based clone
 

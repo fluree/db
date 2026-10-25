@@ -1258,6 +1258,13 @@ pub enum Commands {
         /// Skip pulling binary index data (indexes are pulled by default)
         #[arg(long)]
         no_indexes: bool,
+
+        /// Accept the permanent erasures the ledger's origins carry, for this
+        /// pull: they remove values from history held here, which nothing
+        /// undoes. A named remote is designated with `fluree remote
+        /// erasure-authority` instead
+        #[arg(long)]
+        erasure_authority: bool,
     },
 
     /// Push a ledger to its upstream remote
@@ -1324,6 +1331,12 @@ pub enum Commands {
         /// needed — e.g., when cloning a large ledger for read-only query use.
         #[arg(long)]
         no_txns: bool,
+
+        /// Accept the permanent erasures the origin's history carries, for
+        /// this clone. A named remote is designated with `fluree remote
+        /// erasure-authority` instead
+        #[arg(long, requires = "origin")]
+        erasure_authority: bool,
     },
 
     /// Track a remote ledger (remote-only, no local data)

@@ -1881,3 +1881,428 @@ async fn a_pack_of_no_commits_brings_erasures_published_since() {
         Vec::<std::path::PathBuf>::new()
     );
 }
+
+/// What `fluree push` sends from `source`'s `id` to a receiver whose head is
+/// `base`: the commits it lacks with their transaction documents, ready
+/// for erased history, with the chains of `needed` among the commits the
+/// receiver has.
+async fn push_request(
+    source: &Fluree,
+    id: &str,
+    base: Option<&ContentId>,
+    needed: &[ContentId],
+) -> fluree_db_api::PushCommitsRequest {
+    let store = source.branched_content_store(id).await.unwrap();
+    let (head, _) = head_of(source, id).await;
+    let plan = fluree_db_core::plan_commit_transfer(store.as_ref(), &head, base)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut request = fluree_db_api::PushCommitsRequest {
+        commit_ids: plan.lineage.clone(),
+        ..Default::default()
+    };
+    for cid in &plan.lineage {
+        let bytes = store.get(cid).await.unwrap().into_vec();
+        let commit = fluree_db_core::commit::codec::read_commit(&bytes).unwrap();
+        if let Some(txn) = &commit.txn {
+            if let Ok(doc) = store.get(txn).await {
+                request
+                    .blobs
+                    .insert(txn.to_string(), fluree_db_api::Base64Bytes(doc.into_vec()));
+            }
+        }
+        request.commits.push(fluree_db_api::Base64Bytes(bytes));
+    }
+    source
+        .ready_push(id, &mut request, base, needed)
+        .await
+        .unwrap();
+    request
+}
+
+/// Push `request` to `ledger` at `receiver`, by a principal that may erase
+/// or not.
+async fn push(
+    receiver: &Fluree,
+    ledger: &str,
+    request: fluree_db_api::PushCommitsRequest,
+    erasures: bool,
+) -> fluree_db_api::Result<fluree_db_api::PushCommitsResponse> {
+    receiver
+        .push_commits_with(
+            ledger,
+            request,
+            &fluree_db_api::GovernanceOptions::default(),
+            &fluree_db_api::server_defaults::default_index_config(),
+            fluree_db_api::PushAuthority { erasures },
+        )
+        .await
+}
+
+/// A push carries erased history as a pull does, to a receiver whose
+/// principal may erase. The receiver holds the original of an erased commit
+/// and asks for its erasure; pushed again with it, the push takes that
+/// erasure and the erased commit it brings, makes the copy read as they do,
+/// and the copy's purge leaves no file holding the value. Without the
+/// authority to erase, the push is refused and nothing is taken.
+#[tokio::test]
+async fn a_push_carries_erased_history_to_a_receiver_that_may_erase() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/push-source").await;
+    let t1 = insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@later"}),
+    )
+    .await;
+    let mut before = Vec::new();
+    source
+        .archive_ledger(&id, false, &mut before)
+        .await
+        .unwrap();
+    let (base, _) = head_of(&source, &id).await;
+    let erased = commit_at(&source, &id, t1).await;
+    erase_published(&source, &id, email("alice", "a@secret")).await;
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let copy = receiver
+        .restore_ledger("it/push-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&receiver, &copy).await;
+
+    let request = push_request(&source, &id, Some(&base), &[]).await;
+    assert!(!request.erasure_frames.is_empty());
+    let refused = push(&receiver, &copy, request.clone(), false)
+        .await
+        .expect_err("no authority to erase");
+    assert_eq!(refused.status_code(), 403, "{refused}");
+    let asked = push(&receiver, &copy, request, true)
+        .await
+        .expect_err("asks for an erasure");
+    assert_eq!(asked.status_code(), 409, "{asked}");
+    let needed = fluree_db_api::erasures_needed(&asked.to_string()).unwrap();
+    assert_eq!(needed, std::slice::from_ref(&erased));
+    assert_eq!(
+        objects(&receiver, &copy, "ex:alice", "ex:email").await,
+        vec![json!("a@secret")]
+    );
+
+    let request = push_request(&source, &id, Some(&base), &needed).await;
+    let pushed = push(&receiver, &copy, request, true).await.unwrap();
+    assert_eq!(pushed.head.commit_id, head_of(&source, &id).await.0);
+    received_without(&receiver, &copy, &erased, t1).await;
+    let report = receiver
+        .run_purge_pass(&copy, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A push to an empty ledger, as `fluree publish` makes, brings each erased
+/// commit as its erasure: neither the original nor its transaction document
+/// arrives.
+#[tokio::test]
+async fn a_push_to_an_empty_ledger_brings_erased_commits_as_their_erasures() {
+    let (_dir, source, id, erased, t1) = source("it/push-publish").await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    receiver.create_ledger("it/push-published").await.unwrap();
+    let copy = "it/push-published:main";
+
+    let request = push_request(&source, &id, None, &[]).await;
+    assert!(request.base_erasures.is_empty());
+    // The erased commit's transaction document stays behind.
+    assert!(!request.blobs.values().any(|b| contains(&b.0, "a@secret")));
+    push(&receiver, copy, request, true).await.unwrap();
+    received_without(&receiver, copy, &erased, t1).await;
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A push carries the ledger's removal journal. Removals the receiver's
+/// journal lacks need the authority removing needs; once the receiver has
+/// them, a push carrying the same journal needs none.
+#[tokio::test]
+async fn a_push_carries_the_removal_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = receiving(&dir);
+    let id = ledger(&source, "it/push-journal").await;
+    let t1 = insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let mut before = Vec::new();
+    source
+        .archive_ledger(&id, false, &mut before)
+        .await
+        .unwrap();
+    let (base, _) = head_of(&source, &id).await;
+    let removal = RemovalRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(json!("a@old")),
+        }],
+        ..Default::default()
+    };
+    source.remove_occurrences(&id, removal).await.unwrap();
+    insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@new"}),
+    )
+    .await;
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let copy = receiver
+        .restore_ledger("it/push-journal-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let request = push_request(&source, &id, Some(&base), &[]).await;
+    assert!(request.retention.is_some());
+    let refused = push(&receiver, &copy, request.clone(), false)
+        .await
+        .expect_err("a removal the receiver lacks");
+    assert_eq!(refused.status_code(), 403, "{refused}");
+    push(&receiver, &copy, request, true).await.unwrap();
+    let past = receiver
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{copy}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+
+    let (base, _) = head_of(&source, &id).await;
+    insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@new"}),
+    )
+    .await;
+    let request = push_request(&source, &id, Some(&base), &[]).await;
+    push(&receiver, &copy, request, false).await.unwrap();
+}
+
+/// What an origin's object requests answer for erased history, walked as
+/// `fluree clone --origin` walks it when no pack is served: an erased commit
+/// is answered with its chain and the ledger's journal, its transaction
+/// document not at all. A clone taking them as a pack's reads as the source
+/// does, and holds no file of the value.
+#[tokio::test]
+async fn an_object_walk_carries_erased_history() {
+    use fluree_db_api::retention::erasure::ErasedObject;
+    use fluree_db_core::commit::codec::read_commit_envelope;
+
+    let (_dir, source, id, erased, t1) = source("it/walk-source").await;
+    let replacement = store_of(&source, &id).await.get(&erased).await.unwrap();
+    let txn = read_commit_envelope(&replacement).unwrap().txn.unwrap();
+    assert!(matches!(
+        source.erased_object(&id, &txn).await.unwrap(),
+        Some(ErasedObject::Withheld)
+    ));
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = pulling(&here);
+    receiver.create_ledger("it/walk-copy").await.unwrap();
+    let copy = "it/walk-copy:main";
+    let record = receiver.nameservice().lookup(copy).await.unwrap().unwrap();
+    let storage = receiver.backend().admin_storage_cloned().unwrap();
+    let mut reception = fluree_db_api::retention::erasure::PackReception::default();
+    let (head, head_t) = head_of(&source, &id).await;
+    let mut frontier = vec![head.clone()];
+    let mut chains = 0;
+    while let Some(cid) = frontier.pop() {
+        let bytes = match source.erased_object(&id, &cid).await.unwrap() {
+            Some(ErasedObject::Chain(frames)) => {
+                chains += 1;
+                let mut replacement = None;
+                let mut pos = 0;
+                while pos < frames.len() {
+                    let (frame, used) = decode_frame(&frames[pos..], DEFAULT_MAX_PAYLOAD).unwrap();
+                    pos += used;
+                    if let PackFrame::ErasureArtifact { payload, .. } = &frame {
+                        if is_replacement(payload) {
+                            replacement = Some(payload.clone());
+                        }
+                    }
+                    receiver
+                        .receive_pack_frame(&mut reception, frame)
+                        .await
+                        .unwrap();
+                }
+                replacement.unwrap()
+            }
+            Some(ErasedObject::Withheld) => panic!("a commit withheld"),
+            None => {
+                let bytes = store_of(&source, &id)
+                    .await
+                    .get(&cid)
+                    .await
+                    .unwrap()
+                    .into_vec();
+                fluree_db_nameservice_sync::ingest_pack_frame(
+                    &cid,
+                    &bytes,
+                    &storage,
+                    &record.storage_namespace(),
+                )
+                .await
+                .unwrap();
+                bytes
+            }
+        };
+        frontier.extend(read_commit_envelope(&bytes).unwrap().parents);
+    }
+    // The assertion, and the removal's retraction.
+    assert_eq!(chains, 2);
+    let accepted = receiver
+        .accept_pack(copy, reception, &head, true)
+        .await
+        .unwrap();
+    assert_eq!(accepted.erased_commits, 2, "{accepted:?}");
+    let handle = receiver.ledger_cached(copy).await.unwrap();
+    receiver
+        .set_commit_head(&handle, &head, head_t)
+        .await
+        .unwrap();
+    received_without(&receiver, copy, &erased, t1).await;
+    assert_eq!(
+        files_holding(here.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// Every transfer of erased history either carries it, so the receiver
+/// reads as the source does, or refuses it, as `it_content_hash.rs` checks
+/// each transfer against a hash its receiver does not admit: an archive and
+/// a pack carry it to storage that holds erasures, from a source designated
+/// an erasure authority; a push carries it from a principal that may erase;
+/// an object walk is answered with the erasures. A receiver that cannot
+/// hold them refuses each; so does a pack request that does not take them,
+/// and the paginated export.
+#[tokio::test]
+async fn every_transfer_carries_erased_history_or_refuses_it() {
+    use fluree_db_api::retention::erasure::ErasedObject;
+
+    let (_dir, source, id, erased, t1) = source("it/every-transfer").await;
+    let (head, head_t) = head_of(&source, &id).await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = pulling(&here);
+    let memory = FlureeBuilder::memory().build_memory();
+    let cannot_hold =
+        |e: ApiError| e.status_code() == 501 && e.to_string().contains("cannot store");
+
+    // Archive and restore.
+    let archived = archive(&source, &id).await;
+    let restored = receiver
+        .restore_ledger("it/every-restore", &mut archived.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    received_without(&receiver, &restored, &erased, t1).await;
+    let refused = memory
+        .restore_ledger("it/every-restore", &mut archived.as_slice())
+        .await;
+    assert!(refused.is_err_and(cannot_hold));
+
+    // Pack: taken from an erasure authority, refused from another source,
+    // and refused to a request that does not take erasures.
+    let request = fluree_db_api::pack::PackRequest::commits(vec![head.clone()], vec![])
+        .with_erasures(Vec::new());
+    let pack = packed(&source, &id, &request).await;
+    receiver.create_ledger("it/every-pack").await.unwrap();
+    let refused = take_pack(
+        &receiver,
+        "it/every-pack:main",
+        &pack,
+        (&head, head_t),
+        false,
+    )
+    .await;
+    assert!(refused.is_err_and(|e| e.status_code() == 403));
+    receiver.create_ledger("it/every-clone").await.unwrap();
+    take_pack(
+        &receiver,
+        "it/every-clone:main",
+        &pack,
+        (&head, head_t),
+        true,
+    )
+    .await
+    .unwrap();
+    received_without(&receiver, "it/every-clone:main", &erased, t1).await;
+    let old_client = fluree_db_api::pack::PackRequest::commits(vec![head.clone()], vec![]);
+    assert!(contains(
+        &packed(&source, &id, &old_client).await,
+        "permanently erased"
+    ));
+
+    // The paginated export.
+    let export = source
+        .export_commit_range(
+            &source.ledger_cached(&id).await.unwrap(),
+            &fluree_db_api::ExportCommitsRequest::default(),
+        )
+        .await;
+    assert!(export.is_err_and(|e| e.status_code() == 501));
+
+    // Push, to a server, which caches ledgers.
+    let served = tempfile::tempdir().unwrap();
+    let server = receiving(&served);
+    server.create_ledger("it/every-push").await.unwrap();
+    let request = push_request(&source, &id, None, &[]).await;
+    let refused = push(&server, "it/every-push:main", request.clone(), false).await;
+    assert!(refused.is_err_and(|e| e.status_code() == 403));
+    memory.create_ledger("it/every-push").await.unwrap();
+    let refused = push(&memory, "it/every-push:main", request.clone(), true).await;
+    assert!(refused.is_err_and(cannot_hold));
+    push(&server, "it/every-push:main", request, true)
+        .await
+        .unwrap();
+    received_without(&server, "it/every-push:main", &erased, t1).await;
+
+    // An object walk is answered with the erasure.
+    assert!(matches!(
+        source.erased_object(&id, &erased).await.unwrap(),
+        Some(ErasedObject::Chain(_))
+    ));
+    for dir in [&here, &served] {
+        assert_eq!(
+            files_holding(dir.path(), "a@secret"),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
+}

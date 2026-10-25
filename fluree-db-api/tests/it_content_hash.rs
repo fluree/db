@@ -216,6 +216,7 @@ async fn bundle(fluree: &Fluree, ledger: &str, name_ids: bool) -> PushCommitsReq
             Vec::new()
         },
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -310,6 +311,7 @@ async fn sha2_512_commits_transfer_by_push_pull_and_archive() {
                 merged_commits: Vec::new(),
                 commit_ids,
                 merged_commit_ids: Vec::new(),
+                ..Default::default()
             },
         )
         .await

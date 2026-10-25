@@ -54,6 +54,15 @@ pub const PACK_PROTOCOL: &str = "fluree-pack-v1";
 /// Default maximum frame payload size (256 MiB).
 pub const DEFAULT_MAX_PAYLOAD: u32 = 256 * 1024 * 1024;
 
+/// The `X-Fluree-Content-Kind` of an object request answered with a
+/// permanently erased commit's erasure instead of its bytes: pack frames,
+/// without a preamble, holding the ledger's retention manifest and the
+/// commit's chain.
+pub const ERASURE_CONTENT_KIND: &str = "erasure";
+
+/// The `Content-Type` of that answer.
+pub const ERASURE_CONTENT_TYPE: &str = "application/x-fluree-erasure";
+
 /// Maximum CID binary length in a Data frame.
 pub const MAX_CID_LEN: u16 = 128;
 

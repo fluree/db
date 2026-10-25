@@ -361,8 +361,11 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     // Advertise that `POST /push-merges` exists. A client refuses to push a
     // history containing a merge to a server without it, rather than send a
     // bundle that server would store incompletely.
+    // `erasures`: a push may carry permanently erased commits, which this
+    // server holds.
     doc["push"] = serde_json::json!({
         "merged_commits": true,
+        "erasures": state.fluree.can_hold_erasures(),
     });
 
     // Advertise server-wide serving capabilities so clients can negotiate

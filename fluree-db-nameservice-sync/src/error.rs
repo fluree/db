@@ -41,6 +41,13 @@ pub enum SyncError {
     #[error("Integrity verification failed for CID {0}")]
     IntegrityFailed(String),
 
+    /// The commit is permanently erased at the origin, which answered with
+    /// its erasure: pack frames holding the ledger's retention manifest and
+    /// the commit's chain. Terminal: another origin's bytes would be the
+    /// erased original.
+    #[error("commit {cid} is permanently erased at the origin")]
+    Erased { cid: String, frames: Vec<u8> },
+
     /// Pack protocol error (malformed stream, invalid frame, server-side error)
     #[error("Pack protocol error: {0}")]
     PackProtocol(String),

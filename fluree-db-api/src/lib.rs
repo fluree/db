@@ -168,8 +168,9 @@ pub use block_fetch::{
     LedgerBlockContext,
 };
 pub use commit_transfer::{
-    Base64Bytes, BulkImportResult, CommitImportResult, ExportCommitsRequest, ExportCommitsResponse,
-    PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
+    erasures_needed, Base64Bytes, BaseErasure, BulkImportResult, CommitImportResult,
+    ExportCommitsRequest, ExportCommitsResponse, PushAuthority, PushCommitsRequest,
+    PushCommitsResponse, PushedHead, RestoreResult, StagedPush, ERASURES_NEEDED,
 };
 pub use dataset::{
     sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,

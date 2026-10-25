@@ -784,7 +784,19 @@ impl Committer for QueuedTransactor {
             commit_ids,
             merged_commit_ids,
             governance,
+            erasure_frames,
+            // A cluster holds no erasure: it keeps what it has, and the
+            // removal journal it replicates.
+            base_erasures: _,
+            retention: _,
+            authority: _,
         } = request;
+        if !erasure_frames.is_empty() {
+            return Err(SubmissionError::Execution {
+                status: 501,
+                message: "a cluster does not hold permanently erased commits".to_string(),
+            });
+        }
 
         // See the same comment in `transact` — normalize once so
         // the idempotency map and the per-ledger content store

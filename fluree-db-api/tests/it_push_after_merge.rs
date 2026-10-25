@@ -110,6 +110,7 @@ async fn build_bundle_from(
         merged_commits,
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -410,6 +411,7 @@ async fn lineage_export_pulls_a_merge() {
                 merged_commits: page.merged_commits,
                 commit_ids: page.commit_ids,
                 merged_commit_ids: page.merged_commit_ids,
+                ..Default::default()
             },
         )
         .await

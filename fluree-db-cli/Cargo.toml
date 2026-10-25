@@ -139,6 +139,8 @@ parking_lot = "0.12"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# A native prover with fake receipts, for tests of erased history in transfers.
+fluree-db-erasure = { path = "../fluree-db-erasure", features = ["testing"] }
 # Drive the server's router in-process (behind the `server` feature) so the
 # tracking headers this CLI emits are tested against the parser that consumes
 # them, rather than each side being asserted in isolation.

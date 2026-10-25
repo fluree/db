@@ -124,6 +124,7 @@ async fn push_preserves_signed_policy_and_rejected_commit_can_be_retried_with_a_
         merged_commits: vec![],
         commit_ids: Vec::new(),
         merged_commit_ids: Vec::new(),
+        ..Default::default()
     })
     .unwrap();
     for allow in [false, true] {

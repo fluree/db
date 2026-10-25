@@ -155,6 +155,9 @@ async fn push_ledger_local(
         )));
     }
 
+    // Pushing erasures, or removals, needs what erasing needs.
+    let erasures = (!parsed.erasure_frames.is_empty() || parsed.retention.is_some())
+        && crate::routes::admin_auth::has_admin_authority(&state, &headers.raw).await;
     let req = PushRequest {
         idempotency_key,
         ledger_id: ledger,
@@ -164,6 +167,10 @@ async fn push_ledger_local(
         commit_ids: parsed.commit_ids,
         merged_commit_ids: parsed.merged_commit_ids,
         governance,
+        erasure_frames: parsed.erasure_frames.into_iter().map(|b| b.0).collect(),
+        base_erasures: parsed.base_erasures,
+        retention: parsed.retention,
+        authority: fluree_db_api::PushAuthority { erasures },
     };
 
     let receipt = state

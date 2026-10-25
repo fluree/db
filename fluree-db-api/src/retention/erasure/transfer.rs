@@ -171,14 +171,7 @@ impl Sender {
         held: &[String],
     ) -> Result<Self> {
         let index = fluree.retention.erasure.get().map(|r| r.index.clone());
-        let mut sender = Sender {
-            index: index.clone(),
-            erased: HashMap::new(),
-            held: Vec::new(),
-            history_erased: false,
-            authorizations: HashSet::new(),
-            artifacts: HashSet::new(),
-        };
+        let mut sender = Sender::new(index.clone());
         let Some(index) = index else {
             return Ok(sender);
         };
@@ -202,6 +195,17 @@ impl Sender {
             }
         }
         Ok(sender)
+    }
+
+    fn new(index: Option<Arc<ErasureIndex>>) -> Self {
+        Sender {
+            index,
+            erased: HashMap::new(),
+            held: Vec::new(),
+            history_erased: false,
+            authorizations: HashSet::new(),
+            artifacts: HashSet::new(),
+        }
     }
 
     /// Whether the history holds an erased commit, sent or not.
@@ -451,6 +455,390 @@ impl Fluree {
         }
         Ok(accepted)
     }
+}
+
+impl Fluree {
+    /// Take what a push to `ledger_id` carries of erased history and
+    /// retention, before its commits are validated and before the ledger's
+    /// write lock, which reconciling the ledger takes. The erasures go
+    /// through a pull's receive path, with the ledger a holder of the
+    /// originals it has; erasures need `authority` to erase. The journal is
+    /// merged into the ledger's; a removal it lacks needs that authority
+    /// too. The chains of erased commits the ledger has that the push lists
+    /// but neither carries nor this storage holds are asked for, with a
+    /// `409` (see [`crate::ERASURES_NEEDED`]).
+    ///
+    /// Returns the erased commits the push brings, whose empty bytes in
+    /// `request` are now their replacements.
+    pub(crate) async fn receive_pushed_erasures(
+        &self,
+        ledger_id: &fluree_db_core::LedgerId,
+        request: &mut crate::PushCommitsRequest,
+        authority: crate::PushAuthority,
+    ) -> Result<HashSet<ContentId>> {
+        let positions = erased_positions(request)?;
+        let journal = request
+            .retention
+            .take()
+            .map(|section| crate::retention::registry::ArchivedRetention::parse(&section))
+            .transpose()?;
+        let erasing = !request.erasure_frames.is_empty() || !positions.is_empty();
+        if !erasing && request.base_erasures.is_empty() && journal.is_none() {
+            return Ok(HashSet::new());
+        }
+        let runtime = match self.retention.erasure.get() {
+            Some(runtime) if self.retention.replicas.get().is_none() => Some(runtime),
+            _ if erasing => return Err(crate::commit_transfer::cannot_hold_erasures()),
+            _ => None,
+        };
+        if erasing && !authority.erasures {
+            return Err(ApiError::http(
+                403,
+                "this push carries permanently erased commits; pushing erasures needs the \
+                 authority erasing needs",
+            ));
+        }
+        let record = self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+
+        let mut received = Received::default();
+        for bytes in std::mem::take(&mut request.erasure_frames) {
+            let (frame, _) = fluree_db_core::pack::decode_frame(
+                &bytes.0,
+                fluree_db_core::pack::DEFAULT_MAX_PAYLOAD,
+            )
+            .map_err(|e| bad(format!("erasure frame: {e}")))?;
+            if !matches!(
+                frame,
+                PackFrame::Erasure(_)
+                    | PackFrame::Authorization(_)
+                    | PackFrame::ErasureArtifact { .. }
+            ) {
+                return Err(bad("a push's erasure frames carry only erasures".into()));
+            }
+            self.take_erasure_frame(frame, &mut received).await?;
+        }
+        if let Some(runtime) = runtime {
+            let mut needed = Vec::new();
+            for base in &request.base_erasures {
+                let held = runtime.index.erased(&base.commit).await?;
+                let steps = held
+                    .map(|e| e.steps.len())
+                    .max(
+                        received
+                            .chains
+                            .get(&base.commit.to_string())
+                            .map(|c| c.steps.len()),
+                    )
+                    .unwrap_or(0);
+                if steps < base.steps {
+                    needed.push(base.commit.to_string());
+                }
+            }
+            if !needed.is_empty() {
+                let listed = serde_json::to_string(&needed)
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+                return Err(ApiError::http(
+                    409,
+                    format!("{}{listed}", crate::ERASURES_NEEDED),
+                ));
+            }
+        }
+        // History rules come from config commits, which the receiver applies
+        // itself; a removal is what only a removal request makes.
+        if let Some(journal) = &journal {
+            let current = registry::read(self.publisher()?, ledger_id.as_str())
+                .await?
+                .1
+                .map(|r| r.journal)
+                .unwrap_or_default();
+            let adds = journal.journal.removals.iter().any(|r| {
+                !current
+                    .removals
+                    .iter()
+                    .any(|held| held.commit == r.commit && held.slot == r.slot)
+            });
+            if adds && !authority.erasures {
+                return Err(ApiError::http(
+                    403,
+                    "this push carries removals this ledger's journal lacks; pushing them \
+                     needs the authority removing needs",
+                ));
+            }
+        }
+
+        if received.count() > 0 {
+            let runtime = runtime.expect("erasing needs the runtime");
+            // An erasure accepted or published meanwhile would miss what
+            // this one changes.
+            let _admission = runtime.admission.lock().await;
+            let head = pushed_head(request)?;
+            let history = Substituted {
+                inner: self.branched_content_store(ledger_id.as_str()).await?,
+                replacements: Arc::new(pushed_bytes(request)),
+            };
+            self.receive_erasures(
+                received,
+                Receiver::Live(ledger_id.as_str()),
+                &record.storage_namespace(),
+                &history,
+                &head,
+                journal.as_ref().map(|j| &j.journal),
+            )
+            .await?;
+        }
+        if let Some(journal) = journal {
+            registry::restore(self.publisher()?, &record, Some(journal), None, None).await?;
+            self.checkpoint_journal(ledger_id.as_str()).await?;
+            self.retention.mark_active(ledger_id.as_str());
+        }
+
+        let mut erased = HashSet::new();
+        for (at, cid) in positions {
+            let chain = match runtime {
+                Some(runtime) => runtime.index.erased(&cid).await?,
+                None => None,
+            }
+            .ok_or_else(|| bad(format!("commit {cid} is pushed erased, with no erasure")))?;
+            let latest = chain
+                .steps
+                .last()
+                .ok_or_else(|| ApiError::internal(format!("erasure of {cid} has no steps")))?;
+            let replacement: ContentId = latest
+                .replacement
+                .parse()
+                .map_err(|_| ApiError::internal("erasure names an unparsable replacement"))?;
+            let index = &runtime.expect("held above").index;
+            *position_bytes(request, at) = index.read_replacement(&replacement).await?;
+            erased.insert(cid);
+        }
+        Ok(erased)
+    }
+
+    /// Ready `request`, a push of `ledger_id`'s history to a receiver whose
+    /// head is `base`, for erased history and retention. Each erased commit
+    /// among its commits (named in `commit_ids` / `merged_commit_ids`)
+    /// travels as empty bytes and its chain, without its transaction
+    /// document; each erased commit of `base`'s history is listed with its
+    /// chain's digest, and travels too when the receiver asked for it in
+    /// `needed`. The ledger's retention section rides along. Returns
+    /// whether the push carries erased history, which only a receiver
+    /// advertising `push.erasures` takes.
+    pub async fn ready_push(
+        &self,
+        ledger_id: &str,
+        request: &mut crate::PushCommitsRequest,
+        base: Option<&ContentId>,
+        needed: &[ContentId],
+    ) -> Result<bool> {
+        request.retention = self.retention_archive_section(ledger_id).await?;
+        request.erasure_frames.clear();
+        request.base_erasures.clear();
+        let Some(runtime) = self.retention.erasure.get() else {
+            return Ok(false);
+        };
+        if !runtime.index.any_erased().await? {
+            return Ok(false);
+        }
+        let mut sender = Sender::new(Some(runtime.index.clone()));
+        let mut frames = Vec::new();
+        let mut erased_txns = HashSet::new();
+        let mut carried = false;
+        for (commits, ids, what) in [
+            (&mut request.commits, &request.commit_ids, "commit_ids"),
+            (
+                &mut request.merged_commits,
+                &request.merged_commit_ids,
+                "merged_commit_ids",
+            ),
+        ] {
+            if ids.len() != commits.len() {
+                return Err(ApiError::internal(format!(
+                    "a push of erased history names its commits: {what} has {} for {}",
+                    ids.len(),
+                    commits.len()
+                )));
+            }
+            for (bytes, cid) in commits.iter_mut().zip(ids) {
+                let Some(erased) = runtime.index.erased(cid).await? else {
+                    continue;
+                };
+                bytes.0.clear();
+                erased_txns.extend(erased.txn.clone());
+                frames.extend(sender.chain_frames(&erased).await?);
+                carried = true;
+            }
+        }
+        // What a transaction document of an erased commit holds stays here.
+        request.blobs.retain(|key, _| !held_by(key, &erased_txns));
+        request
+            .missing_blobs
+            .retain(|key| !held_by(key, &erased_txns));
+        if let Some(base) = base {
+            let store = self.branched_content_store(ledger_id).await?;
+            let history = crate::pack::compute_missing_commits(
+                store.as_ref(),
+                std::slice::from_ref(base),
+                &HashSet::new(),
+            )
+            .await?;
+            for cid in history {
+                let Some(erased) = runtime.index.erased(&cid).await? else {
+                    continue;
+                };
+                request.base_erasures.push(crate::BaseErasure {
+                    commit: cid.clone(),
+                    digest: erased.digest(),
+                    steps: erased.steps.len(),
+                });
+                if needed.contains(&cid) {
+                    frames.extend(sender.chain_frames(&erased).await?);
+                }
+            }
+        }
+        request.erasure_frames = frames.into_iter().map(crate::Base64Bytes).collect();
+        Ok(carried || !request.base_erasures.is_empty())
+    }
+}
+
+/// What an object request answers for a permanently erased commit, or for
+/// its transaction document.
+pub enum ErasedObject {
+    /// Pack frames: the ledger's retention section as a `phase: "retention"`
+    /// manifest, then the commit's chain with its replacement, receipts and
+    /// authorizations. A receiver takes them as a pack's.
+    Chain(Vec<u8>),
+    /// The transaction document of an erased commit, which is not served.
+    Withheld,
+}
+
+impl Fluree {
+    /// What a request for object `id` of `ledger_id` answers instead of its
+    /// bytes, when the object is an erased commit or its transaction
+    /// document: an erased commit's bytes are its replacement, which its CID
+    /// does not match.
+    pub async fn erased_object(
+        &self,
+        ledger_id: &str,
+        id: &ContentId,
+    ) -> Result<Option<ErasedObject>> {
+        let Some(runtime) = self.retention.erasure.get() else {
+            return Ok(None);
+        };
+        match id.content_kind() {
+            Some(fluree_db_core::ContentKind::Txn) => Ok(runtime
+                .index
+                .is_erased_txn(&id.address_digest())
+                .await?
+                .then_some(ErasedObject::Withheld)),
+            Some(fluree_db_core::ContentKind::Commit) => {
+                let Some(erased) = runtime.index.erased(id).await? else {
+                    return Ok(None);
+                };
+                let mut bytes = Vec::new();
+                if let Some(mut section) = self.retention_archive_section(ledger_id).await? {
+                    section["phase"] = serde_json::Value::from("retention");
+                    fluree_db_core::pack::encode_manifest_frame(&section, &mut bytes);
+                }
+                let mut sender = Sender::new(Some(runtime.index.clone()));
+                for frame in sender.chain_frames(&erased).await? {
+                    bytes.extend(frame);
+                }
+                Ok(Some(ErasedObject::Chain(bytes)))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Whether `key`, a pushed blob's CID or address, names one of `digests`.
+fn held_by(key: &str, digests: &HashSet<String>) -> bool {
+    key.parse::<ContentId>()
+        .map(|id| id.address_digest())
+        .is_ok_and(|digest| digests.contains(&digest))
+}
+
+/// Where a pushed commit's bytes are: in `commits`, or `merged_commits`.
+#[derive(Clone, Copy)]
+enum Position {
+    Line(usize),
+    Merged(usize),
+}
+
+fn position_bytes(request: &mut crate::PushCommitsRequest, at: Position) -> &mut Vec<u8> {
+    match at {
+        Position::Line(i) => &mut request.commits[i].0,
+        Position::Merged(i) => &mut request.merged_commits[i].0,
+    }
+}
+
+/// The pushed commits sent erased, as empty bytes under a named CID.
+fn erased_positions(request: &crate::PushCommitsRequest) -> Result<Vec<(Position, ContentId)>> {
+    let mut positions = Vec::new();
+    for (commits, ids, at) in [
+        (
+            &request.commits,
+            &request.commit_ids,
+            Position::Line as fn(usize) -> Position,
+        ),
+        (
+            &request.merged_commits,
+            &request.merged_commit_ids,
+            Position::Merged,
+        ),
+    ] {
+        for (i, bytes) in commits.iter().enumerate() {
+            if !bytes.0.is_empty() {
+                continue;
+            }
+            let cid = ids
+                .get(i)
+                .filter(|_| ids.len() == commits.len())
+                .ok_or_else(|| bad("a commit pushed erased needs its CID named".into()))?;
+            positions.push((at(i), cid.clone()));
+        }
+    }
+    Ok(positions)
+}
+
+/// The bytes of the pushed commits not sent erased, by CID.
+fn pushed_bytes(request: &crate::PushCommitsRequest) -> HashMap<ContentId, Arc<[u8]>> {
+    let mut bytes = HashMap::new();
+    for (commits, ids) in [
+        (&request.commits, &request.commit_ids),
+        (&request.merged_commits, &request.merged_commit_ids),
+    ] {
+        for (i, commit) in commits.iter().enumerate() {
+            if commit.0.is_empty() {
+                continue;
+            }
+            let cid = match ids.get(i) {
+                Some(cid) => cid.clone(),
+                None => ContentId::new(fluree_db_core::ContentKind::Commit, &commit.0),
+            };
+            bytes.insert(cid, Arc::from(commit.0.as_slice()));
+        }
+    }
+    bytes
+}
+
+/// The CID of a push's last commit.
+fn pushed_head(request: &crate::PushCommitsRequest) -> Result<ContentId> {
+    let last = request
+        .commits
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| bad("an empty push".into()))?;
+    Ok(match request.commit_ids.get(last) {
+        Some(cid) => cid.clone(),
+        None => ContentId::new(
+            fluree_db_core::ContentKind::Commit,
+            &request.commits[last].0,
+        ),
+    })
 }
 
 impl Fluree {

@@ -340,12 +340,14 @@ async fn run_ledger_archive_remote(
     // archive degrades to commits-only and the manifest will omit
     // `index_head_id` accordingly.
     let include_indexes = !no_indexes;
+    // Erased history travels as its erasures; a restore checks them.
     let request = match (include_indexes, record.index_head_id.clone()) {
         (true, Some(index_root)) => {
             PackRequest::with_indexes(vec![head_commit_id], vec![], index_root, None)
         }
         _ => PackRequest::commits(vec![head_commit_id], vec![]),
-    };
+    }
+    .with_erasures(Vec::new());
 
     match output {
         Some(path) => {
