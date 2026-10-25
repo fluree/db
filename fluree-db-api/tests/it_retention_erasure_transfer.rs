@@ -2179,9 +2179,12 @@ async fn a_push_carries_the_removal_journal() {
 
 /// A push's journal brings removals, never history rules, which a receiver
 /// derives from the config commits it holds: a rule pushed without one is
-/// not taken, and the receiver goes on serving the history it would hide.
+/// not taken, and the receiver goes on serving the history it would hide;
+/// the config commit enabling it brings it, once the receiver's retention
+/// pass reads it. (The copy has the source's name: a ledger's config graph
+/// is named for it.)
 #[tokio::test]
-async fn a_push_takes_no_history_rule_from_its_journal() {
+async fn a_push_takes_history_rules_only_from_config_commits() {
     let dir = tempfile::tempdir().unwrap();
     let source = receiving(&dir);
     let id = ledger(&source, "it/push-rules").await;
@@ -2208,7 +2211,7 @@ async fn a_push_takes_no_history_rule_from_its_journal() {
     let here = tempfile::tempdir().unwrap();
     let receiver = receiving(&here);
     let copy = receiver
-        .restore_ledger("it/push-rules-copy", &mut before.as_slice())
+        .restore_ledger("it/push-rules", &mut before.as_slice())
         .await
         .unwrap()
         .ledger_id;
@@ -2231,17 +2234,40 @@ async fn a_push_takes_no_history_rule_from_its_journal() {
             .is_none_or(|r| r.journal.history_rules.is_empty()),
         "{status:?}"
     );
-    let rows = receiver
-        .query_connection(&json!({
-            "@context": ctx(),
-            "from": format!("{copy}@t:{t1}"),
-            "select": "?o",
-            "where": {"@id": "ex:alice", "ex:email": "?o"}
-        }))
-        .await
-        .unwrap();
+    let past = json!({
+        "@context": ctx(),
+        "from": format!("{copy}@t:{t1}"),
+        "select": "?o",
+        "where": {"@id": "ex:alice", "ex:email": "?o"}
+    });
+    let rows = receiver.query_connection(&past).await.unwrap();
     let ledger = receiver.ledger(&copy).await.unwrap();
     assert_eq!(rows.to_jsonld(&ledger.snapshot).unwrap(), json!(["a@old"]));
+
+    let (base, _) = head_of(&source, &id).await;
+    source
+        .graph(&id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             GRAPH <urn:fluree:{id}#config> {{
+               <urn:fluree:{id}:config:ledger> a f:LedgerConfig ;
+                 f:retentionDefaults <urn:cfg:retention> .
+               <urn:cfg:retention> a f:RetentionDefaults ; f:property <urn:cfg:p> .
+               <urn:cfg:p> a f:RetentionProperty ; f:target ex:email ; f:noHistory true .
+             }}"
+        ))
+        .commit()
+        .await
+        .unwrap();
+    let request = push_request(&source, &id, Some(&base)).await;
+    push(&receiver, &copy, request, false).await.unwrap();
+    receiver.run_retention(&copy).await.unwrap();
+    let refused = receiver.query_connection(&past).await;
+    assert!(
+        matches!(refused, Err(ApiError::HistoryUnavailable(_))),
+        "{refused:?}"
+    );
 }
 
 /// Erasures published after the push of their requests go in a push of no

@@ -5083,6 +5083,77 @@ async fn push_refuses_a_graph_nothing_registers() {
     }
 }
 
+/// A push to another instance of the same ledger carries a commit that
+/// writes its config graph. Writing it registers the namespace of the
+/// ledger's own graph IRIs, so the txn-meta graph encodes differently once
+/// the push applies than when its metadata flakes were stamped; both are
+/// that graph.
+#[tokio::test]
+async fn push_of_a_config_write_reaches_the_same_ledger_elsewhere() {
+    let ledger_id = "it/push-config-write:main";
+    let source = FlureeBuilder::memory().build_memory();
+    source
+        .create_ledger(ledger_id)
+        .await
+        .expect("create source");
+    source
+        .graph(ledger_id)
+        .transact()
+        .insert(&json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:alice", "ex:name": "Alice"}))
+        .commit()
+        .await
+        .expect("insert");
+    source
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{}> {{ <urn:fluree:{ledger_id}:config:ledger> a f:LedgerConfig . }}",
+            config_graph_iri(ledger_id)
+        ))
+        .commit()
+        .await
+        .expect("config write");
+
+    let target = FlureeBuilder::memory().build_memory();
+    target
+        .create_ledger(ledger_id)
+        .await
+        .expect("create target");
+    let pushed = target
+        .push_commits(
+            ledger_id,
+            newest_commits(&source, ledger_id, 100).await,
+            &GovernanceOptions::default(),
+            &target.default_index_config(),
+        )
+        .await
+        .expect("push");
+    assert_eq!(pushed.accepted, 2);
+    let names = target
+        .query_connection(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": ledger_id,
+            "select": "?name",
+            "where": {"@id": "ex:alice", "ex:name": "?name"}
+        }))
+        .await
+        .expect("query");
+    let ledger = target.ledger(ledger_id).await.expect("ledger");
+    assert_eq!(names.to_jsonld(&ledger.snapshot).unwrap(), json!(["Alice"]));
+    // Each commit's metadata is in the txn-meta graph, under either encoding.
+    let commits = target
+        .query_connection(&json!({
+            "from": format!("{ledger_id}#txn-meta"),
+            "select": "?t",
+            "where": {"@id": "?c", "https://ns.flur.ee/db#t": "?t"},
+            "orderBy": "?t"
+        }))
+        .await
+        .expect("txn-meta query");
+    assert_eq!(commits.to_jsonld(&ledger.snapshot).unwrap(), json!([1, 2]));
+}
+
 // =============================================================================
 // Test 17: No shapes, no config — SHACL skips
 // =============================================================================
