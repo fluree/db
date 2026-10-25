@@ -169,6 +169,8 @@ impl Fluree {
                             Erased::Leafwise => report.leafwise += 1,
                             Erased::NeedsRebuild => {
                                 self.reindex(branch, ReindexOptions::default()).await?;
+                                // A new root at the same `t`, as leaf by leaf.
+                                self.announce_refresh(&record.ledger_id).await;
                                 report.rebuilt += 1;
                             }
                             Erased::Nothing => {}

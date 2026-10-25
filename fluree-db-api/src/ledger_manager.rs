@@ -2364,6 +2364,17 @@ impl UpdatePlan {
             }
             _ => None,
         };
+        // The same `t` indexed anew (a reindex, or a purge rewriting the
+        // index without an erased value): a reload reads the record as it is
+        // then, so a stale one cannot bring an old root back.
+        let index_replaced = matches!(
+            (&ns.index_head_id, local_index_id),
+            (Some(ns_idx), Some(local_idx))
+                if ns_idx != local_idx && ns.index_t == local_index_t
+        );
+        if index_replaced && ns.commit_t >= local_t {
+            return UpdatePlan::Reload;
+        }
 
         if ns.commit_t == local_t {
             match index_advance {
@@ -3037,6 +3048,27 @@ mod tests {
         // Local: t()=10, index_t=5
         let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
         assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
+    }
+
+    #[test]
+    fn test_update_plan_reload_when_index_replaced_at_same_t() {
+        // Same t, another root (a purge rewrote the index) -> Reload
+        let ns = make_ns_record(
+            10,
+            8,
+            Some(make_cid("commit:10")),
+            Some(make_index_cid("index:8-rewritten")),
+        );
+        let local_idx = make_index_cid("index:8");
+        assert_eq!(
+            UpdatePlan::plan(10, 8, Some(&local_idx), &ns),
+            UpdatePlan::Reload
+        );
+        // A record older on commits than the cached state is not acted on.
+        assert_eq!(
+            UpdatePlan::plan(11, 8, Some(&local_idx), &ns),
+            UpdatePlan::Noop
+        );
     }
 
     #[test]

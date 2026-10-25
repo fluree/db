@@ -3102,5 +3102,50 @@ async fn publication_and_purge_announce_a_refresh() {
     assert_eq!(refreshed(&mut events), ["it/refresh:dev", id.as_str()]);
 }
 
+/// A value leaf-by-leaf erasure cannot reach (a big integer, in its numeric
+/// arena) sends the index to a rebuild: a new root at the same `t`, which a
+/// follower learns of by a refresh before the old files wait out the grace.
+#[tokio::test]
+async fn a_purge_rebuild_announces_a_refresh() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/refresh-rebuild").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:count": {
+            "@value": "123456789012345678901234567890",
+            "@type": "http://www.w3.org/2001/XMLSchema#integer"
+        }}),
+    )
+    .await;
+    publish_erasure(
+        &fluree,
+        &id,
+        ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/count".into(),
+                graph: None,
+                object: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut events = fluree
+        .event_bus()
+        .subscribe(fluree_db_nameservice::SubscriptionScope::all())
+        .receiver;
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(report.waiting && report.rebuilt == 1, "{report:?}");
+    assert_eq!(refreshed(&mut events), [id.as_str()]);
+}
+
 #[path = "it_retention_erasure_transfer.rs"]
 mod transfer;

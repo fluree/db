@@ -70,6 +70,11 @@ pub fn is_replacement(bytes: &[u8]) -> bool {
     bytes.get(..4) == Some(&REPLACEMENT_MAGIC[..])
 }
 
+/// The original commit `bytes`, a replacement, stands for.
+pub fn original_of(bytes: &[u8]) -> Result<ContentId, CommitCodecError> {
+    Ok(parse(bytes)?.original)
+}
+
 fn parse(bytes: &[u8]) -> Result<Replacement<'_>, CommitCodecError> {
     let mut pos = 0;
     if read_exact(bytes, &mut pos, 4)? != REPLACEMENT_MAGIC {

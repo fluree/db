@@ -184,6 +184,9 @@ impl Sleeper for DriverSleeper {
 /// and a snapshot after a missed one evicts every cached ledger.
 pub(crate) struct PeerHeadSink {
     pub(crate) fluree: Fluree,
+    /// The blocks this peer holds, which a refresh drops: they are cached
+    /// under CIDs a change in place leaves as they were.
+    pub(crate) cas: crate::cas::BrowserCasStorage,
     pub(crate) registry: std::sync::Arc<HeadRegistry>,
     /// The ledgers subscribed to; none subscribes to all.
     pub(crate) ledgers: Vec<fluree_db_api::LedgerId>,
@@ -204,6 +207,7 @@ impl HeadSink for PeerHeadSink {
                 };
                 if named.missed_refresh {
                     tracing::info!("erasures changed on the remote while disconnected; refreshing");
+                    self.cas.invalidate().await;
                     self.fluree.refresh_ledgers().await;
                 }
                 for id in mgr.cached_aliases().await {
@@ -246,6 +250,7 @@ impl HeadSink for PeerHeadSink {
             }
             RemoteEvent::LedgerRefresh { ledger_id, .. } => {
                 tracing::info!(ledger_id = %ledger_id, "ledger history changed on the remote");
+                self.cas.invalidate().await;
                 self.fluree.refresh_ledger(&ledger_id).await;
             }
             RemoteEvent::GraphSourceUpdated(record) => {

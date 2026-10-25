@@ -28,7 +28,7 @@
 //! currently decodes FLKB leaves — this tier is the transport for future
 //! fine-grained (row-level filtered) peer access.
 
-use crate::transport::{HttpTransport, TransportError, TransportRequest};
+use crate::transport::{HttpTransport, TransportError, TransportRequest, TransportResponse};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::error::{Error as CoreError, Result};
@@ -350,6 +350,27 @@ impl ProxyStorage {
         }
     }
 
+    /// A whole object's bytes from `response`, verified against `cid`. An
+    /// erased commit is answered with its erasure, and read as its
+    /// replacement (see [`crate::integrity::erased_replacement`]).
+    fn verified(address: &str, cid: &ContentId, response: &TransportResponse) -> Result<Bytes> {
+        let erased = response
+            .headers
+            .get("x-fluree-content-kind")
+            .is_some_and(|kind| kind == fluree_db_core::pack::ERASURE_CONTENT_KIND);
+        if erased {
+            return crate::integrity::erased_replacement(cid, &response.body)
+                .map(Bytes::from)
+                .map_err(|e| CoreError::storage(format!("{address}: {e}")));
+        }
+        if !crate::integrity::verify_object_integrity(cid, &response.body) {
+            return Err(CoreError::storage(format!(
+                "Integrity verification failed for {address} (cid {cid})"
+            )));
+        }
+        Ok(response.body.clone())
+    }
+
     /// Fetch canonical CAS bytes via `GET /storage/objects/{cid}` and verify
     /// them against the CID before returning.
     ///
@@ -374,15 +395,7 @@ impl ProxyStorage {
 
         let status = response.status;
         match status {
-            StatusCode::OK => {
-                let bytes = response.body;
-                if !crate::integrity::verify_object_integrity(&cid, &bytes) {
-                    return Err(CoreError::storage(format!(
-                        "Integrity verification failed for {address} (cid {cid})"
-                    )));
-                }
-                Ok(bytes)
-            }
+            StatusCode::OK => Self::verified(address, &cid, &response),
             // 403 → NotFound parity with the server's no-existence-leak behavior
             StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Err(CoreError::not_found(address)),
             StatusCode::UNAUTHORIZED => Err(CoreError::storage(format!(
@@ -578,12 +591,7 @@ impl StorageRead for ProxyStorage {
             // Server ignored the Range header (older server): verify the
             // full object and slice locally.
             StatusCode::OK => {
-                let bytes = response.body;
-                if !crate::integrity::verify_object_integrity(&cid, &bytes) {
-                    return Err(CoreError::storage(format!(
-                        "Integrity verification failed for {address} (cid {cid})"
-                    )));
-                }
+                let bytes = Self::verified(address, &cid, &response)?;
                 let start = range.start as usize;
                 if start >= bytes.len() {
                     return Ok(Vec::new());

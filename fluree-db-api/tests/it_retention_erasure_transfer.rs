@@ -2577,3 +2577,54 @@ async fn every_transfer_carries_erased_history_or_refuses_it() {
         );
     }
 }
+
+/// A proxy peer reads an erased commit through its server's object request,
+/// which answers with the erasure: the peer reads the replacement, checked
+/// to be the one the chain names for that commit. An answer for another
+/// commit is refused.
+#[tokio::test]
+async fn a_proxy_reads_an_erased_commit_from_its_erasure_answer() {
+    use fluree_db_api::retention::erasure::ErasedObject;
+    use fluree_db_core::{content_address, ContentKind, StorageNamespace, StorageRead};
+    use fluree_db_nameservice_sync::{ProxyReadMode, ProxyStorage};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (_dir, source, id, erased, t1) = source("it/proxy-read").await;
+    let Some(ErasedObject::Chain(frames)) = source.erased_object(&id, &erased).await.unwrap()
+    else {
+        panic!("an erased commit is answered with its erasure");
+    };
+    let later = commit_at(&source, &id, t1 + 1).await;
+    let server = MockServer::start().await;
+    for cid in [&erased, &later] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/fluree/storage/objects/{cid}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Fluree-Content-Kind", "erasure")
+                    .set_body_bytes(frames.clone()),
+            )
+            .mount(&server)
+            .await;
+    }
+    let proxy = ProxyStorage::from_api_base(
+        format!("{}/v1/fluree", server.uri()),
+        "tok".to_string(),
+        ProxyReadMode::Raw,
+    );
+    let address = |cid: &ContentId| {
+        content_address(
+            "file",
+            ContentKind::Commit,
+            &StorageNamespace::parse_legacy(&id).unwrap(),
+            &cid.address_digest(),
+        )
+    };
+
+    let read = proxy.read_bytes(&address(&erased)).await.unwrap();
+    let replacement = store_of(&source, &id).await.get(&erased).await.unwrap();
+    assert_eq!(read, replacement.into_vec());
+    let refused = proxy.read_bytes(&address(&later)).await;
+    assert!(refused.is_err(), "{refused:?}");
+}

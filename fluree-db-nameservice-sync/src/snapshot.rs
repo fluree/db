@@ -50,11 +50,6 @@ impl SnapshotTracker {
                     names.graph_sources.insert(record.graph_source_id.clone());
                 }
             }
-            RemoteEvent::LedgerRefresh { erasures, .. } => {
-                if erasures.is_some() {
-                    tracked.erasures.clone_from(erasures);
-                }
-            }
             RemoteEvent::SnapshotComplete { erasures } => {
                 let mut names = tracked.names.take()?;
                 if let Some(erasures) = erasures {
@@ -64,7 +59,11 @@ impl SnapshotTracker {
                 return Some(names);
             }
             RemoteEvent::Disconnected { .. } | RemoteEvent::Fatal { .. } => tracked.names = None,
-            RemoteEvent::LedgerRetracted { .. } | RemoteEvent::GraphSourceRetracted { .. } => {}
+            // One ledger's refresh says nothing of the others an erasure
+            // changed: the generation is taken from a completed snapshot only.
+            RemoteEvent::LedgerRetracted { .. }
+            | RemoteEvent::GraphSourceRetracted { .. }
+            | RemoteEvent::LedgerRefresh { .. } => {}
         }
         None
     }
@@ -108,9 +107,9 @@ mod tests {
         }
     }
 
-    /// A snapshot whose erasure generation differs from the last one seen,
-    /// in a snapshot or a refresh, reports a missed refresh; the first
-    /// seen, and one a refresh announced, do not.
+    /// A snapshot whose erasure generation differs from the last snapshot's
+    /// reports a missed refresh, even when a refresh of one ledger carried
+    /// it: an erasure may have changed others whose refresh was missed.
     #[test]
     fn a_changed_erasure_generation_is_a_missed_refresh() {
         let tracker = SnapshotTracker::new();
@@ -125,7 +124,7 @@ mod tests {
             ledger_id: LedgerId::parse("a:main").unwrap(),
             erasures: Some("g3".into()),
         });
-        assert!(!snapshot(Some("g3")).missed_refresh);
+        assert!(snapshot(Some("g3")).missed_refresh);
         // A remote that sends none compares nothing.
         assert!(!snapshot(None).missed_refresh);
         assert!(!snapshot(Some("g3")).missed_refresh);

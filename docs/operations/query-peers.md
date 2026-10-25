@@ -45,7 +45,9 @@ On connecting, a subscriber first receives an `ns-record` for each resource in s
 
 A resource the subscriber holds that the snapshot did not name was dropped while it was disconnected, and a peer drops it at `snapshot-complete`.
 
-A peer evicts a ledger it cached on `ns-refresh`, and reads its erasure map and decoded index leaves again. A server's erasure generation at `snapshot-complete` other than the last one the peer saw means it missed a refresh while disconnected, so it evicts every ledger it cached. Older peers ignore `ns-refresh`, and must restart after an erasure publishes. A subscriber that falls too far behind the live events has its stream ended, so it reconnects and receives a fresh snapshot instead of missing events.
+A peer evicts a ledger it cached on `ns-refresh`, and reads its erasure map and decoded index leaves again; a browser peer also drops the blocks it holds in memory and in IndexedDB, which are cached under CIDs an erasure does not change. A server's erasure generation at `snapshot-complete` other than the one at the peer's last snapshot means it may have missed a refresh while disconnected, so it evicts every ledger it cached. A ledger record naming another index at the same `index_t` (a reindex, or a purge rewriting the index) makes a peer reload the ledger. Older peers ignore `ns-refresh`, and must restart after an erasure publishes.
+
+A proxy-storage peer reads an erased commit through `GET /storage/objects`, which answers with the commit's erasure: the peer reads the replacement, after checking that the chain is that commit's and names that replacement. It takes the proofs on its server's word, as it takes policy-filtered leaves. A subscriber that falls too far behind the live events has its stream ended, so it reconnects and receives a fresh snapshot instead of missing events.
 
 Every ledger has an **instance** id, fixed when it is created. A ledger dropped and created again under the same name gets a new instance and starts again from `t` 0, so heads compare only within one instance:
 

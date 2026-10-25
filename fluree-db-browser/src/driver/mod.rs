@@ -69,6 +69,17 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                     });
                 }
             }
+            // Spawned like a put, so it opens its transaction after every
+            // put queued before it: IndexedDB runs them in that order.
+            IoJob::CacheClear { reply } => match cache.clone() {
+                Some(cache) => spawn_local(async move {
+                    cache.clear().await;
+                    let _ = reply.send(());
+                }),
+                None => {
+                    let _ = reply.send(());
+                }
+            },
             IoJob::SseOpen {
                 url,
                 headers,
