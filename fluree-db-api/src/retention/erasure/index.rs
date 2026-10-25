@@ -85,7 +85,12 @@ impl ErasedCommit {
     /// The chain's identity: the SHA-256 (hex) of its commit, signing
     /// ledger and steps.
     pub fn digest(&self) -> String {
-        let canonical = serde_json::to_vec(&(&self.commit, &self.ledger_id, &self.steps))
+        self.digest_of(self.steps.len())
+    }
+
+    /// The digest of its first `steps` steps: the chain's, when it had them.
+    pub(crate) fn digest_of(&self, steps: usize) -> String {
+        let canonical = serde_json::to_vec(&(&self.commit, &self.ledger_id, &self.steps[..steps]))
             .expect("an erasure chain serializes");
         sha256_hex(&canonical)
     }

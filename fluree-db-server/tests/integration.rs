@@ -3547,6 +3547,7 @@ async fn discovery_advertises_pushing_merged_commits() {
     assert_eq!(json["push"]["merged_commits"], true);
     // A single server on file storage holds erased history.
     assert_eq!(json["push"]["erasures"], true);
+    assert_eq!(json["push"]["retention"], true);
 }
 
 #[tokio::test]

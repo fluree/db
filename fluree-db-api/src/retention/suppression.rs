@@ -406,6 +406,21 @@ impl Fluree {
         out
     }
 
+    /// Whether `ledger_id` holds commit `cid`, as a walk of its history
+    /// asks: a read of it may return an erased commit it does not hold
+    /// (see [`Self::holds_commit`]).
+    pub async fn ledger_holds_commit(&self, ledger_id: &str, cid: &ContentId) -> Result<bool> {
+        let record = self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+            .await?;
+        self.holds_commit(&record, store.as_ref(), cid).await
+    }
+
     /// Whether `record`'s storage, or an ancestor branch's, holds `cid`.
     /// A read of an erased commit returns its replacement wherever it is
     /// made, so an erased one is held where its original's file is, or was

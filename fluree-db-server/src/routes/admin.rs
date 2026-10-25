@@ -362,10 +362,12 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     // history containing a merge to a server without it, rather than send a
     // bundle that server would store incompletely.
     // `erasures`: a push may carry permanently erased commits, which this
-    // server holds.
+    // server holds. `retention`: a push may carry the removal journal, and
+    // need carry no commits.
     doc["push"] = serde_json::json!({
         "merged_commits": true,
         "erasures": state.fluree.can_hold_erasures(),
+        "retention": state.fluree.takes_pushed_retention(),
     });
 
     // Advertise server-wide serving capabilities so clients can negotiate

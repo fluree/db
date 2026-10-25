@@ -9,7 +9,7 @@
 //!
 //! The same harness checks that `fluree info` of a tracked ledger shows the
 //! config diagnostics the server reports, and that `fluree pull` takes what
-//! a remote's journal gained without a commit.
+//! a remote's journal gained without a commit, and `fluree push` sends it.
 //!
 //! Like `track_headers_seam.rs`, this compiles only with the `server`
 //! feature, which is a default feature of this crate.
@@ -35,7 +35,7 @@ async fn start_server() -> Server {
 
 /// A server whose storage a token with `fluree.storage.all` replicates, as
 /// clone and pull do, and such a token, which may also read the raw
-/// commits of a ledger that suppresses history.
+/// commits of a ledger that suppresses history, and push.
 async fn start_replicating_server() -> (Server, String) {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use fluree_db_credential::{did_from_pubkey, sign_ed25519, SigningKey};
@@ -57,6 +57,7 @@ async fn start_replicating_server() -> (Server, String) {
         "iat": now,
         "fluree.storage.all": true,
         "fluree.ledger.audit.all": true,
+        "fluree.ledger.write.all": true,
         "fluree.identity": "ex:Replica"
     });
     let signing_input = format!(
@@ -341,4 +342,86 @@ async fn a_pull_with_no_new_commits_takes_the_journal() {
     assert!(pulled.contains("already up to date"), "{pulled}");
     let refused = fluree_fails(&home, &["query", "mydb", past, "--at", "1"]).await;
     assert!(refused.contains("history"), "{refused}");
+}
+
+/// A push to a remote whose head is this copy's still sends what the copy's
+/// journal gained since, which no commit records: history removed here is
+/// refused there too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_with_no_new_commits_sends_the_journal() {
+    let (server, token) = start_replicating_server().await;
+    let client = reqwest::Client::new();
+    let ctx = json!({ "ex": "http://example.org/" });
+    for (path, body) in [
+        ("create", json!({ "ledger": "mydb" })),
+        (
+            "insert/mydb:main",
+            json!({ "@context": ctx, "@id": "ex:alice", "ex:email": "a@old" }),
+        ),
+        (
+            "upsert/mydb:main",
+            json!({ "@context": ctx, "@id": "ex:alice", "ex:email": "a@new" }),
+        ),
+    ] {
+        let response = client
+            .post(format!("{}/v1/fluree/{path}", server.url))
+            .json(&body)
+            .send()
+            .await
+            .expect(path);
+        assert!(response.status().is_success(), "{path} failed");
+    }
+    let remote = &server.state.fluree;
+    // A remote's ledger info reports its index's `t`.
+    remote
+        .reindex("mydb:main", fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+
+    let home = TempDir::new().unwrap();
+    fluree(&home, &["init"]).await;
+    fluree(
+        &home,
+        &["remote", "add", "origin", &server.url, "--token", &token],
+    )
+    .await;
+    fluree(&home, &["clone", "origin", "mydb"]).await;
+
+    let storage = home.path().join(".fluree").join("storage");
+    assert!(storage.is_dir(), "{}", storage.display());
+    {
+        let local = fluree_db_api::FlureeBuilder::file(storage.to_string_lossy().to_string())
+            .build()
+            .unwrap();
+        let removal = fluree_db_api::retention::RemovalRequest {
+            matching: vec![fluree_db_api::retention::FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/email".into(),
+                graph: None,
+                object: Some(json!("a@old")),
+            }],
+            ..Default::default()
+        };
+        let receipt = local
+            .remove_occurrences("mydb:main", removal)
+            .await
+            .unwrap();
+        assert_eq!(receipt.retracted_t, None, "no longer current: no commit");
+    }
+
+    let pushed = fluree(&home, &["push", "mydb"]).await;
+    assert!(pushed.contains("already up to date"), "{pushed}");
+    assert!(pushed.contains("removal journal"), "{pushed}");
+    let past = remote
+        .query_connection(&json!({
+            "@context": ctx,
+            "from": "mydb:main@t:1",
+            "select": "?o",
+            "where": { "@id": "ex:alice", "ex:email": "?o" }
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(fluree_db_api::ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
 }

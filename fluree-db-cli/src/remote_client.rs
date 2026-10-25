@@ -1673,6 +1673,15 @@ impl RemoteLedgerClient {
             .unwrap_or(false)
     }
 
+    /// Whether the server takes a push's removal journal, and a push of no
+    /// commits.
+    pub async fn supports_push_retention(&self) -> bool {
+        self.fetch_discovery()
+            .await
+            .and_then(|doc| doc["push"]["retention"].as_bool())
+            .unwrap_or(false)
+    }
+
     /// Read the server's `.flpack` import capabilities from discovery.
     ///
     /// Best-effort: any failure (old server, no discovery, parse error) yields

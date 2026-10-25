@@ -1884,13 +1884,11 @@ async fn a_pack_of_no_commits_brings_erasures_published_since() {
 
 /// What `fluree push` sends from `source`'s `id` to a receiver whose head is
 /// `base`: the commits it lacks with their transaction documents, ready
-/// for erased history, with the chains of `needed` among the commits the
-/// receiver has.
+/// for erased history.
 async fn push_request(
     source: &Fluree,
     id: &str,
     base: Option<&ContentId>,
-    needed: &[ContentId],
 ) -> fluree_db_api::PushCommitsRequest {
     let store = source.branched_content_store(id).await.unwrap();
     let (head, _) = head_of(source, id).await;
@@ -1914,11 +1912,47 @@ async fn push_request(
         }
         request.commits.push(fluree_db_api::Base64Bytes(bytes));
     }
+    source.ready_push(id, &mut request, base).await.unwrap();
+    request
+}
+
+/// What `fluree push` sends when the remote's head is `head`, its own: no
+/// commits, and the erasures and journal of that history.
+async fn push_of_no_commits(
+    source: &Fluree,
+    id: &str,
+    head: &ContentId,
+) -> fluree_db_api::PushCommitsRequest {
+    let mut request = fluree_db_api::PushCommitsRequest::default();
     source
-        .ready_push(id, &mut request, base, needed)
+        .ready_push(id, &mut request, Some(head))
         .await
         .unwrap();
     request
+}
+
+/// Push to `ledger` at `receiver` the chains its `409` (`asked`) names, as
+/// `fluree push` does before pushing again: pushes of no commits carrying
+/// at most `limit` bytes of frames each. Returns how many went.
+async fn push_asked(
+    (source, id, base): (&Fluree, &str, &ContentId),
+    receiver: &Fluree,
+    ledger: &str,
+    asked: &ApiError,
+    limit: usize,
+) -> usize {
+    let needed = fluree_db_api::erasures_needed(&asked.to_string()).unwrap();
+    let mut pushes = source
+        .erasure_pushes(id, base, &needed, limit)
+        .await
+        .unwrap();
+    let mut sent = 0;
+    while let Some(request) = pushes.next().await.unwrap() {
+        assert!(request.commits.is_empty());
+        push(receiver, ledger, request, true).await.unwrap();
+        sent += 1;
+    }
+    sent
 }
 
 /// Push `request` to `ledger` at `receiver`, by a principal that may erase
@@ -1986,13 +2020,13 @@ async fn a_push_carries_erased_history_to_a_receiver_that_may_erase() {
         .ledger_id;
     reindex(&receiver, &copy).await;
 
-    let request = push_request(&source, &id, Some(&base), &[]).await;
+    let request = push_request(&source, &id, Some(&base)).await;
     assert!(!request.erasure_frames.is_empty());
     let refused = push(&receiver, &copy, request.clone(), false)
         .await
         .expect_err("no authority to erase");
     assert_eq!(refused.status_code(), 403, "{refused}");
-    let asked = push(&receiver, &copy, request, true)
+    let asked = push(&receiver, &copy, request.clone(), true)
         .await
         .expect_err("asks for an erasure");
     assert_eq!(asked.status_code(), 409, "{asked}");
@@ -2003,7 +2037,8 @@ async fn a_push_carries_erased_history_to_a_receiver_that_may_erase() {
         vec![json!("a@secret")]
     );
 
-    let request = push_request(&source, &id, Some(&base), &needed).await;
+    let pushes = push_asked((&source, &id, &base), &receiver, &copy, &asked, usize::MAX).await;
+    assert_eq!(pushes, 1);
     let pushed = push(&receiver, &copy, request, true).await.unwrap();
     assert_eq!(pushed.head.commit_id, head_of(&source, &id).await.0);
     received_without(&receiver, &copy, &erased, t1).await;
@@ -2016,6 +2051,32 @@ async fn a_push_carries_erased_history_to_a_receiver_that_may_erase() {
         files_holding(here.path(), "a@secret"),
         Vec::<std::path::PathBuf>::new()
     );
+
+    // Listed again, an erasure the receiver holds is not asked for; one
+    // that differs from it is refused.
+    let (base, _) = head_of(&source, &id).await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:dave", "ex:email": "d@later"}),
+    )
+    .await;
+    let request = push_request(&source, &id, Some(&base)).await;
+    assert!(request.base_erasures.iter().any(|b| b.commit == erased));
+    let mut forged = request.clone();
+    for listed in &mut forged.base_erasures {
+        listed.digest = "0".repeat(64);
+    }
+    let refused = push(&receiver, &copy, forged, true)
+        .await
+        .expect_err("another erasure of the commit");
+    assert_eq!(refused.status_code(), 409, "{refused}");
+    assert_eq!(
+        fluree_db_api::erasures_needed(&refused.to_string()),
+        None,
+        "{refused}"
+    );
+    push(&receiver, &copy, request, true).await.unwrap();
 }
 
 /// A push to an empty ledger, as `fluree publish` makes, brings each erased
@@ -2029,7 +2090,7 @@ async fn a_push_to_an_empty_ledger_brings_erased_commits_as_their_erasures() {
     receiver.create_ledger("it/push-published").await.unwrap();
     let copy = "it/push-published:main";
 
-    let request = push_request(&source, &id, None, &[]).await;
+    let request = push_request(&source, &id, None).await;
     assert!(request.base_erasures.is_empty());
     // The erased commit's transaction document stays behind.
     assert!(!request.blobs.values().any(|b| contains(&b.0, "a@secret")));
@@ -2085,7 +2146,7 @@ async fn a_push_carries_the_removal_journal() {
         .await
         .unwrap()
         .ledger_id;
-    let request = push_request(&source, &id, Some(&base), &[]).await;
+    let request = push_request(&source, &id, Some(&base)).await;
     assert!(request.retention.is_some());
     let refused = push(&receiver, &copy, request.clone(), false)
         .await
@@ -2112,8 +2173,177 @@ async fn a_push_carries_the_removal_journal() {
         json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@new"}),
     )
     .await;
-    let request = push_request(&source, &id, Some(&base), &[]).await;
+    let request = push_request(&source, &id, Some(&base)).await;
     push(&receiver, &copy, request, false).await.unwrap();
+}
+
+/// A push's journal brings removals, never history rules, which a receiver
+/// derives from the config commits it holds: a rule pushed without one is
+/// not taken, and the receiver goes on serving the history it would hide.
+#[tokio::test]
+async fn a_push_takes_no_history_rule_from_its_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = receiving(&dir);
+    let id = ledger(&source, "it/push-rules").await;
+    let t1 = insert(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let mut before = Vec::new();
+    source
+        .archive_ledger(&id, false, &mut before)
+        .await
+        .unwrap();
+    let (base, _) = head_of(&source, &id).await;
+    source
+        .graph(&id)
+        .transact()
+        .upsert(&json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@new"}))
+        .commit()
+        .await
+        .unwrap();
+
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let copy = receiver
+        .restore_ledger("it/push-rules-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let mut request = push_request(&source, &id, Some(&base)).await;
+    request.retention = Some(json!({
+        "activeSinceT": 1,
+        "journal": {
+            "generation": 1,
+            "historyRules": [
+                {"predicate": "http://example.org/email", "fromT": 0, "enabledT": 1}
+            ]
+        }
+    }));
+    push(&receiver, &copy, request, false).await.unwrap();
+    let status = receiver.retention_status(&copy).await.unwrap();
+    assert!(
+        status
+            .registration
+            .as_ref()
+            .is_none_or(|r| r.journal.history_rules.is_empty()),
+        "{status:?}"
+    );
+    let rows = receiver
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{copy}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await
+        .unwrap();
+    let ledger = receiver.ledger(&copy).await.unwrap();
+    assert_eq!(rows.to_jsonld(&ledger.snapshot).unwrap(), json!(["a@old"]));
+}
+
+/// Erasures published after the push of their requests go in a push of no
+/// commits, which `fluree push` sends when the remote's head is its own.
+/// The receiver asks for the chains; they go in pushes a body can hold,
+/// here one request's chains each, and the receiver takes each as it
+/// comes: a run stopped between them leaves it asking only for the rest.
+#[tokio::test]
+async fn a_push_of_no_commits_brings_erasures_published_since() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&source, "it/push-since").await;
+    let t1 = insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    insert_kept(
+        &source,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@secret"}),
+    )
+    .await;
+    let mut before = Vec::new();
+    source
+        .archive_ledger(&id, false, &mut before)
+        .await
+        .unwrap();
+    let (base, _) = head_of(&source, &id).await;
+    let here = tempfile::tempdir().unwrap();
+    let receiver = receiving(&here);
+    let copy = receiver
+        .restore_ledger("it/push-since-copy", &mut before.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+
+    // The requests, pushed while they are proved.
+    for who in [("alice", "a@secret"), ("bob", "b@secret")] {
+        source
+            .erase_occurrences(&id, email(who.0, who.1), None)
+            .await
+            .unwrap();
+    }
+    let request = push_request(&source, &id, Some(&base)).await;
+    assert!(request.erasure_frames.is_empty() && request.base_erasures.is_empty());
+    push(&receiver, &copy, request, true).await.unwrap();
+    let (head, head_t) = head_of(&source, &id).await;
+    assert_eq!(head_of(&receiver, &copy).await, (head.clone(), head_t));
+    reindex(&source, &id).await;
+    assert_eq!(source.run_erasure_pass(&id).await.unwrap().published, 2);
+
+    let request = push_of_no_commits(&source, &id, &head).await;
+    // Each value's assertion, and its removal's retraction.
+    assert_eq!(request.base_erasures.len(), 4);
+    let asked = push(&receiver, &copy, request.clone(), true)
+        .await
+        .expect_err("asks for the erasures");
+    let needed = fluree_db_api::erasures_needed(&asked.to_string()).unwrap();
+    assert_eq!(needed.len(), 4, "{asked}");
+
+    let mut pushes = source.erasure_pushes(&id, &head, &needed, 1).await.unwrap();
+    let first = pushes.next().await.unwrap().unwrap();
+    push(&receiver, &copy, first, true).await.unwrap();
+    let asked = push(&receiver, &copy, request.clone(), true)
+        .await
+        .expect_err("asks for the rest");
+    assert_eq!(
+        fluree_db_api::erasures_needed(&asked.to_string()).map(|n| n.len()),
+        Some(2),
+        "{asked}"
+    );
+    let pushes = push_asked((&source, &id, &head), &receiver, &copy, &asked, 1).await;
+    assert_eq!(pushes, 1);
+    let pushed = push(&receiver, &copy, request, true).await.unwrap();
+    assert_eq!((pushed.accepted, pushed.head.commit_id), (0, head));
+    let past = receiver
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{copy}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+    let report = receiver
+        .run_purge_pass(&copy, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 2, "{report:?}");
+    for value in ["a@secret", "b@secret"] {
+        assert_eq!(
+            files_holding(here.path(), value),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
 }
 
 /// What an origin's object requests answer for erased history, walked as
@@ -2283,7 +2513,7 @@ async fn every_transfer_carries_erased_history_or_refuses_it() {
     let served = tempfile::tempdir().unwrap();
     let server = receiving(&served);
     server.create_ledger("it/every-push").await.unwrap();
-    let request = push_request(&source, &id, None, &[]).await;
+    let request = push_request(&source, &id, None).await;
     let refused = push(&server, "it/every-push:main", request.clone(), false).await;
     assert!(refused.is_err_and(|e| e.status_code() == 403));
     memory.create_ledger("it/every-push").await.unwrap();

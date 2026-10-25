@@ -257,8 +257,13 @@ admin token `POST /erase` takes, when the server requires one). Each erased comm
 travels as its erasure: empty bytes under its CID, with its chain, replacement, receipts and
 authorizations; its original and transaction document stay behind. The push also lists the chain
 digest of every erased commit of the history the server already has. A server that holds the original
-of one but not its erasure answers `409`, naming the commits whose erasures it needs, and the CLI
-pushes once more with them.
+of one but not its erasure answers `409`, naming the commits whose erasures it needs; one that holds
+another erasure of a commit refuses the push. The CLI pushes the erasures named in pushes of no
+commits, each within the server's body limit and holding every chain of a request together (the
+server refuses part of a request, which would leave a commit holding what it erased), then the push
+again. The server takes each as it arrives, so a push stopped between them resumes asking only for
+the rest. When the server already has every commit, `fluree push` sends the erasures and journal in a
+push of no commits, so an erasure published after its request was pushed still arrives.
 
 The server takes the erasures as a pull does, before it validates the pushed commits: it checks them,
 makes every ledger it holds with an original read as they do (the pushed ledger among them), and
@@ -273,7 +278,9 @@ commits (`501`).
 erased commit with its erasure: the ledger's journal and the commit's chain, as pack frames, under
 `X-Fluree-Content-Kind: erasure`. It never answers with the replacement, which the CID does not
 match, nor with `304`, since a chain can gain steps. The transaction document of an erased commit is
-not served (`404`). A clone takes the erasures, with `--erasure-authority`, as it takes a pack's.
+not served (`404`). A clone takes the erasures, with `--erasure-authority`, as it takes a pack's. It
+asks for an erased commit even when its storage already reads it for another ledger: taking the
+erasure brings the journal, and makes the clone a holder that later erasures reach.
 
 ## Status
 

@@ -264,7 +264,8 @@ pub struct PushAuthority {
 
 /// How a push's receiver asks for erasure chains it lacks, in the message
 /// of its `409`: this prefix, then a JSON array of the commits' CIDs. A
-/// sender pushes again with their chains (see [`erasures_needed`]).
+/// sender pushes their chains, then the push again (see [`erasures_needed`]
+/// and `Fluree::erasure_pushes`).
 pub const ERASURES_NEEDED: &str = "this server holds erased commits whose erasures it lacks: ";
 
 /// The commits a push's `409` asks erasure chains for, if it does.
@@ -369,10 +370,60 @@ impl Fluree {
         index_config: &IndexConfig,
         authority: PushAuthority,
     ) -> Result<PushCommitsResponse> {
+        if request.commits.is_empty()
+            && request.merged_commits.is_empty()
+            && (!request.erasure_frames.is_empty()
+                || !request.base_erasures.is_empty()
+                || request.retention.is_some())
+        {
+            return self
+                .push_without_commits(ledger_id, request, index_config, authority)
+                .await;
+        }
         let staged = self
             .prepare_push_with(ledger_id, request, opts, index_config, authority)
             .await?;
         self.apply_push(staged).await
+    }
+
+    /// A push of no commits: erasures and the removal journal of history
+    /// `ledger_id` has (see [`Self::receive_pushed_erasures`]).
+    async fn push_without_commits(
+        &self,
+        ledger_id: &str,
+        mut request: PushCommitsRequest,
+        index_config: &IndexConfig,
+        authority: PushAuthority,
+    ) -> Result<PushCommitsResponse> {
+        let id = LedgerId::parse(ledger_id)?;
+        let record = self
+            .nameservice()
+            .lookup(&id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {id}")))?;
+        // Without history, there is nothing for them to apply to.
+        let Some(head) = record.commit_head_id else {
+            return Err(ApiError::http(400, "missing required field 'commits'"));
+        };
+        self.receive_pushed_erasures(&id, &mut request, authority)
+            .await?;
+        let state = self.ledger(id.as_str()).await?;
+        let head = state.head_commit_id.clone().unwrap_or(head);
+        Ok(PushCommitsResponse {
+            ledger: id.to_string(),
+            accepted: 0,
+            head: PushedHead {
+                t: state.t(),
+                commit_id: head,
+            },
+            indexing: IndexingStatus {
+                enabled: self.indexing_mode.is_enabled() && self.defaults_indexing_enabled(),
+                needed: state.should_reindex(index_config),
+                novelty_size: state.novelty_size(),
+                index_t: state.index_t(),
+                commit_t: state.t(),
+            },
+        })
     }
 
     /// Validate and write the push payload up to (but not including)
@@ -3056,6 +3107,19 @@ impl Fluree {
 }
 
 impl Fluree {
+    /// Whether a push may carry the ledger's removal journal, with commits
+    /// or without: a cluster replicates its own.
+    pub fn takes_pushed_retention(&self) -> bool {
+        #[cfg(feature = "native")]
+        {
+            self.retention.replicas.get().is_none()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
+    }
+
     /// Whether a transfer may bring this instance permanently erased
     /// commits: a single node with file storage holds them.
     pub fn can_hold_erasures(&self) -> bool {
