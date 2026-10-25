@@ -2294,10 +2294,19 @@ async fn every_transfer_carries_erased_history_or_refuses_it() {
         .unwrap();
     received_without(&server, "it/every-push:main", &erased, t1).await;
 
-    // An object walk is answered with the erasure.
+    // An object walk is answered with the erasure, only for a ledger that
+    // holds the commit.
     assert!(matches!(
         source.erased_object(&id, &erased).await.unwrap(),
         Some(ErasedObject::Chain(_))
+    ));
+    source.create_ledger("it/every-other").await.unwrap();
+    assert!(matches!(
+        source
+            .erased_object("it/every-other:main", &erased)
+            .await
+            .unwrap(),
+        Some(ErasedObject::Withheld)
     ));
     for dir in [&here, &served] {
         assert_eq!(

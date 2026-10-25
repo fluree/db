@@ -713,7 +713,9 @@ pub enum ErasedObject {
     /// manifest, then the commit's chain with its replacement, receipts and
     /// authorizations. A receiver takes them as a pack's.
     Chain(Vec<u8>),
-    /// The transaction document of an erased commit, which is not served.
+    /// The transaction document of an erased commit, which is not served;
+    /// or an erased commit `ledger_id`'s folder does not hold, whose
+    /// erasure carries another ledger's data.
     Withheld,
 }
 
@@ -740,6 +742,18 @@ impl Fluree {
                 let Some(erased) = runtime.index.erased(id).await? else {
                     return Ok(None);
                 };
+                let record = self
+                    .nameservice()
+                    .lookup(ledger_id)
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+                if !runtime
+                    .index
+                    .holds_original(&record.storage_namespace(), id)
+                    .await?
+                {
+                    return Ok(Some(ErasedObject::Withheld));
+                }
                 let mut bytes = Vec::new();
                 if let Some(mut section) = self.retention_archive_section(ledger_id).await? {
                     section["phase"] = serde_json::Value::from("retention");
