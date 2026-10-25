@@ -380,6 +380,29 @@ impl Fluree {
             .ok_or_else(|| unsupported("permanent erasure needs a single node with file storage"))
     }
 
+    /// Announce that `ledger_id`'s stored history changed in place (an
+    /// erasure published over its commits, or a purge rewrote its index):
+    /// its state cached here goes, and followers evict theirs.
+    pub(crate) async fn announce_refresh(&self, ledger_id: &LedgerId) {
+        if let Some(manager) = &self.ledger_manager {
+            manager.disconnect(ledger_id).await;
+        }
+        self.event_bus()
+            .notify(fluree_db_nameservice::NameServiceEvent::LedgerRefresh {
+                ledger_id: ledger_id.clone(),
+            });
+    }
+
+    /// The erasures published on this storage, as a hash that a follower
+    /// compares across reconnects: a change means it may have missed a
+    /// refresh. `None` without erasure.
+    pub async fn erasure_generation(&self) -> Result<Option<String>> {
+        match self.retention.erasure.get() {
+            Some(runtime) => Ok(Some(runtime.index.generation().await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Each affected commit, checked for what the transform supports, with
     /// the ledger id its signatures verify for.
     pub(super) async fn commits_to_erase(

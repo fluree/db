@@ -180,7 +180,8 @@ impl Sleeper for DriverSleeper {
 /// ledger through `LedgerManager::notify` (between queries — a query in
 /// flight keeps its frozen view) and fan out to registered callbacks;
 /// retractions evict the cached ledger, as does a snapshot that does not
-/// name a cached ledger the subscription covers.
+/// name a cached ledger the subscription covers; a refresh evicts it too,
+/// and a snapshot after a missed one evicts every cached ledger.
 pub(crate) struct PeerHeadSink {
     pub(crate) fluree: Fluree,
     pub(crate) registry: std::sync::Arc<HeadRegistry>,
@@ -197,10 +198,14 @@ impl HeadSink for PeerHeadSink {
             RemoteEvent::Connected => {
                 tracing::info!("head tracking connected");
             }
-            RemoteEvent::SnapshotComplete => {
+            RemoteEvent::SnapshotComplete { .. } => {
                 let (Some(named), Some(mgr)) = (named, self.fluree.ledger_manager()) else {
                     return;
                 };
+                if named.missed_refresh {
+                    tracing::info!("erasures changed on the remote while disconnected; refreshing");
+                    self.fluree.refresh_ledgers().await;
+                }
                 for id in mgr.cached_aliases().await {
                     let covered = self.ledgers.is_empty() || self.ledgers.contains(&id);
                     if covered && !named.ledgers.contains(&id) {
@@ -238,6 +243,10 @@ impl HeadSink for PeerHeadSink {
             RemoteEvent::LedgerRetracted { ledger_id, .. } => {
                 tracing::info!(ledger_id = %ledger_id, "ledger retracted on the remote");
                 self.fluree.disconnect_ledger(&ledger_id).await;
+            }
+            RemoteEvent::LedgerRefresh { ledger_id, .. } => {
+                tracing::info!(ledger_id = %ledger_id, "ledger history changed on the remote");
+                self.fluree.refresh_ledger(&ledger_id).await;
             }
             RemoteEvent::GraphSourceUpdated(record) => {
                 tracing::debug!(graph_source_id = %record.graph_source_id, "graph-source head event ignored (unsupported in the browser peer)");

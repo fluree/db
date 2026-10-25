@@ -217,6 +217,30 @@ impl ErasureIndex {
         format!("fluree:{}://{DIR}/{path}", self.storage.storage_method())
     }
 
+    /// List the map objects again before the next read: another instance
+    /// published since.
+    pub(crate) fn expire(&self) {
+        *self.listed_at.write() = None;
+    }
+
+    /// The published erasures, as a hash: every chain, and where its
+    /// originals are read without a file.
+    pub(crate) async fn generation(&self) -> Result<String> {
+        self.load().await?;
+        let mut chains: Vec<String> = self
+            .entries
+            .read()
+            .values()
+            .map(|e| {
+                let mut at = e.erased.replaced_at.clone();
+                at.sort();
+                format!("{} {}", e.erased.digest(), at.join(" "))
+            })
+            .collect();
+        chains.sort();
+        Ok(sha256_hex(chains.join("\n").as_bytes()))
+    }
+
     /// Whether the last listing of the map objects still stands.
     fn fresh(&self) -> bool {
         self.listed_at

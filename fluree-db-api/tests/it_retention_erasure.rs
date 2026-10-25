@@ -3024,5 +3024,83 @@ async fn an_erasure_refuses_the_same_history_at_every_stage() {
     );
 }
 
+/// The ledgers `events` announced refreshing since last drained.
+fn refreshed(
+    events: &mut tokio::sync::broadcast::Receiver<fluree_db_nameservice::NameServiceEvent>,
+) -> Vec<String> {
+    let mut ledgers = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let fluree_db_nameservice::NameServiceEvent::LedgerRefresh { ledger_id } = event {
+            ledgers.push(ledger_id.to_string());
+        }
+    }
+    ledgers.sort();
+    ledgers.dedup();
+    ledgers
+}
+
+/// Publishing an erasure, rewriting an index without its values, and
+/// purging change a ledger's stored history without moving its heads: each
+/// announces a refresh of every branch holding the commits, on which
+/// followers evict what they cached. Publication also moves the erasure
+/// generation they compare across reconnects.
+#[tokio::test]
+async fn publication_and_purge_announce_a_refresh() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/refresh").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    fluree
+        .create_branch("it/refresh", "dev", None, None)
+        .await
+        .unwrap();
+    let other = ledger(&fluree, "it/refresh-other").await;
+    insert(
+        &fluree,
+        &other,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@kept"}),
+    )
+    .await;
+    let mut events = fluree
+        .event_bus()
+        .subscribe(fluree_db_nameservice::SubscriptionScope::all())
+        .receiver;
+    let before = fluree.erasure_generation().await.unwrap();
+
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    for branch in [id.as_str(), "it/refresh:dev"] {
+        reindex(&fluree, branch).await;
+    }
+    refreshed(&mut events);
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    assert_eq!(refreshed(&mut events), ["it/refresh:dev", id.as_str()]);
+    assert_ne!(fluree.erasure_generation().await.unwrap(), before);
+
+    // An index rewritten while its old files wait out the grace: a peer on
+    // the old root learns of the new one now, not when they are deleted.
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(report.waiting && report.leafwise == 2, "{report:?}");
+    assert_eq!(refreshed(&mut events), ["it/refresh:dev", id.as_str()]);
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(refreshed(&mut events), ["it/refresh:dev", id.as_str()]);
+}
+
 #[path = "it_retention_erasure_transfer.rs"]
 mod transfer;

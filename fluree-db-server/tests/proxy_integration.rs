@@ -4408,3 +4408,80 @@ async fn test_pack_streams_commits_and_the_removal_journal() {
         .count();
     assert_eq!(commits, 2, "the insert and the removal's retraction");
 }
+
+/// Wait for `check` to hold, for up to ten seconds.
+async fn eventually<F, Fut>(what: &str, check: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A peer following a transaction server over `/events` evicts a ledger it
+/// cached when the server announces a refresh of it. The ledger's stored
+/// history changed without its heads moving (an erasure published, or a
+/// purge rewrote its index), which no record update would tell the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_evicts_a_ledger_the_server_refreshes() {
+    use fluree_db_api::LedgerId;
+    use fluree_db_nameservice::NameServiceEvent;
+
+    let (_tx_tmp, tx) = tx_server_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = build_router(tx.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tx.fluree.create_ledger("mydb").await.expect("create");
+    tx.fluree
+        .graph("mydb:main")
+        .transact()
+        .insert(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:alice",
+            "ex:name": "Alice"
+        }))
+        .commit()
+        .await
+        .expect("insert");
+
+    let token = create_storage_proxy_token(&SigningKey::from_bytes(&[7u8; 32]), true);
+    let (_peer_tmp, peer) = proxy_peer_state(&url, &token).await.expect("peer");
+    fluree_db_server::PeerSubscriptionTask::new(
+        peer.config.clone(),
+        peer.peer_state.clone().expect("peer state"),
+        peer.fluree.clone(),
+    )
+    .spawn();
+    let ledger = LedgerId::parse("mydb:main").unwrap();
+    let peer_state = peer.peer_state.clone().unwrap();
+    eventually("the peer to follow the ledger", || async {
+        peer_state.known_ledgers().await.contains(&ledger)
+    })
+    .await;
+    peer.fluree.ledger_cached("mydb:main").await.expect("load");
+    let cached = || async {
+        peer.fluree
+            .ledger_manager()
+            .expect("a peer caches ledgers")
+            .cached_aliases()
+            .await
+            .contains(&ledger)
+    };
+    assert!(cached().await);
+
+    tx.fluree
+        .event_bus()
+        .notify(NameServiceEvent::LedgerRefresh {
+            ledger_id: ledger.clone(),
+        });
+    eventually("the peer to evict the ledger", || async { !cached().await }).await;
+}

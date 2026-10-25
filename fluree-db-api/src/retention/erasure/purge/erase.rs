@@ -39,9 +39,7 @@ impl Fluree {
         let _maintenance = self.hold_indexing(&record.ledger_id).await?;
         let erased = self.erase_from_held_index(record, captured, None).await?;
         if erased == Erased::Leafwise {
-            if let Some(manager) = &self.ledger_manager {
-                manager.disconnect(&record.ledger_id).await;
-            }
+            self.announce_refresh(&record.ledger_id).await;
         }
         Ok(erased)
     }

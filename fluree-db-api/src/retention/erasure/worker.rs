@@ -638,6 +638,9 @@ impl Fluree {
         if !published.is_empty() {
             self.store_authorization(branch, job).await?;
             runtime.index.publish(published).await?;
+            for holder in &holders {
+                self.announce_refresh(&holder.ledger_id).await;
+            }
         }
         drop(admission);
         if self.needs(job).await?.iter().any(|n| *n != Need::Covered) {

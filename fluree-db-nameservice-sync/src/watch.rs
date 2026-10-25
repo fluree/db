@@ -22,6 +22,14 @@ pub enum RemoteEvent {
         ledger_id: LedgerId,
         instance: Option<InstanceId>,
     },
+    /// A ledger's stored history changed on the remote without its heads
+    /// moving (an erasure published, or a purge rewrote its index): a state
+    /// cached of it is stale. `erasures`, when the remote sends it, is its
+    /// erasure generation since.
+    LedgerRefresh {
+        ledger_id: LedgerId,
+        erasures: Option<String>,
+    },
     /// A graph source record was created or updated on the remote
     GraphSourceUpdated(GraphSourceRecord),
     /// A graph source was retracted on the remote
@@ -30,9 +38,11 @@ pub enum RemoteEvent {
     Connected,
     /// The remote has sent every record in scope since [`Connected`]: one
     /// held locally that it did not name was dropped while disconnected.
+    /// `erasures`, when the remote sends it, is its erasure generation: one
+    /// other than last seen means a refresh was missed.
     ///
     /// [`Connected`]: RemoteEvent::Connected
-    SnapshotComplete,
+    SnapshotComplete { erasures: Option<String> },
     /// Disconnected from the remote (will attempt reconnect)
     Disconnected { reason: String },
     /// Fatal error — stop watching, do not retry (e.g., 401/403)

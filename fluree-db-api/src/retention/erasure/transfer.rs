@@ -1609,11 +1609,9 @@ impl Fluree {
         index.publish(published).await?;
         // Their cached states read through the substituting store until
         // now; they read the published erasures from here on.
-        if let Some(manager) = &self.ledger_manager {
-            for ledger_id in &reconciled {
-                if let Ok(id) = fluree_db_core::LedgerId::parse(ledger_id) {
-                    manager.disconnect(&id).await;
-                }
+        for ledger_id in &reconciled {
+            if let Ok(id) = fluree_db_core::LedgerId::parse(ledger_id) {
+                self.announce_refresh(&id).await;
             }
         }
         // A purge, which recording a job may wait for, holds indexing.

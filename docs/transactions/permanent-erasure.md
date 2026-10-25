@@ -147,7 +147,11 @@ A pass that cannot go on records why in the job and tries again an hour later. T
 - a scan that finds something it cannot account for.
 
 A purged job lists, under `purge.unverified`, what this node cannot check. That is the memory of other
-processes reading the same storage, such as query peers. Restart them.
+processes reading the same storage, such as query peers. Publication and the purge each announce a
+refresh of the ledgers they change (`ns-refresh` on [`/events`](../operations/query-peers.md)): a query
+peer following the server evicts what it cached of them, and one that missed the event while
+disconnected evicts everything it cached when it reconnects. Restart any other process, and peers of
+earlier releases.
 
 ## Archives
 
@@ -356,5 +360,6 @@ measurements.
   [Clones and pulls](#clones-and-pulls)), an origin-based clone's object walk, and push (see
   [Pushes](#pushes)), each to a receiver that takes erasures from that source.
 - **Not covered:** copies outside this node's storage (backups, other clones, exports already made), the
-  memory of other processes until they restart, and values in the original CID itself (see
+  memory of other processes that follow no refresh until they restart, and values in the original CID
+  itself (see
   [Signatures](#signatures)). Neither the proof nor the purge shows that copies elsewhere are gone.

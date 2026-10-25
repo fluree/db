@@ -965,6 +965,10 @@ pub enum NameServiceEvent {
         ledger_id: LedgerId,
         instance: InstanceId,
     },
+    /// A branch's stored history changed without its heads moving: a
+    /// permanent erasure published over its commits, or a purge rewrote its
+    /// index. A state cached of it is stale; consumers evict it.
+    LedgerRefresh { ledger_id: LedgerId },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
         graph_source_id: LedgerId,

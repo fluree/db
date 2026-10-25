@@ -1,5 +1,6 @@
 //! What a remote's snapshot names, so a subscriber can drop what it holds
-//! that the remote retracted while the subscriber was disconnected.
+//! that the remote retracted while the subscriber was disconnected, and
+//! whether it missed a refresh meanwhile.
 
 use crate::watch::RemoteEvent;
 use fluree_db_core::LedgerId;
@@ -11,14 +12,23 @@ use std::sync::{Mutex, PoisonError};
 pub struct SnapshotNames {
     pub ledgers: HashSet<LedgerId>,
     pub graph_sources: HashSet<LedgerId>,
+    /// The remote's erasure generation changed since last seen: a refresh
+    /// was missed, so every cached ledger is stale.
+    pub missed_refresh: bool,
 }
 
 /// Follows a remote's events from [`RemoteEvent::Connected`] to
 /// [`RemoteEvent::SnapshotComplete`], collecting what the snapshot names.
 /// A snapshot cut short by a disconnect names nothing, so nothing is
-/// dropped on its account.
+/// dropped on its account. Remembers the erasure generation last seen.
 #[derive(Debug, Default)]
-pub struct SnapshotTracker(Mutex<Option<SnapshotNames>>);
+pub struct SnapshotTracker(Mutex<Tracked>);
+
+#[derive(Debug, Default)]
+struct Tracked {
+    names: Option<SnapshotNames>,
+    erasures: Option<String>,
+}
 
 impl SnapshotTracker {
     pub fn new() -> Self {
@@ -27,21 +37,33 @@ impl SnapshotTracker {
 
     /// Note `event`. Returns what the snapshot named once it completes.
     pub fn observe(&self, event: &RemoteEvent) -> Option<SnapshotNames> {
-        let mut names = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tracked = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match event {
-            RemoteEvent::Connected => *names = Some(SnapshotNames::default()),
+            RemoteEvent::Connected => tracked.names = Some(SnapshotNames::default()),
             RemoteEvent::LedgerUpdated(record) => {
-                if let Some(names) = names.as_mut() {
+                if let Some(names) = tracked.names.as_mut() {
                     names.ledgers.insert(record.ledger_id.clone());
                 }
             }
             RemoteEvent::GraphSourceUpdated(record) => {
-                if let Some(names) = names.as_mut() {
+                if let Some(names) = tracked.names.as_mut() {
                     names.graph_sources.insert(record.graph_source_id.clone());
                 }
             }
-            RemoteEvent::SnapshotComplete => return names.take(),
-            RemoteEvent::Disconnected { .. } | RemoteEvent::Fatal { .. } => *names = None,
+            RemoteEvent::LedgerRefresh { erasures, .. } => {
+                if erasures.is_some() {
+                    tracked.erasures.clone_from(erasures);
+                }
+            }
+            RemoteEvent::SnapshotComplete { erasures } => {
+                let mut names = tracked.names.take()?;
+                if let Some(erasures) = erasures {
+                    let seen = tracked.erasures.replace(erasures.clone());
+                    names.missed_refresh = seen.is_some_and(|seen| seen != *erasures);
+                }
+                return Some(names);
+            }
+            RemoteEvent::Disconnected { .. } | RemoteEvent::Fatal { .. } => tracked.names = None,
             RemoteEvent::LedgerRetracted { .. } | RemoteEvent::GraphSourceRetracted { .. } => {}
         }
         None
@@ -60,25 +82,52 @@ mod tests {
     #[test]
     fn names_what_the_snapshot_sent_and_nothing_after_a_cut() {
         let tracker = SnapshotTracker::new();
-        assert!(tracker.observe(&RemoteEvent::SnapshotComplete).is_none());
+        assert!(tracker.observe(&complete(None)).is_none());
 
         tracker.observe(&RemoteEvent::Connected);
         tracker.observe(&updated("a:main"));
-        let names = tracker
-            .observe(&RemoteEvent::SnapshotComplete)
-            .expect("complete");
+        let names = tracker.observe(&complete(None)).expect("complete");
         assert_eq!(
             names.ledgers,
             HashSet::from([LedgerId::parse("a:main").unwrap()])
         );
         // Live updates after it name nothing further.
         tracker.observe(&updated("b:main"));
-        assert!(tracker.observe(&RemoteEvent::SnapshotComplete).is_none());
+        assert!(tracker.observe(&complete(None)).is_none());
 
         tracker.observe(&RemoteEvent::Connected);
         tracker.observe(&RemoteEvent::Disconnected {
             reason: "cut".into(),
         });
-        assert!(tracker.observe(&RemoteEvent::SnapshotComplete).is_none());
+        assert!(tracker.observe(&complete(None)).is_none());
+    }
+
+    fn complete(erasures: Option<&str>) -> RemoteEvent {
+        RemoteEvent::SnapshotComplete {
+            erasures: erasures.map(str::to_string),
+        }
+    }
+
+    /// A snapshot whose erasure generation differs from the last one seen,
+    /// in a snapshot or a refresh, reports a missed refresh; the first
+    /// seen, and one a refresh announced, do not.
+    #[test]
+    fn a_changed_erasure_generation_is_a_missed_refresh() {
+        let tracker = SnapshotTracker::new();
+        let snapshot = |erasures| {
+            tracker.observe(&RemoteEvent::Connected);
+            tracker.observe(&complete(erasures)).expect("complete")
+        };
+        assert!(!snapshot(Some("g1")).missed_refresh);
+        assert!(!snapshot(Some("g1")).missed_refresh);
+        assert!(snapshot(Some("g2")).missed_refresh);
+        tracker.observe(&RemoteEvent::LedgerRefresh {
+            ledger_id: LedgerId::parse("a:main").unwrap(),
+            erasures: Some("g3".into()),
+        });
+        assert!(!snapshot(Some("g3")).missed_refresh);
+        // A remote that sends none compares nothing.
+        assert!(!snapshot(None).missed_refresh);
+        assert!(!snapshot(Some("g3")).missed_refresh);
     }
 }

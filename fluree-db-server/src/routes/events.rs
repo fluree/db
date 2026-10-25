@@ -18,6 +18,11 @@
 //!   source). A ledger record carries its `instance`.
 //! - `ns-retracted` - Record retracted/deleted. A ledger retraction carries
 //!   the `instance` the branch belonged to when the server knows it.
+//! - `ns-refresh` - A ledger's stored history changed without its heads
+//!   moving (an erasure published, or a purge rewrote its index): a state
+//!   cached of it is stale. Carries `erasures`, the server's erasure
+//!   generation, as `snapshot-complete` does: a subscriber that sees it
+//!   change across a reconnect missed a refresh, and drops what it cached.
 
 use axum::{
     extract::{RawQuery, State},
@@ -203,6 +208,17 @@ struct NsRetractedData {
     emitted_at: String,
 }
 
+/// SSE event data payload for ns-refresh events
+#[derive(Debug, Serialize)]
+struct NsRefreshData {
+    action: &'static str,
+    kind: &'static str,
+    resource_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    erasures: Option<String>,
+    emitted_at: String,
+}
+
 /// Compute the SSE event ID for a ledger record
 fn ledger_event_id(resource_id: &str, record: &NsRecord) -> String {
     format!(
@@ -346,6 +362,27 @@ fn retracted_sse_event(
         .unwrap_or_else(|_| Event::default().comment("serialization error"))
 }
 
+/// Create a refresh SSE Event
+fn refresh_sse_event(resource_id: &str, erasures: Option<String>) -> Event {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let data = NsRefreshData {
+        action: "ns-refresh",
+        kind: SSE_KIND_LEDGER,
+        resource_id: resource_id.to_string(),
+        erasures,
+        emitted_at: now_iso8601(),
+    };
+
+    Event::default()
+        .event("ns-refresh")
+        .id(format!("ledger:{resource_id}:refresh:{timestamp_ms}"))
+        .json_data(data)
+        .unwrap_or_else(|_| Event::default().comment("serialization error"))
+}
+
 /// Build the initial snapshot of records on connection
 async fn build_initial_snapshot<N>(ns: &N, params: &EventsQuery) -> Vec<Event>
 where
@@ -408,6 +445,7 @@ fn event_resource_id(event: &NameServiceEvent) -> &LedgerId {
         NameServiceEvent::LedgerIndexPublished { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerRetracted { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerCreated { ledger_id, .. } => ledger_id,
+        NameServiceEvent::LedgerRefresh { ledger_id } => ledger_id,
         NameServiceEvent::GraphSourceConfigPublished {
             graph_source_id, ..
         } => graph_source_id,
@@ -424,15 +462,21 @@ fn event_kind(event: &NameServiceEvent) -> &'static str {
         NameServiceEvent::LedgerCommitPublished { .. }
         | NameServiceEvent::LedgerIndexPublished { .. }
         | NameServiceEvent::LedgerRetracted { .. }
-        | NameServiceEvent::LedgerCreated { .. } => SSE_KIND_LEDGER,
+        | NameServiceEvent::LedgerCreated { .. }
+        | NameServiceEvent::LedgerRefresh { .. } => SSE_KIND_LEDGER,
         NameServiceEvent::GraphSourceConfigPublished { .. }
         | NameServiceEvent::GraphSourceIndexPublished { .. }
         | NameServiceEvent::GraphSourceRetracted { .. } => SSE_KIND_GRAPH_SOURCE,
     }
 }
 
-/// Transform a nameservice event to an SSE Event, fetching the current record
-async fn transform_event<N>(ns: &N, event: NameServiceEvent) -> Option<Event>
+/// Transform a nameservice event to an SSE Event, fetching the current record.
+/// `erasures` is the server's erasure generation, which a refresh carries.
+async fn transform_event<N>(
+    ns: &N,
+    event: NameServiceEvent,
+    erasures: Option<String>,
+) -> Option<Event>
 where
     N: NameServiceLookup,
 {
@@ -451,6 +495,9 @@ where
             ledger_id,
             instance,
         } => Some(retracted_sse_event(SSE_KIND_LEDGER, &ledger_id, instance)),
+        NameServiceEvent::LedgerRefresh { ledger_id } => {
+            Some(refresh_sse_event(&ledger_id, erasures))
+        }
         NameServiceEvent::GraphSourceConfigPublished { .. }
         | NameServiceEvent::GraphSourceIndexPublished { .. } => {
             let record = ns.lookup_graph_source(&resource_id).await.ok()??;
@@ -539,16 +586,32 @@ fn filter_to_allowed(params: &EventsQuery, principal: &EventsPrincipal) -> Event
 }
 
 /// Marks the end of the snapshot: a subscriber holding a resource in scope
-/// that the snapshot did not name missed its retraction, and drops it.
-fn snapshot_complete_event(records: usize) -> Event {
+/// that the snapshot did not name missed its retraction, and drops it; one
+/// that saw another erasure generation (`erasures`) missed a refresh.
+fn snapshot_complete_event(records: usize, erasures: Option<String>) -> Event {
+    let mut data = serde_json::json!({
+        "action": "snapshot-complete",
+        "records": records,
+        "emitted_at": now_iso8601(),
+    });
+    if let Some(erasures) = erasures {
+        data["erasures"] = serde_json::Value::from(erasures);
+    }
     Event::default()
         .event("snapshot-complete")
-        .json_data(serde_json::json!({
-            "action": "snapshot-complete",
-            "records": records,
-            "emitted_at": now_iso8601(),
-        }))
+        .json_data(data)
         .unwrap_or_else(|_| Event::default().comment("serialization error"))
+}
+
+/// The server's erasure generation, for `snapshot-complete` and
+/// `ns-refresh`. Unread, it is left out: a subscriber then compares nothing.
+async fn erasure_generation(fluree: &fluree_db_api::Fluree) -> Option<String> {
+    fluree
+        .erasure_generation()
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "erasure generation unread"))
+        .ok()
+        .flatten()
 }
 
 /// SSE events endpoint handler
@@ -602,14 +665,16 @@ pub async fn events(
 
     // 2. Build initial snapshot using effective params
     let mut initial_events = build_initial_snapshot(&ns, &effective_params).await;
-    initial_events.push(snapshot_complete_event(initial_events.len()));
+    let erasures = erasure_generation(&state.fluree).await;
+    initial_events.push(snapshot_complete_event(initial_events.len(), erasures));
     let initial_stream = stream::iter(initial_events.into_iter().map(Ok));
 
     // 3. Create live event stream from broadcast receiver using unfold
     let ns_for_live = ns.clone();
+    let fluree = state.fluree.clone();
     let live_stream = stream::unfold(
-        (subscription.receiver, ns_for_live, effective_params),
-        |(mut rx, ns_inner, params)| async move {
+        (subscription.receiver, ns_for_live, effective_params, fluree),
+        |(mut rx, ns_inner, params, fluree)| async move {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
@@ -632,8 +697,14 @@ pub async fn events(
                             continue;
                         }
 
-                        if let Some(sse_event) = transform_event(&ns_inner, event).await {
-                            return Some((Ok(sse_event), (rx, ns_inner, params)));
+                        let erasures = match event {
+                            NameServiceEvent::LedgerRefresh { .. } => {
+                                erasure_generation(&fluree).await
+                            }
+                            _ => None,
+                        };
+                        if let Some(sse_event) = transform_event(&ns_inner, event, erasures).await {
+                            return Some((Ok(sse_event), (rx, ns_inner, params, fluree)));
                         }
                         // Event transformed to None (e.g., record not found), continue
                         continue;

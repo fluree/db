@@ -3207,7 +3207,8 @@ Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sou
 |-------|-------------|
 | `ns-record` | A ledger or graph source was created, restored or updated. A ledger's record carries its `instance` |
 | `ns-retracted` | A ledger or graph source was dropped. A ledger's retraction carries the `instance` it belonged to when known |
-| `snapshot-complete` | The snapshot sent on connecting is complete; live events follow. A resource in scope it did not name was dropped |
+| `ns-refresh` | A ledger's stored history changed without its heads moving (a permanent erasure published, or a purge rewrote its index): a state cached of it is stale. Carries `erasures`, the server's erasure generation |
+| `snapshot-complete` | The snapshot sent on connecting is complete; live events follow. A resource in scope it did not name was dropped. Carries `erasures` when the server holds erasures: one other than last seen means a refresh was missed |
 
 **Authentication:** Configurable via `--events-auth-mode none|optional|required`. See [Query peers and replication](../operations/query-peers.md) for full details including auth configuration, event payloads, and peer subscription setup.
 

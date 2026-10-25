@@ -69,7 +69,7 @@ impl PeerSyncTask {
                     tracing::info!("Connected to transaction server, receiving snapshot");
                     self.preload_configured_ledgers().await;
                 }
-                RemoteEvent::SnapshotComplete => {
+                RemoteEvent::SnapshotComplete { .. } => {
                     if let Some(named) = named {
                         self.reconcile(&named, std::mem::take(&mut prior_graph_sources))
                             .await;
@@ -96,6 +96,12 @@ impl PeerSyncTask {
                 } => {
                     self.handle_ledger_retracted(&ledger_id, instance.as_ref())
                         .await;
+                }
+                // The shared storage changed under it: its erasure maps, and
+                // any index a purge rewrote, are read again.
+                RemoteEvent::LedgerRefresh { ledger_id, .. } => {
+                    tracing::info!(ledger_id = %ledger_id, "Ledger history changed on remote; refreshing");
+                    self.fluree.refresh_ledger(&ledger_id).await;
                 }
                 RemoteEvent::GraphSourceUpdated(record) => {
                     let graph_source_id = record.graph_source_id.clone();
@@ -156,6 +162,10 @@ impl PeerSyncTask {
         named: &SnapshotNames,
         prior_graph_sources: Vec<fluree_db_api::LedgerId>,
     ) {
+        if named.missed_refresh {
+            self.fluree.refresh_ledgers().await;
+            tracing::info!("Erasures changed while disconnected; cached ledgers refreshed");
+        }
         let sub = self.config.peer_subscription();
         if let Some(ns) = self.fluree.nameservice_mode().publisher() {
             match ns.all_records().await {

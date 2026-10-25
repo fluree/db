@@ -1828,6 +1828,10 @@ pub fn spawn_local_cache_event_listener(
                         "local cache event listener disconnected retracted ledger"
                     );
                 }
+                // Its history changed in place: the cached state reloads.
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRefresh { ledger_id }) => {
+                    ledger_manager.disconnect(&ledger_id).await;
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     // The channel overflowed and dropped events. With
@@ -5263,6 +5267,41 @@ impl Fluree {
             mgr.disconnect(&ledger_id).await;
         }
         // If caching is disabled, this is a no-op
+    }
+
+    /// Drop what this instance holds of `ledger_id`, whose stored history
+    /// another instance changed in place (see
+    /// [`fluree_db_nameservice::NameServiceEvent::LedgerRefresh`]): its
+    /// cached state reloads on next use, after the erasure maps are listed
+    /// again, and decoded leaves are read again.
+    pub async fn refresh_ledger(&self, ledger_id: &str) {
+        self.expire_erasures();
+        self.disconnect_ledger(ledger_id).await;
+        self.clear_decoded();
+    }
+
+    /// [`Self::refresh_ledger`] for every ledger cached here: a follower
+    /// that may have missed a refresh.
+    pub async fn refresh_ledgers(&self) {
+        self.expire_erasures();
+        if let Some(mgr) = &self.ledger_manager {
+            for ledger_id in mgr.cached_aliases().await {
+                mgr.disconnect(&ledger_id).await;
+            }
+        }
+        self.clear_decoded();
+    }
+
+    fn expire_erasures(&self) {
+        #[cfg(feature = "native")]
+        if let Some(runtime) = self.retention.erasure.get() {
+            runtime.index.expire();
+        }
+    }
+
+    fn clear_decoded(&self) {
+        self.leaflet_cache().clear();
+        crate::ontology_imports::global_schema_bundle_cache().clear();
     }
 
     /// Disconnect the Fluree system, performing best-effort cleanup

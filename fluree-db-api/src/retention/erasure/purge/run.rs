@@ -287,11 +287,9 @@ impl Fluree {
         }
         report.deleted += self.make_deletes_durable(&plan).await?;
         report.timings.delete += clock.elapsed();
-        if let Some(manager) = &self.ledger_manager {
-            for branch in &plan.rebuild {
-                if let Ok(id) = LedgerId::parse(branch) {
-                    manager.disconnect(&id).await;
-                }
+        for branch in &plan.rebuild {
+            if let Ok(id) = LedgerId::parse(branch) {
+                self.announce_refresh(&id).await;
             }
         }
         // What this process decoded from the released indexes. Other

@@ -1850,6 +1850,10 @@ async fn a_pack_of_no_commits_brings_erasures_published_since() {
     assert_eq!(source.run_erasure_pass(&id).await.unwrap().published, 1);
     assert_eq!(head_of(&source, &id).await, (head.clone(), head_t));
 
+    let mut events = receiver
+        .event_bus()
+        .subscribe(fluree_db_nameservice::SubscriptionScope::all())
+        .receiver;
     let since = pull_to(
         &source,
         &id,
@@ -1862,6 +1866,8 @@ async fn a_pack_of_no_commits_brings_erasures_published_since() {
     // The assertion, and the removal's retraction.
     assert_eq!(since.erased_commits, 2, "{since:?}");
     assert_eq!(since.reconciled, [copy], "{since:?}");
+    // Its heads did not move: followers learn of it by a refresh.
+    assert_eq!(refreshed(&mut events), [copy]);
     let past = receiver
         .query_connection(&json!({
             "@context": ctx(),
