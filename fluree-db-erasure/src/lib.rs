@@ -13,5 +13,7 @@ mod verify;
 
 pub use fluree_db_redaction::protocol::{ProveRequest, ProveResponse};
 pub use fluree_db_redaction::{Signatures, Statement};
-pub use prover::{Prover, ProverConfig, ProverError, SubprocessProver};
+pub use prover::{
+    check_prover, find_prover, Prover, ProverConfig, ProverError, SubprocessProver, PROVER_BINARY,
+};
 pub use verify::{Verifier, VerifyError, REDACT_IMAGE_IDS};

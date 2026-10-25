@@ -558,12 +558,17 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_RETENTION_INTERVAL_SECS", default_value_t = 15)]
     pub retention_interval_secs: u64,
 
-    /// The `fluree-prover` binary that proves permanent erasures
+    /// The `fluree-prover` binary that proves permanent erasures (default:
+    /// `fluree-prover` beside this binary, else on the PATH)
     ///
-    /// A single node with file storage (`--storage-path`) only. Without it,
-    /// erasure requests are refused.
+    /// A single node with file storage (`--storage-path`) only. Without a
+    /// prover of this release, erasure requests are refused.
     #[arg(long, env = "FLUREE_ERASURE_PROVER")]
     pub erasure_prover: Option<PathBuf>,
+
+    /// Refuse permanent erasure requests even where a prover is installed
+    #[arg(long, env = "FLUREE_DISABLE_ERASURE")]
+    pub disable_erasure: bool,
 
     /// Directory for the prover's temporary files, which hold the plaintext
     /// of commits being erased (default: a `fluree-erasure` directory under
@@ -1020,6 +1025,7 @@ impl Default for ServerConfig {
             orphan_sweep_interval_secs: 0,
             retention_interval_secs: 15,
             erasure_prover: None,
+            disable_erasure: false,
             erasure_scratch_dir: None,
             erasure_prover_threads: None,
             erasure_prover_timeout_secs: 14_400,
@@ -1117,10 +1123,27 @@ impl ServerConfig {
         }
     }
 
-    /// How this server proves permanent erasures (`--erasure-prover`), if it
-    /// does.
+    /// How this server proves permanent erasures, if it does: with the
+    /// prover `--erasure-prover` names, or one beside this binary or on the
+    /// PATH, once it proves an image this release accepts.
     pub fn erasure_config(&self) -> Option<fluree_db_api::retention::erasure::ErasureConfig> {
-        let command = self.erasure_prover.clone()?;
+        use fluree_db_api::retention::erasure::{check_prover, find_prover};
+        if self.disable_erasure {
+            tracing::info!("permanent erasure disabled (--disable-erasure)");
+            return None;
+        }
+        let Some(command) = find_prover(self.erasure_prover.as_deref()) else {
+            tracing::info!(
+                "permanent erasure unavailable: no fluree-prover beside this binary or on the \
+                 PATH (install it with `fluree prover install`)"
+            );
+            return None;
+        };
+        if let Err(why) = check_prover(&command) {
+            tracing::warn!("permanent erasure unavailable: {why}");
+            return None;
+        }
+        tracing::info!(prover = %command.display(), "permanent erasure available");
         Some(
             fluree_db_api::retention::erasure::ErasureConfig::subprocess(
                 fluree_db_api::retention::erasure::ProverConfig {
@@ -1639,6 +1662,48 @@ mod raft_validation_tests {
         cfg.storage_path = None;
         cfg.validate()
             .expect("missing storage_path should skip the disjoint check");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod erasure_prover_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// A stand-in prover printing `id` for `--image-id`.
+    fn fake(dir: &std::path::Path, id: &str) -> PathBuf {
+        let path = dir.join("fluree-prover");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{id}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The server proves with a prover of this release, and with none when
+    /// erasure is disabled, the prover is of another release, or missing.
+    #[test]
+    fn the_server_proves_only_with_a_prover_of_this_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = fluree_db_api::retention::erasure::REDACT_IMAGE_IDS[0]
+            .iter()
+            .map(|w| format!("{w:#010x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let config = |prover: PathBuf, disable_erasure| ServerConfig {
+            erasure_prover: Some(prover),
+            disable_erasure,
+            ..Default::default()
+        };
+        let ours = fake(dir.path(), &pinned);
+        assert!(config(ours.clone(), false).erasure_config().is_some());
+        assert!(config(ours, true).erasure_config().is_none());
+        let other = tempfile::tempdir().unwrap();
+        assert!(config(fake(other.path(), "0x00000001"), false)
+            .erasure_config()
+            .is_none());
+        assert!(config(dir.path().join("missing"), false)
+            .erasure_config()
+            .is_none());
     }
 }
 

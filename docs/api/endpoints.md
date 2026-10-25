@@ -32,6 +32,8 @@ Implementations MAY also return an `import` block advertising `.flpack` import c
 
 Implementations MAY also return a `push` block. `"push": {"merged_commits": true}` advertises [`POST /push-merges/*ledger`](#post-push-mergesledger). The CLI refuses to push a history containing a merge to a server that does not advertise it. `"erasures": true` advertises that a push may carry [permanently erased](../transactions/permanent-erasure.md#pushes) commits (see `erasure_frames` below); a single server on file storage takes them. The CLI refuses to push erased history to a server that does not advertise it. `"retention": true` advertises that a push may carry the removal journal (see `retention` below), and need carry no commits; a cluster does not.
 
+Implementations MAY also return an `erasure` block. `"erasure": {"proving": true}` advertises that the server takes [permanent erasure](../transactions/permanent-erasure.md) requests: it has a prover of its release.
+
 ### GET {api_base_url}/whoami
 
 Diagnostic endpoint for Bearer tokens. Returns a summary of the principal:

@@ -3128,6 +3128,24 @@ impl Fluree {
         }
     }
 
+    /// Whether this instance proves permanent erasures: a single node with
+    /// file storage and a prover.
+    pub fn can_prove_erasures(&self) -> bool {
+        #[cfg(feature = "native")]
+        {
+            self.can_hold_erasures()
+                && self
+                    .retention
+                    .erasure
+                    .get()
+                    .is_some_and(|runtime| runtime.config.is_some())
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
+    }
+
     /// Whether a transfer may bring this instance permanently erased
     /// commits: a single node with file storage holds them.
     pub fn can_hold_erasures(&self) -> bool {

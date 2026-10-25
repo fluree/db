@@ -105,6 +105,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 |---------|-------------|
 | [`server`](server.md) | Manage the Fluree HTTP server (run, start, stop, status, restart, logs) |
 | [`cluster`](cluster.md) | Raft cluster administration (init, add, promote, status) |
+| [`prover`](prover.md) | Install and check the prover that permanent erasure needs (install, status) |
 
 Start a server directly from a project directory — it inherits the same `.fluree/` context (config, storage) as the CLI. See [`server`](server.md) for details.
 

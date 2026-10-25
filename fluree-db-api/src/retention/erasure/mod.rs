@@ -36,7 +36,10 @@ mod worker;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-pub use fluree_db_erasure::{Prover, ProverConfig, SubprocessProver, Verifier};
+pub use fluree_db_erasure::{
+    check_prover, find_prover, Prover, ProverConfig, SubprocessProver, Verifier, PROVER_BINARY,
+    REDACT_IMAGE_IDS,
+};
 pub use index::{ErasedCommit, ErasureStep};
 pub use purge::{PurgeInspection, PurgePlan, PurgeReport, PurgeScan, PurgeTimings};
 pub use request::{BranchRemoval, ErasureReceipt, ErasureRequest};

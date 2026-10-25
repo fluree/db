@@ -369,6 +369,9 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         "erasures": state.fluree.can_hold_erasures(),
         "retention": state.fluree.takes_pushed_retention(),
     });
+    // `proving`: this server takes permanent erasure requests (`POST /erase`):
+    // it has a prover of this release.
+    doc["erasure"] = serde_json::json!({ "proving": state.fluree.can_prove_erasures() });
 
     // Advertise server-wide serving capabilities so clients can negotiate
     // query-shipping vs peer (block-fetch) mode before authenticating.

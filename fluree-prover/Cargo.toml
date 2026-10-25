@@ -7,3 +7,4 @@ members = ["prover", "methods"]
 
 [profile.release]
 lto = true
+strip = true

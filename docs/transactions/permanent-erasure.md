@@ -16,7 +16,8 @@ derived search indexes and scratch files.
 ## Scope
 
 - **Deployments:** a single node with file storage (`--storage-path`). On memory or S3 storage, in a
-  Raft cluster, on a query peer, or with no prover configured, a request is refused with `501`.
+  Raft cluster, on a query peer, or without a prover of the server's release, a request is refused
+  with `501`.
 - **Commits:** v4 commits with SHA2-256 CIDs, signed or unsigned. A request touching anything else is
   refused with `422`.
 - **What can be erased:** a commit's operations (assertions and retractions). Transaction metadata and
@@ -300,16 +301,28 @@ erasure brings the journal, and makes the clone a holder that later erasures rea
 
 ## Server configuration
 
+The prover, `fluree-prover`, is a separate binary released with each version: install it with
+[`fluree prover install`](../cli/prover.md), which puts it beside `fluree`, or run the server's
+container image tagged `-erasure`, which includes it. Only a server that takes erasure requests needs
+it. At startup the server finds it beside its own binary, else on the `PATH`, and checks that it
+proves an image the release accepts. It logs whether erasure is available and why not, and its
+discovery document reports `erasure.proving`. Without a prover of its release, the server runs and
+refuses erasure requests (`501`).
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `--erasure-prover <path>` | none | The `fluree-prover` binary. Without it, requests are refused. |
+| `--erasure-prover <path>` | beside the server's binary, else on the `PATH` | The `fluree-prover` binary. |
+| `--disable-erasure` | off | Refuse erasure requests even where a prover is installed. |
 | `--erasure-scratch-dir <dir>` | `<temp>/fluree-erasure` | The prover's temporary files. They hold the plaintext of commits being erased. Each step's directory is removed when the step ends, and a purge removes any that a crashed step left. |
 | `--erasure-prover-threads <n>` | every core | Proving threads. Fewer threads leave transactions their cores. |
 | `--erasure-prover-timeout-secs <n>` | 14400 | A step still running after this long is killed, with its process group, and retried. |
 
-The prover runs at low priority (nice 10). Proving on a host that also serves transactions slows them
-down unless it is limited, so give it its own cores or its own host. See
-[`fluree-prover/README.md`](https://github.com/fluree/db/blob/main/fluree-prover/README.md) to build it.
+Each step runs as its own process, at low priority (nice 10). Proving takes gigabytes of memory
+(about 9.6 GB for a 1,000-operation commit): on Linux the prover is the first process the kernel
+kills when memory runs out, and its step is retried, so the server keeps running. Proving on a host
+that also serves transactions slows them down unless it is limited, so give it its own cores or its
+own host. See [`fluree-prover/README.md`](https://github.com/fluree/db/blob/main/fluree-prover/README.md)
+to build it from source.
 Fluree accepts proofs only from the guest images its build pins. The prover's guest builds in a
 pinned container, so a prover built from the same release's sources proves under the image that
 release pins.

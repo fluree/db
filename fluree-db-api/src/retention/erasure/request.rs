@@ -102,7 +102,10 @@ impl Fluree {
     ) -> Result<ErasureReceipt> {
         let runtime = self.erasure_runtime()?;
         if runtime.config.is_none() {
-            return Err(unsupported("no prover is configured"));
+            return Err(unsupported(
+                "no prover is available: install one with `fluree prover install`, beside the \
+                 server's binary, or name it with `--erasure-prover`",
+            ));
         }
         if self.retention.replicas.get().is_some() {
             return Err(unsupported("a cluster cannot erase permanently yet"));

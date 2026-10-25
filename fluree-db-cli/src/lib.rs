@@ -650,6 +650,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Token { action } => commands::token::run(action),
 
+        Commands::Prover { action } => commands::prover::run(action).await,
+
         Commands::Remote { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::remote::run(action, &fluree_dir).await

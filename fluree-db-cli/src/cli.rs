@@ -1232,6 +1232,12 @@ pub enum Commands {
         action: RemoteAction,
     },
 
+    /// Install and check the prover that permanent erasure needs
+    Prover {
+        #[command(subcommand)]
+        action: ProverAction,
+    },
+
     /// Manage authentication tokens for remotes
     Auth {
         #[command(subcommand)]
@@ -3163,6 +3169,29 @@ pub enum InspectOutputFormat {
     Json,
     /// Table format for claims
     Table,
+}
+
+#[derive(Subcommand)]
+pub enum ProverAction {
+    /// Download this release's prover and install it beside `fluree`, where
+    /// a server finds it
+    Install {
+        /// Release to install from (default: this binary's)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Directory to install into (default: beside this binary)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Replace a prover already there
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Show the prover a server started here would use, and whether it
+    /// proves an image this release accepts
+    Status,
 }
 
 #[derive(Subcommand)]

@@ -47,6 +47,7 @@
   - [track](cli/track.md)
   - [cache](cli/cache.md)
   - [server](cli/server.md)
+  - [prover](cli/prover.md)
   - [server-integration](cli/server-integration.md)
   - [memory](cli/memory.md)
   - [mcp](cli/mcp.md)

@@ -4,6 +4,7 @@ name: Prover
 # digest, so its image id depends only on its sources. Fluree accepts proofs
 # only from the ids `fluree-db-erasure` pins (REDACT_IMAGE_IDS): a change that
 # reaches the guest without a new pin would fail every proof's verification.
+# A release builds and attaches each platform's prover in release.yml.
 on:
   pull_request:
     branches: [main, next]
@@ -21,8 +22,6 @@ on:
       - "fluree-prover/**"
       - "fluree-db-erasure/src/verify.rs"
       - ".github/workflows/prover.yml"
-    tags:
-      - "**[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
 
 concurrency:
@@ -38,31 +37,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install RISC Zero's toolchain (risc0-build reads its version, even in the container)
+        run: |
+          curl -sSL https://risczero.com/install | bash
+          "$HOME/.risc0/bin/rzup" install rust
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
       - name: Build the guest in the pinned container
         working-directory: fluree-prover
         run: cargo run --locked --release -p fluree-prover-methods --example image_id > "$RUNNER_TEMP/image_id"
       - name: Check that fluree-db-erasure pins it
         run: python3 fluree-prover/check-image-id.py < "$RUNNER_TEMP/image_id"
-
-  # A release's prover: built, checked against the release's pins, and kept
-  # with its image id.
-  release:
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - name: Build the prover
-        working-directory: fluree-prover
-        run: cargo build --locked --release -p fluree-prover
-      - name: Check that fluree-db-erasure pins its guest
-        run: |
-          fluree-prover/target/release/fluree-prover --image-id > "$RUNNER_TEMP/image_id"
-          python3 fluree-prover/check-image-id.py < "$RUNNER_TEMP/image_id"
-          mkdir -p "$RUNNER_TEMP/out"
-          cp fluree-prover/target/release/fluree-prover "$RUNNER_TEMP/image_id" "$RUNNER_TEMP/out/"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: fluree-prover-x86_64-unknown-linux-gnu
-          path: ${{ runner.temp }}/out/
