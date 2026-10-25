@@ -263,15 +263,29 @@ impl Fluree {
         records: &[NsRecord],
         record: &NsRecord,
     ) -> BranchedContentStore {
+        self.store_among_unseen(records, record, &mut std::collections::HashSet::new())
+    }
+
+    /// [`Self::store_among`], stopping at a branch `seen` already: records
+    /// whose sources form a cycle.
+    fn store_among_unseen<'r>(
+        &self,
+        records: &'r [NsRecord],
+        record: &'r NsRecord,
+        seen: &mut std::collections::HashSet<&'r str>,
+    ) -> BranchedContentStore {
+        seen.insert(record.branch.as_str());
         let own = self.backend.content_store(&record.storage_namespace());
         let parent = record
             .source_branch
             .as_deref()
+            .filter(|source| !seen.contains(source))
             .and_then(|source| records.iter().find(|r| r.branch == source));
         match parent {
-            Some(parent) => {
-                BranchedContentStore::with_parents(own, vec![self.store_among(records, parent)])
-            }
+            Some(parent) => BranchedContentStore::with_parents(
+                own,
+                vec![self.store_among_unseen(records, parent, seen)],
+            ),
             None => BranchedContentStore::leaf(own),
         }
     }
@@ -448,4 +462,23 @@ async fn write_object(storage: &dyn Storage, prefix: &str, journal: &Journal) ->
     let address = format!("{prefix}{}.json", hex::encode(Sha256::digest(&bytes)));
     storage.write_bytes(&address, &bytes).await?;
     Ok(address)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Records whose sources form a cycle, as only corrupt ones would, give
+    /// a store rather than a walk that never ends.
+    #[tokio::test]
+    async fn a_store_among_cyclic_records_ends() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let branch = |name: &str, source: &str| {
+            let mut record = fluree_db_nameservice::NsRecord::new(
+                fluree_db_core::LedgerId::parse(&format!("t:{name}")).unwrap(),
+            );
+            record.source_branch = Some(source.to_string());
+            record
+        };
+        let records = [branch("a", "b"), branch("b", "a")];
+        fluree.store_among(&records, &records[0]);
+    }
 }

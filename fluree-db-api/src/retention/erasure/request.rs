@@ -6,13 +6,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fluree_db_core::{
-    ContentId, ContentStore, HashAlgorithm, LedgerId, TxnMetaEntry, TxnMetaValue,
+    ContentId, ContentStore, HashAlgorithm, LedgerId, StorageNamespace, TxnMetaEntry, TxnMetaValue,
 };
 use fluree_vocab::{db, namespaces::FLUREE_DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use fluree_db_nameservice::{DroppedState, NsRecord};
+use fluree_db_nameservice::{DroppedLedger, DroppedState, NsRecord, Versioned};
 
 use super::{CommitErasure, ErasureJob, ErasureStage, SignatureMode};
 use crate::retention::registry;
@@ -311,17 +311,10 @@ impl Fluree {
         }
         let mut copies = Vec::new();
         for records in ledgers.into_values() {
-            'ledger: for record in &records {
-                for cid in cids {
-                    if runtime
-                        .index
-                        .holds_original(&record.storage_namespace(), cid)
-                        .await?
-                    {
-                        copies.extend(records.iter().cloned());
-                        break 'ledger;
-                    }
-                }
+            let namespaces: Vec<StorageNamespace> =
+                records.iter().map(NsRecord::storage_namespace).collect();
+            if any_holds(&runtime.index, &namespaces, cids).await? {
+                copies.extend(records);
             }
         }
         copies.sort_by(|a, b| a.ledger_id.cmp(&b.ledger_id));
@@ -330,20 +323,16 @@ impl Fluree {
 
     /// The branches of soft-dropped ledgers, one of whose branches holds the
     /// original of one of `commits` in its own folder, each with its store.
+    /// One being restored holds it as much as one at rest; one being purged
+    /// is going.
     pub(crate) async fn dropped_holders(
         &self,
         commits: &[&str],
     ) -> Result<Vec<(NsRecord, Arc<dyn ContentStore>)>> {
-        let runtime = self.erasure_runtime()?;
-        let mut cids: Vec<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
-        cids.sort();
-        cids.dedup();
         let mut holders = Vec::new();
-        for entry in self.publisher()?.list_dropped().await? {
-            let entry = entry.value;
-            if matches!(entry.state, DroppedState::Purging) {
-                continue;
-            }
+        let admitted: fn(&DroppedState) -> bool = |state| !matches!(state, DroppedState::Purging);
+        for versioned in self.dropped_holding(commits, admitted).await? {
+            let entry = versioned.value;
             // An entry keeps its folder beside its records, not in them.
             let branches: Vec<NsRecord> = entry
                 .branches
@@ -353,24 +342,38 @@ impl Fluree {
                     ..r.clone()
                 })
                 .collect();
-            'entry: for record in &branches {
-                for cid in &cids {
-                    if runtime
-                        .index
-                        .holds_original(&record.storage_namespace(), cid)
-                        .await?
-                    {
-                        for branch in branches.iter().filter(|r| !r.retracted) {
-                            let store: Arc<dyn ContentStore> =
-                                Arc::new(self.store_among(&branches, branch));
-                            holders.push((branch.clone(), store));
-                        }
-                        break 'entry;
-                    }
-                }
+            for branch in branches.iter().filter(|r| !r.retracted) {
+                let store: Arc<dyn ContentStore> = Arc::new(self.store_among(&branches, branch));
+                holders.push((branch.clone(), store));
             }
         }
         Ok(holders)
+    }
+
+    /// The soft-dropped ledgers in a state `admitted` admits, one of whose
+    /// branches holds the original of one of `commits` in its own folder.
+    pub(crate) async fn dropped_holding(
+        &self,
+        commits: &[&str],
+        admitted: fn(&DroppedState) -> bool,
+    ) -> Result<Vec<Versioned<DroppedLedger>>> {
+        let runtime = self.erasure_runtime()?;
+        let mut cids: Vec<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
+        cids.sort();
+        cids.dedup();
+        let mut holding = Vec::new();
+        for versioned in self.publisher()?.list_dropped().await? {
+            let entry = &versioned.value;
+            let namespaces: Vec<StorageNamespace> = entry
+                .branches
+                .iter()
+                .map(|b| entry.root.namespace(&b.branch))
+                .collect();
+            if admitted(&entry.state) && any_holds(&runtime.index, &namespaces, &cids).await? {
+                holding.push(versioned);
+            }
+        }
+        Ok(holding)
     }
 
     pub(crate) fn erasure_runtime(&self) -> Result<&std::sync::Arc<super::ErasureRuntime>> {
@@ -632,6 +635,23 @@ fn receipt_of(
         stage: job.stage,
         removals,
     }
+}
+
+/// Whether one of `namespaces` holds the original of one of `cids` in its own
+/// folder.
+async fn any_holds(
+    index: &super::index::ErasureIndex,
+    namespaces: &[StorageNamespace],
+    cids: &[ContentId],
+) -> Result<bool> {
+    for namespace in namespaces {
+        for cid in cids {
+            if index.holds_original(namespace, cid).await? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

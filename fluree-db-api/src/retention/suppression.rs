@@ -436,7 +436,12 @@ impl Fluree {
         if let Some(runtime) = self.retention.erasure.get() {
             if runtime.index.erased(cid).await?.is_some() {
                 let mut next = Some(record.clone());
+                let mut seen = std::collections::HashSet::new();
                 while let Some(branch) = next {
+                    // Sources that form a cycle, as only corrupt records do.
+                    if !seen.insert(branch.ledger_id.clone()) {
+                        break;
+                    }
                     if runtime
                         .index
                         .holds_original(&branch.storage_namespace(), cid)

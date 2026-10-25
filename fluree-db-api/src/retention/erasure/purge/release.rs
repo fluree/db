@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use fluree_db_core::{ContentId, ContentStore, LedgerId, StorageNamespace};
+use fluree_db_core::{ContentStore, LedgerId, StorageNamespace};
 use fluree_db_nameservice::{DroppedLedger, DroppedState, NsRecord, RegistryCas, Versioned};
 
 use crate::{Fluree, Result};
@@ -33,27 +33,12 @@ pub(super) enum Released {
 }
 
 impl Fluree {
-    /// The soft-dropped ledgers, not being restored or purged, holding the
-    /// original of a commit of `commits`.
-    async fn dropped_holding(&self, commits: &[String]) -> Result<Vec<Versioned<DroppedLedger>>> {
-        let runtime = self.erasure_runtime()?;
-        let cids: Vec<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
-        let mut holding = Vec::new();
-        for versioned in self.publisher()?.list_dropped().await? {
-            if !matches!(versioned.value.state, DroppedState::Dropped) {
-                continue;
-            }
-            'held: for branch in &versioned.value.branches {
-                let namespace = StorageNamespace::new(versioned.value.root.clone(), &branch.branch);
-                for cid in &cids {
-                    if runtime.index.holds_original(&namespace, cid).await? {
-                        holding.push(versioned);
-                        break 'held;
-                    }
-                }
-            }
-        }
-        Ok(holding)
+    /// The soft-dropped ledgers at rest, holding the original of a commit
+    /// of `commits`: one being restored or purged is left alone.
+    async fn dropped_at_rest(&self, commits: &[String]) -> Result<Vec<Versioned<DroppedLedger>>> {
+        let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
+        self.dropped_holding(&commits, |state| matches!(state, DroppedState::Dropped))
+            .await
     }
 
     /// Where `entry`'s index files and dictionaries are.
@@ -78,7 +63,7 @@ impl Fluree {
         let runtime = self.erasure_runtime()?;
         let registry = self.publisher()?;
         let (mut ledgers, mut deleted) = (0, 0);
-        for versioned in self.dropped_holding(commits).await? {
+        for versioned in self.dropped_at_rest(commits).await? {
             let entry = versioned.value;
             let mut next = entry.clone();
             let mut rebuild = released_branches(&entry);
@@ -148,7 +133,7 @@ impl Fluree {
     pub(super) async fn dropped_index_files(&self, commits: &[String]) -> Result<Vec<String>> {
         let runtime = self.erasure_runtime()?;
         let mut files = Vec::new();
-        for versioned in self.dropped_holding(commits).await? {
+        for versioned in self.dropped_at_rest(commits).await? {
             for prefix in self.index_prefixes(&versioned.value)? {
                 files.extend(runtime.index.list_raw(&prefix).await?);
             }
