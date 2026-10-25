@@ -627,11 +627,36 @@ impl crate::Fluree {
                 .into());
             }
         }
+        let mut written: Vec<&ContentId> =
+            manifest.snapshots.iter().map(|e| &e.snapshot_id).collect();
+        written.push(&index_id);
+        self.still_stored(graph_source_id, &written).await?;
         self.publisher()?
             .publish_graph_source_index(&name, &branch, &index_id, index_t)
             .await?;
 
         Ok(index_id)
+    }
+
+    /// Refuse to publish a head naming a file of `ids` no longer stored. A
+    /// purge releases a search index's files no head names, as a sync's are
+    /// until it publishes; held under the heads lock, which the release
+    /// takes, so none goes between this and the publish.
+    pub(crate) async fn still_stored(
+        &self,
+        graph_source_id: &str,
+        ids: &[&ContentId],
+    ) -> Result<()> {
+        let store = self.graph_source_store(graph_source_id)?;
+        for id in ids {
+            if !store.has(id).await? {
+                return Err(fluree_db_nameservice::NameServiceError::conflict(format!(
+                    "{graph_source_id}'s file {id} was released during the sync"
+                ))
+                .into());
+            }
+        }
+        Ok(())
     }
 }
 

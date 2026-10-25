@@ -614,3 +614,80 @@ async fn erasing_leaf_by_leaf_holds_the_branch_against_indexing() {
         super::erase::Erased::Leafwise
     );
 }
+
+/// A sync's files are leftovers until it publishes: a purge that releases
+/// one meanwhile leaves the sync a manifest naming a file gone, which it
+/// does not publish.
+#[tokio::test]
+async fn a_sync_does_not_publish_a_file_a_release_took() {
+    use std::time::Duration;
+
+    use fluree_db_core::ContentKind;
+    use fluree_db_nameservice::NameServiceError;
+    use fluree_db_query::bm25::Bm25SnapshotEntry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/release-race").await.unwrap();
+    let id = "t/release-race:main";
+    let ctx = json!({"ex": "http://example.org/"});
+    insert(
+        &fluree,
+        id,
+        json!({"@context": ctx, "@type": "ex:Person", "@id": "ex:alice", "ex:email": "zephyr"}),
+    )
+    .await;
+    fluree
+        .create_full_text_index(crate::Bm25CreateConfig::new(
+            "t-release-race",
+            id,
+            json!({
+                "@context": ctx,
+                "where": [{"@id": "?x", "@type": "ex:Person", "ex:email": "?email"}],
+                "select": {"?x": ["@id", "ex:email"]}
+            }),
+        ))
+        .await
+        .unwrap();
+    erase(&fluree, id, email("alice", "zephyr")).await;
+    let report = fluree
+        .run_purge_pass(id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(report.waiting, "{report:?}");
+
+    // A sync on the rebuilt head: its snapshot written, not yet published.
+    let source = "t-release-race:main";
+    let mut manifest = fluree.load_or_create_bm25_manifest(source).await.unwrap();
+    let written = fluree
+        .graph_source_store(source)
+        .unwrap()
+        .put(ContentKind::GraphSourceSnapshot, b"a sync's snapshot")
+        .await
+        .unwrap();
+    manifest.append(Bm25SnapshotEntry::new(i64::MAX, written));
+    let head = fluree
+        .nameservice()
+        .lookup_graph_source(source)
+        .await
+        .unwrap();
+
+    let report = fluree.run_purge_pass(id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    let refused = fluree.publish_bm25_manifest(source, &manifest, 2).await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::ApiError::NameService(NameServiceError::Conflict(_)))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fluree
+            .nameservice()
+            .lookup_graph_source(source)
+            .await
+            .unwrap(),
+        head
+    );
+}

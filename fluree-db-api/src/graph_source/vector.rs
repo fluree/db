@@ -454,6 +454,7 @@ impl crate::Fluree {
                 .into());
             }
         }
+        self.still_stored(graph_source_id, &[index_id]).await?;
         self.publisher()?
             .publish_graph_source_index(name, branch, index_id, index_t)
             .await?;
@@ -870,6 +871,7 @@ impl crate::Fluree {
         // from the ledger, so a purge's rebuild replaces one at the same `t`.
         if replace {
             let _heads = self.source_heads_lock().await;
+            self.still_stored(graph_source_id, &[&new_index_id]).await?;
             self.publisher()?
                 .publish_graph_source_index_allow_equal(&name, &branch, &new_index_id, ledger_t)
                 .await?;

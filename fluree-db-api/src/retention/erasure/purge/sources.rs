@@ -99,8 +99,12 @@ impl Fluree {
         Ok(leftovers)
     }
 
-    /// Delete what [`Self::source_leftovers`] names. Returns how many.
+    /// Delete what [`Self::source_leftovers`] names. Returns how many. Held
+    /// under the heads lock: a sync's files are leftovers until it
+    /// publishes, which, finding one gone, it does not (see
+    /// [`Self::still_stored`]).
     pub(super) async fn release_source_leftovers(&self, plan: &PurgePlan) -> Result<usize> {
+        let _heads = self.source_heads_lock().await;
         let runtime = self.erasure_runtime()?;
         let mut deleted = 0;
         for address in self.source_leftovers(plan).await? {
