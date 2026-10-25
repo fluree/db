@@ -340,7 +340,8 @@ measurements.
   `--gc-min-time-mins`). From Rust, a reindex whose `IndexerConfig` sets both to 0 releases it at
   once, at the cost of queries still reading it.
 - **Transaction documents are not redacted.** The stored transaction document of an affected commit
-  holds the original request, and audit retrieval serves it until the purge deletes it whole.
+  holds the original request, and audit retrieval serves it until the purge deletes it whole. No
+  transfer sends it: archives, packs and pushes leave it out, and an object request answers `404`.
 - **Some transfers refuse erased history.** The paginated commit export refuses a ledger whose
   history holds an erased commit, and so does an origin-based pull's object-by-object fallback, which
   walks only new commits. Archives, local or remote (`fluree export --remote --format ledger`), carry

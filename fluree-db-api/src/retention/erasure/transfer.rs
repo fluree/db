@@ -477,11 +477,13 @@ impl Fluree {
         authority: crate::PushAuthority,
     ) -> Result<HashSet<ContentId>> {
         let positions = erased_positions(request)?;
+        // A section without removals or rules carries nothing to merge.
         let journal = request
             .retention
             .take()
             .map(|section| crate::retention::registry::ArchivedRetention::parse(&section))
-            .transpose()?;
+            .transpose()?
+            .filter(|section| !section.journal.is_empty());
         let erasing = !request.erasure_frames.is_empty() || !positions.is_empty();
         if !erasing && request.base_erasures.is_empty() && journal.is_none() {
             return Ok(HashSet::new());
