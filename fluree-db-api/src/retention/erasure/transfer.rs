@@ -1939,8 +1939,15 @@ fn add_jobs(registration: &mut registry::Registration, jobs: &[super::ErasureJob
             changed = true;
             continue;
         };
-        // Still being proved here, or refused: its own publication covers it.
-        if held.pending() || held.stage == super::ErasureStage::Failed || !merge_job(held, job) {
+        // Unless published here: still being proved, refused (its own
+        // publication covers it), or in a later release's stage.
+        let published = matches!(
+            held.stage,
+            super::ErasureStage::Published
+                | super::ErasureStage::Purging
+                | super::ErasureStage::Purged
+        );
+        if !published || !merge_job(held, job) {
             continue;
         }
         let deleted = held.purge.as_ref().map_or(0, |p| p.deleted);
@@ -2151,6 +2158,40 @@ mod activation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A received erasure grows only a job published here: one in a later
+    /// release's stage is left as it is.
+    #[test]
+    fn received_erasures_leave_a_job_in_a_later_release_stage_alone() {
+        let job = |stage: &str, commits: &[&str]| -> super::super::ErasureJob {
+            let commits: Vec<_> = commits
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "commit": c, "t": 1, "slots": [0],
+                        "ledgerId": "l:main", "branches": ["l:main"],
+                    })
+                })
+                .collect();
+            serde_json::from_value(serde_json::json!({
+                "requestId": "erasure-1", "acceptedMs": 1, "authorizedT": 1,
+                "stage": stage, "commits": commits,
+            }))
+            .unwrap()
+        };
+        let received = [job("published", &["a", "b"])];
+        for (stage, grows) in [("published", true), ("queued", false)] {
+            let mut registration = registry::Registration {
+                erasures: vec![job(stage, &["a"])],
+                ..Default::default()
+            };
+            assert_eq!(add_jobs(&mut registration, &received), grows, "{stage}");
+            let held = &registration.erasures[0];
+            assert_eq!(held.commits.len(), if grows { 2 } else { 1 }, "{stage}");
+            let after = if grows { "published" } else { stage };
+            assert_eq!(serde_json::to_value(&held.stage).unwrap(), after);
+        }
+    }
 
     fn step(id: &str) -> ErasureStep {
         ErasureStep {

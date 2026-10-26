@@ -591,14 +591,13 @@ fn signing_ledger(
 const KEEP_FINISHED: usize = 100;
 
 fn keep_recent_finished(jobs: &mut Vec<ErasureJob>) {
-    let finished = |j: &ErasureJob| !j.pending() && !j.purge_pending();
     let mut drop = jobs
         .iter()
-        .filter(|j| finished(j))
+        .filter(|j| j.finished())
         .count()
         .saturating_sub(KEEP_FINISHED);
     jobs.retain(|j| {
-        if drop > 0 && finished(j) {
+        if drop > 0 && j.finished() {
             drop -= 1;
             false
         } else {
@@ -635,7 +634,7 @@ fn receipt_of(
         manifest,
         commits: job.commits.len(),
         authorized_t: job.authorized_t,
-        stage: job.stage,
+        stage: job.stage.clone(),
         removals,
     }
 }
@@ -689,10 +688,13 @@ mod tests {
         jobs.insert(3, job(9_999, ErasureStage::Proving));
         // Published, not yet purged: still to do.
         jobs.insert(5, job(9_998, ErasureStage::Published));
+        // A later release's stage: never taken for finished.
+        jobs.insert(1, job(9_997, ErasureStage::Other("queued".into())));
         keep_recent_finished(&mut jobs);
-        assert_eq!(jobs.len(), KEEP_FINISHED + 2);
+        assert_eq!(jobs.len(), KEEP_FINISHED + 3);
         assert!(jobs.iter().any(|j| j.request_id == "erasure-9999"));
         assert!(jobs.iter().any(|j| j.request_id == "erasure-9998"));
+        assert!(jobs.iter().any(|j| j.request_id == "erasure-9997"));
         assert!(
             jobs.iter().all(|j| j.request_id != "erasure-0"),
             "oldest dropped"
@@ -700,5 +702,39 @@ mod tests {
         assert!(jobs
             .iter()
             .any(|j| j.request_id == format!("erasure-{}", KEEP_FINISHED + 9)));
+    }
+
+    /// A job in a later release's stage reads, is not acted on, and writes
+    /// back as written; this release's stages are written as they always
+    /// were.
+    #[test]
+    fn a_job_in_a_later_release_stage_is_kept_as_written() {
+        let registration = registry::Registration {
+            erasures: vec![job(1, ErasureStage::Proving)],
+            ..Default::default()
+        };
+        let mut written = serde_json::to_value(&registration).unwrap();
+        written["erasures"][0]["stage"] = "queued".into();
+
+        let read: registry::Registration = serde_json::from_value(written.clone()).unwrap();
+        let held = &read.erasures[0];
+        assert_eq!(held.stage, ErasureStage::Other("queued".into()));
+        assert!(!held.pending() && !held.purge_pending() && !held.finished());
+        assert_eq!(serde_json::to_value(&read).unwrap(), written);
+
+        for (stage, name) in [
+            (ErasureStage::Proving, "proving"),
+            (ErasureStage::Indexing, "indexing"),
+            (ErasureStage::Published, "published"),
+            (ErasureStage::Purging, "purging"),
+            (ErasureStage::Purged, "purged"),
+            (ErasureStage::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(&stage).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<ErasureStage>(name.into()).unwrap(),
+                stage
+            );
+        }
     }
 }

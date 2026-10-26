@@ -179,9 +179,9 @@ impl Fluree {
                 None => ErasureStage::Indexing,
             };
             if job.stage != stage {
-                job.stage = stage;
+                job.stage = stage.clone();
                 let _ = self
-                    .update_job(&branch, &job.request_id, |j| j.stage = stage)
+                    .update_job(&branch, &job.request_id, |j| j.stage = stage.clone())
                     .await;
             }
             match next {

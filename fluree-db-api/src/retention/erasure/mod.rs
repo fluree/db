@@ -159,8 +159,7 @@ impl From<SignatureMode> for fluree_db_erasure::Signatures {
 }
 
 /// Where an erasure request stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ErasureStage {
     /// Commits are being proved.
     Proving,
@@ -176,6 +175,49 @@ pub enum ErasureStage {
     Purged,
     /// A commit cannot be proved (the prover refused it); nothing published.
     Failed,
+    /// A stage of a later release, kept as written: this release leaves its
+    /// job alone.
+    Other(String),
+}
+
+impl ErasureStage {
+    fn as_str(&self) -> &str {
+        match self {
+            ErasureStage::Proving => "proving",
+            ErasureStage::Indexing => "indexing",
+            ErasureStage::Published => "published",
+            ErasureStage::Purging => "purging",
+            ErasureStage::Purged => "purged",
+            ErasureStage::Failed => "failed",
+            ErasureStage::Other(stage) => stage,
+        }
+    }
+}
+
+impl Serialize for ErasureStage {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ErasureStage {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let stage = String::deserialize(deserializer)?;
+        Ok(match stage.as_str() {
+            "proving" => ErasureStage::Proving,
+            "indexing" => ErasureStage::Indexing,
+            "published" => ErasureStage::Published,
+            "purging" => ErasureStage::Purging,
+            "purged" => ErasureStage::Purged,
+            "failed" => ErasureStage::Failed,
+            _ => ErasureStage::Other(stage),
+        })
+    }
 }
 
 /// One affected commit of a request.
@@ -264,6 +306,11 @@ impl ErasureJob {
     /// Published, with its storage still to be purged.
     pub fn purge_pending(&self) -> bool {
         matches!(self.stage, ErasureStage::Published | ErasureStage::Purging)
+    }
+
+    /// Purged or refused: nothing left to do.
+    pub fn finished(&self) -> bool {
+        matches!(self.stage, ErasureStage::Purged | ErasureStage::Failed)
     }
 }
 

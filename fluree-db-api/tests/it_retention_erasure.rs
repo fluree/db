@@ -762,7 +762,7 @@ async fn an_overlapping_request_completes_with_the_one_ahead_of_it() {
         .await
         .expect("erase");
     assert_eq!(
-        (second.stage, second.commits),
+        (second.stage.clone(), second.commits),
         (ErasureStage::Proving, 2),
         "{second:?}"
     );
@@ -822,7 +822,13 @@ async fn an_overlapping_request_proves_what_a_failed_one_does_not() {
     );
     let status = fluree.retention_status(&id).await.unwrap();
     let jobs = status.registration.unwrap().erasures;
-    let stage = |id: &str| jobs.iter().find(|j| j.request_id == id).unwrap().stage;
+    let stage = |id: &str| {
+        jobs.iter()
+            .find(|j| j.request_id == id)
+            .unwrap()
+            .stage
+            .clone()
+    };
     assert_eq!(stage(&first.request_id), ErasureStage::Failed);
     assert_eq!(stage(&second.request_id), ErasureStage::Published);
     let raw = store_of(&fluree, &id)
@@ -960,7 +966,13 @@ async fn erasures_survive_a_drop_and_restore() {
         .unwrap();
     let status = fluree.retention_status(&id).await.unwrap();
     let jobs = status.registration.expect("registration").erasures;
-    let stage = |request: &str| jobs.iter().find(|j| j.request_id == request).unwrap().stage;
+    let stage = |request: &str| {
+        jobs.iter()
+            .find(|j| j.request_id == request)
+            .unwrap()
+            .stage
+            .clone()
+    };
     assert_eq!(stage(&first.request_id), ErasureStage::Published);
     assert!(jobs
         .iter()
@@ -1038,7 +1050,7 @@ async fn the_worker_resumes_a_restored_ledgers_erasure() {
     for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let status = fluree.retention_status(&id).await.unwrap();
-        stage = status.registration.unwrap().erasures[0].stage;
+        stage = status.registration.unwrap().erasures[0].stage.clone();
         // The worker goes on to purge it.
         if stage != ErasureStage::Proving && stage != ErasureStage::Indexing {
             break;
@@ -2491,7 +2503,7 @@ async fn the_worker_purges_a_published_erasure() {
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let status = fluree.retention_status(&id).await.unwrap();
-        stage = status.registration.unwrap().erasures[0].stage;
+        stage = status.registration.unwrap().erasures[0].stage.clone();
         if stage == ErasureStage::Purged {
             break;
         }
