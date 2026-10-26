@@ -769,6 +769,7 @@ impl ApiError {
             // lane read it. Nothing in the request is wrong, and it is not
             // capacity pressure, so not a 503.
             ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => 500,
+            ApiError::Transact(TE::SameTPair { .. }) => 500,
             ApiError::Transact(_) => 400,
 
             ApiError::Indexer(e) => {

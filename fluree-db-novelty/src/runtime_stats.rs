@@ -982,10 +982,10 @@ fn stamp_merge(site: &'static str, outcome: &'static str, scans: usize, duplicat
 ///
 /// It deliberately does **not** assume kept flakes alternate assert/retract.
 /// Novelty's set semantics are one-sided — `Novelty::apply_commit` suppresses
-/// redundant *asserts* only — and a same-`t` assert/retract pair reaches this
-/// fold retract-first because POST sorts `op` ascending, so runs like
-/// `(retract, assert, assert)` and `(retract, retract)` are both reachable.
-/// See `delta_in_graph`.
+/// redundant *asserts* only — and a same-`t` assert/retract pair (which
+/// commits written before the staging fix hold) can land in novelty, so runs
+/// like `(retract, retract)` and `(retract, assert, retract, assert)` are
+/// reachable. See `delta_in_graph`.
 ///
 /// Any consumer that folds novelty into indexed counts by hand — the stats
 /// assemblers here, `apoc.meta.data`'s per-`(class, property)` rollup — should
@@ -1063,17 +1063,15 @@ impl<'a> NoveltyDeltaResolver<'a> {
     /// however many flakes the window holds.
     ///
     /// Resolution is the same rule [`crate::Novelty`]'s `fact_state::record`
-    /// applies — the highest `t` wins, and at equal `t` a retract beats an
-    /// assert — so the fold cannot disagree with what a read would see. It
+    /// applies ([`fluree_db_core::same_t::supersedes`]: the highest `t` wins,
+    /// and at equal `t` the assert holds), so the fold cannot disagree with
+    /// what a read would see, whatever order a run's flakes arrive in. It
     /// deliberately does **not** assume kept flakes alternate assert/retract.
-    /// They do not: `Novelty::apply_commit`'s dedup gate short-circuits on
-    /// `flake.op &&`, so it suppresses redundant *asserts* only and never
-    /// examines a retraction. And because POST sorts `op` ascending at equal
-    /// `t`, a same-`t` pair reaches this fold retract-first — the assert
-    /// arrives last despite having lost. `bulk_apply_commits` replays raw
-    /// persisted flakes on cold load, which is why the crate keeps
-    /// `same_t_assert_retract_keeps_later_reassert` around to pin that state as
-    /// legal.
+    /// They do not: `Novelty::apply_commit`'s dedup gate suppresses redundant
+    /// *asserts* only and never examines a retraction, and `bulk_apply_commits`
+    /// replays raw persisted flakes on cold load, which can hold a same-`t`
+    /// pair (`same_t_assert_retract_holds_the_assertion` in lib.rs pins that
+    /// state as legal).
     ///
     /// POST order puts `m` last, so flakes sharing `(p, o, dt, s)` are
     /// contiguous while distinct `m`s (language tags, list positions) interleave
@@ -1136,12 +1134,10 @@ impl<'a> NoveltyDeltaResolver<'a> {
             self.seen.clear();
         }
         if let Some((_, cur_t, cur_op)) = self.seen.iter_mut().find(|(m, _, _)| *m == flake.m) {
-            // Lifecycle resolution, verbatim from `NoveltyFactState::record`.
+            // Lifecycle resolution, as `NoveltyFactState::record` applies it.
             // A flake that does not win changes no presence and charges zero —
-            // that covers the same-`t` assert arriving behind its winning
-            // retract, and a redundant retract repeated at a later `t`.
-            let wins = flake.t > *cur_t || (flake.t == *cur_t && *cur_op && !flake.op);
-            if !wins {
+            // that covers a redundant retract repeated at a later `t`.
+            if !fluree_db_core::same_t::supersedes((flake.t, flake.op), (*cur_t, *cur_op)) {
                 return 0;
             }
             let delta = i64::from(flake.op) - i64::from(*cur_op);
@@ -2453,11 +2449,9 @@ mod tests {
         let p = sid(10, "name");
         // `bulk_apply_commits` (cold load) replays raw persisted flakes, so an
         // assert+retract of one identity at the SAME `t` can both land — see
-        // `same_t_assert_retract_keeps_later_reassert` in lib.rs, which builds
-        // exactly this on purpose. `fact_state` resolves it retract-wins, so a
-        // later re-assert is kept; but `cmp_post` sorts `op` ASCENDING at equal
-        // `t`, so the losing assert arrives AFTER the winning retract and the
-        // walk sees (retract@1, assert@1, assert@2) — two consecutive asserts.
+        // `same_t_assert_retract_holds_the_assertion` in lib.rs. The pair holds
+        // the assertion, so the later re-assert is a no-op `apply_commit`
+        // dedups, and the walk sees (retract@1, assert@1).
         let (deltas, _) = deltas_over(
             Vec::new(),
             vec![
@@ -2478,12 +2472,11 @@ mod tests {
         let s = sid(10, "alice");
         let p = sid(10, "name");
         // Two same-`t` assert/retract pairs back to back. The first pair leaves
-        // the fact ABSENT (retract wins), so the second pair's assert passes
-        // `apply_commit`'s dedup gate and both of its ops land. The walk sees
-        // (retract@1, assert@1, retract@2, assert@2) — the second retract
-        // repeats the first's op, so a fold that only compared against the
-        // previous op would swallow it and then credit the trailing assert.
-        // Resolving presence the way `fact_state::record` does gets it right.
+        // the fact present (the assert holds); the second pair's assert is
+        // kept because its own commit retracts it, so both of its ops land.
+        // The walk sees (retract@1, assert@1, retract@2, assert@2). Resolving
+        // presence the way `fact_state::record` does charges each flake its
+        // change in presence, and the fact ends present.
         let (deltas, _) = deltas_over(
             Vec::new(),
             vec![
@@ -2495,8 +2488,8 @@ mod tests {
         );
         assert_eq!(
             deltas.iter().sum::<i64>(),
-            0,
-            "retract wins at t=2, so the fact is absent and was never in base: {deltas:?}"
+            1,
+            "the assert holds at t=2, so the fact is present and was never in base: {deltas:?}"
         );
     }
 

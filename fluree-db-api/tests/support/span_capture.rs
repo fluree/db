@@ -14,10 +14,13 @@
 //! assert_eq!(span.level, tracing::Level::DEBUG);
 //! ```
 //!
-//! Uses `tracing::subscriber::set_default()` (not `set_global_default`) for test
-//! isolation — each test gets its own subscriber via the returned `DefaultGuard`.
-//! Tests MUST use `#[tokio::test(flavor = "current_thread")]` so all async work
-//! runs on the thread where the subscriber is installed.
+//! Installs the subscriber as this thread's default (not the global default)
+//! for test isolation; each test gets its own via the returned `DefaultGuard`.
+//! It goes through `fluree_test_support::scoped_default`, so the capture sees
+//! every event this thread emits even with sibling tests running in the same
+//! process. Tests MUST use `#[tokio::test(flavor = "current_thread")]` so all
+//! async work runs on the thread where the subscriber is installed; events
+//! emitted on other threads (a rayon pool, say) are not captured.
 
 // Kept for: test utilities — not all methods are used in every test file.
 // Use when: writing new tracing acceptance tests in it_tracing_spans.rs.
@@ -324,21 +327,8 @@ pub fn init_test_tracing() -> (SpanStore, tracing::subscriber::DefaultGuard) {
     let store = SpanStore::new();
     let layer = SpanCaptureLayer::new(store.clone());
     let subscriber = tracing_subscriber::Registry::default().with(layer);
-    keep_interest_from_every_subscriber();
-    let guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
+    let guard = fluree_test_support::scoped_default(subscriber);
     (store, guard)
-}
-
-/// With one dispatcher registered, `tracing` computes a callsite's interest
-/// from the default subscriber of whichever thread first reaches it. A test
-/// thread with no subscriber then caches "never" for a callsite this test
-/// listens on, and the test's events are dropped. A second dispatcher, kept
-/// for the process, makes interest come from every live subscriber; the
-/// rebuild fixes callsites cached before this subscriber existed.
-fn keep_interest_from_every_subscriber() {
-    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }
 
 /// Initialize test tracing that captures only INFO+ spans.
@@ -352,6 +342,6 @@ pub fn init_info_only_tracing() -> (SpanStore, tracing::subscriber::DefaultGuard
     let layer = SpanCaptureLayer::new(store.clone());
     let filter = tracing_subscriber::filter::LevelFilter::INFO;
     let subscriber = tracing_subscriber::Registry::default().with(layer.with_filter(filter));
-    let guard = tracing::subscriber::set_default(subscriber);
+    let guard = fluree_test_support::scoped_default(subscriber);
     (store, guard)
 }

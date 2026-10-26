@@ -72,6 +72,15 @@ Results are merged and deduplicated.
 
 ## Part 2: S2 Spatial Index
 
+> **Status.** The build side is implemented for incremental index builds only: they write the S2 cell index per graph and predicate. The query side described under [Query Pipeline](#query-pipeline) is not reachable yet:
+>
+> - No query surface (JSON-LD, SPARQL, Cypher) constructs an S2 search.
+> - `BinaryIndexStore::spatial_provider_map` keys providers `"{g_id}:{p_id}"`, while the S2 search operator looks them up by `"g{g_id}:{predicate_iri}"`.
+> - Nothing feeds novelty geometries to the provider.
+> - A full rebuild doesn't write the spatial index.
+>
+> See [Geospatial](../indexing-and-search/geospatial.md#s2-spatial-index-complex-geometries).
+
 ### Why S2?
 
 The S2 cell system provides several properties ideal for spatial indexing:
@@ -263,7 +272,7 @@ cargo bench -p fluree-db-spatial
 - Allows graph-specific index configuration
 - Fallback to default graph (g_id=0) for convenience
 
-**Implementation**: Each named graph has a numeric `g_id` (0 for default, 1+ for named graphs). The `GraphRef` struct carries this `g_id`, and `GraphOperator` updates `ctx.binary_g_id` when entering a GRAPH pattern. The S2 search operator uses `ctx.binary_g_id` together with the predicate IRI to construct the provider map key (format: `"g{g_id}:{predicate_iri}"`).
+**Implementation**: Each named graph has a numeric `g_id` (0 for default, 1+ for named graphs). The `GraphRef` struct carries this `g_id`, and `GraphOperator` updates `ctx.binary_g_id` when entering a GRAPH pattern. The S2 search operator uses `ctx.binary_g_id` together with the predicate IRI to construct the provider map key (format: `"g{g_id}:{predicate_iri}"`); the provider map is built with `"{g_id}:{p_id}"` keys, so the two don't agree yet (see the status note under Part 2).
 
 **Cross-Ledger Datasets**: The `g_id` is only meaningful relative to the active `binary_store`. Each ledger has its own binary index with its own g_id namespace. In cross-ledger datasets, switching to a different ledger's graph also requires switching the `binary_store` context.
 
