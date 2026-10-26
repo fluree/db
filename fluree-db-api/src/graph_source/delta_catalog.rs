@@ -141,8 +141,18 @@ pub struct GenerateDeltaR2rmlResponse {
     pub tables: Vec<String>,
 }
 
-fn config_error(e: DeltaError) -> crate::ApiError {
-    crate::ApiError::Config(e.to_string())
+/// An onboarding failure: an identity refusal of the catalog's keeps its type
+/// and code, anything else is the caller's configuration.
+pub(crate) fn config_error(e: DeltaError) -> crate::ApiError {
+    match e {
+        DeltaError::Identity(refusal) => {
+            match crate::graph_source::iceberg_catalog::identity_query_error(refusal) {
+                Ok(typed) => crate::ApiError::Query(typed),
+                Err(other) => crate::ApiError::Config(other.to_string()),
+            }
+        }
+        other => crate::ApiError::Config(other.to_string()),
+    }
 }
 
 /// `catalog.schema.table` as the emitter's namespace and name.

@@ -1724,6 +1724,29 @@ mod tests {
         }
     }
 
+    /// Nobody writes `vended_credentials` beside `storage_auth`: the
+    /// constructor sets it to agree, so only hand-written contradictory JSON
+    /// meets the both-directions check below.
+    #[test]
+    fn with_storage_auth_sets_vended_credentials_to_agree() {
+        let google = StorageAuth::Google {
+            credentials: GoogleCredentials::Metadata,
+            quota_project: None,
+        };
+        for (start, storage) in [
+            (false, StorageAuth::Vended),
+            (true, StorageAuth::Ambient),
+            (true, StorageAuth::Catalog),
+            (true, google),
+        ] {
+            let vended = matches!(storage, StorageAuth::Vended);
+            let mut config = with_storage(rest_with(google_metadata()), start, None);
+            config.io = config.io.with_storage_auth(storage);
+            assert_eq!(config.io.vended_credentials, vended);
+            config.validate().unwrap();
+        }
+    }
+
     #[test]
     fn storage_auth_and_vended_credentials_may_not_contradict() {
         for (vended_credentials, storage) in [

@@ -320,7 +320,7 @@ impl Inner {
             self.auth
                 .request_headers()
                 .await
-                .map_err(|e| SqlError::Auth(e.to_string()))?,
+                .map_err(SqlError::from_auth)?,
         );
         Ok(headers)
     }

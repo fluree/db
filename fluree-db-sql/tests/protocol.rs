@@ -327,3 +327,36 @@ async fn every_auth_header_reaches_the_statement_endpoint() {
     let (_, b) = c.execute_collect("SELECT 1").await.unwrap();
     assert_eq!(b[0].column(0).unwrap().get_i32(0), Some(1));
 }
+
+/// An identity refusal from the endpoint's auth provider stays typed, so the
+/// API reports it with the same code as an Iceberg source.
+#[tokio::test]
+async fn an_identity_refusal_from_the_auth_provider_stays_typed() {
+    #[derive(Debug)]
+    struct Refused;
+    #[async_trait::async_trait]
+    impl SendCatalogAuth for Refused {
+        async fn request_headers(&self) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+            Err(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Sts,
+                status: Some(403),
+                reason: Some("PERMISSION_DENIED".to_string()),
+            })
+        }
+        async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    let c = TrinoClient::new(&SqlGsConfig::new(server.uri()), Arc::new(Refused)).unwrap();
+    match c.execute_collect("SELECT 1").await {
+        Err(fluree_db_sql::SqlError::Identity(
+            fluree_db_iceberg::IcebergError::GoogleTokenExchange { status, .. },
+        )) => assert_eq!(status, Some(403)),
+        other => panic!("expected a typed identity refusal, got {other:?}"),
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "nothing is sent without the provider's headers"
+    );
+}

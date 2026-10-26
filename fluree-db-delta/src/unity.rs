@@ -189,10 +189,13 @@ impl UnityClient {
         http: reqwest::Client,
         identity: &IdentityContext,
     ) -> Result<Self> {
-        let auth = config
-            .auth
-            .create_provider_arc(identity)
-            .map_err(|e| DeltaError::Config(format!("Unity Catalog auth: {e}")))?;
+        let auth = config.auth.create_provider_arc(identity).map_err(|e| {
+            if e.is_identity_refusal() {
+                DeltaError::Identity(e)
+            } else {
+                DeltaError::Config(format!("Unity Catalog auth: {e}"))
+            }
+        })?;
         Ok(Self {
             base: config.uri.trim_end_matches('/').to_string(),
             auth,
@@ -434,28 +437,29 @@ impl UnityClient {
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let failed = |message: String| about.failed(message);
+        // The catalog identity's own refusals stay typed; other auth failures
+        // are this request failing.
+        let auth_failed = |e: fluree_db_iceberg::IcebergError| {
+            if e.is_identity_refusal() {
+                DeltaError::Identity(e)
+            } else {
+                failed(format!("catalog auth: {e}"))
+            }
+        };
         let url = format!("{}{path}", self.base);
         for retried in [false, true] {
             let mut request = match body {
                 Some(body) => self.http.post(&url).json(body),
                 None => self.http.get(&url),
             };
-            request = request.headers(
-                self.auth
-                    .request_headers()
-                    .await
-                    .map_err(|e| failed(format!("catalog auth: {e}")))?,
-            );
+            request = request.headers(self.auth.request_headers().await.map_err(auth_failed)?);
             let response = request
                 .send()
                 .await
                 .map_err(|e| failed(format!("request failed: {e}")))?;
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED && !retried {
-                self.auth
-                    .refresh()
-                    .await
-                    .map_err(|e| failed(format!("catalog auth: {e}")))?;
+                self.auth.refresh().await.map_err(auth_failed)?;
                 continue;
             }
             let text = response
@@ -778,6 +782,63 @@ mod tests {
         let table = client(&server).table("main.sales.orders").await.unwrap();
         assert_eq!(table.id, "t-1");
         assert_eq!(table.location, "s3://bucket/tables/t-1");
+    }
+
+    /// The catalog identity's own refusals stay typed (`DeltaError::Identity`),
+    /// whether building its auth provider or minting a token for a request,
+    /// so the API reports them with the codes an Iceberg source would.
+    #[tokio::test]
+    async fn an_identity_refusal_from_unitys_auth_stays_typed() {
+        let google = UnityConfig {
+            uri: "https://workspace.invalid".to_string(),
+            auth: AuthConfig::GoogleMetadata {
+                scopes: None,
+                metadata_url: None,
+            },
+            catalog: None,
+            schema: None,
+        };
+        let closed = IdentityContext {
+            policy: fluree_db_iceberg::HostIdentityPolicy::deny_all(),
+            ..IdentityContext::default()
+        };
+        match UnityClient::new(&google, &closed) {
+            Err(DeltaError::Identity(fluree_db_iceberg::IcebergError::HostIdentityRefused {
+                ..
+            })) => {}
+            other => panic!("expected a typed refusal, got {:?}", other.err()),
+        }
+
+        #[derive(Debug)]
+        struct Refused;
+        #[async_trait]
+        impl SendCatalogAuth for Refused {
+            async fn request_headers(
+                &self,
+            ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+                Err(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                    stage: fluree_db_iceberg::GoogleTokenStage::Sts,
+                    status: Some(400),
+                    reason: Some("invalid_grant".to_string()),
+                })
+            }
+            async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+                Ok(())
+            }
+        }
+        let server = MockServer::start().await;
+        let unity = UnityClient {
+            base: server.uri(),
+            auth: Arc::new(Refused),
+            http: reqwest::Client::new(),
+        };
+        match unity.table("main.sales.orders").await {
+            Err(DeltaError::Identity(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                reason,
+                ..
+            })) => assert_eq!(reason.as_deref(), Some("invalid_grant")),
+            other => panic!("expected a typed refusal, got {:?}", other.err()),
+        }
     }
 
     /// Every header the catalog auth provider sends reaches Unity, not just

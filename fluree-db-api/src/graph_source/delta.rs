@@ -854,6 +854,14 @@ fn delta_query_error(graph_source_id: &str, table_name: &str, error: DeltaError)
                 message,
             ),
         },
+        // The catalog identity's own refusals: the codes an Iceberg source
+        // reports for them.
+        DeltaError::Identity(refusal) => {
+            let fallback =
+                format!("Delta graph source '{graph_source_id}', table '{table_name}': {refusal}");
+            crate::graph_source::iceberg_catalog::identity_query_error(refusal)
+                .unwrap_or(QueryError::Internal(fallback))
+        }
         other => QueryError::Internal(format!(
             "Delta graph source '{graph_source_id}', table '{table_name}': {other}"
         )),
@@ -877,6 +885,94 @@ pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Opti
 mod tests {
     use super::*;
     use fluree_db_delta::AzureAuth;
+
+    fn google_unity() -> UnityConfig {
+        UnityConfig {
+            uri: "https://workspace.invalid".to_string(),
+            auth: fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+                scopes: None,
+                metadata_url: None,
+            },
+            catalog: None,
+            schema: None,
+        }
+    }
+
+    fn denying() -> crate::Fluree {
+        crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(fluree_db_iceberg::HostIdentityPolicy::deny_all())
+    }
+
+    /// The catalog identity's refusal is typed on the query path (opening a
+    /// Unity-placed table, the step a query's first touch takes) and through
+    /// the onboarding mapping, with the codes an Iceberg source reports.
+    #[tokio::test]
+    async fn a_refused_unity_identity_is_typed_on_query_and_onboarding_paths() {
+        let fluree = denying();
+        let config = DeltaGsConfig {
+            unity: Some(google_unity()),
+            ..Default::default()
+        };
+        let opened = fluree
+            .r2rml_cache()
+            .delta_table(
+                "orders",
+                &Placement::Unity("main.sales.orders".to_string()),
+                &config,
+                fluree.identity_context(),
+            )
+            .await;
+        let error = match opened {
+            Ok(_) => panic!("the policy refuses the metadata server"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, DeltaError::Identity(_)), "{error:?}");
+        let query = delta_query_error("gs:main", "orders", error);
+        assert!(
+            matches!(&query, QueryError::HostIdentityRefused { kind, .. } if kind == "google-metadata"),
+            "{query:?}"
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 403);
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+
+        // Onboarding validates a Unity config before building its auth (and
+        // accepts only bearer / OAuth2 there today), so the mapping is checked
+        // directly: a refusal reaching it keeps its type and code.
+        let onboarding = super::super::delta_catalog::config_error(DeltaError::Identity(
+            fluree_db_iceberg::IcebergError::HostIdentityRefused {
+                kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+            },
+        ));
+        assert_eq!(onboarding.status_code(), 403, "{onboarding:?}");
+        assert_eq!(
+            onboarding.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+    }
+
+    #[test]
+    fn a_google_exchange_refusal_from_unity_keeps_its_code() {
+        let query = delta_query_error(
+            "gs:main",
+            "orders",
+            DeltaError::Identity(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Jwt,
+                status: Some(400),
+                reason: Some("invalid_grant".to_string()),
+            }),
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 401, "{api:?}");
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::GOOGLE_TOKEN_EXCHANGE
+        );
+    }
 
     /// A catalog's 401/403 reaches the client as a typed 403, not as an
     /// invalid query; any other catalog failure keeps its old mapping.

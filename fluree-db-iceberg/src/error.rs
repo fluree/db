@@ -3,7 +3,11 @@
 use thiserror::Error;
 
 /// Errors from Iceberg operations.
-#[derive(Debug, Error)]
+///
+/// `Clone` so a typed refusal can be recovered intact from an error chain
+/// that only lends it out by reference (an object store's credential
+/// provider, for one).
+#[derive(Debug, Clone, Error)]
 pub enum IcebergError {
     /// Configuration error
     #[error("Configuration error: {0}")]
@@ -169,6 +173,21 @@ pub enum IcebergError {
 }
 
 impl IcebergError {
+    /// Whether this is one of the graph-source identity refusals — a Google
+    /// token exchange refused, invalid Google credentials, a host identity the
+    /// policy refuses, a catalog that needs a quota project — that every
+    /// surface (Iceberg, SQL, Delta) carries typed to its own wire code rather
+    /// than flattening into a message.
+    pub fn is_identity_refusal(&self) -> bool {
+        matches!(
+            self,
+            IcebergError::GoogleTokenExchange { .. }
+                | IcebergError::GoogleCredentialsInvalid(_)
+                | IcebergError::HostIdentityRefused { .. }
+                | IcebergError::CatalogQuotaProjectRequired { .. }
+        )
+    }
+
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Config(msg.into())
     }

@@ -277,6 +277,10 @@ impl GoogleIdentity {
                     material: Material::ApplicationDefault { path },
                     source: GoogleSource::ApplicationDefault,
                     principal,
+                    // The ADC file is one host-global, policy-gated identity, so
+                    // there is no tenant to bind against here; its token is bound
+                    // per use instead, to the secrets the file holds then
+                    // (`read_adc`), so a changed file never serves an old token.
                     binding: None,
                     subject: "-".to_string(),
                 }
