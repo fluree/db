@@ -638,7 +638,7 @@ async fn lane_a_cypher_over_the_union_default_graph() {
             match got {
                 Ok(rows) if *rows == want => {}
                 Ok(rows) => {
-                    failures.push(format!("{}: {lane}: {rows:?}, want {want:?}", run.label))
+                    failures.push(format!("{}: {lane}: {rows:?}, want {want:?}", run.label));
                 }
                 Err(e) => failures.push(format!("{}: {lane}: failed: {e}", run.label)),
             }
