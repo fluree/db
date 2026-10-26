@@ -10,8 +10,8 @@ use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    branch_or_none, object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan,
-    ProbeOps, RowFate,
+    branch_or_none, object_probe_lane_plan, overlay_holds_ops, p_id_or_none,
+    subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps, RowFate,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -1970,10 +1970,13 @@ impl NestedLoopJoinOperator {
 
     /// Phase 1: Resolve the batched predicate SID to a binary-index p_id.
     ///
-    /// Returns `None` if the predicate is not in the binary index (no results possible).
-    fn resolve_batched_predicate(&self, store: &BinaryIndexStore) -> Option<u32> {
+    /// Returns `None` if the predicate is not in the binary index (no results
+    /// possible), and refuses when the lane merges its novelty
+    /// ([`p_id_or_none`]).
+    fn resolve_batched_predicate(&self, store: &BinaryIndexStore) -> Result<Option<u32>> {
         let pred_sid = self.batched_predicate.as_ref().unwrap();
-        store.sid_to_p_id(pred_sid)
+        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        p_id_or_none(store, pred_sid, || Ok(merging))
     }
 
     /// Phase 2: Group accumulator entries by subject ID.
@@ -2448,7 +2451,7 @@ impl NestedLoopJoinOperator {
         let dict_overlay = make_dict_overlay(ctx, &store);
 
         // Phase 1: Resolve predicate
-        let p_id = match self.resolve_batched_predicate(&store) {
+        let p_id = match self.resolve_batched_predicate(&store)? {
             Some(id) => id,
             None => {
                 self.clear_batched_state();
@@ -2687,7 +2690,7 @@ impl NestedLoopJoinOperator {
         let store = ctx.binary_store.as_ref().unwrap().clone();
 
         // Resolve predicate
-        let p_id = match self.resolve_batched_predicate(&store) {
+        let p_id = match self.resolve_batched_predicate(&store)? {
             Some(id) => id,
             None => {
                 self.clear_batched_state();
@@ -3307,13 +3310,9 @@ fn batched_subject_probe_binary_uncharged(
         return Ok(Vec::new());
     }
 
-    let Some(p_id) = store.sid_to_p_id(params.pred_sid) else {
-        // Empty only when no overlay merge is in play — the lane plan
-        // declines novelty-only predicates before reaching here.
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline novelty-only predicates"
-        );
+    // The probe's ops are this predicate's, so a merge holds some of them.
+    let merging = probe_ops.is_some();
+    let Some(p_id) = p_id_or_none(store, params.pred_sid, || Ok(merging))? else {
         return Ok(Vec::new());
     };
     let Some(branch) = branch_or_none(
@@ -3590,19 +3589,22 @@ fn batched_subject_star_spot_uncharged(
         return Ok(Vec::new());
     }
 
+    // The probe's ops merge every predicate's, so whether one the index
+    // doesn't hold has any is asked of that predicate alone: without ops it
+    // simply reads nothing.
+    let merging = probe_ops.is_some();
     let mut predicates_by_id: FxHashMap<u32, &SpotStarPredicateParams<'_>> =
         FxHashMap::with_capacity_and_hasher(predicates.len(), FxBuildHasher);
     for predicate in predicates {
-        let Some(p_id) = store.sid_to_p_id(&predicate.pred_sid) else {
+        let Some(p_id) = p_id_or_none(store, &predicate.pred_sid, || {
+            Ok(merging && overlay_holds_ops(ctx, store, &predicate.pred_sid)?)
+        })?
+        else {
             continue;
         };
         predicates_by_id.insert(p_id, predicate);
     }
     if predicates_by_id.is_empty() {
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline novelty-only predicates"
-        );
         return Ok(Vec::new());
     }
 

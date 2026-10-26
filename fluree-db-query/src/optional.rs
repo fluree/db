@@ -28,8 +28,8 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
-    branch_or_none, object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan,
-    ProbeOps,
+    branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, ObjectProbeOps,
+    ProbeLanePlan, ProbeOps,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -495,13 +495,15 @@ impl PatternOptionalBuilder {
         objects.sort_unstable();
         let mut values: Vec<Vec<Binding>> = vec![Vec::new(); slots];
         let mut matched = 0usize;
+        let merging = matches!(lane_plan, ProbeLanePlan::Merge(_));
         let branch = branch_or_none(
             &store,
             ctx.binary_g_id,
             fluree_db_binary_index::RunSortOrder::Opst,
-            matches!(lane_plan, ProbeLanePlan::Merge(_)),
+            merging,
         )?;
-        if let (Some(p_id), Some(branch)) = (store.sid_to_p_id(&pred_sid), branch) {
+        let p_id = p_id_or_none(&store, &pred_sid, || Ok(merging))?;
+        if let (Some(p_id), Some(branch)) = (p_id, branch) {
             let slots_by_object: Vec<&[usize]> =
                 objects.iter().map(|o| object_slots[o].as_slice()).collect();
             let mut probe_ops = match &lane_plan {
