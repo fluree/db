@@ -20,7 +20,8 @@ use fluree_db_binary_index::format::run_record_v2::{
 };
 use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
 use fluree_db_binary_index::{
-    BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, ColumnSet,
+    BinaryCursor, BinaryFilter, BinaryIndexStore, BranchManifest, ColumnBatch, ColumnProjection,
+    ColumnSet,
 };
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
@@ -2844,6 +2845,29 @@ pub fn star_probe_lane_plan(
     Ok(ProbeLanePlan::Merge(merged.into()))
 }
 
+/// The `order` branch a batched probe reads for `g_id`, or `None` when the
+/// index holds no such branch.
+///
+/// A graph with no branch has nothing indexed, so a probe there finds
+/// nothing. That answer is complete only while no overlay merge is in play:
+/// the lane plans above decline a branchless graph whose novelty the probe
+/// would have to merge, and a probe that reached one with ops to merge would
+/// drop those rows. That case is refused, in release builds as well.
+pub(crate) fn branch_or_none(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    order: RunSortOrder,
+    merging: bool,
+) -> Result<Option<&Arc<BranchManifest>>> {
+    match store.branch_for_order(g_id, order) {
+        Some(branch) => Ok(Some(branch)),
+        None if merging => Err(QueryError::Internal(format!(
+            "{order:?} probe has novelty to merge in graph {g_id}, which has no {order:?} branch"
+        ))),
+        None => Ok(None),
+    }
+}
+
 /// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
 /// overlay and honoring `to_t`.
 ///
@@ -4434,6 +4458,27 @@ mod tests {
                 std::cmp::Ordering::Less,
                 "{index:?}: rhs stays below higher predicates"
             );
+        }
+    }
+
+    /// A graph with no branch answers a probe with nothing only when no
+    /// overlay merge is in play; with ops to merge, that answer would drop
+    /// them, so the lookup refuses.
+    #[test]
+    fn branch_or_none_refuses_a_merge_over_a_graph_with_no_branch() {
+        let store = BinaryIndexStore::empty(std::env::temp_dir());
+        for order in [RunSortOrder::Psot, RunSortOrder::Opst, RunSortOrder::Spot] {
+            assert!(
+                matches!(branch_or_none(&store, 3, order, false), Ok(None)),
+                "{order:?}: no merge, no branch: nothing to read"
+            );
+            match branch_or_none(&store, 3, order, true) {
+                Err(QueryError::Internal(msg)) => {
+                    assert!(msg.contains(&format!("no {order:?} branch")), "{msg}");
+                }
+                Err(other) => panic!("{order:?}: wrong error: {other}"),
+                Ok(_) => panic!("{order:?}: a merge over a graph with no branch must refuse"),
+            }
         }
     }
 }

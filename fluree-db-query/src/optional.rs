@@ -28,7 +28,8 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
-    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
+    branch_or_none, object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan,
+    ProbeOps,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -494,8 +495,12 @@ impl PatternOptionalBuilder {
         objects.sort_unstable();
         let mut values: Vec<Vec<Binding>> = vec![Vec::new(); slots];
         let mut matched = 0usize;
-        let branch =
-            store.branch_for_order(ctx.binary_g_id, fluree_db_binary_index::RunSortOrder::Opst);
+        let branch = branch_or_none(
+            &store,
+            ctx.binary_g_id,
+            fluree_db_binary_index::RunSortOrder::Opst,
+            matches!(lane_plan, ProbeLanePlan::Merge(_)),
+        )?;
         if let (Some(p_id), Some(branch)) = (store.sid_to_p_id(&pred_sid), branch) {
             let slots_by_object: Vec<&[usize]> =
                 objects.iter().map(|o| object_slots[o].as_slice()).collect();

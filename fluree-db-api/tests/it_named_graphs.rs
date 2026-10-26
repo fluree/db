@@ -5603,11 +5603,15 @@ async fn a_top_level_values_iri_in_a_new_namespace_writes_and_reads_as_itself() 
     assert_eq!(rows, json!([["v"]]));
 }
 
-/// A join inside a named graph first written after the last index probes
-/// that graph by subject, and the index has no branch for it: the graph holds
-/// nothing for the probe, so the join answers with no rows. `ex:sel` is read
-/// from g3's novelty, and `ex:v` is known to the index only from g1.
-#[tokio::test]
+/// A join inside a graph the index has no branch for: a named graph first
+/// written after the last index, and the default graph of a ledger whose
+/// indexed facts are all in named graphs. The join probes that graph by
+/// subject, and the graph holds nothing for the probe, so it answers with no
+/// rows. `ex:sel` is read from novelty, and `ex:v` is known to the index only
+/// from g1. The `GRAPH` spellings are pinned to the batched subject probe,
+/// which is the read that needs the graph's branch; the per-row path answers
+/// the same rows, so a test on the rows alone could pass on either.
+#[tokio::test(flavor = "current_thread")]
 async fn a_join_in_a_graph_written_after_the_index_probes_it_and_finds_nothing() {
     let id = "probe-branchless-graph:main";
     let fluree = FlureeBuilder::memory().without_indexing().build_memory();
@@ -5629,28 +5633,78 @@ async fn a_join_in_a_graph_written_after_the_index_probes_it_and_finds_nothing()
     let ledger = fluree
         .stage_owned(ledger)
         .insert_turtle(
-            "@prefix ex: <http://example.org/> .\nGRAPH <urn:g3> { ex:b ex:sel ex:y0 . }",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:sel ex:y0 .\n\
+             GRAPH <urn:g3> { ex:b ex:sel ex:y0 . }",
         )
         .execute()
         .await
-        .expect("write g3")
+        .expect("write the default graph and g3")
         .ledger;
-    let join = |g: &str| {
-        format!(
-            "PREFIX ex: <http://example.org/>\n\
-             SELECT ?x ?o WHERE {{ GRAPH <{g}> {{ ?x ex:sel ?y . ?y ex:v ?o }} }}"
-        )
+
+    let join = "?x ex:sel ?y . ?y ex:v ?o";
+    let sparql = |dataset: &str, body: &str| {
+        format!("PREFIX ex: <http://example.org/>\nSELECT ?x ?o {dataset} WHERE {{ {body} }}")
     };
-    let in_g3 = support::query_sparql_formatted(&fluree, &ledger, &join("urn:g3"))
-        .await
-        .expect("the join in g3");
-    assert_eq!(in_g3, json!([]), "g3 holds no ex:v");
-    let in_g1 = support::query_sparql_formatted(&fluree, &ledger, &join("urn:g1"))
-        .await
-        .expect("the join in g1");
-    assert_eq!(
-        in_g1.as_array().map(Vec::len),
-        Some(1),
-        "the same join in g1: {in_g1}"
-    );
+    let default_graph = sparql("", join);
+    let from_g3 = sparql("FROM <urn:g3>", join);
+    let graph_g3 = sparql("", &format!("GRAPH <urn:g3> {{ {join} }}"));
+    let graph_g1 = sparql("", &format!("GRAPH <urn:g1> {{ {join} }}"));
+    let jsonld_graph_g3 = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?x", "?o"],
+        "where": [["graph", "urn:g3", {"@id": "?x", "ex:sel": "?y"}, {"@id": "?y", "ex:v": "?o"}]]
+    });
+    // (spelling, query, rows, pinned to the batched subject probe)
+    let cases: [(&str, fluree_db_api::QueryInput<'_>, usize, bool); 5] = [
+        ("default graph", default_graph.as_str().into(), 0, false),
+        ("FROM <urn:g3>", from_g3.as_str().into(), 0, false),
+        ("GRAPH <urn:g3>", graph_g3.as_str().into(), 0, true),
+        ("JSON-LD graph urn:g3", (&jsonld_graph_g3).into(), 0, true),
+        ("GRAPH <urn:g1>", graph_g1.as_str().into(), 1, true),
+    ];
+
+    let db = support::graphdb_from_ledger(&ledger);
+    let (store, guard) = support::span_capture::init_test_tracing();
+    // The join's routing event is shared with sibling tests, which can pin its
+    // interest to "never" while the subscriber installs: run each query once,
+    // then recompute every registered callsite's interest.
+    for (_, query, _, _) in &cases {
+        let _ = fluree.query(&db, *query).await;
+    }
+    tracing::callsite::rebuild_interest_cache();
+
+    let mut failures = Vec::new();
+    for (label, query, rows, pinned) in cases {
+        let before = store.find_events("nested loop join runtime path").len();
+        let answer = match fluree.query(&db, query).await {
+            Ok(result) => result
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("format"),
+            Err(err) => {
+                failures.push(format!("{label}: {err}"));
+                continue;
+            }
+        };
+        if answer.as_array().map(Vec::len) != Some(rows) {
+            failures.push(format!("{label}: expected {rows} rows, got {answer}"));
+        }
+        // (use_batched, batched_eligible, batched_object_eligible)
+        let routes: Vec<[String; 3]> = store.find_events("nested loop join runtime path")[before..]
+            .iter()
+            .map(|e| {
+                ["use_batched", "batched_eligible", "batched_object_eligible"]
+                    .map(|f| e.fields.get(f).cloned().unwrap_or_default())
+            })
+            .collect();
+        let subject_probe = ["true", "true", "false"].map(String::from);
+        if pinned && routes != [subject_probe] {
+            failures.push(format!(
+                "{label}: must take the batched subject probe, took {routes:?}"
+            ));
+        }
+    }
+    drop(guard);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

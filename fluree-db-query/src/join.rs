@@ -10,8 +10,8 @@ use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
-    RowFate,
+    branch_or_none, object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan,
+    ProbeOps, RowFate,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -2463,10 +2463,10 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
         // A graph the index has no PSOT branch for holds nothing for the
-        // probe: its lane plan would have declined had the graph's novelty held
-        // the predicate. Its left rows (from novelty) match nothing, as on the
-        // object probe.
-        let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
+        // probe, so its left rows (from novelty) match nothing.
+        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Psot, merging)?
+        else {
             self.clear_batched_state();
             return Ok(());
         };
@@ -2702,11 +2702,9 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
-            debug_assert!(
-                !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
-                "lane plan must decline branchless graphs"
-            );
+        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Opst, merging)?
+        else {
             self.clear_batched_state();
             return Ok(());
         };
@@ -3318,11 +3316,13 @@ fn batched_subject_probe_binary_uncharged(
         );
         return Ok(Vec::new());
     };
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline branchless graphs"
-        );
+    let Some(branch) = branch_or_none(
+        store,
+        ctx.binary_g_id,
+        RunSortOrder::Psot,
+        probe_ops.is_some(),
+    )?
+    else {
         return Ok(Vec::new());
     };
 
@@ -3606,11 +3606,13 @@ fn batched_subject_star_spot_uncharged(
         return Ok(Vec::new());
     }
 
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Spot) else {
-        debug_assert!(
-            probe_ops.is_none(),
-            "lane plan must decline branchless graphs"
-        );
+    let Some(branch) = branch_or_none(
+        store,
+        ctx.binary_g_id,
+        RunSortOrder::Spot,
+        probe_ops.is_some(),
+    )?
+    else {
         return Ok(Vec::new());
     };
 
