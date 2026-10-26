@@ -431,11 +431,6 @@ path = "tests/it_multigraph_lanes.rs"
 name = "it_index_scope"
 path = "tests/it_index_scope.rs"
 
-# Own binary: toggles the process-global fast-path kill switch.
-[[test]]
-name = "it_union_fact_identity"
-path = "tests/it_union_fact_identity.rs"
-
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]

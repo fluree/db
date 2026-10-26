@@ -9,10 +9,13 @@
 //! reads the list as RDF, #2159). Each runs before the ledger is indexed (the
 //! scan reads decoded flakes) and after (it reads index rows), with fast
 //! paths on and off, and every mismatch of every run is reported together.
-//!
-//! Own test binary: toggles the process-global fast-path kill switch.
+//! The kill switch is process-wide: the runs with fast paths on hold the
+//! read side of `support::FAST_PATH_SWITCH`, so no test in this binary turns
+//! them off underneath, and the runs with them off hold the write side.
 
-use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions};
+use fluree_db_api::{
+    fast_paths_disabled, set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions,
+};
 use serde_json::{json, Value as JsonValue};
 
 const LEDGER: &str = "it/union-fact-identity:main";
@@ -223,18 +226,35 @@ async fn check_jsonld(fluree: &Fluree, state: &str, failures: &mut Vec<String>) 
 
 /// Every check in `state`, with fast paths on and then off.
 async fn check_state(fluree: &Fluree, state: &str, failures: &mut Vec<String>) {
-    for (lanes, disabled) in [("fast paths on", false), ("fast paths off", true)] {
-        set_fast_paths_disabled(disabled);
-        assert_eq!(
-            fluree_db_api::fast_paths_disabled(),
-            disabled,
-            "the kill switch must read as set"
-        );
-        let state = format!("{state}, {lanes}");
+    {
+        let _on = crate::support::FAST_PATH_SWITCH.read().await;
+        assert!(!fast_paths_disabled(), "fast paths must be on");
+        let state = format!("{state}, fast paths on");
         check_sparql(fluree, &state, failures).await;
         check_jsonld(fluree, &state, failures).await;
     }
-    set_fast_paths_disabled(false);
+    let _off = crate::support::FAST_PATH_SWITCH.write().await;
+    let _restore = FastPathsOff::set();
+    let state = format!("{state}, fast paths off");
+    check_sparql(fluree, &state, failures).await;
+    check_jsonld(fluree, &state, failures).await;
+}
+
+/// The kill switch on, and off again however the holder exits.
+struct FastPathsOff;
+
+impl FastPathsOff {
+    fn set() -> Self {
+        set_fast_paths_disabled(true);
+        assert!(fast_paths_disabled(), "the kill switch must read as set");
+        Self
+    }
+}
+
+impl Drop for FastPathsOff {
+    fn drop(&mut self) {
+        set_fast_paths_disabled(false);
+    }
 }
 
 #[tokio::test]
