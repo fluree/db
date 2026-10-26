@@ -226,6 +226,19 @@ pub enum GoogleTokenStage {
 }
 
 impl GoogleTokenStage {
+    const ALL: [GoogleTokenStage; 5] = [
+        GoogleTokenStage::Sts,
+        GoogleTokenStage::Impersonation,
+        GoogleTokenStage::Jwt,
+        GoogleTokenStage::Refresh,
+        GoogleTokenStage::Metadata,
+    ];
+
+    /// The stage [`as_str`](Self::as_str) names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|stage| stage.as_str() == name)
+    }
+
     /// The stage's stable name.
     pub fn as_str(self) -> &'static str {
         match self {

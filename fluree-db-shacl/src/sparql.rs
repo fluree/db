@@ -572,6 +572,10 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::Nameservice(_)
         | QueryError::CatalogCredentialsNotVended { .. }
         | QueryError::CatalogAccessDenied { .. }
+        | QueryError::CatalogQuotaProjectRequired { .. }
+        | QueryError::GoogleTokenExchange { .. }
+        | QueryError::GoogleCredentialsInvalid(_)
+        | QueryError::HostIdentityRefused { .. }
         | QueryError::Policy(_)
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
@@ -907,6 +911,23 @@ mod tests {
             ];
             QueryError::CatalogAccessDenied { .. } => true, [
                 QueryError::CatalogAccessDenied { table: s(), message: s() },
+            ];
+            QueryError::CatalogQuotaProjectRequired { .. } => true, [
+                QueryError::CatalogQuotaProjectRequired { table: s(), message: s() },
+            ];
+            QueryError::GoogleTokenExchange { .. } => true, [
+                QueryError::GoogleTokenExchange {
+                    stage: s(),
+                    status: Some(403),
+                    reason: None,
+                    message: s(),
+                },
+            ];
+            QueryError::GoogleCredentialsInvalid(_) => true, [
+                QueryError::GoogleCredentialsInvalid(s()),
+            ];
+            QueryError::HostIdentityRefused { .. } => true, [
+                QueryError::HostIdentityRefused { kind: s(), message: s() },
             ];
             QueryError::Policy(_) => true, [QueryError::Policy(s())];
             QueryError::TimeRangeNotCovered { .. } => true, [

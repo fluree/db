@@ -787,6 +787,11 @@ impl ApiError {
             #[cfg(feature = "iceberg")]
             ApiError::Iceberg(e) => match e {
                 fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => 409,
+                fluree_db_iceberg::IcebergError::GoogleTokenExchange { status, .. } => {
+                    google_token_exchange_status(*status)
+                }
+                fluree_db_iceberg::IcebergError::HostIdentityRefused { .. }
+                | fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => 403,
                 _ => 400,
             },
 
@@ -899,6 +904,10 @@ impl ApiError {
                 QE::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
                 QE::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
                 QE::CatalogAccessDenied { .. } => errors::CATALOG_ACCESS_DENIED,
+                QE::CatalogQuotaProjectRequired { .. } => errors::CATALOG_QUOTA_PROJECT_REQUIRED,
+                QE::GoogleTokenExchange { .. } => errors::GOOGLE_TOKEN_EXCHANGE,
+                QE::GoogleCredentialsInvalid(_) => errors::GOOGLE_CREDENTIALS_INVALID,
+                QE::HostIdentityRefused { .. } => errors::HOST_IDENTITY_REFUSED,
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
@@ -954,6 +963,18 @@ impl ApiError {
             ApiError::Iceberg(e) => match e {
                 fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => {
                     errors::MERGE_ON_READ_DELETES
+                }
+                fluree_db_iceberg::IcebergError::GoogleTokenExchange { .. } => {
+                    errors::GOOGLE_TOKEN_EXCHANGE
+                }
+                fluree_db_iceberg::IcebergError::GoogleCredentialsInvalid(_) => {
+                    errors::GOOGLE_CREDENTIALS_INVALID
+                }
+                fluree_db_iceberg::IcebergError::HostIdentityRefused { .. } => {
+                    errors::HOST_IDENTITY_REFUSED
+                }
+                fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => {
+                    errors::CATALOG_QUOTA_PROJECT_REQUIRED
                 }
                 _ => errors::CONFIG,
             },
@@ -1020,7 +1041,12 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         QE::MemoryBudgetExceeded { .. } => 507,
         QE::StorageAccessDenied { .. }
         | QE::CatalogCredentialsNotVended { .. }
-        | QE::CatalogAccessDenied { .. } => 403,
+        | QE::CatalogAccessDenied { .. }
+        | QE::CatalogQuotaProjectRequired { .. }
+        | QE::HostIdentityRefused { .. } => 403,
+        QE::GoogleTokenExchange { status, .. } => google_token_exchange_status(*status),
+        // Registration-time configuration the caller supplied.
+        QE::GoogleCredentialsInvalid(_) => 400,
         // Engine and storage faults no change to the query can clear.
         QE::Core(_)
         | QE::OperatorNotOpened
@@ -1051,6 +1077,18 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::TimeRangeNotCovered { .. }
         | QE::Arithmetic(_)
         | QE::Comparison(_) => 400,
+    }
+}
+
+/// The status for a refused Google token exchange: Google's 403 stays a 403 (the
+/// identity lacks a grant); a 5xx or no answer at all is an upstream failure
+/// (502); any other refusal means the credential did not authenticate (401).
+fn google_token_exchange_status(google: Option<u16>) -> u16 {
+    match google {
+        Some(403) => 403,
+        Some(status) if status >= 500 => 502,
+        None => 502,
+        Some(_) => 401,
     }
 }
 
@@ -1109,6 +1147,16 @@ mod tests {
         ApiError::Transact(TE::CommitConflict {
             expected_t: 1,
             head_t: 2,
+        })
+    }
+
+    /// A refused Google token exchange carrying Google's `status`.
+    fn google_exchange(status: Option<u16>) -> ApiError {
+        ApiError::Query(QE::GoogleTokenExchange {
+            stage: "sts".into(),
+            status,
+            reason: None,
+            message: "m".into(),
         })
     }
 
@@ -1232,6 +1280,62 @@ mod tests {
                 }),
                 403,
                 CATALOG_ACCESS_DENIED,
+            ),
+            (
+                ApiError::Query(QE::CatalogQuotaProjectRequired {
+                    table: "t".into(),
+                    message: "m".into(),
+                }),
+                403,
+                CATALOG_QUOTA_PROJECT_REQUIRED,
+            ),
+            (
+                ApiError::Query(QE::HostIdentityRefused {
+                    kind: "google-adc".into(),
+                    message: "m".into(),
+                }),
+                403,
+                HOST_IDENTITY_REFUSED,
+            ),
+            (
+                ApiError::Query(QE::GoogleCredentialsInvalid("token_url".into())),
+                400,
+                GOOGLE_CREDENTIALS_INVALID,
+            ),
+            (google_exchange(Some(403)), 403, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(Some(400)), 401, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(Some(401)), 401, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(Some(503)), 502, GOOGLE_TOKEN_EXCHANGE),
+            (google_exchange(None), 502, GOOGLE_TOKEN_EXCHANGE),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::HostIdentityRefused {
+                    kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+                }),
+                403,
+                HOST_IDENTITY_REFUSED,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::GoogleCredentialsInvalid("x".into())),
+                400,
+                GOOGLE_CREDENTIALS_INVALID,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::GoogleTokenExchange {
+                    stage: fluree_db_iceberg::GoogleTokenStage::Sts,
+                    status: Some(400),
+                    reason: Some("invalid_grant".into()),
+                }),
+                401,
+                GOOGLE_TOKEN_EXCHANGE,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::CatalogQuotaProjectRequired { table: "t".into() }),
+                403,
+                CATALOG_QUOTA_PROJECT_REQUIRED,
             ),
             (
                 ApiError::Transact(TE::PolicyViolation(PE::modify_denied("no"))),

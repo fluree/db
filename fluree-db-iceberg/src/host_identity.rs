@@ -65,7 +65,8 @@ impl HostIdentityKind {
         }
     }
 
-    fn parse(name: &str) -> Option<Self> {
+    /// The kind [`as_str`](Self::as_str) names.
+    pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == name)
     }
 }
@@ -156,7 +157,7 @@ impl HostIdentityPolicy {
             Some(list) => {
                 let mut policy = Self::deny_all();
                 for name in list.split(',').map(str::trim) {
-                    let kind = HostIdentityKind::parse(name).ok_or_else(|| {
+                    let kind = HostIdentityKind::from_name(name).ok_or_else(|| {
                         IcebergError::Config(format!(
                             "{HOST_IDENTITIES_ENV}: '{name}' is not a host identity (expected a \
                              comma-separated list of aws, google-metadata, google-adc, google-wif, \

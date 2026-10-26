@@ -139,9 +139,50 @@ pub struct CatalogBrowse {
     pub tables: Vec<TableRef>,
 }
 
-/// A catalog auth provider that could not be built.
+/// A catalog auth provider that could not be built. The graph-source identity
+/// refusals (host identity refused, invalid Google credentials) keep their type
+/// and wire code; anything else is the pre-existing config error.
 pub(crate) fn auth_provider_error(err: fluree_db_iceberg::IcebergError) -> crate::ApiError {
-    crate::ApiError::config(format!("Failed to create auth provider: {err}"))
+    match identity_query_error(err) {
+        Ok(typed) => crate::ApiError::Query(typed),
+        Err(other) => crate::ApiError::config(format!("Failed to create auth provider: {other}")),
+    }
+}
+
+/// The graph-source identity errors as their typed [`QueryError`]s (each with
+/// its own wire code), or the error back when it is not one: a Google token
+/// exchange refused, invalid Google credentials, a host identity the policy
+/// refuses, a catalog that needs a quota project. Shared by the query, preview
+/// and provider-construction paths so the three report them identically.
+///
+/// [`QueryError`]: fluree_db_query::QueryError
+pub(crate) fn identity_query_error(
+    err: fluree_db_iceberg::IcebergError,
+) -> std::result::Result<fluree_db_query::QueryError, fluree_db_iceberg::IcebergError> {
+    use fluree_db_iceberg::IcebergError as E;
+    use fluree_db_query::QueryError as Q;
+    let message = err.to_string();
+    Ok(match err {
+        E::GoogleTokenExchange {
+            stage,
+            status,
+            reason,
+        } => Q::GoogleTokenExchange {
+            stage: stage.as_str().to_string(),
+            status,
+            reason,
+            message,
+        },
+        E::GoogleCredentialsInvalid(detail) => Q::GoogleCredentialsInvalid(detail),
+        E::HostIdentityRefused { kind } => Q::HostIdentityRefused {
+            kind: kind.as_str().to_string(),
+            message,
+        },
+        E::CatalogQuotaProjectRequired { table } => {
+            Q::CatalogQuotaProjectRequired { table, message }
+        }
+        other => return Err(other),
+    })
 }
 
 /// Build a catalog client from a connection — REST, AWS Glue, or AWS S3 Tables —
@@ -977,7 +1018,10 @@ pub(crate) fn storage_query_error(
                 message: query_safe_denial(context, message),
             }
         }
-        other => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
+        other => match identity_query_error(other) {
+            Ok(typed) => typed,
+            Err(other) => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
+        },
     }
 }
 
@@ -1052,7 +1096,10 @@ pub(crate) fn storage_api_error(
                 message,
             })
         }
-        other => crate::ApiError::config(format!("{context}: {other}")),
+        other => match identity_query_error(other) {
+            Ok(typed) => crate::ApiError::Query(typed),
+            Err(other) => crate::ApiError::config(format!("{context}: {other}")),
+        },
     }
 }
 

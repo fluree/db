@@ -2982,9 +2982,11 @@ async fn hydrated_auth_provider(
         .hydrate(identity.secret_resolver.as_ref())
         .await
         .map_err(|e| QueryError::Internal(format!("Failed to resolve catalog auth secret: {e}")))?;
-    hydrated
-        .create_provider_arc(identity)
-        .map_err(|e| QueryError::Internal(format!("Failed to create auth provider: {e}")))
+    hydrated.create_provider_arc(identity).map_err(|e| {
+        super::iceberg_catalog::identity_query_error(e).unwrap_or_else(|e| {
+            QueryError::Internal(format!("Failed to create auth provider: {e}"))
+        })
+    })
 }
 
 /// Resolve the S3 storage client for a catalog-backed table (REST, AWS Glue, AWS
@@ -3120,9 +3122,10 @@ async fn build_catalog_storage(
 /// Carry a [`QueryError`] through a deferred [`LazyS3Storage`] builder, whose
 /// `Result` channel is `IcebergError`-typed, without losing its type:
 /// [`storage_query_error`] lifts these variants straight back to their
-/// `QueryError` counterparts, so a lazy-forced build reports the same 403 + wire
-/// code (`err:storage/AccessDenied`, `err:catalog/CredentialsNotVended`,
-/// `err:catalog/AccessDenied`) as the eager path. A blanket `to_string()` here
+/// `QueryError` counterparts, so a lazy-forced build reports the same status and
+/// wire code (`err:storage/AccessDenied`, `err:catalog/CredentialsNotVended`,
+/// `err:catalog/AccessDenied`, `err:catalog/QuotaProjectRequired`, and the
+/// `err:auth/*` identity codes) as the eager path. A blanket `to_string()` here
 /// would flatten them into an opaque string and put hosts back to regex-guessing.
 fn builder_channel_error(error: QueryError) -> IcebergError {
     match error {
@@ -3142,6 +3145,31 @@ fn builder_channel_error(error: QueryError) -> IcebergError {
         }
         QueryError::CatalogAccessDenied { table, message } => {
             IcebergError::CatalogAccessDenied { table, message }
+        }
+        QueryError::CatalogQuotaProjectRequired { table, .. } => {
+            IcebergError::CatalogQuotaProjectRequired { table }
+        }
+        QueryError::GoogleCredentialsInvalid(detail) => {
+            IcebergError::GoogleCredentialsInvalid(detail)
+        }
+        QueryError::GoogleTokenExchange {
+            stage,
+            status,
+            reason,
+            message,
+        } => match fluree_db_iceberg::GoogleTokenStage::from_name(&stage) {
+            Some(stage) => IcebergError::GoogleTokenExchange {
+                stage,
+                status,
+                reason,
+            },
+            None => IcebergError::Catalog(message),
+        },
+        QueryError::HostIdentityRefused { kind, message } => {
+            match fluree_db_iceberg::HostIdentityKind::from_name(&kind) {
+                Some(kind) => IcebergError::HostIdentityRefused { kind },
+                None => IcebergError::Catalog(message),
+            }
         }
         other => IcebergError::Catalog(other.to_string()),
     }
@@ -5790,6 +5818,38 @@ mod tests {
                 assert_eq!(table, "Glue table demo.orders");
             }
             other => panic!("CatalogAccessDenied must survive the builder: {other:?}"),
+        }
+
+        // The graph-source identity errors, each as the eager path types it.
+        let typed = |e: IcebergError| {
+            super::super::iceberg_catalog::identity_query_error(e).expect("an identity error")
+        };
+        let identity_errors = || {
+            [
+                IcebergError::GoogleTokenExchange {
+                    stage: fluree_db_iceberg::GoogleTokenStage::Impersonation,
+                    status: Some(403),
+                    reason: Some("PERMISSION_DENIED".to_string()),
+                },
+                IcebergError::GoogleCredentialsInvalid(
+                    "external_account.config.token_url".to_string(),
+                ),
+                IcebergError::HostIdentityRefused {
+                    kind: fluree_db_iceberg::HostIdentityKind::GoogleApplicationDefault,
+                },
+                IcebergError::CatalogQuotaProjectRequired {
+                    table: "db.events".to_string(),
+                },
+            ]
+        };
+        for (error, again) in identity_errors().into_iter().zip(identity_errors()) {
+            let eager = typed(error);
+            let lazy = ferry(typed(again));
+            assert_eq!(
+                format!("{lazy:?}"),
+                format!("{eager:?}"),
+                "an identity error must survive the builder unchanged"
+            );
         }
     }
 

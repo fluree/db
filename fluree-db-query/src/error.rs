@@ -198,6 +198,44 @@ pub enum QueryError {
         message: String,
     },
 
+    /// A Google catalog refused the request because it names no quota project.
+    #[error("{message}")]
+    CatalogQuotaProjectRequired {
+        /// The table the refused request was for.
+        table: String,
+        /// The rendered refusal, naming the fix.
+        message: String,
+    },
+
+    /// A Google token exchange for a graph source's identity was refused or
+    /// failed. Carries Google's status and error code, never a response body.
+    #[error("{message}")]
+    GoogleTokenExchange {
+        /// Which exchange (`sts`, `impersonation`, `jwt`, `refresh`, `metadata`).
+        stage: String,
+        /// Google's HTTP status, or `None` when no response arrived.
+        status: Option<u16>,
+        /// Google's error code, or a fixed Fluree code.
+        reason: Option<String>,
+        /// The rendered refusal.
+        message: String,
+    },
+
+    /// A graph source's Google credential configuration was refused. Names
+    /// the field, never its value.
+    #[error("Invalid Google credentials: {0}")]
+    GoogleCredentialsInvalid(String),
+
+    /// A host-derived identity was refused by the instance's host-identity
+    /// policy.
+    #[error("{message}")]
+    HostIdentityRefused {
+        /// The refused kind (`aws`, `google-metadata`, `google-adc`, `google-wif`).
+        kind: String,
+        /// The rendered refusal, naming the setting that governs it.
+        message: String,
+    },
+
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),
