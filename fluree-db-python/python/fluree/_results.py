@@ -48,7 +48,8 @@ class Record(tuple):  # type: ignore[type-arg]
         return self[name]
 
     def get(self, key: str, default: Any = None) -> Any:
-        """The value of column ``key``, or ``default`` without one."""
+        """The value of column ``key`` (``None`` when unbound), or ``default``
+        when the result has no column ``key``."""
         return self[key] if key in self._keys else default
 
     def index(self, key: str | int) -> int:  # type: ignore[override]

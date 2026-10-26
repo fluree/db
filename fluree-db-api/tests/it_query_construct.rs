@@ -639,9 +639,10 @@ async fn sparql_construct_minted_blank_disjoint_from_data_blank() {
 }
 
 /// P4 lock: an RDF collection `( … )` in a CONSTRUCT template desugars to
-/// rdf:first / rdf:rest / rdf:nil cells (fresh `#coll…` blanks, which are
-/// hardened `#`-prefixed and so unforgeable), producing a well-formed list in
-/// the output.
+/// rdf:first / rdf:rest / rdf:nil cells (fresh `-coll…` blanks, whose leading
+/// `-` no written label can have, so they are unforgeable), producing a
+/// well-formed list in the output, which JSON-LD writes as `@list`: one per
+/// solution.
 #[tokio::test]
 async fn sparql_construct_collection_desugars_to_list() {
     let (fluree, ledger) = seed_people().await;
@@ -658,17 +659,23 @@ async fn sparql_construct_collection_desugars_to_list() {
         .await
         .expect("CONSTRUCT with a collection object must execute");
 
-    let dump = out.to_string();
-    for frag in ["syntax-ns#first", "syntax-ns#rest", "syntax-ns#nil"] {
-        assert!(
-            dump.contains(frag),
-            "collection did not desugar to an rdf list ({frag} missing): {out:#}"
-        );
-    }
+    let lists: Vec<&JsonValue> = out["@graph"][0]["ex:items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("one list per solution: {out:#}"))
+        .iter()
+        .map(|item| &item["@list"])
+        .collect();
+    assert_eq!(lists.len(), 4, "{out:#}");
+    assert!(
+        lists
+            .iter()
+            .all(|l| l.as_array().is_some_and(|l| l.len() == 1)),
+        "each list holds its solution's handle: {out:#}"
+    );
 }
 
 /// P4 lock: nested property lists `[ :p [ :q ?x ] ]` mint DISTINCT blank nodes
-/// for the outer and inner node (both via the parser's hardened `#bnpl…`
+/// for the outer and inner node (both via the parser's unforgeable `-bnpl…`
 /// scheme), so the output has the inner node linked from the outer, never a
 /// single conflated node.
 #[tokio::test]
