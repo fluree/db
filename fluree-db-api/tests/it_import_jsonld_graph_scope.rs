@@ -363,6 +363,10 @@ async fn transact_lines(shared: Option<&Value>, lines: &[Value]) -> Result<Vec<S
     Ok(statements(&fluree_at(dir.path()), TXN).await)
 }
 
+/// A `.jsonl` case: its name, the shared context of a leading `@context`
+/// line if any, the lines, and the statements expected.
+type JsonlCase = (&'static str, Option<Value>, Vec<Value>, Vec<&'static str>);
+
 /// Newline-delimited JSON-LD: each line is a document of its own, under the
 /// shared context of a leading `@context` line, as if it were imported or
 /// inserted alone. A line's own `@context` resolves its graph names, a
@@ -371,7 +375,7 @@ async fn transact_lines(shared: Option<&Value>, lines: &[Value]) -> Result<Vec<S
 #[tokio::test]
 async fn bulk_import_of_jsonl_reads_each_line_as_a_document() {
     let c = ctx();
-    let cases: Vec<(&str, Option<Value>, Vec<Value>, Vec<&str>)> = vec![
+    let cases: Vec<JsonlCase> = vec![
         (
             "named-graph, plain and selector lines under a shared context",
             Some(c.clone()),
