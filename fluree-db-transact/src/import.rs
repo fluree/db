@@ -186,6 +186,19 @@ mod inner {
         )
     }
 
+    /// Whether a newline-delimited `line` reads the same as a node of the
+    /// chunk's envelope as it does as a document of its own: it has no
+    /// `@context` of its own and is not itself an envelope.
+    fn reads_as_a_node(line: &serde_json::Value) -> Result<bool> {
+        Ok(match line.as_object() {
+            Some(obj) => {
+                !obj.contains_key("@context")
+                    && fluree_graph_json_ld::envelope_graph_key(obj)?.is_none()
+            }
+            None => true,
+        })
+    }
+
     /// The top-level context of a newline-delimited `line`: the shared one,
     /// beneath the line's own `@context` if it has one.
     fn line_context<'s>(
@@ -1531,7 +1544,27 @@ mod inner {
                 )?;
             }
             Some(shared) => {
-                for line in ndjson_lines(&doc)? {
+                // Most lines read the same whether the chunk expands as one
+                // envelope or line by line: those with no `@context` of their
+                // own that are not envelopes. They expand together and are
+                // written in one walk, which resolves each graph name once per
+                // chunk. Any other line expands, and resolves its graph
+                // names, as the document it is.
+                let lines = ndjson_lines(&doc)?;
+                let serde_json::Value::Array(expanded) =
+                    fluree_graph_json_ld::expand(&doc).map_err(expand_error)?
+                else {
+                    return Err(not_an_ndjson_chunk());
+                };
+                if expanded.len() != lines.len() {
+                    return Err(not_an_ndjson_chunk());
+                }
+                let mut plain = Vec::with_capacity(expanded.len());
+                for (line, expanded) in lines.iter().zip(expanded) {
+                    if reads_as_a_node(line)? {
+                        plain.push(expanded);
+                        continue;
+                    }
                     let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
                         .map_err(expand_error)?;
                     write_jsonld_document(
@@ -1541,6 +1574,12 @@ mod inner {
                         ledger_id,
                     )?;
                 }
+                write_jsonld_document(
+                    &serde_json::Value::Array(plain),
+                    &mut sink,
+                    || Ok(std::borrow::Cow::Borrowed(shared)),
+                    ledger_id,
+                )?;
             }
         }
         drop(_parse_span);
