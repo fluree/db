@@ -3769,8 +3769,7 @@ pub struct IcebergMapArgs {
 
     /// Table identifier in namespace.table format (e.g., "openflights.airlines").
     /// Optional: tables are defined in the --r2rml mapping file (for glue, each
-    /// rr:tableName is a Glue `<database>.<table>`). In rest mode, a table given
-    /// here is the one `map` loads to test the catalog connection.
+    /// rr:tableName is a Glue `<database>.<table>`).
     #[arg(long)]
     pub table: Option<String>,
 

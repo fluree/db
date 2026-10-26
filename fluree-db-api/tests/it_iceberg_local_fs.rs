@@ -1919,3 +1919,129 @@ async fn a_direct_registration_reports_whether_its_tables_resolve() {
         "the failure names the location: {err}"
     );
 }
+
+/// A REST catalog that serves the committed `people` fixture's current
+/// metadata inline at `silver.people` and refuses `silver.refused` (403).
+async fn people_catalog() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let metadata_dir = fixtures_dir().join("silver/people/metadata");
+    let current = std::fs::read_dir(&metadata_dir)
+        .expect("people metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&current).expect("read metadata"))
+            .expect("parse metadata");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/people"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata-location": format!("file://{}", current.display()),
+            "metadata": metadata,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/refused"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("not yours"))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Registering a REST source loads each table its mapping names through the
+/// catalog, as its queries will, and reports it as `connection_tested`. A
+/// source whose tables come from its mapping has no table of its own; the
+/// check once loaded the placeholder standing in for one, so it reported
+/// `false` for every such source. A table the catalog refuses still
+/// registers, reported as not verified.
+#[tokio::test]
+async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let register = |name: &'static str, mapping: String| {
+        let fluree = &fluree;
+        let config = R2rmlCreateConfig::new(
+            name,
+            catalog.uri(),
+            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+            mapping,
+        )
+        .with_mapping_media_type("text/turtle")
+        .with_vended_credentials(false)
+        .with_s3_region("us-east-1");
+        async move {
+            fluree
+                .create_r2rml_graph_source(config)
+                .await
+                .unwrap_or_else(|e| panic!("register {name}: {e}"))
+        }
+    };
+
+    let mapped = register("rest-people", PEOPLE_R2RML.to_string()).await;
+    assert!(
+        mapped.connection_tested,
+        "a table the catalog serves is verified"
+    );
+    let asked: Vec<String> = catalog
+        .received_requests()
+        .await
+        .expect("request recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        asked
+            .iter()
+            .any(|p| p == "/v1/namespaces/silver/tables/people"),
+        "the mapped table was loaded: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|p| p.contains("default")),
+        "the placeholder is never loaded: {asked:?}"
+    );
+
+    let refused = register(
+        "rest-refused",
+        PEOPLE_R2RML.replace("silver.people", "silver.refused"),
+    )
+    .await;
+    assert!(
+        !refused.connection_tested,
+        "a table the catalog refuses is not verified"
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup_graph_source("rest-refused:main")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "and is still registered"
+    );
+
+    // Verified means every mapped table: one refused among served ones is not.
+    let both = format!(
+        "{PEOPLE_R2RML}\n{}",
+        PEOPLE_R2RML
+            .replace("silver.people", "silver.refused")
+            .replace("mapping#PeopleMapping", "mapping#RefusedMapping")
+    );
+    let partial = register("rest-partial", both).await;
+    assert_eq!(partial.table_count, 2, "{:?}", partial.table_names);
+    assert!(
+        !partial.connection_tested,
+        "one refused table leaves the source unverified"
+    );
+}

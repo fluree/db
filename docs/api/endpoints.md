@@ -3066,7 +3066,7 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `name` | string | Graph source name (required) |
 | `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
-| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables. In `rest` mode, a given `table` is the one loaded to test the catalog connection |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables |
 | `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
 | `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
 | `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
@@ -3128,7 +3128,7 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
 - `401/403` — admin auth required
 - `500 Internal Server Error` — the graph source could not be published
 
-`connection_tested` reports whether registration reached the source's tables: a `rest` source by loading its table from the catalog, a `direct` source by resolving each mapped table's current metadata the way a query does (metadata only, no data files). It is always `false` in `glue` and `s3tables` modes, whose catalog is first called at query time. A table that cannot be reached does not fail the request; the response carries `connection_tested: false`.
+`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files. A table that cannot be loaded does not fail the request; the response carries `connection_tested: false`.
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 

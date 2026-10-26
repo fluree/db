@@ -206,22 +206,20 @@ pub(crate) fn map_iceberg<'py>(
     config.iceberg.model = common.model;
     config.iceberg.default_allow = common.default_allow;
     config.mapping_media_type = common.mapping_type;
-    // Registration reaches a REST table through its catalog and a Direct one
-    // by reading its metadata; Glue and S3 Tables are first called at query time.
-    let (rest, direct) = (config.iceberg.is_rest(), config.iceberg.is_direct());
+    // Registration loads each mapped table the way a query does: through the
+    // catalog, or at a Direct table's location.
+    let direct = config.iceberg.is_direct();
     let created = block_on(py, fluree.create_r2rml_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.model_warnings;
-    if rest && !created.connection_tested {
+    if !created.connection_tested {
+        let failed = if direct {
+            "could not read a mapped table's metadata at"
+        } else {
+            "could not load a mapped table from the catalog at"
+        };
         warnings.push(format!(
-            "could not reach the catalog at {}; the source is registered, and queries will \
-             fail until it can be reached",
-            created.catalog_uri
-        ));
-    }
-    if direct && !created.connection_tested {
-        warnings.push(format!(
-            "could not read the table metadata at {}; the source is registered, and queries \
-             will fail until it can be read",
+            "{failed} {}; the source is registered, and queries will fail until it can be \
+             loaded",
             created.catalog_uri
         ));
     }

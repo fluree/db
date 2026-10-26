@@ -7,7 +7,7 @@
 
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
-use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateConfig};
+use crate::graph_source::config::R2rmlCreateConfig;
 use crate::graph_source::iceberg_catalog::{
     decide_credential_source, storage_query_error, CredentialSource,
 };
@@ -1087,23 +1087,6 @@ impl crate::Fluree {
         let mapping_address = registered.address;
         let table_count = table_names.len();
 
-        // Reach a REST source's table through its catalog before publishing.
-        // A Direct source is reached after, below. Glue / S3 Tables are first
-        // called at query time.
-        let catalog_reached = if config.iceberg.is_rest() {
-            let reached = self.test_iceberg_connection(&config.iceberg).await;
-            if let Err(e) = &reached {
-                warn!(
-                    graph_source_id = %graph_source_id,
-                    error = %e,
-                    "Could not verify catalog connection - graph source will be created but may fail at query time"
-                );
-            }
-            reached.is_ok()
-        } else {
-            false
-        };
-
         // Store config with CAS mapping address
         let iceberg_config = config.to_iceberg_gs_config(&mapping_address);
         let config_json = iceberg_config
@@ -1120,12 +1103,7 @@ impl crate::Fluree {
             )
             .await?;
 
-        let connection_tested = if config.iceberg.is_direct() {
-            self.probe_direct_tables(&graph_source_id, &table_names)
-                .await
-        } else {
-            catalog_reached
-        };
+        let connection_tested = self.probe_tables(&graph_source_id, &table_names).await;
 
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
 
@@ -1143,99 +1121,51 @@ impl crate::Fluree {
         })
     }
 
-    /// Resolve the current metadata of each table a just-published Direct
-    /// source reads, the way its queries do (a warehouse root's per-table
-    /// directory, the local-root guard, version-hint or metadata listing): the
-    /// table metadata only, never a manifest or data file. `true` when every
-    /// table resolves. A failure is logged and never returned, so it cannot
-    /// fail registration, as a REST catalog that cannot be reached does not.
-    async fn probe_direct_tables(&self, graph_source_id: &str, table_names: &[String]) -> bool {
+    /// Load each table a just-published source reads, the way its queries do
+    /// (`load_table_context`): through the catalog's `loadTable` for REST, AWS
+    /// Glue and S3 Tables, and by resolving the table's current metadata at
+    /// its location for Direct (a warehouse root's per-table directory, the
+    /// local-root guard, version-hint or metadata listing). Table metadata
+    /// only, never a manifest or data file. `true` when every table loads. A
+    /// failure is logged and never returned, so it cannot fail registration.
+    async fn probe_tables(&self, graph_source_id: &str, table_names: &[String]) -> bool {
+        use futures::TryStreamExt;
+        /// Catalog round trips in flight at once: a mapping over a warehouse
+        /// can name dozens of tables, each its own `loadTable`.
+        const CONCURRENT_LOADS: usize = 8;
+
         let provider = FlureeR2rmlProvider::new(self);
-        // A mapping that could not be read names no tables; the location's own
+        // A mapping that could not be read names no tables; the source's own
         // table is then the one a query would read.
         let tables: Vec<&str> = if table_names.is_empty() {
             vec![""]
         } else {
             table_names.iter().map(String::as_str).collect()
         };
-        for table in tables {
-            if let Err(e) = provider.load_table_context(graph_source_id, table).await {
+        let loaded = futures::stream::iter(tables.into_iter().map(Ok))
+            .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
+                let provider = &provider;
+                async move {
+                    provider
+                        .load_table_context(graph_source_id, table)
+                        .await
+                        .map(drop)
+                        .map_err(|e| (table, e))
+                }
+            })
+            .await;
+        match loaded {
+            Ok(()) => true,
+            Err((table, e)) => {
                 warn!(
                     graph_source_id = %graph_source_id,
                     table = %table,
                     error = %e,
-                    "Could not resolve Direct table metadata - graph source was created but may fail at query time"
+                    "Could not load a mapped table - graph source was created but may fail at query time"
                 );
-                return false;
+                false
             }
         }
-        true
-    }
-
-    /// Test connection to an Iceberg REST catalog.
-    ///
-    /// Only applicable to REST mode. Direct mode has no catalog to test.
-    async fn test_iceberg_connection(&self, config: &IcebergCreateConfig) -> Result<()> {
-        use fluree_db_iceberg::catalog::parse_table_identifier;
-
-        let rest = match &config.connection.catalog_mode {
-            CatalogMode::Rest(rest) => rest,
-            CatalogMode::Direct { .. } => {
-                return Err(crate::ApiError::Config(
-                    "Connection test is not supported for Direct catalog mode".to_string(),
-                ));
-            }
-            // Only REST sources are connection-tested at create time (the callers
-            // gate on `is_rest()`); a Glue / S3 Tables table is resolved, and any
-            // catalog error surfaces, at query time.
-            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
-                return Err(crate::ApiError::Config(
-                    "Connection test is not supported for AWS Glue / S3 Tables catalog mode"
-                        .to_string(),
-                ));
-            }
-        };
-
-        // Hydrate any SecretRef auth BEFORE building the provider — this is the
-        // connection-test gate, so a secret reference with no resolver (or a
-        // Denied resolution) must error HERE, actionably, before any network call.
-        let hydrated_auth = rest
-            .auth
-            .hydrate(self.secret_resolver())
-            .await
-            .map_err(|e| {
-                crate::ApiError::Config(format!("Failed to resolve catalog auth secret: {e}"))
-            })?;
-
-        // Create auth provider
-        let auth = hydrated_auth
-            .create_provider_arc()
-            .map_err(|e| crate::ApiError::Config(format!("Failed to create auth provider: {e}")))?;
-
-        // Create catalog client
-        let catalog_config = RestCatalogConfig {
-            uri: rest.catalog_uri.clone(),
-            warehouse: rest.warehouse.clone(),
-            ..Default::default()
-        };
-
-        let catalog = RestCatalogClient::new(catalog_config, auth).map_err(|e| {
-            crate::ApiError::Config(format!("Failed to create catalog client: {e}"))
-        })?;
-
-        // Parse table identifier
-        let table_id = parse_table_identifier(&config.table_identifier)
-            .map_err(|e| crate::ApiError::Config(format!("Invalid table identifier: {e}")))?;
-
-        // Attempt to load table metadata (this tests the connection)
-        catalog
-            .load_table(&table_id, config.connection.io.vended_credentials)
-            .await
-            .map_err(|e| {
-                crate::ApiError::Config(format!("Failed to load table from catalog: {e}"))
-            })?;
-
-        Ok(())
     }
 
     /// Resolve a registration's mapping input to the address the record stores.
@@ -2972,10 +2902,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 /// `create_provider_arc`: that resolves `ConfigValue`s SYNCHRONOUSLY, so a `SecretRef`
 /// reaching it un-hydrated hard-errors via `resolve()`'s fail-closed arm. Pairing the
 /// two here means a NEW client-construction site cannot silently ship without
-/// hydration — which is exactly how the pointer rung's copy arrived. (The one
-/// deliberate exception is `test_iceberg_connection`, which is `ApiError`-typed and
-/// hydrates inline so a missing/denied resolver surfaces as an actionable *config*
-/// error at the connection-test gate rather than a query error.)
+/// hydration — which is exactly how the pointer rung's copy arrived.
 ///
 /// ⚠️ ORDERING: the caller MUST already have computed its `catalog_client_cache_key`
 /// fingerprint over the RAW, reference-bearing config BEFORE calling this. Hydrating

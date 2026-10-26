@@ -219,10 +219,9 @@ pub struct R2rmlCreateResult {
     /// Names of the distinct logical tables referenced by the mapping (sorted)
     pub table_names: Vec<String>,
 
-    /// Whether the source's tables were reached at registration: through the
-    /// catalog for a REST source, and by resolving each table's current
-    /// metadata for a Direct one. Always `false` for AWS Glue / S3 Tables,
-    /// whose catalog is first called at query time. A `false` never fails
+    /// Whether every table the mapping reads loaded at registration, the way
+    /// a query loads it: through the catalog for REST, AWS Glue and S3 Tables,
+    /// and by resolving its current metadata for Direct. A `false` never fails
     /// registration.
     pub connection_tested: bool,
 

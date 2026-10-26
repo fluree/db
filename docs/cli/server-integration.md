@@ -2389,7 +2389,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `name` | string | Yes | Graph source name (no colons) |
 | `mode` | string | No | `"rest"` (default), `"direct"`, `"glue"` (AWS Glue Data Catalog), or `"s3tables"` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST mode | REST catalog URI |
-| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`). The R2RML mapping's `rr:tableName` entries name the tables; in REST mode a given `table` is the one loaded to test the catalog connection |
+| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`). The R2RML mapping's `rr:tableName` entries name the tables |
 | `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`), or a `file://` URI / absolute local path under `FLUREE_ICEBERG_LOCAL_ROOTS` |
 | `region` | string | No | AWS region of the Glue / S3 Tables API (Glue and S3 Tables modes) |
 | `catalog_id` | string | No | Glue catalog id for cross-account access (Glue mode; default: the caller's account) |
@@ -2476,7 +2476,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `graph_source_id` | string | Always | Created ID (e.g., `"warehouse-orders:main"`) |
 | `table_identifier` | string | Always | Table identifier or derived from location |
 | `catalog_uri` | string | Always | REST catalog URI, Direct table location, Glue catalog id (`aws-glue` for the caller's own account), or S3 Tables bucket ARN |
-| `connection_tested` | boolean | Always | Whether registration reached the source's tables: through the catalog in REST mode, by resolving each mapped table's current metadata in Direct mode; always `false` for Glue and S3 Tables, whose catalog is first called at query time |
+| `connection_tested` | boolean | Always | Whether every table the mapping names loaded at registration, the way a query loads it: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata (Direct) |
 | `mapping_source` | string | Always | Content address of the stored R2RML mapping |
 | `triples_map_count` | integer | Always | Number of TriplesMap definitions found |
 | `table_count` | integer | Always | Number of distinct tables the mapping reads |
@@ -2488,7 +2488,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 - `409 Conflict` — graph source with this name already exists (if your nameservice enforces uniqueness)
 - `500 Internal Server Error` — nameservice write failure
 
-A table that cannot be reached, through a REST catalog or at a Direct location, does not fail the request: the source is created and the response carries `connection_tested: false`.
+A table that cannot be loaded does not fail the request: the source is created and the response carries `connection_tested: false`.
 
 ### Querying graph sources
 

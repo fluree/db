@@ -1238,7 +1238,7 @@ triples map a scan skipped because its predicates were hidden.
 
 ### Connection Issues
 
-**AWS Glue / S3 Tables.** `fluree iceberg map` tests the connection for REST catalogs and Direct locations only; for these modes it reports `Connection: not tested`, and catalog errors first surface on the first query. To check a connection before querying, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
+**AWS Glue / S3 Tables.** `fluree iceberg map` loads each mapped table through the Glue or S3 Tables catalog, as a query will, and reports `Connection: not verified` when one cannot be loaded; the source is still registered. To check that the credentials can also read the table's storage, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
 
 | Error | Cause |
 |---|---|

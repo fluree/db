@@ -327,21 +327,18 @@ async fn run_iceberg_map_remote(
     Ok(())
 }
 
-/// The `Connection:` line of a `map` report. A REST source is reached through
-/// its catalog and a Direct one by resolving its tables' metadata; Glue and S3
-/// Tables catalogs are first called at query time. Neither outcome fails `map`.
+/// The `Connection:` line of a `map` report: whether every mapped table loaded
+/// the way a query will load it, through the catalog or, in Direct mode, at the
+/// table's location. Neither outcome fails `map`.
 fn connection_summary(tested: bool, mode: &str) -> &'static str {
-    if tested {
-        return "verified";
-    }
-    match mode.to_ascii_lowercase().as_str() {
-        "glue" | "s3tables" => {
-            "not tested (Glue and S3 Tables catalogs are first called at query time)"
+    match (tested, mode.eq_ignore_ascii_case("direct")) {
+        (true, _) => "verified",
+        (false, true) => {
+            "not verified (a mapped table's metadata could not be read; queries will fail until it can be)"
         }
-        "direct" => {
-            "not verified (the table metadata could not be read; queries will fail until it can be)"
+        (false, false) => {
+            "not verified (the catalog could not load a mapped table; queries will fail until it can)"
         }
-        _ => "not verified (the catalog could not load the table; queries will fail until it can)",
     }
 }
 
