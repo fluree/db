@@ -324,8 +324,21 @@ pub fn init_test_tracing() -> (SpanStore, tracing::subscriber::DefaultGuard) {
     let store = SpanStore::new();
     let layer = SpanCaptureLayer::new(store.clone());
     let subscriber = tracing_subscriber::Registry::default().with(layer);
+    keep_interest_from_every_subscriber();
     let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
     (store, guard)
+}
+
+/// With one dispatcher registered, `tracing` computes a callsite's interest
+/// from the default subscriber of whichever thread first reaches it. A test
+/// thread with no subscriber then caches "never" for a callsite this test
+/// listens on, and the test's events are dropped. A second dispatcher, kept
+/// for the process, makes interest come from every live subscriber; the
+/// rebuild fixes callsites cached before this subscriber existed.
+fn keep_interest_from_every_subscriber() {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }
 
 /// Initialize test tracing that captures only INFO+ spans.

@@ -413,7 +413,11 @@ async fn build_policy_context_from_opts_inner(
     // runtime class check, which is not. Left on the estimate lane anyway —
     // an uncached per-query builder cannot afford base probes — but the
     // exposure is a count-drift one, not a no-op.
-    let stats: Option<Arc<IndexStats>> = if let Some(novelty) = novelty_for_stats {
+    let stats: Option<Arc<IndexStats>> = if restrictions.is_empty() {
+        // Empty policy sets never consult stats. Avoid scanning accumulated
+        // novelty while preserving the default-allow/root decision below.
+        None
+    } else if let Some(novelty) = novelty_for_stats {
         let indexed = snapshot.stats.clone().unwrap_or_default();
         let lookup = PolicyStatsLookup { overlay };
         Some(Arc::new(
@@ -1727,6 +1731,115 @@ fn extract_iris(value: &JsonValue) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::{Flake, GraphId, OverlayProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingOverlay {
+        novelty: Novelty,
+        reads: AtomicUsize,
+    }
+
+    impl OverlayProvider for CountingOverlay {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn epoch(&self) -> u64 {
+            self.novelty.epoch()
+        }
+
+        fn for_each_overlay_flake(
+            &self,
+            g_id: GraphId,
+            index: IndexType,
+            first: Option<&Flake>,
+            rhs: Option<&Flake>,
+            leftmost: bool,
+            to_t: i64,
+            callback: &mut dyn FnMut(&Flake),
+        ) {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.novelty
+                .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, callback);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_restrictions_skip_stats_and_preserve_defaults() {
+        let mut snapshot = LedgerSnapshot::genesis("policy-stats:main");
+        snapshot
+            .insert_namespace_code(100, "http://example.org/".to_string())
+            .unwrap();
+        let subject = Sid::new(100, "alice");
+        let property = Sid::new(100, "name");
+        let object = FlakeValue::String("Alice".to_string());
+        let mut novelty = Novelty::new(0);
+        // A non-type property forces full stats assembly to look up the
+        // subject's classes, making the unnecessary work observable.
+        novelty
+            .apply_commit(
+                vec![Flake::new(
+                    subject.clone(),
+                    property.clone(),
+                    object.clone(),
+                    Sid::new(fluree_vocab::namespaces::XSD, "string"),
+                    1,
+                    true,
+                    None,
+                )],
+                1,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let overlay = CountingOverlay {
+            novelty,
+            reads: AtomicUsize::new(0),
+        };
+
+        for default_allow in [true, false] {
+            for bind_identity in [false, true] {
+                let opts = GovernanceOptions {
+                    default_allow: Some(default_allow),
+                    policy_values: bind_identity.then(|| {
+                        HashMap::from([(
+                            "?$identity".to_string(),
+                            serde_json::json!({"@id": "http://example.org/alice"}),
+                        )])
+                    }),
+                    ..Default::default()
+                };
+                let context = build_policy_context_from_opts(
+                    &snapshot,
+                    &overlay,
+                    Some(&overlay.novelty),
+                    1,
+                    &opts,
+                    &[0],
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(overlay.reads.load(Ordering::Relaxed), 0);
+                assert_eq!(context.wrapper.is_root(), default_allow);
+                assert_eq!(context.wrapper.default_allow(), default_allow);
+                assert!(context.wrapper.view().restrictions.is_empty());
+                assert!(context.wrapper.modify().restrictions.is_empty());
+                assert_eq!(
+                    context
+                        .allow_modify_flake(&subject, &property, &object, &[])
+                        .unwrap(),
+                    default_allow
+                );
+                if bind_identity {
+                    assert_eq!(context.identity, subject);
+                    assert_eq!(
+                        context.wrapper.policy_values().get("?$identity"),
+                        Some(&subject)
+                    );
+                }
+            }
+        }
+    }
 
     // ========================================================================
     // extract_iris tests
