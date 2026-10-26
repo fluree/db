@@ -752,9 +752,7 @@ fn to_literal(v: &ScanValue) -> Literal {
         ScanValue::Date(d) => Literal::Date(*d),
         ScanValue::Str(s) => Literal::Str(s.clone()),
         ScanValue::Double(d) => Literal::Double(*d),
-        ScanValue::Decimal {
-            unscaled, scale, ..
-        } => Literal::Decimal {
+        ScanValue::Decimal { unscaled, scale } => Literal::Decimal {
             unscaled: *unscaled,
             scale: *scale,
         },

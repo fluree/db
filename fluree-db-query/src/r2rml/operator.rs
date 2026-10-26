@@ -2220,9 +2220,7 @@ pub(crate) fn rdf_term_eq_object_constant_cached(
                 // above). These arms exist for match exhaustiveness; should one be
                 // reached, match loosely by value so it can never be WRONG.
                 ScanValue::Double(f) => v.parse::<f64>().is_ok_and(|x| x == *f),
-                ScanValue::Decimal {
-                    unscaled, scale, ..
-                } => {
+                ScanValue::Decimal { unscaled, scale } => {
                     let d = bigdecimal::BigDecimal::new(
                         num_bigint::BigInt::from(*unscaled),
                         i64::from(*scale),

@@ -245,19 +245,16 @@ fn column_cell_to_json(col: &Column, idx: usize) -> Value {
         Column::Date(v) => v.get(idx).copied().flatten().map(TypedValue::Date),
         Column::Timestamp(v) => v.get(idx).copied().flatten().map(TypedValue::Timestamp),
         Column::TimestampTz(v) => v.get(idx).copied().flatten().map(TypedValue::TimestampTz),
-        Column::Decimal {
-            values,
-            precision,
-            scale,
-        } => values
-            .get(idx)
-            .copied()
-            .flatten()
-            .map(|unscaled| TypedValue::Decimal {
-                unscaled,
-                precision: *precision,
-                scale: *scale,
-            }),
+        Column::Decimal { values, scale, .. } => {
+            values
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|unscaled| TypedValue::Decimal {
+                    unscaled,
+                    scale: *scale,
+                })
+        }
     };
     typed.as_ref().map_or(Value::Null, typed_value_to_json)
 }

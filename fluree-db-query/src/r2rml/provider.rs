@@ -63,12 +63,13 @@ pub enum ScanValue {
     /// column only (see `build_iceberg_filter`). NaN bounds never over-prune (the
     /// Iceberg compare treats a NaN operand as incomparable → keep).
     Double(f64),
-    /// A decimal value as its unscaled i128 + precision/scale (mirrors
+    /// A decimal value as its unscaled i128 and scale (mirrors
     /// `LiteralValue::Decimal`). Carries the LITERAL's scale; the column's scale
-    /// may differ and is normalized during comparison.
+    /// may differ and is normalized during comparison. There is deliberately no
+    /// precision: a literal has none, and the column's own `decimal(p, s)` is
+    /// what any consumer that needs one must use.
     Decimal {
         unscaled: i128,
-        precision: u8,
         scale: i8,
     },
     /// A raw column value recovered by reversing a subject template (bound-subject
