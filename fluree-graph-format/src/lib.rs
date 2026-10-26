@@ -27,6 +27,7 @@
 //! // {"@graph": [{"@id": "http://example.org/alice", ...}]}
 //! ```
 
+mod collections;
 mod jsonld;
 mod policy;
 mod prefix;

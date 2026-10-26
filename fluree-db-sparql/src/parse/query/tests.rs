@@ -1587,14 +1587,48 @@ fn test_construct_template_blank_node_property_list() {
 
 #[test]
 fn test_blank_node_property_list_label_no_user_collision() {
-    // A user blank node literally named `_:#bnpl0` is impossible (the lexer
-    // rejects `#`), so the synthetic property-list node cannot be addressed or
-    // accidentally joined. A user label like `_b` near a `[ … ]` stays distinct:
-    // `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3 triples, and the
-    // synthetic node is its own variable.
+    // A user blank node literally named `_:-bnpl0` is impossible (a label
+    // can't start with `-`), so the synthetic property-list node cannot be
+    // addressed or accidentally joined. A user label like `_b` near a `[ … ]`
+    // stays distinct: `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3
+    // triples, and the synthetic node is its own variable.
     let ast = assert_parses("SELECT ?o WHERE { ?s :p _:b . ?s :q [ :r ?o ] }");
     if let QueryBody::Select(q) = &ast.body {
         assert_eq!(bgp_triple_count(&q.where_clause.pattern), 3);
+    }
+    for synthetic in ["-bnpl0", "-coll0", "-reif0"] {
+        let query = format!("SELECT ?o WHERE {{ _:{synthetic} :p ?o }}");
+        assert!(parse(&query).has_errors(), "{query} must not parse");
+    }
+}
+
+#[test]
+fn test_minted_blank_node_labels_start_with_a_dash() {
+    // The other half of the test above: every label the parser mints for a
+    // `[ … ]`, a `( … )` or a standalone `<< … >>` with no reifier starts
+    // with `-`.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         INSERT { _:b ex:p [ ex:q ?o ] ; ex:list ( ?o ?o ) } \
+         WHERE { ?s ex:p ?o . ?s ex:r [ ex:q ?x ] ; ex:list ( ?x ) . << ?s ex:p ?o >> . }",
+    );
+    let debug = format!("{ast:?}");
+    let labels: Vec<&str> = debug
+        .split("Labeled(\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    for kind in ["bnpl", "coll", "reif"] {
+        assert!(
+            labels.iter().any(|label| label.contains(kind)),
+            "no {kind} label minted: {labels:?}"
+        );
+    }
+    for label in labels {
+        assert!(
+            label == "b" || label.starts_with('-'),
+            "minted label {label} can lex as a user's label"
+        );
     }
 }
 

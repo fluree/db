@@ -798,9 +798,9 @@ fn merge_stats(acc: &mut MaterializeStats, other: MaterializeStats) {
     }
 }
 
-/// One completed chunk's `(idx, ParsedChunk)` or a stringified build error — the
-/// item type of the producer→consumer result channel (Send + Clone sender).
-type ChunkResult = std::result::Result<(usize, ParsedChunk), String>;
+/// One completed chunk's `(idx, ParsedChunk)` or a build error — the item type
+/// of the producer→consumer result channel (Send + Clone sender).
+type ChunkResult = std::result::Result<(usize, ParsedChunk), crate::import::ImportError>;
 
 /// One unit of produce work handed to a worker: `(TriplesMap IRI, scanned batch)`.
 type WorkItem = (String, fluree_db_tabular::ColumnBatch);
@@ -3014,8 +3014,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl fluree_db_query::r2rml::R2rmlProvider for MockBuildProvider {
-        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,

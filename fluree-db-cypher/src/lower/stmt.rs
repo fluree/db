@@ -57,6 +57,7 @@ pub fn lower_query<E: IriEncoder>(
         // Cypher null: a later pattern using a var an OPTIONAL MATCH left
         // null matches nothing (SPARQL's unbound would match anything).
         unmatched_optional: UnmatchedOptional::Poisoned,
+        rdf_list_view: false,
     })
 }
 
@@ -154,6 +155,7 @@ fn lower_union_query<E: IriEncoder>(
         // Cypher null: a later pattern using a var an OPTIONAL MATCH left
         // null matches nothing (SPARQL's unbound would match anything).
         unmatched_optional: UnmatchedOptional::Poisoned,
+        rdf_list_view: false,
     })
 }
 
