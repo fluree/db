@@ -798,9 +798,9 @@ fn merge_stats(acc: &mut MaterializeStats, other: MaterializeStats) {
     }
 }
 
-/// One completed chunk's `(idx, ParsedChunk)` or a stringified build error — the
-/// item type of the producer→consumer result channel (Send + Clone sender).
-type ChunkResult = std::result::Result<(usize, ParsedChunk), String>;
+/// One completed chunk's `(idx, ParsedChunk)` or a build error — the item type
+/// of the producer→consumer result channel (Send + Clone sender).
+type ChunkResult = std::result::Result<(usize, ParsedChunk), crate::import::ImportError>;
 
 /// One unit of produce work handed to a worker: `(TriplesMap IRI, scanned batch)`.
 type WorkItem = (String, fluree_db_tabular::ColumnBatch);

@@ -69,6 +69,7 @@ pub mod ir;
 pub mod join;
 pub mod lang_support;
 pub mod limit;
+pub mod list_view;
 pub mod materializer;
 pub(crate) mod membership_join;
 pub mod minus;

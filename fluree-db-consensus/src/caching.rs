@@ -254,7 +254,8 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
         | SubmissionError::DatatypeLimitExceeded { message }
         | SubmissionError::CommitNotFound { message }
         | SubmissionError::ConfigUnavailable { message }
-        | SubmissionError::CommitContention { message } => message.capacity(),
+        | SubmissionError::CommitContention { message }
+        | SubmissionError::IndexNotLoaded { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,
@@ -1586,6 +1587,12 @@ mod tests {
             message: "c".into()
         }
         .is_settled());
+        // Refused before staging read anything; retryable like the novelty
+        // refusals, so settled for the same reason.
+        assert!(SubmissionError::IndexNotLoaded {
+            message: "i".into()
+        }
+        .is_settled());
     }
 
     /// The `execution_failure` flattening must route novelty refusals by
@@ -1627,6 +1634,12 @@ mod tests {
             SubmissionError::DatatypeLimitExceeded { .. }
         ));
         assert!(matches!(
+            f(ApiError::Transact(TransactError::IndexNotLoaded(
+                "the ledger's index (t=1) is not loaded".into()
+            ))),
+            SubmissionError::IndexNotLoaded { .. }
+        ));
+        assert!(matches!(
             f(ApiError::Transact(TransactError::EmptyTransaction)),
             SubmissionError::Execution { status: 400, .. }
         ));
@@ -1645,14 +1658,20 @@ mod tests {
     }
 
     /// Executor scripted for the keyed-retry pin: refuses the first
-    /// transact with novelty backpressure, commits the second — the
+    /// transact with a retryable refusal, commits the second — the
     /// "indexer drained between attempts" shape.
     #[derive(Clone)]
-    struct ScriptedNoveltyExecutor(Arc<std::sync::atomic::AtomicUsize>);
+    struct ScriptedNoveltyExecutor(Arc<std::sync::atomic::AtomicUsize>, fn() -> SubmissionError);
 
     impl ScriptedNoveltyExecutor {
         fn new() -> Self {
-            Self(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            Self::refusing(|| SubmissionError::NoveltyBackpressure {
+                message: "Novelty at maximum size, reindexing required".into(),
+            })
+        }
+
+        fn refusing(refusal: fn() -> SubmissionError) -> Self {
+            Self(Arc::new(std::sync::atomic::AtomicUsize::new(0)), refusal)
         }
 
         fn calls(&self) -> usize {
@@ -1668,9 +1687,7 @@ mod tests {
         ) -> Result<TransactionReceipt, SubmissionError> {
             let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if attempt == 0 {
-                return Err(SubmissionError::NoveltyBackpressure {
-                    message: "Novelty at maximum size, reindexing required".into(),
-                });
+                return Err((self.1)());
             }
             Ok(TransactionReceipt {
                 idempotency_key: request.idempotency_key,
@@ -1737,6 +1754,39 @@ mod tests {
 
         // Same key, same body, after the condition clears: must re-execute
         // and commit — not 409 AlreadyInFlight, not a replayed refusal.
+        let second = committer.transact(req()).await;
+        let receipt = second.expect("keyed retry must re-execute and succeed");
+        assert_eq!(receipt.commit.t, 1);
+        assert_eq!(scripted.calls(), 2, "executor must run once per attempt");
+    }
+
+    /// The same pin for a refusal because this node has not loaded the
+    /// ledger's index: a keyed retry once it loads re-executes. Mutation
+    /// check: flipping its arm of `is_settled` to `false` fails this test
+    /// with `AlreadyInFlight` on the retry.
+    #[tokio::test]
+    async fn keyed_retry_after_index_not_loaded_reexecutes() {
+        let scripted = ScriptedNoveltyExecutor::refusing(|| SubmissionError::IndexNotLoaded {
+            message: "Index not loaded: the ledger's index (t=1) is not loaded".into(),
+        });
+        let committer: CachingCommitter<ScriptedNoveltyExecutor> = CachingCommitter {
+            executor: scripted.clone(),
+            cache: Cache::builder()
+                .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+                .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+                .weigher(weigh_cached_submission)
+                .build(),
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: Arc::new(DashMap::new()),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        };
+
+        let req = || request("test/db:main", Some("ingest-2"), sample_insert("a"));
+        let first = committer.transact(req()).await;
+        assert!(
+            matches!(first, Err(SubmissionError::IndexNotLoaded { .. })),
+            "first attempt must surface the refusal, got {first:?}"
+        );
         let second = committer.transact(req()).await;
         let receipt = second.expect("keyed retry must re-execute and succeed");
         assert_eq!(receipt.commit.t, 1);

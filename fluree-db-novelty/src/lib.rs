@@ -549,6 +549,9 @@ pub struct Novelty {
     /// both the index root and novelty report no list rows. Never cleared —
     /// a trimmed overlay keeps the bit; the indexed root takes over.
     pub has_list_meta: bool,
+    /// The predicates of the flakes behind [`Self::has_list_meta`]. Sticky
+    /// the same way, and shared so a clone stays cheap.
+    pub list_predicates: std::sync::Arc<std::collections::HashSet<Sid>>,
     /// Sticky: some assertion in this overlay holds a term whose persisted
     /// index key keeps less than the term
     /// ([`FlakeValue::index_key_loses_detail`](fluree_db_core::FlakeValue::index_key_loses_detail)).
@@ -597,6 +600,17 @@ fn flake_has_lossy_index_term(flake: &Flake) -> bool {
 }
 
 impl Novelty {
+    /// Record `flake`'s list position in [`Self::has_list_meta`] and
+    /// [`Self::list_predicates`].
+    fn note_list_meta(&mut self, flake: &Flake) {
+        if flake_has_list_meta(flake) {
+            self.has_list_meta = true;
+            if !self.list_predicates.contains(&flake.p) {
+                std::sync::Arc::make_mut(&mut self.list_predicates).insert(flake.p.clone());
+            }
+        }
+    }
+
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
         Self {
@@ -609,6 +623,7 @@ impl Novelty {
             schema_epoch: 0,
             shacl_epoch: 0,
             has_list_meta: false,
+            list_predicates: Default::default(),
             has_lossy_index_terms: false,
             config_write_t: 0,
             attachments: AttachmentNovelty::new(),
@@ -980,7 +995,7 @@ impl Novelty {
             // SHACL-vocabulary flake invalidates the compiled-shapes cache.
             schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
             shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
-            self.has_list_meta |= flake_has_list_meta(&flake);
+            self.note_list_meta(&flake);
             self.has_lossy_index_terms |= flake_has_lossy_index_term(&flake);
             per_graph.entry(g_id).or_default().push(flake);
         }
@@ -1082,7 +1097,7 @@ impl Novelty {
                 if fluree_db_core::namespaces::is_shacl_affecting_flake(&flake) {
                     self.shacl_epoch += 1;
                 }
-                self.has_list_meta |= flake_has_list_meta(&flake);
+                self.note_list_meta(&flake);
                 self.has_lossy_index_terms |= flake_has_lossy_index_term(&flake);
                 per_graph.entry(g_id).or_default().push(flake);
             }
@@ -1512,6 +1527,10 @@ use fluree_db_core::OverlayProvider;
 impl OverlayProvider for Novelty {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn list_predicates(&self) -> Option<std::sync::Arc<std::collections::HashSet<Sid>>> {
+        Some(std::sync::Arc::clone(&self.list_predicates))
     }
 
     fn epoch(&self) -> u64 {
