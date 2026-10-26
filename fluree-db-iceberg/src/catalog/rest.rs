@@ -564,6 +564,14 @@ mod tests {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+    /// A mock catalog on a port of its own. Not `MockServer::start()`: that
+    /// hands out pooled servers, so a test can get a URL an earlier test
+    /// used, and the process-wide route-prefix cache (`lock_prefixes`, keyed
+    /// by catalog URL + warehouse) would answer it with that test's prefix.
+    async fn mock_catalog() -> MockServer {
+        MockServer::builder().start().await
+    }
+
     /// A test client pointed at a wiremock server. Uses a PLAIN reqwest client so
     /// the loopback mock is reachable (the production `new` hardens against
     /// loopback for SSRF), and injects `sem` as the catalog semaphore.
@@ -618,7 +626,7 @@ mod tests {
         // 403 on loadTable (and 401 surviving the token refresh, with NoAuth's
         // no-op refresh) is the catalog refusing this principal.
         for status in [403, 401] {
-            let server = MockServer::start().await;
+            let server = mock_catalog().await;
             serve_config(&server, serde_json::json!({})).await;
             Mock::given(method("GET"))
                 .and(path("/v1/namespaces/db/tables/events"))
@@ -651,7 +659,7 @@ mod tests {
         // can come with another test's cached route prefix.
         let user_project_denied = serde_json::json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
             "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "USER_PROJECT_DENIED"}]}});
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(&server, serde_json::json!({})).await;
         Mock::given(method("GET"))
             .and(path("/v1/namespaces/db/tables/events"))
@@ -670,7 +678,7 @@ mod tests {
         }
         assert!(err.to_string().contains("quota_project"), "{err}");
 
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
             .respond_with(ResponseTemplate::new(403).set_body_string(
@@ -708,7 +716,7 @@ mod tests {
                 Ok(())
             }
         }
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(&server, serde_json::json!({})).await;
         serve_table(&server, "/v1/namespaces/db/tables/events").await;
         // A warehouse no other test uses (pooled mock servers reuse URLs).
@@ -723,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prefix_the_catalog_names_is_used_whole() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
             .and(query_param("warehouse", "lake&x=y"))
@@ -745,7 +753,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_default_prefix_is_used_when_nothing_overrides_it() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(
             &server,
             serde_json::json!({"defaults": {"prefix": "main"}, "overrides": {}}),
@@ -760,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_catalog_naming_no_prefix_is_read_without_one() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(
             &server,
             serde_json::json!({"defaults": {}, "overrides": {}}),
@@ -776,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_catalog_without_a_config_route_keeps_the_warehouse_as_its_prefix() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
 
         loads(&warehouse_client(&server.uri(), Some("lake")), "db")
@@ -786,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_route_that_fails_is_not_read_as_no_prefix() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
             .respond_with(ResponseTemplate::new(403).set_body_string("no"))
@@ -807,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_catalog_is_asked_for_its_prefix_once() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(&server, serde_json::json!({"overrides": {"prefix": "p"}})).await;
         serve_table(&server, "/v1/p/namespaces/db/tables/events").await;
 
@@ -826,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_config_route_is_asked_again_not_cached() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
             .respond_with(ResponseTemplate::new(404))
@@ -900,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_on_429_then_succeeds() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         let calls = Arc::new(AtomicUsize::new(0));
         Mock::given(method("GET"))
             .respond_with(FlakyResponder {
@@ -921,7 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn gives_up_after_max_retries_and_surfaces_the_error() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
             .mount(&server)
@@ -948,7 +956,7 @@ mod tests {
         // Each response is delayed, so with a 2-permit semaphore, 6 requests run in
         // 3 waves ≈ 3×delay; an unbounded (6-permit) client finishes in ≈1×delay.
         let delay = Duration::from_millis(120);
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
