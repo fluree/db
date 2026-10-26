@@ -1334,6 +1334,104 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
     }
 }
 
+/// A full read pinned to a snapshot returns that snapshot whole, whatever the
+/// per-pass budget. The budget paces the tracking worker's unpinned passes; a
+/// consumer that pins a snapshot and gets a prefix back has silently lost rows.
+///
+/// Both routes a cut can take are crossed. On `people_window` every snapshot is
+/// retained, so a cut checkpoints at an earlier snapshot and reports it as the
+/// read's `to` with no sequence — nothing a caller can tell from a whole read.
+/// On `people_backlog` nothing near the start is retained, so a cut records a
+/// sequence cursor instead. A pin resuming from a cursor reads everything above
+/// it, which crosses the cursor path's own cut.
+///
+/// Assumes `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` and
+/// `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` are unset, as they are in CI.
+#[tokio::test]
+async fn a_pinned_full_read_is_never_cut_by_the_row_budget() {
+    allow_fixture_roots();
+    // The ceiling the drain tests use, so the budget cuts inside the second
+    // 600-row commit of a 3,000-row table.
+    let fluree = FlureeBuilder::memory()
+        .with_indexing_thresholds(64 * 1024, 500 * 1024)
+        .build_memory();
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let budget = provider.pass_row_budget();
+    assert!(
+        (601..=1200).contains(&budget),
+        "an unpinned read of these tables must be cut for this test to mean \
+         anything: budget={budget}"
+    );
+
+    async fn read_all(stream: fluree_db_query::r2rml::ColumnBatchStream) -> usize {
+        let batches: Vec<_> = stream.try_collect().await.expect("stream batches");
+        batches.iter().map(|b| b.num_rows).sum()
+    }
+
+    for fixture in ["people_window", "people_backlog"] {
+        let location = format!(
+            "file://{}/tests/fixtures/iceberg/silver/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let table = format!("silver.{fixture}");
+        let mapping = PEOPLE_R2RML.replace("silver.people", &table);
+        let config = R2rmlCreateConfig::new_direct(fixture, &location, &mapping)
+            .with_mapping_media_type("text/turtle");
+        fluree
+            .create_r2rml_graph_source(config)
+            .await
+            .expect("create graph source");
+        let gs = format!("{fixture}:main");
+        let head = provider
+            .current_snapshot_id(&gs, &table)
+            .await
+            .expect("current snapshot")
+            .expect("fixture has snapshots");
+
+        let scan = provider
+            .scan_for_materialize_stream(&gs, &table, &[], None, Some(head), None)
+            .await
+            .expect("pinned full read");
+        assert!(!scan.incremental, "{fixture}: no window, so a full read");
+        assert_eq!(
+            scan.to_snapshot_id,
+            Some(head),
+            "{fixture}: reports its pin"
+        );
+        assert_eq!(scan.to_sequence, None, "{fixture}: not a prefix");
+        assert_eq!(
+            read_all(scan.stream).await,
+            3000,
+            "{fixture}: every row of the pin"
+        );
+    }
+
+    // Commits 3..=5 lie above a cursor at 2, and all of them are read.
+    let scan = provider
+        .scan_for_materialize_stream(
+            "people_backlog:main",
+            "silver.people_backlog",
+            &[],
+            None,
+            Some(
+                provider
+                    .current_snapshot_id("people_backlog:main", "silver.people_backlog")
+                    .await
+                    .expect("current snapshot")
+                    .expect("fixture has snapshots"),
+            ),
+            Some(2),
+        )
+        .await
+        .expect("pinned read resumed from a cursor");
+    assert_eq!(scan.to_sequence, None, "not a prefix");
+    assert_eq!(
+        read_all(scan.stream).await,
+        1800,
+        "every commit above the cursor"
+    );
+}
+
 /// A graph source sharing the default graph with a ledger is refused, in
 /// SPARQL and JSON-LD alike — the default graph would not union it in, and a
 /// query that silently read only some of its sources would be wrong. Named

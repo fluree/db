@@ -210,6 +210,10 @@ A commit reference that names no commit of the ledger (an `@commit:` pin,
 `err:db/CommitNotFound`. A malformed one (too short, an abbreviated CID, or a
 prefix that matches several commits) is a 400.
 
+A reference that names another ledger where only the target ledger can be
+read (a ledger route's dataset, a view's JSON-LD `from`, an update's `USING`)
+is a 400, as is one whose grammar is wrong.
+
 #### 408 Request Timeout
 
 The request took too long to process.
@@ -409,6 +413,10 @@ An unexpected error occurred on the server.
 - Unhandled exception
 - Database error
 - Internal logic error
+- A nameservice lookup a query needed failed, for instance while checking
+  whether a `GRAPH <iri>` names a graph source (`err:system/NameServiceError`).
+  The query fails rather than read a possible graph source as an empty graph;
+  the request itself was fine, so retry it.
 
 **Example:**
 ```json
@@ -460,6 +468,7 @@ of them indicate a fault in the request. The `@type` identifies the cause:
 | `err:db/NoveltyAtMax` | Novelty backpressure: in-memory novelty is at `reindex_max_bytes` (or this transaction would cross it, while still fitting once novelty drains). Clears when the indexer catches up. |
 | `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
 | `err:db/CommitContention` | Every commit attempt the server made lost its race with other writers to the same ledger. Nothing was committed; the same request can succeed once the other writers ease off. |
+| `err:db/IndexNotLoaded` | The server has not loaded the ledger's index: it failed to load, or the one the server holds is older than the ledger's. The write was refused before it read or committed anything; the same request can succeed once the index loads. |
 | `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
 
 **Example:**
@@ -480,10 +489,12 @@ Retry-After: 5
 **How to Fix:**
 - Wait at least `Retry-After` seconds, then retry the same request
 - Idempotent retries are safe: replay the request with the same
-  `Idempotency-Key` — a novelty refusal does not consume the key
+  `Idempotency-Key` — a novelty or index-not-loaded refusal does not
+  consume the key
 - Keep your own exponential backoff as the outer bound for repeated 503s
 - If a ledger 503s persistently, check indexer health and
-  `--reindex-max-bytes` sizing
+  `--reindex-max-bytes` sizing; for `err:db/IndexNotLoaded`, check the
+  server log for why the ledger's index failed to load
 
 #### 504 Gateway Timeout
 

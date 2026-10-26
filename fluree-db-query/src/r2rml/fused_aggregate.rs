@@ -2338,12 +2338,19 @@ impl FusedR2rmlAggregateOperator {
         } else {
             Some(ctx.to_t)
         };
+        // Only a graph that is an R2RML source has a mapping to load; for one
+        // that is (the precomputed set or a probe says so), a failed load fails
+        // the query instead of reading the source through the native fallback.
+        // A graph loaded as a ledger graph is never probed.
         let mapping = match ctx.r2rml_provider {
-            Some(provider) => provider
-                .compiled_mapping(&self.graph_iri, as_of_t)
-                .await
-                .ok(),
-            None => None,
+            Some(provider)
+                if ctx.r2rml_graph_ids.contains(self.graph_iri.as_ref())
+                    || (!ctx.graph_is_native(&self.graph_iri)
+                        && provider.has_r2rml_mapping(&self.graph_iri).await?) =>
+            {
+                Some(provider.compiled_mapping(&self.graph_iri, as_of_t).await?)
+            }
+            _ => None,
         };
 
         // Rewrite the inner triples for this graph using the active snapshot.
@@ -5673,6 +5680,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         }
     }
 
@@ -5851,8 +5859,8 @@ mod tests {
         struct MapProvider(Arc<CompiledR2rmlMapping>);
         #[async_trait]
         impl R2rmlProvider for MapProvider {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -5935,8 +5943,8 @@ mod tests {
         }
         #[async_trait]
         impl R2rmlProvider for P {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -6324,8 +6332,8 @@ mod tests {
         }
         #[async_trait]
         impl R2rmlProvider for P {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -6579,8 +6587,8 @@ mod tests {
         }
         #[async_trait]
         impl R2rmlProvider for P {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -6869,6 +6877,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6901,6 +6910,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6941,6 +6951,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_none());
     }
@@ -7340,6 +7351,7 @@ mod tests {
                 union_default_graph: None,
                 cypher_vocab: None,
                 unmatched_optional: Default::default(),
+                rdf_list_view: false,
             };
             assert!(detect_fused_r2rml_aggregate(&q).is_some());
         }
@@ -7732,8 +7744,8 @@ mod tests {
     }
     #[async_trait]
     impl crate::r2rml::R2rmlProvider for CrtProvider {
-        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,

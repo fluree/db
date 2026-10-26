@@ -73,8 +73,8 @@ impl MockR2rmlProvider {
 
 #[async_trait]
 impl R2rmlProvider for MockR2rmlProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -224,7 +224,7 @@ async fn test_mock_r2rml_provider() {
     let provider = MockR2rmlProvider::new(mapping, vec![batch]);
 
     // Test has_r2rml_mapping
-    assert!(provider.has_r2rml_mapping("test-gs:main").await);
+    assert!(provider.has_r2rml_mapping("test-gs:main").await.unwrap());
 
     // Test compiled_mapping
     let loaded = provider
@@ -939,8 +939,8 @@ struct IcebergDirectProvider {
 
 #[async_trait]
 impl R2rmlProvider for IcebergDirectProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -1483,6 +1483,53 @@ async fn engine_e2e_wildcard_binds_predicate_var() {
     assert_eq!(type_rows, 3, "exactly one rdf:type row per subject");
 }
 
+/// SPARQL reads the ledger's RDF lists through a list view, which wraps a
+/// variable-predicate pattern. An R2RML graph source holds no lists, so a
+/// wildcard inside `GRAPH <source>` still scans the source on a ledger that
+/// holds a list.
+#[tokio::test]
+async fn engine_e2e_wildcard_over_a_ledger_holding_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "r2rml-wild-lists:main");
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\nex:config ex:order (1 2) .",
+        )
+        .await
+        .expect("insert a list")
+        .ledger;
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Var(p),
+            Term::Var(o),
+        ))],
+    }];
+    parsed.output = QueryOutput::select_all(vec![s, p, o]);
+    parsed.rdf_list_view = true;
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &*ledger.novelty, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("R2RML scan should execute");
+    let rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(rows, 12, "3 airlines x (3 predicates + rdf:type)");
+}
+
 /// Regression (fluree/db#1406 review): a class and a predicate that live in
 /// SEPARATE TriplesMaps sharing a subject template must NOT be fused. Fusing the
 /// class into the predicate star would make TriplesMap resolution require one map
@@ -1503,8 +1550,8 @@ async fn engine_e2e_split_triples_map_class_and_predicate_not_fused() {
 
     #[async_trait]
     impl R2rmlProvider for SplitTableProvider {
-        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,
@@ -1685,10 +1732,10 @@ async fn engine_e2e_provider_method_calls() {
 
     #[async_trait]
     impl R2rmlProvider for TrackingProvider {
-        async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
+        async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
             eprintln!("has_r2rml_mapping called for: {graph_source_id}");
             self.has_mapping_called.store(true, Ordering::SeqCst);
-            graph_source_id == "airlines-gs:main"
+            Ok(graph_source_id == "airlines-gs:main")
         }
 
         async fn compiled_mapping(
@@ -2442,8 +2489,8 @@ struct MultiTableMockProvider {
 
 #[async_trait]
 impl R2rmlProvider for MultiTableMockProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -2680,8 +2727,8 @@ struct RecordingTableProvider {
 
 #[async_trait]
 impl R2rmlProvider for RecordingTableProvider {
-    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
 
     async fn compiled_mapping(
@@ -3471,8 +3518,8 @@ impl CountingProvider {
 
 #[async_trait]
 impl R2rmlProvider for CountingProvider {
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        graph_source_id == "edw-gs:main"
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
     }
 
     async fn compiled_mapping(
@@ -4015,8 +4062,8 @@ struct LimitProbeProvider {
 
 #[async_trait]
 impl R2rmlProvider for LimitProbeProvider {
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        graph_source_id == "edw-gs:main"
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
     }
     async fn compiled_mapping(
         &self,
@@ -4089,8 +4136,8 @@ struct FilterCapturingProvider {
 
 #[async_trait::async_trait]
 impl R2rmlProvider for FilterCapturingProvider {
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        graph_source_id == "edw-gs:main"
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
     }
     async fn compiled_mapping(
         &self,
@@ -4769,8 +4816,8 @@ struct MultiTableMock {
 
 #[async_trait]
 impl R2rmlProvider for MultiTableMock {
-    async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-        true
+    async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
     }
     async fn compiled_mapping(
         &self,
