@@ -84,7 +84,13 @@ decomposition:
 4. **RETURN** — answered by one final read query (`VALUES(final rows) RETURN
    items`) against the final virtual state: full expression surface
    (projections, `DISTINCT`, `ORDER BY`, `SKIP`/`LIMIT`) rather than the
-   created-entity-only reconstruction single-Txn writes use.
+   created-entity-only reconstruction single-Txn writes use. The RETURN is
+   the only reader of the state after the last write clause, so a statement
+   without one stages its last clause (unless it's a MERGE, which probes its
+   own writes) without building that state, as SPARQL's last `;` operation
+   does. The final state reaches a caller only with the answered RETURN
+   (`AnsweredReturn`); the `cypher_unread_final_state` stamp records which way
+   a statement went.
 
 ## Row threading representation
 
