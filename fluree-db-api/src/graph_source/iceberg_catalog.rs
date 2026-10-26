@@ -2054,6 +2054,93 @@ mod tests {
         assert!(fluree.secret_resolver().is_none());
     }
 
+    #[derive(Debug)]
+    struct TenantSubject;
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::AwsSubjectCredentials for TenantSubject {
+        fn principal_key(&self) -> String {
+            "arn:aws:iam::123456789012:role/tenant/session-a".to_string()
+        }
+        async fn credentials(
+            &self,
+        ) -> fluree_db_iceberg::Result<fluree_db_iceberg::AwsCredentials> {
+            Ok(fluree_db_iceberg::AwsCredentials::new(
+                "AKID", "SECRET", None, None, "test",
+            ))
+        }
+        fn region(&self) -> Option<String> {
+            Some("us-east-1".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn host_identity_policy_and_aws_subject_clone_and_leave_original_untouched() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let original = fluree.identity_context().cache_scope();
+        let restricted =
+            fluree.with_host_identity_policy(fluree_db_iceberg::HostIdentityPolicy::deny_all());
+        let tenant = fluree.with_aws_subject_credentials(std::sync::Arc::new(TenantSubject));
+
+        assert_eq!(
+            restricted.identity_context().policy,
+            fluree_db_iceberg::HostIdentityPolicy::deny_all()
+        );
+        assert!(tenant.identity_context().aws_subject.is_some());
+        assert_eq!(fluree.identity_context().cache_scope(), original);
+        assert_eq!(
+            fluree.identity_context().policy,
+            fluree_db_iceberg::HostIdentityPolicy::allow_all()
+        );
+        assert!(fluree.identity_context().aws_subject.is_none());
+        // Each derived context keys the shared client caches apart.
+        assert_ne!(restricted.identity_context().cache_scope(), original);
+        assert_ne!(tenant.identity_context().cache_scope(), original);
+    }
+
+    /// The instance's host-identity policy reaches the providers its onboarding
+    /// routes build, and the refusal is typed (403, `err:auth/HostIdentityRefused`)
+    /// before any request is made. Set per instance or on the builder.
+    #[tokio::test]
+    async fn a_refused_host_identity_is_typed_on_the_onboarding_path() {
+        let deny = fluree_db_iceberg::HostIdentityPolicy::deny_all;
+        for fluree in [
+            crate::FlureeBuilder::memory()
+                .build_memory()
+                .with_host_identity_policy(deny()),
+            crate::FlureeBuilder::memory()
+                .with_host_identity_policy(deny())
+                .build_memory(),
+        ] {
+            let conn = IcebergConnectionConfig::rest("https://unreachable.invalid")
+                .with_auth_google_metadata(None);
+            let err = fluree
+                .browse_iceberg_catalog(conn, BrowseDepth::Namespaces)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    crate::ApiError::Query(fluree_db_query::QueryError::HostIdentityRefused {
+                        kind,
+                        ..
+                    }) if kind == "google-metadata"
+                ),
+                "{err:?}"
+            );
+            assert_eq!(err.status_code(), 403);
+            assert_eq!(
+                err.error_type(),
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED
+            );
+            assert!(
+                err.to_string()
+                    .contains(fluree_db_iceberg::HOST_IDENTITIES_ENV),
+                "{err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn hydrate_conn_fails_closed_before_network_when_ref_has_no_resolver() {
         // No resolver injected + SecretRef auth ⇒ hydrate_conn errors with an

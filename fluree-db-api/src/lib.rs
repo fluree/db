@@ -293,8 +293,8 @@ pub use fluree_db_iceberg::ConfigValue as IcebergConfigValue;
 /// [`Fluree::with_aws_subject_credentials`].
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::{
-    AwsSubjectCredentials, HostIdentityKind, HostIdentityPolicy, AMBIENT_BUCKETS_ENV,
-    HOST_IDENTITIES_ENV,
+    AwsCredentials, AwsSubjectCredentials, HostIdentityKind, HostIdentityPolicy,
+    AMBIENT_BUCKETS_ENV, HOST_IDENTITIES_ENV,
 };
 /// A Google identity's credential source, and which identity reads a graph
 /// source's storage.

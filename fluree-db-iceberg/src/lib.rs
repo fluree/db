@@ -88,7 +88,7 @@ pub(crate) fn env_switch_enabled(name: &str) -> bool {
 
 // Re-export commonly used types
 #[cfg(feature = "aws")]
-pub use auth::AwsSubjectCredentials;
+pub use auth::{AwsCredentials, AwsSubjectCredentials};
 pub use auth::{GoogleCredentials, IdentityContext};
 pub use config::{
     CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, StorageAuth,

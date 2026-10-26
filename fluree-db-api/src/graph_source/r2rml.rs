@@ -5931,6 +5931,84 @@ mod tests {
         .unwrap()
     }
 
+    /// The client cache is shared by every clone of a `Fluree`, so a client built
+    /// under one identity context (AWS subject, host-identity policy) must never
+    /// be handed to another.
+    #[test]
+    fn the_client_cache_key_is_scoped_by_identity_context() {
+        #[derive(Debug)]
+        struct Subject(&'static str);
+        #[async_trait]
+        impl fluree_db_iceberg::AwsSubjectCredentials for Subject {
+            fn principal_key(&self) -> String {
+                self.0.to_string()
+            }
+            async fn credentials(
+                &self,
+            ) -> fluree_db_iceberg::Result<fluree_db_iceberg::AwsCredentials> {
+                Err(IcebergError::Credential("unused".to_string()))
+            }
+            fn region(&self) -> Option<String> {
+                None
+            }
+        }
+        let raw = gs_config_json(oauth2_auth(fluree_db_iceberg::ConfigValue::literal("s")));
+        let subject = |key: &'static str| fluree_db_iceberg::IdentityContext {
+            aws_subject: Some(Arc::new(Subject(key))),
+            ..Default::default()
+        };
+        let keys = [
+            fluree_db_iceberg::IdentityContext::default(),
+            fluree_db_iceberg::IdentityContext {
+                policy: fluree_db_iceberg::HostIdentityPolicy::deny_all(),
+                ..Default::default()
+            },
+            subject("tenant-a"),
+            subject("tenant-b"),
+        ]
+        .map(|identity| catalog_client_cache_key("gs-1", &raw, &identity));
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(
+            catalog_client_cache_key("gs-1", &raw, &subject("tenant-a")),
+            keys[2],
+            "the same context keys the same client"
+        );
+    }
+
+    /// The query path builds its catalog client under the instance's identity
+    /// context: a host identity the policy refuses is a typed 403, not an
+    /// internal error, and nothing is cached for it.
+    #[tokio::test]
+    async fn the_query_path_builds_catalog_auth_under_the_instance_policy() {
+        use fluree_db_iceberg::auth::AuthConfig;
+        let fluree = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(fluree_db_iceberg::HostIdentityPolicy::deny_all());
+        let raw = gs_config_json(AuthConfig::GoogleMetadata {
+            scopes: None,
+            metadata_url: None,
+        });
+        let config = IcebergGsConfig::from_json(&raw).unwrap();
+        let err = shared_catalog_client(&fluree, "gs-policy", &raw, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, QueryError::HostIdentityRefused { kind, .. } if kind == "google-metadata"),
+            "{err:?}"
+        );
+        // The same source on an instance that allows it builds (no network
+        // until the first catalog request).
+        let open = crate::FlureeBuilder::memory().build_memory();
+        assert!(shared_catalog_client(&open, "gs-policy", &raw, &config)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     /// The fingerprint keys the process-wide REST client cache. It MUST be stable
     /// across secret rotations (so a warm server does one OAuth exchange per client
     /// lifetime, not one per query) — which holds ONLY because it is computed over

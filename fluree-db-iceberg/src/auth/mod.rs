@@ -19,12 +19,12 @@ mod oauth2;
 mod token;
 
 pub use bearer::BearerTokenAuth;
-#[cfg(feature = "aws")]
-pub use google::AwsSubjectCredentials;
 pub use google::{
     AccessToken, ExternalAccountConfig, GoogleCatalogAuth, GoogleCredentials, GoogleIdentity,
     GoogleSource,
 };
+#[cfg(feature = "aws")]
+pub use google::{AwsCredentials, AwsSubjectCredentials};
 pub use oauth2::{OAuth2ClientCredentials, OAuth2Config};
 
 use crate::config_value::{ConfigValue, SecretResolver};

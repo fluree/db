@@ -30,6 +30,10 @@ mod metadata;
 mod service_account;
 mod wire;
 
+/// The credential type [`AwsSubjectCredentials::credentials`] returns,
+/// re-exported so an embedder implements the trait against the same version.
+#[cfg(feature = "aws")]
+pub use aws_credential_types::Credentials as AwsCredentials;
 #[cfg(feature = "aws")]
 pub use aws_subject::AwsSubjectCredentials;
 pub use credentials::{ExternalAccountConfig, GoogleCredentials};
