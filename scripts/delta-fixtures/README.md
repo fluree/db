@@ -25,8 +25,11 @@ uv run --locked --python 3.12 scripts/delta-fixtures/spark_fixture.py /tmp/delta
   (rename, drop, re-add over one Parquet file), `in_commit_time`,
   `history_loss` (a version whose data file is gone), `checkpointed` and
   `log_cleaned` (the same 13-commit table with and without the commits below
-  its checkpoint), `types` (every scalar type plus a row of nulls) and
-  `partitioned`. Small Parquet pages and row groups are deliberate: they are
+  its checkpoint), `types` (every scalar type plus a row of nulls),
+  `partitioned`, `change_feed` (an update, a delete, an append, a MERGE that
+  updates, inserts and deletes, and a deleted key inserted again, with its
+  change data feed on throughout) and `change_feed_late` (its feed turned on
+  at version 2). Small Parquet pages and row groups are deliberate: they are
   what lets the pruning tests see inside a file.
 
 Data and expected rows are repeatable; commit timestamps, table ids and file

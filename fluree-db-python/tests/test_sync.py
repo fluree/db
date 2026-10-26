@@ -62,11 +62,12 @@ def test_named_graph_and_turtle(ledger):
     assert names(ledger) == ["Zed"]
 
 
-def test_empty_data_needs_allow_empty(ledger):
+@pytest.mark.parametrize("empty", [{"@graph": []}, []])
+def test_empty_data_needs_allow_empty(ledger, empty):
     ledger.sync(staff("Alice"))
     with pytest.raises(InvalidRequestError, match="allowEmpty"):
-        ledger.sync({"@graph": []})
-    cleared = ledger.sync({"@graph": []}, allow_empty=True)
+        ledger.sync(empty)
+    cleared = ledger.sync(empty, allow_empty=True)
     assert cleared.retracts == 1
     assert names(ledger) == []
 
