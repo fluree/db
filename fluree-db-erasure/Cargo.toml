@@ -16,6 +16,8 @@ thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 libc = "0.2"
+# Staging an installed prover.
+tempfile = "3"
 # Scratch directories of ended processes.
 fluree-db-core = { path = "../fluree-db-core" }
 
@@ -25,6 +27,5 @@ fluree-db-core = { path = "../fluree-db-core" }
 testing = ["fluree-db-redaction/rust-zstd"]
 
 [dev-dependencies]
-tempfile = "3"
 fluree-db-core = { path = "../fluree-db-core", features = ["credential"] }
 fluree-db-credential = { path = "../fluree-db-credential" }

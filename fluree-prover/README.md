@@ -49,15 +49,16 @@ Any change to `fluree-db-redaction` that reaches the guest changes the id: add t
 `REDACT_IMAGE_IDS`, and remove an old one only when no stored proof uses it.
 
 `cargo run --release -p fluree-prover-methods --example image_id` prints the id without
-building the prover. CI (`.github/workflows/prover.yml`) rebuilds the guest whenever a change
-reaches it, and fails unless `REDACT_IMAGE_IDS` pins the id (`check-image-id.py`). A release
-(`.github/workflows/release.yml`) builds the guest once, builds each platform's prover from it,
-checks each the same way, and attaches it to the release.
+building the prover. `.github/workflows/prover-build.yml` builds the guest once, builds each
+platform's prover from it, and fails unless `REDACT_IMAGE_IDS` pins the id
+(`check-image-id.py`). A release (`release.yml`) runs it and attaches each prover; CI
+(`prover.yml`) runs it, without publishing, whenever a change reaches the guest or the build,
+and by hand.
 
 ## Running
 
 A server finds the prover beside its own binary, else on the PATH, unless `--erasure-prover`
 names it, and checks its image id at startup. Fluree's configuration names its scratch directory,
-thread count and timeout; it runs at nice 10 and, on Linux, first in line for the OOM killer. One
-step at a time is the default; a step that runs past its timeout is killed with its process group
+thread count and timeout; it runs at nice 10 and, on Linux, as the OOM killer's preferred victim.
+One step at a time is the default; a step that runs past its timeout is killed with its process group
 and retried later. The prover refuses to run with `RISC0_DEV_MODE` set, and Fluree clears it.

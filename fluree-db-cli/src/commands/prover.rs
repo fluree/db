@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use colored::Colorize;
-use fluree_db_api::retention::erasure::{check_prover, find_prover, PROVER_BINARY};
+use fluree_db_api::retention::erasure::{check_prover, find_prover, install_prover, PROVER_BINARY};
 use sha2::{Digest, Sha256};
 
 use crate::cli::ProverAction;
@@ -133,21 +133,7 @@ async fn install(base: &str, target: &str, dir: &Path, force: bool) -> CliResult
         .map_err(|e| failed(format!("unpacking {asset}: {e}")))?;
 
     std::fs::create_dir_all(dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
-    let staged = tempfile::Builder::new()
-        .prefix(".fluree-prover-")
-        .tempfile_in(dir)
-        .map_err(|e| failed(format!("{}: {e}", dir.display())))?;
-    std::fs::write(staged.path(), &binary).map_err(|e| failed(e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| failed(e.to_string()))?;
-    }
-    check_prover(staged.path()).map_err(failed)?;
-    staged
-        .persist(&dest)
-        .map_err(|e| failed(format!("{}: {}", dest.display(), e.error)))?;
+    install_prover(&binary, &dest).map_err(failed)?;
     Ok(dest)
 }
 

@@ -54,19 +54,25 @@ pub struct ProverConfig {
 /// The prover's executable name.
 pub const PROVER_BINARY: &str = "fluree-prover";
 
-/// Where the prover is: `explicit` when given, else `fluree-prover` beside
-/// the running executable, else the first on the `PATH`.
+/// Where the prover is, as an absolute path: `explicit` when given, else
+/// `fluree-prover` beside the running executable, else the first on the
+/// `PATH`.
 pub fn find_prover(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(explicit) = explicit {
-        return Some(explicit.to_path_buf());
-    }
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default();
-    find_in(beside.into_iter().chain(path))
+    let found = match explicit {
+        Some(explicit) => Some(explicit.to_path_buf()),
+        None => {
+            let beside = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf));
+            let path = std::env::var_os("PATH")
+                .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+                .unwrap_or_default();
+            find_in(beside.into_iter().chain(path))
+        }
+    };
+    // Steps run in their scratch directories, where a relative path names
+    // nothing.
+    found.map(|p| std::path::absolute(&p).unwrap_or(p))
 }
 
 fn find_in(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
@@ -78,11 +84,40 @@ fn find_in(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
 
 /// Check that `prover` proves an image this build accepts
 /// ([`crate::REDACT_IMAGE_IDS`]): a prover of another release makes proofs
-/// every check here refuses.
+/// every check here refuses. A prover that does not answer within ten
+/// seconds is killed and refused.
 pub fn check_prover(prover: &Path) -> Result<(), String> {
-    let output = std::process::Command::new(prover)
+    check_within(prover, CHECK_TIMEOUT)
+}
+
+/// How long `--image-id`, which prints a constant, may take.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn check_within(prover: &Path, timeout: Duration) -> Result<(), String> {
+    let mut command = std::process::Command::new(prover);
+    command
         .arg("--image-id")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let child = command
+        .spawn()
+        .map_err(|e| format!("{}: {e}", prover.display()))?;
+    let _group = Group(Some(child.id()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx
+        .recv_timeout(timeout)
+        .map_err(|_| {
+            format!(
+                "{} --image-id did not answer within {timeout:?}",
+                prover.display()
+            )
+        })?
         .map_err(|e| format!("{}: {e}", prover.display()))?;
     if !output.status.success() {
         return Err(format!(
@@ -110,6 +145,31 @@ pub fn check_prover(prover: &Path) -> Result<(), String> {
             printed.trim()
         )),
     }
+}
+
+/// Install `binary` at `dest` once it passes [`check_prover`]: staged
+/// beside `dest`, then renamed into place, so `dest` is never a prover
+/// that failed the check.
+pub fn install_prover(binary: &[u8], dest: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let dir = dest.parent().unwrap_or(Path::new("."));
+    let mut staged = tempfile::Builder::new()
+        .prefix(".fluree-prover-")
+        .tempfile_in(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    staged.write_all(binary).map_err(|e| e.to_string())?;
+    // Closed before it runs: Linux refuses to run a file open for writing.
+    let staged = staged.into_temp_path();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+    check_prover(&staged)?;
+    staged
+        .persist(dest)
+        .map_err(|e| format!("{}: {}", dest.display(), e.error))
 }
 
 /// Runs [`ProverConfig::command`] once per step: the request on stdin, the
@@ -170,7 +230,8 @@ impl Drop for Group {
 }
 
 /// The command a step runs: in `scratch`, at low priority, in its own
-/// process group, and the first the kernel kills when memory runs out.
+/// process group, and the process the kernel prefers to kill when memory
+/// runs out.
 fn command(config: &ProverConfig, scratch: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(&config.command);
     // Nothing in Fluree's environment may switch the prover to fake
@@ -206,8 +267,10 @@ fn command(config: &ProverConfig, scratch: &Path) -> tokio::process::Command {
                     return Err(std::io::Error::last_os_error());
                 }
                 // Proving can take gigabytes: when memory runs out, the
-                // kernel kills the prover, whose step is retried, before
-                // the server. Raising the score needs no privilege.
+                // kernel picks the prover, whose step is retried, over the
+                // server. A cgroup with memory.oom.group set is killed
+                // whole; only a separate limit isolates the server.
+                // Raising the score needs no privilege.
                 #[cfg(target_os = "linux")]
                 {
                     let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
@@ -312,7 +375,7 @@ mod discovery_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use super::{check_prover, find_in, PROVER_BINARY};
+    use super::{check_prover, check_within, find_in, find_prover, install_prover, PROVER_BINARY};
 
     /// A stand-in prover printing `id` for `--image-id`.
     fn fake(dir: &Path, id: &str) -> std::path::PathBuf {
@@ -350,6 +413,67 @@ mod discovery_tests {
         let garbled = check_prover(&fake(dir.path(), "not an id")).unwrap_err();
         assert!(garbled.contains("no image id"), "{garbled}");
         assert!(check_prover(&dir.path().join("missing")).is_err());
+    }
+
+    /// A relative prover path resolves where it was given, not in a step's
+    /// scratch directory.
+    #[test]
+    fn the_prover_is_named_by_an_absolute_path() {
+        let found = find_prover(Some(Path::new("bin/fluree-prover"))).unwrap();
+        assert_eq!(
+            found,
+            std::env::current_dir().unwrap().join("bin/fluree-prover")
+        );
+    }
+
+    /// A prover that does not answer is killed, with its process group,
+    /// and refused.
+    #[test]
+    fn a_prover_that_does_not_answer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let hung = fake(dir.path(), "");
+        std::fs::write(
+            &hung,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let why = check_within(&hung, std::time::Duration::from_secs(2)).unwrap_err();
+        assert!(why.contains("did not answer"), "{why}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: signal 0 only checks that the process exists.
+            unsafe { libc::kill(pid, 0) != 0 }
+        });
+        assert!(gone, "the prover {pid} still runs");
+    }
+
+    /// Only a prover that passes the check is installed, and a refused one
+    /// leaves nothing behind.
+    #[test]
+    fn only_a_checked_prover_is_installed() {
+        let script = |id: &str| format!("#!/bin/sh\necho '{id}'\n").into_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(PROVER_BINARY);
+
+        let why = install_prover(&script("0x00000001"), &dest).unwrap_err();
+        assert!(why.contains("does not accept"), "{why}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        install_prover(&script(&pinned()), &dest).unwrap();
+        check_prover(&dest).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
 

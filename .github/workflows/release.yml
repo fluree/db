@@ -212,81 +212,13 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
   # The prover permanent erasure needs (`fluree prover install`), which
-  # lives outside the workspace dist builds. Its guest builds once, in RISC
-  # Zero's container pinned by digest, and every platform's prover embeds
-  # that build, so each proves the image fluree-db-erasure pins: macOS
-  # runners have no Docker to build it themselves.
-  build-prover-guest:
-    needs:
-      - plan
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - name: Install RISC Zero's toolchain (risc0-build reads its version, even in the container)
-        run: |
-          curl -sSL https://risczero.com/install | bash
-          "$HOME/.risc0/bin/rzup" install rust
-          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
-      - name: Build the guest in the pinned container
-        working-directory: fluree-prover
-        run: cargo run --locked --release -p fluree-prover-methods --example guest -- "$RUNNER_TEMP/redact.bin"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: fluree-prover-guest
-          path: ${{ runner.temp }}/redact.bin
-
-  # Each platform's prover, checked against the release's pins and attached
-  # to the release (`artifacts-*`) as a zstd-packed binary with its checksum.
+  # lives outside the workspace dist builds: each platform's, checked against
+  # the release's pins and attached (`artifacts-*`).
   build-prover:
     needs:
       - plan
-      - build-prover-guest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            runner: macos-14
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: actions/download-artifact@v7
-        with:
-          name: fluree-prover-guest
-          path: ${{ runner.temp }}/guest
-      - name: Build the prover
-        working-directory: fluree-prover
-        env:
-          FLUREE_PROVER_GUEST: ${{ runner.temp }}/guest/redact.bin
-        run: cargo build --locked --release -p fluree-prover
-      - name: Check that fluree-db-erasure pins its guest, and package it
-        shell: bash
-        run: |
-          prover="$GITHUB_WORKSPACE/fluree-prover/target/release/fluree-prover"
-          "$prover" --image-id | python3 fluree-prover/check-image-id.py
-          mkdir -p "$RUNNER_TEMP/out"
-          cd "$RUNNER_TEMP/out"
-          command -v zstd >/dev/null || brew install zstd
-          # A long window: 27 MB, against 63 MB gzipped.
-          zstd -19 --long=27 -q "$prover" -o "fluree-prover-${{ matrix.target }}.zst"
-          shasum -a 256 "fluree-prover-${{ matrix.target }}.zst" > "fluree-prover-${{ matrix.target }}.zst.sha256"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: artifacts-fluree-prover-${{ matrix.target }}
-          path: ${{ runner.temp }}/out/
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    uses: ./.github/workflows/prover-build.yml
 
   # Determines if we should publish/announce
   host:

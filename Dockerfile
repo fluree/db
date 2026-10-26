@@ -41,6 +41,8 @@ ENTRYPOINT ["/usr/local/bin/fluree-entrypoint.sh"]
 FROM server-base AS erasure
 ARG TARGETARCH
 COPY --chown=root:root --chmod=0755 docker-artifacts/${TARGETARCH}/fluree-prover /usr/local/bin/fluree-prover
+# Fails the build unless it runs here.
+RUN ["/usr/local/bin/fluree-prover", "--image-id"]
 
 # The server: the default target.
 FROM server-base AS server

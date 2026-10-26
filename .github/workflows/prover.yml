@@ -4,7 +4,8 @@ name: Prover
 # digest, so its image id depends only on its sources. Fluree accepts proofs
 # only from the ids `fluree-db-erasure` pins (REDACT_IMAGE_IDS): a change that
 # reaches the guest without a new pin would fail every proof's verification.
-# A release builds and attaches each platform's prover in release.yml.
+# This builds every platform's prover as a release does (prover-build.yml),
+# without publishing.
 on:
   pull_request:
     branches: [main, next]
@@ -14,6 +15,8 @@ on:
       - "fluree-prover/**"
       - "fluree-db-erasure/src/verify.rs"
       - ".github/workflows/prover.yml"
+      - ".github/workflows/prover-build.yml"
+      - "Dockerfile"
   push:
     branches: [main, next]
     paths:
@@ -22,6 +25,8 @@ on:
       - "fluree-prover/**"
       - "fluree-db-erasure/src/verify.rs"
       - ".github/workflows/prover.yml"
+      - ".github/workflows/prover-build.yml"
+      - "Dockerfile"
   workflow_dispatch:
 
 concurrency:
@@ -29,21 +34,5 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Rebuild the guest alone and check that its id is pinned.
-  image-id:
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - name: Install RISC Zero's toolchain (risc0-build reads its version, even in the container)
-        run: |
-          curl -sSL https://risczero.com/install | bash
-          "$HOME/.risc0/bin/rzup" install rust
-          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
-      - name: Build the guest in the pinned container
-        working-directory: fluree-prover
-        run: cargo run --locked --release -p fluree-prover-methods --example image_id > "$RUNNER_TEMP/image_id"
-      - name: Check that fluree-db-erasure pins it
-        run: python3 fluree-prover/check-image-id.py < "$RUNNER_TEMP/image_id"
+  build:
+    uses: ./.github/workflows/prover-build.yml

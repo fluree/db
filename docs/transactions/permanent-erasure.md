@@ -305,9 +305,10 @@ The prover, `fluree-prover`, is a separate binary released with each version: in
 [`fluree prover install`](../cli/prover.md), which puts it beside `fluree`, or run the server's
 container image tagged `-erasure`, which includes it. Only a server that takes erasure requests needs
 it. At startup the server finds it beside its own binary, else on the `PATH`, and checks that it
-proves an image the release accepts. It logs whether erasure is available and why not, and its
-discovery document reports `erasure.proving`. Without a prover of its release, the server runs and
-refuses erasure requests (`501`).
+proves an image the release accepts; a prover that does not answer within ten seconds is refused.
+It logs whether erasure is available and why not, and its discovery document reports
+`erasure.proving`. Without a prover of its release, the server runs and refuses erasure requests
+(`501`).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -318,11 +319,20 @@ refuses erasure requests (`501`).
 | `--erasure-prover-timeout-secs <n>` | 14400 | A step still running after this long is killed, with its process group, and retried. |
 
 Each step runs as its own process, at low priority (nice 10). Proving takes gigabytes of memory
-(about 9.6 GB for a 1,000-operation commit): on Linux the prover is the first process the kernel
-kills when memory runs out, and its step is retried, so the server keeps running. Proving on a host
-that also serves transactions slows them down unless it is limited, so give it its own cores or its
-own host. See [`fluree-prover/README.md`](https://github.com/fluree/db/blob/main/fluree-prover/README.md)
-to build it from source.
+(about 9.6 GB for a 1,000-operation commit). On Linux the prover asks to be the process the kernel
+kills when memory runs out (`oom_score_adj` 1000), so the kernel picks it over the server and its
+step is retried. That is a preference, not isolation; check two common setups:
+
+- **Kubernetes** on cgroup v2 kills a container's processes together, the server with the prover,
+  unless the kubelet sets `singleProcessOOMKill`.
+- **systemd** stops a service when the kernel kills any of its processes, unless its unit sets
+  `OOMPolicy=continue`.
+
+Only a separate memory limit, such as a container or host of its own, keeps the prover's memory
+from the server. Proving on a host that also serves transactions slows them down unless it is
+limited, so give it its own cores or its own host. See
+[`fluree-prover/README.md`](https://github.com/fluree/db/blob/main/fluree-prover/README.md) to build
+it from source.
 Fluree accepts proofs only from the guest images its build pins. The prover's guest builds in a
 pinned container, so a prover built from the same release's sources proves under the image that
 release pins.
