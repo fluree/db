@@ -664,8 +664,7 @@ impl<'l> FactIdentity<'l> {
         // Every retraction of a key pairs with an assertion of it: one fact
         // can be retracted under several terms (novelty holding a big integer
         // under two subtypes), and a retraction left over would still pair.
-        // One per key is the usual case, held inline.
-        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), SmallVec<[(usize, &'f Flake); 1]>> =
+        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), KeyRetractions<'f>> =
             FxHashMap::default();
         for (i, &f) in slot
             .iter()
@@ -699,6 +698,10 @@ impl<'l> FactIdentity<'l> {
         }
     }
 }
+
+/// The retractions of one index key in a slot, each with its position in
+/// the walk. One per key is the usual case, held inline.
+type KeyRetractions<'f> = SmallVec<[(usize, &'f Flake); 1]>;
 
 /// A retraction and an assertion of one fact ([`FactIdentity`]) in one
 /// graph at one `t` ([`FactIdentity::same_t_pairs`]).
