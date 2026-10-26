@@ -110,4 +110,18 @@ pub trait SendCatalogClient: std::fmt::Debug + Send + Sync {
         table_id: &TableIdentifier,
         request_credentials: bool,
     ) -> Result<LoadTableResponse>;
+
+    /// The table's storage credentials, vended again (to renew ones about to
+    /// expire), matched against `metadata_location` as at `loadTable`.
+    ///
+    /// The default asks for a fresh `loadTable` with credential delegation; a
+    /// REST catalog asks its per-table credentials endpoint first.
+    async fn load_credentials(
+        &self,
+        table_id: &TableIdentifier,
+        metadata_location: &str,
+    ) -> Result<Option<VendedCredentials>> {
+        let _ = metadata_location;
+        Ok(self.load_table(table_id, true).await?.credentials)
+    }
 }

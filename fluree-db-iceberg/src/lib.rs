@@ -128,6 +128,9 @@ pub use catalog::SendDirectCatalogClient;
 #[cfg(feature = "aws")]
 pub use fluree_db_core::disk_cache::DiskArtifactCache;
 #[cfg(feature = "aws")]
-pub use io::{S3IcebergStorage, SendIcebergStorage, SendParquetReader};
+pub use io::{
+    GcsIcebergStorage, IcebergStorageBackend, S3IcebergStorage, SendIcebergStorage,
+    SendParquetReader, StorageScope,
+};
 #[cfg(feature = "aws")]
 pub use scan::SendScanPlanner;

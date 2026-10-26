@@ -502,7 +502,7 @@ mod iceberg_tests {
     use fluree_db_iceberg::credential::VendedCredentials;
 
     fn creds(expires_in_secs: i64) -> VendedCredentials {
-        VendedCredentials {
+        VendedCredentials::S3(fluree_db_iceberg::credential::S3Credentials {
             access_key_id: "AKIA".to_string(),
             secret_access_key: "secret".to_string(),
             session_token: Some("token".to_string()),
@@ -510,7 +510,7 @@ mod iceberg_tests {
             endpoint: None,
             region: Some("us-east-2".to_string()),
             path_style: false,
-        }
+        })
     }
 
     fn entry(loc: &str, creds: Option<VendedCredentials>) -> Arc<CachedLoadTable> {

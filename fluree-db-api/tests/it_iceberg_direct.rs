@@ -253,6 +253,7 @@ async fn direct_catalog_full_lifecycle() {
     .await;
 
     // -- Step 2: Create storage + DirectCatalogClient and resolve --
+    #[allow(deprecated)]
     let storage = S3IcebergStorage::from_default_chain(Some(REGION), Some(&endpoint), true)
         .await
         .expect("S3IcebergStorage created");
@@ -336,6 +337,7 @@ async fn direct_catalog_missing_version_hint() {
     ensure_bucket(&sdk_config, BUCKET).await;
 
     // No version-hint.text written — table location exists but is empty
+    #[allow(deprecated)]
     let storage = S3IcebergStorage::from_default_chain(Some(REGION), Some(&endpoint), true)
         .await
         .expect("storage");

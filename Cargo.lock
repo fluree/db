@@ -3494,6 +3494,7 @@ dependencies = [
  "hyper-rustls 0.24.2",
  "jsonwebtoken",
  "lru 0.18.5",
+ "object_store",
  "parquet",
  "rand 0.8.8",
  "reqwest 0.13.5",

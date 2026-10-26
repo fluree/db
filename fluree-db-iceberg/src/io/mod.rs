@@ -11,7 +11,12 @@ pub mod batch;
 #[cfg(feature = "aws")]
 pub mod chunk_reader;
 pub mod file_storage;
+#[cfg(feature = "aws")]
+pub mod gcs;
+pub mod location;
 pub mod parquet;
+#[cfg(feature = "aws")]
+pub mod scope;
 #[cfg(feature = "aws")]
 pub mod send_parquet;
 pub mod storage;
@@ -27,6 +32,10 @@ pub use storage::{IcebergStorage, MemoryStorage, RangeOnlyStorage, SendIcebergSt
 
 #[cfg(feature = "aws")]
 pub use chunk_reader::RangeBackedChunkReader;
+#[cfg(feature = "aws")]
+pub use gcs::GcsIcebergStorage;
+#[cfg(feature = "aws")]
+pub use scope::StorageScope;
 #[cfg(feature = "aws")]
 pub use send_parquet::SendParquetReader;
 #[cfg(feature = "aws")]

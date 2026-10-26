@@ -3087,6 +3087,11 @@ async fn build_catalog_storage(
     // the SDK client is pinned to HTTP/1.1 so the GCS HTTP/2 range-read bug cannot
     // occur.
     if let Some(credentials) = vended {
+        let fluree_db_iceberg::credential::VendedCredentials::S3(credentials) = credentials else {
+            return Err(QueryError::Internal(
+                "the catalog vended a GCS token; this read path builds S3 storage only".to_string(),
+            ));
+        };
         info!(
             region = ?io.s3_region,
             endpoint = ?io.s3_endpoint,
@@ -3109,6 +3114,7 @@ async fn build_catalog_storage(
             endpoint = ?io.s3_endpoint,
             "Using ambient AWS credentials"
         );
+        #[allow(deprecated)]
         S3IcebergStorage::from_default_chain(
             io.s3_region.as_deref(),
             io.s3_endpoint.as_deref(),
@@ -4353,6 +4359,7 @@ impl FlureeR2rmlProvider<'_> {
                         footers.as_ref(),
                         &disk_cache,
                         &cache_dir,
+                        &fluree_db_iceberg::StorageScope::shared(),
                     )
                     .read_task(&tasks[orig])
                     .instrument(read_span)
@@ -4432,11 +4439,13 @@ impl FlureeR2rmlProvider<'_> {
                             );
                             async move {
                                 tokio::spawn(async move {
+                                    let scope = fluree_db_iceberg::StorageScope::shared();
                                     let reader = SendParquetReader::with_caches(
                                         storage.as_ref(),
                                         footers.as_ref(),
                                         &disk_cache,
                                         &cache_dir,
+                                        &scope,
                                     );
                                     reader.read_task(&task).instrument(read_span).await.map_err(
                                         |e| {
@@ -4502,11 +4511,13 @@ impl FlureeR2rmlProvider<'_> {
                 );
                 async move {
                     tokio::spawn(async move {
+                        let scope = fluree_db_iceberg::StorageScope::shared();
                         let reader = SendParquetReader::with_caches(
                             storage.as_ref(),
                             footers.as_ref(),
                             &disk_cache,
                             &cache_dir,
+                            &scope,
                         )
                         .with_rowgroup_concurrency(rowgroup_concurrency);
                         reader
@@ -4838,6 +4849,7 @@ async fn direct_session_storage(
     // gs://-backed tables (GCS S3-interop endpoint) are read through this same S3
     // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK HTTP/2
     // range-read bug against that endpoint.
+    #[allow(deprecated)]
     let built = Arc::new(IcebergStorageBackend::S3(
         S3IcebergStorage::from_default_chain(region, endpoint, path_style)
             .await
@@ -5644,14 +5656,18 @@ mod tests {
         LoadTableResponse {
             metadata_location: loc.to_string(),
             config: std::collections::HashMap::default(),
-            credentials: with_creds.then(|| fluree_db_iceberg::credential::VendedCredentials {
-                access_key_id: "AKIAEXAMPLE".to_string(),
-                secret_access_key: "secret".to_string(),
-                session_token: None,
-                expires_at: None,
-                endpoint: None,
-                region: Some("us-east-2".to_string()),
-                path_style: false,
+            credentials: with_creds.then(|| {
+                fluree_db_iceberg::credential::VendedCredentials::S3(
+                    fluree_db_iceberg::credential::S3Credentials {
+                        access_key_id: "AKIAEXAMPLE".to_string(),
+                        secret_access_key: "secret".to_string(),
+                        session_token: None,
+                        expires_at: None,
+                        endpoint: None,
+                        region: Some("us-east-2".to_string()),
+                        path_style: false,
+                    },
+                )
             }),
             metadata: None,
         }

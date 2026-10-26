@@ -152,6 +152,26 @@ impl RestCatalogClient {
         })
     }
 
+    /// A client for a mock catalog on loopback, which the production client's
+    /// SSRF guard refuses. Tests only.
+    #[cfg(all(test, feature = "aws"))]
+    pub(crate) fn for_mock(
+        uri: &str,
+        warehouse: Option<&str>,
+        auth: Arc<dyn SendCatalogAuth>,
+    ) -> Self {
+        Self {
+            config: RestCatalogConfig {
+                uri: uri.to_string(),
+                warehouse: warehouse.map(str::to_string),
+                ..Default::default()
+            },
+            auth,
+            http_client: reqwest::Client::new(),
+            catalog_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
+
     /// Make a GET request to the catalog API.
     ///
     /// Handles authentication headers and 401 retry with token refresh.
@@ -507,6 +527,33 @@ impl super::SendCatalogClient for RestCatalogClient {
             .map_err(|e| super::name_denied_table(e, table_id))?;
 
         parse_load_table_response(&response)
+    }
+
+    /// `GET …/tables/{table}/credentials` (the Iceberg REST `loadCredentials`
+    /// route), which re-vends without re-reading the table. A catalog without
+    /// that route (404) is asked for a fresh `loadTable` instead.
+    async fn load_credentials(
+        &self,
+        table_id: &TableIdentifier,
+        metadata_location: &str,
+    ) -> Result<Option<VendedCredentials>> {
+        let path = format!("{}/credentials", self.table_path(table_id).await?);
+        match self
+            .get(
+                &path,
+                &[("X-Iceberg-Access-Delegation", "vended-credentials")],
+            )
+            .await
+        {
+            Ok(response) => {
+                VendedCredentials::from_load_table_response(&response, metadata_location)
+            }
+            Err(IcebergError::TableNotFound(_)) => {
+                let load = super::SendCatalogClient::load_table(self, table_id, true).await?;
+                Ok(load.credentials)
+            }
+            Err(e) => Err(super::name_denied_table(e, table_id)),
+        }
     }
 }
 

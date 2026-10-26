@@ -57,6 +57,39 @@ pub enum IcebergError {
         message: String,
     },
 
+    /// A path whose scheme this source's storage identity does not serve: a
+    /// `gs://` path on an AWS identity without a GCS interop endpoint, an
+    /// `s3://` path on a Google identity, and so on. The identity is decided by
+    /// the source's configuration, never by the path, so an unserved path is
+    /// refused rather than read with whatever identity happens to accept its
+    /// scheme (an `s3` client would read `gs://b/k` as `s3://b/k`, on AWS).
+    #[error(
+        "Refusing to read {path}: this source's storage identity ({identity}) serves only \
+         {served} paths. Set io.storage_auth to an identity that serves {scheme}:// paths"
+    )]
+    SchemeNotServed {
+        /// The refused path.
+        path: String,
+        /// Its scheme (`s3`, `gs`, `file`, …).
+        scheme: String,
+        /// The identity that refused it (`ambient AWS`, `Google`, …).
+        identity: String,
+        /// The schemes that identity serves, for the message.
+        served: String,
+    },
+
+    /// An ambient-AWS read of a bucket the operator's allowlist
+    /// ([`crate::host_identity::AMBIENT_BUCKETS_ENV`]) does not name.
+    #[error(
+        "Graph sources on this instance may not read bucket '{bucket}' with the host's ambient \
+         AWS identity: the bucket allowlist ({env}) does not name it",
+        env = crate::host_identity::AMBIENT_BUCKETS_ENV
+    )]
+    AmbientBucketRefused {
+        /// The refused bucket.
+        bucket: String,
+    },
+
     /// The source is configured to require catalog-vended storage credentials
     /// (`io.vended_credentials = true`) but the catalog's `loadTable` returned none.
     ///

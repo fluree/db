@@ -1174,6 +1174,11 @@ pub(crate) async fn build_preview_storage(
         match decide_credential_source(io.vended_credentials, credentials.is_some(), is_rest) {
             CredentialSource::Vended => {
                 let creds = credentials.expect("Vended decision implies credentials are present");
+                let fluree_db_iceberg::credential::VendedCredentials::S3(creds) = creds else {
+                    return Err(crate::ApiError::config(
+                        "the catalog vended a GCS token; this read path builds S3 storage only",
+                    ));
+                };
                 S3IcebergStorage::from_vended_credentials(
                     creds,
                     io.s3_region.as_deref(),
@@ -1182,7 +1187,9 @@ pub(crate) async fn build_preview_storage(
                 )
                 .await
             }
-            CredentialSource::Ambient => {
+            CredentialSource::Ambient =>
+            {
+                #[allow(deprecated)]
                 S3IcebergStorage::from_default_chain(
                     io.s3_region.as_deref(),
                     io.s3_endpoint.as_deref(),

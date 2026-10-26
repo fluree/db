@@ -34,6 +34,7 @@ use crate::io::parquet::{
     build_batch_schema, build_batch_schema_with_iceberg, calculate_column_chunk_ranges,
     parse_parquet_metadata_from_bytes, ParquetFooterCache, NULL_COLUMN_SENTINEL,
 };
+use crate::io::scope::StorageScope;
 use crate::io::SendIcebergStorage;
 use crate::metadata::Schema;
 use crate::scan::predicate::Expression;
@@ -122,15 +123,28 @@ const LARGE_FILE_ADMIT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 struct DiskCacheRef<'a> {
     cache: &'a Arc<DiskArtifactCache>,
     dir: &'a Path,
+    /// The storage identity the bytes are read under: part of every local name,
+    /// so a file fetched by one identity is never served to another that names
+    /// the same source path (nor joined to its single-flight fill, which is
+    /// keyed by the local name).
+    scope: &'a StorageScope,
 }
 
 impl DiskCacheRef<'_> {
     /// Stable local path for an immutable source file. The expected size is part
     /// of the key, so a cached file whose length differs is never even named.
+    /// The shared scope keeps the name files had before scopes existed.
     fn local_path(&self, source_path: &str, expected_size: u64) -> PathBuf {
         let h = xxhash_rust::xxh64::xxh64(source_path.as_bytes(), 0);
-        self.dir
-            .join(format!("iceberg-{h:016x}-{expected_size}.parquet"))
+        if self.scope.is_shared() {
+            self.dir
+                .join(format!("iceberg-{h:016x}-{expected_size}.parquet"))
+        } else {
+            self.dir.join(format!(
+                "iceberg-{h:016x}-{}-{expected_size}.parquet",
+                self.scope.file_segment()
+            ))
+        }
     }
 
     /// The local cache path iff a file of exactly `expected_size` bytes exists.
@@ -376,11 +390,18 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     /// a whole file already cached is served from disk; otherwise the file is
     /// cached whole only when the read is cheap (small file) or broad (touches a
     /// large share). Narrow projections keep range-reading from source.
+    ///
+    /// `scope` is the storage identity `storage` reads as
+    /// (`ResolvedStorage::scope` in `fluree-db-api`): cached files are keyed by
+    /// it, so one identity's files never serve another's reads. The footer
+    /// cache needs no scope: a footer is served only after `storage` has
+    /// answered the file's size (see [`Self::read_metadata`]).
     pub fn with_caches(
         storage: &'a S,
         footer_cache: &'a ParquetFooterCache,
         disk_cache: &'a Arc<DiskArtifactCache>,
         cache_dir: &'a Path,
+        scope: &'a StorageScope,
     ) -> Self {
         Self {
             storage,
@@ -388,6 +409,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             disk_cache: Some(DiskCacheRef {
                 cache: disk_cache,
                 dir: cache_dir,
+                scope,
             }),
             rowgroup_concurrency: 1,
         }
@@ -403,6 +425,12 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     }
 
     /// Read the Parquet file metadata (footer) using range reads.
+    ///
+    /// The footer cache is keyed by path and size alone, which is safe only
+    /// because the size comes from `storage` first: a reader whose identity
+    /// cannot see the file fails here, before a footer another identity cached
+    /// could be served. Keep the HEAD ahead of the cache lookup
+    /// (`a_cached_footer_is_served_only_after_the_store_answers_the_head`).
     pub async fn read_metadata(&self, path: &str) -> Result<Arc<ParquetMetaData>> {
         let file_size = self.storage.file_size(path).await?;
 
@@ -1073,9 +1101,11 @@ mod tests {
     fn local_path_keys_on_size() {
         let dir = fresh_cache_dir("key");
         let cache = DiskArtifactCache::for_dir(&dir);
+        let shared = StorageScope::shared();
         let dc = DiskCacheRef {
             cache: &cache,
             dir: &dir,
+            scope: &shared,
         };
         // The same source path at a different size maps to a different cache
         // file, so a hit can never serve bytes of the wrong length.
@@ -1089,9 +1119,11 @@ mod tests {
     fn valid_local_requires_a_matching_size_on_disk() {
         let dir = fresh_cache_dir("valid");
         let cache = DiskArtifactCache::for_dir(&dir);
+        let shared = StorageScope::shared();
         let dc = DiskCacheRef {
             cache: &cache,
             dir: &dir,
+            scope: &shared,
         };
         let src = "s3://b/f.parquet";
         assert!(dc.valid_local(src, 4).is_none(), "absent file is not valid");
@@ -1101,6 +1133,236 @@ mod tests {
             dc.valid_local(src, 5).is_none(),
             "a different expected size names a different (absent) path"
         );
+    }
+
+    #[test]
+    fn the_shared_scope_keeps_the_name_cached_files_had_before_scopes() {
+        // Pinned literally: every data file an install cached before storage
+        // scopes existed is still found under the default configuration.
+        let dir = fresh_cache_dir("shared_name");
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let shared = StorageScope::shared();
+        let dc = DiskCacheRef {
+            cache: &cache,
+            dir: &dir,
+            scope: &shared,
+        };
+        let h = xxhash_rust::xxh64::xxh64(b"s3://b/data/f.parquet", 0);
+        assert_eq!(
+            dc.local_path("s3://b/data/f.parquet", 4096),
+            dir.join(format!("iceberg-{h:016x}-4096.parquet"))
+        );
+        let scoped = StorageScope::of(&[("kind", "google"), ("principal", "a@p.iam")]);
+        let dc = DiskCacheRef {
+            cache: &cache,
+            dir: &dir,
+            scope: &scoped,
+        };
+        assert_ne!(
+            dc.local_path("s3://b/data/f.parquet", 4096),
+            dir.join(format!("iceberg-{h:016x}-4096.parquet"))
+        );
+    }
+
+    /// A source store that answers every read with its own bytes, optionally
+    /// holding each read until released (to overlap two fills).
+    #[derive(Debug, Clone)]
+    struct GatedSource {
+        bytes: Bytes,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GatedSource {
+        fn new(fill: u8, len: usize) -> Self {
+            Self {
+                bytes: Bytes::from(vec![fill; len]),
+                gate: None,
+                reads: Arc::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for GatedSource {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let _permit = gate.acquire().await.expect("gate open");
+            }
+            Ok(self.bytes.clone())
+        }
+
+        async fn read_range(&self, _path: &str, range: Range<u64>) -> Result<Bytes> {
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    #[tokio::test]
+    async fn two_identities_reading_one_path_never_share_a_cached_file() {
+        let dir = fresh_cache_dir("cross_identity");
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let footers = ParquetFooterCache::new(8);
+        let path = "gs://lake/data/f.parquet";
+        let alice = StorageScope::of(&[("kind", "google"), ("principal", "alice@p.iam")]);
+        let bob = StorageScope::of(&[("kind", "google"), ("principal", "bob@p.iam")]);
+        let alice_store = GatedSource::new(b'A', 64);
+        let bob_store = GatedSource::new(b'B', 64);
+
+        let read = |store: &GatedSource, scope: &StorageScope| {
+            let store = store.clone();
+            let scope = scope.clone();
+            let footers = &footers;
+            let cache = &cache;
+            let dir = &dir;
+            async move {
+                SendParquetReader::with_caches(&store, footers, cache, dir, &scope)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        assert!(read(&alice_store, &alice).await.iter().all(|b| *b == b'A'));
+        // Bob's read is a miss under his own scope: he gets his store's bytes,
+        // and his store was asked.
+        assert!(read(&bob_store, &bob).await.iter().all(|b| *b == b'B'));
+        assert_eq!(bob_store.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Each is now served from disk under its own scope.
+        assert!(read(&alice_store, &alice).await.iter().all(|b| *b == b'A'));
+        assert_eq!(
+            alice_store.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // The control: under one shared scope the second reader IS handed the
+        // first one's bytes without its store being asked — what the scope
+        // prevents.
+        let shared = StorageScope::shared();
+        let shared_dir = fresh_cache_dir("cross_identity_control");
+        let shared_cache = DiskArtifactCache::for_dir(&shared_dir);
+        let first = GatedSource::new(b'A', 64);
+        let second = GatedSource::new(b'B', 64);
+        for (store, expected) in [(&first, b'A'), (&second, b'A')] {
+            let bytes = SendParquetReader::with_caches(
+                store,
+                &footers,
+                &shared_cache,
+                &shared_dir,
+                &shared,
+            )
+            .try_whole_bytes_no_footer(path, 64)
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(bytes.iter().all(|b| *b == expected));
+        }
+        assert_eq!(second.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn two_identities_never_join_one_single_flight_fill() {
+        // Alice's fill is held open; Bob's fill of the same path under another
+        // scope must complete on its own rather than wait for (and be handed)
+        // Alice's bytes.
+        let dir = fresh_cache_dir("cross_identity_fill");
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let footers = Arc::new(ParquetFooterCache::new(8));
+        let path = "gs://lake/data/held.parquet";
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut alice_store = GatedSource::new(b'A', 64);
+        alice_store.gate = Some(Arc::clone(&gate));
+        let alice = StorageScope::of(&[("kind", "google"), ("principal", "alice@p.iam")]);
+        let alice_fill = {
+            let (cache, dir, footers) = (Arc::clone(&cache), dir.clone(), Arc::clone(&footers));
+            tokio::spawn(async move {
+                SendParquetReader::with_caches(&alice_store, &footers, &cache, &dir, &alice)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        // Let Alice's fill become the in-flight leader.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let bob_store = GatedSource::new(b'B', 64);
+        let bob = StorageScope::of(&[("kind", "google"), ("principal", "bob@p.iam")]);
+        let bob_bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            SendParquetReader::with_caches(&bob_store, &footers, &cache, &dir, &bob)
+                .try_whole_bytes_no_footer(path, 64),
+        )
+        .await
+        .expect("Bob's fill waited on Alice's: the single-flight key is not scoped")
+        .unwrap()
+        .unwrap();
+        assert!(bob_bytes.iter().all(|b| *b == b'B'));
+
+        gate.add_permits(1);
+        assert!(alice_fill.await.unwrap().iter().all(|b| *b == b'A'));
+    }
+
+    #[tokio::test]
+    async fn a_cached_footer_is_served_only_after_the_store_answers_the_head() {
+        /// A store that refuses every request, as one whose identity cannot
+        /// see the file does.
+        #[derive(Debug, Clone)]
+        struct Denied {
+            heads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl SendIcebergStorage for Denied {
+            async fn read(&self, _path: &str) -> Result<Bytes> {
+                Err(IcebergError::storage("denied"))
+            }
+            async fn read_range(&self, _path: &str, _range: Range<u64>) -> Result<Bytes> {
+                Err(IcebergError::storage("denied"))
+            }
+            async fn file_size(&self, _path: &str) -> Result<u64> {
+                self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(IcebergError::StorageAccessDenied {
+                    bucket: "lake".to_string(),
+                    key: "data/f.parquet".to_string(),
+                    region: None,
+                    message: "403".to_string(),
+                })
+            }
+        }
+
+        let path = "gs://lake/data/f.parquet";
+        let footers = ParquetFooterCache::new(8);
+        // Another identity read (and cached) the footer.
+        let allowed = InMemorySource {
+            bytes: multitype_parquet(),
+        };
+        SendParquetReader::with_cache(&allowed, &footers)
+            .read_metadata(path)
+            .await
+            .expect("the allowed identity reads the footer");
+        assert!(footers
+            .get(path, allowed.bytes.len() as u64)
+            .await
+            .is_some());
+
+        // An identity that cannot see the file is refused at the HEAD, never
+        // handed the cached footer.
+        let denied = Denied {
+            heads: Arc::default(),
+        };
+        let err = SendParquetReader::with_cache(&denied, &footers)
+            .read_metadata(path)
+            .await
+            .expect_err("a cached footer must not answer a reader the store refuses");
+        assert!(
+            matches!(err, IcebergError::StorageAccessDenied { .. }),
+            "{err:?}"
+        );
+        assert_eq!(denied.heads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
