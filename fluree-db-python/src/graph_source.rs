@@ -212,16 +212,20 @@ pub(crate) fn map_iceberg<'py>(
     let created = block_on(py, fluree.create_r2rml_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.model_warnings;
     if !created.connection_tested {
-        let failed = if direct {
-            "could not read a mapped table's metadata at"
+        // The catalog wording predates Direct's check; callers match on it.
+        warnings.push(if direct {
+            format!(
+                "could not read a mapped table's metadata at {}; the source is registered, \
+                 and queries will fail until it can be read",
+                created.catalog_uri
+            )
         } else {
-            "could not load a mapped table from the catalog at"
-        };
-        warnings.push(format!(
-            "{failed} {}; the source is registered, and queries will fail until it can be \
-             loaded",
-            created.catalog_uri
-        ));
+            format!(
+                "could not reach the catalog at {}; the source is registered, and queries \
+                 will fail until it can be reached",
+                created.catalog_uri
+            )
+        });
     }
     registered(py, &created.graph_source_id, &created.table_names, warnings)
 }
