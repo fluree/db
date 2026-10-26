@@ -605,7 +605,8 @@ impl<'l> FactIdentity<'l> {
     /// `(subject, predicate)` slot holding only one op is passed over, two
     /// terms of one fact are found among neighbours with equal objects, and
     /// index keys are computed only for the kinds of value whose key can
-    /// merge terms, in slots holding both ops.
+    /// merge terms, in slots holding both ops. Each pair names its
+    /// retraction's position in `flakes` ([`SameTPair::retraction_at`]).
     ///
     /// [`StagedLedger::staged_flakes_spot`]: fluree_db_ledger::StagedLedger::staged_flakes_spot
     pub fn same_t_pairs<'f>(
@@ -615,6 +616,7 @@ impl<'l> FactIdentity<'l> {
         let mut pairs = Vec::new();
         let mut slot: Vec<&'f Flake> = Vec::new();
         let mut flakes = flakes.into_iter().peekable();
+        let mut at = 0;
         while let Some(first) = flakes.next() {
             slot.clear();
             slot.push(first);
@@ -622,30 +624,34 @@ impl<'l> FactIdentity<'l> {
                 slot.push(next);
             }
             if slot.len() > 1 {
-                self.pairs_in_slot(&slot, &mut pairs);
+                self.pairs_in_slot(&slot, at, &mut pairs);
             }
+            at += slot.len();
         }
         pairs
     }
 
     /// [`Self::same_t_pairs`] for one `(subject, predicate)` slot, in SPOT
-    /// order.
-    fn pairs_in_slot<'f>(&self, slot: &[&'f Flake], pairs: &mut Vec<SameTPair<'f>>) {
+    /// order, starting at position `at` of the walk.
+    fn pairs_in_slot<'f>(&self, slot: &[&'f Flake], at: usize, pairs: &mut Vec<SameTPair<'f>>) {
         if !(slot.iter().any(|f| f.op) && slot.iter().any(|f| !f.op)) {
             return;
         }
         // One term: SPOT orders the object first, so both ops of a term sit
         // in one run of equal objects.
         let found = pairs.len();
+        let mut run_at = at;
         for run in slot.chunk_by(|a, b| cmp_object(a, b).is_eq()) {
-            for &r in run.iter().filter(|f| !f.op) {
+            for (i, &r) in run.iter().enumerate().filter(|(_, f)| !f.op) {
                 if let Some(&a) = run.iter().find(|&&a| a.op && a.g == r.g && *a == *r) {
                     pairs.push(SameTPair {
                         retraction: r,
                         assertion: a,
+                        retraction_at: run_at + i,
                     });
                 }
             }
+            run_at += run.len();
         }
         // Two terms of one index key.
         let may_merge = |op: bool| {
@@ -659,17 +665,18 @@ impl<'l> FactIdentity<'l> {
         // can be retracted under several terms (novelty holding a big integer
         // under two subtypes), and a retraction left over would still pair.
         // One per key is the usual case, held inline.
-        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), SmallVec<[&'f Flake; 1]>> =
+        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), SmallVec<[(usize, &'f Flake); 1]>> =
             FxHashMap::default();
-        for &f in slot
+        for (i, &f) in slot
             .iter()
-            .filter(|f| !f.op && f.o.index_key_may_merge_terms())
+            .enumerate()
+            .filter(|(_, f)| !f.op && f.o.index_key_may_merge_terms())
         {
-            if pairs[found..].iter().any(|p| std::ptr::eq(p.retraction, f)) {
+            if pairs[found..].iter().any(|p| p.retraction_at == at + i) {
                 continue;
             }
             if let Some(key) = self.key(self.graph_id(&f.g), f) {
-                retracted.entry((&f.g, key)).or_default().push(f);
+                retracted.entry((&f.g, key)).or_default().push((at + i, f));
             }
         }
         if retracted.is_empty() {
@@ -682,10 +689,11 @@ impl<'l> FactIdentity<'l> {
             let Some(key) = self.key(self.graph_id(&a.g), a) else {
                 continue;
             };
-            for r in retracted.remove(&(&a.g, key)).into_iter().flatten() {
+            for (retraction_at, r) in retracted.remove(&(&a.g, key)).into_iter().flatten() {
                 pairs.push(SameTPair {
                     retraction: r,
                     assertion: a,
+                    retraction_at,
                 });
             }
         }
@@ -698,6 +706,9 @@ impl<'l> FactIdentity<'l> {
 pub struct SameTPair<'f> {
     pub retraction: &'f Flake,
     pub assertion: &'f Flake,
+    /// The retraction's position in the sequence
+    /// [`FactIdentity::same_t_pairs`] walked.
+    pub retraction_at: usize,
 }
 
 /// `flakes` with each same-`t` pair resolved to its assertion: the pair's
@@ -717,16 +728,9 @@ pub fn resolve_same_t_pairs(ledger: &LedgerState, flakes: Vec<Flake>) -> Vec<Fla
         if pairs.is_empty() {
             return flakes;
         }
-        // Pairs are rare (only commits written before the staging fix hold
-        // them), so each is found by identity in the sorted references.
-        pairs
-            .iter()
-            .filter_map(|p| {
-                spot.iter()
-                    .find(|(_, f)| std::ptr::eq(*f, p.retraction))
-                    .map(|&(n, _)| n)
-            })
-            .collect()
+        // Each pair names its retraction's place in `spot`, which holds the
+        // position in `flakes`: a legacy merge commit can hold many pairs.
+        pairs.iter().map(|p| spot[p.retraction_at].0).collect()
     };
     let mut keep = vec![true; flakes.len()];
     for n in dropped {
@@ -990,7 +994,7 @@ impl<'l> CurrentFacts<'l> {
         Ok(self.resolve(g_id, flakes, g_sid, index_only))
     }
 
-    /// Every current fact of graph `g_id`, graph Sid stamped.
+    /// Every current fact of graph `g_id` as of `to_t`, graph Sid stamped.
     ///
     /// The whole-graph verbs (graph sync, CLEAR, DROP, COPY, MOVE) read
     /// through this. `limit` bounds what is materialized, not just what is
@@ -1014,7 +1018,7 @@ impl<'l> CurrentFacts<'l> {
         // (overlay-only) path matches an empty `Eq` against every flake.
         let opts = RangeOptions {
             flake_limit: limit.map(|l| l.saturating_add(1)),
-            ..Default::default()
+            ..RangeOptions::new().with_to_t(self.to_t)
         };
         let flakes = db_ref
             .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
@@ -2975,5 +2979,88 @@ mod tests {
         let resolved = resolve_same_t_pairs(&ledger, flakes);
         assert_eq!(resolved.len(), 1, "{resolved:?}");
         assert!(resolved[0].op);
+    }
+
+    /// Resolving a commit's pairs drops each pair's retraction wherever it
+    /// sits: flakes out of SPOT order, two pairs by term and one by index
+    /// key, and a retraction and an assertion that pair with nothing. Each
+    /// pair names its retraction's place in the walk.
+    #[test]
+    fn resolving_pairs_drops_each_retraction_wherever_it_sits() {
+        let ledger = ledger(Vec::new(), &HashMap::new());
+        let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+        let big = |dt: &str, op: bool| {
+            Flake::new(
+                sid("k"),
+                sid("p"),
+                FlakeValue::BigInt(Box::new(v.clone())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                2,
+                op,
+                None,
+            )
+        };
+        let flakes = vec![
+            flake("z", "p", "z", 2, true, None),
+            flake("a", "p", "lone", 2, false, None),
+            big("integer", false),
+            flake("m", "p", "m", 2, false, None),
+            flake("z", "p", "z", 2, false, None),
+            big("nonNegativeInteger", true),
+            flake("m", "p", "m", 2, true, None),
+            flake("b", "p", "new", 2, true, None),
+        ];
+        let mut spot: Vec<&Flake> = flakes.iter().collect();
+        spot.sort_by(|a, b| IndexType::Spot.compare(a, b));
+        let pairs = FactIdentity::new(&ledger).same_t_pairs(spot.iter().copied());
+        assert_eq!(pairs.len(), 3);
+        for p in &pairs {
+            assert!(std::ptr::eq(spot[p.retraction_at], p.retraction));
+        }
+        let shape = |f: &Flake| {
+            (
+                f.s.name_str().to_string(),
+                f.op,
+                format!("{:?}", f.o),
+                f.dt.name_str().to_string(),
+            )
+        };
+        let got: Vec<_> = resolve_same_t_pairs(&ledger, flakes.clone())
+            .iter()
+            .map(shape)
+            .collect();
+        let want: Vec<_> = [0, 1, 5, 6, 7].iter().map(|&n| shape(&flakes[n])).collect();
+        assert_eq!(got, want);
+    }
+
+    /// `whole_graph` reads as of `to_t`, as the other reads here do: at
+    /// `t = 1` a value asserted at 2 isn't there yet, and the one retracted
+    /// at 2 still is.
+    #[tokio::test]
+    async fn whole_graph_reads_as_of_to_t() {
+        let ledger = ledger(
+            vec![
+                vec![flake("a", "b", "x", 1, true, None)],
+                vec![
+                    flake("a", "b", "x", 2, false, None),
+                    flake("a", "b", "y", 2, true, None),
+                ],
+            ],
+            &HashMap::new(),
+        );
+        let objects = |facts: Vec<StoredFact>| -> Vec<String> {
+            facts.iter().map(|f| format!("{:?}", f.flake().o)).collect()
+        };
+        let string = |s: &str| format!("{:?}", FlakeValue::String(s.to_string()));
+        let head = CurrentFacts::new(&ledger)
+            .whole_graph(0, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(objects(head), vec![string("y")]);
+        let at_1 = CurrentFacts::at(&ledger, 1)
+            .whole_graph(0, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(objects(at_1), vec![string("x")]);
     }
 }
