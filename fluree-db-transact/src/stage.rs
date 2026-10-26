@@ -472,10 +472,6 @@ fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid
         .collect()
 }
 
-/// Resolve a flake's graph ID from its `Flake.g` field.
-///
-/// - `None` → default graph (g_id = 0)
-/// - `Some(sid)` → looked up in `reverse_graph`; returns error if unknown
 /// One relationship on an edge: an annotation subject whose `f:reifies*`
 /// bundle names the edge, with the bundle and the rest of its facts (its
 /// properties), as the ledger holds them.
@@ -548,6 +544,10 @@ async fn edge_reifiers(
     Ok(out)
 }
 
+/// Resolve a flake's graph ID from its `Flake.g` field.
+///
+/// - `None` → default graph (g_id = 0)
+/// - `Some(sid)` → looked up in `reverse_graph`; returns error if unknown
 fn resolve_flake_graph_id(flake: &Flake, reverse_graph: &HashMap<Sid, GraphId>) -> Result<GraphId> {
     match &flake.g {
         None => Ok(0),
