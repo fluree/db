@@ -38,7 +38,7 @@ fluree create <LEDGER> [OPTIONS]
 
 Creates a new empty ledger with the given name and sets it as the active ledger. The ledger is stored in `.fluree/storage/`.
 
-Use `--from` to create a ledger pre-populated with data from a Turtle, N-Triples, N-Quads, TriG, or JSON-LD file (or a directory of same-format files). Any input may be gzip- or zstd-compressed and is decoded transparently (`data.ttl.gz`, `dump.nq.zst`, mixed directories — the underlying RDF extension classifies the file). N-Triples (`.nt`) is a strict subset of Turtle and is parsed by the same parser. N-Quads (`.nq`) and TriG (`.trig`) support named graphs, and so does JSON-LD (`.jsonld`, `.jsonl`/`.ndjson`), which writes `@graph` exactly as a transaction does: a node's graph selector (`"@graph": "ex:g"`) puts it and the nodes nested in it in that graph, and a JSON-LD named graph (`{"@id": "ex:g", "@graph": [...]}`) puts its content there. Named graphs are queryable after import via the `#<graph-iri>` fragment. For large Turtle/N-Triples files (including `.ttl.gz`/`.nt.gz`), the CLI splits work into chunks and runs parallel parse threads — though compressed inputs decode single-threaded; TriG/N-Quads/JSON-LD use a serial path. Tune with `--memory-budget-mb` and `--parallelism` if needed.
+Use `--from` to create a ledger pre-populated with data from a Turtle, N-Triples, N-Quads, TriG, or JSON-LD file (or a directory of same-format files). Any input may be gzip- or zstd-compressed and is decoded transparently (`data.ttl.gz`, `dump.nq.zst`, mixed directories — the underlying RDF extension classifies the file). N-Triples (`.nt`) is a strict subset of Turtle and is parsed by the same parser. N-Quads (`.nq`) and TriG (`.trig`) support named graphs, and so does JSON-LD (`.jsonld`, `.jsonl`/`.ndjson`), which writes `@graph` exactly as a transaction does: a node's graph selector (`"@graph": "ex:g"`) puts it and the nodes nested in it in that graph, and a JSON-LD named graph (`{"@id": "ex:g", "@graph": [...]}`) puts its content there. Each `.jsonl`/`.ndjson` line is read as a document of its own under the shared context: its own `@context` resolves its graph names, a top-level bare `"graph"` key is dropped as a transaction drops it, and a line that is an envelope is unwrapped. A JSON-LD import refuses an unknown `@`-keyword on a node (`"@foo"`), naming it, as a transaction does; the JSON-LD 1.1 expansion algorithm would drop the key with a warning instead (see [Standards and Feature Flags](../reference/compatibility.md#json-ld-11)). Named graphs are queryable after import via the `#<graph-iri>` fragment. For large Turtle/N-Triples files (including `.ttl.gz`/`.nt.gz`), the CLI splits work into chunks and runs parallel parse threads — though compressed inputs decode single-threaded; TriG/N-Quads/JSON-LD use a serial path. Tune with `--memory-budget-mb` and `--parallelism` if needed.
 
 **Reserved graphs are refused, not imported.** A `GRAPH` block or JSON-LD `@graph` naming the ledger's own `urn:fluree:<ledger>#txn-meta` or `urn:fluree:<ledger>#config` (in JSON-LD also the `"txn-meta"` and `"config"` keywords) fails the import rather than loading. `#txn-meta` is the ledger's commit provenance, which the commit resolvers trust, so no user data may be written into it on any surface. `#config` is a capability gap rather than a policy — ledger configuration *is* writable, just not by bulk import, because the import pipeline has no index pass that populates it; create the ledger first and set its configuration with an ordinary transaction. User-defined named graphs are unaffected, and the `<#txn-meta>` sidecar block (a relative IRI, not the ledger-scoped one) still supplies commit metadata as documented below.
 
@@ -76,12 +76,12 @@ combined.jsonl` work. Each such switch ends one document and starts the next, so
 segment a label unifies across every chunk.
 
 > **Caveat.** If you write ndjson in the "every line is an independent document"
-> style — an inline `@context` on *every* line — Fluree treats those lines as
-> ordinary nodes in one `@graph`, which is one document. A `_:x` reused across
-> such lines therefore resolves to **one** node. That is correct JSON-LD (node
-> objects carrying local contexts inside a shared graph are co-document), but it
-> is not what the NDJSON-of-independent-documents convention would suggest. Use
-> a lone context line to separate them, or give the nodes real `@id`s.
+> style — an inline `@context` on *every* line — each line's context, graph
+> names and top-level keys are read as that line's own, but its blank-node
+> labels are still scoped to the segment: a `_:x` reused across such lines
+> resolves to **one** node. That is not what the NDJSON-of-independent-documents
+> convention would suggest. Use a lone context line to separate them, or give
+> the nodes real `@id`s.
 
 **Cross-ledger identity.** The ledger id salts the mint, so importing one source
 tree into two ledgers gives them disjoint blank nodes. Pass the same
