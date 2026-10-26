@@ -100,8 +100,8 @@ pub(crate) struct SequentialStager {
     /// That retraction was staged against the base, so it names the fact as
     /// the base stores it; a later one may name it as an earlier operation
     /// wrote it. See [`Self::drop_reversed_facts`].
-    first_retractions: HashMap<usize, fluree_db_core::Flake>,
-    fold_index: HashMap<SequentialFactKey, usize>,
+    first_retractions: FxHashMap<usize, fluree_db_core::Flake>,
+    fold_index: FxHashMap<SequentialFactKey, usize>,
     /// Simulated sequential per-op graph-id assignment, so the merged view's
     /// routing matches the ids each op's staging (and each intermediate
     /// envelope apply) used.
@@ -152,8 +152,8 @@ impl SequentialStager {
             final_t,
             folded: Vec::new(),
             first_ops: Vec::new(),
-            first_retractions: HashMap::new(),
-            fold_index: HashMap::new(),
+            first_retractions: FxHashMap::default(),
+            fold_index: FxHashMap::default(),
             sim_registry: ledger.snapshot.graph_registry.clone(),
             merged_graph_iris: Vec::new(),
             seen_graph_iris: std::collections::HashSet::new(),
