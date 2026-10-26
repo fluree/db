@@ -75,5 +75,3 @@ mod it_query_wildcard_system_facts;
 mod it_reserved_graph_contract;
 #[path = "it_service_cross_ledger_iri.rs"]
 mod it_service_cross_ledger_iri;
-#[path = "it_spatial_query.rs"]
-mod it_spatial_query;
