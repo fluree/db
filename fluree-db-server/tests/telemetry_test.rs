@@ -1,9 +1,10 @@
 //! Integration tests for telemetry functionality.
 //!
 //! These tests verify that `create_request_span` and `set_span_error_code` produce
-//! the expected span metadata. They use a local `SpanCaptureLayer` (via `set_default`)
-//! rather than `init_logging` (which sets a global subscriber) to avoid global state
-//! conflicts between tests.
+//! the expected span metadata. They use a local `SpanCaptureLayer` installed as the
+//! thread's default (via `fluree_test_support::scoped_default`) rather than
+//! `init_logging` (which sets a global subscriber) to avoid global state conflicts
+//! between tests.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,7 +35,7 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
     }
     let events = Events::default();
     let subscriber = tracing_subscriber::registry().with(EventCapture(events.clone()));
-    tracing::subscriber::with_default(subscriber, || {
+    fluree_test_support::with_scoped_default(subscriber, || {
         for mode in [
             "controller",
             "delegated",
@@ -220,7 +221,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
 fn init_capture() -> (Store, tracing::subscriber::DefaultGuard) {
     let store = Store::default();
     let sub = tracing_subscriber::Registry::default().with(Capture(store.clone()));
-    let guard = tracing::subscriber::set_default(sub);
+    let guard = fluree_test_support::scoped_default(sub);
     (store, guard)
 }
 

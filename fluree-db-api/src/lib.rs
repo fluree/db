@@ -5802,7 +5802,7 @@ mod tests {
             .with_writer(buf.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = fluree_test_support::scoped_default(subscriber);
         (buf, guard)
     }
 
