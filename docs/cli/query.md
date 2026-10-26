@@ -208,6 +208,8 @@ Tracked/remote ledgers also support `--at`. The CLI will translate `--at` into t
 
 SPARQL note (remote): if your SPARQL already includes `FROM` / `FROM NAMED`, the CLI will **not** rewrite it for `--at`. In that case, encode time travel directly in the `FROM` IRI (e.g., `FROM <myledger:main@t:5>`).
 
+A query whose dataset names another ledger runs on the connection path (`/query`); one that names only the ledger and its graphs runs on the ledger's own route. Against a remote server the CLI cannot read the ledger's graph registry, so text that reads both as a graph IRI and as another ledger's address (`other:main`, `urn:x`) is taken as that ledger and goes to the connection path. To name a graph of the ledger that is spelled that way, name it through the ledger: `FROM <myledger:main#urn:x>`.
+
 ## Examples
 
 ```bash

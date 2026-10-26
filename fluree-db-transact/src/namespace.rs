@@ -580,6 +580,16 @@ impl NsAllocator<'_> {
             NsAllocator::Cached(cache) => cache.blank_node_sid(unique_id),
         }
     }
+
+    /// The IRI `sid` names, for a message. An overflow Sid carries its whole
+    /// IRI in `name`, under no prefix.
+    pub fn iri(&self, sid: &Sid) -> String {
+        let prefix = match self {
+            NsAllocator::Exclusive(reg) => reg.get_prefix(sid.namespace_code).map(str::to_string),
+            NsAllocator::Cached(cache) => cache.alloc.get_prefix(sid.namespace_code),
+        };
+        format!("{}{}", prefix.unwrap_or_default(), sid.name)
+    }
 }
 
 // ============================================================================

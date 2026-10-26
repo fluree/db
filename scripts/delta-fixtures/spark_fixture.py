@@ -187,6 +187,89 @@ def generate(root):
         else:
             raise AssertionError("Spark silently read missing historical data")
 
+        # A change data feed across every kind of change: an update, a delete, an
+        # append, a MERGE that updates, inserts and deletes in one commit, and a
+        # deleted key inserted again. Spark's own feed is checked against changes
+        # stated from the inputs, as rows are.
+        feed = root / "change_feed"
+        schema = "id long, name string, amount long"
+        feed_rows = {i: {"id": i, "name": c, "amount": i * 100}
+                     for i, c in zip(range(1, 6), "abcde")}
+        (spark.createDataFrame(list(feed_rows.values()), schema).coalesce(1).write.format("delta")
+         .option("delta.enableChangeDataFeed", "true").save(str(feed)))
+        tables["change_feed"] = {"key": "id", "versions": []}
+
+        def save_feed():
+            save("change_feed", [feed_rows[k] for k in sorted(feed_rows)])
+
+        save_feed()
+        changes = [dict(r, _change_type="insert", _commit_version=0) for r in feed_rows.values()]
+        spark.sql(f"UPDATE {sql_table('change_feed')} SET amount = amount + 1 WHERE id IN (2, 3)")
+        for k in (2, 3):
+            changes.append(dict(feed_rows[k], _change_type="update_preimage", _commit_version=1))
+            feed_rows[k] = dict(feed_rows[k], amount=feed_rows[k]["amount"] + 1)
+            changes.append(dict(feed_rows[k], _change_type="update_postimage", _commit_version=1))
+        save_feed()
+        spark.sql(f"DELETE FROM {sql_table('change_feed')} WHERE id = 4")
+        changes.append(dict(feed_rows.pop(4), _change_type="delete", _commit_version=2))
+        save_feed()
+        feed_rows[6] = {"id": 6, "name": "f", "amount": 600}
+        (spark.createDataFrame([feed_rows[6]], schema).coalesce(1)
+         .write.format("delta").mode("append").save(str(feed)))
+        changes.append(dict(feed_rows[6], _change_type="insert", _commit_version=3))
+        save_feed()
+        merge_source = [(1, None, None, "D"), (5, "e2", 501, "U"), (7, "g", 700, "I")]
+        spark.createDataFrame(merge_source, "id long, name string, amount long, op string") \
+            .createOrReplaceTempView("feed_merge")
+        spark.sql(f"""MERGE INTO {sql_table('change_feed')} t USING feed_merge s ON t.id = s.id
+            WHEN MATCHED AND s.op = 'D' THEN DELETE
+            WHEN MATCHED THEN UPDATE SET name = s.name, amount = s.amount
+            WHEN NOT MATCHED THEN INSERT (id, name, amount) VALUES (s.id, s.name, s.amount)""")
+        changes.append(dict(feed_rows.pop(1), _change_type="delete", _commit_version=4))
+        changes.append(dict(feed_rows[5], _change_type="update_preimage", _commit_version=4))
+        feed_rows[5] = {"id": 5, "name": "e2", "amount": 501}
+        changes.append(dict(feed_rows[5], _change_type="update_postimage", _commit_version=4))
+        feed_rows[7] = {"id": 7, "name": "g", "amount": 700}
+        changes.append(dict(feed_rows[7], _change_type="insert", _commit_version=4))
+        save_feed()
+        feed_rows[4] = {"id": 4, "name": "d2", "amount": 401}
+        (spark.createDataFrame([feed_rows[4]], schema).coalesce(1)
+         .write.format("delta").mode("append").save(str(feed)))
+        changes.append(dict(feed_rows[4], _change_type="insert", _commit_version=5))
+        save_feed()
+        change_key = lambda r: (r["_commit_version"], r["id"], r["_change_type"])
+        spark_changes = sorted(
+            ({k: v for k, v in r.asDict().items() if k != "_commit_timestamp"}
+             for r in spark.read.format("delta").option("readChangeFeed", "true")
+             .option("startingVersion", 0).load(str(feed)).collect()),
+            key=change_key)
+        assert spark_changes == sorted(changes, key=change_key), "Spark's feed differs from the oracle"
+        assert any((feed / "_change_data").iterdir()), "updates and deletes must write change files"
+        tables["change_feed"]["changes"] = sorted(changes, key=change_key)
+
+        # The feed switched on only at version 2: a range that starts before it
+        # has no feed to read.
+        late = root / "change_feed_late"
+        late_rows = {1: {"id": 1, "name": "a", "amount": 100}}
+        tables["change_feed_late"] = {"key": "id", "versions": [], "feed_from_version": 2}
+
+        def save_late():
+            save("change_feed_late", [late_rows[k] for k in sorted(late_rows)])
+
+        (spark.createDataFrame(list(late_rows.values()), schema).coalesce(1)
+         .write.format("delta").save(str(late)))
+        save_late()
+        late_rows[2] = {"id": 2, "name": "b", "amount": 200}
+        (spark.createDataFrame([late_rows[2]], schema).coalesce(1)
+         .write.format("delta").mode("append").save(str(late)))
+        save_late()
+        spark.sql(f"ALTER TABLE {sql_table('change_feed_late')} "
+                  "SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+        save_late()
+        spark.sql(f"UPDATE {sql_table('change_feed_late')} SET amount = 201 WHERE id = 2")
+        late_rows[2] = dict(late_rows[2], amount=201)
+        save_late()
+
         # Keep fixtures portable to an isolated S3 prefix. Only history_loss's
         # explicitly recorded retired file may be missing.
         for name in tables:
