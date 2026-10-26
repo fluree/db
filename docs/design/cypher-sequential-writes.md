@@ -75,9 +75,17 @@ decomposition:
      SETs, since its items apply in order.
    - **DETACH DELETE** of a node: one seeded Txn, like SET; its lowering finds
      the node's triples in the state it stages on.
-   - A bare or relationship **DELETE** in a multi-clause chain: rejected
-     (clear error) in v1 — its relationship-existence / parallel-edge probes
-     stay single-statement.
+   - A relationship's **DELETE** (`DELETE r`): one seeded Txn that re-matches
+     the edge `r` was matched on (`MATCH (a)-[r:T]->(b)`, the lowering's view
+     of `r`), so the LPG cleanup takes the properties earlier clauses set on
+     `r`. First, the parallel-edge probe runs against the current virtual
+     state, seeded with the rows: it lists every relationship on the edge,
+     ignoring `r`'s property map and `WHERE`, and refuses when one isn't `r`
+     (retracting the edge would take it too). The single-clause `DELETE r`
+     uses the same probe. A relationship's DELETE meets every other write
+     clause, so a statement with one beside other clauses always comes here.
+   - A bare node **DELETE** in a multi-clause chain: rejected (clear error) in
+     v1 — its relationship-existence probe stays single-statement.
 3. **Finish** — `SequentialStager::finish()` produces one `StageResult` over
    the original base: single commit at `t+1`, union namespace delta, folded
    flakes. Zero staged flakes → the ordinary no-op update path.
@@ -116,7 +124,9 @@ so seeded rows satisfy `SET`/`REMOVE` target checks.
    every row binds). It also takes statements without a MERGE whose write
    clauses can see or undo one another's writes (`interacting_writes`): two
    clauses writing one property key or one label (on any variables, since two
-   can bind one node), a DETACH DELETE with any other write, or a CREATE with
+   can bind one node), a DETACH DELETE or a relationship's DELETE with any
+   other write (the single `Txn` has no parallel-edge probe for the latter,
+   so it comes here even when the driver will refuse it), or a CREATE with
    a clause whose lowering reads stored values (a SET or REMOVE of a property,
    a map SET, DETACH DELETE — the `OPTIONAL` lookup adds rows the CREATE would
    fire on), plus a SET writing one key twice. The single-`Txn` lowering

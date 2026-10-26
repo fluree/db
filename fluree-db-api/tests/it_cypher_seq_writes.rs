@@ -1507,3 +1507,267 @@ async fn the_next_statement_in_a_transaction_reads_a_write_with_no_return() {
     let ledger = fluree.ledger(id).await.expect("ledger");
     assert_eq!(twin_state(&fluree, &ledger).await, want, "Transaction");
 }
+
+// ---- A relationship's DELETE beside other clauses -------------------------
+//
+// `DELETE r` retracts the edge `r` reifies, and every relationship on that
+// edge goes with it. Beside other write clauses it stages in the driver, after
+// the clauses before it, and refuses when the edge carries another
+// relationship too (a parallel sibling), as a `DELETE r` of its own refuses.
+
+const PARALLEL_REFUSAL: &str = "parallel relationships share its underlying edge";
+
+/// Nodes `a`, `b`, `c` (`:P`, by `id`) and `(a)-[:K {w: 1}]->(b)`; with
+/// `parallel`, a second relationship `(a)-[:K {w: 2}]->(b)` on the same edge.
+async fn rel_seeded(
+    fluree: &fluree_db_api::Fluree,
+    id: &str,
+    parallel: bool,
+) -> fluree_db_api::LedgerState {
+    let mut seed = vec![
+        r#"CREATE (:P {id: "a"})"#,
+        r#"CREATE (:P {id: "b"})"#,
+        r#"CREATE (:P {id: "c"})"#,
+        r#"MATCH (a:P {id: "a"}), (b:P {id: "b"}) CREATE (a)-[:K {w: 1}]->(b)"#,
+    ];
+    if parallel {
+        seed.push(r#"MATCH (a:P {id: "a"}), (b:P {id: "b"}) CREATE (a)-[:K {w: 2}]->(b)"#);
+    }
+    let mut l = fluree.create_ledger(id).await.expect("create");
+    for s in seed {
+        l = fluree.transact_cypher(l, s).await.expect(s).ledger;
+    }
+    l
+}
+
+/// The `:K` relationships as Cypher reads them (`[from, w, v, to]`, sorted),
+/// and every triple, with nodes named by their `id`, any other subject (a
+/// relationship's annotation) as `rel`, and IRIs by their last segment.
+async fn rel_state(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> (Vec<String>, Vec<String>) {
+    let db = graphdb_from_ledger(ledger);
+    let rels = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:P)-[r:K]->(o:P) RETURN s.id AS from, r.w AS w, r.v AS v, o.id AS to",
+        )
+        .await
+        .expect("relationships")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+    let mut rels: Vec<String> = rels["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|d| d["row"].to_string())
+        .collect();
+    rels.sort();
+    let json = support::query_sparql(fluree, ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("state query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    let last = |v: &str| v.rsplit(['/', '#']).next().unwrap_or(v).to_string();
+    let ids: std::collections::HashMap<String, String> = bindings
+        .iter()
+        .filter(|b| b["p"]["value"].as_str().map(last).as_deref() == Some("id"))
+        .map(|b| {
+            (
+                b["s"]["value"].as_str().unwrap_or("?").to_string(),
+                b["o"]["value"].as_str().unwrap_or("?").to_string(),
+            )
+        })
+        .collect();
+    let name = |b: &serde_json::Value, k: &str| {
+        let v = b[k]["value"].as_str().unwrap_or("?");
+        match ids.get(v) {
+            Some(id) => id.clone(),
+            None if k == "s" => "rel".to_string(),
+            None => last(v),
+        }
+    };
+    let mut triples: Vec<String> = bindings
+        .iter()
+        .map(|b| format!("{} {} {}", name(b, "s"), name(b, "p"), name(b, "o")))
+        .collect();
+    triples.sort();
+    (rels, triples)
+}
+
+/// The seeded nodes' own triples (no relationship), plus `extra`, sorted.
+fn nodes_and(extra: &[&str]) -> Vec<String> {
+    let mut rows: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .flat_map(|n| [format!("{n} id {n}"), format!("{n} type P")])
+        .chain(extra.iter().map(|s| (*s).to_string()))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Run `statement` on a fresh seeded ledger: its outcome, and the state after.
+async fn rel_run(
+    label: &str,
+    parallel: bool,
+    statement: &str,
+) -> (Result<(), String>, (Vec<String>, Vec<String>)) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = format!("it/cyseq-rel-{label}:main");
+    let ledger = rel_seeded(&fluree, &id, parallel).await;
+    let outcome = fluree
+        .transact_cypher(ledger, statement)
+        .await
+        .map(drop)
+        .map_err(|e| e.to_string());
+    let ledger = fluree.ledger(&id).await.expect("ledger");
+    (outcome, rel_state(&fluree, &ledger).await)
+}
+
+/// A SET on a relationship, then its DELETE: the relationship goes with
+/// everything it carries. In one `Txn`, the DELETE cleared only the
+/// properties stored before the statement, and the SET's value was left on
+/// the deleted relationship.
+#[tokio::test]
+async fn a_set_on_a_relationship_then_its_delete_leaves_nothing() {
+    for set in ["SET r.v = 5", "SET r.w = 9"] {
+        let statement =
+            format!(r#"MATCH (a:P {{id: "a"}})-[r:K]->(b:P {{id: "b"}}) {set} DELETE r"#);
+        let (outcome, (rels, triples)) = rel_run("set-delete", false, &statement).await;
+        assert_eq!(outcome, Ok(()), "{statement}");
+        assert!(rels.is_empty(), "{statement}: {rels:?}");
+        assert_eq!(triples, nodes_and(&[]), "{statement}");
+    }
+}
+
+/// A relationship's DELETE, then a CREATE of the same edge: the new
+/// relationship replaces the old. In one `Txn` the edge's retraction and its
+/// re-assertion cancelled, the old relationship's properties were never
+/// cleared, and both relationships stood on the edge.
+#[tokio::test]
+async fn a_relationship_deleted_then_created_again_is_the_new_one() {
+    for (create, rel, extra) in [
+        (
+            "CREATE (a)-[:K {w: 7}]->(b)",
+            r#"["a",7,null,"b"]"#,
+            &["a K b", "rel w 7"][..],
+        ),
+        (
+            "CREATE (a)-[:K]->(b)",
+            r#"["a",null,null,"b"]"#,
+            &["a K b"][..],
+        ),
+    ] {
+        let statement =
+            format!(r#"MATCH (a:P {{id: "a"}})-[r:K]->(b:P {{id: "b"}}) DELETE r {create}"#);
+        let (outcome, (rels, triples)) = rel_run("delete-create", false, &statement).await;
+        assert_eq!(outcome, Ok(()), "{statement}");
+        assert_eq!(rels, vec![rel.to_string()], "{statement}");
+        assert_eq!(triples, nodes_and(extra), "{statement}");
+    }
+}
+
+/// A relationship's DELETE beside another clause, on an edge that carries a
+/// second relationship: refused, and nothing is written. In one `Txn` it
+/// skipped the parallel-relationship check and deleted both.
+#[tokio::test]
+async fn a_multi_clause_delete_of_a_parallel_relationship_refuses() {
+    let seeded = rel_run(
+        "parallel-seed",
+        true,
+        r#"MATCH (n:P {id: "c"}) SET n.id = "c""#,
+    )
+    .await
+    .1;
+    for clauses in [
+        "SET a.seen = true DELETE r",
+        "DELETE r SET a.seen = true",
+        "SET r.v = 5 DELETE r",
+    ] {
+        let statement =
+            format!(r#"MATCH (a:P {{id: "a"}})-[r:K {{w: 1}}]->(b:P {{id: "b"}}) {clauses}"#);
+        let (outcome, state) = rel_run("parallel-multi", true, &statement).await;
+        let err = outcome.expect_err(&statement);
+        assert!(err.contains(PARALLEL_REFUSAL), "{statement}: {err}");
+        assert_eq!(state, seeded, "{statement}: nothing written");
+    }
+}
+
+/// A DELETE r of its own, filtered down to one of two relationships on an
+/// edge: refused, as the unfiltered form is. The check counted only the
+/// relationships the MATCH kept, so the filter hid the sibling and both were
+/// deleted.
+#[tokio::test]
+async fn a_filtered_delete_of_a_parallel_relationship_refuses() {
+    let seeded = rel_run(
+        "parallel-seed-1",
+        true,
+        r#"MATCH (n:P {id: "c"}) SET n.id = "c""#,
+    )
+    .await
+    .1;
+    for statement in [
+        r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DELETE r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) WHERE r.w = 1 DELETE r"#,
+    ] {
+        let (outcome, state) = rel_run("parallel-single", true, statement).await;
+        let err = outcome.expect_err(statement);
+        assert!(err.contains(PARALLEL_REFUSAL), "{statement}: {err}");
+        assert_eq!(state, seeded, "{statement}: nothing written");
+    }
+}
+
+/// With no second relationship on the edge, the same statements commit.
+#[tokio::test]
+async fn a_relationship_delete_with_no_sibling_commits() {
+    for (statement, extra) in [
+        (
+            r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DELETE r"#,
+            &[][..],
+        ),
+        (
+            r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) SET a.seen = true DELETE r"#,
+            &["a seen true"][..],
+        ),
+        (
+            r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) DELETE r SET a.seen = true"#,
+            &["a seen true"][..],
+        ),
+    ] {
+        let (outcome, (rels, triples)) = rel_run("no-sibling", false, statement).await;
+        assert_eq!(outcome, Ok(()), "{statement}");
+        assert!(rels.is_empty(), "{statement}: {rels:?}");
+        assert_eq!(triples, nodes_and(extra), "{statement}");
+    }
+    let statement = r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) DELETE r DETACH DELETE b"#;
+    let (outcome, (rels, triples)) = rel_run("no-sibling-detach", false, statement).await;
+    assert_eq!(outcome, Ok(()), "{statement}");
+    assert!(rels.is_empty(), "{statement}: {rels:?}");
+    let mut want = nodes_and(&[]);
+    want.retain(|t| !t.starts_with("b "));
+    assert_eq!(triples, want, "{statement}");
+}
+
+/// The check reads the state the clauses before the DELETE leave: a second
+/// relationship an earlier clause created on the edge refuses the DELETE, as
+/// a stored one does. (An earlier clause can't remove a sibling without
+/// taking the edge, since that DELETE is refused itself.)
+#[tokio::test]
+async fn a_sibling_an_earlier_clause_created_refuses_the_delete() {
+    let seeded = rel_run(
+        "created-seed",
+        false,
+        r#"MATCH (n:P {id: "c"}) SET n.id = "c""#,
+    )
+    .await
+    .1;
+    let statement =
+        r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) CREATE (a)-[:K {w: 2}]->(b) DELETE r"#;
+    let (outcome, state) = rel_run("created-sibling", false, statement).await;
+    let err = outcome.expect_err(statement);
+    assert!(err.contains(PARALLEL_REFUSAL), "{statement}: {err}");
+    assert_eq!(state, seeded, "nothing written");
+}

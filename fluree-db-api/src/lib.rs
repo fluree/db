@@ -4624,38 +4624,20 @@ impl Fluree {
                 // disturb the sibling — reject. The endpoints must be named so
                 // the probe can group by them.
                 for target in &delete.targets {
-                    let (a, b) = crate::cypher_write::rel_endpoint_vars(update, &target.name)
-                        .ok_or_else(|| {
-                            ApiError::cypher(
-                                format!(
-                                    "DELETE of relationship `{}` requires both endpoint \
-                                     nodes to be named (e.g. `(a)-[{}]->(b)`)",
-                                    target.name, target.name
-                                ),
-                                Vec::new(),
-                            )
+                    let edge =
+                        crate::cypher_write::rel_edge(update, &target.name).ok_or_else(|| {
+                            crate::cypher_write::unnamed_endpoints_error(&target.name)
                         })?;
-                    let probe_ast = crate::cypher_write::build_parallel_probe_ast(
-                        &update.read_clauses,
-                        &a,
-                        &b,
-                        &target.name,
+                    let probe_ast = crate::cypher_write::build_sibling_probe_ast(
+                        update.read_clauses.clone(),
+                        &edge,
+                        target,
+                        target.span,
                     );
-                    if self
-                        .query_cypher_ast(&probe_view, &probe_ast)
-                        .await?
-                        .row_count()
-                        > 0
-                    {
-                        return Err(ApiError::cypher(
-                            format!(
-                                "DELETE of relationship `{}` failed: parallel relationships \
-                                 share its underlying edge, so deleting one would affect the \
-                                 others. Per-occurrence DELETE of a parallel relationship is \
-                                 not yet supported.",
-                                target.name
-                            ),
-                            Vec::new(),
+                    let siblings = self.query_cypher_ast(&probe_view, &probe_ast).await?;
+                    if crate::cypher_seq::has_parallel_sibling(siblings, &target.name)? {
+                        return Err(crate::cypher_write::parallel_relationship_error(
+                            &target.name,
                         ));
                     }
                 }

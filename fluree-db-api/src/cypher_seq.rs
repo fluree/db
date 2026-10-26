@@ -180,12 +180,27 @@ fn interacting_writes(u: &Update) -> Option<Update> {
         || u.write_clauses
             .iter()
             .any(|c| matches!(c, WriteClause::Set(s) if set_repeats_a_key(s)));
-    if !meet || validate_members(u).is_err() {
+    if !meet {
+        return None;
+    }
+    // A relationship's DELETE beside another write clause has no single-`Txn`
+    // form that sees the other clauses' writes or checks the edge for a
+    // parallel relationship, so it goes to the driver even when the driver
+    // will refuse it (unnamed endpoints, say), as a DELETE r of its own does.
+    if validate_members(u).is_err() && !deletes_a_relationship(u) {
         return None;
     }
     Some(Update {
         write_clauses: split_repeated_set_keys(&u.write_clauses),
         ..u.clone()
+    })
+}
+
+/// Whether a `DELETE` in `u` targets a relationship variable.
+fn deletes_a_relationship(u: &Update) -> bool {
+    let rel_vars = relationship_vars(&u.read_clauses);
+    u.write_clauses.iter().any(|w| {
+        matches!(w, WriteClause::Delete(d) if d.targets.iter().any(|t| rel_vars.contains(&t.name)))
     })
 }
 
@@ -263,7 +278,10 @@ struct ClauseWrites<'a> {
     labels: Vec<&'a str>,
     reads: bool,
     creates: bool,
-    detach: bool,
+    /// A `DELETE`: a node's `DETACH DELETE` takes every fact of the node, and
+    /// a relationship's takes its edge and every property of the
+    /// relationship, so it meets every other clause.
+    deletes: bool,
 }
 
 impl<'a> ClauseWrites<'a> {
@@ -296,9 +314,9 @@ impl<'a> ClauseWrites<'a> {
                     }
                 }
             }
-            WriteClause::Delete(d) => {
-                w.detach = d.detach;
-                w.reads = d.detach;
+            WriteClause::Delete(_) => {
+                w.deletes = true;
+                w.reads = true;
             }
             WriteClause::Merge(_) | WriteClause::Foreach(_) => {}
         }
@@ -344,8 +362,8 @@ impl<'a> ClauseWrites<'a> {
         if self.creates && other.creates {
             return false;
         }
-        self.detach
-            || other.detach
+        self.deletes
+            || other.deletes
             || (self.creates && other.reads)
             || (other.creates && self.reads)
             || self.shares_keys(other)
@@ -630,9 +648,26 @@ impl Fluree {
                     let bound = table.bound_on(&targets);
                     let table = bound.as_ref().unwrap_or(&table);
                     if !table.rows.is_empty() {
+                        let edges = match clause {
+                            WriteClause::Delete(d) if !d.detach => {
+                                self.seq_rel_delete_edges(
+                                    update,
+                                    d,
+                                    &stager,
+                                    table,
+                                    governance,
+                                    default_context.as_ref(),
+                                    tracker,
+                                    span,
+                                )
+                                .await?
+                            }
+                            _ => Vec::new(),
+                        };
                         self.seq_stage_seeded(
                             &mut stager,
                             table,
+                            edges,
                             vec![clause.clone()],
                             Some(clause_skolem),
                             ledger_id,
@@ -879,6 +914,7 @@ impl Fluree {
         self.seq_stage_seeded(
             stager,
             table,
+            Vec::new(),
             vec![WriteClause::Create(create.clone())],
             Some(clause_skolem.clone()),
             ledger_id,
@@ -1012,6 +1048,7 @@ impl Fluree {
                 self.seq_stage_seeded(
                     stager,
                     &sub,
+                    Vec::new(),
                     vec![create_ast_clause],
                     Some(clause_skolem.clone()),
                     ledger_id,
@@ -1215,6 +1252,7 @@ impl Fluree {
                 .seq_stage_seeded(
                     stager,
                     &table,
+                    Vec::new(),
                     vec![WriteClause::Set(SetClause {
                         items: items.to_vec(),
                         span,
@@ -1254,6 +1292,7 @@ impl Fluree {
             self.seq_stage_seeded(
                 stager,
                 &table,
+                Vec::new(),
                 vec![clause],
                 None,
                 ledger_id,
@@ -1562,13 +1601,60 @@ impl Fluree {
         Ok(clause)
     }
 
-    /// Lower `write_clauses` as one sub-statement with the table's columns
+    /// The edges a relationship `DELETE` retracts, as `MATCH` clauses its
+    /// seeded sub-statement re-matches (the lowering retracts the edge a
+    /// relationship variable was matched on). First, each edge is checked in
+    /// the state the clauses before it leave: an edge that backs another
+    /// relationship too (a parallel sibling, including one an earlier clause
+    /// created) is refused, as a DELETE r of its own refuses it, since
+    /// retracting the edge would take the sibling with it.
+    #[allow(clippy::too_many_arguments)]
+    async fn seq_rel_delete_edges(
+        &self,
+        update: &Update,
+        delete: &fluree_db_cypher::ast::DeleteClause,
+        stager: &SequentialStager,
+        table: &RowTable,
+        governance: Option<&GovernanceOptions>,
+        default_context: Option<&serde_json::Value>,
+        tracker: Option<&Tracker>,
+        span: SourceSpan,
+    ) -> Result<Vec<ReadClause>> {
+        let mut edges = Vec::with_capacity(delete.targets.len());
+        for target in &delete.targets {
+            let edge = crate::cypher_write::rel_edge(update, &target.name)
+                .ok_or_else(|| crate::cypher_write::unnamed_endpoints_error(&target.name))?;
+            let probe = crate::cypher_write::build_sibling_probe_ast(
+                vec![inline_rows_placeholder(&table.cols, span)],
+                &edge,
+                target,
+                span,
+            );
+            let view = self
+                .seq_probe_view(stager.state(), governance, default_context)
+                .await?;
+            let siblings = self
+                .query_cypher_ast_seeded(&view, &probe, &table.cols, table.rows.clone(), tracker)
+                .await?;
+            if has_parallel_sibling(siblings, &target.name)? {
+                return Err(crate::cypher_write::parallel_relationship_error(
+                    &target.name,
+                ));
+            }
+            edges.push(edge.match_clause(Some(target.clone()), span));
+        }
+        Ok(edges)
+    }
+
+    /// Lower `write_clauses` (after `read_clauses`, which re-match what the
+    /// writes need matched) as one sub-statement with the table's columns
     /// declared bound, seed the row block, and stage it on the stager.
     #[allow(clippy::too_many_arguments)]
     async fn seq_stage_seeded(
         &self,
         stager: &mut SequentialStager,
         table: &RowTable,
+        read_clauses: Vec<ReadClause>,
         write_clauses: Vec<WriteClause>,
         skolem: Option<String>,
         ledger_id: &str,
@@ -1578,7 +1664,15 @@ impl Fluree {
         span: SourceSpan,
         after: StateAfter,
     ) -> Result<usize> {
-        let ast = update_ast(write_clauses, span);
+        let ast = CypherAst {
+            statement: Statement::Update(Update {
+                read_clauses,
+                write_clauses,
+                return_clause: None,
+                span,
+            }),
+            span,
+        };
         let mut txn = self
             .lower_cypher_ast_to_txn_seeded(
                 &ast,
@@ -1724,11 +1818,23 @@ fn validate_members(u: &Update) -> Result<()> {
             // lowering finds the node's triples in the state it stages on.
             WriteClause::Delete(d)
                 if d.detach && d.targets.iter().all(|t| !rel_vars.contains(&t.name)) => {}
+            // A relationship's DELETE re-matches the edge it reifies in the
+            // state it stages on (see `seq_rel_delete_edges`), so its endpoints
+            // must be named, as for a DELETE r of its own.
+            WriteClause::Delete(d)
+                if !d.detach && d.targets.iter().all(|t| rel_vars.contains(&t.name)) =>
+            {
+                for t in &d.targets {
+                    if crate::cypher_write::rel_edge(u, &t.name).is_none() {
+                        return Err(crate::cypher_write::unnamed_endpoints_error(&t.name));
+                    }
+                }
+            }
             WriteClause::Delete(_) => {
                 return Err(cypher_err(
-                    "a bare or relationship DELETE in a multi-clause write statement is \
-                     deferred — run the DELETE as its own statement (a node's DETACH DELETE \
-                     is supported)",
+                    "a bare node DELETE in a multi-clause write statement is deferred — run \
+                     the DELETE as its own statement (a node's DETACH DELETE and a \
+                     relationship's DELETE are supported)",
                 ));
             }
             WriteClause::Foreach(_) => {
@@ -2084,6 +2190,20 @@ fn extract_rows(mut result: QueryResult, wanted: &[String]) -> Result<Vec<Vec<Bi
         }
     }
     Ok(out)
+}
+
+/// Whether a [`crate::cypher_write::build_sibling_probe_ast`] result shows a
+/// relationship being deleted sharing its edge with another: a row whose
+/// sibling isn't the relationship itself.
+pub(crate) fn has_parallel_sibling(result: QueryResult, rel_var: &str) -> Result<bool> {
+    let rows = extract_rows(
+        result,
+        &[
+            rel_var.to_string(),
+            crate::cypher_write::SIBLING_VAR.to_string(),
+        ],
+    )?;
+    Ok(rows.iter().any(|row| row[0] != row[1]))
 }
 
 /// Normalize a materialized binding for row threading: strip history

@@ -481,7 +481,11 @@ error listing the supported set.
   and relationship sidecar metadata.
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
-  removes a node together with its relationships.
+  removes a node together with its relationships. `DELETE r` retracts the
+  edge `r` was matched on, so it is refused when that edge carries another
+  relationship too (a parallel relationship between the same endpoints, with
+  the same type), whether or not the `MATCH` filters that one out, and it
+  needs both endpoints named (`(a)-[r:T]->(b)`).
 - **`FOREACH`** — unroll a write over a **constant** list (inline literal,
   constant `range()`, or a `$param` array), running a `CREATE` / `SET` /
   `REMOVE` body per element:
@@ -546,7 +550,8 @@ error listing the supported set.
   the edge is inserted — idempotent in RDF, but redundant.
 - **Multi-clause write composition** — a statement may chain multiple write
   clauses (`MERGE` chains, `CREATE`+`MERGE` mixes, interleaved `SET` /
-  `REMOVE` / `DETACH DELETE`), with each clause observing the writes of the
+  `REMOVE` / `DETACH DELETE` / a relationship's `DELETE`), with each clause
+  observing the writes of the
   clauses before it and rows piping downstream — the standard Cypher loading
   idioms:
 
@@ -577,10 +582,13 @@ error listing the supported set.
   "x"` leaves `"x"`, and `SET n.name = "y", n.name = "w"` (one clause) leaves
   `"w"`. A write that ends where the stored value was commits nothing. A
   `CREATE` after a `SET`, `REMOVE` or `DETACH DELETE` creates once per matched
-  row.
+  row. A relationship's `DELETE` takes the properties earlier clauses set on
+  it, and a `CREATE` of the same edge after it creates the one new
+  relationship; it is refused when the edge carries another relationship in
+  the state the clauses before it leave.
 
-  Deferred in a multi-clause statement (clear errors): a bare or relationship
-  `DELETE` and `FOREACH` members, `CALL { … }` in the read prefix, and
+  Deferred in a multi-clause statement (clear errors): a bare node `DELETE`
+  and `FOREACH` members, `CALL { … }` in the read prefix, and
   `OPTIONAL MATCH` in the read prefix of a statement with a `CREATE` or
   `MERGE`. See
   `docs/design/cypher-sequential-writes.md` for the execution model.

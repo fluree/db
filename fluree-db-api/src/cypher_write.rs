@@ -19,10 +19,11 @@
 //! current state, derives the actual write, and commits it as one transaction.
 
 use fluree_db_cypher::ast::{
-    BinOp, CypherAst, DeleteClause, Direction, Expr, FuncCall, Literal, MatchClause, MergeClause,
-    NodePattern, Pattern, PatternPart, ProjectionItem, Query, ReadClause, ReturnClause, SetClause,
-    SetItem, Statement, Update, Variable, WithClause, WriteClause,
+    CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
+    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, RelType, ReturnClause,
+    SetClause, SetItem, Statement, Update, Variable, WriteClause,
 };
+use fluree_db_cypher::span::SourceSpan;
 use fluree_db_ledger::LedgerState;
 use fluree_db_transact::ir::Txn;
 
@@ -322,10 +323,56 @@ pub(crate) fn bound_by_mandatory_match(u: &Update, name: &str) -> bool {
     })
 }
 
-/// Find the (subject-side, object-side) endpoint variables of relationship
-/// variable `rel_var` in the MATCH, honoring direction. Returns `None` if the
-/// endpoints aren't both named.
-pub(crate) fn rel_endpoint_vars(u: &Update, rel_var: &str) -> Option<(Variable, Variable)> {
+/// The base edge a relationship variable was matched on: its endpoints,
+/// named and ordered subject → object, and its type. A relationship's
+/// `DELETE` retracts that edge, and every relationship reifying it goes with
+/// it.
+pub(crate) struct RelEdge {
+    pub s: Variable,
+    pub o: Variable,
+    pub types: Vec<RelType>,
+}
+
+impl RelEdge {
+    /// `MATCH (s)-[rel:T]->(o)`: the edge alone, with no labels or properties
+    /// (where this is used, `s` and `o` are already bound).
+    pub(crate) fn match_clause(&self, rel: Option<Variable>, span: SourceSpan) -> ReadClause {
+        let node = |v: &Variable| NodePattern {
+            var: Some(v.clone()),
+            labels: Vec::new(),
+            props: None,
+            span,
+        };
+        ReadClause::Match(MatchClause {
+            pattern: Pattern {
+                parts: vec![PatternPart {
+                    path_var: None,
+                    path_search: None,
+                    head: node(&self.s),
+                    tail: vec![(
+                        RelPattern {
+                            var: rel,
+                            direction: Direction::Outgoing,
+                            types: self.types.clone(),
+                            length: None,
+                            props: None,
+                            span,
+                        },
+                        node(&self.o),
+                    )],
+                    span,
+                }],
+                span,
+            },
+            where_clause: None,
+            span,
+        })
+    }
+}
+
+/// The [`RelEdge`] relationship variable `rel_var` was matched on, honoring
+/// direction. `None` if the endpoints aren't both named.
+pub(crate) fn rel_edge(u: &Update, rel_var: &str) -> Option<RelEdge> {
     for clause in &u.read_clauses {
         let (ReadClause::Match(m) | ReadClause::OptionalMatch(m)) = clause else {
             continue;
@@ -338,13 +385,42 @@ pub(crate) fn rel_endpoint_vars(u: &Update, rel_var: &str) -> Option<(Variable, 
                         Direction::Incoming => (next, prev),
                         _ => (prev, next),
                     };
-                    return Some((s.var.clone()?, o.var.clone()?));
+                    return Some(RelEdge {
+                        s: s.var.clone()?,
+                        o: o.var.clone()?,
+                        types: rel.types.clone(),
+                    });
                 }
                 prev = next;
             }
         }
     }
     None
+}
+
+/// The refusal for a `DELETE` of relationship `rel_var` whose edge backs a
+/// parallel relationship.
+pub(crate) fn parallel_relationship_error(rel_var: &str) -> crate::error::ApiError {
+    crate::error::ApiError::cypher(
+        format!(
+            "DELETE of relationship `{rel_var}` failed: parallel relationships share its \
+             underlying edge, so deleting one would affect the others. Per-occurrence DELETE \
+             of a parallel relationship is not yet supported."
+        ),
+        Vec::new(),
+    )
+}
+
+/// The refusal for a `DELETE` of relationship `rel_var` whose endpoints
+/// aren't both named.
+pub(crate) fn unnamed_endpoints_error(rel_var: &str) -> crate::error::ApiError {
+    crate::error::ApiError::cypher(
+        format!(
+            "DELETE of relationship `{rel_var}` requires both endpoint nodes to be named \
+             (e.g. `(a)-[{rel_var}]->(b)`)"
+        ),
+        Vec::new(),
+    )
 }
 
 /// Build a probe that returns at most one row when a node matching the MERGE
@@ -490,72 +566,44 @@ pub(crate) fn build_delete_target_probe_ast(
     }
 }
 
-/// Build a probe that returns at most one row when the matched relationship
-/// `rel_var` has a **parallel sibling** — another reified edge sharing the same
-/// `(a)-[:T]->(b)` base triple. Appends
-/// `WITH <a>, <b>, count(<rel_var>) AS __cyrel_c WHERE __cyrel_c > 1
-///  RETURN <a> LIMIT 1` to the original read clauses. Named relationships bind
-/// one row per annotation SID, so a `count > 1` per `(a, b)` group means the
-/// base edge backs multiple relationship identities — retracting it would
-/// disturb the siblings, so `DELETE r` must reject.
-pub(crate) fn build_parallel_probe_ast(
-    read_clauses: &[ReadClause],
-    a: &Variable,
-    b: &Variable,
-    rel_var: &str,
+/// Name of the sibling variable in [`build_sibling_probe_ast`].
+pub(crate) const SIBLING_VAR: &str = "__cyrel_sib";
+
+/// Build a probe listing, for each relationship `rel` being deleted, every
+/// relationship on the edge it reifies: `prefix` (the clauses that bind
+/// `rel` and its endpoints) followed by `MATCH (s)-[__cyrel_sib:T]->(o)
+/// RETURN rel, __cyrel_sib`. Named relationships bind one row per annotation
+/// SID, so a row whose `__cyrel_sib` isn't its `rel` is a **parallel
+/// sibling**: retracting the edge would take it too, so `DELETE r` must
+/// refuse (see [`crate::cypher_seq::has_parallel_sibling`]).
+///
+/// The siblings are matched afresh, without `rel`'s property map or `WHERE`:
+/// a filter that keeps only one of them must not hide the others.
+pub(crate) fn build_sibling_probe_ast(
+    mut prefix: Vec<ReadClause>,
+    edge: &RelEdge,
+    rel: &Variable,
+    span: SourceSpan,
 ) -> CypherAst {
-    let span = a.span;
     let proj = |v: &Variable| ProjectionItem {
         expr: Expr::Var(v.clone()),
         alias: None,
         span,
     };
-    let count_alias = Variable {
-        name: "__cyrel_c".to_string(),
+    let sibling = Variable {
+        name: SIBLING_VAR.to_string(),
         span,
     };
-    let count_item = ProjectionItem {
-        // DISTINCT: count relationship *identities*, not solution rows. Extra
-        // multiplicity in the original MATCH (another matched variable) can
-        // repeat one identity across rows, which would falsely trip the guard.
-        expr: Expr::Call(FuncCall {
-            name: "count".to_string(),
-            args: vec![Expr::Var(Variable {
-                name: rel_var.to_string(),
-                span,
-            })],
-            distinct: true,
-            span,
-        }),
-        alias: Some(count_alias.clone()),
-        span,
-    };
-    let having = Expr::BinOp(
-        BinOp::Gt,
-        Box::new(Expr::Var(count_alias)),
-        Box::new(Expr::Lit(Literal::Integer(1, span))),
-        span,
-    );
-    let mut clauses: Vec<ReadClause> = read_clauses.to_vec();
-    clauses.push(ReadClause::With(WithClause {
-        items: vec![proj(a), proj(b), count_item],
-        distinct: false,
-        where_clause: Some(having),
-        order_by: Vec::new(),
-        skip: None,
-        limit: None,
-        span,
-    }));
-
+    prefix.push(edge.match_clause(Some(sibling.clone()), span));
     CypherAst {
         statement: Statement::Query(Query {
-            clauses,
+            clauses: prefix,
             return_clause: ReturnClause {
-                items: vec![proj(a)],
+                items: vec![proj(rel), proj(&sibling)],
                 distinct: false,
                 order_by: Vec::new(),
                 skip: None,
-                limit: Some(Expr::Lit(Literal::Integer(1, span))),
+                limit: None,
                 span,
             },
             union_tail: None,
