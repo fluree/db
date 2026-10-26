@@ -131,13 +131,16 @@ pub(crate) fn mapping_source_of(
 /// index), which no R2RML probe serves.
 ///
 /// A mapped record without a mapping (an Iceberg source stored before
-/// registration required one) is [`QueryError::GraphSourceUnmapped`], and one
-/// whose config does not parse is an internal error. Read as `None`, either
-/// would send its query to the ledger lookup or to an empty genesis graph. The
-/// R2RML probe and the genesis-view resolver both decide here.
+/// registration required one) is [`QueryError::GraphSourceUnmapped`], one of a
+/// family this build does not read (SQL without `sql`, Delta without `delta`)
+/// is [`QueryError::GraphSourceUnsupported`], and one whose config does not
+/// parse is an internal error. Read as `None`, any of them would send its query
+/// to the ledger lookup or to an empty genesis graph. The R2RML probe and the
+/// genesis-view resolver both decide here.
 pub(crate) fn served_mapping_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> QueryResult<Option<fluree_db_iceberg::config::MappingSource>> {
+    super::SourceReaders::BUILT.refuse_unread(record)?;
     let graph_source_id = record.graph_source_id.as_str();
     match mapping_reference(record) {
         None => Ok(None),

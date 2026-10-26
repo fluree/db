@@ -122,6 +122,11 @@ pub const GRAPH_SOURCE_RETRACTED: &str = "err:db/GraphSourceRetracted";
 /// from (HTTP 409). Registering it again with a mapping clears it.
 pub const GRAPH_SOURCE_UNMAPPED: &str = "err:db/GraphSourceUnmapped";
 
+/// The graph source is of a family this build was compiled without (an
+/// Iceberg / R2RML source without the `iceberg` feature, SQL without `sql`,
+/// Delta without `delta`), so nothing here can read it (HTTP 501).
+pub const GRAPH_SOURCE_UNSUPPORTED: &str = "err:db/GraphSourceUnsupported";
+
 /// A graph the target ledger does not have
 pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
 

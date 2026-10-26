@@ -173,6 +173,63 @@ pub(crate) fn pin_graph_source_times<'v>(
     Ok(())
 }
 
+/// The graph-source readers compiled into a build. A value rather than a set
+/// of `cfg!` checks at the use site, so the refusal it drives can be tested
+/// for a build without a reader from a build that has them all.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourceReaders {
+    pub(crate) iceberg: bool,
+    pub(crate) sql: bool,
+    pub(crate) delta: bool,
+}
+
+impl SourceReaders {
+    /// The readers this build has.
+    pub(crate) const BUILT: Self = Self {
+        iceberg: cfg!(feature = "iceberg"),
+        sql: cfg!(feature = "sql"),
+        delta: cfg!(feature = "delta"),
+    };
+
+    /// Refuse a graph source of a mapped family these readers lack. Read by
+    /// nothing, its genesis view would answer every query as an empty graph.
+    pub(crate) fn refuse_unread(
+        self,
+        record: &fluree_db_nameservice::GraphSourceRecord,
+    ) -> fluree_db_query::error::Result<()> {
+        use fluree_db_nameservice::GraphSourceType as T;
+        let missing = match record.source_type {
+            T::Iceberg if !self.iceberg => Some(("an Iceberg", "iceberg")),
+            T::R2rml if !self.iceberg => Some(("an R2RML", "iceberg")),
+            T::Sql if !self.sql => Some(("a SQL", "sql")),
+            T::Delta if !self.delta => Some(("a Delta", "delta")),
+            _ => None,
+        };
+        match missing {
+            Some((family, feature)) => Err(fluree_db_query::QueryError::GraphSourceUnsupported {
+                graph_source_id: record.graph_source_id.to_string(),
+                family,
+                feature,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Refuse a live graph-source record this build cannot answer a query from: a
+/// mapped source whose reader is not compiled in, or one with no mapping. The
+/// genesis-view resolver refuses through here, so no such source reaches a
+/// query as an empty graph.
+pub(crate) fn require_readable(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> fluree_db_query::error::Result<()> {
+    #[cfg(feature = "iceberg")]
+    r2rml::served_mapping_of(record)?;
+    #[cfg(not(feature = "iceberg"))]
+    SourceReaders::BUILT.refuse_unread(record)?;
+    Ok(())
+}
+
 fn describe_source_time(time: Option<fluree_db_query::r2rml::SourceTime>) -> String {
     match time {
         None => "latest".to_string(),
@@ -331,3 +388,56 @@ pub use r2rml::FlureeR2rmlProvider;
 pub use r2rml_materialize::{MaterializeResult, PersistedMaterializeJob};
 
 // Helper functions are used internally by bm25.rs via direct module path
+
+#[cfg(test)]
+mod tests {
+    use super::SourceReaders;
+    use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType as T};
+    use fluree_db_query::QueryError;
+
+    fn record(source_type: T) -> GraphSourceRecord {
+        GraphSourceRecord::new("gs", "main", source_type, "{}", Vec::new())
+    }
+
+    /// A build without a mapped family's reader refuses that family by name,
+    /// whatever features this test binary itself was compiled with.
+    #[test]
+    fn a_build_without_a_reader_refuses_its_family_by_name() {
+        let none = SourceReaders {
+            iceberg: false,
+            sql: false,
+            delta: false,
+        };
+        for (source_type, family, feature) in [
+            (T::Iceberg, "an Iceberg", "iceberg"),
+            (T::R2rml, "an R2RML", "iceberg"),
+            (T::Sql, "a SQL", "sql"),
+            (T::Delta, "a Delta", "delta"),
+        ] {
+            match none.refuse_unread(&record(source_type.clone())) {
+                Err(QueryError::GraphSourceUnsupported {
+                    graph_source_id,
+                    family: f,
+                    feature: g,
+                }) => {
+                    assert_eq!(graph_source_id, "gs:main");
+                    assert_eq!((f, g), (family, feature), "{source_type:?}");
+                }
+                other => panic!("{source_type:?}: expected GraphSourceUnsupported, got {other:?}"),
+            }
+        }
+        // An index source has no mapped reader to lack.
+        for source_type in [T::Bm25, T::Vector, T::Geo] {
+            assert!(none.refuse_unread(&record(source_type)).is_ok());
+        }
+
+        let all = SourceReaders {
+            iceberg: true,
+            sql: true,
+            delta: true,
+        };
+        for source_type in [T::Iceberg, T::R2rml, T::Sql, T::Delta] {
+            assert!(all.refuse_unread(&record(source_type)).is_ok());
+        }
+    }
+}

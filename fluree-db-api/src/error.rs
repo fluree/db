@@ -903,6 +903,7 @@ impl ApiError {
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
                 QE::GraphSourceUnmapped { .. } => errors::GRAPH_SOURCE_UNMAPPED,
+                QE::GraphSourceUnsupported { .. } => errors::GRAPH_SOURCE_UNSUPPORTED,
                 // Typed as `ApiError::NameService` is: the backend's fault.
                 QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
@@ -1026,6 +1027,9 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         // registering it again with a mapping clears it: a conflict with the
         // resource, as querying a dropped source is.
         QE::GraphSourceUnmapped { .. } => 409,
+        // The deployment lacks the reader, and no request can supply it: the
+        // server does not support what the request needs.
+        QE::GraphSourceUnsupported { .. } => 501,
         // Engine and storage faults no change to the query can clear.
         QE::Core(_)
         | QE::OperatorNotOpened
@@ -1319,6 +1323,15 @@ mod tests {
                 }),
                 409,
                 GRAPH_SOURCE_UNMAPPED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceUnsupported {
+                    graph_source_id: "gs:main".into(),
+                    family: "an Iceberg",
+                    feature: "iceberg",
+                }),
+                501,
+                GRAPH_SOURCE_UNSUPPORTED,
             ),
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),

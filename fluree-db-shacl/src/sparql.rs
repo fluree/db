@@ -577,6 +577,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::SnapshotNotFound { .. }
         | QueryError::NoSnapshotAtTime { .. }
         | QueryError::GraphSourceUnmapped { .. }
+        | QueryError::GraphSourceUnsupported { .. }
         | QueryError::R2rml(_)
         | QueryError::Core(_)
         | QueryError::Batch(_)
@@ -921,6 +922,13 @@ mod tests {
             ];
             QueryError::GraphSourceUnmapped { .. } => true, [
                 QueryError::GraphSourceUnmapped { graph_source_id: s() },
+            ];
+            QueryError::GraphSourceUnsupported { .. } => true, [
+                QueryError::GraphSourceUnsupported {
+                    graph_source_id: s(),
+                    family: "an Iceberg",
+                    feature: "iceberg",
+                },
             ];
             QueryError::R2rml(_) => true, [
                 QueryError::R2rml(fluree_db_r2rml::R2rmlError::Parse(s())),

@@ -162,6 +162,24 @@ pub enum QueryError {
     )]
     GraphSourceUnmapped { graph_source_id: String },
 
+    /// A registered graph source of a family this build was compiled without
+    /// (an Iceberg / R2RML source without the `iceberg` feature, SQL without
+    /// `sql`, Delta without `delta`), so no reader for it exists here.
+    ///
+    /// Typed so the query fails naming what the build lacks, rather than
+    /// reading the source as an empty graph.
+    #[error(
+        "graph source '{graph_source_id}' is {family} graph source, which this build cannot \
+         read: it was compiled without the '{feature}' feature"
+    )]
+    GraphSourceUnsupported {
+        graph_source_id: String,
+        /// The family, with its article ("an Iceberg").
+        family: &'static str,
+        /// The cargo feature that reads it.
+        feature: &'static str,
+    },
+
     /// Object storage denied a read of an external table's data (S3 403 /
     /// `AccessDenied`).
     ///

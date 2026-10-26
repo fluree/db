@@ -434,6 +434,30 @@ An unexpected error occurred on the server.
 - Retry request
 - Contact support if persists
 
+#### 501 Not Implemented
+
+The server was built without a capability the request needs.
+
+**Common Causes:**
+- Querying a graph source whose reader this build was compiled without
+  (`err:db/GraphSourceUnsupported`): an Iceberg or R2RML source on a build
+  without the `iceberg` feature, a SQL source without `sql`, a Delta source
+  without `delta`. The record was registered by a build that had the reader
+  and shares this nameservice.
+
+**Example:**
+```json
+{
+  "error": "Query error: graph source 'orders:main' is an Iceberg graph source, which this build cannot read: it was compiled without the 'iceberg' feature",
+  "status": 501,
+  "@type": "err:db/GraphSourceUnsupported"
+}
+```
+
+**How to Fix:**
+- Query the source through a server built with the feature the message names
+- Rebuild with that feature
+
 #### 502 Bad Gateway
 
 Error communicating with upstream service.

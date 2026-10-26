@@ -831,6 +831,28 @@ impl Fluree {
         self.resolve_graph_source_address(&address, spec).await
     }
 
+    /// Refuse the graph source `id` names when this build cannot answer a query
+    /// from it ([`crate::graph_source::require_readable`]). `Ok` when it names
+    /// none, or one that can be read.
+    #[cfg(not(feature = "iceberg"))]
+    pub(crate) async fn refuse_unreadable_graph_source(
+        &self,
+        id: &fluree_db_core::LedgerId,
+    ) -> Result<()> {
+        let record = self
+            .nameservice()
+            .lookup_graph_source(id)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        match record {
+            // A drop leaves the record as a tombstone.
+            Some(record) if !record.retracted => {
+                Ok(crate::graph_source::require_readable(&record)?)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// [`Self::resolve_graph_source_at`] for an already-parsed address: the
     /// graph source is looked up by the address's id, and the address's graph
     /// selected on the genesis view.
@@ -852,13 +874,13 @@ impl Fluree {
             return Ok(None);
         };
 
-        // A mapped source with no mapping has nothing to answer from. Every
-        // route that names a graph source (a direct target, `FROM`, `FROM
-        // NAMED`, the server's query routes) resolves it here, so refusing it
-        // here keeps the genesis view below, which would read as an empty
-        // graph, from ever standing in for it.
-        #[cfg(feature = "iceberg")]
-        crate::graph_source::r2rml::served_mapping_of(&record)?;
+        // A source this build cannot answer from (a mapped source with no
+        // mapping, or of a family whose reader is not compiled in). Every route
+        // that names a graph source (a direct target, `FROM`, `FROM NAMED`, the
+        // server's query routes) resolves it here, so refusing it here keeps
+        // the genesis view below, which would read as an empty graph, from
+        // ever standing in for it.
+        crate::graph_source::require_readable(&record)?;
 
         let graph_source_time = crate::graph_source::source_time_for(spec)?;
         if graph_source_time.is_some()
