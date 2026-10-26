@@ -203,18 +203,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     // PR-BASE: relative-IRI/BASE resolution in query output (2)
-    // list-2..4: the SPARQL parser now desugars `( ... )` patterns to
-    // rdf:first/rest/nil triples, but Fluree's Turtle ingest emits
-    // OBJECT-position collections as Fluree list_index items —
-    // `parse_collection_as_list`, fluree-graph-turtle/src/parser.rs — so
-    // the first/rest triples the query needs are never stored. Eval-side
-    // ingest/model gap (D-13), not parser. list-1 came OFF this register
-    // with the #1694 empty-collection fix: `()` now ingests as the
-    // `rdf:nil` triple it denotes (`:x :list0 rdf:nil`), and `:x ?p ()`
-    // needs no spine — the pattern lowers to the rdf:nil constant.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",
     // dawg-bev-1..6: greened by the datatype-aware, fallible bare-variable EBV
     // (numeric-zero/empty-string falsy; ill-typed/lang/IRI/unbound → type error
     // excluding the row) — D-EBV, PR-X2

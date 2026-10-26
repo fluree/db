@@ -278,6 +278,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: None,
             ordering: Vec::new(),
             order_binds: Vec::new(),

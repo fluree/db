@@ -128,7 +128,18 @@ pub struct FlakeGenerator<'a> {
     /// the IRI (the fallback Sid's name), so each is re-encoded once per
     /// transaction, not once per flake.
     canonical_sids: FxHashMap<Arc<str>, Sid>,
+
+    /// List members asserted so far, held as lists for staging to store
+    /// ([`crate::lists`]): each list's members and its chain cells' label.
+    lists: Vec<(Vec<Flake>, String)>,
+    /// Each list by its template list, solution and owner: a template list
+    /// is a fresh list in every solution.
+    list_slots: HashMap<ListKey, usize>,
 }
+
+/// A list a transaction asserts: the template list, the solution, and the
+/// owning graph, subject and predicate.
+type ListKey = (Option<u32>, u64, Option<Sid>, Sid, Sid);
 
 impl<'a> FlakeGenerator<'a> {
     /// Create a new flake generator
@@ -149,7 +160,41 @@ impl<'a> FlakeGenerator<'a> {
             bound_graphs: HashMap::new(),
             sid_graphs: HashMap::new(),
             canonical_sids: FxHashMap::default(),
+            lists: Vec::new(),
+            list_slots: HashMap::new(),
         }
+    }
+
+    /// The lists asserted so far, for [`crate::lists::store_lists`].
+    pub fn take_lists(&mut self) -> Vec<crate::lists::PendingList> {
+        self.list_slots.clear();
+        std::mem::take(&mut self.lists)
+            .into_iter()
+            .map(|(members, cells)| crate::lists::PendingList::new(members, cells))
+            .collect()
+    }
+
+    /// Hold `member`, asserted by `template` in `solution`, as a member of
+    /// its list.
+    fn hold_list_member(&mut self, template: &TripleTemplate, solution: u64, member: Flake) {
+        let key = (
+            template.list_id,
+            solution,
+            member.g.clone(),
+            member.s.clone(),
+            member.p.clone(),
+        );
+        let slot = match self.list_slots.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                let n = self.lists.len();
+                let cells = format!("{}-{solution}--l{n}-", self.txn_id);
+                self.lists.push((Vec::new(), cells));
+                self.list_slots.insert(key, n);
+                n
+            }
+        };
+        self.lists[slot].0.push(member);
     }
 
     /// `sid`'s IRI, decoded with the transaction's namespace codes: the
@@ -266,7 +311,16 @@ impl<'a> FlakeGenerator<'a> {
         let mut flakes = Vec::new();
         for row_idx in 0..Self::solution_rows(bindings) {
             for template in templates {
-                flakes.extend(self.materialize_template(template, bindings, row_idx, op)?);
+                let Some(flake) = self.materialize_template(template, bindings, row_idx, op)?
+                else {
+                    continue;
+                };
+                if op && template.list_index.is_some() {
+                    let solution = self.solution_base + row_idx as u64;
+                    self.hold_list_member(template, solution, flake);
+                } else {
+                    flakes.push(flake);
+                }
             }
         }
         Ok(flakes)
@@ -668,22 +722,13 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
              a parser produced a mismatched (value, datatype) shape"
         )));
     }
-    // Empty vectors must never reach the indexer: `FlakeValue::Vector(Vec::new())`
-    // is reserved as the `FlakeValue::max()` upper-bound sentinel, and the shared
-    // vector arena hard-rejects them. Catch any path that bypassed
-    // `coerce_array_to_vector`'s upstream check (e.g. a future direct
-    // construction of `FlakeValue::Vector(vec![].into())`).
-    if is_vector_dt {
-        if let FlakeValue::Vector(v) = val {
-            if v.is_empty() {
-                return Err(TransactError::FlakeGeneration(
-                    "f:embeddingVector flake must have at least one element; \
-                     empty vectors collide with the FlakeValue::max() sentinel \
-                     and the vector arena rejects them"
-                        .to_string(),
-                ));
-            }
-        }
+    // Every vector must be one the vector arena can store. An empty vector
+    // would also collide with the `FlakeValue::max()` upper-bound sentinel.
+    // Whether its length matches the property's other vectors is checked per
+    // commit (`crate::vector_dims`).
+    if let FlakeValue::Vector(v) = val {
+        fluree_db_core::vector::check_vector_f64(None, v)
+            .map_err(|e| TransactError::InvalidVector(e.to_string()))?;
     }
     if dt == &*DT_JSON && !matches!(val, FlakeValue::Json(_)) {
         return Err(TransactError::FlakeGeneration(format!(
@@ -938,7 +983,9 @@ mod tests {
         ];
 
         let batch = make_empty_batch();
-        let flakes = generator.generate_assertions(&templates, &batch).unwrap();
+        let held = generator.generate_assertions(&templates, &batch).unwrap();
+        assert!(held.is_empty(), "list members are held as a list");
+        let flakes = crate::lists::store_new_lists(generator.take_lists());
 
         assert_eq!(flakes.len(), 3);
 
@@ -968,7 +1015,9 @@ mod tests {
         .with_list_index(0)];
 
         let batch = make_empty_batch();
-        let flakes = generator.generate_assertions(&templates, &batch).unwrap();
+        let held = generator.generate_assertions(&templates, &batch).unwrap();
+        assert!(held.is_empty(), "list members are held as a list");
+        let flakes = crate::lists::store_new_lists(generator.take_lists());
 
         assert_eq!(flakes.len(), 1);
 
@@ -998,7 +1047,18 @@ mod tests {
             &Sid::new(FLUREE_DB, "embeddingVector"),
         )
         .expect_err("empty vector must be rejected");
-        assert!(format!("{err}").contains("at least one element"), "{err}");
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_pair_rejects_a_vector_longer_than_the_arena_holds() {
+        let dt = Sid::new(FLUREE_DB, "embeddingVector");
+        let longest = vec![0.5; fluree_db_core::vector::MAX_VECTOR_DIMS];
+        validate_value_dt_pair(&FlakeValue::Vector(longest.into()), &dt).expect("65535 elements");
+        let too_long = vec![0.5; fluree_db_core::vector::MAX_VECTOR_DIMS + 1];
+        let err = validate_value_dt_pair(&FlakeValue::Vector(too_long.into()), &dt)
+            .expect_err("65536 elements must be rejected");
+        assert!(matches!(err, TransactError::InvalidVector(_)), "{err}");
     }
 
     #[test]

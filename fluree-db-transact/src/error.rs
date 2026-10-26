@@ -137,6 +137,22 @@ pub enum TransactError {
         max: usize,
     },
 
+    /// An `f:embeddingVector` value the ledger cannot store: empty, longer
+    /// than 65,535 elements, holding a non-finite element, or of a length
+    /// other than the property's other vectors in the same graph
+    /// ([`fluree_db_core::vector`]).
+    #[error("Invalid vector: {0}")]
+    InvalidVector(String),
+
+    /// This process has not loaded the ledger's index, so it cannot stage a
+    /// write against it: no index is attached, or the one attached is older
+    /// than the index the ledger's novelty starts from. Decided before any
+    /// read and before any commit, so nothing is committed, and the same
+    /// write can succeed once the index loads
+    /// ([`crate::check_index_loaded`]).
+    #[error("Index not loaded: {0}")]
+    IndexNotLoaded(String),
+
     /// Whole-graph scan larger than the memory backstop
     #[error(
         "whole-graph operation would materialize more than {limit} currently-asserted flakes; \

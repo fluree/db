@@ -41,6 +41,8 @@ pub mod error;
 pub mod flake_sink;
 pub mod generate;
 pub mod ir;
+mod list_edits;
+pub mod lists;
 pub mod lower_cypher_update;
 pub mod lower_sparql_update;
 pub mod namespace;
@@ -50,6 +52,7 @@ pub mod stage;
 pub mod staged_dicts;
 pub mod template_sink;
 pub mod value_convert;
+pub mod vector_dims;
 
 #[cfg(feature = "import")]
 pub mod import;
@@ -62,7 +65,8 @@ pub use fluree_graph_turtle::splitter as turtle_splitter;
 // Re-exports
 pub use address::parse_commit_id;
 pub use commit::{
-    build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
+    build_commit, check_index_loaded, commit, CommitOpts, CommitOptsRequest, CommitReceipt,
+    StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{
@@ -88,9 +92,9 @@ pub use parse::{
     Placement, RdfText, RdfTextSummary,
 };
 pub use parse::{
-    might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,
-    parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm, RawTrigMeta,
-    RawTriple, TrigPhase1Result,
+    is_empty_document, might_contain_graph_block, parse_graph_insert, parse_sync_transaction,
+    parse_transaction, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm,
+    RawTrigMeta, RawTriple, TrigPhase1Result,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{

@@ -970,6 +970,14 @@ enum LoadState {
         handle: LedgerHandle,
         waiters: Vec<oneshot::Sender<std::result::Result<(), Arc<ApiError>>>>,
     },
+    /// The ledger's binary store failed to load. Until `retry_at`, a request
+    /// gets this error without loading again, so a lasting failure costs one
+    /// load per [`LedgerManagerConfig::store_load_retry`], not one per
+    /// request. The next request after that loads again.
+    Failed {
+        error: Arc<ApiError>,
+        retry_at: Instant,
+    },
 }
 
 // ============================================================================
@@ -1113,6 +1121,10 @@ pub struct LedgerManagerConfig {
     ///
     /// By default this is injected by `Fluree` from its global cache budget.
     pub leaflet_cache: Option<Arc<LeafletCache>>,
+    /// How long a ledger whose binary store failed to load answers with that
+    /// failure before a request loads it again (default: 5 s). Zero loads
+    /// again on the next request.
+    pub store_load_retry: Duration,
 }
 
 impl std::fmt::Debug for LedgerManagerConfig {
@@ -1122,6 +1134,7 @@ impl std::fmt::Debug for LedgerManagerConfig {
             .field("sweep_interval", &self.sweep_interval)
             .field("cache_dir", &self.cache_dir)
             .field("has_leaflet_cache", &self.leaflet_cache.is_some())
+            .field("store_load_retry", &self.store_load_retry)
             .finish()
     }
 }
@@ -1133,6 +1146,7 @@ impl Default for LedgerManagerConfig {
             sweep_interval: Duration::from_secs(60),
             cache_dir: default_cache_dir(),
             leaflet_cache: None,
+            store_load_retry: Duration::from_secs(5),
         }
     }
 }
@@ -1597,7 +1611,7 @@ impl LedgerManager {
         let entries = self.entries.read().await;
         match entries.get(&canonical_alias)? {
             LoadState::Ready(handle) | LoadState::Reloading { handle, .. } => Some(handle.clone()),
-            LoadState::Loading { .. } => None,
+            LoadState::Loading { .. } | LoadState::Failed { .. } => None,
         }
     }
 
@@ -1629,6 +1643,12 @@ impl LedgerManager {
             {
                 // Handle is valid even during reload
                 return Ok(handle.clone());
+            } else if let Some(LoadState::Failed { error, retry_at }) =
+                entries.get(&canonical_alias)
+            {
+                if Instant::now() < *retry_at {
+                    return Err(ApiError::http(error.status_code(), error.to_string()));
+                }
             }
         }
 
@@ -1651,7 +1671,11 @@ impl LedgerManager {
                     waiters.push(tx);
                     (Some(rx), 0)
                 }
-                None => {
+                Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
+                    return Err(ApiError::http(error.status_code(), error.to_string()));
+                }
+                // A failure whose window has passed loads again.
+                Some(LoadState::Failed { .. }) | None => {
                     // We're first - mark as loading (with a fresh generation),
                     // release lock, do I/O.
                     let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
@@ -1720,11 +1744,16 @@ impl LedgerManager {
             "ledger.load.state.done"
         );
 
+        // Whether the load failed on the binary store, which is remembered for
+        // `store_load_retry` (a ledger-state failure, such as not found, is not).
+        let mut store_failed = false;
         let publish = match load_result {
             Ok(mut state) => {
-                // Attempt to load binary index store (v2 only).
-                // Non-fatal: if loading fails, log and continue without binary index.
-                let binary_store = match load_and_attach_binary_store(
+                // Attach the binary index store. A ledger with an index can be
+                // neither read nor checked without it, so a failure fails the
+                // load: a handle without its store is never cached, and a
+                // later request loads again.
+                match load_and_attach_binary_store(
                     &self.backend,
                     self.nameservice_mode.reader(),
                     &mut state,
@@ -1734,16 +1763,22 @@ impl LedgerManager {
                 )
                 .await
                 {
-                    Ok(store) => store,
+                    Ok(binary_store) => Ok((state, binary_store)),
                     Err(e) => {
                         tracing::warn!(
                             ledger_id = %ledger_id,
                             error = %e,
-                            "Failed to load binary store, continuing without"
+                            "Failed to load binary store; the load fails"
                         );
-                        None
+                        store_failed = true;
+                        Err(e)
                     }
-                };
+                }
+            }
+            Err(e) => Err(e),
+        };
+        let publish = match publish {
+            Ok((state, binary_store)) => {
                 tracing::debug!(alias = %canonical_alias, "ledger.load.binary_store.done");
                 #[cfg(feature = "shacl")]
                 let loaded_config = warn_if_shapes_unenforced(&state).await;
@@ -1839,6 +1874,18 @@ impl LedgerManager {
                         for tx in waiters {
                             let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
                         }
+                    }
+                    // Remember a store failure, so requests in the window get
+                    // it without each loading again.
+                    let retry = self.config.store_load_retry;
+                    if store_failed && !retry.is_zero() && !shutting_down {
+                        entries.insert(
+                            canonical_alias.clone(),
+                            LoadState::Failed {
+                                error: error_for_waiters,
+                                retry_at: Instant::now() + retry,
+                            },
+                        );
                     }
                 }
 
@@ -1942,7 +1989,8 @@ impl LedgerManager {
                     waiters.push(tx);
                     ReloadAction::WaitForInitialLoad(rx)
                 }
-                None => ReloadAction::NotLoaded,
+                // Nothing is cached to reload; the next request loads.
+                Some(LoadState::Failed { .. }) | None => ReloadAction::NotLoaded,
             }
         };
         // Manager lock released
@@ -2000,75 +2048,79 @@ impl LedgerManager {
                 let loaded = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
                     .await
                     .map_err(ApiError::from);
-                let result = match loaded {
-                    Ok(mut new_state) => {
-                        // Attempt to load binary index store (v2 only) — still off-lock.
-                        // Artifacts shared with the store being replaced are
-                        // carried over; the slot is read on its own (no
-                        // `state` lock held), which keeps the lock order.
-                        let prev_store = handle.inner.binary_store.read().await.clone();
-                        let new_binary_store = match load_and_attach_binary_store(
-                            &self.backend,
-                            self.nameservice_mode.reader(),
-                            &mut new_state,
-                            &self.config.cache_dir,
-                            self.config.leaflet_cache.clone(),
-                            prev_store.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(store) => store,
-                            Err(e) => {
-                                tracing::warn!(
-                                    ledger_id = %ledger_id,
-                                    error = %e,
-                                    "Failed to load binary store during reload, continuing without"
-                                );
-                                None
-                            }
-                        };
+                let result = 'load: {
+                    match loaded {
+                        Ok(mut new_state) => {
+                            // Attempt to load binary index store (v2 only) — still off-lock.
+                            // Artifacts shared with the store being replaced are
+                            // carried over; the slot is read on its own (no
+                            // `state` lock held), which keeps the lock order.
+                            let prev_store = handle.inner.binary_store.read().await.clone();
+                            let new_binary_store = match load_and_attach_binary_store(
+                                &self.backend,
+                                self.nameservice_mode.reader(),
+                                &mut new_state,
+                                &self.config.cache_dir,
+                                self.config.leaflet_cache.clone(),
+                                prev_store.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(store) => store,
+                                Err(e) => {
+                                    // Keep serving the state and store the handle
+                                    // has rather than swap in one without a store.
+                                    tracing::warn!(
+                                        ledger_id = %ledger_id,
+                                        error = %e,
+                                        "Failed to load binary store during reload; keeping the previous state"
+                                    );
+                                    break 'load Err(e);
+                                }
+                            };
 
-                        // Brief coherent swap. Lock order: state -> binary_store;
-                        // acquire both before mutating so there is no `.await`
-                        // between the two assignments (no incoherent
-                        // state/binary_store window on cancellation, and readers
-                        // blocked on `state` never observe a half-applied swap).
-                        let mut write_guard = handle.lock_for_write().await;
-                        // Compare total `t()` (novelty included), not `index_t()`:
-                        // this is deliberately novelty-protective. If the reloaded
-                        // state carries a newer persisted index but an older total
-                        // `t` than the in-memory state, we skip the swap and keep
-                        // the fresher novelty — transiently forgoing the newer
-                        // index, which the next reload picks up. Never clobber a
-                        // newer in-memory commit to adopt a newer index.
-                        if new_state.t() >= write_guard.state().t() {
-                            let mut bs_guard = handle.inner.binary_store.write().await;
-                            write_guard.replace(new_state);
-                            *bs_guard = new_binary_store;
-                            // Out-of-band swap: any resolved-config entry may
-                            // have been cached against a state this swap just
-                            // replaced — including a detached-commit
-                            // placeholder whose marker (0) a reloaded state
-                            // can legitimately share. See `config_cache_clear`.
-                            // Taking the config lock while holding `state` is
-                            // safe: no path acquires `state` while holding the
-                            // config lock.
-                            handle.config_cache_clear().await;
-                        } else {
-                            // A concurrent commit advanced the in-memory state
-                            // past the reloaded storage HEAD (a txn took the
-                            // still-valid handle via get_or_load's Reloading
-                            // fast path while we loaded). Keep the fresher
-                            // in-memory state rather than clobber the commit.
-                            tracing::debug!(
-                                ledger_id = %ledger_id,
-                                "reload: in-memory state newer than reloaded storage; skipping swap"
-                            );
+                            // Brief coherent swap. Lock order: state -> binary_store;
+                            // acquire both before mutating so there is no `.await`
+                            // between the two assignments (no incoherent
+                            // state/binary_store window on cancellation, and readers
+                            // blocked on `state` never observe a half-applied swap).
+                            let mut write_guard = handle.lock_for_write().await;
+                            // Compare total `t()` (novelty included), not `index_t()`:
+                            // this is deliberately novelty-protective. If the reloaded
+                            // state carries a newer persisted index but an older total
+                            // `t` than the in-memory state, we skip the swap and keep
+                            // the fresher novelty — transiently forgoing the newer
+                            // index, which the next reload picks up. Never clobber a
+                            // newer in-memory commit to adopt a newer index.
+                            if new_state.t() >= write_guard.state().t() {
+                                let mut bs_guard = handle.inner.binary_store.write().await;
+                                write_guard.replace(new_state);
+                                *bs_guard = new_binary_store;
+                                // Out-of-band swap: any resolved-config entry may
+                                // have been cached against a state this swap just
+                                // replaced — including a detached-commit
+                                // placeholder whose marker (0) a reloaded state
+                                // can legitimately share. See `config_cache_clear`.
+                                // Taking the config lock while holding `state` is
+                                // safe: no path acquires `state` while holding the
+                                // config lock.
+                                handle.config_cache_clear().await;
+                            } else {
+                                // A concurrent commit advanced the in-memory state
+                                // past the reloaded storage HEAD (a txn took the
+                                // still-valid handle via get_or_load's Reloading
+                                // fast path while we loaded). Keep the fresher
+                                // in-memory state rather than clobber the commit.
+                                tracing::debug!(
+                                    ledger_id = %ledger_id,
+                                    "reload: in-memory state newer than reloaded storage; skipping swap"
+                                );
+                            }
+                            Ok(())
+                            // state (and binary_store) guards dropped here, before `entries`.
                         }
-                        Ok(())
-                        // state (and binary_store) guards dropped here, before `entries`.
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 };
 
                 // Publish under a brief `entries` lock — no `.await` between the
@@ -2151,6 +2203,10 @@ impl LedgerManager {
                     evicted.push(alias.clone());
                     return false;
                 }
+            }
+            // A remembered store failure past its window holds nothing.
+            if let LoadState::Failed { retry_at, .. } = load_state {
+                return Instant::now() < *retry_at;
             }
             // Keep Loading/Reloading entries - they're transient
             true

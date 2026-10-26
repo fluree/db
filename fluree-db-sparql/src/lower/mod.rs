@@ -116,6 +116,7 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     if let Ok(query) = &mut result {
         query.include_system_facts = ast.pragmas.include_system_facts.unwrap_or(false);
         query.union_default_graph = ast.pragmas.union_default_graph;
+        query.rdf_list_view = true;
     }
 
     match &result {
@@ -420,6 +421,7 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 // predicate — adapters / search calls / leaf nodes.
                 // f:reifies* predicates can't appear inside them.
                 Pattern::Filter(_)
+                | Pattern::ListView(_)
                 | Pattern::Bind { .. }
                 | Pattern::Unwind { .. }
                 | Pattern::IndexSearch(_)
@@ -655,6 +657,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     union_default_graph: None,
                     cypher_vocab: None,
                     unmatched_optional: Default::default(),
+                    rdf_list_view: false,
                 })
             }
             QueryBody::Construct(construct_query) => self.lower_construct(construct_query),
