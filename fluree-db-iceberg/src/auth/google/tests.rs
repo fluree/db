@@ -1,7 +1,9 @@
 //! Google identity tests, every exchange against a wiremock Google.
 //!
-//! Each test starts its own mock server, so its endpoints (part of every
-//! token-cache key) are its own: tests never see each other's cached tokens.
+//! Mock servers are pooled and reuse their URLs, so each `GoogleEndpoints::at`
+//! gets a token-cache partition of its own: tests never see each other's
+//! cached tokens, and two identities share one only when built from the same
+//! endpoints value.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,15 +45,14 @@ async fn requests_to(server: &MockServer, route: &str) -> Vec<Request> {
         .collect()
 }
 
-/// A metadata identity whose server is `server`.
+/// A metadata identity whose server is `server`, in a token-cache partition
+/// of its own.
 fn metadata_identity(server: &MockServer) -> GoogleIdentity {
-    GoogleIdentity::with_endpoints(
-        &GoogleCredentials::Metadata,
-        None,
-        &ctx(),
-        &GoogleEndpoints::at(&server.uri()),
-    )
-    .unwrap()
+    metadata_identity_with(&GoogleEndpoints::at(&server.uri()))
+}
+
+fn metadata_identity_with(endpoints: &GoogleEndpoints) -> GoogleIdentity {
+    GoogleIdentity::with_endpoints(&GoogleCredentials::Metadata, None, &ctx(), endpoints).unwrap()
 }
 
 const METADATA_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
@@ -69,8 +70,9 @@ async fn metadata_sends_the_flavor_header_and_scopes_and_caches() {
         .mount(&server)
         .await;
 
+    let endpoints = GoogleEndpoints::at(&server.uri());
     let auth = GoogleCatalogAuth::new(
-        Arc::new(metadata_identity(&server)),
+        Arc::new(metadata_identity_with(&endpoints)),
         vec![CLOUD_PLATFORM_SCOPE.to_string()],
     );
     let headers = SendCatalogAuth::request_headers(&auth).await.unwrap();
@@ -84,7 +86,7 @@ async fn metadata_sends_the_flavor_header_and_scopes_and_caches() {
     // A second call, and a second identity with the same fingerprint, reuse
     // the cached token.
     SendCatalogAuth::request_headers(&auth).await.unwrap();
-    metadata_identity(&server)
+    metadata_identity_with(&endpoints)
         .access_token(&[CLOUD_PLATFORM_SCOPE])
         .await
         .unwrap();
@@ -785,6 +787,9 @@ async fn the_key_files_quota_project_reaches_the_catalog_request() {
         let client = RestCatalogClient::new(
             RestCatalogConfig {
                 uri: server.uri(),
+                // A warehouse no other test uses: pooled mock servers reuse
+                // URLs, and the route-prefix cache is keyed by URL + warehouse.
+                warehouse: Some("google-quota-project".to_string()),
                 ..Default::default()
             },
             auth,

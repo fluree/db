@@ -77,6 +77,10 @@ pub(crate) struct GoogleEndpoints {
     pub(crate) sts_token: String,
     pub(crate) iam_credentials: String,
     pub(crate) metadata_token: String,
+    /// Part of every token-cache key. Empty in production; each test's mock
+    /// Google gets its own, because mock servers are pooled and reuse their
+    /// URLs, so the URLs alone would let one test see another's tokens.
+    pub(crate) cache_partition: String,
 }
 
 impl GoogleEndpoints {
@@ -92,18 +96,24 @@ impl GoogleEndpoints {
                 .ok()
                 .filter(|url| !url.is_empty())
                 .unwrap_or_else(|| METADATA_TOKEN_URL.to_string()),
+            cache_partition: String::new(),
         })
     }
 
     /// Every endpoint at `base` (a mock server), for tests.
     #[cfg(test)]
     pub(crate) fn at(base: &str) -> GoogleEndpoints {
+        static PARTITION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         GoogleEndpoints {
             oauth2_token: format!("{base}/token"),
             sts_token: format!("{base}/v1/token"),
             iam_credentials: base.to_string(),
             metadata_token: format!(
                 "{base}/computeMetadata/v1/instance/service-accounts/default/token"
+            ),
+            cache_partition: format!(
+                "test-{}",
+                PARTITION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ),
         }
     }
@@ -284,7 +294,7 @@ impl GoogleIdentity {
             quota_project: quota_project
                 .map(str::to_string)
                 .or(built.file_quota_project),
-            fingerprint: built.fingerprint,
+            fingerprint: format!("{}|{}", built.fingerprint, endpoints.cache_partition),
             binding: built.binding,
             subject: built.subject,
             endpoints: endpoints.clone(),

@@ -647,6 +647,8 @@ mod tests {
     async fn googles_missing_quota_project_refusal_is_typed_with_the_fix() {
         // On loadTable (named by table) and on /v1/config (still fail closed:
         // the lookup errors rather than reading the catalog without a prefix).
+        // Warehouses no other test uses: mock servers are pooled, so a URL
+        // can come with another test's cached route prefix.
         let user_project_denied = serde_json::json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
             "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "USER_PROJECT_DENIED"}]}});
         let server = MockServer::start().await;
@@ -656,9 +658,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(403).set_body_json(user_project_denied))
             .mount(&server)
             .await;
-        let err = loads(&warehouse_client(&server.uri(), None), "db")
-            .await
-            .unwrap_err();
+        let err = loads(
+            &warehouse_client(&server.uri(), Some("quota-on-load-table")),
+            "db",
+        )
+        .await
+        .unwrap_err();
         match &err {
             IcebergError::CatalogQuotaProjectRequired { table } => assert_eq!(table, "db.events"),
             other => panic!("expected CatalogQuotaProjectRequired, got {other:?}"),
@@ -674,10 +679,13 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
-        let err = loads(&warehouse_client(&server.uri(), Some("lake")), "db")
-            .await
-            .unwrap_err();
+        serve_table(&server, "/v1/quota-on-config/namespaces/db/tables/events").await;
+        let err = loads(
+            &warehouse_client(&server.uri(), Some("quota-on-config")),
+            "db",
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, IcebergError::CatalogQuotaProjectRequired { .. }),
             "{err:?}"
@@ -703,7 +711,8 @@ mod tests {
         let server = MockServer::start().await;
         serve_config(&server, serde_json::json!({})).await;
         serve_table(&server, "/v1/namespaces/db/tables/events").await;
-        let mut client = warehouse_client(&server.uri(), None);
+        // A warehouse no other test uses (pooled mock servers reuse URLs).
+        let mut client = warehouse_client(&server.uri(), Some("two-provider-headers"));
         client.auth = Arc::new(TwoHeaders);
         loads(&client, "db").await.unwrap();
         for request in server.received_requests().await.unwrap() {
