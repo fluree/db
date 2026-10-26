@@ -197,10 +197,13 @@ async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>
 /// An undo's net change with each fact its deciding commit held as a
 /// same-`t` pair (`NetChange::same_t_pairs`) resolved by the fact's
 /// presence just before that commit. The pair left the fact present
-/// whatever it was before, so undoing the commit restores that: absent,
-/// the fact is retracted; present, nothing is written for it. The commit
-/// alone can't tell the two apart. One read per pair, at the deciding
-/// commit's `t - 1`; only commits written before the staging fix hold pairs.
+/// whatever it was before, and the commit alone can't say which, so the
+/// undo writes the state before it: the fact asserted if it was present,
+/// retracted if it wasn't. Like any undo, that is a restatement when the
+/// head already agrees, and a change when a later commit in the range
+/// changed the fact again (a revert of the pair's commit and a later
+/// delete restores the value). One read per pair, at the deciding commit's
+/// `t - 1`; only commits written before the staging fix hold pairs.
 async fn undo_same_t_pairs(state: &LedgerState, undo: NetChange) -> Result<Vec<Flake>> {
     use fluree_db_transact::{CurrentFacts, Slot};
     let NetChange {
@@ -234,16 +237,9 @@ async fn undo_same_t_pairs(state: &LedgerState, undo: NetChange) -> Result<Vec<F
             present_before.push((*n, held.is_some()));
         }
     }
-    let mut keep = vec![true; inverted.len()];
     for (n, present) in present_before {
-        if present {
-            keep[n] = false;
-        } else {
-            inverted[n].op = false;
-        }
+        inverted[n].op = present;
     }
-    let mut keep = keep.into_iter();
-    inverted.retain(|_| keep.next().unwrap_or(true));
     Ok(inverted)
 }
 

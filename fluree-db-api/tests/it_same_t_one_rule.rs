@@ -746,6 +746,84 @@ async fn a_pair_over_an_absent_value_counts_once_and_reverts_to_absent() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// `DELETE DATA` of `literal` on the ledger at `path`: the commit's id.
+async fn delete_value(path: &str, id: &str, literal: &str) -> fluree_db_core::ContentId {
+    let fluree = open(path);
+    let commit_id = fluree
+        .graph(id)
+        .transact()
+        .sparql_update(&format!("{PFX}DELETE DATA {{ ex:s ex:p {literal} . }}"))
+        .commit()
+        .await
+        .expect("delete")
+        .receipt
+        .commit_id;
+    fluree.disconnect_ledger(id).await;
+    commit_id
+}
+
+/// Revert `commits` together on the ledger at `path`.
+async fn revert_range(path: &str, id: &str, commits: Vec<fluree_db_core::ContentId>) {
+    let fluree = open(path);
+    let name = id.split(':').next().expect("ledger name");
+    fluree
+        .revert_commits(
+            name,
+            "main",
+            commits.into_iter().map(CommitRef::Exact).collect(),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("revert");
+    fluree.disconnect_ledger(id).await;
+}
+
+/// Reverting a pair's commit together with a later one that deleted the
+/// value restores what held before the pair, whatever the head holds now:
+/// the value, when it was there before (a big integer and a `dateTime`,
+/// reverted from novelty and from an index), and nothing, when it wasn't.
+/// The pair stored in either order.
+#[tokio::test]
+async fn a_range_revert_from_a_pair_restores_what_held_before_it() {
+    let mut failures = Vec::new();
+    for order in [Order::RetractFirst, Order::AssertFirst] {
+        for kind in [Kind::BigInt, Kind::DateTime] {
+            for indexed in [false, true] {
+                let case = format!("present before, {kind:?} {order:?} indexed={indexed}");
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().to_string_lossy().to_string();
+                let id = "it/same-t-range:main";
+                let commits = source_commits(kind, Path::NeverIndexed, None, order).await;
+                let pair = pulled(&path, id, commits).await;
+                let delete = delete_value(&path, id, &kind.literal()).await;
+                if indexed {
+                    full_rebuild(&path, id).await;
+                }
+                revert_range(&path, id, vec![pair, delete]).await;
+                let got = values(&open(&path), id, None, None).await;
+                if got != vec![kind.lexical().to_string()] {
+                    failures.push(format!("{case}: {got:?}"));
+                }
+            }
+        }
+        let big = format!("\"{BIG}\"^^xsd:nonNegativeInteger");
+        for literal in ["\"v\"", big.as_str()] {
+            let case = format!("absent before, {literal} {order:?}");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let id = "it/same-t-range-absent:main";
+            let pair = pulled(&path, id, absent_pair_commits(literal, order).await).await;
+            let delete = delete_value(&path, id, literal).await;
+            revert_range(&path, id, vec![pair, delete]).await;
+            let got = values(&open(&path), id, None, None).await;
+            if !got.is_empty() {
+                failures.push(format!("{case}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// A `DELETE DATA` of an indexed big integer, while novelty holds a pair of
 /// it (`-x^^xsd:integer`, `+x^^xsd:nonNegativeInteger`), deletes it: the
 /// read it names the stored fact from merges the index row and the two ops
