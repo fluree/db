@@ -346,7 +346,14 @@ impl crate::Fluree {
             columns.sort();
             columns.dedup();
             let probed = async {
-                let table = open_placed(&gs_config, unity.as_ref(), &io, table_name).await?;
+                let table = open_placed(
+                    &gs_config,
+                    unity.as_ref(),
+                    &io,
+                    table_name,
+                    self.identity_context(),
+                )
+                .await?;
                 let snapshot = table
                     .snapshot(fluree_db_delta::VersionSelector::Latest)
                     .await?;
@@ -399,16 +406,17 @@ impl crate::Fluree {
 }
 
 /// Open `table_name` where `config` places it. `unity` and `io` are the
-/// config's own, hydrated.
+/// config's own, hydrated; Unity's auth is built under `identity`.
 pub(crate) async fn open_placed(
     config: &DeltaGsConfig,
     unity: Option<&UnityConfig>,
     io: &DeltaIoConfig,
     table_name: &str,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> Result<DeltaTable, DeltaError> {
     match (config.placement(table_name)?, unity) {
         (Placement::Unity(full_name), Some(unity)) => {
-            DeltaTable::open_in_unity(table_name, unity, &full_name, io).await
+            DeltaTable::open_in_unity(table_name, unity, &full_name, io, identity).await
         }
         (Placement::Path(location), _) => DeltaTable::open(table_name, &location, io),
         (Placement::Unity(full_name), None) => Err(DeltaError::Config(format!(
@@ -533,7 +541,7 @@ impl DeltaSource {
                 table_name,
                 &placement,
                 &self.config,
-                fluree.secret_resolver(),
+                fluree.identity_context(),
             )
             .await
             .map_err(|e| self.query_error(table_name, e))?;

@@ -230,8 +230,9 @@ impl DeltaTable {
         unity: &UnityConfig,
         full_name: &str,
         io: &DeltaIoConfig,
+        identity: &fluree_db_iceberg::auth::IdentityContext,
     ) -> Result<Self> {
-        let client = Arc::new(UnityClient::new(unity)?);
+        let client = Arc::new(UnityClient::new(unity, identity)?);
         let table = client.table(full_name).await?;
         let location = table.location.clone();
         Self::over(

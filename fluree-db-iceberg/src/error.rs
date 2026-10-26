@@ -85,6 +85,58 @@ pub enum IcebergError {
         message: String,
     },
 
+    /// A catalog on Google refused the request because no quota project was
+    /// named (`USER_PROJECT_DENIED` / "requires a quota project"). User
+    /// credentials bill to a project the request must name; the fix is the
+    /// source's `quota_project`, not a broader grant.
+    #[error(
+        "Catalog request for {table} needs a quota project: Google bills user credentials to \
+         the project named in x-goog-user-project; set quota_project on the source's Google auth"
+    )]
+    CatalogQuotaProjectRequired {
+        /// The table (or catalog route) the refused request was for.
+        table: String,
+    },
+
+    /// A Google token exchange was refused or failed. Carries Google's own
+    /// error code (`invalid_grant`, `PERMISSION_DENIED`) or one of Fluree's
+    /// fixed codes, never a response body: a token endpoint's body can echo
+    /// request material.
+    #[error(
+        "Google token exchange failed at the {stage} step ({outcome}){hint}",
+        outcome = exchange_outcome(*.status, .reason.as_deref()),
+        hint = if *.stage == GoogleTokenStage::Metadata {
+            "; the metadata server is reachable only on GCE/GKE"
+        } else {
+            ""
+        }
+    )]
+    GoogleTokenExchange {
+        /// Which exchange failed.
+        stage: GoogleTokenStage,
+        /// Google's HTTP status, or `None` when no response arrived.
+        status: Option<u16>,
+        /// Google's error code, or a fixed Fluree code; never a body.
+        reason: Option<String>,
+    },
+
+    /// A Google credential configuration was refused. The message names the
+    /// offending field, never its value.
+    #[error("Invalid Google credentials: {0}")]
+    GoogleCredentialsInvalid(String),
+
+    /// A host-derived identity was refused by this instance's host-identity
+    /// policy (see [`crate::host_identity`]).
+    #[error(
+        "Graph sources on this instance may not use the host identity '{kind}': the host-identity \
+         policy ({env}) does not allow it",
+        env = crate::host_identity::HOST_IDENTITIES_ENV
+    )]
+    HostIdentityRefused {
+        /// The refused kind.
+        kind: crate::host_identity::HostIdentityKind,
+    },
+
     /// Snapshot not found
     #[error("Snapshot not found: {0}")]
     SnapshotNotFound(String),
@@ -155,6 +207,49 @@ impl IcebergError {
 
     pub fn unsupported_format(msg: impl Into<String>) -> Self {
         Self::UnsupportedFormat(msg.into())
+    }
+}
+
+/// The Google token exchange a [`IcebergError::GoogleTokenExchange`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoogleTokenStage {
+    /// Workload Identity Federation's exchange at `sts.googleapis.com`.
+    Sts,
+    /// Service-account impersonation at `iamcredentials.googleapis.com`.
+    Impersonation,
+    /// A service-account JWT assertion at `oauth2.googleapis.com`.
+    Jwt,
+    /// A user refresh token at `oauth2.googleapis.com`.
+    Refresh,
+    /// The GCE/GKE metadata server.
+    Metadata,
+}
+
+impl GoogleTokenStage {
+    /// The stage's stable name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GoogleTokenStage::Sts => "sts",
+            GoogleTokenStage::Impersonation => "impersonation",
+            GoogleTokenStage::Jwt => "jwt",
+            GoogleTokenStage::Refresh => "refresh",
+            GoogleTokenStage::Metadata => "metadata",
+        }
+    }
+}
+
+impl std::fmt::Display for GoogleTokenStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn exchange_outcome(status: Option<u16>, reason: Option<&str>) -> String {
+    match (status, reason) {
+        (Some(status), Some(reason)) => format!("HTTP {status}, {reason}"),
+        (Some(status), None) => format!("HTTP {status}"),
+        (None, Some(reason)) => reason.to_string(),
+        (None, None) => "no response".to_string(),
     }
 }
 

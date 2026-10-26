@@ -291,7 +291,7 @@ impl crate::Fluree {
 
         let mut gs_config = config.to_gs_config(&mapping_address);
         let mut mapping_warnings = Vec::new();
-        let connection_tested = match build_sql_client(&gs_config, self.secret_resolver()).await {
+        let connection_tested = match build_sql_client(&gs_config, self.identity_context()).await {
             Ok(client) => match client.execute_collect("SELECT 1").await {
                 Ok(_) => {
                     if let Some(mapping) = &compiled_for_probe {
@@ -400,7 +400,7 @@ impl crate::Fluree {
             mapping_ref.media_type.as_deref(),
             &mapping_ref.source,
         )?;
-        let client = build_sql_client(&config, self.secret_resolver())
+        let client = build_sql_client(&config, self.identity_context())
             .await
             .map_err(|e| crate::ApiError::Config(e.to_string()))?;
         let (flagged, unverified, mapping_warnings) =
@@ -431,7 +431,7 @@ impl crate::Fluree {
 
     /// `SELECT 1` against the endpoint with the configured credentials.
     pub async fn test_sql_connection(&self, config: &SqlGsConfig) -> crate::Result<()> {
-        let client = build_sql_client(config, self.secret_resolver())
+        let client = build_sql_client(config, self.identity_context())
             .await
             .map_err(|e| crate::ApiError::Config(e.to_string()))?;
         client
@@ -444,13 +444,14 @@ impl crate::Fluree {
     }
 }
 
-/// Hydrate secrets, build the auth provider, and construct the client.
+/// Hydrate secrets, build the auth provider under `identity`, and construct the
+/// client.
 async fn build_sql_client(
     config: &SqlGsConfig,
-    resolver: Option<&Arc<dyn fluree_db_sql::SecretResolver>>,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> Result<TrinoClient, SqlError> {
-    let hydrated = config.hydrate(resolver).await?;
-    let auth = hydrated.auth.create_provider_arc()?;
+    let hydrated = config.hydrate(identity.secret_resolver.as_ref()).await?;
+    let auth = hydrated.auth.create_provider_arc(identity)?;
     TrinoClient::new(&hydrated, auth)
 }
 
@@ -476,12 +477,16 @@ impl SqlSource {
             ))
         })?;
         let cache = fluree.r2rml_cache();
-        let key = super::r2rml::catalog_client_cache_key(&record.graph_source_id, &record.config);
+        let key = super::r2rml::catalog_client_cache_key(
+            &record.graph_source_id,
+            &record.config,
+            fluree.identity_context(),
+        );
         let client = match cache.sql_client(&key) {
             Some(c) => c,
             None => {
                 let c = Arc::new(
-                    build_sql_client(&config, fluree.secret_resolver())
+                    build_sql_client(&config, fluree.identity_context())
                         .await
                         .map_err(|e| {
                             QueryError::Internal(format!(

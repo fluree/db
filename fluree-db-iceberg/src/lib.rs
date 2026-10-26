@@ -12,7 +12,9 @@
 //!
 //! The crate is organized into several modules:
 //!
-//! - [`auth`] - Authentication providers (bearer tokens, OAuth2 client credentials)
+//! - [`auth`] - Authentication providers (bearer tokens, OAuth2 client credentials,
+//!   Google identities)
+//! - [`host_identity`] - The operator's policy for host-derived identities
 //! - [`catalog`] - REST catalog client for table discovery and metadata location
 //! - [`credential`] - Vended credentials handling and caching
 //! - [`metadata`] - Iceberg table metadata parsing and snapshot selection
@@ -57,6 +59,7 @@ pub mod config;
 pub mod config_value;
 pub mod credential;
 pub mod error;
+pub mod host_identity;
 pub mod io;
 pub mod local_guard;
 pub mod manifest;
@@ -84,11 +87,18 @@ pub(crate) fn env_switch_enabled(name: &str) -> bool {
 }
 
 // Re-export commonly used types
+#[cfg(feature = "aws")]
+pub use auth::AwsSubjectCredentials;
+pub use auth::{GoogleCredentials, IdentityContext};
 pub use config::{
-    CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, TableConfig,
+    CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, StorageAuth,
+    TableConfig,
 };
 pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
-pub use error::{IcebergError, Result};
+pub use error::{GoogleTokenStage, IcebergError, Result};
+pub use host_identity::{
+    HostIdentityKind, HostIdentityPolicy, AMBIENT_BUCKETS_ENV, HOST_IDENTITIES_ENV,
+};
 pub use local_guard::{
     ensure_local_location_allowed, is_local_location, local_roots, resolve_local_path,
     LOCAL_ROOTS_ENV,

@@ -3,7 +3,7 @@
 //! This module defines the JSON-serializable configuration structures
 //! stored in `GraphSourceRecord.config` for Iceberg graph sources.
 
-use crate::auth::AuthConfig;
+use crate::auth::{AuthConfig, GoogleCredentials};
 use crate::catalog::parse_table_identifier;
 use crate::catalog::TableIdentifier;
 use crate::error::{IcebergError, Result};
@@ -266,10 +266,80 @@ impl IcebergGsConfig {
             }
         }
 
+        self.validate_storage_auth()?;
+
         if let Some(delete) = &self.delete {
             delete.validate()?;
         }
 
+        Ok(())
+    }
+
+    /// Validate `io.storage_auth` against the catalog it reads beside.
+    ///
+    /// - `vended` needs a REST catalog (the only kind that vends);
+    /// - `catalog` needs a REST catalog whose own auth is a Google identity
+    ///   (`google` or `google_metadata`), since that identity reads `gs://`;
+    /// - `ambient` and `google` are valid in any mode;
+    /// - `vended_credentials` must agree with it (`true` exactly for `vended`):
+    ///   the flag predates `storage_auth` and is still what older readers of a
+    ///   stored config consult, so the two may not say different things.
+    pub fn validate_storage_auth(&self) -> Result<()> {
+        let Some(storage_auth) = &self.io.storage_auth else {
+            return Ok(());
+        };
+        let kind = storage_auth.kind();
+        let rest_auth = match &self.catalog {
+            CatalogConfig::Rest { auth, .. } => Some(auth),
+            _ => None,
+        };
+        match storage_auth {
+            StorageAuth::Vended if rest_auth.is_none() => {
+                return Err(IcebergError::Config(
+                    "io.storage_auth `vended` needs a REST catalog: no other catalog mode vends \
+                     storage credentials"
+                        .to_string(),
+                ));
+            }
+            StorageAuth::Catalog
+                if !matches!(
+                    rest_auth,
+                    Some(AuthConfig::Google { .. } | AuthConfig::GoogleMetadata { .. })
+                ) =>
+            {
+                return Err(IcebergError::Config(
+                    "io.storage_auth `catalog` needs a REST catalog authenticated with a Google \
+                     identity (auth type `google` or `google_metadata`): that identity is what \
+                     reads the table's gs:// files"
+                        .to_string(),
+                ));
+            }
+            StorageAuth::Google {
+                credentials,
+                quota_project,
+            } => {
+                if quota_project
+                    .as_deref()
+                    .is_some_and(|p| !crate::auth::google::is_project_id(p))
+                {
+                    return Err(IcebergError::GoogleCredentialsInvalid(
+                        "io.storage_auth.quota_project is not a Google Cloud project id"
+                            .to_string(),
+                    ));
+                }
+                credentials.validate_static()?;
+            }
+            StorageAuth::Vended | StorageAuth::Ambient | StorageAuth::Catalog => {}
+        }
+        let vended = matches!(storage_auth, StorageAuth::Vended);
+        if self.io.vended_credentials != vended {
+            return Err(IcebergError::Config(format!(
+                "io.storage_auth `{kind}` contradicts io.vended_credentials = {}: set \
+                 vended_credentials = {vended} (it must be true exactly when storage_auth is \
+                 `vended`)",
+                self.io.vended_credentials
+            )));
+        }
         Ok(())
     }
 }
@@ -638,6 +708,56 @@ pub struct IoConfig {
     /// Use path-style S3 URLs (for MinIO, LocalStack)
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Which identity reads the table's files. Absent (every record written
+    /// before this field existed) means what `vended_credentials` says; see
+    /// [`IoConfig::effective_storage_auth`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_auth: Option<StorageAuth>,
+}
+
+/// Which identity reads a graph source's data and metadata files.
+///
+/// ```json
+/// {"type": "vended"}
+/// {"type": "ambient"}
+/// {"type": "catalog"}
+/// {"type": "google", "credentials": {"source": "service_account", "key": {"env_var": "SA_KEY"}}, "quota_project": "p"}
+/// ```
+///
+/// Explicit, never inferred: a vending catalog that failed to vend must not
+/// silently fall back to another identity.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StorageAuth {
+    /// The catalog's per-table vended credentials, required: a table it vends
+    /// nothing for is refused.
+    Vended,
+    /// The host's ambient AWS credential chain (a host identity).
+    Ambient,
+    /// The REST catalog's own Google identity reads `gs://` — Google's model
+    /// for BigLake federation (`bq://`), which never vends.
+    Catalog,
+    /// A Google identity of the source's own, for `gs://` (e.g. Direct mode).
+    Google {
+        /// Where the credential comes from.
+        credentials: GoogleCredentials,
+        /// The project storage requests bill to (requester pays); wins over
+        /// the credential JSON's `quota_project_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quota_project: Option<String>,
+    },
+}
+
+impl StorageAuth {
+    /// The variant's stored tag.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            StorageAuth::Vended => "vended",
+            StorageAuth::Ambient => "ambient",
+            StorageAuth::Catalog => "catalog",
+            StorageAuth::Google { .. } => "google",
+        }
+    }
 }
 
 fn default_vended_credentials() -> bool {
@@ -651,11 +771,33 @@ impl Default for IoConfig {
             s3_region: None,
             s3_endpoint: None,
             s3_path_style: false,
+            storage_auth: None,
         }
     }
 }
 
 impl IoConfig {
+    /// The storage identity this config asks for: `storage_auth` when set,
+    /// else what `vended_credentials` has always meant (`vended` when true,
+    /// `ambient` when false).
+    pub fn effective_storage_auth(&self) -> std::borrow::Cow<'_, StorageAuth> {
+        match &self.storage_auth {
+            Some(storage_auth) => std::borrow::Cow::Borrowed(storage_auth),
+            None if self.vended_credentials => std::borrow::Cow::Owned(StorageAuth::Vended),
+            None => std::borrow::Cow::Owned(StorageAuth::Ambient),
+        }
+    }
+
+    /// These settings reading with `storage_auth`, with `vended_credentials`
+    /// set to agree with it (see [`IcebergGsConfig::validate_storage_auth`]).
+    pub fn with_storage_auth(&self, storage_auth: StorageAuth) -> IoConfig {
+        IoConfig {
+            vended_credentials: matches!(storage_auth, StorageAuth::Vended),
+            storage_auth: Some(storage_auth),
+            ..self.clone()
+        }
+    }
+
     /// These settings with `s3_region` falling back to a native-AWS catalog's
     /// region: a lake's catalog and its data normally share a region, so a user
     /// who names only the catalog's region still reads S3 there. An explicit
@@ -1433,5 +1575,212 @@ mod tests {
         let old_json = r#"{"uri": "https://polaris.example.com"}"#;
         let parsed: CatalogConfig = serde_json::from_str(old_json).unwrap();
         assert!(matches!(parsed, CatalogConfig::Rest { .. }));
+    }
+
+    // ── io.storage_auth ──
+
+    fn with_storage(
+        catalog: CatalogConfig,
+        vended_credentials: bool,
+        storage_auth: Option<StorageAuth>,
+    ) -> IcebergGsConfig {
+        IcebergGsConfig {
+            catalog,
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig {
+                vended_credentials,
+                storage_auth,
+                ..Default::default()
+            },
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        }
+    }
+
+    fn rest_with(auth: AuthConfig) -> CatalogConfig {
+        CatalogConfig::Rest {
+            catalog_type: "rest".to_string(),
+            uri: "https://biglake.googleapis.com/iceberg/v1/restcatalog".to_string(),
+            auth,
+            warehouse: Some("bq://lake-project/us".to_string()),
+        }
+    }
+
+    fn google_metadata() -> AuthConfig {
+        AuthConfig::GoogleMetadata {
+            scopes: None,
+            metadata_url: None,
+        }
+    }
+
+    #[test]
+    fn absent_storage_auth_is_derived_and_never_written() {
+        // Every stored record predates the field: it reads as before.
+        let io: IoConfig = serde_json::from_str(r#"{"vended_credentials": true}"#).unwrap();
+        assert_eq!(io.storage_auth, None);
+        assert_eq!(*io.effective_storage_auth(), StorageAuth::Vended);
+        let io: IoConfig = serde_json::from_str(r#"{"vended_credentials": false}"#).unwrap();
+        assert_eq!(*io.effective_storage_auth(), StorageAuth::Ambient);
+        let json = serde_json::to_string(&IoConfig::default()).unwrap();
+        assert!(!json.contains("storage_auth"), "{json}");
+    }
+
+    #[test]
+    fn every_storage_auth_round_trips() {
+        for stored in [
+            r#"{"type":"vended"}"#,
+            r#"{"type":"ambient"}"#,
+            r#"{"type":"catalog"}"#,
+            r#"{"type":"google","credentials":{"source":"metadata"}}"#,
+            r#"{"type":"google","credentials":{"source":"service_account","key":{"secret_ref":"vault://sa"}},"quota_project":"p"}"#,
+        ] {
+            let parsed: StorageAuth = serde_json::from_str(stored).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), stored);
+        }
+        let io = IoConfig::default().with_storage_auth(StorageAuth::Catalog);
+        let json = serde_json::to_string(&io).unwrap();
+        let back: IoConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.storage_auth, Some(StorageAuth::Catalog));
+        assert!(
+            !back.vended_credentials,
+            "with_storage_auth keeps the flag agreeing"
+        );
+    }
+
+    #[test]
+    fn catalog_storage_needs_a_google_authenticated_rest_catalog() {
+        let catalog = Some(StorageAuth::Catalog);
+        with_storage(rest_with(google_metadata()), false, catalog.clone())
+            .validate()
+            .unwrap();
+        with_storage(
+            rest_with(AuthConfig::Google {
+                credentials: GoogleCredentials::ApplicationDefault,
+                scopes: None,
+                quota_project: None,
+            }),
+            false,
+            catalog.clone(),
+        )
+        .validate()
+        .unwrap();
+        for refused in [
+            with_storage(
+                rest_with(AuthConfig::Bearer {
+                    token: crate::ConfigValue::literal("t"),
+                }),
+                false,
+                catalog.clone(),
+            ),
+            with_storage(
+                CatalogConfig::direct("s3://b/wh/ns/t"),
+                false,
+                catalog.clone(),
+            ),
+            with_storage(CatalogConfig::glue(None, None), false, catalog.clone()),
+        ] {
+            let err = refused.validate().unwrap_err().to_string();
+            assert!(err.contains("`catalog`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn vended_storage_needs_a_rest_catalog() {
+        with_storage(rest_with(AuthConfig::None), true, Some(StorageAuth::Vended))
+            .validate()
+            .unwrap();
+        let err = with_storage(
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            false,
+            Some(StorageAuth::Vended),
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs a REST catalog"), "{err}");
+    }
+
+    #[test]
+    fn ambient_and_google_storage_are_valid_in_any_mode() {
+        let google = StorageAuth::Google {
+            credentials: GoogleCredentials::ServiceAccount {
+                key: crate::ConfigValue::from_env("SA_KEY"),
+            },
+            quota_project: Some("lake-project".to_string()),
+        };
+        for catalog in [
+            rest_with(AuthConfig::None),
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            CatalogConfig::glue(None, None),
+        ] {
+            for storage in [StorageAuth::Ambient, google.clone()] {
+                with_storage(catalog.clone(), false, Some(storage))
+                    .validate()
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn storage_auth_and_vended_credentials_may_not_contradict() {
+        for (vended_credentials, storage) in [
+            (false, StorageAuth::Vended),
+            (true, StorageAuth::Ambient),
+            (true, StorageAuth::Catalog),
+        ] {
+            let err = with_storage(
+                rest_with(google_metadata()),
+                vended_credentials,
+                Some(storage),
+            )
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("contradicts io.vended_credentials"), "{err}");
+        }
+    }
+
+    #[test]
+    fn google_storage_credentials_are_checked_where_they_can_be() {
+        let bad_wif = StorageAuth::Google {
+            credentials: GoogleCredentials::ExternalAccount {
+                config: crate::auth::ExternalAccountConfig::Inline(
+                    serde_json::json!({"type": "external_account", "credential_source": {"file": "/x"}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            },
+            quota_project: None,
+        };
+        let err = with_storage(
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            false,
+            Some(bad_wif),
+        )
+        .validate()
+        .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::GoogleCredentialsInvalid(_)),
+            "{err:?}"
+        );
+        let bad_project = StorageAuth::Google {
+            credentials: GoogleCredentials::Metadata,
+            quota_project: Some("not a project".to_string()),
+        };
+        let err = with_storage(
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            false,
+            Some(bad_project),
+        )
+        .validate()
+        .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::GoogleCredentialsInvalid(_)),
+            "{err:?}"
+        );
     }
 }

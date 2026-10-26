@@ -5,6 +5,7 @@ use crate::auth::{CatalogAuth, SendCatalogAuth};
 use crate::error::{IcebergError, Result};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use reqwest::header::HeaderMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::Instrument;
@@ -185,9 +186,9 @@ impl OAuth2ClientCredentials {
 
 #[async_trait(?Send)]
 impl CatalogAuth for OAuth2ClientCredentials {
-    async fn authorization_header(&self) -> Result<Option<String>> {
+    async fn request_headers(&self) -> Result<HeaderMap> {
         let token = self.get_token().await?;
-        Ok(Some(token.authorization_header()))
+        crate::auth::authorization(&token.authorization_header())
     }
 
     async fn refresh(&self) -> Result<()> {
@@ -200,9 +201,9 @@ impl CatalogAuth for OAuth2ClientCredentials {
 
 #[async_trait]
 impl SendCatalogAuth for OAuth2ClientCredentials {
-    async fn authorization_header(&self) -> Result<Option<String>> {
+    async fn request_headers(&self) -> Result<HeaderMap> {
         let token = self.get_token().await?;
-        Ok(Some(token.authorization_header()))
+        crate::auth::authorization(&token.authorization_header())
     }
 
     async fn refresh(&self) -> Result<()> {

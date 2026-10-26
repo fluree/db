@@ -219,13 +219,27 @@ fn config_fingerprint(config: &str) -> u64 {
     h.finish()
 }
 
-/// Build the process-wide catalog-client cache key for a graph source: its id plus
-/// a fingerprint of the raw config JSON. Shared by the query scan path and the
-/// `/info` row-count fetch so both reuse the SAME cached client (one OAuth token
-/// and one HTTPS connection pool), warmed by whichever path runs first. Keeping
-/// this in one place guarantees the two keys never drift.
-pub(crate) fn catalog_client_cache_key(graph_source_id: &str, config: &str) -> String {
-    format!("{graph_source_id}\u{1f}{:016x}", config_fingerprint(config))
+/// Build the process-wide catalog-client cache key for a graph source: its id, a
+/// fingerprint of the raw config JSON, and the identity context's scope. Shared by
+/// the query scan path and the `/info` row-count fetch so both reuse the SAME
+/// cached client (one OAuth token and one HTTPS connection pool), warmed by
+/// whichever path runs first. Keeping this in one place guarantees the two keys
+/// never drift.
+///
+/// The identity scope (the AWS subject that signs WIF exchanges, the host-identity
+/// policy) is part of the key because the cache is shared by every clone of a
+/// `Fluree`: a client built for one tenant's subject, or under a looser policy,
+/// must never serve another.
+pub(crate) fn catalog_client_cache_key(
+    graph_source_id: &str,
+    config: &str,
+    identity: &fluree_db_iceberg::IdentityContext,
+) -> String {
+    format!(
+        "{graph_source_id}\u{1f}{:016x}\u{1f}{}",
+        config_fingerprint(config),
+        identity.cache_scope()
+    )
 }
 
 /// Key for the `loadTable` caches that OUTLIVE a query (the in-memory cross-query
@@ -261,7 +275,8 @@ pub(crate) async fn shared_catalog_client(
         return Ok(None);
     }
     let cache = fluree.r2rml_cache();
-    let client_fp = catalog_client_cache_key(graph_source_id, raw_config);
+    let client_fp =
+        catalog_client_cache_key(graph_source_id, raw_config, fluree.identity_context());
     if let Some(client) = cache.catalog_client(&client_fp) {
         return Ok(Some(client));
     }
@@ -280,7 +295,7 @@ pub(crate) async fn shared_catalog_client(
             // cache-miss arm, strictly AFTER `client_fp` was computed above over
             // the RAW, reference-bearing config. The fingerprint-stability test
             // pins this.
-            let auth_provider = hydrated_auth_provider(auth, fluree.secret_resolver()).await?;
+            let auth_provider = hydrated_auth_provider(auth, fluree.identity_context()).await?;
             Arc::new(
                 RestCatalogClient::new(
                     RestCatalogConfig {
@@ -1191,8 +1206,8 @@ impl crate::Fluree {
 
         // Create auth provider
         let auth = hydrated_auth
-            .create_provider_arc()
-            .map_err(|e| crate::ApiError::Config(format!("Failed to create auth provider: {e}")))?;
+            .create_provider_arc(self.identity_context())
+            .map_err(super::iceberg_catalog::auth_provider_error)?;
 
         // Create catalog client
         let catalog_config = RestCatalogConfig {
@@ -2961,14 +2976,14 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 /// by `secret_ref_fingerprint_is_rotation_stable`.
 async fn hydrated_auth_provider(
     auth: &fluree_db_iceberg::auth::AuthConfig,
-    resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> QueryResult<Arc<dyn fluree_db_iceberg::auth::SendCatalogAuth>> {
     let hydrated = auth
-        .hydrate(resolver)
+        .hydrate(identity.secret_resolver.as_ref())
         .await
         .map_err(|e| QueryError::Internal(format!("Failed to resolve catalog auth secret: {e}")))?;
     hydrated
-        .create_provider_arc()
+        .create_provider_arc(identity)
         .map_err(|e| QueryError::Internal(format!("Failed to create auth provider: {e}")))
 }
 
@@ -5873,9 +5888,10 @@ mod tests {
         let raw = gs_config_json(oauth2_auth(fluree_db_iceberg::ConfigValue::SecretRef {
             secret_ref: "vault://cs".to_string(),
         }));
-        let key_raw = catalog_client_cache_key(gsid, &raw);
+        let identity = fluree_db_iceberg::IdentityContext::default();
+        let key_raw = catalog_client_cache_key(gsid, &raw, &identity);
         assert_eq!(
-            catalog_client_cache_key(gsid, &raw),
+            catalog_client_cache_key(gsid, &raw, &identity),
             key_raw,
             "the ref-bearing fingerprint must be stable across rotations"
         );
@@ -5891,8 +5907,8 @@ mod tests {
         let r2: Arc<dyn fluree_db_iceberg::SecretResolver> = Arc::new(FixedResolver("secret-v2"));
         let hydrated_v1 = gs_config_json(auth.hydrate(Some(&r1)).await.unwrap());
         let hydrated_v2 = gs_config_json(auth.hydrate(Some(&r2)).await.unwrap());
-        let key_h1 = catalog_client_cache_key(gsid, &hydrated_v1);
-        let key_h2 = catalog_client_cache_key(gsid, &hydrated_v2);
+        let key_h1 = catalog_client_cache_key(gsid, &hydrated_v1, &identity);
+        let key_h2 = catalog_client_cache_key(gsid, &hydrated_v2, &identity);
         assert_ne!(
             key_h1, key_h2,
             "hydrated configs with rotated secrets differ → hydrating before the \

@@ -1,10 +1,10 @@
 //! Shared cached access token with jittered expiry.
 //!
 //! Used by the refreshing catalog-auth providers ([`OAuth2ClientCredentials`]
-//! and [`GoogleMetadataAuth`]) so the expiry/refresh policy lives in one place.
+//! and [`GoogleIdentity`]) so the expiry/refresh policy lives in one place.
 //!
 //! [`OAuth2ClientCredentials`]: crate::auth::OAuth2ClientCredentials
-//! [`GoogleMetadataAuth`]: crate::auth::GoogleMetadataAuth
+//! [`GoogleIdentity`]: crate::auth::GoogleIdentity
 
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;

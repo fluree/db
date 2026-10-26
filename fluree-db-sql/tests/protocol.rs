@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use fluree_db_iceberg::auth::NoAuth;
+use fluree_db_iceberg::auth::{NoAuth, SendCatalogAuth};
 use fluree_db_sql::{LogicalSource, SqlGsConfig, TrinoClient};
 use futures::StreamExt;
 use serde_json::json;
@@ -289,6 +289,41 @@ async fn presto_header_family_is_selectable() {
     cfg.protocol = fluree_db_sql::WireProtocol::Presto;
     cfg.user = "svc".into();
     let c = TrinoClient::new(&cfg, Arc::new(NoAuth)).unwrap();
+    let (_, b) = c.execute_collect("SELECT 1").await.unwrap();
+    assert_eq!(b[0].column(0).unwrap().get_i32(0), Some(1));
+}
+
+/// Every header the auth provider sends reaches the endpoint, not just
+/// `Authorization`: a Google identity's quota project rides along, and the
+/// provider's `Authorization` is the one sent.
+#[tokio::test]
+async fn every_auth_header_reaches_the_statement_endpoint() {
+    #[derive(Debug)]
+    struct WithQuotaProject;
+    #[async_trait::async_trait]
+    impl SendCatalogAuth for WithQuotaProject {
+        async fn request_headers(&self) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("authorization", "Bearer ya29.minted".parse().unwrap());
+            headers.insert("x-goog-user-project", "lake-project".parse().unwrap());
+            Ok(headers)
+        }
+        async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(header("Authorization", "Bearer ya29.minted"))
+        .and(header("x-goog-user-project", "lake-project"))
+        .and(header("X-Trino-User", "fluree"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "q", "columns": [{"name": "x", "type": "integer"}], "data": [[1]], "stats": {"state": "FINISHED"}
+        })))
+        .mount(&server)
+        .await;
+    let c = TrinoClient::new(&SqlGsConfig::new(server.uri()), Arc::new(WithQuotaProject)).unwrap();
     let (_, b) = c.execute_collect("SELECT 1").await.unwrap();
     assert_eq!(b[0].column(0).unwrap().get_i32(0), Some(1));
 }

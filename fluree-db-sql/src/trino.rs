@@ -311,20 +311,17 @@ impl Inner {
         }
     }
 
+    /// The protocol headers plus every header the auth provider sends
+    /// (`Authorization`, and e.g. Google's `x-goog-user-project`); the
+    /// provider's replace any protocol header of the same name.
     async fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = self.base_headers.clone();
-        if let Some(value) = self
-            .auth
-            .authorization_header()
-            .await
-            .map_err(|e| SqlError::Auth(e.to_string()))?
-        {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                HeaderValue::from_str(&value)
-                    .map_err(|_| SqlError::Auth("invalid authorization header".into()))?,
-            );
-        }
+        headers.extend(
+            self.auth
+                .request_headers()
+                .await
+                .map_err(|e| SqlError::Auth(e.to_string()))?,
+        );
         Ok(headers)
     }
 

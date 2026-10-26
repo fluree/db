@@ -32,8 +32,8 @@ use serde_json::{Map, Value};
 use fluree_db_iceberg::catalog::SendCatalogClient;
 use fluree_db_iceberg::metadata::Schema;
 use fluree_db_iceberg::{
-    typed_value_to_json, Column, ColumnBatch, ScanConfig, SendParquetReader, SendScanPlanner,
-    TypedValue,
+    typed_value_to_json, Column, ColumnBatch, IdentityContext, ScanConfig, SendParquetReader,
+    SendScanPlanner, TypedValue,
 };
 
 use crate::graph_source::config::IcebergConnectionConfig;
@@ -50,18 +50,38 @@ use crate::{ApiError, Result};
 /// Cheap peek — see the [module docs](self). Returns at most
 /// `min(n, rows-in-first-row-group)` rows; an empty table (no data files) yields
 /// an empty vector.
+///
+/// Builds the catalog's auth with the default identity context (every host
+/// identity allowed, the host's own AWS chain for WIF). An instance with a
+/// host-identity policy or an AWS subject governs this through the `Fluree`
+/// method of the same name.
 pub async fn sample_iceberg_rows(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     projection: Option<Vec<String>>,
     n: usize,
 ) -> Result<Vec<Value>> {
+    sample_iceberg_rows_in(conn, table, projection, n, &IdentityContext::default()).await
+}
+
+/// [`sample_iceberg_rows`] under `identity`.
+pub(crate) async fn sample_iceberg_rows_in(
+    conn: IcebergConnectionConfig,
+    table: TableIdentifier,
+    projection: Option<Vec<String>>,
+    n: usize,
+    identity: &IdentityContext,
+) -> Result<Vec<Value>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let batches = sample_table_batches(&conn, &table, n, |schema| {
-        resolve_projection(schema, projection.as_deref(), &table)
-    })
+    let batches = sample_table_batches(
+        &conn,
+        &table,
+        n,
+        |schema| resolve_projection(schema, projection.as_deref(), &table),
+        identity,
+    )
     .await?;
     Ok(rows_from_batches(&batches, n))
 }
@@ -71,25 +91,47 @@ pub async fn sample_iceberg_rows(
 ///
 /// Cheap peek — see the [module docs](self). Returns at most
 /// `min(n, rows-in-first-row-group)` values.
+///
+/// Builds the catalog's auth with the default identity context (every host
+/// identity allowed, the host's own AWS chain for WIF). An instance with a
+/// host-identity policy or an AWS subject governs this through the `Fluree`
+/// method of the same name.
 pub async fn sample_column_values(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     column: String,
     n: usize,
 ) -> Result<Vec<Value>> {
+    sample_column_values_in(conn, table, column, n, &IdentityContext::default()).await
+}
+
+/// [`sample_column_values`] under `identity`.
+pub(crate) async fn sample_column_values_in(
+    conn: IcebergConnectionConfig,
+    table: TableIdentifier,
+    column: String,
+    n: usize,
+    identity: &IdentityContext,
+) -> Result<Vec<Value>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let batches = sample_table_batches(&conn, &table, n, |schema| {
-        let field = schema.field_by_name(&column).ok_or_else(|| {
-            ApiError::config(format!(
-                "Column {column:?} not found in table {}. Available: {:?}",
-                table.qualified(),
-                schema.field_names()
-            ))
-        })?;
-        Ok(vec![field.id])
-    })
+    let batches = sample_table_batches(
+        &conn,
+        &table,
+        n,
+        |schema| {
+            let field = schema.field_by_name(&column).ok_or_else(|| {
+                ApiError::config(format!(
+                    "Column {column:?} not found in table {}. Available: {:?}",
+                    table.qualified(),
+                    schema.field_names()
+                ))
+            })?;
+            Ok(vec![field.id])
+        },
+        identity,
+    )
     .await?;
     Ok(column_values_from_batches(&batches, n))
 }
@@ -107,11 +149,12 @@ async fn sample_table_batches<F>(
     table: &TableIdentifier,
     n: usize,
     resolve_field_ids: F,
+    identity: &IdentityContext,
 ) -> Result<Vec<ColumnBatch>>
 where
     F: FnOnce(&Schema) -> Result<Vec<i32>>,
 {
-    let (catalog, _uri, _wh) = catalog_client(conn, "table sample").await?;
+    let (catalog, _uri, _wh) = catalog_client(conn, "table sample", identity).await?;
     let table_id = table.to_catalog();
 
     let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
@@ -273,7 +316,7 @@ impl crate::Fluree {
         n: usize,
     ) -> Result<Vec<Value>> {
         let conn = self.hydrate_conn(conn).await?;
-        sample_iceberg_rows(conn, table, projection, n).await
+        sample_iceberg_rows_in(conn, table, projection, n, self.identity_context()).await
     }
 
     /// Sample the first `n` values of a single Iceberg column as a JSON array.
@@ -287,7 +330,7 @@ impl crate::Fluree {
         n: usize,
     ) -> Result<Vec<Value>> {
         let conn = self.hydrate_conn(conn).await?;
-        sample_column_values(conn, table, column, n).await
+        sample_column_values_in(conn, table, column, n, self.identity_context()).await
     }
 }
 

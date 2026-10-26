@@ -299,7 +299,8 @@ impl crate::Fluree {
 
         // Build the catalog client once (Direct mode fails fast with the
         // shared typed error). Reused across every table scan in this query.
-        let (catalog, _uri, _warehouse) = catalog_client(&conn, "provisional R2RML query").await?;
+        let (catalog, _uri, _warehouse) =
+            catalog_client(&conn, "provisional R2RML query", self.identity_context()).await?;
 
         let provider = EphemeralR2rmlProvider {
             conn,

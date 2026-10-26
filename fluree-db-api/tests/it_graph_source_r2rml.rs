@@ -997,16 +997,16 @@ impl R2rmlTableProvider for IcebergDirectProvider {
                     scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
                     audience: None,
                 }
-                .create_provider_arc()
+                .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
                 .map_err(|e| QueryError::Internal(format!("OAuth2 auth error: {e}")))?
             } else {
                 AuthConfig::None
-                    .create_provider_arc()
+                    .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
                     .map_err(|e| QueryError::Internal(format!("Auth error: {e}")))?
             }
         } else {
             AuthConfig::None
-                .create_provider_arc()
+                .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
                 .map_err(|e| QueryError::Internal(format!("Auth error: {e}")))?
         };
 

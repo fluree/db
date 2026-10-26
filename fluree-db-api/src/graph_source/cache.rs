@@ -349,19 +349,20 @@ impl R2rmlCache {
         table_name: &str,
         placement: &fluree_db_delta::Placement,
         config: &fluree_db_delta::DeltaGsConfig,
-        resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
+        identity: &fluree_db_iceberg::IdentityContext,
     ) -> fluree_db_delta::Result<fluree_db_delta::DeltaTable> {
         use fluree_db_delta::{DeltaTable, Placement};
-        let key = delta_table_key(placement, config);
+        let key = delta_table_key(placement, config, identity);
         if let Some(table) = self.delta_tables.get(&key) {
             return Ok(table);
         }
+        let resolver = identity.secret_resolver.as_ref();
         let io = config.io.hydrate(resolver).await?;
         let table = match (placement, &config.unity) {
             (Placement::Path(location), _) => DeltaTable::open(table_name, location, &io)?,
             (Placement::Unity(full_name), Some(unity)) => {
                 let unity = unity.hydrate(resolver).await?;
-                DeltaTable::open_in_unity(table_name, &unity, full_name, &io).await?
+                DeltaTable::open_in_unity(table_name, &unity, full_name, &io, identity).await?
             }
             (Placement::Unity(full_name), None) => {
                 return Err(fluree_db_delta::DeltaError::Config(format!(
@@ -575,13 +576,17 @@ mod iceberg_tests {
 fn delta_table_key(
     placement: &fluree_db_delta::Placement,
     config: &fluree_db_delta::DeltaGsConfig,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> String {
     use fluree_db_delta::Placement;
     let io = serde_json::to_string(&config.io).unwrap_or_default();
+    // A handle holds clients built under the identity context (Unity's auth,
+    // and the storage it reads with); another context must not reuse it.
+    let scope = identity.cache_scope();
     match placement {
-        Placement::Path(location) => format!("{location}\u{1f}{io}"),
+        Placement::Path(location) => format!("{location}\u{1f}{io}\u{1f}{scope}"),
         Placement::Unity(full_name) => format!(
-            "{full_name}\u{1f}{}\u{1f}{io}",
+            "{full_name}\u{1f}{}\u{1f}{io}\u{1f}{scope}",
             serde_json::to_string(&config.unity).unwrap_or_default(),
         ),
     }
@@ -593,6 +598,7 @@ mod delta_key_tests {
     use fluree_db_delta::{DeltaGsConfig, Placement, UnityConfig};
     use fluree_db_iceberg::auth::AuthConfig;
     use fluree_db_iceberg::ConfigValue;
+    use fluree_db_iceberg::IdentityContext;
 
     fn source(token: ConfigValue) -> DeltaGsConfig {
         DeltaGsConfig {
@@ -614,29 +620,33 @@ mod delta_key_tests {
         let bob = source(ConfigValue::literal("bob"));
 
         assert_eq!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&orders, &alice)
+            delta_table_key(&orders, &alice, &IdentityContext::default()),
+            delta_table_key(&orders, &alice, &IdentityContext::default())
         );
         assert_ne!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&orders, &bob)
+            delta_table_key(&orders, &alice, &IdentityContext::default()),
+            delta_table_key(&orders, &bob, &IdentityContext::default())
         );
         assert_ne!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&items, &alice)
+            delta_table_key(&orders, &alice, &IdentityContext::default()),
+            delta_table_key(&items, &alice, &IdentityContext::default())
         );
 
         let mut elsewhere = alice.clone();
         elsewhere.unity.as_mut().unwrap().uri = "https://other.example.com".to_string();
         assert_ne!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&orders, &elsewhere)
+            delta_table_key(&orders, &alice, &IdentityContext::default()),
+            delta_table_key(&orders, &elsewhere, &IdentityContext::default())
         );
 
         // A path and a catalog name spelt alike are different tables.
         assert_ne!(
-            delta_table_key(&Placement::Path("main.sales.orders".to_string()), &alice),
-            delta_table_key(&orders, &alice)
+            delta_table_key(
+                &Placement::Path("main.sales.orders".to_string()),
+                &alice,
+                &IdentityContext::default()
+            ),
+            delta_table_key(&orders, &alice, &IdentityContext::default())
         );
     }
 
@@ -646,7 +656,25 @@ mod delta_key_tests {
         let key = delta_table_key(
             &orders,
             &source(ConfigValue::from_env("UNITY_TOKEN_KEY_TEST")),
+            &IdentityContext::default(),
         );
         assert!(key.contains("UNITY_TOKEN_KEY_TEST"), "{key}");
+    }
+
+    /// The cache is shared by every clone of a `Fluree`: a handle opened under
+    /// one identity context (AWS subject, host-identity policy) never serves
+    /// another.
+    #[test]
+    fn the_identity_context_is_part_of_the_key() {
+        let orders = Placement::Unity("main.sales.orders".to_string());
+        let config = source(ConfigValue::literal("t"));
+        let closed = IdentityContext {
+            policy: fluree_db_iceberg::HostIdentityPolicy::deny_all(),
+            ..IdentityContext::default()
+        };
+        assert_ne!(
+            delta_table_key(&orders, &config, &IdentityContext::default()),
+            delta_table_key(&orders, &config, &closed)
+        );
     }
 }

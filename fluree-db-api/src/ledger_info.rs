@@ -1078,6 +1078,15 @@ const SECRET_CONFIG_KEYS: &[&str] = &[
     "refresh_token",
 ];
 
+/// A Google service-account credential stores its key file under the generic
+/// name `key` (`{"source": "service_account", "key": …}`, in catalog auth and in
+/// `io.storage_auth`), which no name rule could mark secret without masking every
+/// other `key`. So `key` is secret exactly inside an object that says it is a
+/// service account.
+fn holds_service_account_key(map: &serde_json::Map<String, JsonValue>) -> bool {
+    map.get("source").and_then(JsonValue::as_str) == Some("service_account")
+}
+
 fn is_secret_config_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
@@ -1128,8 +1137,9 @@ pub fn redact_json_secrets(value: &mut JsonValue) -> bool {
     let mut redacted = false;
     match value {
         JsonValue::Object(map) => {
+            let service_account = holds_service_account_key(map);
             for (k, v) in map.iter_mut() {
-                if is_secret_config_key(k) {
+                if is_secret_config_key(k) || (service_account && k == "key") {
                     if is_secret_ref_object(v) {
                         // A secret *reference* is not a secret (same policy as
                         // env-var names, which the redactor deliberately keeps):
@@ -3491,7 +3501,7 @@ mod tests {
     #[cfg(feature = "iceberg")]
     #[test]
     fn test_every_auth_config_variant_redacts_on_emit() {
-        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::auth::{AuthConfig, ExternalAccountConfig, GoogleCredentials};
         use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
         use fluree_db_iceberg::{ConfigValue, IcebergGsConfig};
 
@@ -3543,6 +3553,46 @@ mod tests {
                 scopes: None,
                 metadata_url: None,
             },
+            // A service-account key file (stored under the generic name `key`),
+            // as a literal and as an env var with an inline default; and as a
+            // secret reference, which stays visible.
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::literal(format!(
+                        r#"{{"type":"service_account","private_key":"{SENTINEL_A}"}}"#
+                    )),
+                },
+                scopes: None,
+                quota_project: Some("lake-project".to_string()),
+            },
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::Dynamic {
+                        env_var: Some("MY_TOKEN".to_string()),
+                        java_property: None,
+                        default_val: Some(SENTINEL_B.to_string()),
+                    },
+                },
+                scopes: None,
+                quota_project: None,
+            },
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::SecretRef {
+                        secret_ref: VISIBLE_REF.to_string(),
+                    },
+                },
+                scopes: None,
+                quota_project: None,
+            },
+            // A WIF configuration is not secret; the other sources carry none.
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ExternalAccount {
+                    config: ExternalAccountConfig::Inline(serde_json::Map::new()),
+                },
+                scopes: None,
+                quota_project: None,
+            },
         ];
 
         // Exhaustiveness canary — NO wildcard arm. A new AuthConfig variant
@@ -3553,7 +3603,8 @@ mod tests {
                 AuthConfig::None
                 | AuthConfig::Bearer { .. }
                 | AuthConfig::OAuth2ClientCredentials { .. }
-                | AuthConfig::GoogleMetadata { .. } => {}
+                | AuthConfig::GoogleMetadata { .. }
+                | AuthConfig::Google { .. } => {}
             }
         }
 

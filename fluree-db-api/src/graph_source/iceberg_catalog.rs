@@ -34,7 +34,7 @@ use fluree_db_iceberg::metadata::{
 use fluree_db_iceberg::stats::{
     aggregate_column_stats, send_read_snapshot_data_files, AggregatedColumnStats,
 };
-use fluree_db_iceberg::FieldType;
+use fluree_db_iceberg::{FieldType, IdentityContext};
 // The emitter owns the canonical `FieldType → xsd:` map; the preview lane reuses
 // it (single source of truth) rather than duplicating it here.
 use fluree_db_r2rml::emit::naming::xsd_datatype;
@@ -139,6 +139,11 @@ pub struct CatalogBrowse {
     pub tables: Vec<TableRef>,
 }
 
+/// A catalog auth provider that could not be built.
+pub(crate) fn auth_provider_error(err: fluree_db_iceberg::IcebergError) -> crate::ApiError {
+    crate::ApiError::config(format!("Failed to create auth provider: {err}"))
+}
+
 /// Build a catalog client from a connection — REST, AWS Glue, or AWS S3 Tables —
 /// or a clear typed error for Direct mode (which has no catalog to browse/list).
 ///
@@ -148,16 +153,20 @@ pub struct CatalogBrowse {
 /// the Glue catalog id, or the S3 Tables bucket ARN), and the warehouse (REST
 /// only). Async because the AWS SDK clients load the ambient AWS config.
 ///
-/// REST auth must already be resolver-free (see [`crate::Fluree::hydrate_conn`]).
+/// REST auth must already be resolver-free (see [`crate::Fluree::hydrate_conn`]);
+/// it is built under `identity` (the instance's host-identity policy and AWS
+/// subject).
 pub(crate) async fn catalog_client(
     conn: &IcebergConnectionConfig,
     op: &str,
+    identity: &IdentityContext,
 ) -> Result<(Arc<dyn SendCatalogClient>, String, Option<String>)> {
     match &conn.catalog_mode {
         CatalogMode::Rest(rest) => {
-            let auth = rest.auth.create_provider_arc().map_err(|e| {
-                crate::ApiError::config(format!("Failed to create auth provider: {e}"))
-            })?;
+            let auth = rest
+                .auth
+                .create_provider_arc(identity)
+                .map_err(auth_provider_error)?;
             let catalog_config = RestCatalogConfig {
                 uri: rest.catalog_uri.clone(),
                 warehouse: rest.warehouse.clone(),
@@ -245,11 +254,26 @@ pub(crate) async fn read_load_response_metadata(
 /// **Metadata-only** and stateless — it needs no `Fluree` instance and reads no
 /// S3 objects (Glue / S3 Tables list via their native SDK APIs). Direct catalog
 /// mode returns a clear [`crate::ApiError::Config`] (there is nothing to browse).
+///
+/// Builds the catalog's auth with the default identity context (every host
+/// identity allowed, the host's own AWS chain for WIF). An instance with a
+/// host-identity policy or an AWS subject governs this through the `Fluree`
+/// method of the same name.
 pub async fn browse_iceberg_catalog(
     conn: IcebergConnectionConfig,
     depth: BrowseDepth,
 ) -> Result<CatalogBrowse> {
-    let (catalog, catalog_uri, warehouse) = catalog_client(&conn, "catalog browse").await?;
+    browse_iceberg_catalog_in(conn, depth, &IdentityContext::default()).await
+}
+
+/// [`browse_iceberg_catalog`] under `identity`.
+pub(crate) async fn browse_iceberg_catalog_in(
+    conn: IcebergConnectionConfig,
+    depth: BrowseDepth,
+    identity: &IdentityContext,
+) -> Result<CatalogBrowse> {
+    let (catalog, catalog_uri, warehouse) =
+        catalog_client(&conn, "catalog browse", identity).await?;
 
     let namespaces = SendCatalogClient::list_namespaces(&*catalog)
         .await
@@ -330,7 +354,7 @@ impl crate::Fluree {
         depth: BrowseDepth,
     ) -> Result<CatalogBrowse> {
         let conn = self.hydrate_conn(conn).await?;
-        browse_iceberg_catalog(conn, depth).await
+        browse_iceberg_catalog_in(conn, depth, self.identity_context()).await
     }
 }
 
@@ -745,12 +769,27 @@ fn preview_counts_are_upper_bounds(
 /// `metadata_location`) fetched + parsed from S3 — never a Parquet/data file.
 /// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files.
 /// Direct catalog mode returns a clear typed error (there is no catalog to load).
+///
+/// Builds the catalog's auth with the default identity context (every host
+/// identity allowed, the host's own AWS chain for WIF). An instance with a
+/// host-identity policy or an AWS subject governs this through the `Fluree`
+/// method of the same name.
 pub async fn preview_iceberg_table(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     tier: StatsTier,
 ) -> Result<TablePreview> {
-    let (catalog, _uri, _wh) = catalog_client(&conn, "table preview").await?;
+    preview_iceberg_table_in(conn, table, tier, &IdentityContext::default()).await
+}
+
+/// [`preview_iceberg_table`] under `identity`.
+pub(crate) async fn preview_iceberg_table_in(
+    conn: IcebergConnectionConfig,
+    table: TableIdentifier,
+    tier: StatsTier,
+    identity: &IdentityContext,
+) -> Result<TablePreview> {
+    let (catalog, _uri, _wh) = catalog_client(&conn, "table preview", identity).await?;
     let table_id = table.to_catalog();
 
     let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
@@ -1149,7 +1188,7 @@ impl crate::Fluree {
         tier: StatsTier,
     ) -> Result<TablePreview> {
         let conn = self.hydrate_conn(conn).await?;
-        preview_iceberg_table(conn, table, tier).await
+        preview_iceberg_table_in(conn, table, tier, self.identity_context()).await
     }
 }
 
@@ -1363,11 +1402,26 @@ fn parse_qualified_table(table: &str) -> TableIdentifier {
 /// Catalog modes only (REST, Glue, S3 Tables): Direct mode returns the same clear
 /// typed error as [`preview_iceberg_table`] (there is no catalog to authorize the
 /// read).
+///
+/// Builds the catalog's auth with the default identity context (every host
+/// identity allowed, the host's own AWS chain for WIF). An instance with a
+/// host-identity policy or an AWS subject governs this through the `Fluree`
+/// method of the same name.
 pub async fn verify_storage_access(
     conn: IcebergConnectionConfig,
     table: &str,
 ) -> Result<StorageAccessReport> {
-    let (catalog, _uri, _wh) = catalog_client(&conn, "storage access verification").await?;
+    verify_storage_access_in(conn, table, &IdentityContext::default()).await
+}
+
+/// [`verify_storage_access`] under `identity`.
+pub(crate) async fn verify_storage_access_in(
+    conn: IcebergConnectionConfig,
+    table: &str,
+    identity: &IdentityContext,
+) -> Result<StorageAccessReport> {
+    let (catalog, _uri, _wh) =
+        catalog_client(&conn, "storage access verification", identity).await?;
     let table_id = parse_qualified_table(table);
     let catalog_table = table_id.to_catalog();
 
@@ -1460,7 +1514,7 @@ impl crate::Fluree {
         table: &str,
     ) -> Result<StorageAccessReport> {
         let conn = self.hydrate_conn(conn).await?;
-        verify_storage_access(conn, table).await
+        verify_storage_access_in(conn, table, self.identity_context()).await
     }
 }
 

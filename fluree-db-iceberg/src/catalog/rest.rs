@@ -188,10 +188,9 @@ impl RestCatalogClient {
                     .get(&url)
                     .header("Accept", "application/json");
 
-                // Add auth header if available
-                if let Some(auth_header) = self.auth.authorization_header().await? {
-                    request = request.header("Authorization", auth_header);
-                }
+                // The provider's headers: Authorization, plus any it adds
+                // (Google's x-goog-user-project).
+                request = request.headers(self.auth.request_headers().await?);
 
                 // Add custom headers
                 for (name, value) in headers {
@@ -239,6 +238,14 @@ impl RestCatalogClient {
 
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
+                    // Google refuses user credentials that name no quota
+                    // project. Still a refusal (fail closed), typed so the hint
+                    // names the fix instead of a broader grant.
+                    if status == reqwest::StatusCode::FORBIDDEN && needs_quota_project(&body) {
+                        return Err(IcebergError::CatalogQuotaProjectRequired {
+                            table: path.to_string(),
+                        });
+                    }
                     let message = format!("Catalog request failed ({status}): {body}");
                     // A 403, or a 401 that survived the token refresh above, is the
                     // catalog refusing this principal: typed, so a query reports it as
@@ -318,6 +325,16 @@ impl RestCatalogClient {
         };
         Ok(named("overrides").or_else(|| named("defaults")))
     }
+}
+
+/// Whether a Google 403 is the missing-quota-project refusal: the
+/// `USER_PROJECT_DENIED` reason, or the "requires a quota project" message
+/// Google gives user (ADC) credentials.
+fn needs_quota_project(body: &str) -> bool {
+    body.contains("USER_PROJECT_DENIED")
+        || body
+            .to_ascii_lowercase()
+            .contains("requires a quota project")
 }
 
 /// Route prefix by (catalog URI, warehouse).
@@ -623,6 +640,75 @@ mod tests {
                 }
                 other => panic!("{status}: expected CatalogAccessDenied, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn googles_missing_quota_project_refusal_is_typed_with_the_fix() {
+        // On loadTable (named by table) and on /v1/config (still fail closed:
+        // the lookup errors rather than reading the catalog without a prefix).
+        let user_project_denied = serde_json::json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "USER_PROJECT_DENIED"}]}});
+        let server = MockServer::start().await;
+        serve_config(&server, serde_json::json!({})).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/db/tables/events"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(user_project_denied))
+            .mount(&server)
+            .await;
+        let err = loads(&warehouse_client(&server.uri(), None), "db")
+            .await
+            .unwrap_err();
+        match &err {
+            IcebergError::CatalogQuotaProjectRequired { table } => assert_eq!(table, "db.events"),
+            other => panic!("expected CatalogQuotaProjectRequired, got {other:?}"),
+        }
+        assert!(err.to_string().contains("quota_project"), "{err}");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "Your application is authenticating by using local Application Default Credentials. \
+                 The biglake.googleapis.com API Requires a quota project, which is not set by default.",
+            ))
+            .mount(&server)
+            .await;
+        serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
+        let err = loads(&warehouse_client(&server.uri(), Some("lake")), "db")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::CatalogQuotaProjectRequired { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_provider_header_reaches_the_catalog() {
+        #[derive(Debug)]
+        struct TwoHeaders;
+        #[async_trait]
+        impl SendCatalogAuth for TwoHeaders {
+            async fn request_headers(&self) -> Result<reqwest::header::HeaderMap> {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("authorization", "Bearer t".parse().unwrap());
+                headers.insert("x-goog-user-project", "p".parse().unwrap());
+                Ok(headers)
+            }
+            async fn refresh(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let server = MockServer::start().await;
+        serve_config(&server, serde_json::json!({})).await;
+        serve_table(&server, "/v1/namespaces/db/tables/events").await;
+        let mut client = warehouse_client(&server.uri(), None);
+        client.auth = Arc::new(TwoHeaders);
+        loads(&client, "db").await.unwrap();
+        for request in server.received_requests().await.unwrap() {
+            assert_eq!(request.headers["authorization"], "Bearer t");
+            assert_eq!(request.headers["x-goog-user-project"], "p");
         }
     }
 

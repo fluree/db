@@ -25,9 +25,10 @@ use crate::error::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-/// Name the table a catalog refused access to. A denial is raised where only
-/// the request is known (a REST path, an SDK operation), so each `load_table`
-/// relabels it with the table it was loading; any other error passes through.
+/// Name the table a catalog refused access to (a denial, or Google's missing
+/// quota project). A refusal is raised where only the request is known (a REST
+/// path, an SDK operation), so each `load_table` relabels it with the table it
+/// was loading; any other error passes through.
 pub(crate) fn name_denied_table(
     err: crate::IcebergError,
     table_id: &TableIdentifier,
@@ -37,6 +38,11 @@ pub(crate) fn name_denied_table(
             crate::IcebergError::CatalogAccessDenied {
                 table: format!("{}.{}", table_id.namespace, table_id.table),
                 message,
+            }
+        }
+        crate::IcebergError::CatalogQuotaProjectRequired { .. } => {
+            crate::IcebergError::CatalogQuotaProjectRequired {
+                table: format!("{}.{}", table_id.namespace, table_id.table),
             }
         }
         other => other,

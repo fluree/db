@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use delta_kernel::object_store::aws::AwsCredential;
 use delta_kernel::object_store::azure::AzureCredential;
 use delta_kernel::object_store::{self as object_store, CredentialProvider};
-use fluree_db_iceberg::auth::SendCatalogAuth;
+use fluree_db_iceberg::auth::{IdentityContext, SendCatalogAuth};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::Deserialize;
 
@@ -174,18 +174,24 @@ struct AzureSas {
 
 impl UnityClient {
     /// `config` must be hydrated: an unresolved secret reference fails here.
-    pub(crate) fn new(config: &UnityConfig) -> Result<Self> {
+    /// `identity` is the host's identity context (policy, AWS subject) the
+    /// catalog auth provider is built under.
+    pub(crate) fn new(config: &UnityConfig, identity: &IdentityContext) -> Result<Self> {
         let http = fluree_db_iceberg::net::hardened_client_builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| DeltaError::Config(format!("Unity Catalog client: {e}")))?;
-        Self::with_http(config, http)
+        Self::with_http(config, http, identity)
     }
 
-    pub(crate) fn with_http(config: &UnityConfig, http: reqwest::Client) -> Result<Self> {
+    pub(crate) fn with_http(
+        config: &UnityConfig,
+        http: reqwest::Client,
+        identity: &IdentityContext,
+    ) -> Result<Self> {
         let auth = config
             .auth
-            .create_provider_arc()
+            .create_provider_arc(identity)
             .map_err(|e| DeltaError::Config(format!("Unity Catalog auth: {e}")))?;
         Ok(Self {
             base: config.uri.trim_end_matches('/').to_string(),
@@ -434,14 +440,12 @@ impl UnityClient {
                 Some(body) => self.http.post(&url).json(body),
                 None => self.http.get(&url),
             };
-            if let Some(header) = self
-                .auth
-                .authorization_header()
-                .await
-                .map_err(|e| failed(format!("catalog auth: {e}")))?
-            {
-                request = request.header("Authorization", header);
-            }
+            request = request.headers(
+                self.auth
+                    .request_headers()
+                    .await
+                    .map_err(|e| failed(format!("catalog auth: {e}")))?,
+            );
             let response = request
                 .send()
                 .await
@@ -679,7 +683,10 @@ mod tests {
             catalog: None,
             schema: None,
         };
-        Arc::new(UnityClient::with_http(&config, reqwest::Client::new()).unwrap())
+        Arc::new(
+            UnityClient::with_http(&config, reqwest::Client::new(), &IdentityContext::default())
+                .unwrap(),
+        )
     }
 
     fn orders(location: &str) -> UnityTable {
@@ -771,6 +778,45 @@ mod tests {
         let table = client(&server).table("main.sales.orders").await.unwrap();
         assert_eq!(table.id, "t-1");
         assert_eq!(table.location, "s3://bucket/tables/t-1");
+    }
+
+    /// Every header the catalog auth provider sends reaches Unity, not just
+    /// `Authorization`: a Google identity's quota project rides along.
+    #[tokio::test]
+    async fn every_auth_header_reaches_unity() {
+        #[derive(Debug)]
+        struct WithQuotaProject;
+        #[async_trait]
+        impl SendCatalogAuth for WithQuotaProject {
+            async fn request_headers(
+                &self,
+            ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("authorization", "Bearer catalog-token".parse().unwrap());
+                headers.insert("x-goog-user-project", "lake-project".parse().unwrap());
+                Ok(headers)
+            }
+            async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+                Ok(())
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(TABLES))
+            .and(header("Authorization", "Bearer catalog-token"))
+            .and(header("x-goog-user-project", "lake-project"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "table_id": "t-1", "table_type": "MANAGED", "data_source_format": "DELTA",
+                "storage_location": "s3://bucket/tables/t-1",
+            })))
+            .mount(&server)
+            .await;
+        let unity = UnityClient {
+            base: server.uri(),
+            auth: Arc::new(WithQuotaProject),
+            http: reqwest::Client::new(),
+        };
+        assert_eq!(unity.table("main.sales.orders").await.unwrap().id, "t-1");
     }
 
     #[tokio::test]
@@ -1144,7 +1190,14 @@ mod tests {
             catalog: None,
             schema: None,
         };
-        let unity = Arc::new(UnityClient::with_http(&server_less, reqwest::Client::new()).unwrap());
+        let unity = Arc::new(
+            UnityClient::with_http(
+                &server_less,
+                reqwest::Client::new(),
+                &IdentityContext::default(),
+            )
+            .unwrap(),
+        );
         for location in ["/etc", "file:///etc"] {
             let refused = crate::store::open(
                 location,
