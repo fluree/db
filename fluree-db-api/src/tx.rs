@@ -195,6 +195,12 @@ impl SequentialStager {
         &self.governance
     }
 
+    /// Whether the virtual state is built: false only after a
+    /// `stage(…, advance: false)`.
+    pub(crate) fn has_state(&self) -> bool {
+        self.current.is_some()
+    }
+
     /// The current virtual state (base + every staged operation so far).
     /// Probe queries against it observe earlier operations' writes.
     pub(crate) fn state(&self) -> &LedgerState {

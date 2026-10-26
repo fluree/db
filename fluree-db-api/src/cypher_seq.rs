@@ -43,6 +43,7 @@ use fluree_db_cypher::ast::{
 use fluree_db_cypher::span::SourceSpan;
 use fluree_db_ledger::IndexConfig;
 use fluree_db_ledger::LedgerState;
+use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use fluree_db_query::parse::{UnresolvedPattern, UnresolvedValue};
 use fluree_db_query::{Binding, Materializer};
 
@@ -370,15 +371,39 @@ pub fn classify_sequential_source(
 }
 
 /// Outcome of staging a sequential write: the merged one-commit stage result,
-/// the answered trailing `RETURN` (when the statement has one), and the final
-/// virtual state (base + every clause) the RETURN evaluated against — call
-/// sites format the result against it (or against the equivalent committed
-/// state).
+/// and the trailing `RETURN` answered, when the statement has one.
 pub(crate) struct SequentialOutcome {
     pub stage_result: StageResult,
-    pub return_result: Option<QueryResult>,
+    pub returned: Option<AnsweredReturn>,
+}
+
+/// A trailing `RETURN`'s result, with the state it was read from: the final
+/// virtual state (base + every clause). Call sites format the result against
+/// it, or against the equivalent committed state.
+///
+/// The final state is only reachable here. The driver builds the state after
+/// the last write clause only for a statement with a `RETURN`
+/// ([`StateAfter`]), so no caller can read a state it didn't build.
+pub(crate) struct AnsweredReturn {
+    pub result: QueryResult,
     pub final_state: LedgerState,
 }
+
+/// Whether anything reads the virtual state after a clause is staged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateAfter {
+    /// A later clause, a MERGE probe or the trailing `RETURN` reads it.
+    Read,
+    /// Nothing does: the last write clause of a statement with no `RETURN`.
+    /// Its stage folds the clause's facts into the merged result, which is
+    /// all the commit reads, and builds no state after it.
+    Unread,
+}
+
+/// Routing stamp site for the state after a statement's last write clause:
+/// `proceed` when it was left unbuilt, a fallback when it was built (a
+/// `RETURN` or a MERGE reads it, or the last clause staged nothing).
+pub const UNREAD_FINAL_STATE_SITE: &str = "cypher_unread_final_state";
 
 /// Input for staging a sequential Cypher write through the transaction
 /// builder ([`crate::RefTransactBuilder::cypher_sequential`]): the detected
@@ -535,8 +560,19 @@ impl Fluree {
         };
 
         // ---- 2. Per-clause staging loop ----------------------------------
+        let last_clause = update.write_clauses.len().saturating_sub(1);
         for (ci, clause) in update.write_clauses.iter().enumerate() {
             let clause_skolem = format!("{skolem_base}-s{ci}");
+            // The state after the last write clause is read only by a
+            // trailing RETURN, or by the clause itself when it's a MERGE.
+            let after = if ci == last_clause
+                && update.return_clause.is_none()
+                && !matches!(clause, WriteClause::Merge(_))
+            {
+                StateAfter::Unread
+            } else {
+                StateAfter::Read
+            };
             // Hoist computed value expressions (`{name: p.team}`,
             // `SET n.x = p.age + 1`) into engine-evaluated row columns —
             // the write lowering takes literals and bound variables only.
@@ -564,6 +600,7 @@ impl Fluree {
                         policy,
                         tracker,
                         span,
+                        after,
                     )
                     .await?;
                 }
@@ -603,6 +640,7 @@ impl Fluree {
                             policy,
                             tracker,
                             span,
+                            after,
                         )
                         .await?;
                     }
@@ -612,6 +650,17 @@ impl Fluree {
                 }
             }
         }
+
+        // Stamped from what the stager holds rather than from the decision,
+        // so `proceed` means the state was in fact left unbuilt.
+        stamp_fast_path(
+            UNREAD_FINAL_STATE_SITE,
+            if stager.has_state() {
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+            } else {
+                FastPathOutcome::Proceed
+            },
+        );
 
         // ---- 3. Trailing RETURN off the final row table ------------------
         let return_result = match &update.return_clause {
@@ -671,11 +720,13 @@ impl Fluree {
             None => None,
         };
 
-        let final_state = stager.state().clone();
+        let returned = return_result.map(|result| AnsweredReturn {
+            result,
+            final_state: stager.state().clone(),
+        });
         Ok(SequentialOutcome {
             stage_result: stager.finish().await?,
-            return_result,
-            final_state,
+            returned,
         })
     }
 
@@ -696,6 +747,8 @@ impl Fluree {
             sync_graph: _,
             scope: _,
         } = outcome.stage_result;
+        // The rows format against the committed state, not the virtual one.
+        let return_result = outcome.returned.map(|answered| answered.result);
 
         let commit_opts = fluree_db_transact::CommitOpts::default()
             .with_txn_meta(txn_meta)
@@ -716,7 +769,7 @@ impl Fluree {
             .finalize_owned_commit(receipt, ledger, index_config)
             .await;
 
-        let rows = match outcome.return_result {
+        let rows = match return_result {
             Some(qr) => {
                 let view = GraphDb::from_ledger_state(&result.ledger);
                 Some(
@@ -793,6 +846,7 @@ impl Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
+        after: StateAfter,
     ) -> Result<()> {
         if table.rows.is_empty() {
             return Ok(());
@@ -832,6 +886,7 @@ impl Fluree {
             policy,
             tracker,
             span,
+            after,
         )
         .await?;
 
@@ -964,6 +1019,7 @@ impl Fluree {
                     policy,
                     tracker,
                     span,
+                    StateAfter::Read,
                 )
                 .await?;
             } else {
@@ -1169,6 +1225,7 @@ impl Fluree {
                     policy,
                     tracker,
                     span,
+                    StateAfter::Read,
                 )
                 .await
                 .map(|_| ());
@@ -1204,6 +1261,7 @@ impl Fluree {
                 policy,
                 tracker,
                 span,
+                StateAfter::Read,
             )
             .await?;
         }
@@ -1518,6 +1576,7 @@ impl Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
+        after: StateAfter,
     ) -> Result<usize> {
         let ast = update_ast(write_clauses, span);
         let mut txn = self
@@ -1548,7 +1607,14 @@ impl Fluree {
         }
         txn.opts.skolem_txn_id = skolem;
         stager
-            .stage(self, txn, index_config, policy, tracker, true)
+            .stage(
+                self,
+                txn,
+                index_config,
+                policy,
+                tracker,
+                after == StateAfter::Read,
+            )
             .await
     }
 }

@@ -1267,3 +1267,243 @@ async fn a_set_on_a_node_the_statement_creates_writes_that_node_once() {
     };
     assert_twins("CREATE then SET of the created node", got, want, (3, 0));
 }
+
+// ---- The state after the last clause --------------------------------------
+//
+// Only a trailing RETURN reads the virtual state after a statement's last
+// write clause, so without one the driver doesn't build it. The commit reads
+// the merged result, which is the same either way.
+
+/// Two SETs of one key on node `a`; the last write is `"w"`.
+const TWO_SETS: &str = r#"MATCH (n:P {id: "a"}) SET n.name = "y" SET n.name = "w""#;
+
+/// The `cypher_unread_final_state` stamps since event `from`.
+fn final_state_stamps(store: &support::span_capture::SpanStore, from: usize) -> Vec<String> {
+    let site = fluree_db_api::cypher_seq::UNREAD_FINAL_STATE_SITE;
+    store.find_events("fast-path outcome")[from..]
+        .iter()
+        .filter(|e| e.fields.get("site").map(String::as_str) == Some(site))
+        .filter_map(|e| e.fields.get("outcome").cloned())
+        .collect()
+}
+
+/// A fresh ledger `id` seeded with [`TWIN_SEED`].
+async fn twin_seeded(fluree: &fluree_db_api::Fluree, id: &str) {
+    fluree.create_ledger(id).await.expect("create");
+    fluree
+        .graph(id)
+        .transact()
+        .sparql_update(TWIN_SEED)
+        .commit()
+        .await
+        .expect("seed");
+}
+
+/// A statement commits the same facts whether or not a RETURN reads the
+/// state after its last clause: the run without one leaves that state
+/// unbuilt, the run with one builds it, and both commit the merged result.
+#[tokio::test]
+async fn a_write_commits_the_same_facts_with_or_without_a_return() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+    let cases = [
+        (
+            r#"MATCH (n:P) SET n.name = "y" SET n.name = "w""#,
+            " RETURN n.name AS name",
+        ),
+        (
+            r#"MATCH (n:P {id: "a"}) DETACH DELETE n CREATE (:P {id: "a"})"#,
+            " RETURN 1 AS done",
+        ),
+        (
+            r#"MATCH (n:P {id: "a"}) SET n.name = "y" DETACH DELETE n"#,
+            " RETURN 1 AS done",
+        ),
+        (
+            r#"MATCH (n:P {id: "a"}) REMOVE n.name SET n.name = "x""#,
+            " RETURN n.name AS name",
+        ),
+    ];
+    for (i, (statement, ret)) in cases.into_iter().enumerate() {
+        let mut runs = Vec::new();
+        for (with_return, expected_stamp) in [(false, "proceed"), (true, "fallback:gate_declined")]
+        {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let id = format!("it/cyseq-unread-{i}-{with_return}:main");
+            twin_seeded(&fluree, &id).await;
+            let ledger = fluree.ledger(&id).await.expect("ledger");
+            let before = store.find_events("fast-path outcome").len();
+            let (result, rows) = if with_return {
+                fluree
+                    .transact_cypher_returning(ledger, &format!("{statement}{ret}"), None)
+                    .await
+                    .expect("with RETURN")
+            } else {
+                let result = fluree
+                    .transact_cypher(ledger, statement)
+                    .await
+                    .expect("without RETURN");
+                (result, None)
+            };
+            assert_eq!(rows.is_some(), with_return, "{statement}");
+            assert_eq!(
+                final_state_stamps(&store, before),
+                [expected_stamp],
+                "{statement} (RETURN: {with_return})"
+            );
+            let commit = (result.receipt.assert_count, result.receipt.retract_count);
+            let ledger = fluree.ledger(&id).await.expect("ledger");
+            runs.push((twin_state(&fluree, &ledger).await, commit));
+        }
+        assert_eq!(runs[0], runs[1], "{statement}: without vs with a RETURN");
+    }
+}
+
+/// A trailing RETURN reads the last clause's write, on every path that
+/// formats one: autocommit, the transaction builder (which the consensus
+/// committers use), a `Transaction`, and a Bolt transaction.
+#[tokio::test]
+async fn a_trailing_return_reads_the_last_clauses_write() {
+    use fluree_db_api::format::cypher_typed::CypherCell;
+
+    let (store, _guard) = support::span_capture::init_test_tracing();
+    let statement = format!("{TWO_SETS} RETURN n.name AS name");
+    let declined = ["fallback:gate_declined"];
+
+    // Autocommit.
+    let fluree = FlureeBuilder::memory().build_memory();
+    twin_seeded(&fluree, "it/cyseq-return:auto").await;
+    let ledger = fluree.ledger("it/cyseq-return:auto").await.expect("ledger");
+    let before = store.find_events("fast-path outcome").len();
+    let (_, rows) = fluree
+        .transact_cypher_returning(ledger, &statement, None)
+        .await
+        .expect("autocommit");
+    let rows = rows.expect("RETURN rows");
+    assert_eq!(
+        rows["results"][0]["data"][0]["row"][0],
+        json!("w"),
+        "{rows}"
+    );
+    assert_eq!(final_state_stamps(&store, before), declined);
+
+    // The transaction builder.
+    let id = "it/cyseq-return:builder";
+    twin_seeded(&fluree, id).await;
+    let ast = fluree_db_cypher::parse_cypher(&statement)
+        .ast
+        .expect("parse");
+    let plan = fluree_db_api::cypher_seq::detect_sequential(&ast).expect("sequential");
+    let handle = fluree.ledger_cached(id).await.expect("handle");
+    let before = store.find_events("fast-path outcome").len();
+    let committed = fluree
+        .stage(&handle)
+        .cypher_sequential(fluree_db_api::cypher_seq::CypherSeqInput {
+            plan,
+            governance: Default::default(),
+            skolem_txn_id: None,
+        })
+        .execute()
+        .await
+        .expect("builder");
+    let rows = committed.cypher_return.expect("RETURN rows");
+    assert_eq!(
+        rows["results"][0]["data"][0]["row"][0],
+        json!("w"),
+        "{rows}"
+    );
+    assert_eq!(final_state_stamps(&store, before), declined);
+
+    // A `Transaction`.
+    let id = "it/cyseq-return:transaction";
+    twin_seeded(&fluree, id).await;
+    let mut txn = fluree
+        .begin_transaction(id, fluree_db_api::TransactionOptions::default())
+        .await
+        .expect("begin");
+    let before = store.find_events("fast-path outcome").len();
+    let (_, rows) = txn
+        .stage_cypher(&statement, None)
+        .await
+        .expect("stage")
+        .expect("RETURN rows");
+    assert_eq!(rows, vec![vec![CypherCell::Value(json!("w"))]]);
+    assert_eq!(final_state_stamps(&store, before), declined);
+
+    // A Bolt transaction.
+    let id = "it/cyseq-return:bolt";
+    twin_seeded(&fluree, id).await;
+    let mut txn = fluree
+        .begin_cypher_transaction(
+            id,
+            fluree_db_api::GovernanceOptions::default(),
+            fluree_db_api::TrackingOptions::default(),
+        )
+        .await
+        .expect("begin");
+    let before = store.find_events("fast-path outcome").len();
+    let out = fluree
+        .cypher_transaction_write(&mut txn, &statement, None)
+        .await
+        .expect("write");
+    let (_, rows) = out.return_table.expect("RETURN rows");
+    assert_eq!(rows, vec![vec![CypherCell::Value(json!("w"))]]);
+    assert_eq!(final_state_stamps(&store, before), declined);
+}
+
+/// A statement with no RETURN leaves the state after its last clause
+/// unbuilt; the next statement in the same transaction still reads its
+/// writes, from the transaction's own state.
+#[tokio::test]
+async fn the_next_statement_in_a_transaction_reads_a_write_with_no_return() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let next = r#"MATCH (n:P {name: "w"}) SET n.seen = "yes""#;
+    let want = seeded_with(&[
+        ("a name x", None),
+        ("a name w", Some("")),
+        ("a seen yes", Some("")),
+    ]);
+
+    // A Bolt transaction.
+    let id = "it/cyseq-next:bolt";
+    twin_seeded(&fluree, id).await;
+    let mut txn = fluree
+        .begin_cypher_transaction(
+            id,
+            fluree_db_api::GovernanceOptions::default(),
+            fluree_db_api::TrackingOptions::default(),
+        )
+        .await
+        .expect("begin");
+    let before = store.find_events("fast-path outcome").len();
+    fluree
+        .cypher_transaction_write(&mut txn, TWO_SETS, None)
+        .await
+        .expect("two SETs");
+    assert_eq!(final_state_stamps(&store, before), ["proceed"]);
+    let out = fluree
+        .cypher_transaction_write(&mut txn, next, None)
+        .await
+        .expect("next statement");
+    assert_eq!(out.flake_count, 1, "the next MATCH finds the written name");
+    fluree.commit_cypher_transaction(txn).await.expect("commit");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    assert_eq!(twin_state(&fluree, &ledger).await, want, "Bolt");
+
+    // A `Transaction`.
+    let id = "it/cyseq-next:transaction";
+    twin_seeded(&fluree, id).await;
+    let mut txn = fluree
+        .begin_transaction(id, fluree_db_api::TransactionOptions::default())
+        .await
+        .expect("begin");
+    let before = store.find_events("fast-path outcome").len();
+    txn.stage_cypher(TWO_SETS, None).await.expect("two SETs");
+    assert_eq!(final_state_stamps(&store, before), ["proceed"]);
+    txn.stage_cypher(next, None).await.expect("next statement");
+    txn.commit(fluree_db_api::CommitOpts::default())
+        .await
+        .expect("commit");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    assert_eq!(twin_state(&fluree, &ledger).await, want, "Transaction");
+}
