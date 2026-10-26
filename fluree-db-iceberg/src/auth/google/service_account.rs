@@ -18,9 +18,8 @@ pub(super) struct ServiceAccountKey {
     pub(super) quota_project_id: Option<String>,
     #[cfg(feature = "aws")]
     signing_key: jsonwebtoken::EncodingKey,
-    /// SHA-256 of the private key PEM: binds a cached token to the key that
+    /// Digest of the private key PEM: binds a cached token to the key that
     /// minted it (see `cache::TokenKey`). In memory only.
-    #[cfg(feature = "aws")]
     pub(super) binding: [u8; 32],
 }
 
@@ -102,17 +101,8 @@ impl ServiceAccountKey {
         };
 
         #[cfg(feature = "aws")]
-        let (signing_key, binding) = {
-            use sha2::Digest;
-            let signing_key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes())
-                .map_err(|_| {
-                    invalid(format!("{field}.private_key is not a PEM RSA private key"))
-                })?;
-            let binding: [u8; 32] = sha2::Sha256::digest(private_key.as_bytes()).into();
-            (signing_key, binding)
-        };
-        #[cfg(not(feature = "aws"))]
-        let _ = private_key;
+        let signing_key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes())
+            .map_err(|_| invalid(format!("{field}.private_key is not a PEM RSA private key")))?;
 
         Ok(Self {
             client_email: client_email.to_string(),
@@ -120,8 +110,7 @@ impl ServiceAccountKey {
             quota_project_id,
             #[cfg(feature = "aws")]
             signing_key,
-            #[cfg(feature = "aws")]
-            binding,
+            binding: super::secret_binding(&[private_key]),
         })
     }
 }

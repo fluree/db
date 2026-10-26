@@ -107,8 +107,14 @@ impl GoogleCredentials {
 ///
 /// Deserialized by hand rather than `#[serde(untagged)]`: `ConfigValue`'s
 /// `Dynamic` arm has only defaulted fields, so it matches *any* JSON object and
-/// would swallow an inline configuration as an empty env-var reference. An
-/// object is a reference only when every key is one of `ConfigValue`'s own.
+/// would swallow an inline configuration as an empty env-var reference. The
+/// rules:
+///
+/// - a string is a [`ConfigValue::Literal`] holding the configuration's JSON;
+/// - an object whose every key is one of `ConfigValue`'s own (`secret_ref`,
+///   `env_var`, `default_val`, `java_property`) is a reference;
+/// - an object with a `type` and none of those keys is the configuration;
+/// - anything else, including an object mixing the two, is refused.
 #[derive(Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ExternalAccountConfig {
@@ -128,7 +134,10 @@ impl<'de> Deserialize<'de> for ExternalAccountConfig {
             serde_json::Value::String(text) => {
                 Ok(ExternalAccountConfig::Ref(ConfigValue::Literal(text)))
             }
-            serde_json::Value::Object(map) if map.contains_key("type") => {
+            serde_json::Value::Object(map)
+                if map.contains_key("type")
+                    && !map.keys().any(|k| CONFIG_VALUE_KEYS.contains(&k.as_str())) =>
+            {
                 Ok(ExternalAccountConfig::Inline(map))
             }
             serde_json::Value::Object(map)
@@ -189,6 +198,7 @@ mod tests {
             r#"{"source":"external_account","config":{"type":"external_account","audience":"a"}}"#,
             r#"{"source":"external_account","config":{"env_var":"WIF","java_property":null,"default_val":null}}"#,
             r#"{"source":"external_account","config":"{\"type\":\"external_account\"}"}"#,
+            r#"{"source":"external_account","config":{"secret_ref":"vault://wif"}}"#,
         ] {
             let parsed: GoogleCredentials = serde_json::from_str(json).unwrap();
             assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
@@ -219,6 +229,53 @@ mod tests {
                 config: ExternalAccountConfig::Ref(ConfigValue::SecretRef { .. })
             }
         ));
+    }
+
+    #[test]
+    fn each_config_shape_deserializes_to_its_variant() {
+        let config = |json: &str| -> ExternalAccountConfig {
+            match serde_json::from_str::<GoogleCredentials>(&format!(
+                r#"{{"source":"external_account","config":{json}}}"#
+            ))
+            .unwrap()
+            {
+                GoogleCredentials::ExternalAccount { config } => config,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(matches!(
+            config(r#""{\"type\":\"external_account\"}""#),
+            ExternalAccountConfig::Ref(ConfigValue::Literal(_))
+        ));
+        assert!(matches!(
+            config(r#"{"secret_ref":"vault://wif"}"#),
+            ExternalAccountConfig::Ref(ConfigValue::SecretRef { .. })
+        ));
+        assert!(matches!(
+            config(r#"{"env_var":"WIF","default_val":"{}"}"#),
+            ExternalAccountConfig::Ref(ConfigValue::Dynamic { .. })
+        ));
+        assert!(matches!(
+            config(r#"{"type":"external_account","audience":"a"}"#),
+            ExternalAccountConfig::Inline(_)
+        ));
+    }
+
+    #[test]
+    fn an_ambiguous_object_is_refused() {
+        // A reference key beside an inline configuration's: which was meant
+        // cannot be decided, so neither is chosen.
+        for config in [
+            r#"{"type":"external_account","secret_ref":"vault://wif"}"#,
+            r#"{"type":"external_account","env_var":"WIF"}"#,
+            r#"{"env_var":"WIF","audience":"a"}"#,
+        ] {
+            let json = format!(r#"{{"source":"external_account","config":{config}}}"#);
+            assert!(
+                serde_json::from_str::<GoogleCredentials>(&json).is_err(),
+                "{config} must be refused"
+            );
+        }
     }
 
     #[test]

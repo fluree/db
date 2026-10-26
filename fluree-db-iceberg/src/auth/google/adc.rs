@@ -56,6 +56,18 @@ impl AdcFile {
         }
     }
 
+    /// Digest of the secret this read of the file proves its identity with
+    /// (the refresh token and client secret; a service account's key), so a
+    /// cached token never outlives a change to it. In memory only.
+    pub(super) fn binding(&self) -> [u8; 32] {
+        match self {
+            AdcFile::AuthorizedUser(user) => {
+                super::secret_binding(&[&user.client_id, &user.client_secret, &user.refresh_token])
+            }
+            AdcFile::ServiceAccount(key) => key.binding,
+        }
+    }
+
     pub(super) fn quota_project_id(&self) -> Option<&str> {
         match self {
             AdcFile::AuthorizedUser(user) => user.quota_project_id.as_deref(),

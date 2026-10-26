@@ -427,16 +427,17 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
         .mount(&server)
         .await;
     let file = std::env::temp_dir().join(format!("fluree-adc-test-{}.json", std::process::id()));
-    let write = |client_id: &str, kind: &str| {
+    let write_with = |client_id: &str, kind: &str, refresh_token: &str| {
         let adc = serde_json::json!({
             "type": kind,
             "client_id": client_id,
             "client_secret": "CLIENT-SECRET",
-            "refresh_token": "REFRESH-SECRET",
+            "refresh_token": refresh_token,
             "quota_project_id": "user-project",
         });
         std::fs::write(&file, adc.to_string()).unwrap();
     };
+    let write = |client_id: &str, kind: &str| write_with(client_id, kind, "REFRESH-SECRET");
     write(
         "gcloud-client.apps.googleusercontent.com",
         "authorized_user",
@@ -468,6 +469,25 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
     assert_eq!(sent["grant_type"], "refresh_token");
     assert_eq!(sent["refresh_token"], "REFRESH-SECRET");
     assert_eq!(sent["scope"], CLOUD_PLATFORM_SCOPE);
+
+    // Same identity, cached: no second exchange.
+    SendCatalogAuth::request_headers(&auth).await.unwrap();
+    assert_eq!(requests_to(&server, "/token").await.len(), 1);
+
+    // A new login for the same identity (a new refresh token) never serves
+    // the token the old one minted: the file's secrets key the cache.
+    write_with(
+        "gcloud-client.apps.googleusercontent.com",
+        "authorized_user",
+        "REFRESH-SECRET-ROTATED",
+    );
+    SendCatalogAuth::request_headers(&auth).await.unwrap();
+    let exchanges = requests_to(&server, "/token").await;
+    assert_eq!(exchanges.len(), 2, "the rotated refresh token is exchanged");
+    assert_eq!(
+        form(&exchanges[1].body)["refresh_token"],
+        "REFRESH-SECRET-ROTATED"
+    );
 
     // The file now holds someone else: refused, not followed.
     write(
@@ -595,6 +615,16 @@ fn without_signing_a_service_account_is_refused_by_name() {
         &GoogleEndpoints::at("http://127.0.0.1:9"),
     )
     .unwrap_err();
+    // The typed credential refusal (err:auth/GoogleCredentialsInvalid), naming
+    // why: not a generic error, never a panic.
+    assert!(
+        matches!(err, IcebergError::GoogleCredentialsInvalid(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("not available in this build"),
+        "{err}"
+    );
     assert!(err.to_string().contains("`aws` feature"), "{err}");
 }
 

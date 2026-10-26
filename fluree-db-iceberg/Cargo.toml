@@ -32,7 +32,6 @@ aws = [
     # neither and work without this feature.
     "dep:jsonwebtoken",
     "dep:aws-sigv4",
-    "dep:sha2",
 ]
 [dependencies]
 # Core dependencies
@@ -100,8 +99,10 @@ hyper-rustls = { workspace = true, optional = true }
 # carries through the AWS SDK.
 aws-sigv4 = { version = "1.4.2", optional = true }
 jsonwebtoken = { workspace = true, optional = true }
-# Binds a cached service-account token to the key that minted it (in memory only).
-sha2 = { workspace = true, optional = true }
+# Binds a cached Google token to the secret that minted it (a service-account
+# key, an ADC refresh token), in memory only. Unconditional: gcloud user ADC
+# works without the `aws` feature.
+sha2 = { workspace = true }
 
 # Optional: Arrow columnar reader (the single Iceberg decode path, gated by the
 # `aws` feature). `default-features = false` drops the unused csv/json readers

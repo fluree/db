@@ -306,8 +306,11 @@ impl GoogleIdentity {
     /// one is outside its refresh margin, else minted single-flight.
     pub async fn access_token(&self, scopes: &[&str]) -> Result<AccessToken> {
         let scopes = normalize_scopes(scopes);
-        let slot = cache::slot(&self.key(&scopes));
-        let token = slot.get_or_fetch(|| self.fetch(&scopes)).await?;
+        let adc = self.read_adc()?;
+        let slot = cache::slot(&self.key(&scopes, adc.as_ref()));
+        let token = slot
+            .get_or_fetch(|| self.fetch(&scopes, adc.as_ref()))
+            .await?;
         Ok(token.into())
     }
 
@@ -315,8 +318,29 @@ impl GoogleIdentity {
     /// server refused it).
     pub async fn refresh(&self, scopes: &[&str]) -> Result<()> {
         let scopes = normalize_scopes(scopes);
-        let slot = cache::slot(&self.key(&scopes));
-        slot.refetch(|| self.fetch(&scopes)).await
+        let adc = self.read_adc()?;
+        let slot = cache::slot(&self.key(&scopes, adc.as_ref()));
+        slot.refetch(|| self.fetch(&scopes, adc.as_ref())).await
+    }
+
+    /// The ADC file as it is now, for an application-default identity (`None`
+    /// for every other source). Read on every use, before the cache is
+    /// consulted, so its secrets key the cached token: a refreshed login is
+    /// picked up and a changed file never serves the old token. The identity
+    /// the source was opened with must still be the one in the file.
+    fn read_adc(&self) -> Result<Option<adc::AdcFile>> {
+        let Material::ApplicationDefault { path } = &self.material else {
+            return Ok(None);
+        };
+        let file = adc::read(path)?;
+        if file.principal() != self.principal {
+            return Err(IcebergError::GoogleCredentialsInvalid(
+                "application_default: the credentials file now holds a different identity \
+                 than when this source was opened"
+                    .to_string(),
+            ));
+        }
+        Ok(Some(file))
     }
 
     /// The project Google requests bill to (`x-goog-user-project`): the
@@ -337,16 +361,18 @@ impl GoogleIdentity {
         self.source
     }
 
-    fn key(&self, scopes: &[String]) -> cache::TokenKey {
+    fn key(&self, scopes: &[String], adc: Option<&adc::AdcFile>) -> cache::TokenKey {
         cache::TokenKey {
             identity: self.fingerprint.clone(),
-            binding: self.binding,
+            binding: adc.map(adc::AdcFile::binding).or(self.binding),
             subject: self.subject.clone(),
             scopes: scopes.to_vec(),
         }
     }
 
-    async fn fetch(&self, scopes: &[String]) -> Result<CachedToken> {
+    /// Mint a token. `adc` is the file [`read_adc`](Self::read_adc) read for
+    /// this call, so the token is minted from the secrets that key it.
+    async fn fetch(&self, scopes: &[String], adc: Option<&adc::AdcFile>) -> Result<CachedToken> {
         let token = match &self.material {
             Material::Metadata(source) => source.fetch(scopes).await,
             Material::ServiceAccount(key) => self.fetch_service_account(key, scopes).await,
@@ -355,26 +381,17 @@ impl GoogleIdentity {
                 spec.fetch(subject.as_ref(), &self.http, &self.endpoints, scopes)
                     .await
             }
-            Material::ApplicationDefault { path } => {
-                // Re-read: a refreshed login is picked up, but the identity the
-                // source was opened with must still be the one in the file.
-                let file = adc::read(path)?;
-                if file.principal() != self.principal {
-                    return Err(IcebergError::GoogleCredentialsInvalid(
-                        "application_default: the credentials file now holds a different \
-                         identity than when this source was opened"
-                            .to_string(),
-                    ));
+            Material::ApplicationDefault { .. } => match adc {
+                Some(adc::AdcFile::AuthorizedUser(user)) => {
+                    user.fetch(&self.http, &self.endpoints, scopes).await
                 }
-                match &file {
-                    adc::AdcFile::AuthorizedUser(user) => {
-                        user.fetch(&self.http, &self.endpoints, scopes).await
-                    }
-                    adc::AdcFile::ServiceAccount(key) => {
-                        self.fetch_service_account(key, scopes).await
-                    }
+                Some(adc::AdcFile::ServiceAccount(key)) => {
+                    self.fetch_service_account(key, scopes).await
                 }
-            }
+                None => Err(IcebergError::GoogleCredentialsInvalid(
+                    "application_default: the credentials file was not read".to_string(),
+                )),
+            },
         }?;
         tracing::debug!(
             source = ?self.source,
@@ -422,10 +439,7 @@ impl Built {
         endpoints: &GoogleEndpoints,
     ) -> Result<Self> {
         require_signing("service_account")?;
-        #[cfg(feature = "aws")]
         let binding = Some(key.binding);
-        #[cfg(not(feature = "aws"))]
-        let binding = None;
         Ok(Built {
             fingerprint: format!(
                 "sa|{}|{}|{}",
@@ -505,11 +519,26 @@ fn require_signing(source: &str) -> Result<()> {
     }
 }
 
+/// Typed like any other credential refusal, so it surfaces as
+/// `err:auth/GoogleCredentialsInvalid` (400) rather than a generic error.
 fn signing_unavailable(source: &str) -> IcebergError {
-    IcebergError::Config(format!(
-        "Google {source} credentials need request signing, which this build of \
-         fluree-db-iceberg was compiled without (the `aws` feature)"
+    IcebergError::GoogleCredentialsInvalid(format!(
+        "{source} credentials are not available in this build: they need request \
+         signing, which this fluree-db-iceberg was compiled without (the `aws` feature)"
     ))
+}
+
+/// A digest binding a cached token to the secret parts that prove its
+/// identity. Each part is length-prefixed, so no two splits of the same bytes
+/// collide. Held in memory only; never logged or persisted.
+pub(super) fn secret_binding(parts: &[&str]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest.finalize().into()
 }
 
 /// Sorted, de-duplicated scopes; cloud-platform when none are given.

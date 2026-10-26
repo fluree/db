@@ -5979,6 +5979,78 @@ mod tests {
         );
     }
 
+    /// Two clones of one `Fluree` share its client cache, so a clone with
+    /// another AWS subject, or another host-identity policy, must get a client
+    /// of its own; the same context gets the cached one back.
+    #[tokio::test]
+    async fn clones_with_other_identity_contexts_never_share_a_catalog_client() {
+        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::HostIdentityPolicy;
+        #[derive(Debug)]
+        struct Subject(&'static str);
+        #[async_trait]
+        impl fluree_db_iceberg::AwsSubjectCredentials for Subject {
+            fn principal_key(&self) -> String {
+                self.0.to_string()
+            }
+            async fn credentials(
+                &self,
+            ) -> fluree_db_iceberg::Result<fluree_db_iceberg::AwsCredentials> {
+                Err(IcebergError::Credential("unused".to_string()))
+            }
+            fn region(&self) -> Option<String> {
+                None
+            }
+        }
+
+        let raw = gs_config_json(AuthConfig::None);
+        let config = IcebergGsConfig::from_json(&raw).unwrap();
+        let client = |fluree: &crate::Fluree| {
+            let fluree = fluree.clone();
+            let (raw, config) = (raw.clone(), config.clone());
+            async move {
+                shared_catalog_client(&fluree, "gs-shared", &raw, &config)
+                    .await
+                    .unwrap()
+                    .expect("a REST source has a catalog client")
+            }
+        };
+        let same = |a: &Arc<dyn SendCatalogClient>, b: &Arc<dyn SendCatalogClient>| {
+            std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+        };
+
+        let base = crate::FlureeBuilder::memory().build_memory();
+        let tenant_a = base.with_aws_subject_credentials(Arc::new(Subject("tenant-a")));
+        let tenant_b = base.with_aws_subject_credentials(Arc::new(Subject("tenant-b")));
+        let metadata_only = base.with_host_identity_policy(
+            HostIdentityPolicy::parse(Some("google-metadata"), None).unwrap(),
+        );
+        let closed = base.with_host_identity_policy(HostIdentityPolicy::deny_all());
+
+        let from_a = client(&tenant_a).await;
+        assert!(
+            same(&from_a, &client(&tenant_a).await),
+            "the same context is served the cached client"
+        );
+        assert!(
+            !same(&from_a, &client(&tenant_b).await),
+            "another AWS subject"
+        );
+        assert!(
+            !same(&from_a, &client(&base).await),
+            "the host's own subject"
+        );
+        let from_metadata_only = client(&metadata_only).await;
+        assert!(
+            !same(&client(&base).await, &from_metadata_only),
+            "another policy"
+        );
+        assert!(
+            !same(&from_metadata_only, &client(&closed).await),
+            "another policy"
+        );
+    }
+
     /// The query path builds its catalog client under the instance's identity
     /// context: a host identity the policy refuses is a typed 403, not an
     /// internal error, and nothing is cached for it.
