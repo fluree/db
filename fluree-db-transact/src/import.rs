@@ -212,6 +212,10 @@ mod inner {
         /// Accumulated turtle @prefix short names: IRI → short prefix.
         /// Captured from `on_prefix()` calls across all chunks.
         pub prefix_map: HashMap<String, String>,
+        /// The owners whose list a chunk has stored compactly, for chunks
+        /// that do not spool (a spooled chunk shares
+        /// `SpoolConfig::list_owners`).
+        pub list_owners: crate::lists::ClaimedOwners,
     }
 
     impl ImportState {
@@ -232,6 +236,7 @@ mod inner {
                 // dict_id+1 convention so spooled and fallback g_ids agree.
                 next_gid: fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
                 prefix_map: HashMap::new(),
+                list_owners: Default::default(),
             }
         }
     }
@@ -320,6 +325,9 @@ mod inner {
         )
         .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
             let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
@@ -336,7 +344,7 @@ mod inner {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, chunk_prefix_map, spool_ctx) = sink
                 .into_parts()
-                .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+                .map_err(crate::import_sink::encode_failure)?;
             state.prefix_map.extend(chunk_prefix_map);
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
@@ -481,6 +489,9 @@ mod inner {
         )
         .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
             let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
@@ -501,7 +512,7 @@ mod inner {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, _chunk_prefix_map, spool_ctx) = sink
                 .into_parts()
-                .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+                .map_err(crate::import_sink::encode_failure)?;
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
             let op_count = writer.op_count();
@@ -672,6 +683,9 @@ mod inner {
         )
         .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
             let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
@@ -691,7 +705,7 @@ mod inner {
         // The spool is finished only after the named-graph loop completes.
         let (mut writer, chunk_prefix_map, mut spool_ctx) = sink
             .into_parts()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         state.prefix_map.extend(chunk_prefix_map);
         let mut op_count = writer.op_count();
 
@@ -785,6 +799,7 @@ mod inner {
                     if let Some(sc) = spool_ctx.as_mut() {
                         sc.push_named_graph_record(
                             g_id,
+                            &block.iri,
                             crate::import_sink::FlakeRecord {
                                 s: &s,
                                 p: &p,
@@ -850,6 +865,7 @@ mod inner {
                     if let Some(sc) = spool_ctx.as_mut() {
                         sc.push_named_graph_record(
                             g_id,
+                            &block.iri,
                             crate::import_sink::FlakeRecord {
                                 s: &flake.s,
                                 p: &flake.p,
@@ -1151,7 +1167,7 @@ mod inner {
 
         let (writer, prefix_map, spool_ctx) = sink
             .into_parts()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
@@ -1227,7 +1243,7 @@ mod inner {
 
         let (writer, _prefix_map, spool_ctx) = sink
             .into_parts()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
@@ -1422,7 +1438,7 @@ mod inner {
 
         let output = sink
             .into_output()
-            .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
+            .map_err(crate::import_sink::encode_failure)?;
         let op_count = output.writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 

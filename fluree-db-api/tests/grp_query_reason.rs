@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_owl2rl_list_encodings.rs"]
+mod it_owl2rl_list_encodings;
 #[path = "it_property_path_batched.rs"]
 mod it_property_path_batched;
 #[path = "it_query_owl2ql.rs"]

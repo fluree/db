@@ -96,6 +96,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         })
     }
 
@@ -229,6 +230,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 }
                 // Filters, Binds, Values, PropertyPaths, Subqueries, IndexSearch, Service, and R2rml don't contribute template triples
                 Pattern::Filter(_)
+                | Pattern::ListView(_)
                 | Pattern::Bind { .. }
                 | Pattern::Unwind { .. }
                 | Pattern::Values { .. }

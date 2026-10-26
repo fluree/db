@@ -49,6 +49,7 @@ fn pattern_reads_default_graph(pattern: &Pattern) -> bool {
     };
     match pattern {
         Pattern::Triple(_)
+        | Pattern::ListView(_)
         | Pattern::PropertyPath(_)
         | Pattern::ShortestPath(_)
         | Pattern::GeoSearch(_)

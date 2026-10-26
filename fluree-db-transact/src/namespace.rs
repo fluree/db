@@ -586,7 +586,9 @@ impl NsAllocator<'_> {
         }
     }
 
-    /// The IRI a SID from [`Self::sid_for_iri`] stands for.
+    /// The IRI a SID from [`Self::sid_for_iri`] stands for, or `None` when
+    /// its namespace code has no prefix here. An overflow Sid carries its
+    /// whole IRI in `name`, under no prefix.
     pub fn iri_for_sid(&self, sid: &Sid) -> Option<String> {
         if sid.namespace_code == OVERFLOW {
             return Some(sid.name.to_string());
@@ -596,6 +598,13 @@ impl NsAllocator<'_> {
             NsAllocator::Cached(cache) => cache.prefix_for_code(sid.namespace_code),
         }?;
         Some(format!("{prefix}{}", sid.name))
+    }
+
+    /// The IRI `sid` names, for a message: [`Self::iri_for_sid`], or the bare
+    /// name when its namespace code has no prefix here.
+    pub fn iri(&self, sid: &Sid) -> String {
+        self.iri_for_sid(sid)
+            .unwrap_or_else(|| sid.name.to_string())
     }
 }
 

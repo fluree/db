@@ -485,6 +485,19 @@ pub async fn prepare_execution_with_config(
                 geo_index_covers,
             );
 
+            // SPARQL's view of RDF lists (`crate::list_view`), for a ledger
+            // that may hold list members. History reads keep the stored rows.
+            let list_view = if query.query.rdf_list_view && !planning.is_history() {
+                crate::list_view::view_for(db.snapshot, db.overlay, binary_store)?
+            } else {
+                None
+            };
+            let encode = |iri: &str| db.snapshot.encode_iri(iri);
+            let rewritten_patterns = match &list_view {
+                Some(view) => crate::list_view::rewrite_patterns(rewritten_patterns, view, &encode),
+                None => rewritten_patterns,
+            };
+
             let before_dedup = rewritten_patterns.len();
             let rewritten_patterns = dedup_exact_triples(rewritten_patterns);
             if rewritten_patterns.len() != before_dedup {
@@ -505,7 +518,13 @@ pub async fn prepare_execution_with_config(
                 );
             }
 
-            query.query.with_patterns(rewritten_patterns)
+            let mut rewritten = query.query.with_patterns(rewritten_patterns);
+            if let Some(view) = &list_view {
+                // The WHERE is rewritten above; this reaches the `EXISTS` of
+                // the grouping and ordering expressions.
+                crate::list_view::rewrite_modifiers_of(&mut rewritten, view, &encode);
+            }
+            rewritten
         };
 
         // ---- plan: build operator tree from rewritten query ----

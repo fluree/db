@@ -508,16 +508,16 @@ where
 
         let mut indexed_items = Vec::with_capacity(items.len());
 
-        for (index, item) in items.iter().enumerate() {
-            // Process each list item as a single value (lists cannot be nested directly)
-            match self.list_item(item, scope)? {
-                Some(term_id) => {
-                    indexed_items.push((index as i32, term_id));
-                }
-                None => {
-                    // Skip null/unsupported items in list
-                }
+        for item in items {
+            // Process each list item as a single value (lists cannot be nested
+            // directly). A skipped null/unsupported item takes no position:
+            // positions run from 0 without gaps, and 0 begins a list.
+            if let Some(term_id) = self.list_item(item, scope)? {
+                indexed_items.push((indexed_items.len() as i32, term_id));
             }
+        }
+        if indexed_items.is_empty() {
+            return Ok(ProcessedValue::Single(self.sink.term_iri(rdf::NIL)));
         }
 
         Ok(ProcessedValue::List(indexed_items))
