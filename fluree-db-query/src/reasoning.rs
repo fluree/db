@@ -63,6 +63,13 @@ impl OverlayProvider for ReasoningOverlay<'_> {
         self.base.as_any()
     }
 
+    /// The base's: a derived fact carries no list position.
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        self.base.list_predicates()
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
     }
