@@ -3221,11 +3221,10 @@ pub enum IcebergAction {
     /// Map an Iceberg table as a graph source
     ///
     /// Examples:
-    ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --table openflights.airlines
-    ///   fluree iceberg map my-gs --catalog-uri https://... --r2rml mappings/airlines.ttl
-    ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table
+    ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --r2rml mappings/airlines.ttl
+    ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table --r2rml mappings/table.ttl
     ///   fluree iceberg map my-gs --mode glue --region us-east-1 --r2rml mappings/sales.ttl
-    ///   fluree iceberg map my-gs --mode s3tables --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --table sales.orders
+    ///   fluree iceberg map my-gs --mode s3tables --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --r2rml mappings/sales.ttl
     #[command(verbatim_doc_comment)]
     Map(Box<IcebergMapArgs>),
 
@@ -3769,9 +3768,9 @@ pub struct IcebergMapArgs {
     pub catalog_uri: Option<String>,
 
     /// Table identifier in namespace.table format (e.g., "openflights.airlines").
-    /// Required for rest, glue and s3tables modes without --r2rml. When using
-    /// --r2rml, tables are defined in the mapping file (for glue, each
-    /// rr:tableName is a Glue `<database>.<table>`).
+    /// Optional: tables are defined in the --r2rml mapping file (for glue, each
+    /// rr:tableName is a Glue `<database>.<table>`). In rest mode, a table given
+    /// here is the one `map` loads to test the catalog connection.
     #[arg(long)]
     pub table: Option<String>,
 
@@ -3808,11 +3807,11 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub table_bucket_arn: Option<String>,
 
-    /// R2RML mapping file (Turtle format). Defines how Iceberg table rows
-    /// are mapped to RDF triples. When provided, table references come from
-    /// the mapping's rr:tableName entries.
+    /// R2RML mapping file (Turtle format, required). Defines how Iceberg table
+    /// rows are mapped to RDF triples; table references come from the mapping's
+    /// rr:tableName entries.
     #[arg(long)]
-    pub r2rml: Option<PathBuf>,
+    pub r2rml: PathBuf,
 
     /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
     #[arg(long)]

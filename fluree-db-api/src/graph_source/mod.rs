@@ -315,9 +315,6 @@ pub use result::VectorStalenessCheck;
 pub use result::VectorSyncResult;
 
 #[cfg(feature = "iceberg")]
-pub use result::IcebergCreateResult;
-
-#[cfg(feature = "iceberg")]
 pub use result::R2rmlCreateResult;
 
 // Re-export cache types

@@ -185,9 +185,8 @@ pub(crate) fn map_iceberg<'py>(
         table_bucket_arn: spec.s3_tables.as_ref().map(|t| t.table_bucket_arn.as_str()),
         rest_only: &rest_only,
     };
-    let iceberg =
-        IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref(), true)
-            .map_err(|e| invalid_request(e.message(str::to_string)))?;
+    let iceberg = IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref())
+        .map_err(|e| invalid_request(e.message(str::to_string)))?;
     let mut config = R2rmlCreateConfig {
         iceberg,
         mapping: R2rmlMappingInput::Content(common.mapping),

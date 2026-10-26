@@ -273,64 +273,55 @@ async fn run_iceberg_map_remote(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    if let Some(mapping) = result.get("mapping_source").and_then(|v| v.as_str()) {
-        println!("Mapped Iceberg table as R2RML graph source '{gs_id}'");
-        println!("  Table:       {table}");
-        println!("  Catalog:     {catalog}");
-        println!("  R2RML:       {mapping}");
-        if let Some(count) = result
-            .get("triples_map_count")
-            .and_then(serde_json::Value::as_u64)
-        {
-            println!("  TriplesMaps: {count}");
-        }
-        if let Some(table_count) = result
-            .get("table_count")
-            .and_then(serde_json::Value::as_u64)
-        {
-            let table_names: Vec<String> = result
-                .get("table_names")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            println!(
-                "  Tables:      {}",
-                format_table_summary(table_count as usize, &table_names)
-            );
-        }
+    let mapping = result
+        .get("mapping_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+
+    println!("Mapped Iceberg table as R2RML graph source '{gs_id}'");
+    println!("  Table:       {table}");
+    println!("  Catalog:     {catalog}");
+    println!("  R2RML:       {mapping}");
+    if let Some(count) = result
+        .get("triples_map_count")
+        .and_then(serde_json::Value::as_u64)
+    {
+        println!("  TriplesMaps: {count}");
+    }
+    if let Some(table_count) = result
+        .get("table_count")
+        .and_then(serde_json::Value::as_u64)
+    {
+        let table_names: Vec<String> = result
+            .get("table_names")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         println!(
-            "  Connection:  {}",
-            if connection { "verified" } else { "not tested" }
-        );
-        let validated = result
-            .get("mapping_validated")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        println!(
-            "  Mapping:     {}",
-            if validated {
-                "validated"
-            } else {
-                "not validated (check mapping source)"
-            }
-        );
-    } else {
-        println!("Mapped Iceberg table as graph source '{gs_id}'");
-        println!("  Table:       {table}");
-        println!("  Catalog:     {catalog}");
-        println!(
-            "  Connection:  {}",
-            if connection {
-                "verified"
-            } else {
-                "not tested (tested for REST catalogs only, or catalog unreachable)"
-            }
+            "  Tables:      {}",
+            format_table_summary(table_count as usize, &table_names)
         );
     }
+    println!(
+        "  Connection:  {}",
+        if connection { "verified" } else { "not tested" }
+    );
+    let validated = result
+        .get("mapping_validated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    println!(
+        "  Mapping:     {}",
+        if validated {
+            "validated"
+        } else {
+            "not validated (check mapping source)"
+        }
+    );
 
     print_model_warnings(&model_warnings_of(&result));
     Ok(())
@@ -402,20 +393,21 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     if let Some(ref v) = args.table_bucket_arn {
         obj.insert("table_bucket_arn".into(), v.clone().into());
     }
-    if let Some(ref v) = args.r2rml {
-        // Read file content and send it (not the path)
-        let content = std::fs::read_to_string(v).map_err(|e| {
-            CliError::Input(format!("failed to read R2RML file {}: {e}", v.display()))
-        })?;
-        obj.insert("r2rml".into(), content.into());
-    }
+    // Read file content and send it (not the path)
+    let content = std::fs::read_to_string(&args.r2rml).map_err(|e| {
+        CliError::Input(format!(
+            "failed to read R2RML file {}: {e}",
+            args.r2rml.display()
+        ))
+    })?;
+    obj.insert("r2rml".into(), content.into());
     // Explicit `--r2rml-type` wins; otherwise infer from the mapping file
     // extension so the server records a concrete, self-describing media type
     // (issue #1397).
     let r2rml_type = args
         .r2rml_type
         .clone()
-        .or_else(|| args.r2rml.as_deref().and_then(infer_mapping_media_type));
+        .or_else(|| infer_mapping_media_type(&args.r2rml));
     if let Some(v) = r2rml_type {
         obj.insert("r2rml_type".into(), v.into());
     }
@@ -593,77 +585,57 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
     let fluree = crate::context::build_fluree(dirs).await?;
     let iceberg_config = build_iceberg_config(&args)?;
 
-    if let Some(ref r2rml_path) = args.r2rml {
-        // Read mapping file content
-        let mapping_content = std::fs::read_to_string(r2rml_path).map_err(|e| {
-            crate::error::CliError::Input(format!(
-                "Failed to read R2RML mapping file '{}': {}",
-                r2rml_path.display(),
-                e
-            ))
-        })?;
+    let r2rml_path = &args.r2rml;
+    let mapping_content = std::fs::read_to_string(r2rml_path).map_err(|e| {
+        crate::error::CliError::Input(format!(
+            "Failed to read R2RML mapping file '{}': {}",
+            r2rml_path.display(),
+            e
+        ))
+    })?;
 
-        let config = fluree_db_api::R2rmlCreateConfig {
-            iceberg: iceberg_config,
-            mapping: fluree_db_api::R2rmlMappingInput::Content(mapping_content),
-            // Explicit `--r2rml-type` wins; otherwise infer from the file
-            // extension (issue #1397).
-            mapping_media_type: args
-                .r2rml_type
-                .clone()
-                .or_else(|| infer_mapping_media_type(r2rml_path)),
-        };
+    let config = fluree_db_api::R2rmlCreateConfig {
+        iceberg: iceberg_config,
+        mapping: fluree_db_api::R2rmlMappingInput::Content(mapping_content),
+        // Explicit `--r2rml-type` wins; otherwise infer from the file
+        // extension (issue #1397).
+        mapping_media_type: args
+            .r2rml_type
+            .clone()
+            .or_else(|| infer_mapping_media_type(r2rml_path)),
+    };
 
-        let result = fluree.create_r2rml_graph_source(config).await?;
+    let result = fluree.create_r2rml_graph_source(config).await?;
 
-        println!(
-            "Mapped Iceberg table as R2RML graph source '{}'",
-            result.graph_source_id
-        );
-        println!("  Table:       {}", result.table_identifier);
-        print_model_warnings(&result.model_warnings);
-        println!("  Catalog:     {}", result.catalog_uri);
-        println!("  R2RML:       {}", result.mapping_source);
-        println!("  TriplesMaps: {}", result.triples_map_count);
-        println!(
-            "  Tables:      {}",
-            format_table_summary(result.table_count, &result.table_names)
-        );
-        println!(
-            "  Connection:  {}",
-            if result.connection_tested {
-                "verified"
-            } else {
-                "not tested"
-            }
-        );
-        println!(
-            "  Mapping:     {}",
-            if result.mapping_validated {
-                "validated"
-            } else {
-                "not validated (check mapping source)"
-            }
-        );
-    } else {
-        let result = fluree.create_iceberg_graph_source(iceberg_config).await?;
-
-        println!(
-            "Mapped Iceberg table as graph source '{}'",
-            result.graph_source_id
-        );
-        println!("  Table:       {}", result.table_identifier);
-        print_model_warnings(&result.model_warnings);
-        println!("  Catalog:     {}", result.catalog_uri);
-        println!(
-            "  Connection:  {}",
-            if result.connection_tested {
-                "verified"
-            } else {
-                "not tested (tested for REST catalogs only, or catalog unreachable)"
-            }
-        );
-    }
+    println!(
+        "Mapped Iceberg table as R2RML graph source '{}'",
+        result.graph_source_id
+    );
+    println!("  Table:       {}", result.table_identifier);
+    print_model_warnings(&result.model_warnings);
+    println!("  Catalog:     {}", result.catalog_uri);
+    println!("  R2RML:       {}", result.mapping_source);
+    println!("  TriplesMaps: {}", result.triples_map_count);
+    println!(
+        "  Tables:      {}",
+        format_table_summary(result.table_count, &result.table_names)
+    );
+    println!(
+        "  Connection:  {}",
+        if result.connection_tested {
+            "verified"
+        } else {
+            "not tested"
+        }
+    );
+    println!(
+        "  Mapping:     {}",
+        if result.mapping_validated {
+            "validated"
+        } else {
+            "not validated (check mapping source)"
+        }
+    );
 
     Ok(())
 }
@@ -724,13 +696,11 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
         table_bucket_arn: args.table_bucket_arn.as_deref(),
         rest_only: &rest_only,
     };
-    let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
-        &args.name,
-        mode_args,
-        args.table.as_deref(),
-        args.r2rml.is_some(),
-    )
-    .map_err(|e| CliError::Usage(e.message(|field| format!("--{}", field.replace('_', "-")))))?;
+    let mut config =
+        fluree_db_api::IcebergCreateConfig::from_mode(&args.name, mode_args, args.table.as_deref())
+            .map_err(|e| {
+                CliError::Usage(e.message(|field| format!("--{}", field.replace('_', "-"))))
+            })?;
 
     if let Some(ref branch) = args.branch {
         config = config.with_branch(branch);
@@ -807,8 +777,13 @@ fn is_iceberg_family_type_str(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn base_rest_args() -> IcebergMapArgs {
-        IcebergMapArgs {
+    /// A REST `map` request, with the mapping file it reads in a directory that
+    /// lives as long as the returned guard.
+    fn base_rest_args() -> (tempfile::TempDir, IcebergMapArgs) {
+        let dir = tempfile::tempdir().unwrap();
+        let mapping = dir.path().join("mapping.ttl");
+        std::fs::write(&mapping, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
+        let args = IcebergMapArgs {
             name: "gs".to_string(),
             remote: None,
             mode: "rest".to_string(),
@@ -818,7 +793,7 @@ mod tests {
             region: None,
             catalog_id: None,
             table_bucket_arn: None,
-            r2rml: None,
+            r2rml: mapping,
             r2rml_type: None,
             branch: None,
             model: None,
@@ -836,12 +811,13 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             s3_path_style: false,
-        }
+        };
+        (dir, args)
     }
 
     #[test]
     fn args_to_json_carries_model_ledger() {
-        let mut args = base_rest_args();
+        let (_mapping_dir, mut args) = base_rest_args();
         assert!(args_to_json(&args).unwrap().get("model").is_none());
         args.model = Some("governance:main".to_string());
         assert_eq!(args_to_json(&args).unwrap()["model"], "governance:main");
@@ -852,7 +828,7 @@ mod tests {
 
     #[test]
     fn args_to_json_includes_oauth2_scope_and_audience() {
-        let mut args = base_rest_args();
+        let (_mapping_dir, mut args) = base_rest_args();
         args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
         args.oauth2_client_secret = Some("pat".to_string());
         args.oauth2_scope = Some("session:role:ICEBERG_READER".to_string());
@@ -867,7 +843,7 @@ mod tests {
 
     #[test]
     fn a_secret_named_by_variable_reaches_a_remote_server_as_the_name() {
-        let mut args = base_rest_args();
+        let (_mapping_dir, mut args) = base_rest_args();
         args.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
         args.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
 
@@ -881,7 +857,7 @@ mod tests {
     #[cfg(feature = "iceberg")]
     #[test]
     fn a_secret_named_by_variable_is_stored_as_the_name() {
-        let mut bearer = base_rest_args();
+        let (_mapping_dir, mut bearer) = base_rest_args();
         bearer.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
         let stored = serde_json::to_value(
             build_iceberg_config(&bearer)
@@ -895,7 +871,7 @@ mod tests {
             "CATALOG_TOKEN"
         );
 
-        let mut oauth2 = base_rest_args();
+        let (_mapping_dir, mut oauth2) = base_rest_args();
         oauth2.oauth2_token_url = Some("https://catalog.example.com/token".to_string());
         oauth2.oauth2_client_id = Some("app".to_string());
         oauth2.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
@@ -922,6 +898,8 @@ mod tests {
                 "gs",
                 "--catalog-uri",
                 "https://c",
+                "--r2rml",
+                "mapping.ttl",
             ];
             argv.extend_from_slice(extra);
             crate::cli::Cli::try_parse_from(argv)
@@ -940,7 +918,7 @@ mod tests {
     #[cfg(feature = "iceberg")]
     #[test]
     fn build_iceberg_config_activates_oauth2_without_client_id_and_threads_scope() {
-        let mut args = base_rest_args();
+        let (_mapping_dir, mut args) = base_rest_args();
         args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
         // No client_id -> defaults to "" so OAuth2 still activates.
         args.oauth2_client_secret = Some("pat".to_string());
@@ -962,7 +940,7 @@ mod tests {
     #[cfg(feature = "iceberg")]
     #[test]
     fn build_iceberg_config_no_oauth2_without_secret() {
-        let mut args = base_rest_args();
+        let (_mapping_dir, mut args) = base_rest_args();
         // token_url alone (no client_secret) must NOT activate OAuth2.
         args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
 
@@ -1059,8 +1037,8 @@ mod tests {
         let path = dir.path().join("airlines.ttl");
         std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
 
-        let mut args = base_rest_args();
-        args.r2rml = Some(path);
+        let (_mapping_dir, mut args) = base_rest_args();
+        args.r2rml = path;
         // No explicit --r2rml-type: inferred from the `.ttl` extension.
         let body = args_to_json(&args).unwrap();
         assert_eq!(body["r2rml_type"], "text/turtle");
@@ -1072,8 +1050,8 @@ mod tests {
         let path = dir.path().join("airlines.ttl");
         std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
 
-        let mut args = base_rest_args();
-        args.r2rml = Some(path);
+        let (_mapping_dir, mut args) = base_rest_args();
+        args.r2rml = path;
         // Explicit flag wins over the conflicting `.ttl` extension.
         args.r2rml_type = Some("application/ld+json".to_string());
         let body = args_to_json(&args).unwrap();

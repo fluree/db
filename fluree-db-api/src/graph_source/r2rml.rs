@@ -11,7 +11,7 @@ use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateC
 use crate::graph_source::iceberg_catalog::{
     decide_credential_source, storage_query_error, CredentialSource,
 };
-use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
+use crate::graph_source::result::R2rmlCreateResult;
 use crate::Result;
 use async_trait::async_trait;
 use fluree_db_core::ContentStore;
@@ -1018,74 +1018,6 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
 // =============================================================================
 
 impl crate::Fluree {
-    /// Create an Iceberg graph source.
-    ///
-    /// This operation:
-    /// 1. Validates the configuration
-    /// 2. Optionally tests the catalog connection
-    /// 3. Publishes the graph source record to the nameservice
-    pub async fn create_iceberg_graph_source(
-        &self,
-        config: IcebergCreateConfig,
-    ) -> Result<IcebergCreateResult> {
-        let graph_source_id = config.graph_source_id();
-        info!(
-            graph_source_id = %graph_source_id,
-            catalog = %config.catalog_uri_or_location(),
-            table = %config.table_identifier_display(),
-            "Creating Iceberg graph source"
-        );
-
-        // 1. Validate configuration
-        config.validate()?;
-        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
-
-        // 2. Test catalog connection (REST mode only — Direct mode verified at query time)
-        let connection_tested = if config.is_rest() {
-            let ok = self.test_iceberg_connection(&config).await.is_ok();
-            if !ok {
-                warn!(
-                    graph_source_id = %graph_source_id,
-                    "Could not verify catalog connection - graph source will be created but may fail at query time"
-                );
-            }
-            ok
-        } else {
-            false
-        };
-
-        // 3. Convert config to storage format
-        let iceberg_config = config.to_iceberg_gs_config();
-        let config_json = iceberg_config
-            .to_json()
-            .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
-
-        // 4. Publish graph source record to nameservice
-        self.publisher()?
-            .publish_graph_source(
-                &config.name,
-                config.effective_branch(),
-                GraphSourceType::Iceberg,
-                &config_json,
-                &[], // No ledger dependencies for Iceberg graph sources
-            )
-            .await?;
-
-        info!(
-            graph_source_id = %graph_source_id,
-            connection_tested = connection_tested,
-            "Created Iceberg graph source"
-        );
-
-        Ok(IcebergCreateResult {
-            model_warnings,
-            graph_source_id,
-            table_identifier: config.table_identifier_display(),
-            catalog_uri: config.catalog_uri_or_location().to_string(),
-            connection_tested,
-        })
-    }
-
     /// Create an R2RML graph source (Iceberg table with R2RML mapping).
     ///
     /// For `R2rmlMappingInput::Content`, validates the mapping content and
