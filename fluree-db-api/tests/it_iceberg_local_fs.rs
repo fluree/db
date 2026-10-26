@@ -1846,3 +1846,76 @@ async fn an_unmapped_graph_source_refuses_a_graph_pattern_in_a_ledger_query() {
         "JSON-LD graph in a ledger query",
     );
 }
+
+/// Registering a Direct source reaches its tables the way its queries do (a
+/// warehouse root's per-table directory included) and reports the outcome as
+/// `connection_tested`, as registering a REST source does. A table that cannot
+/// be read still registers, and then fails when queried.
+#[tokio::test]
+async fn a_direct_registration_reports_whether_its_tables_resolve() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let register = |name: &'static str, location: String| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .create_r2rml_graph_source(
+                    R2rmlCreateConfig::new_direct(name, &location, PEOPLE_R2RML)
+                        .with_mapping_media_type("text/turtle"),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("register {name}: {e}"))
+        }
+    };
+
+    let table = register("probe-table", table_location()).await;
+    assert!(table.connection_tested, "a readable table is verified");
+
+    // The mapping's `silver.people` resolves to its own directory beneath the
+    // root, as it does when the source is queried.
+    let root = format!("file://{}/silver", fixtures_dir().display());
+    let rooted = register("probe-root", root).await;
+    assert!(
+        rooted.connection_tested,
+        "a warehouse root resolves the mapping's table"
+    );
+    let rows = fluree
+        .query_from()
+        .sparql(
+            "SELECT ?name FROM <probe-root:main> \
+             WHERE { ?s <http://example.org/name> ?name }",
+        )
+        .execute()
+        .await
+        .expect("query the warehouse-root source");
+    assert_eq!(rows.row_count(), 5, "the probe and the query agree");
+
+    let missing = format!("file://{}/silver/no_such_table", fixtures_dir().display());
+    let unread = register("probe-missing", missing).await;
+    assert!(
+        !unread.connection_tested,
+        "a table that cannot be read is not verified"
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup_graph_source("probe-missing:main")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "and is still registered"
+    );
+    let err = fluree
+        .query_from()
+        .sparql(
+            "SELECT ?name FROM <probe-missing:main> \
+             WHERE { ?s <http://example.org/name> ?name }",
+        )
+        .execute()
+        .await
+        .expect_err("a source whose table cannot be read fails when queried");
+    assert!(
+        err.to_string().contains("no_such_table"),
+        "the failure names the location: {err}"
+    );
+}

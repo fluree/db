@@ -308,7 +308,7 @@ async fn run_iceberg_map_remote(
     }
     println!(
         "  Connection:  {}",
-        if connection { "verified" } else { "not tested" }
+        connection_summary(connection, &args.mode)
     );
     let validated = result
         .get("mapping_validated")
@@ -325,6 +325,24 @@ async fn run_iceberg_map_remote(
 
     print_model_warnings(&model_warnings_of(&result));
     Ok(())
+}
+
+/// The `Connection:` line of a `map` report. A REST source is reached through
+/// its catalog and a Direct one by resolving its tables' metadata; Glue and S3
+/// Tables catalogs are first called at query time. Neither outcome fails `map`.
+fn connection_summary(tested: bool, mode: &str) -> &'static str {
+    if tested {
+        return "verified";
+    }
+    match mode.to_ascii_lowercase().as_str() {
+        "glue" | "s3tables" => {
+            "not tested (Glue and S3 Tables catalogs are first called at query time)"
+        }
+        "direct" => {
+            "not verified (the table metadata could not be read; queries will fail until it can be)"
+        }
+        _ => "not verified (the catalog could not load the table; queries will fail until it can)",
+    }
 }
 
 /// Infer an R2RML mapping media type from a file extension.
@@ -622,11 +640,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
     );
     println!(
         "  Connection:  {}",
-        if result.connection_tested {
-            "verified"
-        } else {
-            "not tested"
-        }
+        connection_summary(result.connection_tested, &args.mode)
     );
     println!(
         "  Mapping:     {}",

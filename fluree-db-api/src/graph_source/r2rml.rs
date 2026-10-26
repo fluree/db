@@ -1084,9 +1084,19 @@ impl crate::Fluree {
         let mapping_address = registered.address;
         let table_count = table_names.len();
 
-        // Test catalog connection (REST mode only)
-        let connection_tested = if config.iceberg.is_rest() {
-            self.test_iceberg_connection(&config.iceberg).await.is_ok()
+        // Reach a REST source's table through its catalog before publishing.
+        // A Direct source is reached after, below. Glue / S3 Tables are first
+        // called at query time.
+        let catalog_reached = if config.iceberg.is_rest() {
+            let reached = self.test_iceberg_connection(&config.iceberg).await;
+            if let Err(e) = &reached {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    error = %e,
+                    "Could not verify catalog connection - graph source will be created but may fail at query time"
+                );
+            }
+            reached.is_ok()
         } else {
             false
         };
@@ -1107,7 +1117,14 @@ impl crate::Fluree {
             )
             .await?;
 
-        info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created R2RML graph source");
+        let connection_tested = if config.iceberg.is_direct() {
+            self.probe_direct_tables(&graph_source_id, &table_names)
+                .await
+        } else {
+            catalog_reached
+        };
+
+        info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
 
         Ok(R2rmlCreateResult {
             model_warnings,
@@ -1121,6 +1138,35 @@ impl crate::Fluree {
             connection_tested,
             mapping_validated,
         })
+    }
+
+    /// Resolve the current metadata of each table a just-published Direct
+    /// source reads, the way its queries do (a warehouse root's per-table
+    /// directory, the local-root guard, version-hint or metadata listing): the
+    /// table metadata only, never a manifest or data file. `true` when every
+    /// table resolves. A failure is logged and never returned, so it cannot
+    /// fail registration, as a REST catalog that cannot be reached does not.
+    async fn probe_direct_tables(&self, graph_source_id: &str, table_names: &[String]) -> bool {
+        let provider = FlureeR2rmlProvider::new(self);
+        // A mapping that could not be read names no tables; the location's own
+        // table is then the one a query would read.
+        let tables: Vec<&str> = if table_names.is_empty() {
+            vec![""]
+        } else {
+            table_names.iter().map(String::as_str).collect()
+        };
+        for table in tables {
+            if let Err(e) = provider.load_table_context(graph_source_id, table).await {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    table = %table,
+                    error = %e,
+                    "Could not resolve Direct table metadata - graph source was created but may fail at query time"
+                );
+                return false;
+            }
+        }
+        true
     }
 
     /// Test connection to an Iceberg REST catalog.
