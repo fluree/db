@@ -902,6 +902,7 @@ impl ApiError {
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                QE::GraphSourceUnmapped { .. } => errors::GRAPH_SOURCE_UNMAPPED,
                 // Typed as `ApiError::NameService` is: the backend's fault.
                 QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
@@ -1021,6 +1022,10 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         QE::StorageAccessDenied { .. }
         | QE::CatalogCredentialsNotVended { .. }
         | QE::CatalogAccessDenied { .. } => 403,
+        // The source's stored state, not the query, is what is wrong, and
+        // registering it again with a mapping clears it: a conflict with the
+        // resource, as querying a dropped source is.
+        QE::GraphSourceUnmapped { .. } => 409,
         // Engine and storage faults no change to the query can clear.
         QE::Core(_)
         | QE::OperatorNotOpened
@@ -1307,6 +1312,13 @@ mod tests {
                 ApiError::GraphSourceRetracted("x".into()),
                 409,
                 GRAPH_SOURCE_RETRACTED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceUnmapped {
+                    graph_source_id: "gs:main".into(),
+                }),
+                409,
+                GRAPH_SOURCE_UNMAPPED,
             ),
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),

@@ -150,6 +150,18 @@ pub enum QueryError {
     )]
     R2rmlUnsupportedPattern { detail: String },
 
+    /// A registered mapped graph source (Iceberg / R2RML) has no R2RML mapping,
+    /// so nothing defines the triples a query of it reads. Only a record stored
+    /// before registration required a mapping can be in this state.
+    ///
+    /// Typed, and raised wherever the query names the source, so the query
+    /// fails with its cause rather than reading the source as a ledger that is
+    /// not there or as an empty graph.
+    #[error(
+        "graph source '{graph_source_id}' has no R2RML mapping; register it again with a mapping"
+    )]
+    GraphSourceUnmapped { graph_source_id: String },
+
     /// Object storage denied a read of an external table's data (S3 403 /
     /// `AccessDenied`).
     ///

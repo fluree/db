@@ -852,6 +852,14 @@ impl Fluree {
             return Ok(None);
         };
 
+        // A mapped source with no mapping has nothing to answer from. Every
+        // route that names a graph source (a direct target, `FROM`, `FROM
+        // NAMED`, the server's query routes) resolves it here, so refusing it
+        // here keeps the genesis view below, which would read as an empty
+        // graph, from ever standing in for it.
+        #[cfg(feature = "iceberg")]
+        crate::graph_source::r2rml::served_mapping_of(&record)?;
+
         let graph_source_time = crate::graph_source::source_time_for(spec)?;
         if graph_source_time.is_some()
             && !matches!(

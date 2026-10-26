@@ -576,6 +576,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
         | QueryError::NoSnapshotAtTime { .. }
+        | QueryError::GraphSourceUnmapped { .. }
         | QueryError::R2rml(_)
         | QueryError::Core(_)
         | QueryError::Batch(_)
@@ -917,6 +918,9 @@ mod tests {
             ];
             QueryError::NoSnapshotAtTime { .. } => true, [
                 QueryError::NoSnapshotAtTime { table: s(), requested: s(), oldest: None },
+            ];
+            QueryError::GraphSourceUnmapped { .. } => true, [
+                QueryError::GraphSourceUnmapped { graph_source_id: s() },
             ];
             QueryError::R2rml(_) => true, [
                 QueryError::R2rml(fluree_db_r2rml::R2rmlError::Parse(s())),

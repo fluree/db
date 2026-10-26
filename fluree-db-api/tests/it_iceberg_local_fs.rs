@@ -1608,3 +1608,241 @@ async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
         );
     }
 }
+
+/// Store an Iceberg graph-source record with no R2RML mapping, as registration
+/// once allowed: no surface can register one now, but records stored then
+/// remain. Its location is a real table, so only the missing mapping can be
+/// why a query of it fails.
+async fn publish_unmapped_source(fluree: &fluree_db_api::Fluree, name: &str) -> String {
+    let config = fluree_db_api::IcebergCreateConfig::new_direct(name, table_location())
+        .to_iceberg_gs_config()
+        .to_json()
+        .expect("serialize config");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_graph_source(
+            name,
+            "main",
+            fluree_db_nameservice::GraphSourceType::Iceberg,
+            &config,
+            &[],
+        )
+        .await
+        .expect("publish unmapped record");
+    format!("{name}:main")
+}
+
+/// The refusal every route gives a query that names a graph source with no
+/// mapping: the typed code and status, naming the source and the cause.
+fn assert_unmapped<T: std::fmt::Debug>(result: Result<T, ApiError>, gs: &str, route: &str) {
+    let err = match result {
+        Ok(answer) => panic!("{route}: answered instead of refusing: {answer:?}"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.error_type(),
+        "err:db/GraphSourceUnmapped",
+        "{route}: {err}"
+    );
+    assert_eq!(err.status_code(), 409, "{route}: {err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("graph source '{gs}' has no R2RML mapping")),
+        "{route}: {message}"
+    );
+    assert!(!message.contains("not found"), "{route}: {message}");
+}
+
+const NAME_SPARQL: &str = "SELECT ?name WHERE { ?s <http://example.org/name> ?name }";
+
+fn name_jsonld() -> serde_json::Value {
+    serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    })
+}
+
+/// A graph source with no mapping queried as the target itself refuses with
+/// its cause. Read as "not a mapped source", the target fell through to the
+/// ledger lookup and answered "Ledger not found".
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_query_that_targets_it() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-target").await;
+
+    let graph = fluree.graph(&gs);
+    assert_unmapped(
+        graph.query().sparql(NAME_SPARQL).execute_formatted().await,
+        &gs,
+        "SPARQL target",
+    );
+    let jsonld = name_jsonld();
+    assert_unmapped(
+        graph.query().jsonld(&jsonld).execute_formatted().await,
+        &gs,
+        "JSON-LD target",
+    );
+
+    // Materializing it reads the same mapping, and refuses the same way.
+    assert_unmapped(
+        fluree
+            .materialize_r2rml_graph_source(&gs, "unmapped-target-copy:main", false)
+            .await
+            .map(|_| ()),
+        &gs,
+        "materialize",
+    );
+
+    // The remedy the refusal names: registering it again under the same name,
+    // with a mapping, replaces the record, and the source answers.
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("unmapped-target", table_location(), PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("register again with a mapping");
+    let rows = fluree
+        .graph(&gs)
+        .query()
+        .sparql(NAME_SPARQL)
+        .execute()
+        .await
+        .expect("query the remapped source");
+    assert_eq!(rows.row_count(), 5, "the remapped source answers");
+}
+
+/// A graph source with no mapping named in a dataset (`FROM`, `FROM NAMED`)
+/// refuses with its cause. It used to resolve to an empty genesis graph and
+/// answer no rows without an error.
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_query_that_names_it_in_its_dataset() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-dataset").await;
+    fluree.create_ledger("crm:main").await.expect("ledger");
+
+    let from = format!("SELECT ?name FROM <{gs}> WHERE {{ ?s <http://example.org/name> ?name }}");
+    assert_unmapped(
+        fluree.query_from().sparql(&from).execute_formatted().await,
+        &gs,
+        "SPARQL FROM",
+    );
+    let mut from_jsonld = name_jsonld();
+    from_jsonld["from"] = gs.clone().into();
+    assert_unmapped(
+        fluree
+            .query_from()
+            .jsonld(&from_jsonld)
+            .execute_formatted()
+            .await,
+        &gs,
+        "JSON-LD from",
+    );
+
+    // Every server SPARQL request carries governance options; that branch once
+    // ran without the graph-source providers, so the refusal must not depend
+    // on them.
+    assert_unmapped(
+        fluree
+            .query_from()
+            .sparql(&from)
+            .connection_opts(fluree_db_api::GovernanceOptions::default())
+            .execute_formatted()
+            .await,
+        &gs,
+        "SPARQL FROM with governance options",
+    );
+    // `query_dataset` runs a dataset built up front without the graph-source
+    // providers, so their probe never sees the source: resolving it into the
+    // dataset is what has to refuse.
+    let spec = fluree_db_api::DatasetSpec::new()
+        .with_default(fluree_db_api::GraphSource::parse(&gs).expect("parse source"));
+    assert_unmapped(
+        fluree.build_dataset_view(&spec).await.map(|_| ()),
+        &gs,
+        "build_dataset_view",
+    );
+
+    // A tracked query reports only a status and a message.
+    match fluree.query_from().sparql(&from).execute_tracked().await {
+        Ok(answer) => panic!("tracked SPARQL FROM: answered {}", answer.result),
+        Err(err) => {
+            assert_eq!(err.status, 409, "tracked SPARQL FROM: {}", err.error);
+            assert!(
+                err.error.contains("has no R2RML mapping"),
+                "tracked SPARQL FROM: {}",
+                err.error
+            );
+        }
+    }
+
+    let named = format!(
+        "SELECT ?name FROM <crm:main> FROM NAMED <{gs}> \
+         WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}"
+    );
+    assert_unmapped(
+        fluree.query_from().sparql(&named).execute_formatted().await,
+        &gs,
+        "SPARQL FROM NAMED + GRAPH",
+    );
+    let named_jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "crm:main",
+        "fromNamed": [gs],
+        "select": ["?name"],
+        "where": [["graph", gs, {"@id": "?s", "ex:name": "?name"}]],
+    });
+    assert_unmapped(
+        fluree
+            .query_from()
+            .jsonld(&named_jsonld)
+            .execute_formatted()
+            .await,
+        &gs,
+        "JSON-LD fromNamed + graph",
+    );
+}
+
+/// `GRAPH <source>` inside a query of a ledger, with no dataset naming the
+/// source, asks the R2RML probe directly rather than resolving a dataset. A
+/// source with no mapping refuses there too, instead of matching nothing.
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_graph_pattern_in_a_ledger_query() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-graph").await;
+    let ledger = fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "http://example.org/person/1", "ex:tier": "gold"
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let graph = fluree.graph("crm:main");
+    let sparql =
+        format!("SELECT ?name WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}");
+    assert_unmapped(
+        graph.query().sparql(&sparql).execute_formatted().await,
+        &gs,
+        "SPARQL GRAPH in a ledger query",
+    );
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": [["graph", gs, {"@id": "?s", "ex:name": "?name"}]],
+    });
+    assert_unmapped(
+        graph.query().jsonld(&jsonld).execute_formatted().await,
+        &gs,
+        "JSON-LD graph in a ledger query",
+    );
+}

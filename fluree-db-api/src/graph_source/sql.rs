@@ -767,11 +767,14 @@ fn to_literal(v: &ScanValue) -> Literal {
     }
 }
 
-/// The mapping reference of a SQL record, if it has one.
-pub(crate) fn mapping_source(record: &GraphSourceRecord) -> Option<MappingSource> {
+/// The mapping reference of a SQL record, if it has one; `Err` when
+/// its config does not parse.
+pub(crate) fn mapping_source(
+    record: &GraphSourceRecord,
+) -> std::result::Result<Option<MappingSource>, String> {
     SqlGsConfig::from_json(&record.config)
-        .ok()
-        .and_then(|c| c.mapping)
+        .map(|c| c.mapping)
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Option<bool>) {

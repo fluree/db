@@ -118,6 +118,10 @@ pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
 /// The graph source was dropped, so it can no longer be synced (HTTP 409)
 pub const GRAPH_SOURCE_RETRACTED: &str = "err:db/GraphSourceRetracted";
 
+/// The graph source has no R2RML mapping, so it has nothing to answer a query
+/// from (HTTP 409). Registering it again with a mapping clears it.
+pub const GRAPH_SOURCE_UNMAPPED: &str = "err:db/GraphSourceUnmapped";
+
 /// A graph the target ledger does not have
 pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
 

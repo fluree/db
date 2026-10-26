@@ -121,18 +121,55 @@ fn require_iceberg_backed(
 pub(crate) fn mapping_source_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> Option<fluree_db_iceberg::config::MappingSource> {
-    match record.source_type {
+    mapping_reference(record)
+        .and_then(std::result::Result::ok)
+        .flatten()
+}
+
+/// The mapping a live graph-source record answers queries from: `Ok(None)`
+/// when it is not a mapped source this build reads (a BM25, vector or geo
+/// index), which no R2RML probe serves.
+///
+/// A mapped record without a mapping (an Iceberg source stored before
+/// registration required one) is [`QueryError::GraphSourceUnmapped`], and one
+/// whose config does not parse is an internal error. Read as `None`, either
+/// would send its query to the ledger lookup or to an empty genesis graph. The
+/// R2RML probe and the genesis-view resolver both decide here.
+pub(crate) fn served_mapping_of(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> QueryResult<Option<fluree_db_iceberg::config::MappingSource>> {
+    let graph_source_id = record.graph_source_id.as_str();
+    match mapping_reference(record) {
+        None => Ok(None),
+        Some(Ok(Some(mapping))) => Ok(Some(mapping)),
+        Some(Ok(None)) => Err(QueryError::GraphSourceUnmapped {
+            graph_source_id: graph_source_id.to_string(),
+        }),
+        Some(Err(e)) => Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' has a config that cannot be read: {e}"
+        ))),
+    }
+}
+
+/// The mapping reference of a mapped record, per source family, keeping a
+/// config that does not parse (`Some(Err)`) apart from one with no mapping
+/// (`Some(Ok(None))`). `None` when the record is not a mapped family this
+/// build reads.
+fn mapping_reference(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> Option<std::result::Result<Option<fluree_db_iceberg::config::MappingSource>, String>> {
+    Some(match record.source_type {
         GraphSourceType::R2rml | GraphSourceType::Iceberg => {
             IcebergGsConfig::from_json(&record.config)
-                .ok()
-                .and_then(|c| c.mapping)
+                .map(|c| c.mapping)
+                .map_err(|e| e.to_string())
         }
         #[cfg(feature = "sql")]
         GraphSourceType::Sql => super::sql::mapping_source(record),
         #[cfg(feature = "delta")]
         GraphSourceType::Delta => super::delta::mapping_source(record),
-        _ => None,
-    }
+        _ => return None,
+    })
 }
 
 /// The policy configuration a virtual source's record carries: its model
@@ -2452,7 +2489,8 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     /// parse as a graph-source id names no source, so it is `false` without a
     /// lookup. A failed lookup of a well-formed id fails the query: reading it
     /// as "no mapping" would query an R2RML / Iceberg / SQL source as an empty
-    /// native graph whenever the nameservice is unavailable.
+    /// native graph whenever the nameservice is unavailable. A mapped source
+    /// with no mapping fails it for the same reason ([`served_mapping_of`]).
     async fn has_r2rml_mapping(&self, graph_source_id: &str) -> QueryResult<bool> {
         let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
             return Ok(false);
@@ -2463,8 +2501,11 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .lookup_graph_source(&id)
             .await
             .map_err(|e| QueryError::Nameservice(e.to_string()))?;
-        // A drop leaves the record as a tombstone.
-        Ok(record.is_some_and(|r| !r.retracted && mapping_source_of(&r).is_some()))
+        match record {
+            // A drop leaves the record as a tombstone.
+            Some(record) if !record.retracted => Ok(served_mapping_of(&record)?.is_some()),
+            _ => Ok(false),
+        }
     }
 
     /// Get the compiled R2RML mapping for a graph source.
@@ -2499,9 +2540,10 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             )));
         }
 
-        let mapping_config = mapping_source_of(&record).ok_or_else(|| {
+        let mapping_config = served_mapping_of(&record)?.ok_or_else(|| {
             QueryError::InvalidQuery(format!(
-                "Graph source '{graph_source_id}' is missing 'mapping' in config"
+                "Graph source '{}' is not an R2RML graph source (type: {:?})",
+                graph_source_id, record.source_type
             ))
         })?;
         let mapping_config = &mapping_config;
