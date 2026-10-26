@@ -5602,3 +5602,55 @@ async fn a_top_level_values_iri_in_a_new_namespace_writes_and_reads_as_itself() 
     .expect("jsonld");
     assert_eq!(rows, json!([["v"]]));
 }
+
+/// A join inside a named graph first written after the last index probes
+/// that graph by subject, and the index has no branch for it: the graph holds
+/// nothing for the probe, so the join answers with no rows. `ex:sel` is read
+/// from g3's novelty, and `ex:v` is known to the index only from g1.
+#[tokio::test]
+async fn a_join_in_a_graph_written_after_the_index_probes_it_and_finds_nothing() {
+    let id = "probe-branchless-graph:main";
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    fluree
+        .stage_owned(ledger)
+        .insert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             GRAPH <urn:g1> { ex:s ex:sel ex:y0 . ex:y0 ex:v \"x\" . }",
+        )
+        .execute()
+        .await
+        .expect("seed g1");
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
+    let ledger = fluree.ledger(id).await.expect("load");
+    let ledger = fluree
+        .stage_owned(ledger)
+        .insert_turtle(
+            "@prefix ex: <http://example.org/> .\nGRAPH <urn:g3> { ex:b ex:sel ex:y0 . }",
+        )
+        .execute()
+        .await
+        .expect("write g3")
+        .ledger;
+    let join = |g: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?x ?o WHERE {{ GRAPH <{g}> {{ ?x ex:sel ?y . ?y ex:v ?o }} }}"
+        )
+    };
+    let in_g3 = support::query_sparql_formatted(&fluree, &ledger, &join("urn:g3"))
+        .await
+        .expect("the join in g3");
+    assert_eq!(in_g3, json!([]), "g3 holds no ex:v");
+    let in_g1 = support::query_sparql_formatted(&fluree, &ledger, &join("urn:g1"))
+        .await
+        .expect("the join in g1");
+    assert_eq!(
+        in_g1.as_array().map(Vec::len),
+        Some(1),
+        "the same join in g1: {in_g1}"
+    );
+}

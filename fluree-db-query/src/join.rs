@@ -2462,9 +2462,14 @@ impl NestedLoopJoinOperator {
             self.clear_batched_state();
             return Ok(());
         }
-        let branch = store
-            .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
-            .ok_or_else(|| QueryError::Internal("PSOT index not found for graph".into()))?;
+        // A graph the index has no PSOT branch for holds nothing for the
+        // probe: its lane plan would have declined had the graph's novelty held
+        // the predicate. Its left rows (from novelty) match nothing, as on the
+        // object probe.
+        let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
+            self.clear_batched_state();
+            return Ok(());
+        };
         let leaf_range = Self::find_psot_leaf_range(
             branch,
             ctx.binary_g_id,
