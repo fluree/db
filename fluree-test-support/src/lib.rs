@@ -259,20 +259,23 @@ pub fn assert_every_test_file_is_reachable(manifest_dir: &str) {
 /// Scans the `.rs` files under `src/` and `tests/` of each member of the
 /// workspace whose root is `workspace_root`, other than this crate and the
 /// `fluree-bench-*` crates, for `tracing::subscriber` or `tracing::dispatcher`
-/// `set_default(` / `with_default(` calls. Lines that start as comments are
-/// ignored. A call made through some other spelling, a `use` of the function
-/// say, is not caught.
+/// `set_default(` / `with_default(` calls, and for `tracing-subscriber`'s
+/// method form, `.set_default()` (`SubscriberInitExt`, as in
+/// `fmt().with_test_writer().set_default()`). Lines that start as comments
+/// are ignored. A call made through some other spelling, a `use` of the
+/// function say, is not caught.
 ///
 /// # Panics
 ///
 /// Panics listing each `file:line` that installs one directly, or if the
 /// workspace `Cargo.toml` cannot be read.
 pub fn assert_scoped_subscribers_use_the_floor(workspace_root: &str) {
-    const DIRECT: [&str; 4] = [
+    const DIRECT: [&str; 5] = [
         "subscriber::set_default(",
         "subscriber::with_default(",
         "dispatcher::set_default(",
         "dispatcher::with_default(",
+        ".set_default()",
     ];
     let root = Path::new(workspace_root);
     let manifest: toml::Value = fs::read_to_string(root.join("Cargo.toml"))
@@ -361,8 +364,18 @@ mod tests {
 
         /// The guard's panic message, or `None` when it passes.
         fn failure(&self) -> Option<String> {
+            self.panic_of(assert_every_test_file_is_reachable)
+        }
+
+        /// The floor guard's panic message, with this tree as the workspace
+        /// root, or `None` when it passes.
+        fn floor_failure(&self) -> Option<String> {
+            self.panic_of(assert_scoped_subscribers_use_the_floor)
+        }
+
+        fn panic_of(&self, guard: fn(&str)) -> Option<String> {
             let dir = self.root.to_str().unwrap().to_owned();
-            std::panic::catch_unwind(|| assert_every_test_file_is_reachable(&dir))
+            std::panic::catch_unwind(|| guard(&dir))
                 .err()
                 .map(|payload| {
                     payload
@@ -381,6 +394,45 @@ mod tests {
     }
 
     const ONE_HARNESS: &str = "[[test]]\nname = \"grp\"\npath = \"tests/grp.rs\"\n";
+
+    const ONE_MEMBER: &str = "[workspace]\nmembers = [\"m\"]\n";
+
+    /// The floor guard names every direct install, in `src/` and `tests/`,
+    /// by `file:line`: the function forms and `tracing-subscriber`'s method
+    /// form. A commented-out call is not one.
+    #[test]
+    fn the_floor_guard_names_each_direct_install() {
+        let workspace = Crate::new(&[
+            ("Cargo.toml", ONE_MEMBER),
+            (
+                "m/src/lib.rs",
+                "let _g = tracing::subscriber::set_default(s);\n\
+                 let _g = tracing_subscriber::fmt().with_test_writer().set_default();\n\
+                 // tracing::subscriber::set_default(s);\n",
+            ),
+            (
+                "m/tests/t.rs",
+                "tracing::dispatcher::with_default(&d, || {});\n",
+            ),
+        ]);
+        let msg = workspace.floor_failure().expect("three direct installs");
+        for site in ["m/src/lib.rs:1", "m/src/lib.rs:2", "m/tests/t.rs:1"] {
+            assert!(msg.contains(site), "{site} not named in: {msg}");
+        }
+        assert!(!msg.contains("m/src/lib.rs:3"), "{msg}");
+    }
+
+    #[test]
+    fn the_floor_guard_passes_installs_through_the_helper() {
+        let workspace = Crate::new(&[
+            ("Cargo.toml", ONE_MEMBER),
+            (
+                "m/src/lib.rs",
+                "let _g = fluree_test_support::scoped_default(s);\n",
+            ),
+        ]);
+        assert_eq!(workspace.floor_failure(), None);
+    }
 
     /// Pins the inference this crate adds on top of TOML, not TOML itself:
     /// a `[[test]]` without `path` means `tests/<name>.rs`, and other target
