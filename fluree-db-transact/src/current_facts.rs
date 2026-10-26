@@ -639,6 +639,10 @@ impl Slot {
 }
 
 /// Reads a ledger's current facts as of its current `t`.
+///
+/// Each read refuses with [`crate::TransactError::IndexNotLoaded`] when this
+/// process has not loaded the ledger's index ([`crate::check_index_loaded`]):
+/// merge and rebase read here before they commit.
 pub struct CurrentFacts<'l> {
     ledger: &'l LedgerState,
     to_t: i64,
@@ -855,6 +859,7 @@ impl<'l> CurrentFacts<'l> {
         limit: Option<usize>,
         tracker: Option<&Tracker>,
     ) -> Result<Vec<StoredFact>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         let db_ref = match tracker {
             Some(t) => self.ledger.as_graph_db_ref(g_id).with_tracker(t),
             None => self.ledger.as_graph_db_ref(g_id),
@@ -888,7 +893,11 @@ impl<'l> CurrentFacts<'l> {
     /// Persisted-index rows matching `rm` in graph `g_id`, read through
     /// `NoOverlay`: one leaf seek, no novelty translation. At genesis (no
     /// index yet) there is no provider and the answer is empty.
+    ///
+    /// Every reader that reads the index reads it here, so this is where an
+    /// index this process has not loaded is refused.
     async fn base(&self, g_id: GraphId, rm: RangeMatch) -> Result<Vec<Flake>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         Ok(range_with_overlay(
             &self.ledger.snapshot,
             g_id,
@@ -1909,6 +1918,44 @@ mod tests {
                 .expect("apply commit");
         }
         LedgerState::new(LedgerSnapshot::genesis("test:main"), novelty)
+    }
+
+    /// A ledger with an index this process has not loaded refuses every
+    /// read here with `IndexNotLoaded`; merge and rebase read here first.
+    #[tokio::test]
+    async fn an_index_that_is_not_loaded_refuses_every_read() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        let ledger = LedgerState::new(snapshot, Novelty::new(1));
+        let facts = CurrentFacts::new(&ledger);
+        let refused = |r: Result<Vec<StoredFact>>| {
+            assert!(
+                matches!(r, Err(crate::TransactError::IndexNotLoaded(_))),
+                "{r:?}"
+            );
+        };
+        refused(
+            facts
+                .of_slots(&[slot(0, None, "a", "b")])
+                .await
+                .map(|mut v| v.pop().unwrap_or_default()),
+        );
+        refused(facts.of_subject(0, None, &sid("a")).await);
+        refused(facts.whole_graph(0, None, None, None).await);
+        let named = flake("a", "b", "x", 1, true, None);
+        let items = [(slot(0, None, "a", "b"), &named)];
+        refused(
+            facts
+                .named_by(&items)
+                .await
+                .map(|v| v.into_iter().flatten().collect()),
+        );
+        refused(
+            facts
+                .all_named_by(&items)
+                .await
+                .map(|mut v| v.pop().unwrap_or_default()),
+        );
     }
 
     fn slot(g_id: GraphId, g_sid: Option<&Sid>, s: &str, p: &str) -> Slot {

@@ -34,6 +34,7 @@ mod inner {
     use fluree_db_core::commit::codec::CommitCodecError;
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::{ObjKey, ObjKind};
+    use fluree_db_core::vector::VectorError;
     use fluree_db_core::DatatypeConstraint;
     use fluree_db_core::{DatatypeDictId, Flake, FlakeMeta, FlakeValue, GraphId, Sid};
     use fluree_db_indexer::run_index::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
@@ -44,6 +45,18 @@ mod inner {
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// An import sink's deferred failure as the import reports it: a value
+    /// the ledger refuses (an `Invalid vector`, the datatype limit) keeps the
+    /// type a transaction's refusal has; anything else failed to encode.
+    pub fn encode_failure(error: TransactError) -> TransactError {
+        match error {
+            TransactError::CommitCodec(e) => {
+                TransactError::Parse(format!("flake encode error: {e}"))
+            }
+            refused => refused,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // ResolvedTerm — local term representation (same shape as FlakeSink's)
@@ -351,7 +364,7 @@ mod inner {
         ///
         /// Fails once the import holds more non-reserved datatypes than a
         /// ledger can, so no record carries an ID the index cannot store.
-        fn assign_datatype_id(&mut self, sid: &Sid) -> Result<u16, CommitCodecError> {
+        fn assign_datatype_id(&mut self, sid: &Sid) -> Result<u16, TransactError> {
             let code = sid.namespace_code;
             self.cache_prefix(code);
             let prefix = self
@@ -362,14 +375,13 @@ mod inner {
             let id = self.datatypes.get_or_insert_parts(prefix, &sid.name);
             DatatypeDictId::try_from_dict_id(id)
                 .map(DatatypeDictId::as_u16)
-                .ok_or_else(|| {
+                .ok_or({
                     let max = MAX_NON_RESERVED_DATATYPES;
-                    let limit = TransactError::DatatypeLimitExceeded {
+                    TransactError::DatatypeLimitExceeded {
                         used: max,
                         adding: 1,
                         max,
-                    };
-                    CommitCodecError::InvalidOp(limit.to_string())
+                    }
                 })
         }
 
@@ -393,8 +405,15 @@ mod inner {
         /// Uses the same encoders as `CommitResolver` in the indexer for inline
         /// types. For subjects and strings, assigns chunk-local IDs (remapped
         /// during merge). For BigInt/Decimal/Vector, uses shared global pools.
-        fn resolve_object_value(&mut self, value: &FlakeValue, p_id: u32) -> Option<(u8, u64)> {
-            Some(match value {
+        ///
+        /// Fails when the shared vector pool cannot store a vector, which stops
+        /// the import.
+        fn resolve_object_value(
+            &mut self,
+            value: &FlakeValue,
+            p_id: u32,
+        ) -> Result<(u8, u64), VectorError> {
+            Ok(match value {
                 FlakeValue::Ref(sid) => {
                     let local_id = self.assign_subject_id(sid);
                     (ObjKind::REF_ID.as_u8(), local_id)
@@ -492,24 +511,31 @@ mod inner {
                 }
                 FlakeValue::Vector(v) => {
                     // Use shared vector pool for global handle.
-                    match self.vector_pool.insert_f64(self.g_id, p_id, v) {
-                        Ok(handle) => (
-                            ObjKind::VECTOR_ID.as_u8(),
-                            ObjKey::encode_u32_id(handle).as_u64(),
-                        ),
-                        Err(e) => {
-                            tracing::error!("SpoolContext: vector insert failed: {}", e);
-                            return None;
-                        }
-                    }
+                    let handle = self.vector_pool.insert_f64(self.g_id, p_id, v)?;
+                    (
+                        ObjKind::VECTOR_ID.as_u8(),
+                        ObjKey::encode_u32_id(handle).as_u64(),
+                    )
                 }
             })
         }
 
-        /// Write a spool record for one flake.
+        /// Write a spool record for one default-graph flake.
         ///
-        /// Fails if the flake's datatype would pass the datatype limit.
-        fn write_record(&mut self, rec: FlakeRecord) -> Result<(), CommitCodecError> {
+        /// Fails if the flake's datatype would pass the datatype limit, or its
+        /// vector is one the ledger cannot store: the refusals a transaction
+        /// gets for the same data.
+        fn write_record(&mut self, rec: FlakeRecord) -> Result<(), TransactError> {
+            self.write_record_in(rec, None)
+        }
+
+        /// [`Self::write_record`] for a flake of the named graph `graph`, or
+        /// the default graph.
+        fn write_record_in(
+            &mut self,
+            rec: FlakeRecord,
+            graph: Option<&str>,
+        ) -> Result<(), TransactError> {
             let FlakeRecord {
                 s,
                 p,
@@ -522,9 +548,9 @@ mod inner {
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
             let dt_id = self.assign_datatype_id(dt)?;
-            let Some((o_kind, o_key)) = self.resolve_object_value(o, p_id) else {
-                return Ok(()); // skip spool record on unresolvable value (e.g. bad vector)
-            };
+            let (o_kind, o_key) = self
+                .resolve_object_value(o, p_id)
+                .map_err(|e| self.invalid_vector(p, graph, &e))?;
             let lang_id = lang.map(|l| self.assign_lang_id(l)).unwrap_or(0);
             let i = list_index
                 .map(|idx| {
@@ -555,6 +581,21 @@ mod inner {
             Ok(())
         }
 
+        /// The refusal of a vector of `p` the ledger cannot store.
+        /// `assign_predicate_id` has cached `p`'s prefix.
+        fn invalid_vector(
+            &self,
+            p: &Sid,
+            graph: Option<&str>,
+            error: &VectorError,
+        ) -> TransactError {
+            let prefix = self
+                .ns_prefix_cache
+                .get(&p.namespace_code)
+                .map_or("", String::as_str);
+            crate::vector_dims::invalid_vector(&format!("{prefix}{}", p.name), graph, error)
+        }
+
         /// Allocate (or look up) the `g_id` for a named-graph IRI via the shared
         /// graph allocator.
         ///
@@ -578,11 +619,12 @@ mod inner {
         pub fn push_named_graph_record(
             &mut self,
             g_id: GraphId,
+            graph_iri: &str,
             rec: FlakeRecord,
-        ) -> Result<(), CommitCodecError> {
+        ) -> Result<(), TransactError> {
             let saved = self.g_id;
             self.g_id = g_id;
-            let result = self.write_record(rec);
+            let result = self.write_record_in(rec, Some(graph_iri));
             self.g_id = saved;
             result
         }
@@ -625,8 +667,10 @@ mod inner {
         /// `term_blank`.
         sub_chunk: u32,
         writer: StreamingCommitWriter,
-        /// First encoding error encountered (checked after parse).
-        encode_error: Option<CommitCodecError>,
+        /// First encoding error encountered (checked after parse): a value the
+        /// ledger refuses, typed as a transaction's refusal, or else a
+        /// `CommitCodec` failure.
+        encode_error: Option<TransactError>,
         /// Turtle @prefix short names: IRI → short prefix (e.g., "http://example.org/" → "ex").
         /// Captured from `on_prefix()` calls during parse.
         prefix_map: HashMap<String, String>,
@@ -721,7 +765,8 @@ mod inner {
 
         /// Consume the sink and return the writer for finalization.
         ///
-        /// Returns an error if any flake failed to encode during parsing.
+        /// Returns an error if any flake failed to encode during parsing (see
+        /// [`encode_failure`]).
         ///
         /// Distinct from the protocol's [`GraphSink::finish`] (flush /
         /// finalize): this is the sink's *product*. Deferred-error semantics
@@ -737,7 +782,7 @@ mod inner {
                 HashMap<String, String>,
                 Option<SpoolContext>,
             ),
-            CommitCodecError,
+            TransactError,
         > {
             let mut sink = self;
             let lists: Vec<_> = std::mem::take(&mut sink.lists)
@@ -821,13 +866,27 @@ mod inner {
 
             // Late hard guard: reject (FlakeValue, datatype) shapes that would
             // produce corrupt flakes (e.g. scalar object key with VECTOR_ID
-            // datatype). Surface as a CommitCodecError so the import fails
+            // datatype). Surface as the sink's encode error so the import fails
             // loudly rather than silently dropping/storing bad records.
             if let Err(e) = crate::generate::flakes::validate_value_dt_pair(&o, &dt) {
                 if self.encode_error.is_none() {
-                    let msg = format!("invariant violation: {e}");
-                    tracing::error!("ImportSink: {msg}");
-                    self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                    // A vector no ledger can store is refused as a write of
+                    // it is, naming its property.
+                    let refusal = match &o {
+                        FlakeValue::Vector(v) => fluree_db_core::vector::check_vector_f64(None, v)
+                            .err()
+                            .map(|ve| {
+                                crate::vector_dims::invalid_vector(&self.ns.iri(&p), None, &ve)
+                            }),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        TransactError::CommitCodec(CommitCodecError::InvalidOp(format!(
+                            "invariant violation: {e}"
+                        )))
+                    });
+                    tracing::error!("ImportSink: {refusal}");
+                    self.encode_error = Some(refusal);
                 }
                 return;
             }
@@ -861,7 +920,7 @@ mod inner {
             if let Err(e) = self.writer.push_flake(flake) {
                 if self.encode_error.is_none() {
                     tracing::error!("ImportSink: flake encode failed: {}", e);
-                    self.encode_error = Some(e);
+                    self.encode_error = Some(TransactError::CommitCodec(e));
                 }
                 return; // Don't spool a flake that failed to encode
             }
@@ -1039,7 +1098,8 @@ mod inner {
                     if self.encode_error.is_none() {
                         let msg = format!("invariant violation in reifier bundle: {e}");
                         tracing::error!("ImportSink: {msg}");
-                        self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                        self.encode_error =
+                            Some(TransactError::CommitCodec(CommitCodecError::InvalidOp(msg)));
                     }
                     return Ok(());
                 }
@@ -1048,7 +1108,7 @@ mod inner {
                 if let Err(e) = self.writer.push_flake(&flake) {
                     if self.encode_error.is_none() {
                         tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);
-                        self.encode_error = Some(e);
+                        self.encode_error = Some(TransactError::CommitCodec(e));
                     }
                     return Ok(()); // Don't spool a flake that failed to encode
                 }
@@ -1183,7 +1243,7 @@ mod inner {
             let new = Sid::new(fluree_vocab::namespaces::XSD, "int");
             let err = ctx.write_record(rec(&new)).unwrap_err();
             assert!(
-                err.to_string().contains("datatype limit exceeded"),
+                matches!(err, TransactError::DatatypeLimitExceeded { .. }),
                 "unexpected error: {err}"
             );
             assert_eq!(ctx.record_count(), 1, "the refused record is not spooled");
@@ -1577,6 +1637,7 @@ mod inner {
     }
 }
 
+pub use inner::encode_failure;
 pub use inner::BufferedSpoolResult;
 pub use inner::FlakeRecord;
 pub use inner::ImportSink;

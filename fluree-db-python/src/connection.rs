@@ -9,7 +9,7 @@ use crate::convert::{
     time_spec, to_json, to_jsonld,
 };
 use crate::cypher;
-use crate::error::{api_error, fluree_error, invalid_request, not_found};
+use crate::error::{api_error, fluree_error, import_error, invalid_request, not_found};
 use crate::graph_source;
 use crate::ops;
 use crate::query::{execute, Controls};
@@ -371,15 +371,9 @@ impl Connection {
                 .map(drop)
                 .map_err(api_error)?,
             Some(source) => block_on(py, async {
-                fluree
-                    .create(&id)
-                    .import(&source)
-                    .execute()
-                    .await
-                    .map(drop)
-                    .map_err(|e| e.to_string())
+                fluree.create(&id).import(&source).execute().await.map(drop)
             })?
-            .map_err(fluree_error)?,
+            .map_err(import_error)?,
         }
         Ok(id)
     }

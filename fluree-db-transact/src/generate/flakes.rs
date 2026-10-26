@@ -722,22 +722,13 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
              a parser produced a mismatched (value, datatype) shape"
         )));
     }
-    // Empty vectors must never reach the indexer: `FlakeValue::Vector(Vec::new())`
-    // is reserved as the `FlakeValue::max()` upper-bound sentinel, and the shared
-    // vector arena hard-rejects them. Catch any path that bypassed
-    // `coerce_array_to_vector`'s upstream check (e.g. a future direct
-    // construction of `FlakeValue::Vector(vec![].into())`).
-    if is_vector_dt {
-        if let FlakeValue::Vector(v) = val {
-            if v.is_empty() {
-                return Err(TransactError::FlakeGeneration(
-                    "f:embeddingVector flake must have at least one element; \
-                     empty vectors collide with the FlakeValue::max() sentinel \
-                     and the vector arena rejects them"
-                        .to_string(),
-                ));
-            }
-        }
+    // Every vector must be one the vector arena can store. An empty vector
+    // would also collide with the `FlakeValue::max()` upper-bound sentinel.
+    // Whether its length matches the property's other vectors is checked per
+    // commit (`crate::vector_dims`).
+    if let FlakeValue::Vector(v) = val {
+        fluree_db_core::vector::check_vector_f64(None, v)
+            .map_err(|e| TransactError::InvalidVector(e.to_string()))?;
     }
     if dt == &*DT_JSON && !matches!(val, FlakeValue::Json(_)) {
         return Err(TransactError::FlakeGeneration(format!(
@@ -1056,7 +1047,18 @@ mod tests {
             &Sid::new(FLUREE_DB, "embeddingVector"),
         )
         .expect_err("empty vector must be rejected");
-        assert!(format!("{err}").contains("at least one element"), "{err}");
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_pair_rejects_a_vector_longer_than_the_arena_holds() {
+        let dt = Sid::new(FLUREE_DB, "embeddingVector");
+        let longest = vec![0.5; fluree_db_core::vector::MAX_VECTOR_DIMS];
+        validate_value_dt_pair(&FlakeValue::Vector(longest.into()), &dt).expect("65535 elements");
+        let too_long = vec![0.5; fluree_db_core::vector::MAX_VECTOR_DIMS + 1];
+        let err = validate_value_dt_pair(&FlakeValue::Vector(too_long.into()), &dt)
+            .expect_err("65536 elements must be rejected");
+        assert!(matches!(err, TransactError::InvalidVector(_)), "{err}");
     }
 
     #[test]
