@@ -16,6 +16,7 @@
 use bigdecimal::BigDecimal;
 use fluree_db_binary_index::arena::numbig::NumBigArena;
 use fluree_db_binary_index::arena::vector::VectorArena;
+use fluree_db_core::vector::VectorError;
 use fluree_db_core::GraphId;
 use num_bigint::BigInt;
 use parking_lot::{Mutex, RwLock};
@@ -54,14 +55,14 @@ impl SharedVectorArenaPool {
     /// Insert an f32 vector for the given (graph, predicate).
     ///
     /// Creates the arena on first access. Returns a global handle.
-    pub fn insert_f32(&self, g_id: GraphId, p_id: u32, vec: &[f32]) -> Result<u32, String> {
+    pub fn insert_f32(&self, g_id: GraphId, p_id: u32, vec: &[f32]) -> Result<u32, VectorError> {
         let arena = self.get_or_create(g_id, p_id);
         let mut guard = arena.lock();
         guard.insert_f32(vec)
     }
 
     /// Insert an f64 vector for the given (graph, predicate) (downcasts to f32).
-    pub fn insert_f64(&self, g_id: GraphId, p_id: u32, vec: &[f64]) -> Result<u32, String> {
+    pub fn insert_f64(&self, g_id: GraphId, p_id: u32, vec: &[f64]) -> Result<u32, VectorError> {
         let arena = self.get_or_create(g_id, p_id);
         let mut guard = arena.lock();
         guard.insert_f64(vec)

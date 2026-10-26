@@ -4,7 +4,7 @@
 
 use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
-use crate::dataset::DataSet;
+use crate::dataset::{DataSet, MemberKind};
 use crate::error::Result;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
@@ -491,6 +491,19 @@ pub async fn prepare_execution_with_config(
                 geo_index_covers,
             );
 
+            // SPARQL's view of RDF lists (`crate::list_view`), for a ledger
+            // that may hold list members. History reads keep the stored rows.
+            let list_view = if query.query.rdf_list_view && !planning.is_history() {
+                crate::list_view::view_for(db.snapshot, db.overlay, binary_store)?
+            } else {
+                None
+            };
+            let encode = |iri: &str| db.snapshot.encode_iri(iri);
+            let rewritten_patterns = match &list_view {
+                Some(view) => crate::list_view::rewrite_patterns(rewritten_patterns, view, &encode),
+                None => rewritten_patterns,
+            };
+
             let before_dedup = rewritten_patterns.len();
             let rewritten_patterns = dedup_exact_triples(rewritten_patterns);
             if rewritten_patterns.len() != before_dedup {
@@ -511,7 +524,13 @@ pub async fn prepare_execution_with_config(
                 );
             }
 
-            query.query.with_patterns(rewritten_patterns)
+            let mut rewritten = query.query.with_patterns(rewritten_patterns);
+            if let Some(view) = &list_view {
+                // The WHERE is rewritten above; this reaches the `EXISTS` of
+                // the grouping and ordering expressions.
+                crate::list_view::rewrite_modifiers_of(&mut rewritten, view, &encode);
+            }
+            rewritten
         };
 
         // ---- plan: build operator tree from rewritten query ----
@@ -780,6 +799,10 @@ pub struct ContextConfig<'a, 'b> {
     pub english_lang_id: Option<u16>,
     /// Remote SERVICE executor for `fluree:remote:` endpoints.
     pub remote_service: Option<&'b dyn crate::remote_service::RemoteServiceExecutor>,
+    /// What `db` reads when there is no dataset, if the caller knows (see
+    /// [`MemberKind`]); dataset members carry their own
+    /// [`GraphRef::kind`](crate::dataset::GraphRef::kind).
+    pub primary_kind: MemberKind,
 }
 
 /// Execute a prepared query with configurable context options
@@ -970,34 +993,39 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx = ctx.with_remote_service(executor);
     }
 
-    // Precompute which graphs in the dataset are R2RML-backed.
-    if let (Some(r2rml_provider), Some(dataset)) = (ctx.r2rml_provider, ctx.explicit_dataset()) {
+    // Precompute which of the query's graphs are R2RML-backed: the members of
+    // a dataset the query named, or otherwise the primary snapshot (a
+    // single-source graph source query; a union default graph's members are
+    // the primary ledger's own graphs). The provider is asked only about
+    // graphs whose kind leaves it open; a native graph is never looked up, and
+    // a lookup that fails fails the query rather than reading a graph source
+    // as an empty graph.
+    ctx.primary_kind = config.primary_kind;
+    if let Some(provider) = ctx.r2rml_provider {
         let mut r2rml_ids = std::collections::HashSet::new();
-        for graph_ref in dataset.default_graphs() {
-            let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
-            if is_r2rml {
-                r2rml_ids.insert(Arc::clone(&graph_ref.ledger_id));
+        if let Some(dataset) = ctx.explicit_dataset() {
+            for graph_ref in dataset.default_graphs() {
+                if graph_ref.kind != MemberKind::Native
+                    && provider.has_r2rml_mapping(&graph_ref.ledger_id).await?
+                {
+                    r2rml_ids.insert(Arc::clone(&graph_ref.ledger_id));
+                }
             }
-        }
-        for (iri, graph_ref) in dataset.named_graphs_iter() {
-            let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
-            if is_r2rml {
-                // Insert the graph IRI (not ledger_id) since graph.rs
-                // checks r2rml_graph_ids against the GRAPH pattern IRI.
-                r2rml_ids.insert(Arc::clone(iri));
+            for (iri, graph_ref) in dataset.named_graphs_iter() {
+                if graph_ref.kind != MemberKind::Native
+                    && provider.has_r2rml_mapping(&graph_ref.ledger_id).await?
+                {
+                    // Insert the graph IRI (not ledger_id) since graph.rs
+                    // checks r2rml_graph_ids against the GRAPH pattern IRI.
+                    r2rml_ids.insert(Arc::clone(iri));
+                }
             }
+        } else if config.primary_kind != MemberKind::Native
+            && provider.has_r2rml_mapping(&db.snapshot.ledger_id).await?
+        {
+            r2rml_ids.insert(Arc::from(db.snapshot.ledger_id.as_str()));
         }
         ctx.r2rml_graph_ids = r2rml_ids;
-    }
-    // Also check the primary snapshot's ledger_id (for single-source graph source queries)
-    if let Some(provider) = ctx.r2rml_provider {
-        if ctx.explicit_dataset().is_none() {
-            let is_r2rml = provider.has_r2rml_mapping(&db.snapshot.ledger_id).await;
-            if is_r2rml {
-                ctx.r2rml_graph_ids
-                    .insert(Arc::from(db.snapshot.ledger_id.as_str()));
-            }
-        }
     }
 
     // A sub-query plans at run time; name the variables in its plan errors.

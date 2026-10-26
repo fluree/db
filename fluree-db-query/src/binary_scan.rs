@@ -202,6 +202,11 @@ pub struct BinaryScanOperator {
     /// `f:reifies*` skip in `flakes_to_bindings`) become no-ops so
     /// debug/inspection callers can see Fluree-system facts directly.
     include_system_facts: bool,
+    /// Skip rows that are members of a compactly stored RDF list — rows with
+    /// a list position. In SPARQL's view of lists (see
+    /// [`crate::list_view`]) a member is not a value of its predicate; the
+    /// list's owner edge and cells come from [`crate::list_view`] instead.
+    hide_list_members: bool,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -743,6 +748,7 @@ impl BinaryScanOperator {
             p_sids_ephemeral: HashMap::new(),
             p_is_var,
             include_system_facts: false,
+            hide_list_members: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -758,6 +764,12 @@ impl BinaryScanOperator {
             unresolved_bound_subject_iri: None,
             mode,
         }
+    }
+
+    /// Skip list members (see [`Self::hide_list_members`]).
+    pub fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -825,6 +837,9 @@ impl BinaryScanOperator {
                 && !self.include_system_facts
                 && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
             {
+                continue;
+            }
+            if self.hide_list_members && flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
                 continue;
             }
 
@@ -1408,6 +1423,14 @@ impl BinaryScanOperator {
         // rows is parsed once per temporal kind, not per row.
         let object_bounds = self.object_bounds.clone();
         let object_bounds = object_bounds.as_ref().map(ObjectBounds::prepare);
+        // Decided per batch: a leaflet holding no list rows loads its
+        // position column as the constant "none".
+        let hide_members = self.hide_list_members
+            && !matches!(
+                batch.o_i,
+                fluree_db_binary_index::ColumnData::Const(u32::MAX)
+                    | fluree_db_binary_index::ColumnData::AbsentDefault
+            );
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
@@ -1423,6 +1446,9 @@ impl BinaryScanOperator {
 
             // Skip internal db: predicates on wildcard scans.
             if self.is_internal_predicate(p_id) {
+                continue;
+            }
+            if hide_members && o_i != u32::MAX {
                 continue;
             }
 
@@ -2084,6 +2110,9 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // Over a dataset spanning ledgers the list view is not applied, and a
+        // member is a value of its predicate.
+        self.hide_list_members &= !ctx.is_multi_ledger();
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
         // hiding it would defeat the point of inspecting a history
@@ -3165,7 +3194,8 @@ impl Operator for BinaryScanOperator {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
-        if !self.count_only_eligible() {
+        // Counting rows undecoded would count the list members it hides.
+        if !self.count_only_eligible() || self.hide_list_members {
             return Ok(None);
         }
 

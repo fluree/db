@@ -37,7 +37,7 @@ use fluree_db_novelty::{
     stamp_graph_on_commit_flakes, warn_if_forged_commit_flakes_dropped, Novelty,
 };
 use fluree_db_policy::PolicyContext;
-use fluree_db_transact::datatype_limit;
+use fluree_db_transact::{datatype_limit, vector_dims};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -489,6 +489,27 @@ impl Fluree {
             )
             .map_err(ApiError::Transact)?;
             pushed_datatypes.extend(adding);
+
+            // 4.0.3 Vectors the index can store: checked against the ledger
+            // and the earlier commits of this push, as a local write is.
+            vector_dims::check_vectors(
+                &base_state,
+                &evolving_novelty,
+                &c.commit.flakes,
+                &reverse_graph,
+                |sid| {
+                    base_state
+                        .snapshot
+                        .decode_sid(sid)
+                        .or_else(|| {
+                            pushed_namespaces
+                                .get(&sid.namespace_code)
+                                .map(|prefix| format!("{prefix}{}", sid.name))
+                        })
+                        .unwrap_or_else(|| sid.to_string())
+                },
+            )
+            .map_err(ApiError::Transact)?;
 
             // 4.1 Retraction invariant (strict), read as of `current_t`: the
             // state's `t` is the greater of the index's and novelty's.

@@ -223,6 +223,10 @@ impl<O: OverlayProvider + ?Sized> OverlayProvider for SizedOverlayRef<'_, O> {
         self.0.epoch()
     }
 
+    fn list_predicates(&self) -> Option<std::sync::Arc<std::collections::HashSet<Sid>>> {
+        self.0.list_predicates()
+    }
+
     fn is_effectively_empty(&self) -> bool {
         self.0.is_effectively_empty()
     }
