@@ -193,7 +193,9 @@ pub use import::{
     EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
     ImportSummary, RemoteSource,
 };
-pub use ledger_info::{redact_graph_source_config, LedgerInfoBuilder};
+pub use ledger_info::{
+    redact_graph_source_config, redact_graph_source_record_config, LedgerInfoBuilder,
+};
 pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
@@ -246,6 +248,8 @@ pub use view::{
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
 };
 
+#[cfg(feature = "sql")]
+pub use graph_source::sql_auth_from_json;
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
     guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
@@ -257,6 +261,16 @@ pub use graph_source::{
     StorageAccessReport, StorageDecision, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
     TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
 };
+/// The one codec every surface turns its graph-source input into the
+/// persisted config with; see [`graph_source::surface`].
+#[cfg(feature = "iceberg")]
+pub use graph_source::{
+    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, AuthProfile,
+    CatalogAuthFields, GraphSourceInputError, InputErrorKind, SecretRules, StorageAuthFields,
+    SECRET_ENV_VARS_ENV,
+};
+#[cfg(feature = "delta")]
+pub use graph_source::{delta_connection_from_json, DeltaConnection};
 
 #[cfg(feature = "delta")]
 pub use fluree_db_delta::{
@@ -3881,6 +3895,13 @@ impl Fluree {
     #[cfg(feature = "iceberg")]
     pub(crate) fn secret_resolver(&self) -> Option<&Arc<dyn fluree_db_iceberg::SecretResolver>> {
         self.identity.secret_resolver.as_ref()
+    }
+
+    /// Whether this instance can resolve a graph source's `secret_ref` values
+    /// (see [`Fluree::with_secret_resolver`]); a surface refuses them otherwise.
+    #[cfg(feature = "iceberg")]
+    pub fn has_secret_resolver(&self) -> bool {
+        self.identity.secret_resolver.is_some()
     }
 
     /// Everything a graph-source auth provider is built with on this instance.

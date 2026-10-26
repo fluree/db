@@ -236,6 +236,14 @@ pub enum ApiError {
     #[error("{0}")]
     Iceberg(#[from] fluree_db_iceberg::IcebergError),
 
+    /// A surface's graph-source input (an HTTP body, CLI flags, a Python
+    /// spec) was refused before anything was built: an unknown field, auth
+    /// given two ways or half given, a secret it may not name. A 400 whose
+    /// message names the field.
+    #[cfg(feature = "iceberg")]
+    #[error("{0}")]
+    GraphSourceInput(#[from] crate::graph_source::GraphSourceInputError),
+
     /// Core/Storage errors
     #[error("Core error: {0}")]
     Core(#[from] fluree_db_core::Error),
@@ -785,6 +793,8 @@ impl ApiError {
             // conflict (unsupported state), not bad input. Other Iceberg
             // errors are configuration the caller supplied.
             #[cfg(feature = "iceberg")]
+            ApiError::GraphSourceInput(_) => 400,
+            #[cfg(feature = "iceberg")]
             ApiError::Iceberg(e) => match e {
                 fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => 409,
                 fluree_db_iceberg::IcebergError::GoogleTokenExchange { status, .. } => {
@@ -961,6 +971,8 @@ impl ApiError {
                 .map_or(errors::BAD_REQUEST, BuilderError::error_code),
             #[cfg(feature = "credential")]
             ApiError::Credential(_) => errors::INVALID_CREDENTIAL,
+            #[cfg(feature = "iceberg")]
+            ApiError::GraphSourceInput(_) => errors::INVALID_GRAPH_SOURCE_CONFIG,
             #[cfg(feature = "iceberg")]
             ApiError::Iceberg(e) => match e {
                 fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => {
@@ -1150,7 +1162,7 @@ mod tests {
     const VARIANTS: usize = 49
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
-        + cfg!(feature = "iceberg") as usize;
+        + 2 * cfg!(feature = "iceberg") as usize;
 
     fn conflict() -> ApiError {
         ApiError::Transact(TE::CommitConflict {
@@ -1253,6 +1265,15 @@ mod tests {
             ),
             #[cfg(feature = "iceberg")]
             (ApiError::Iceberg(IbE::Config("x".into())), 400, CONFIG),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::GraphSourceInput(crate::graph_source::GraphSourceInputError::invalid(
+                    "catalog.uri",
+                    "x",
+                )),
+                400,
+                INVALID_GRAPH_SOURCE_CONFIG,
+            ),
             (ApiError::config("x"), 400, CONFIG),
             (
                 ApiError::Format(FormatError::InvalidBinding("x".into())),
@@ -1635,7 +1656,7 @@ mod tests {
                 #[cfg(feature = "credential")]
                 ApiError::Credential(_) => {}
                 #[cfg(feature = "iceberg")]
-                ApiError::Iceberg(_) => {}
+                ApiError::Iceberg(_) | ApiError::GraphSourceInput(_) => {}
             }
         }
         rows

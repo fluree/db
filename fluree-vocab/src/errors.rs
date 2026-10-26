@@ -155,6 +155,12 @@ pub const NOT_ACCEPTABLE: &str = "err:api/NotAcceptable";
 /// Unsupported media type (request body format not accepted)
 pub const UNSUPPORTED_MEDIA_TYPE: &str = "err:api/UnsupportedMediaType";
 
+/// A graph source's connection, auth or storage-identity input was refused
+/// before anything was built (HTTP 400): an unknown field, auth given two ways
+/// or only partly, flat and structured fields mixed, or a secret the surface
+/// may not name. The message names the field, never its value.
+pub const INVALID_GRAPH_SOURCE_CONFIG: &str = "err:api/InvalidGraphSourceConfig";
+
 // =============================================================================
 // Parsing Errors (parse)
 // =============================================================================

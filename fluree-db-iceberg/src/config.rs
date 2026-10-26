@@ -266,8 +266,11 @@ impl IcebergGsConfig {
                 // operator-allowlisted root. Refuse at creation rather than
                 // letting a disallowed path surface as a storage error later.
                 crate::local_guard::ensure_local_location_allowed(table_location)?;
-                // Validate table identifier can be derived from table_location
-                self.table_identifier()?;
+                // Without a mapping the table is the location's own; with one,
+                // each `rr:tableName` names it (a warehouse root names none).
+                if self.mapping.is_none() {
+                    self.table_identifier()?;
+                }
                 // Vended credentials are not supported with Direct catalog
                 if self.io.vended_credentials {
                     return Err(IcebergError::Config(
@@ -1338,6 +1341,34 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("table_location"));
+    }
+
+    #[test]
+    fn test_validate_direct_warehouse_root_needs_a_table_only_without_a_mapping() {
+        // `s3://bucket/dw` names no table: the source's own table cannot be
+        // derived from it, but each of a mapping's `rr:tableName`s can be found
+        // beneath it.
+        let config = |mapping: Option<MappingSource>| IcebergGsConfig {
+            catalog: CatalogConfig::direct("s3://bucket/dw"),
+            table: TableConfig::Identifier(String::new()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        };
+        let err = config(None).validate().unwrap_err().to_string();
+        assert!(err.contains("table identifier"), "{err}");
+        config(Some(MappingSource {
+            source: "fluree:cid:m".into(),
+            media_type: Some("text/turtle".into()),
+        }))
+        .validate()
+        .unwrap();
     }
 
     #[test]

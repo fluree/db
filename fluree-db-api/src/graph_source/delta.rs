@@ -66,46 +66,20 @@ pub struct DeltaAzureFields {
 impl DeltaAzureFields {
     /// `None` when no field is set (ambient credentials). A partial set is an
     /// error: silently falling back to ambient credentials would read with an
-    /// identity the caller did not name.
+    /// identity the caller did not name. The one rule every surface uses
+    /// ([`super::surface::azure_auth`]).
     pub fn into_auth(self) -> crate::Result<Option<fluree_db_delta::AzureAuth>> {
-        use fluree_db_iceberg::ConfigValue;
-        let Self {
-            tenant_id,
-            client_id,
+        let client_secret = super::surface::secret_field(
+            "azure_client_secret",
+            self.client_secret,
+            "azure_client_secret_env",
+            self.client_secret_env,
+        )?;
+        Ok(super::surface::azure_auth(
+            self.tenant_id,
+            self.client_id,
             client_secret,
-            client_secret_env,
-        } = self;
-        if tenant_id.is_none()
-            && client_id.is_none()
-            && client_secret.is_none()
-            && client_secret_env.is_none()
-        {
-            return Ok(None);
-        }
-        let client_secret = match (client_secret, client_secret_env) {
-            (Some(literal), None) => ConfigValue::literal(literal),
-            (None, Some(var)) => ConfigValue::from_env(var),
-            _ => {
-                return Err(crate::ApiError::Config(
-                    "Azure service principal: give exactly one of the client secret and the \
-                     environment variable holding it"
-                        .to_string(),
-                ))
-            }
-        };
-        match (tenant_id, client_id) {
-            (Some(tenant_id), Some(client_id)) => {
-                Ok(Some(fluree_db_delta::AzureAuth::ClientSecret {
-                    tenant_id,
-                    client_id,
-                    client_secret,
-                }))
-            }
-            _ => Err(crate::ApiError::Config(
-                "Azure service principal: tenant id, client id and client secret are all required"
-                    .to_string(),
-            )),
-        }
+        )?)
     }
 }
 
@@ -129,52 +103,26 @@ pub struct DeltaUnityFields {
 
 impl DeltaUnityFields {
     /// `None` when no field is set. Catalog fields without a workspace, or a
-    /// workspace without exactly one way to authenticate, are errors.
+    /// workspace without exactly one way to authenticate, are errors: the
+    /// catalog-auth rule every surface uses
+    /// ([`super::surface::CatalogAuthFields`]).
     pub fn into_config(self) -> crate::Result<Option<UnityConfig>> {
-        use fluree_db_iceberg::auth::AuthConfig;
-        use fluree_db_iceberg::ConfigValue;
-        let bad = |message: &str| Err(crate::ApiError::Config(format!("Unity Catalog: {message}")));
-        let Some(uri) = self.uri else {
-            let stray = self.catalog.is_some()
-                || self.schema.is_some()
-                || self.bearer.is_some()
-                || self.oauth2_client_id.is_some()
-                || self.oauth2_client_secret.is_some()
-                || self.oauth2_token_url.is_some()
-                || self.oauth2_scope.is_some();
-            return if stray {
-                bad("catalog and auth options need the workspace URL")
-            } else {
-                Ok(None)
-            };
+        let auth = super::surface::CatalogAuthFields {
+            bearer: self.bearer.map(|token| ("auth_bearer", token)),
+            oauth2_token_url: self.oauth2_token_url,
+            oauth2_client_id: self.oauth2_client_id,
+            oauth2_client_secret: self
+                .oauth2_client_secret
+                .map(|secret| ("oauth2_client_secret", secret)),
+            oauth2_scope: self.oauth2_scope,
+            ..Default::default()
         };
-        let auth = match (
-            self.bearer,
-            self.oauth2_client_id,
-            self.oauth2_client_secret,
-        ) {
-            (Some(token), None, None) => AuthConfig::Bearer { token },
-            (None, Some(client_id), Some(client_secret)) => AuthConfig::OAuth2ClientCredentials {
-                token_url: self
-                    .oauth2_token_url
-                    .unwrap_or_else(|| format!("{}/oidc/v1/token", uri.trim_end_matches('/'))),
-                client_id: ConfigValue::literal(client_id),
-                client_secret,
-                scope: Some(self.oauth2_scope.unwrap_or_else(|| "all-apis".to_string())),
-                audience: None,
-            },
-            _ => {
-                return bad(
-                    "give a bearer token, or the client id and secret of a service principal",
-                )
-            }
-        };
-        Ok(Some(UnityConfig {
-            uri,
+        Ok(super::surface::unity_config(
+            self.uri,
+            self.catalog,
+            self.schema,
             auth,
-            catalog: self.catalog,
-            schema: self.schema,
-        }))
+        )?)
     }
 }
 

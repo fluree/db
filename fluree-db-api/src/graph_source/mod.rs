@@ -233,6 +233,20 @@ mod ephemeral;
 #[cfg(feature = "iceberg")]
 mod r2rml_materialize;
 
+#[cfg(feature = "iceberg")]
+pub mod surface;
+
+#[cfg(feature = "sql")]
+pub use surface::sql_auth_from_json;
+#[cfg(feature = "iceberg")]
+pub use surface::{
+    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, AuthProfile,
+    CatalogAuthFields, GraphSourceInputError, InputErrorKind, SecretRules, StorageAuthFields,
+    SECRET_ENV_VARS_ENV,
+};
+#[cfg(feature = "delta")]
+pub use surface::{delta_connection_from_json, DeltaConnection};
+
 #[cfg(feature = "sql")]
 mod sql;
 

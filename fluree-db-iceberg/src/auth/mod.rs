@@ -14,11 +14,13 @@
 //!   catalogs (BigLake), where a static bearer would expire
 
 mod bearer;
+pub mod fields;
 pub mod google;
 mod oauth2;
 mod token;
 
 pub use bearer::BearerTokenAuth;
+pub use fields::{ConfigValueField, ValueClass};
 pub use google::{
     AccessToken, ExternalAccountConfig, GoogleCatalogAuth, GoogleCredentials, GoogleIdentity,
     GoogleSource,
@@ -345,6 +347,38 @@ impl AuthConfig {
                 scopes: scopes.clone(),
                 quota_project: quota_project.clone(),
             }),
+        }
+    }
+
+    /// Check what can be checked before any secret resolves: a Google
+    /// identity's scopes, quota project and credential shape (see
+    /// [`GoogleCredentials::validate_static`]). Lets a registration refuse a
+    /// config no request could ever use, instead of storing it.
+    pub fn validate_static(&self) -> Result<()> {
+        match self {
+            AuthConfig::None
+            | AuthConfig::Bearer { .. }
+            | AuthConfig::OAuth2ClientCredentials { .. } => Ok(()),
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url: _,
+            } => google::parse_scopes(scopes.as_deref()).map(|_| ()),
+            AuthConfig::Google {
+                credentials,
+                scopes,
+                quota_project,
+            } => {
+                google::parse_scopes(scopes.as_deref())?;
+                if quota_project
+                    .as_deref()
+                    .is_some_and(|p| !google::is_project_id(p))
+                {
+                    return Err(crate::error::IcebergError::GoogleCredentialsInvalid(
+                        "quota_project is not a Google Cloud project id".to_string(),
+                    ));
+                }
+                credentials.validate_static()
+            }
         }
     }
 }
