@@ -3066,12 +3066,12 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `name` | string | Graph source name (required) |
 | `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
-| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables. In `rest` mode, a given `table` is the one loaded to test the catalog connection |
 | `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
 | `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
 | `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
 | `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
-| `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle (required). A request without it is a 400 and registers nothing. |
 | `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
 | `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
@@ -3116,17 +3116,19 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
   "connection_tested": true,
   "mapping_source": "r2rml-inline",
   "triples_map_count": 3,
+  "table_count": 1,
+  "table_names": ["sales.orders"],
   "mapping_validated": true
 }
 ```
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — missing required fields, or an `r2rml` that does not parse or compile
+- `400 Bad Request` — missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile
 - `401/403` — admin auth required
 - `500 Internal Server Error` — the graph source could not be published
 
-A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
+`connection_tested` reports whether registration reached the source's tables: a `rest` source by loading its table from the catalog, a `direct` source by resolving each mapped table's current metadata the way a query does (metadata only, no data files). It is always `false` in `glue` and `s3tables` modes, whose catalog is first called at query time. A table that cannot be reached does not fail the request; the response carries `connection_tested: false`.
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 

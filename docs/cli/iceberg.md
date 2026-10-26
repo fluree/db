@@ -18,7 +18,7 @@ Map an Iceberg table as a queryable graph source.
 ### Usage
 
 ```bash
-fluree iceberg map <NAME> [OPTIONS]
+fluree iceberg map <NAME> --r2rml <PATH> [OPTIONS]
 ```
 
 ### Arguments
@@ -54,7 +54,7 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--table <ID>` | Table identifier `namespace.table`; required unless `--r2rml` is given, whose `rr:tableName` entries then name the tables. For `glue`, `namespace` is the Glue database. |
+| `--table <ID>` | Table identifier `namespace.table`. Optional: the `--r2rml` mapping's `rr:tableName` entries name the tables. In `rest` mode, a given table is the one `map` loads to test the catalog connection. For `glue`, `namespace` is the Glue database. |
 | `--region <REGION>` | AWS region of the Glue / S3 Tables API. Glue falls back to `--s3-region`, then the AWS SDK's region chain; S3 Tables defaults to the table bucket ARN's region and refuses a `--region` that contradicts it. S3 data reads use `--s3-region` when given, else this region. Must be an AWS region code (e.g. `us-east-1`). |
 | `--catalog-id <ID>` | Glue catalog id for cross-account access (`glue` mode; defaults to the caller's account) |
 | `--table-bucket-arn <ARN>` | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required for `s3tables` mode; any AWS partition) |
@@ -109,7 +109,7 @@ Four catalog modes are supported:
 - **AWS Glue mode** (`--mode glue`): Looks the table up in the AWS Glue Data Catalog (Glue `GetTable`) and reads the metadata file its `metadata_location` parameter names. The Glue database is the namespace; `--catalog-id` reads another account's catalog.
 - **AWS S3 Tables mode** (`--mode s3tables`): Resolves the table's metadata file in an S3 Tables table bucket (`--table-bucket-arn`) with `GetTableMetadataLocation`.
 
-Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` tests the connection for REST catalogs only: for Glue and S3 Tables it reports `Connection: not tested`, and catalog errors surface at query time. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` tests the connection for REST catalogs (by loading the table) and Direct locations (by resolving each mapped table's current metadata, as a query does); for Glue and S3 Tables it reports `Connection: not tested`, and catalog errors surface at query time. A connection that cannot be verified does not fail `map`: it reports `Connection: not verified` and registers the source. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
 
 ### Examples
 

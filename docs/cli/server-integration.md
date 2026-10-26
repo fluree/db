@@ -2389,12 +2389,12 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `name` | string | Yes | Graph source name (no colons) |
 | `mode` | string | No | `"rest"` (default), `"direct"`, `"glue"` (AWS Glue Data Catalog), or `"s3tables"` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST mode | REST catalog URI |
-| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`); required for REST, Glue and S3 Tables modes if not specified in R2RML mapping |
+| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`). The R2RML mapping's `rr:tableName` entries name the tables; in REST mode a given `table` is the one loaded to test the catalog connection |
 | `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`), or a `file://` URI / absolute local path under `FLUREE_ICEBERG_LOCAL_ROOTS` |
 | `region` | string | No | AWS region of the Glue / S3 Tables API (Glue and S3 Tables modes) |
 | `catalog_id` | string | No | Glue catalog id for cross-account access (Glue mode; default: the caller's account) |
 | `table_bucket_arn` | string | S3 Tables mode | S3 Tables table-bucket ARN (`arn:aws:s3tables:<region>:<account>:bucket/<name>`) |
-| `r2rml` | string | No | Inline R2RML mapping content (Turtle). Without it the source is a plain Iceberg source with no mapping |
+| `r2rml` | string | Yes | Inline R2RML mapping content (Turtle). A request without it is a 400 and registers nothing |
 | `r2rml_type` | string | No | Mapping media type; default `"text/turtle"` (JSON-LD mappings are not supported yet) |
 | `branch` | string | No | Branch name (default: `"main"`) |
 | `auth_bearer` | string | No | Bearer token for REST catalog auth |
@@ -2476,17 +2476,19 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `graph_source_id` | string | Always | Created ID (e.g., `"warehouse-orders:main"`) |
 | `table_identifier` | string | Always | Table identifier or derived from location |
 | `catalog_uri` | string | Always | REST catalog URI, Direct table location, Glue catalog id (`aws-glue` for the caller's own account), or S3 Tables bucket ARN |
-| `connection_tested` | boolean | Always | Whether catalog connection was verified (tested for REST mode only; always `false` for Direct, Glue and S3 Tables) |
-| `mapping_source` | string | With `r2rml` | Content address of the stored R2RML mapping |
-| `triples_map_count` | integer | With `r2rml` | Number of TriplesMap definitions found |
-| `mapping_validated` | boolean | With `r2rml` | Whether mapping was parsed and compiled successfully |
+| `connection_tested` | boolean | Always | Whether registration reached the source's tables: through the catalog in REST mode, by resolving each mapped table's current metadata in Direct mode; always `false` for Glue and S3 Tables, whose catalog is first called at query time |
+| `mapping_source` | string | Always | Content address of the stored R2RML mapping |
+| `triples_map_count` | integer | Always | Number of TriplesMap definitions found |
+| `table_count` | integer | Always | Number of distinct tables the mapping reads |
+| `table_names` | string[] | Always | Those tables, sorted |
+| `mapping_validated` | boolean | Always | Whether mapping was parsed and compiled successfully |
 
 **Error responses:**
-- `400 Bad Request` — validation failures (missing fields, invalid mode, bad table identifier, an `r2rml` that does not parse or compile)
+- `400 Bad Request` — validation failures (missing fields, `r2rml` among them; invalid mode, bad table identifier, an `r2rml` that does not parse or compile)
 - `409 Conflict` — graph source with this name already exists (if your nameservice enforces uniqueness)
 - `500 Internal Server Error` — nameservice write failure
 
-A REST catalog that cannot be reached does not fail the request: the source is created and the response carries `connection_tested: false`.
+A table that cannot be reached, through a REST catalog or at a Direct location, does not fail the request: the source is created and the response carries `connection_tested: false`.
 
 ### Querying graph sources
 
