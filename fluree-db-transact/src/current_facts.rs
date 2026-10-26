@@ -2982,9 +2982,10 @@ mod tests {
     }
 
     /// Resolving a commit's pairs drops each pair's retraction wherever it
-    /// sits: flakes out of SPOT order, two pairs by term and one by index
-    /// key, and a retraction and an assertion that pair with nothing. Each
-    /// pair names its retraction's place in the walk.
+    /// sits: flakes out of SPOT order, two pairs by term (one behind another
+    /// value of its slot) and one by index key, and a retraction and
+    /// assertions that pair with nothing. Each pair names its retraction's
+    /// place in the walk.
     #[test]
     fn resolving_pairs_drops_each_retraction_wherever_it_sits() {
         let ledger = ledger(Vec::new(), &HashMap::new());
@@ -3009,6 +3010,7 @@ mod tests {
             big("nonNegativeInteger", true),
             flake("m", "p", "m", 2, true, None),
             flake("b", "p", "new", 2, true, None),
+            flake("m", "p", "a", 2, true, None),
         ];
         let mut spot: Vec<&Flake> = flakes.iter().collect();
         spot.sort_by(|a, b| IndexType::Spot.compare(a, b));
@@ -3029,7 +3031,10 @@ mod tests {
             .iter()
             .map(shape)
             .collect();
-        let want: Vec<_> = [0, 1, 5, 6, 7].iter().map(|&n| shape(&flakes[n])).collect();
+        let want: Vec<_> = [0, 1, 5, 6, 7, 8]
+            .iter()
+            .map(|&n| shape(&flakes[n]))
+            .collect();
         assert_eq!(got, want);
     }
 
