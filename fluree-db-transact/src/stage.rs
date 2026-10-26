@@ -95,10 +95,9 @@ async fn cascade_attachment_retracts(
     reverse_graph: &HashMap<Sid, GraphId>,
     new_t: i64,
     lpg_edge_lifecycle: bool,
+    relationship_deletes: Option<&[String]>,
 ) -> Result<Vec<Flake>> {
-    use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
-    use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
     use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
 
     use std::collections::BTreeMap;
@@ -132,11 +131,6 @@ async fn cascade_attachment_retracts(
         cascade_count = tracing::field::Empty,
     );
     async {
-        let f_reifies_subject = Sid::new(
-            fluree_vocab::namespaces::FLUREE_DB,
-            fluree_vocab::db::REIFIES_SUBJECT,
-        );
-        let to_t = ledger.t();
         let current = CurrentFacts::new(ledger);
         let is_bundle = |f: &StoredFact| is_reserved_reifies_predicate(&f.flake().p);
         let retract_all = |facts: Vec<StoredFact>| {
@@ -188,56 +182,34 @@ async fn cascade_attachment_retracts(
             let edge_key = EdgeKey::from_flake(flake);
             let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
 
-            // POST scan: find every annotation whose `f:reifiesSubject`
-            // points at this edge's subject. The flake's `s` is the
-            // candidate annotation Sid.
-            let candidates = fluree_db_core::range_with_overlay(
-                &ledger.snapshot,
-                g_id,
-                ledger.novelty.as_ref(),
-                IndexType::Post,
-                RangeTest::Eq,
-                RangeMatch::new()
-                    .with_predicate(f_reifies_subject.clone())
-                    .with_object(FlakeValue::Ref(edge_key.s.clone())),
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-
-            let mut seen: HashSet<Sid> = HashSet::new();
-            for cand in &candidates {
-                let ann_sid = cand.s.clone();
-                if !seen.insert(ann_sid.clone()) {
-                    continue;
+            // A reifier this transaction re-points is the transaction's to
+            // rewrite, not the cascade's to retract (its bundle describes
+            // some edge afterwards). `enforce_single_target_reifiers` still
+            // checks the result, so a genuinely malformed re-point is caught.
+            let reifiers: Vec<EdgeReifier> = edge_reifiers(ledger, &current, g_id, &edge_key)
+                .await?
+                .into_iter()
+                .filter(|r| !repointed.contains(&r.ann))
+                .collect();
+            // A Cypher `DELETE r` means one relationship, but retracting the
+            // edge takes every relationship on it: refuse an edge that
+            // carries others, whatever the statement's MATCH kept.
+            if let Some(rels) = relationship_deletes {
+                if reifiers.len() > 1 {
+                    return Err(TransactError::UnsupportedFeature(format!(
+                        "DELETE of relationship `{}` failed: parallel relationships share its \
+                         underlying edge, so deleting one would affect the others. \
+                         Per-occurrence DELETE of a parallel relationship is not yet supported.",
+                        rels.join("`, `")
+                    )));
                 }
-                if repointed.contains(&ann_sid) {
-                    // This transaction re-points the reifier; its bundle is
-                    // the transaction's to rewrite, not the cascade's to
-                    // retract. `enforce_single_target_reifiers` still checks
-                    // the result, so a genuinely malformed re-point is caught.
-                    continue;
-                }
-
-                // All of the candidate's facts (system bundle + body
-                // metadata), stamped with the edge's graph: index rows decode
-                // without one, and `from_reifies_facts` reconciles the
-                // bundle's `f:reifiesGraph` against the flake-level `g`.
-                let (bundle, metadata): (Vec<StoredFact>, Vec<StoredFact>) = current
-                    .of_subject(g_id, flake.g.as_ref(), &ann_sid)
-                    .await?
-                    .into_iter()
-                    .partition(is_bundle);
-                if bundle.is_empty() {
-                    continue;
-                }
-                let cand_edge = match decode(&bundle) {
-                    Ok(k) => k,
-                    Err(_) => continue,
-                };
-                if cand_edge != edge_key {
-                    continue;
-                }
-
+            }
+            for EdgeReifier {
+                ann: ann_sid,
+                bundle,
+                metadata,
+            } in reifiers
+            {
                 // Retract the bundle as stored.
                 cascade.extend(retract_all(bundle));
 
@@ -504,6 +476,78 @@ fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid
 ///
 /// - `None` → default graph (g_id = 0)
 /// - `Some(sid)` → looked up in `reverse_graph`; returns error if unknown
+/// One relationship on an edge: an annotation subject whose `f:reifies*`
+/// bundle names the edge, with the bundle and the rest of its facts (its
+/// properties), as the ledger holds them.
+struct EdgeReifier {
+    ann: Sid,
+    bundle: Vec<StoredFact>,
+    metadata: Vec<StoredFact>,
+}
+
+/// Every annotation subject whose `f:reifies*` bundle names `edge` (in graph
+/// `g_id`), as `current` reads it: what retracting the edge cascades away
+/// (see [`cascade_attachment_retracts`]). The candidates come from one POST
+/// point lookup (annotations whose `f:reifiesSubject` is the edge's subject),
+/// novelty and indexed base both; each candidate's facts then take one
+/// bounded subject read, stamped with the edge's graph (index rows decode
+/// without one, and `from_reifies_facts` reconciles the bundle's
+/// `f:reifiesGraph` against it).
+async fn edge_reifiers(
+    ledger: &LedgerState,
+    current: &CurrentFacts<'_>,
+    g_id: GraphId,
+    edge: &fluree_db_core::edge::EdgeKey,
+) -> Result<Vec<EdgeReifier>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
+
+    let f_reifies_subject = Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    );
+    let candidates = fluree_db_core::range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::new()
+            .with_predicate(f_reifies_subject)
+            .with_object(FlakeValue::Ref(edge.s.clone())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await?;
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<Sid> = HashSet::new();
+    for cand in &candidates {
+        let ann = cand.s.clone();
+        if !seen.insert(ann.clone()) {
+            continue;
+        }
+        let (bundle, metadata): (Vec<StoredFact>, Vec<StoredFact>) = current
+            .of_subject(g_id, edge.g.as_ref(), &ann)
+            .await?
+            .into_iter()
+            .partition(|f| is_reserved_reifies_predicate(&f.flake().p));
+        if bundle.is_empty() {
+            continue;
+        }
+        let flakes: Vec<Flake> = bundle.iter().map(|f| f.flake().clone()).collect();
+        match fluree_db_core::edge::EdgeKey::from_reifies_facts(&flakes) {
+            Ok(key) if &key == edge => out.push(EdgeReifier {
+                ann,
+                bundle,
+                metadata,
+            }),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 fn resolve_flake_graph_id(flake: &Flake, reverse_graph: &HashMap<Sid, GraphId>) -> Result<GraphId> {
     match &flake.g {
         None => Ok(0),
@@ -1057,6 +1101,7 @@ pub async fn stage_with_graph_delta(
             &reverse_graph,
             new_t,
             lpg_edge_lifecycle,
+            txn.opts.relationship_deletes.as_deref(),
         )
         .await?;
         if !cascade.is_empty() {

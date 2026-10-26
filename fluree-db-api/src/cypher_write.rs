@@ -398,19 +398,6 @@ pub(crate) fn rel_edge(u: &Update, rel_var: &str) -> Option<RelEdge> {
     None
 }
 
-/// The refusal for a `DELETE` of relationship `rel_var` whose edge backs a
-/// parallel relationship.
-pub(crate) fn parallel_relationship_error(rel_var: &str) -> crate::error::ApiError {
-    crate::error::ApiError::cypher(
-        format!(
-            "DELETE of relationship `{rel_var}` failed: parallel relationships share its \
-             underlying edge, so deleting one would affect the others. Per-occurrence DELETE \
-             of a parallel relationship is not yet supported."
-        ),
-        Vec::new(),
-    )
-}
-
 /// The refusal for a `DELETE` of relationship `rel_var` whose endpoints
 /// aren't both named.
 pub(crate) fn unnamed_endpoints_error(rel_var: &str) -> crate::error::ApiError {
@@ -553,53 +540,6 @@ pub(crate) fn build_delete_target_probe_ast(
                     alias: None,
                     span,
                 }],
-                distinct: false,
-                order_by: Vec::new(),
-                skip: None,
-                limit: None,
-                span,
-            },
-            union_tail: None,
-            span,
-        }),
-        span,
-    }
-}
-
-/// Name of the sibling variable in [`build_sibling_probe_ast`].
-pub(crate) const SIBLING_VAR: &str = "__cyrel_sib";
-
-/// Build a probe listing, for each relationship `rel` being deleted, every
-/// relationship on the edge it reifies: `prefix` (the clauses that bind
-/// `rel` and its endpoints) followed by `MATCH (s)-[__cyrel_sib:T]->(o)
-/// RETURN rel, __cyrel_sib`. Named relationships bind one row per annotation
-/// SID, so a row whose `__cyrel_sib` isn't its `rel` is a **parallel
-/// sibling**: retracting the edge would take it too, so `DELETE r` must
-/// refuse (see [`crate::cypher_seq::has_parallel_sibling`]).
-///
-/// The siblings are matched afresh, without `rel`'s property map or `WHERE`:
-/// a filter that keeps only one of them must not hide the others.
-pub(crate) fn build_sibling_probe_ast(
-    mut prefix: Vec<ReadClause>,
-    edge: &RelEdge,
-    rel: &Variable,
-    span: SourceSpan,
-) -> CypherAst {
-    let proj = |v: &Variable| ProjectionItem {
-        expr: Expr::Var(v.clone()),
-        alias: None,
-        span,
-    };
-    let sibling = Variable {
-        name: SIBLING_VAR.to_string(),
-        span,
-    };
-    prefix.push(edge.match_clause(Some(sibling.clone()), span));
-    CypherAst {
-        statement: Statement::Query(Query {
-            clauses: prefix,
-            return_clause: ReturnClause {
-                items: vec![proj(rel), proj(&sibling)],
                 distinct: false,
                 order_by: Vec::new(),
                 skip: None,

@@ -885,6 +885,15 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
 
+    /// The relationship variables of a Cypher `DELETE r` (or several). When
+    /// set, an edge this transaction retracts must carry at most one
+    /// relationship: retracting the edge takes every relationship on it with
+    /// it (the `f:reifies*` cascade), so staging refuses an edge that carries
+    /// others, naming these variables. Deleting one of several parallel
+    /// relationships isn't supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_deletes: Option<Vec<String>>,
+
     /// Skolemization id override for blank-node minting in this transaction.
     ///
     /// When set, staging uses this id instead of a generated timestamp in the

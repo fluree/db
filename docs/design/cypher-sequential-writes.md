@@ -78,12 +78,15 @@ decomposition:
    - A relationship's **DELETE** (`DELETE r`): one seeded Txn that re-matches
      the edge `r` was matched on (`MATCH (a)-[r:T]->(b)`, the lowering's view
      of `r`), so the LPG cleanup takes the properties earlier clauses set on
-     `r`. First, the parallel-edge probe runs against the current virtual
-     state, seeded with the rows: it lists every relationship on the edge,
-     ignoring `r`'s property map and `WHERE`, and refuses when one isn't `r`
-     (retracting the edge would take it too). The single-clause `DELETE r`
-     uses the same probe. A relationship's DELETE meets every other write
-     clause, so a statement with one beside other clauses always comes here.
+     `r`. The lowering marks the Txn (`TxnOpts::relationship_deletes`), and
+     staging refuses an edge that carries more than one relationship, where
+     the `f:reifies*` cascade reads the edge's relationships: retracting the
+     edge would take them all. The check reads the state the Txn stages on
+     (here the virtual state, so a sibling an earlier clause created counts)
+     and has no view of `r`'s property map or `WHERE`. The single-clause
+     `DELETE r` gets the same check. A relationship's DELETE meets every other
+     write clause, so a statement with one beside other clauses always comes
+     here.
    - A bare node **DELETE** in a multi-clause chain: rejected (clear error) in
      v1 — its relationship-existence probe stays single-statement.
 3. **Finish** — `SequentialStager::finish()` produces one `StageResult` over

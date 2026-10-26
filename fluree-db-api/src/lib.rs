@@ -4619,30 +4619,15 @@ impl Fluree {
                     ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
                 })?;
                 // `DELETE r` retracts the relationship's base `(a)-[:T]->(b)`
-                // triple, whose `f:reifies*` cascade removes the bundle. If the
-                // base edge backs a parallel sibling, that retraction would
-                // disturb the sibling — reject. The endpoints must be named so
-                // the probe can group by them.
+                // triple, whose `f:reifies*` cascade removes the bundle; staging
+                // refuses an edge that backs a parallel sibling too (see
+                // `TxnOpts::relationship_deletes`). The endpoints must be named.
                 for target in &delete.targets {
-                    let edge =
-                        crate::cypher_write::rel_edge(update, &target.name).ok_or_else(|| {
-                            crate::cypher_write::unnamed_endpoints_error(&target.name)
-                        })?;
-                    let probe_ast = crate::cypher_write::build_sibling_probe_ast(
-                        update.read_clauses.clone(),
-                        &edge,
-                        target,
-                        target.span,
-                    );
-                    let siblings = self.query_cypher_ast(&probe_view, &probe_ast).await?;
-                    if crate::cypher_seq::has_parallel_sibling(siblings, &target.name)? {
-                        return Err(crate::cypher_write::parallel_relationship_error(
-                            &target.name,
-                        ));
+                    if crate::cypher_write::rel_edge(update, &target.name).is_none() {
+                        return Err(crate::cypher_write::unnamed_endpoints_error(&target.name));
                     }
                 }
-                // No parallel siblings → retracting each base edge removes only
-                // its own reifier bundle. Lower the original DELETE directly.
+                // Lower the original DELETE directly.
                 let ast = fluree_db_cypher::CypherAst {
                     statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
                     span: update.span,
