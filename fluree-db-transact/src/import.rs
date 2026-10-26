@@ -126,20 +126,115 @@ mod inner {
     /// envelope's own keys are not data on either path, and the bare key on
     /// a node inside the document is a selector on both.) A context that
     /// defines `graph` as a term makes it an ordinary property, kept.
-    fn strip_top_level_graph_key(doc: &mut serde_json::Value) -> Result<()> {
+    /// `shared` is the context a newline-delimited line is read under, beneath
+    /// its own; a whole document has none.
+    fn strip_top_level_graph_key(
+        doc: &mut serde_json::Value,
+        shared: Option<&fluree_graph_json_ld::ParsedContext>,
+    ) -> Result<()> {
         let Some(obj) = doc.as_object().filter(|obj| obj.contains_key("graph")) else {
             return Ok(());
         };
         if fluree_graph_json_ld::envelope_graph_key(obj)?.is_some() {
             return Ok(());
         }
-        let context = crate::parse::edge_annotations::top_level_context(doc)?;
+        let context = match shared {
+            Some(shared) => line_context(shared, doc)?.into_owned(),
+            None => crate::parse::edge_annotations::top_level_context(doc)?,
+        };
         if fluree_graph_json_ld::is_graph_key("graph", &context) {
             if let Some(obj) = doc.as_object_mut() {
                 obj.remove("graph");
             }
         }
         Ok(())
+    }
+
+    /// How a JSON-LD chunk of a bulk import is laid out.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JsonLdChunk {
+        /// One JSON-LD document: a `.jsonld` file, whole.
+        Document,
+        /// Newline-delimited JSON-LD as the ndjson reader hands it over: a
+        /// `{"@context": <shared>, "@graph": [lines]}` wrapper. Each line is a
+        /// document of its own under the shared context, as it would be
+        /// imported or inserted alone: its own `@context` resolves its graph
+        /// names, a top-level bare `graph` key is dropped, and a line that is
+        /// an envelope is unwrapped. (Blank-node labels still unify across
+        /// the lines of a context segment, as the reader documents.)
+        Lines,
+    }
+
+    /// The lines of a newline-delimited chunk: its wrapper's `@graph`.
+    fn ndjson_lines(doc: &serde_json::Value) -> Result<&[serde_json::Value]> {
+        match doc.get("@graph") {
+            Some(serde_json::Value::Array(lines)) => Ok(lines),
+            _ => Err(not_an_ndjson_chunk()),
+        }
+    }
+
+    fn ndjson_lines_mut(doc: &mut serde_json::Value) -> Result<&mut [serde_json::Value]> {
+        match doc.get_mut("@graph") {
+            Some(serde_json::Value::Array(lines)) => Ok(lines),
+            _ => Err(not_an_ndjson_chunk()),
+        }
+    }
+
+    fn not_an_ndjson_chunk() -> TransactError {
+        TransactError::Parse(
+            "a newline-delimited JSON-LD chunk is a {\"@graph\": [lines]} wrapper".to_string(),
+        )
+    }
+
+    /// The top-level context of a newline-delimited `line`: the shared one,
+    /// beneath the line's own `@context` if it has one.
+    fn line_context<'s>(
+        shared: &'s fluree_graph_json_ld::ParsedContext,
+        line: &serde_json::Value,
+    ) -> Result<std::borrow::Cow<'s, fluree_graph_json_ld::ParsedContext>> {
+        Ok(match line.get("@context") {
+            Some(own) => {
+                std::borrow::Cow::Owned(fluree_graph_json_ld::parse_context_with_base(shared, own)?)
+            }
+            None => std::borrow::Cow::Borrowed(shared),
+        })
+    }
+
+    /// Write one expanded JSON-LD document into `sink`. Its graph names
+    /// resolve against `context`, the document's top-level `@context`,
+    /// computed only for a document that names a graph (the adapter asks once
+    /// per name). A refusal keeps its own error.
+    fn write_jsonld_document<'c>(
+        expanded: &serde_json::Value,
+        sink: &mut ImportSink,
+        context: impl FnOnce() -> Result<std::borrow::Cow<'c, fluree_graph_json_ld::ParsedContext>>,
+        ledger_id: &str,
+    ) -> Result<()> {
+        let mut context = Some(context);
+        let mut graph_context = None;
+        let mut refusal: Option<TransactError> = None;
+        let converted =
+            fluree_graph_json_ld::adapter::to_graph_events_scoped(expanded, sink, |name| {
+                let resolved = (|| {
+                    if let Some(context) = context.take() {
+                        graph_context = Some(context()?);
+                    }
+                    let parsed = graph_context.as_deref().ok_or_else(|| {
+                        TransactError::Parse(
+                            "no @context to resolve a graph name against".to_string(),
+                        )
+                    })?;
+                    import_graph_name(name, parsed, ledger_id)
+                })();
+                resolved.map_err(|e| {
+                    let message = e.to_string();
+                    refusal = Some(e);
+                    fluree_graph_json_ld::adapter::AdapterError::Unsupported(message)
+                })
+            });
+        converted.map_err(|e| {
+            refusal.unwrap_or_else(|| TransactError::Parse(format!("JSON-LD adapter error: {e}")))
+        })
     }
 
     /// Where a graph name in a bulk-imported JSON-LD document writes: the
@@ -1323,7 +1418,8 @@ mod inner {
     /// statements go to its graph selector's graph, and a JSON-LD named
     /// graph's content to the graph its `@id` names (see
     /// [`fluree_graph_json_ld::adapter`]). `ledger_id` names the ledger
-    /// whose system graphs a document may not write.
+    /// whose system graphs a document may not write. `shape` says whether the
+    /// chunk is one document or newline-delimited lines ([`JsonLdChunk`]).
     #[allow(clippy::too_many_arguments)]
     pub fn parse_jsonld_chunk(
         jsonld: &str,
@@ -1336,6 +1432,7 @@ mod inner {
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
         ledger_id: &str,
+        shape: JsonLdChunk,
     ) -> Result<ParsedChunk> {
         // Chunk-scoped, matching the behavior before document scoping existed.
         // For the `Files` and remote arms that is also document-scoped, because
@@ -1368,7 +1465,21 @@ mod inner {
 
         let mut doc: serde_json::Value = serde_json::from_str(jsonld)
             .map_err(|e| TransactError::Parse(format!("JSON parse error: {e}")))?;
-        strip_top_level_graph_key(&mut doc)?;
+        // A newline-delimited chunk's lines are read under the wrapper's
+        // shared context, each as a document of its own.
+        let shared = match shape {
+            JsonLdChunk::Document => {
+                strip_top_level_graph_key(&mut doc, None)?;
+                None
+            }
+            JsonLdChunk::Lines => {
+                let shared = crate::parse::edge_annotations::top_level_context(&doc)?;
+                for line in ndjson_lines_mut(&mut doc)? {
+                    strip_top_level_graph_key(line, Some(&shared))?;
+                }
+                Some(shared)
+            }
+        };
 
         // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
         // `f:reifies*` encoding before expansion, exactly as the transact path
@@ -1405,34 +1516,32 @@ mod inner {
         // declared prefixes.
         register_jsonld_prefixes(&doc, &mut sink);
 
-        let expanded = fluree_graph_json_ld::expand(&doc)
-            .map_err(|e| TransactError::Parse(format!("JSON-LD expand error: {e}")))?;
-
-        // Graph names resolve against the top-level `@context`, parsed only
-        // for a document that names a graph (the adapter asks once per
-        // name). A refusal keeps its own error.
-        let mut graph_context: Option<fluree_graph_json_ld::ParsedContext> = None;
-        let mut refusal: Option<TransactError> = None;
-        let converted =
-            fluree_graph_json_ld::adapter::to_graph_events_scoped(&expanded, &mut sink, |name| {
-                let resolved = match graph_context.take() {
-                    Some(context) => Ok(context),
-                    None => crate::parse::edge_annotations::top_level_context(&doc),
+        let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
+        match &shared {
+            None => {
+                let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                write_jsonld_document(
+                    &expanded,
+                    &mut sink,
+                    || {
+                        crate::parse::edge_annotations::top_level_context(&doc)
+                            .map(std::borrow::Cow::Owned)
+                    },
+                    ledger_id,
+                )?;
+            }
+            Some(shared) => {
+                for line in ndjson_lines(&doc)? {
+                    let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
+                        .map_err(expand_error)?;
+                    write_jsonld_document(
+                        &expanded,
+                        &mut sink,
+                        || line_context(shared, line),
+                        ledger_id,
+                    )?;
                 }
-                .and_then(|context| {
-                    let graph = import_graph_name(name, &context, ledger_id);
-                    graph_context = Some(context);
-                    graph
-                });
-                resolved.map_err(|e| {
-                    let message = e.to_string();
-                    refusal = Some(e);
-                    fluree_graph_json_ld::adapter::AdapterError::Unsupported(message)
-                })
-            });
-        if let Err(e) = converted {
-            return Err(refusal
-                .unwrap_or_else(|| TransactError::Parse(format!("JSON-LD adapter error: {e}"))));
+            }
         }
         drop(_parse_span);
 
@@ -1574,5 +1683,6 @@ mod inner {
 
 pub use inner::{
     finalize_parsed_chunk, import_commit_with_prelude, import_trig_commit, parse_chunk,
-    parse_chunk_with_prelude, parse_jsonld_chunk, ImportCommitResult, ImportState, ParsedChunk,
+    parse_chunk_with_prelude, parse_jsonld_chunk, ImportCommitResult, ImportState, JsonLdChunk,
+    ParsedChunk,
 };

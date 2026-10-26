@@ -340,30 +340,91 @@ async fn bulk_import_writes_each_graph_scoped_form_where_insert_does() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-/// Newline-delimited JSON-LD: the lines after a leading `@context` line are
-/// the nodes of one envelope, so a named-graph line writes its graph and a
-/// plain line the default graph. A selector resolves against that shared
-/// context, as an envelope's does.
+/// Insert each line as a document of its own, under `shared` (beneath the
+/// line's own `@context`) when given: what a `.jsonl` import of the lines is.
+async fn transact_lines(shared: Option<&Value>, lines: &[Value]) -> Result<Vec<String>, String> {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = fluree_at(dir.path());
+    let mut ledger = fluree.create_ledger(TXN).await.unwrap();
+    for line in lines {
+        let mut doc = line.clone();
+        if let Some(shared) = shared {
+            doc["@context"] = match line.get("@context") {
+                Some(own) => json!([shared, own]),
+                None => shared.clone(),
+            };
+        }
+        ledger = fluree
+            .insert(ledger, &doc)
+            .await
+            .map_err(|e| e.to_string())?
+            .ledger;
+    }
+    Ok(statements(&fluree_at(dir.path()), TXN).await)
+}
+
+/// Newline-delimited JSON-LD: each line is a document of its own, under the
+/// shared context of a leading `@context` line, as if it were imported or
+/// inserted alone. A line's own `@context` resolves its graph names, a
+/// top-level bare `graph` key on a line is dropped as `insert` drops it, and a
+/// line that is an envelope is unwrapped.
 #[tokio::test]
-async fn bulk_import_of_jsonl_writes_each_line_to_its_graph() {
+async fn bulk_import_of_jsonl_reads_each_line_as_a_document() {
     let c = ctx();
-    let nodes = [
-        json!({"@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:q": "v"}]}),
-        json!({"@id": "ex:b", "ex:q": "w"}),
-        json!({"@id": "ex:c", "@graph": "ex:h", "ex:q": "x"}),
+    let cases: Vec<(&str, Option<Value>, Vec<Value>, Vec<&str>)> = vec![
+        (
+            "named-graph, plain and selector lines under a shared context",
+            Some(c.clone()),
+            vec![
+                json!({"@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:q": "v"}]}),
+                json!({"@id": "ex:b", "ex:q": "w"}),
+                json!({"@id": "ex:c", "@graph": "ex:h", "ex:q": "x"}),
+            ],
+            vec!["default: ex:b ex:q w", "g: ex:a ex:q v", "h: ex:c ex:q x"],
+        ),
+        (
+            "a line whose own @context resolves its selector",
+            None,
+            vec![json!({"@context": c, "@id": "ex:a", "@graph": "ex:g", "ex:q": "v"})],
+            vec!["g: ex:a ex:q v"],
+        ),
+        (
+            "a line whose own @context adds to the shared one",
+            Some(json!({"other": "http://other.example/"})),
+            vec![json!({"@context": c, "@id": "ex:a", "@graph": "ex:g", "ex:q": "v"})],
+            vec!["g: ex:a ex:q v"],
+        ),
+        (
+            "a top-level bare `graph` key on a line",
+            Some(c.clone()),
+            vec![json!({"@id": "ex:a", "graph": "ex:g", "ex:q": "v"})],
+            vec!["default: ex:a ex:q v"],
+        ),
+        (
+            "a line that is an envelope",
+            Some(c.clone()),
+            vec![json!({"@graph": [{"@id": "ex:a", "ex:q": "v"}]})],
+            vec!["default: ex:a ex:q v"],
+        ),
     ];
-    let expected = vec!["default: ex:b ex:q w", "g: ex:a ex:q v", "h: ex:c ex:q x"];
-    let envelope = json!({"@context": c, "@graph": nodes});
-    assert_eq!(transact(&envelope).await.unwrap(), expected, "insert");
-    let body: String = std::iter::once(json!({"@context": c}))
-        .chain(nodes)
-        .map(|line| format!("{line}\n"))
-        .collect();
-    assert_eq!(
-        import("data.jsonl", &body).await.unwrap(),
-        expected,
-        "import"
-    );
+    let mut mismatches = Vec::new();
+    for (case, shared, lines, expected) in cases {
+        let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+        let transacted = transact_lines(shared.as_ref(), &lines).await;
+        let body: String = shared
+            .iter()
+            .map(|c| json!({"@context": c}))
+            .chain(lines)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let imported = import("data.jsonl", &body).await;
+        if transacted.as_ref() != Ok(&expected) || imported.as_ref() != Ok(&expected) {
+            mismatches.push(format!(
+                "{case}\n  expected: {expected:?}\n  insert:   {transacted:?}\n  import:   {imported:?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 /// TriG writes named graphs on a path of its own; a JSON-LD import of the

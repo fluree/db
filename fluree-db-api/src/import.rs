@@ -4072,7 +4072,7 @@ where
     use fluree_db_indexer::run_index::{persist_namespaces, SortedCommitInfo};
     use fluree_db_transact::import::{
         finalize_parsed_chunk, import_trig_commit, parse_chunk, parse_chunk_with_prelude,
-        parse_jsonld_chunk, ImportState, ParsedChunk,
+        parse_jsonld_chunk, ImportState, JsonLdChunk, ParsedChunk,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -5131,6 +5131,11 @@ where
                         Some(&spool_config),
                         idx,
                         alias,
+                        if chunk_source.is_jsonld_stream() {
+                            JsonLdChunk::Lines
+                        } else {
+                            JsonLdChunk::Document
+                        },
                     )
                 } else {
                     parse_chunk(
@@ -5389,6 +5394,7 @@ where
                             Some(&spool_config),
                             i,
                             alias,
+                            JsonLdChunk::Document,
                         )
                     } else {
                         parse_chunk(
