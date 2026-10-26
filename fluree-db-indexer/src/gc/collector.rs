@@ -961,7 +961,7 @@ mod tests {
     impl InfoEvents {
         fn capture(&self) -> tracing::subscriber::DefaultGuard {
             use tracing_subscriber::layer::SubscriberExt;
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+            fluree_test_support::scoped_default(tracing_subscriber::registry().with(self.clone()))
         }
 
         fn fields_of(&self, message: &str) -> Vec<Fields> {

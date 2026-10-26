@@ -503,19 +503,7 @@ fn outcomes(store: &SpanStore, before: usize) -> Vec<String> {
 async fn plain_turtle_stays_on_the_streaming_parser() {
     let (store, _guard) = init_test_tracing();
     let fluree = memory();
-
-    // A sibling test can register the stamp's callsite under the no-op global
-    // dispatcher while this subscriber is being installed, pinning its
-    // interest to "never". Hit the callsite once, then rebuild the cache.
-    let ledger = fluree
-        .insert_turtle(
-            genesis_ledger(&fluree, "it/trig-routing:main"),
-            "<http://example.org/warm> <http://example.org/up> 1 .",
-        )
-        .await
-        .expect("warm-up")
-        .ledger;
-    tracing::callsite::rebuild_interest_cache();
+    let ledger = genesis_ledger(&fluree, "it/trig-routing:main");
 
     let turtle = "@prefix ex: <http://example.org/> .\n\
                   ex:alice ex:knows ex:bob {| ex:note \"GRAPH { }\" |} .\n\

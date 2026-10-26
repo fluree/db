@@ -127,7 +127,7 @@ fn init_capture() -> (SpanStore, tracing::subscriber::DefaultGuard) {
     // test harness's normal RUST_LOG might be info.
     let filter = tracing_subscriber::filter::LevelFilter::DEBUG;
     let subscriber = tracing_subscriber::registry().with(layer).with(filter);
-    let guard = tracing::subscriber::set_default(subscriber);
+    let guard = fluree_test_support::scoped_default(subscriber);
     (store, guard)
 }
 
