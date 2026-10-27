@@ -112,6 +112,7 @@ enum ExprKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RdfClass {
     Iri,
+    /// An `xsd:string`; on a column, one the database holds as text.
     Str,
     LangStr(String),
     Numeric,
@@ -119,6 +120,36 @@ pub(crate) enum RdfClass {
     Date,
     DateTime,
     Other,
+    /// An `xsd:string` the engine renders from a column the database holds as
+    /// another type (an un-annotated `rr:column` over a `bigint`, a `double`, a
+    /// `date`), or whose type the probe did not report. The term is the
+    /// materializer's lexical form: it orders as that string (`"10"` before
+    /// `"9"`) where the database orders the column by value, and it compares
+    /// with a string literal where the database would cast the literal. So no
+    /// comparison or ordering of it is pushed, and equality only where
+    /// [`RdfClass::database_eq_is_exact`] holds.
+    Rendered(Option<FieldType>),
+}
+
+impl RdfClass {
+    /// Whether the database's `=` over a column of this class partitions its
+    /// values as the engine's equality of their terms does — what a `GROUP BY`,
+    /// a `DISTINCT`, a `COUNT(DISTINCT)` or a join on the column relies on.
+    /// Only a rendered string can fail it: the rendering is one-to-one for
+    /// integers, decimals (one scale per column), booleans, dates and bytes,
+    /// but a float renders `-0.0` and `0.0` apart where the database groups
+    /// them, a timestamp is decoded to the microsecond where the database keeps
+    /// finer instants apart, and an unprobed column cannot be vouched for.
+    pub(crate) fn database_eq_is_exact(&self) -> bool {
+        use FieldType as F;
+        match self {
+            RdfClass::Rendered(ty) => matches!(
+                ty,
+                Some(F::Int32 | F::Int64 | F::Decimal { .. } | F::Boolean | F::Date | F::Bytes)
+            ),
+            _ => true,
+        }
+    }
 }
 
 /// The columns a variable's value is a function of — what a join, a seed or
@@ -726,9 +757,11 @@ impl<'a> Lowerer<'a> {
                     .col()
                     .is_some_and(|c| !matches!(self.field_type(c), None | Some(FieldType::String)))
             }))
-            && !projected
-                .iter()
-                .any(|v| matches!(self.vars[v].term, TermSource::Union { .. }));
+            && !projected.iter().any(|v| {
+                matches!(self.vars[v].term, TermSource::Union { .. })
+                    || matches!(&self.vars[v].key,
+                        Some(KeyShape::Column { class, .. }) if !class.database_eq_is_exact())
+            });
         let mut accesses: Vec<AccessInfo> = self
             .accesses
             .iter()
@@ -1818,9 +1851,10 @@ impl<'a> Lowerer<'a> {
     fn literal_exact(&self, col: &ColRef, class: &RdfClass) -> bool {
         use FieldType as F;
         let Some(ty) = self.field_type(col) else {
-            return *class != RdfClass::DateTime;
+            return !matches!(class, RdfClass::DateTime | RdfClass::Rendered(_));
         };
         match class {
+            RdfClass::Rendered(_) => false,
             RdfClass::Numeric => matches!(
                 ty,
                 F::Int32 | F::Int64 | F::Float32 | F::Float64 | F::Decimal { .. }
@@ -1832,6 +1866,16 @@ impl<'a> Lowerer<'a> {
                 ty == F::TimestampTz || (ty == F::Timestamp && !self.caps.timestamp_is_text)
             }
             RdfClass::Iri | RdfClass::Other => true,
+        }
+    }
+
+    /// The class of `col` read as `declared`, given what the database holds: an
+    /// `xsd:string` over anything but a text column is [`RdfClass::Rendered`].
+    fn column_class(&self, col: &ColRef, declared: RdfClass) -> RdfClass {
+        match (declared, self.field_type(col)) {
+            (RdfClass::Str, Some(FieldType::String)) => RdfClass::Str,
+            (RdfClass::Str, ty) => RdfClass::Rendered(ty),
+            (declared, _) => declared,
         }
     }
 
@@ -2147,9 +2191,15 @@ impl<'a> Lowerer<'a> {
                 // number — a silently wrong answer rather than an error. Require
                 // both sides to carry the class natively, the rule
                 // `literal_exact` already applies to a literal comparison.
-                // `Str` is exempt: a string join on text columns is exact.
-                if *cl != RdfClass::Str && !(self.literal_exact(l, cl) && self.literal_exact(r, cr))
-                {
+                // `Str` is exempt: a string join on text columns is exact. So is a
+                // rendered string over one column type whose rendering the
+                // database's `=` matches; `-0.0 = 0.0` and `10 = 10.00` are not.
+                let exact = match cl {
+                    RdfClass::Str => true,
+                    RdfClass::Rendered(_) => cl.database_eq_is_exact(),
+                    _ => self.literal_exact(l, cl) && self.literal_exact(r, cr),
+                };
+                if !exact {
                     return decline("repeated variable joins columns that do not carry the class");
                 }
                 self.push_edge(l.clone(), r.clone());
@@ -2201,8 +2251,11 @@ impl<'a> Lowerer<'a> {
                 language,
                 term_type,
             } => {
-                let class = class_of(datatype.as_deref(), language.as_deref(), *term_type);
                 let col = ColRef::new(alias, column);
+                let class = self.column_class(
+                    &col,
+                    class_of(datatype.as_deref(), language.as_deref(), *term_type),
+                );
                 if !nullable {
                     self.require(alias, column);
                 }

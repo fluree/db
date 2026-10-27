@@ -397,6 +397,18 @@ points, instants) and declines rather than approximate:
   DECIMAL columns at the scale it was started with (`--decimal-scale`,
   default 6), and SQLite's `NUMERIC` is a double.
 
+**An un-annotated column the database does not hold as text** — a `bigint`,
+`double`, `decimal`, `date`, `timestamp` or `varbinary` mapped with no
+`rr:datatype` — reads as the `xsd:string` of its rendered value (`10`, `-0`,
+`0.050000000`, `2024-01-01T00:00:00Z`, hex bytes), so it sorts as text (`"10"`
+before `"9"`) where the database sorts the column by value. The lane pushes no
+`ORDER BY … LIMIT`, `MIN`/`MAX` or comparison of such a column, and pushes a
+`GROUP BY`, `SELECT DISTINCT`, `COUNT(DISTINCT …)` or join on it only where the
+database's `=` is the strings' equality: integers, decimals of one scale,
+booleans, dates and bytes. A float renders `-0.0` and `0.0` apart where the
+database groups them, and a timestamp is decoded to the microsecond, so those
+group in the engine.
+
 CI replays every lane case against SQLite, Postgres 16 and MySQL 8 behind
 the bridge, the two servers deliberately running five hours off UTC, and
 pins both the rows and which of these forms each statement took.
