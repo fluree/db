@@ -80,7 +80,7 @@ sql-db:main → R2RML → PostgreSQL tables
 
 ## Query Transparency
 
-Graph sources are queried like regular ledgers:
+Graph sources are queried through the same query interface as ledgers. A mapped source (Iceberg, R2RML, SQL, Delta) is addressed like a ledger, in `FROM` or as the query target. A search index is named by a search pattern, with its source ledger as the dataset:
 
 ```json
 {

@@ -2916,9 +2916,12 @@ async fn execute_query(
     }
 
     // Shared storage mode: use load_ledger_for_query with freshness checking.
-    // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather than a
-    // ledger; those resolve through the connection/dataset path, which queries
-    // them via their source engine instead of loading a ledger (#1369).
+    // The alias may name a mapped graph source (Iceberg, R2RML, SQL, Delta)
+    // rather than a ledger; that resolves through the connection/dataset path,
+    // which queries it via its source engine instead of loading a ledger
+    // (#1369). Resolving a source no query reads as a graph (an index, an
+    // unmapped one, one this build has no reader for) is refused with its
+    // typed error.
     let ledger = match load_ledger_or_missing(state, ledger_id, &span).await {
         Ok(l) => l,
         Err(e) => {
@@ -2926,9 +2929,10 @@ async fn execute_query(
             if !matches!(&e, ServerError::Api(api) if api.is_not_found()) {
                 return Err(e);
             }
-            // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather
-            // than a ledger. A registered source runs through the dataset path
-            // (queried via its source engine); a delimited format on a real
+            // The alias may name a mapped graph source rather than a ledger. A
+            // registered one runs through the dataset path (queried via its
+            // source engine), and resolving one no query reads as a graph is
+            // refused with its typed error; a delimited format on a real
             // source gets the explicit format error (matching the SPARQL
             // handler). A genuinely-missing ledger returns a clean NotFound
             // (404 + NotFound span) instead of being misreported by that path.

@@ -2484,11 +2484,11 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `mapping_validated` | boolean | Always | Whether mapping was parsed and compiled successfully |
 
 **Error responses:**
-- `400 Bad Request` — validation failures (missing fields, `r2rml` among them; invalid mode, bad table identifier, an `r2rml` that does not parse or compile)
+- `400 Bad Request` — validation failures (missing fields, `r2rml` among them; invalid mode, bad table identifier, an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap`)
 - `409 Conflict` — graph source with this name already exists (if your nameservice enforces uniqueness)
 - `500 Internal Server Error` — nameservice write failure
 
-A table that cannot be loaded does not fail the request: the source is created and the response carries `connection_tested: false`.
+The check reads table metadata only and stops after 10 s. A table that cannot be loaded in that time does not fail the request: the source is created and the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
 
 ### Querying graph sources
 

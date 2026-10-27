@@ -3124,11 +3124,11 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile
+- `400 Bad Request` — missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`)
 - `401/403` — admin auth required
 - `500 Internal Server Error` — the graph source could not be published
 
-`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files. A table that cannot be loaded does not fail the request; the response carries `connection_tested: false`.
+`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
@@ -3478,7 +3478,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 
 An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
 
-**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
 
 See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
 

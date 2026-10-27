@@ -251,7 +251,7 @@ The request conflicts with current server state.
 - Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
 - The ledger advanced while a reindex ran (`err:system/ReindexConflict`)
 - Syncing a graph source that has been dropped (`err:db/GraphSourceRetracted`)
-- Querying a graph source that has no R2RML mapping (`err:db/GraphSourceUnmapped`): one registered before a mapping was required. Register it again under the same name, with a mapping, to replace it
+- Querying a graph source that has no R2RML mapping, or one that defines no `rr:TriplesMap` (`err:db/GraphSourceUnmapped`): one registered before registration refused both. Register it again under the same name, with a mapping that defines one, to replace it
 - An Iceberg table that carries merge-on-read delete files (`err:iceberg/MergeOnReadDeletes`)
 
 **Example:**

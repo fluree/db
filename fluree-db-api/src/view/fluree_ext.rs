@@ -679,10 +679,12 @@ impl Fluree {
     /// Like [`db()`](Self::db) but falls back to graph-source resolution when no
     /// ledger exists under the alias.
     ///
-    /// Used where an alias may name a registered graph source (Iceberg/R2RML,
-    /// BM25, vector, …) rather than a native ledger — e.g. resolving a view for
-    /// result formatting after a `FROM <alias>` query. Native ledgers keep the
-    /// full `db()` resolution (graph-ref selection + config attachment).
+    /// Used where an alias may name a registered mapped graph source (Iceberg,
+    /// R2RML, SQL, Delta) rather than a native ledger — e.g. resolving a view
+    /// for result formatting after a `FROM <alias>` query. A source no query
+    /// reads as a graph (an index, an unmapped one) is refused with its typed
+    /// error. Native ledgers keep the full `db()` resolution (graph-ref
+    /// selection + config attachment).
     pub async fn db_or_graph_source(&self, ledger_id: &str) -> Result<GraphDb> {
         self.db_or_graph_source_address(&Self::parse_unpinned(ledger_id)?)
             .await
@@ -818,8 +820,10 @@ impl Fluree {
     /// pinned alias (the `from`-driven dataset builder and the lazy `graph_at()`
     /// handle) both come through here, so refusals live in one place: `@t:` /
     /// `@commit:` on any graph source, and any pin on a source that is not an
-    /// Iceberg-backed table (SQL, BM25, vector, geo) — those read their current
-    /// state and would otherwise accept the pin and ignore it.
+    /// Iceberg- or Delta-backed table (SQL), which reads its current state and
+    /// would otherwise accept the pin and ignore it. A source no query reads
+    /// as a graph (an index, an unmapped one) is refused before its pin is
+    /// considered.
     pub(crate) async fn resolve_graph_source_at(
         &self,
         ledger_id: &str,

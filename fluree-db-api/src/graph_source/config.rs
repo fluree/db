@@ -1009,8 +1009,8 @@ impl IcebergCreateConfig {
     /// create config — the one dispatch every surface goes through (see
     /// [`CatalogModeArgs`]). The source's tables come from its R2RML mapping,
     /// each `rr:tableName` naming one, so a catalog mode (rest, glue, s3tables)
-    /// needs no `table`; one given is the table the catalog connection test
-    /// loads. Direct ignores `table`.
+    /// needs no `table`; registration's table check loads the mapped tables,
+    /// never this one. Direct ignores `table`.
     pub fn from_mode(
         name: impl Into<String>,
         args: CatalogModeArgs<'_>,
