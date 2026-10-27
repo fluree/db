@@ -1014,6 +1014,7 @@ mod tests {
             location,
             &io,
             Credentials::Unity(client(&server), orders(location)),
+            &IdentityContext::default(),
         )
         .unwrap();
         let table = crate::DeltaTable::over("orders", opened).unwrap();
@@ -1041,6 +1042,7 @@ mod tests {
             location,
             &DeltaIoConfig::default(),
             Credentials::Unity(client(&server), orders(location)),
+            &IdentityContext::default(),
         ) {
             Ok(_) => panic!("a gs:// placement is not read"),
             Err(e) => e.to_string(),
@@ -1053,6 +1055,7 @@ mod tests {
             location,
             &DeltaIoConfig::default(),
             Credentials::Unity(client(&server), orders(location)),
+            &IdentityContext::default(),
         )
         .expect_err("refused");
         assert!(
@@ -1283,6 +1286,7 @@ mod tests {
                 location,
                 &DeltaIoConfig::default(),
                 Credentials::Unity(unity.clone(), orders(location)),
+                &IdentityContext::default(),
             )
             .err()
             .unwrap_or_else(|| panic!("{location} was opened"));
@@ -1321,6 +1325,7 @@ mod tests {
             location,
             &io,
             Credentials::Unity(client(&server), orders(location)),
+            &IdentityContext::default(),
         )
         .unwrap();
         for _ in 0..2 {

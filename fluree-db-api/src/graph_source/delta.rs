@@ -351,6 +351,30 @@ impl crate::Fluree {
             model_warnings,
         })
     }
+
+    /// Open the Delta table at `location` the way this instance's graph
+    /// sources read one: `io`'s secret references resolved with the
+    /// instance's resolver, and the host's own AWS or Azure credentials used
+    /// only as its host-identity policy allows (`aws` and its bucket
+    /// allowlist, `azure`). An embedder that reads a table outside a graph
+    /// source opens it here rather than with [`DeltaTable::open`], which
+    /// takes the identity context explicitly.
+    ///
+    /// A host-identity refusal is the typed [`QueryError`] a query reports
+    /// for it; any other failure is a configuration error naming the table.
+    pub async fn open_delta_table(
+        &self,
+        name: &str,
+        location: &str,
+        io: &DeltaIoConfig,
+    ) -> crate::Result<DeltaTable> {
+        let io = io
+            .hydrate(self.secret_resolver())
+            .await
+            .map_err(super::delta_catalog::config_error)?;
+        DeltaTable::open(name, location, &io, self.identity_context())
+            .map_err(super::delta_catalog::config_error)
+    }
 }
 
 /// Open `table_name` where `config` places it. `unity` and `io` are the
@@ -366,7 +390,7 @@ pub(crate) async fn open_placed(
         (Placement::Unity(full_name), Some(unity)) => {
             DeltaTable::open_in_unity(table_name, unity, &full_name, io, identity).await
         }
-        (Placement::Path(location), _) => DeltaTable::open(table_name, &location, io),
+        (Placement::Path(location), _) => DeltaTable::open(table_name, &location, io, identity),
         (Placement::Unity(full_name), None) => Err(DeltaError::Config(format!(
             "table '{full_name}' is placed in a catalog the source does not have"
         ))),
@@ -486,6 +510,7 @@ impl DeltaSource {
         let table = fluree
             .r2rml_cache()
             .delta_table(
+                &self.graph_source_id,
                 table_name,
                 &placement,
                 &self.config,
@@ -865,6 +890,7 @@ mod tests {
         let opened = fluree
             .r2rml_cache()
             .delta_table(
+                "gs:main",
                 "orders",
                 &Placement::Unity("main.sales.orders".to_string()),
                 &config,
@@ -901,6 +927,87 @@ mod tests {
             onboarding.error_type(),
             fluree_vocab::errors::HOST_IDENTITY_REFUSED
         );
+    }
+
+    /// A path source read with the host's own credentials is read with a host
+    /// identity the instance's policy governs, on the query path and through
+    /// the embedder's `Fluree::open_delta_table`, before any request.
+    #[tokio::test]
+    async fn a_path_source_borrows_the_host_identity_only_as_the_policy_allows() {
+        use fluree_db_iceberg::HostIdentityPolicy;
+        let io = DeltaIoConfig {
+            s3_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let config = DeltaGsConfig {
+            io: io.clone(),
+            ..Default::default()
+        };
+        let internal = "s3://stack-internal/t";
+        let azure = "abfss://lake@account.dfs.core.windows.net/t";
+
+        // The query path: a typed 403 naming the switch.
+        let fluree = denying();
+        for (location, kind) in [(internal, "aws"), (azure, "azure")] {
+            let error = match fluree
+                .r2rml_cache()
+                .delta_table(
+                    "gs:path",
+                    "t",
+                    &Placement::Path(location.to_string()),
+                    &config,
+                    fluree.identity_context(),
+                )
+                .await
+            {
+                Ok(_) => panic!("{location}: the policy refuses the host identity"),
+                Err(error) => error,
+            };
+            let query = delta_query_error("gs:path", "t", error);
+            assert!(
+                matches!(&query, QueryError::HostIdentityRefused { kind: k, .. } if k == kind),
+                "{query:?}"
+            );
+        }
+
+        // The embedder's way in, under the instance's context.
+        for location in [internal, azure] {
+            let err = fluree
+                .open_delta_table("t", location, &io)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(err.status_code(), 403, "{err}");
+            assert_eq!(
+                err.error_type(),
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED
+            );
+        }
+        let lake_only = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(HostIdentityPolicy::parse(None, Some("lake")).unwrap());
+        assert!(lake_only
+            .open_delta_table("t", "s3://lake/t", &io)
+            .await
+            .is_ok());
+        let err = lake_only
+            .open_delta_table("t", internal, &io)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+        assert!(err.to_string().contains("stack-internal"), "{err}");
+        // An instance that allows every host identity opens both.
+        let open = crate::FlureeBuilder::memory().build_memory();
+        for location in [internal, azure] {
+            assert!(
+                open.open_delta_table("t", location, &io).await.is_ok(),
+                "{location}"
+            );
+        }
     }
 
     #[test]

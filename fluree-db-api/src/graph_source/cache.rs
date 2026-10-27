@@ -365,32 +365,42 @@ impl R2rmlCache {
         self.sql_clients.insert(key, client);
     }
 
-    /// The shared handle for the Delta table at `placement`, opened on first
-    /// use. Keyed on the config as stored, before secrets are resolved, so a
+    /// The shared handle for source `graph_source_id`'s Delta table at
+    /// `placement`, opened on first use. Keyed on the config as stored, so a
     /// rotated secret behind a reference does not re-key the cache; the TTL
     /// bounds how long a handle keeps the old one — and, for a table found
     /// through a catalog, how long one dropped and recreated elsewhere is
     /// still read where it was.
+    ///
+    /// The config's secrets are resolved before the lookup, on every call: a
+    /// caller whose resolver cannot resolve them does not reach a handle
+    /// another caller opened with them.
     #[cfg(feature = "delta")]
     pub(crate) async fn delta_table(
         &self,
+        graph_source_id: &str,
         table_name: &str,
         placement: &fluree_db_delta::Placement,
         config: &fluree_db_delta::DeltaGsConfig,
         identity: &fluree_db_iceberg::IdentityContext,
     ) -> fluree_db_delta::Result<fluree_db_delta::DeltaTable> {
         use fluree_db_delta::{DeltaTable, Placement};
-        let key = delta_table_key(placement, config, identity);
+        let resolver = identity.secret_resolver.as_ref();
+        let io = config.io.hydrate(resolver).await?;
+        let unity = match (placement, &config.unity) {
+            (Placement::Unity(_), Some(unity)) => Some(unity.hydrate(resolver).await?),
+            _ => None,
+        };
+        let key = delta_table_key(graph_source_id, placement, config, identity);
         if let Some(table) = self.delta_tables.get(&key) {
             return Ok(table);
         }
-        let resolver = identity.secret_resolver.as_ref();
-        let io = config.io.hydrate(resolver).await?;
-        let table = match (placement, &config.unity) {
-            (Placement::Path(location), _) => DeltaTable::open(table_name, location, &io)?,
+        let table = match (placement, &unity) {
+            (Placement::Path(location), _) => {
+                DeltaTable::open(table_name, location, &io, identity)?
+            }
             (Placement::Unity(full_name), Some(unity)) => {
-                let unity = unity.hydrate(resolver).await?;
-                DeltaTable::open_in_unity(table_name, &unity, full_name, &io, identity).await?
+                DeltaTable::open_in_unity(table_name, unity, full_name, &io, identity).await?
             }
             (Placement::Unity(full_name), None) => {
                 return Err(fluree_db_delta::DeltaError::Config(format!(
@@ -597,11 +607,13 @@ mod iceberg_tests {
     }
 }
 
-/// Keyed on the config as stored, never on resolved secrets. Two sources that
-/// name one catalog table with different catalog credentials get a handle
-/// each: the credentials are what reads it.
+/// Keyed on the source and its config as stored, never on resolved secrets.
+/// Two sources never share a handle, even with one config: each is its own
+/// registration, and what one source's references resolve to is not
+/// evidence of what another's do.
 #[cfg(feature = "delta")]
 fn delta_table_key(
+    graph_source_id: &str,
     placement: &fluree_db_delta::Placement,
     config: &fluree_db_delta::DeltaGsConfig,
     identity: &fluree_db_iceberg::IdentityContext,
@@ -612,9 +624,11 @@ fn delta_table_key(
     // and the storage it reads with); another context must not reuse it.
     let scope = identity.cache_scope();
     match placement {
-        Placement::Path(location) => format!("{location}\u{1f}{io}\u{1f}{scope}"),
+        Placement::Path(location) => {
+            format!("{graph_source_id}\u{1f}{location}\u{1f}{io}\u{1f}{scope}")
+        }
         Placement::Unity(full_name) => format!(
-            "{full_name}\u{1f}{}\u{1f}{io}\u{1f}{scope}",
+            "{graph_source_id}\u{1f}{full_name}\u{1f}{}\u{1f}{io}\u{1f}{scope}",
             serde_json::to_string(&config.unity).unwrap_or_default(),
         ),
     }
@@ -648,33 +662,39 @@ mod delta_key_tests {
         let bob = source(ConfigValue::literal("bob"));
 
         assert_eq!(
-            delta_table_key(&orders, &alice, &IdentityContext::default()),
-            delta_table_key(&orders, &alice, &IdentityContext::default())
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default())
         );
         assert_ne!(
-            delta_table_key(&orders, &alice, &IdentityContext::default()),
-            delta_table_key(&orders, &bob, &IdentityContext::default())
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &bob, &IdentityContext::default())
         );
         assert_ne!(
-            delta_table_key(&orders, &alice, &IdentityContext::default()),
-            delta_table_key(&items, &alice, &IdentityContext::default())
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &items, &alice, &IdentityContext::default())
+        );
+        // Two sources with one config are two registrations.
+        assert_ne!(
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:b", &orders, &alice, &IdentityContext::default())
         );
 
         let mut elsewhere = alice.clone();
         elsewhere.unity.as_mut().unwrap().uri = "https://other.example.com".to_string();
         assert_ne!(
-            delta_table_key(&orders, &alice, &IdentityContext::default()),
-            delta_table_key(&orders, &elsewhere, &IdentityContext::default())
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &elsewhere, &IdentityContext::default())
         );
 
         // A path and a catalog name spelt alike are different tables.
         assert_ne!(
             delta_table_key(
+                "gs:a",
                 &Placement::Path("main.sales.orders".to_string()),
                 &alice,
                 &IdentityContext::default()
             ),
-            delta_table_key(&orders, &alice, &IdentityContext::default())
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default())
         );
     }
 
@@ -682,6 +702,7 @@ mod delta_key_tests {
     fn a_secret_named_by_variable_keys_on_the_name() {
         let orders = Placement::Unity("main.sales.orders".to_string());
         let key = delta_table_key(
+            "gs:a",
             &orders,
             &source(ConfigValue::from_env("UNITY_TOKEN_KEY_TEST")),
             &IdentityContext::default(),
@@ -701,8 +722,104 @@ mod delta_key_tests {
             ..IdentityContext::default()
         };
         assert_ne!(
-            delta_table_key(&orders, &config, &IdentityContext::default()),
-            delta_table_key(&orders, &config, &closed)
+            delta_table_key("gs:a", &orders, &config, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &config, &closed)
         );
+    }
+
+    /// Resolves every reference to one secret, for `tenant` (or for no one in
+    /// particular), or refuses every one.
+    #[derive(Debug)]
+    struct Tenant {
+        tenant: Option<&'static str>,
+        refuses: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::SecretResolver for Tenant {
+        async fn resolve_secret(
+            &self,
+            secret_ref: &str,
+        ) -> Result<String, fluree_db_iceberg::SecretResolveError> {
+            if self.refuses {
+                return Err(fluree_db_iceberg::SecretResolveError::Denied(
+                    secret_ref.to_string(),
+                ));
+            }
+            Ok("one-secret".to_string())
+        }
+
+        fn scope_id(&self) -> Option<String> {
+            self.tenant.map(str::to_string)
+        }
+    }
+
+    fn resolving(tenant: Option<&'static str>, refuses: bool) -> IdentityContext {
+        IdentityContext {
+            secret_resolver: Some(std::sync::Arc::new(Tenant { tenant, refuses })),
+            ..IdentityContext::default()
+        }
+    }
+
+    /// A source on Azure whose service principal's secret is a reference.
+    fn azure_source() -> (Placement, DeltaGsConfig) {
+        let config = DeltaGsConfig {
+            io: fluree_db_delta::DeltaIoConfig {
+                azure: Some(fluree_db_delta::AzureAuth::ClientSecret {
+                    tenant_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                    client_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    client_secret: ConfigValue::SecretRef {
+                        secret_ref: "azure-secret".to_string(),
+                    },
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let placement =
+            Placement::Path("abfss://lake@account.dfs.core.windows.net/orders".to_string());
+        (placement, config)
+    }
+
+    /// Two resolvers that resolve the same stored reference for two tenants
+    /// key two handles; one tenant's two resolvers share one.
+    #[test]
+    fn a_resolvers_scope_id_is_part_of_the_key() {
+        let (orders, config) = azure_source();
+        let key = |ctx: &IdentityContext| delta_table_key("gs:a", &orders, &config, ctx);
+        let a = key(&resolving(Some("tenant-a"), false));
+        assert_eq!(a, key(&resolving(Some("tenant-a"), false)));
+        assert_ne!(a, key(&resolving(Some("tenant-b"), false)));
+        assert_ne!(a, key(&resolving(None, false)));
+    }
+
+    /// A cached handle is never a way around the resolver: a caller whose
+    /// resolver refuses the source's secret gets that refusal, not the handle
+    /// a caller that could resolve it opened, even under one key.
+    #[tokio::test]
+    async fn a_caller_that_cannot_resolve_the_secrets_is_not_served_the_handle() {
+        let (orders, config) = azure_source();
+        let cache = super::R2rmlCache::new(4, 4);
+        let (allowed, refused) = (resolving(None, false), resolving(None, true));
+        assert_eq!(
+            delta_table_key("gs:a", &orders, &config, &allowed),
+            delta_table_key("gs:a", &orders, &config, &refused),
+            "the two callers share a key, so only the resolver can tell them apart"
+        );
+        cache
+            .delta_table("gs:a", "orders", &orders, &config, &allowed)
+            .await
+            .expect("an Azure store is built without a request");
+        match cache
+            .delta_table("gs:a", "orders", &orders, &config, &refused)
+            .await
+        {
+            Ok(_) => panic!("served a handle opened with a secret this caller cannot resolve"),
+            Err(error) => assert!(error.to_string().contains("denied"), "{error}"),
+        }
+        assert!(cache
+            .delta_table("gs:a", "orders", &orders, &config, &allowed)
+            .await
+            .is_ok());
     }
 }

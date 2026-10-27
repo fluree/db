@@ -18,6 +18,8 @@ use delta_kernel::object_store::{
 use futures::stream::{self, BoxStream, StreamExt};
 use url::Url;
 
+use fluree_db_iceberg::{HostIdentityKind, HostIdentityPolicy, IcebergError, IdentityContext};
+
 use crate::config::{AzureAuth, DeltaIoConfig, LocationKind};
 use crate::error::{DeltaError, Result};
 use crate::unity::{UnityClient, UnityTable};
@@ -31,11 +33,24 @@ pub(crate) enum Credentials {
 }
 
 /// Parse a table location into the directory URL Kernel expects (trailing
-/// slash) and open a store for it.
+/// slash) and open a store for it, under `identity`'s host-identity policy.
+///
+/// The host's own credentials are a host identity the operator governs
+/// ([`HostIdentityPolicy`]): ambient AWS (`aws`, and its bucket allowlist) for
+/// an `s3://` table read with [`Credentials::Ambient`], and ambient Azure
+/// (`azure`) for an Azure table with no `io.azure` of its own. A service
+/// principal `io.azure` names, and Unity's per-table credentials, are not.
+///
+/// The bucket checked is the table's: a store is bound to one bucket (or
+/// container) here, and Kernel addresses every file it reads, including an
+/// absolute data-file URL from the log, as a path within that store
+/// (`Path::from_url_path(url.path())`, which drops the URL's host), so no
+/// read can leave the bucket that was checked.
 pub(crate) fn open(
     location: &str,
     io: &DeltaIoConfig,
     credentials: Credentials,
+    identity: &IdentityContext,
 ) -> Result<(Url, Arc<dyn ObjectStore>)> {
     let bad = |e: &dyn std::fmt::Display| DeltaError::Config(format!("{location}: {e}"));
 
@@ -72,7 +87,13 @@ pub(crate) fn open(
         let builder = match (credentials, &io.azure) {
             (Credentials::Unity(unity, table), _) => MicrosoftAzureBuilder::new()
                 .with_credentials(crate::unity::Vending::azure(unity, table)),
-            (Credentials::Ambient, None) => MicrosoftAzureBuilder::from_env(),
+            (Credentials::Ambient, None) => {
+                identity
+                    .policy
+                    .ensure(HostIdentityKind::Azure)
+                    .map_err(DeltaError::Identity)?;
+                MicrosoftAzureBuilder::from_env()
+            }
             // An unresolved secret reference fails here: `io` must be hydrated.
             (
                 Credentials::Ambient,
@@ -117,6 +138,9 @@ pub(crate) fn open(
         .strip_prefix("s3a://")
         .map_or_else(|| location.to_string(), |rest| format!("s3://{rest}"));
     let url = Url::parse(&format!("{}/", normalized.trim_end_matches('/'))).map_err(|e| bad(&e))?;
+    if let Credentials::Ambient = credentials {
+        ensure_ambient_s3(&url, io, &identity.policy)?;
+    }
     let mut builder = AmazonS3Builder::from_env().with_url(url.as_str());
     if let Credentials::Unity(unity, table) = credentials {
         builder = builder.with_credentials(crate::unity::Vending::aws(unity, table));
@@ -140,6 +164,29 @@ pub(crate) fn open(
         local: false,
     };
     Ok((url, Arc::new(store)))
+}
+
+/// The host's ambient AWS identity may read the bucket `url` names: the `aws`
+/// kind is allowed and, under a bucket allowlist, the bucket is on it and no
+/// endpoint override can redirect the read to another bucket.
+fn ensure_ambient_s3(url: &Url, io: &DeltaIoConfig, policy: &HostIdentityPolicy) -> Result<()> {
+    policy
+        .ensure(HostIdentityKind::Aws)
+        .map_err(DeltaError::Identity)?;
+    if let Some(allowed) = &policy.ambient_aws_buckets {
+        if let Some(endpoint) = &io.s3_endpoint {
+            return Err(DeltaError::Identity(IcebergError::AmbientEndpointRefused {
+                endpoint: endpoint.clone(),
+            }));
+        }
+        let bucket = url.host_str().unwrap_or_default();
+        if !allowed.iter().any(|b| b == bucket) {
+            return Err(DeltaError::Identity(IcebergError::AmbientBucketRefused {
+                bucket: bucket.to_string(),
+            }));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -273,6 +320,7 @@ mod tests {
             "s3://bucket/table",
             &with_endpoint("http://169.254.169.254"),
             Credentials::Ambient,
+            &IdentityContext::default(),
         ) {
             Ok(_) => panic!("a metadata-range endpoint must be refused"),
             Err(e) => e.to_string(),
@@ -283,6 +331,101 @@ mod tests {
             "s3://bucket/table",
             &with_endpoint("http://127.0.0.1:4566"),
             Credentials::Ambient,
+            &IdentityContext::default(),
+        )
+        .is_ok());
+    }
+
+    fn under(policy: HostIdentityPolicy) -> IdentityContext {
+        IdentityContext {
+            policy,
+            ..IdentityContext::default()
+        }
+    }
+
+    fn refusal(result: Result<(Url, Arc<dyn ObjectStore>)>) -> IcebergError {
+        match result {
+            Err(DeltaError::Identity(refusal)) => refusal,
+            Err(other) => panic!("expected a host-identity refusal, got {other:?}"),
+            Ok(_) => panic!("expected a host-identity refusal, got a store"),
+        }
+    }
+
+    #[test]
+    fn an_ambient_s3_table_is_the_aws_host_identity() {
+        let io = DeltaIoConfig {
+            s3_region: Some("us-east-1".to_string()),
+            ..DeltaIoConfig::default()
+        };
+        let no_aws = under(HostIdentityPolicy::parse(Some("azure"), None).unwrap());
+        assert!(matches!(
+            refusal(open("s3://lake/t", &io, Credentials::Ambient, &no_aws)),
+            IcebergError::HostIdentityRefused {
+                kind: HostIdentityKind::Aws
+            }
+        ));
+        assert!(matches!(
+            refusal(open("s3a://lake/t", &io, Credentials::Ambient, &no_aws)),
+            IcebergError::HostIdentityRefused { .. }
+        ));
+
+        let lake_only = under(HostIdentityPolicy::parse(None, Some("lake")).unwrap());
+        assert!(open("s3://lake/t", &io, Credentials::Ambient, &lake_only).is_ok());
+        match refusal(open(
+            "s3://stack-internal/t",
+            &io,
+            Credentials::Ambient,
+            &lake_only,
+        )) {
+            IcebergError::AmbientBucketRefused { bucket } => assert_eq!(bucket, "stack-internal"),
+            other => panic!("expected AmbientBucketRefused, got {other:?}"),
+        }
+        // An endpoint override could name a bucket of its own.
+        let redirected = DeltaIoConfig {
+            s3_endpoint: Some("https://stack-internal.s3.us-east-1.amazonaws.com".to_string()),
+            s3_path_style: true,
+            ..io.clone()
+        };
+        assert!(matches!(
+            refusal(open(
+                "s3://lake/t",
+                &redirected,
+                Credentials::Ambient,
+                &lake_only
+            )),
+            IcebergError::AmbientEndpointRefused { .. }
+        ));
+    }
+
+    #[test]
+    fn an_ambient_azure_table_is_the_azure_host_identity_but_a_service_principal_is_not() {
+        let location = "abfss://container@account.dfs.core.windows.net/t";
+        let no_azure = under(HostIdentityPolicy::parse(Some("aws"), None).unwrap());
+        assert!(matches!(
+            refusal(open(
+                location,
+                &DeltaIoConfig::default(),
+                Credentials::Ambient,
+                &no_azure
+            )),
+            IcebergError::HostIdentityRefused {
+                kind: HostIdentityKind::Azure
+            }
+        ));
+        // The source's own service principal is not a host identity.
+        let own = DeltaIoConfig {
+            azure: Some(AzureAuth::ClientSecret {
+                tenant_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                client_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                client_secret: fluree_db_iceberg::ConfigValue::literal("s3cr3t"),
+            }),
+            ..DeltaIoConfig::default()
+        };
+        assert!(open(
+            location,
+            &own,
+            Credentials::Ambient,
+            &under(HostIdentityPolicy::deny_all())
         )
         .is_ok());
     }

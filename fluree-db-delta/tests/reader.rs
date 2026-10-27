@@ -12,6 +12,7 @@ use fluree_db_delta::{
     ColumnFilter, DeltaError, DeltaIoConfig, DeltaSnapshot, DeltaTable, FilterOp, FilterValue,
     VersionSelector,
 };
+use fluree_db_iceberg::auth::IdentityContext;
 use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
 
@@ -31,8 +32,13 @@ fn allow_roots() {
 fn open(table: &str) -> DeltaTable {
     allow_roots();
     let location = fixtures().join(table);
-    DeltaTable::open(table, location.to_str().unwrap(), &DeltaIoConfig::default())
-        .expect("open table")
+    DeltaTable::open(
+        table,
+        location.to_str().unwrap(),
+        &DeltaIoConfig::default(),
+        &IdentityContext::default(),
+    )
+    .expect("open table")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,7 +245,13 @@ async fn a_version_whose_data_was_removed_fails_at_scan() {
 #[tokio::test]
 async fn reads_outside_the_local_allowlist_are_refused() {
     allow_roots();
-    let err = DeltaTable::open("passwd", "/etc", &DeltaIoConfig::default()).unwrap_err();
+    let err = DeltaTable::open(
+        "passwd",
+        "/etc",
+        &DeltaIoConfig::default(),
+        &IdentityContext::default(),
+    )
+    .unwrap_err();
     assert!(matches!(err, DeltaError::Config(_)), "{err}");
 }
 
@@ -316,6 +328,7 @@ async fn without_in_commit_timestamps_an_instant_resolves_by_log_file_mtime() {
         "fact_order",
         dir.to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap();
     for (instant, version) in [
@@ -381,6 +394,7 @@ async fn an_absolute_data_path_outside_the_allowlist_is_refused_at_read() {
         "dim_store",
         dir.to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap();
     let snapshot = table.snapshot(VersionSelector::Latest).await.unwrap();
@@ -417,8 +431,13 @@ impl Growing {
                 std::fs::rename(entry.path(), held.join(entry.file_name())).unwrap();
             }
         }
-        let table = DeltaTable::open(fixture, root.to_str().unwrap(), &DeltaIoConfig::default())
-            .expect("open table");
+        let table = DeltaTable::open(
+            fixture,
+            root.to_str().unwrap(),
+            &DeltaIoConfig::default(),
+            &IdentityContext::default(),
+        )
+        .expect("open table");
         let growing = Self {
             _dir: dir,
             log,
@@ -567,6 +586,7 @@ async fn a_repeat_read_does_not_replay_the_log() {
         "checkpointed",
         growing.log.parent().unwrap().to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap();
     assert!(fresh.snapshot(VersionSelector::Latest).await.is_err());
@@ -695,6 +715,7 @@ async fn an_instant_before_the_oldest_retained_commit_is_refused_on_a_cleaned_lo
         "log_cleaned",
         dir.to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap();
 
@@ -1100,7 +1121,13 @@ async fn the_log_answers_a_row_count_only_when_it_provably_matches_a_scan() {
     // without any statistics, the log proves nothing.
     allow_roots();
     let open_copy = |dir: &Path| {
-        DeltaTable::open("copy", dir.to_str().unwrap(), &DeltaIoConfig::default()).unwrap()
+        DeltaTable::open(
+            "copy",
+            dir.to_str().unwrap(),
+            &DeltaIoConfig::default(),
+            &IdentityContext::default(),
+        )
+        .unwrap()
     };
     let no_null_count = tempfile::tempdir().unwrap();
     copy_dir_all(&fixtures().join("partitioned"), no_null_count.path());
@@ -1155,6 +1182,7 @@ async fn azure_locations_open_with_a_hydrated_service_principal_only() {
         "orders",
         location,
         &with_secret(ConfigValue::literal("s3cret")),
+        &IdentityContext::default(),
     )
     .expect("service principal store builds offline");
 
@@ -1163,7 +1191,8 @@ async fn azure_locations_open_with_a_hydrated_service_principal_only() {
     let by_ref = with_secret(ConfigValue::SecretRef {
         secret_ref: "vault://delta/azure".to_string(),
     });
-    let err = DeltaTable::open("orders", location, &by_ref).unwrap_err();
+    let err =
+        DeltaTable::open("orders", location, &by_ref, &IdentityContext::default()).unwrap_err();
     assert!(matches!(err, DeltaError::Config(_)), "{err}");
     let err = by_ref.hydrate(None).await.unwrap_err();
     assert!(matches!(err, DeltaError::Config(_)), "{err}");
@@ -1172,6 +1201,7 @@ async fn azure_locations_open_with_a_hydrated_service_principal_only() {
         "orders",
         "abfss://lake@evil.example.com/Tables/orders",
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap_err();
     assert!(matches!(err, DeltaError::Config(_)), "{err}");
@@ -1202,6 +1232,7 @@ async fn live_azure_token_request_reaches_entra() {
         "probe",
         "abfss://probe@azureopendatastorage.dfs.core.windows.net/none",
         &io,
+        &IdentityContext::default(),
     )
     .unwrap();
     let err = format!(
@@ -1276,8 +1307,13 @@ fn with_protocol(protocol: serde_json::Value) -> (tempfile::TempDir, DeltaTable)
         })
         .collect();
     std::fs::write(&log, rewritten.join("\n")).unwrap();
-    let table = DeltaTable::open("flags", dir.to_str().unwrap(), &DeltaIoConfig::default())
-        .expect("open table");
+    let table = DeltaTable::open(
+        "flags",
+        dir.to_str().unwrap(),
+        &DeltaIoConfig::default(),
+        &IdentityContext::default(),
+    )
+    .expect("open table");
     (staged, table)
 }
 
@@ -1349,6 +1385,7 @@ async fn the_data_file_probe_reaches_a_file_the_log_alone_does_not() {
         "dim_store",
         dir.to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap();
     let snapshot = table.snapshot(VersionSelector::Latest).await.unwrap();
@@ -1535,6 +1572,7 @@ async fn a_schema_change_inside_a_range_is_named_as_such() {
         "change_feed",
         dir.to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .expect("open table");
     let latest = table.snapshot(VersionSelector::Latest).await.unwrap();
@@ -1567,6 +1605,7 @@ async fn a_failure_inside_a_range_is_remembered_beyond_the_table_handle() {
             "change_feed",
             dir.to_str().unwrap(),
             &DeltaIoConfig::default(),
+            &IdentityContext::default(),
         )
         .expect("open table");
         async move { table.snapshot(selector).await.unwrap() }
