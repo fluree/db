@@ -2041,8 +2041,6 @@ async fn a_direct_registration_reports_whether_its_tables_resolve() {
     );
 }
 
-/// A REST catalog that serves the committed `people` fixture's current
-/// metadata inline at `silver.people` and refuses `silver.refused` (403).
 /// A catalog's `loadTable` answer for the people fixture, its metadata inline.
 /// The table is placed on S3: a catalog that places a table on this host's
 /// disk is refused (only a catalog-less source may read local files), and a
@@ -2068,6 +2066,8 @@ fn people_load_table() -> serde_json::Value {
     })
 }
 
+/// A REST catalog that serves the committed `people` fixture's current
+/// metadata inline at `silver.people` and refuses `silver.refused` (403).
 async fn people_catalog() -> wiremock::MockServer {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
