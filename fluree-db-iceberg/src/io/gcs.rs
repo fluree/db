@@ -19,8 +19,9 @@
 //!   tokens ([`GoogleIdentity::ensure_token_destination`]); a store that would
 //!   send it elsewhere is refused when it is built, before any token is minted.
 //! - Tokens come from a [`GoogleIdentity`] (minted for
-//!   [`DEVSTORAGE_READ_ONLY_SCOPE`]) or a catalog-vended token that renews
-//!   itself ([`RenewingVendedCredentials`]). A request refused with 401 renews
+//!   [`DEVSTORAGE_READ_ONLY_SCOPE`]; a user's own credentials, which a refresh
+//!   grant cannot narrow, carry the user's cloud-platform scope instead) or a
+//!   catalog-vended token that renews itself ([`RenewingVendedCredentials`]). A request refused with 401 renews
 //!   the token and is retried once; a 403 is
 //!   [`IcebergError::StorageAccessDenied`].
 //! - It serves `gs://` paths only ([`IcebergError::SchemeNotServed`] for any

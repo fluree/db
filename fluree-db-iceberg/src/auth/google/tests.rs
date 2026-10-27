@@ -663,6 +663,28 @@ fn metadata_identity_at(base: &str) -> GoogleIdentity {
 
 // ── application default credentials ───────────────────────────────────────
 
+const DEVSTORAGE_READ_ONLY: &str = "https://www.googleapis.com/auth/devstorage.read_only";
+
+/// Google's token endpoint for a user's refresh grant, as observed live: it
+/// grants a scope of the user's consent (gcloud's login consents to
+/// cloud-platform) and refuses any other, `devstorage.read_only` included,
+/// with `400 invalid_scope`.
+struct ConsentedScopes;
+
+impl Respond for ConsentedScopes {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        match form(&request.body).get("scope").map(String::as_str) {
+            Some(CLOUD_PLATFORM_SCOPE) => {
+                ResponseTemplate::new(200).set_body_json(token_body("ya29.user", 3599))
+            }
+            _ => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_scope",
+                "error_description": "Bad Request"
+            })),
+        }
+    }
+}
+
 /// The one test that sets `GOOGLE_APPLICATION_CREDENTIALS` (nothing else in
 /// this binary reads it).
 #[tokio::test]
@@ -670,7 +692,7 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(token_body("ya29.user", 3599)))
+        .respond_with(ConsentedScopes)
         .mount(&server)
         .await;
     let file = std::env::temp_dir().join(format!("fluree-adc-test-{}.json", std::process::id()));
@@ -716,7 +738,8 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
     let dbg = format!("{identity:?}");
     assert!(!dbg.contains("SECRET"), "{dbg}");
 
-    let auth = GoogleCatalogAuth::new(Arc::new(identity), Vec::new());
+    let identity = Arc::new(identity);
+    let auth = GoogleCatalogAuth::new(Arc::clone(&identity), Vec::new());
     let headers = SendCatalogAuth::request_headers(&auth, BIGLAKE)
         .await
         .unwrap();
@@ -733,6 +756,20 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
         .unwrap();
     assert_eq!(requests_to(&server, "/token").await.len(), 1);
 
+    // Storage asks for read-only storage, which a user's refresh grant
+    // cannot narrow to: the user's cloud-platform token serves it, the one
+    // already cached, and a renewal asks for cloud-platform again.
+    let storage = identity
+        .access_token(&[DEVSTORAGE_READ_ONLY])
+        .await
+        .unwrap();
+    assert_eq!(storage.token, "ya29.user");
+    assert_eq!(requests_to(&server, "/token").await.len(), 1);
+    identity.refresh(&[DEVSTORAGE_READ_ONLY]).await.unwrap();
+    let exchanges = requests_to(&server, "/token").await;
+    assert_eq!(exchanges.len(), 2, "the renewal is one exchange");
+    assert_eq!(form(&exchanges[1].body)["scope"], CLOUD_PLATFORM_SCOPE);
+
     // A new login for the same identity (a new refresh token) never serves
     // the token the old one minted: the file's secrets key the cache.
     write_with(
@@ -744,9 +781,9 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
         .await
         .unwrap();
     let exchanges = requests_to(&server, "/token").await;
-    assert_eq!(exchanges.len(), 2, "the rotated refresh token is exchanged");
+    assert_eq!(exchanges.len(), 3, "the rotated refresh token is exchanged");
     assert_eq!(
-        form(&exchanges[1].body)["refresh_token"],
+        form(&exchanges[2].body)["refresh_token"],
         "REFRESH-SECRET-ROTATED"
     );
 

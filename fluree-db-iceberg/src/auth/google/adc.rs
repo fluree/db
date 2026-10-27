@@ -199,7 +199,10 @@ pub(super) fn parse(text: &str) -> Result<AdcFile> {
 }
 
 impl AuthorizedUser {
-    /// The refresh-token grant at Google's OAuth endpoint.
+    /// The refresh-token grant at Google's OAuth endpoint, for `scopes`,
+    /// which must be ones the user consented to: a refresh grant cannot widen
+    /// or narrow the consent (see `grantable_scopes`, which asks for
+    /// cloud-platform).
     pub(super) async fn fetch(
         &self,
         http: &reqwest::Client,

@@ -361,8 +361,8 @@ impl GoogleIdentity {
     /// A token for `scopes` (cloud-platform when empty), from the cache when
     /// one is outside its refresh margin, else minted single-flight.
     pub async fn access_token(&self, scopes: &[&str]) -> Result<AccessToken> {
-        let scopes = normalize_scopes(scopes);
         let adc = self.read_adc()?;
+        let scopes = grantable_scopes(normalize_scopes(scopes), adc.as_ref());
         let slot = cache::slot(&self.key(&scopes, adc.as_ref()));
         let token = slot
             .get_or_fetch(|| self.fetch(&scopes, adc.as_ref()))
@@ -376,8 +376,8 @@ impl GoogleIdentity {
     /// caller's retry reports the server's refusal. This keeps one source's
     /// 401s from re-minting, over and over, a token many sources share.
     pub async fn refresh(&self, scopes: &[&str]) -> Result<()> {
-        let scopes = normalize_scopes(scopes);
         let adc = self.read_adc()?;
+        let scopes = grantable_scopes(normalize_scopes(scopes), adc.as_ref());
         let slot = cache::slot(&self.key(&scopes, adc.as_ref()));
         slot.refetch(|| self.fetch(&scopes, adc.as_ref()))
             .await
@@ -648,6 +648,24 @@ fn normalize_scopes(scopes: &[&str]) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// The scopes a token for `scopes` is minted for. A user's credentials (an
+/// `authorized_user` ADC file, gcloud's `application-default login`) are a
+/// refresh token, and a refresh grant may request only scopes the user
+/// consented to: gcloud's login consents to cloud-platform, so asking for
+/// `devstorage.read_only` is refused (`400 invalid_scope`). A user's token is
+/// therefore never down-scoped: it is minted for cloud-platform, for the
+/// catalog and for storage alike, which then share one cached token. User
+/// credentials are for development on a person's own machine, and a host
+/// identity the operator can refuse (`google-adc`). Every other source (a
+/// service account, WIF, the metadata server, an ADC service-account key) is
+/// minted for exactly the scopes asked: read-only for storage.
+fn grantable_scopes(scopes: Vec<String>, adc: Option<&adc::AdcFile>) -> Vec<String> {
+    match adc {
+        Some(adc::AdcFile::AuthorizedUser(_)) => vec![CLOUD_PLATFORM_SCOPE.to_string()],
+        _ => scopes,
+    }
 }
 
 /// Parse a stored comma-separated scope list (`None` → cloud-platform).

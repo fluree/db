@@ -495,6 +495,8 @@ Google's BigLake Iceberg REST catalog (`https://biglake.googleapis.com/iceberg/v
 | `roles/serviceusage.serviceUsageConsumer` | the quota project | billing BigLake's requests to it |
 | `roles/storage.objectViewer` | the bucket | reading the table's metadata and data files (`storage_auth: catalog`) |
 
+**Token scopes.** A service account, Workload Identity Federation and the metadata server mint storage tokens for `devstorage.read_only` only. User credentials (gcloud's `application-default login`, an `authorized_user` file) cannot be narrowed that way: a refresh grant may ask only for scopes the user consented to, and gcloud's login consents to `cloud-platform`, so asking for `devstorage.read_only` is refused (`invalid_scope`). A user's token therefore carries the user's own `cloud-platform` scope, for the catalog and for storage alike (one token serves both). User credentials are for development on your own machine; on a server they are a host identity the operator can refuse (`google-adc` in `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`).
+
 GCS reads need no `serviceusage` grant unless the bucket is requester-pays, in which case the reading identity needs `roles/serviceusage.serviceUsageConsumer` on the storage quota project. A refused read says what GCS said, once: `AccessDenied` (a missing `storage.objects.get`) or `UserProjectAccessDenied` (no `serviceusage.services.use` on the billed project).
 
 Tests and private deployments can point the Google endpoints at their own hosts with the operator-only overrides `FLUREE_GOOGLE_METADATA_URL`, `FLUREE_GOOGLE_TOKEN_HOSTS` and `FLUREE_GCS_ENDPOINT` (see [configuration](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)); no source can.

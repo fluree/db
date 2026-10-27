@@ -84,7 +84,9 @@ class Google:
       account;
     - ``"application_default"``: the host's application-default credentials
       (``GOOGLE_APPLICATION_CREDENTIALS``, else gcloud's), e.g. after
-      ``gcloud auth application-default login``;
+      ``gcloud auth application-default login``. A user's credentials carry
+      the user's own cloud-platform scope, which a refresh cannot narrow to
+      read-only storage, so use them for development;
     - an :class:`EnvVar` naming the variable that holds a service-account
       key's JSON, read where the source is read. A key is never given
       literally: it would be stored with the source;
