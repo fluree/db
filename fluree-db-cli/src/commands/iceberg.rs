@@ -991,7 +991,10 @@ mod tests {
     #[cfg(feature = "iceberg")]
     #[test]
     fn a_biglake_warehouse_defaults_the_catalog_quota_project() {
+        let (_dir, mapping) = mapping_file();
         let federation = rest(&[
+            "--r2rml",
+            &mapping,
             "--warehouse",
             "bq://projects/lake-project/locations/us-central1",
             "--auth-google-metadata",

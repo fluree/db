@@ -22,6 +22,16 @@ const CATALOG: &str = "https://catalog.invalid/iceberg/v1/restcatalog";
 const FEDERATION: &str = "bq://projects/lake/locations/us/catalogs/sales";
 /// Named by the flags, never set: the key is not read before registration.
 const SA_KEY_VAR: &str = "FLUREE_TEST_GRAPH_SOURCE_SA_KEY_NEVER_SET";
+/// The mapping every `map` is registered with, naming the one table.
+const MAPPING: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+<http://example.org/mapping#Orders>
+    a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sales.orders" ] ;
+    rr:subjectMap [ rr:template "http://example.org/orders/{id}" ] ;
+    rr:predicateObjectMap [ rr:predicate ex:total ; rr:objectMap [ rr:column "total" ] ] .
+"#;
 
 fn fluree_cmd(work_dir: &TempDir) -> Command {
     let mut cmd = cargo_bin_cmd!("fluree");
@@ -30,6 +40,13 @@ fn fluree_cmd(work_dir: &TempDir) -> Command {
     cmd.env("NO_COLOR", "1");
     cmd.env_remove(SA_KEY_VAR);
     cmd
+}
+
+/// Write [`MAPPING`] into `dir` and return its path, for `--r2rml`.
+fn mapping_file(dir: &std::path::Path) -> String {
+    let path = dir.join("mapping.ttl");
+    std::fs::write(&path, MAPPING).unwrap();
+    path.to_str().unwrap().to_string()
 }
 
 fn google_federation_flags() -> Vec<&'static str> {
@@ -51,8 +68,9 @@ fn google_federation_flags() -> Vec<&'static str> {
 fn a_local_map_stores_the_google_identity_its_flags_name() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
+    let mapping = mapping_file(tmp.path());
     fluree_cmd(&tmp)
-        .args(["iceberg", "map", "orders"])
+        .args(["iceberg", "map", "orders", "--r2rml", &mapping])
         .args(google_federation_flags())
         .assert()
         .success();
@@ -73,6 +91,7 @@ fn a_local_map_stores_the_google_identity_its_flags_name() {
 fn a_local_map_refuses_flags_that_cannot_mean_anything_in_their_spelling() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
+    let mapping = mapping_file(tmp.path());
     for (flags, refusal) in [
         (
             vec![
@@ -122,7 +141,7 @@ fn a_local_map_refuses_flags_that_cannot_mean_anything_in_their_spelling() {
         ),
     ] {
         fluree_cmd(&tmp)
-            .args(["iceberg", "map", "gs"])
+            .args(["iceberg", "map", "gs", "--r2rml", &mapping])
             .args(&flags)
             .assert()
             .failure()
@@ -162,7 +181,11 @@ mod seam {
         std::env::set_var(fluree_db_api::SECRET_ENV_VARS_ENV, SA_KEY_VAR);
         std::env::remove_var(SA_KEY_VAR);
 
-        let args = map_args(&google_federation_flags());
+        let dir = tempfile::tempdir().unwrap();
+        let mapping = mapping_file(dir.path());
+        let mut flags = vec!["--r2rml", mapping.as_str()];
+        flags.extend(google_federation_flags());
+        let args = map_args(&flags);
         let body = fluree_db_cli::commands::iceberg::args_to_json(&args).unwrap();
         assert!(
             body.get("catalog").is_some() && body.get("auth_google_service_account_env").is_none(),
@@ -205,13 +228,21 @@ mod seam {
             .await
             .unwrap()
             .expect("registered");
-        let remote: serde_json::Value = serde_json::from_str(&record.config).unwrap();
-        let local = serde_json::to_value(
+        let mut remote: serde_json::Value = serde_json::from_str(&record.config).unwrap();
+        // The stored mapping is registration's: its content address. The
+        // connection and settings are the flags'.
+        let stored_mapping = remote.as_object_mut().unwrap().remove("mapping");
+        assert!(
+            stored_mapping.is_some_and(|m| m["source"].is_string()),
+            "the mapping is stored: {remote}"
+        );
+        let mut local = serde_json::to_value(
             fluree_db_cli::commands::iceberg::build_iceberg_config(&args)
                 .unwrap()
                 .to_iceberg_gs_config(),
         )
         .unwrap();
+        local.as_object_mut().unwrap().remove("mapping");
         assert_eq!(remote, local);
         assert_eq!(
             remote["catalog"]["auth"]["credentials"]["key"]["env_var"],
