@@ -878,6 +878,35 @@ async fn tenants_whose_resolvers_differ_only_in_scope_id_share_no_client_or_cach
     assert_ne!(in_a.qualify(S3_META), in_b.qualify(S3_META));
 }
 
+/// A host identity whose token may not go to the GCS endpoint gets no plan,
+/// and is refused before a token is minted for it: the refusal comes from
+/// the destination check, not from a mint (the metadata server named here
+/// does not exist).
+#[tokio::test]
+async fn a_host_identitys_plan_is_refused_for_a_gcs_endpoint_its_token_may_not_reach() {
+    let identity =
+        Arc::new(GoogleIdentity::new(&GoogleCredentials::Metadata, None, &open()).unwrap());
+    let refused = super::google_plan(
+        Arc::clone(&identity),
+        None,
+        false,
+        &ambient_io(),
+        "ctx",
+        "https://storage.attacker.example",
+    )
+    .await;
+    match refused {
+        Err(IcebergError::GoogleTokenHostRefused { kind, host }) => {
+            assert_eq!(kind, HostIdentityKind::GoogleMetadata);
+            assert_eq!(host, "storage.attacker.example");
+        }
+        other => panic!(
+            "expected GoogleTokenHostRefused, got {:?}",
+            other.map(|_| ())
+        ),
+    }
+}
+
 /// An AWS subject that counts the WIF exchanges it is asked to sign, and has
 /// no credentials for any of them.
 #[derive(Debug, Default)]

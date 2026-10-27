@@ -12,12 +12,23 @@ use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::*;
-use crate::auth::google::GoogleEndpoints;
+use crate::auth::google::{parse_token_hosts, GoogleEndpoints};
 use crate::auth::{GoogleCredentials, IdentityContext};
 use crate::credential::{GcsCredentials, VendedCredentialSource};
 
 const METADATA_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
 const LAST_MODIFIED: &str = "Wed, 21 Oct 2026 07:28:00 GMT";
+
+/// Google's token endpoints at the mock `google`, with the mock GCS host
+/// listed as a token destination, as an operator lists one in
+/// `FLUREE_GOOGLE_TOKEN_HOSTS`: the metadata identity these tests read as is a
+/// host identity, whose token goes nowhere else.
+fn endpoints_at(google: &MockServer) -> GoogleEndpoints {
+    GoogleEndpoints {
+        token_hosts: parse_token_hosts(Some("127.0.0.1")),
+        ..GoogleEndpoints::at(&google.uri())
+    }
+}
 
 /// A metadata identity whose token server is `google`, minting `token`.
 async fn identity(google: &MockServer, token: &str) -> Arc<GoogleIdentity> {
@@ -33,7 +44,7 @@ async fn identity(google: &MockServer, token: &str) -> Arc<GoogleIdentity> {
             &GoogleCredentials::Metadata,
             None,
             &IdentityContext::default(),
-            &GoogleEndpoints::at(&google.uri()),
+            &endpoints_at(google),
         )
         .unwrap(),
     )
@@ -281,7 +292,7 @@ async fn a_401_renews_the_token_and_retries_once() {
             &GoogleCredentials::Metadata,
             None,
             &IdentityContext::default(),
-            &GoogleEndpoints::at(&google.uri()),
+            &endpoints_at(&google),
         )
         .unwrap(),
     );
@@ -407,6 +418,50 @@ fn a_store_that_names_no_valid_project_is_refused() {
     assert!(
         GcsIcebergStorage::build(source, Some("bad\r\nheader".to_string()), "http://x").is_err()
     );
+}
+
+/// A host identity's token goes only to Google's APIs or a host the operator
+/// listed: a store whose endpoint is neither is refused when it is built,
+/// typed, and no token is ever minted for it. At Google's own endpoint the
+/// same identity builds; a vended token is the catalog's to scope (the vended
+/// tests below read through an unlisted mock host).
+#[tokio::test]
+async fn a_host_identitys_token_never_goes_to_an_unlisted_endpoint() {
+    let (google, gcs) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .and(path(METADATA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "ya29.host", "expires_in": 3600, "token_type": "Bearer"
+        })))
+        .expect(0)
+        .mount(&google)
+        .await;
+    let unlisted = Arc::new(
+        GoogleIdentity::with_endpoints(
+            &GoogleCredentials::Metadata,
+            None,
+            &IdentityContext::default(),
+            &GoogleEndpoints::at(&google.uri()),
+        )
+        .unwrap(),
+    );
+    match GcsIcebergStorage::build(
+        TokenSource::Identity(Arc::clone(&unlisted)),
+        None,
+        &gcs.uri(),
+    ) {
+        Err(IcebergError::GoogleTokenHostRefused { kind, host }) => {
+            assert_eq!(kind, crate::host_identity::HostIdentityKind::GoogleMetadata);
+            assert_eq!(host, "127.0.0.1");
+        }
+        Err(other) => panic!("expected GoogleTokenHostRefused, got {other:?}"),
+        Ok(_) => panic!("a store sending a host token to an unlisted host was built"),
+    }
+    assert!(
+        GcsIcebergStorage::build(TokenSource::Identity(unlisted), None, GCS_DEFAULT_ENDPOINT)
+            .is_ok()
+    );
+    // `expect(0)` on the token server is verified when `google` drops.
 }
 
 /// A store keeps one client per bucket it reads, reused, and at most

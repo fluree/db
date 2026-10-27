@@ -13,7 +13,11 @@
 //!   ([`crate::config::StorageAuth`]), never borrowed from the host.
 //! - The bearer token goes only to Google's storage host. The operator may point
 //!   every GCS read at another endpoint for tests or private access
-//!   ([`GCS_ENDPOINT_ENV`]); no source can.
+//!   ([`GCS_ENDPOINT_ENV`]); no source can. A host identity's token (the
+//!   metadata server's, the host's ADC, host-signed WIF) goes to that endpoint
+//!   only if it is one of Google's APIs or a host the operator listed for
+//!   tokens ([`GoogleIdentity::ensure_token_destination`]); a store that would
+//!   send it elsewhere is refused when it is built, before any token is minted.
 //! - Tokens come from a [`GoogleIdentity`] (minted for
 //!   [`DEVSTORAGE_READ_ONLY_SCOPE`]) or a catalog-vended token that renews
 //!   itself ([`RenewingVendedCredentials`]). A request refused with 401 renews
@@ -199,6 +203,11 @@ impl GcsIcebergStorage {
     }
 
     fn build(source: TokenSource, user_project: Option<String>, endpoint: &str) -> Result<Self> {
+        // Every request this store makes goes to `endpoint`. A catalog-vended
+        // token is the catalog's to scope; an identity's is checked here.
+        if let TokenSource::Identity(identity) = &source {
+            identity.ensure_token_destination(endpoint)?;
+        }
         if let Some(project) = &user_project {
             if !crate::auth::google::is_project_id(project) {
                 return Err(IcebergError::GoogleCredentialsInvalid(

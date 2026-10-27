@@ -569,7 +569,7 @@ pub(crate) async fn plan_storage(
             })
             .await?;
             let user_project = identity.quota_project().map(str::to_string);
-            google_plan(identity, user_project, true, io, &context).await
+            google_plan(identity, user_project, true, io, &context, gcs_endpoint()).await
         }
         StorageAuth::Google {
             credentials,
@@ -585,7 +585,7 @@ pub(crate) async fn plan_storage(
             })
             .await?;
             let user_project = identity.quota_project().map(str::to_string);
-            google_plan(identity, user_project, false, io, &context).await
+            google_plan(identity, user_project, false, io, &context, gcs_endpoint()).await
         }
     }
 }
@@ -655,12 +655,17 @@ async fn google_plan(
     from_catalog: bool,
     io: &IoConfig,
     context: &str,
+    endpoint: &str,
 ) -> IcebergResult<StoragePlan> {
+    // The store built from this plan sends the identity's token to `endpoint`
+    // (the process's GCS endpoint): refuse a host identity whose token may not
+    // go there before minting one. The store checks again when it is built.
+    identity.ensure_token_destination(endpoint)?;
     identity.access_token(&[DEVSTORAGE_READ_ONLY_SCOPE]).await?;
     let scope = StorageScope::of(&[
         ("kind", "google"),
         ("principal", identity.principal()),
-        ("endpoint", gcs_endpoint()),
+        ("endpoint", endpoint),
         ("context", context),
     ]);
     Ok(StoragePlan {
