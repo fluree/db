@@ -1598,6 +1598,18 @@ pub struct FlureeBuilder {
     identity: fluree_db_iceberg::IdentityContext,
 }
 
+/// The identity context an instance starts with: no secret resolver, and the
+/// operator's host-identity policy from the environment
+/// ([`HostIdentityPolicy::from_env`](fluree_db_iceberg::HostIdentityPolicy::from_env)),
+/// which allows every host identity when its variables are unset.
+#[cfg(feature = "iceberg")]
+fn default_identity_context() -> fluree_db_iceberg::IdentityContext {
+    fluree_db_iceberg::IdentityContext {
+        policy: fluree_db_iceberg::HostIdentityPolicy::from_env(),
+        ..fluree_db_iceberg::IdentityContext::default()
+    }
+}
+
 /// Configuration for background indexing in `FlureeBuilder`.
 #[derive(Debug, Clone)]
 pub struct IndexingBuilderConfig {
@@ -1834,7 +1846,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            identity: fluree_db_iceberg::IdentityContext::default(),
+            identity: default_identity_context(),
         }
     }
 
@@ -1859,7 +1871,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            identity: fluree_db_iceberg::IdentityContext::default(),
+            identity: default_identity_context(),
         }
     }
 
@@ -1940,7 +1952,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            identity: fluree_db_iceberg::IdentityContext::default(),
+            identity: default_identity_context(),
         }
     }
 
@@ -2173,7 +2185,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            identity: fluree_db_iceberg::IdentityContext::default(),
+            identity: default_identity_context(),
         })
     }
 
@@ -2610,8 +2622,10 @@ impl FlureeBuilder {
     /// Set which host-derived identities graph sources built by this instance
     /// may use (the ambient AWS chain, the GCE metadata server, the host's
     /// gcloud ADC, host-signed Workload Identity Federation). Defaults to
-    /// allowing all of them; the server sets
-    /// [`HostIdentityPolicy::from_env`](fluree_db_iceberg::HostIdentityPolicy::from_env).
+    /// [`HostIdentityPolicy::from_env`](fluree_db_iceberg::HostIdentityPolicy::from_env),
+    /// the operator's `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES` and
+    /// `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS`, which allows all of them when
+    /// neither is set.
     /// Forwarded to the finalized `Fluree`; see [`Fluree::with_host_identity_policy`].
     #[cfg(feature = "iceberg")]
     pub fn with_host_identity_policy(
@@ -3783,7 +3797,7 @@ impl Fluree {
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
-            identity: fluree_db_iceberg::IdentityContext::default(),
+            identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             #[cfg(feature = "native")]
             root: RootHold::default(),
@@ -3811,7 +3825,7 @@ impl Fluree {
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
-            identity: fluree_db_iceberg::IdentityContext::default(),
+            identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             #[cfg(feature = "native")]
             root: RootHold::default(),
