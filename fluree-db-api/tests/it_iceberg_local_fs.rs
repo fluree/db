@@ -2315,11 +2315,11 @@ async fn a_registration_builds_one_catalog_client_for_all_its_tables() {
     );
 }
 
-/// `GRAPH ?g` with `?g` bound from data. A binding that names a source no
-/// query reads as a graph (no mapping, an empty mapping, a BM25 index) is a
-/// graph outside the dataset: it yields no rows, SPARQL's answer, and the query
-/// goes on, answering for the other bindings. A constant `GRAPH <source>`
-/// naming the same source is refused.
+/// `GRAPH ?g` with `?g` bound from data before the block runs. A binding that
+/// names a source no query reads as a graph (no mapping, an empty mapping, a
+/// BM25 index) is a graph outside the dataset: it yields no rows, SPARQL's
+/// answer, and the query goes on, answering for the other bindings. A
+/// constant `GRAPH <source>` naming the same source is refused.
 #[tokio::test]
 async fn a_graph_variable_bound_from_data_to_an_unreadable_source_yields_no_rows() {
     allow_fixture_roots();
@@ -2354,37 +2354,86 @@ async fn a_graph_variable_bound_from_data_to_an_unreadable_source_yields_no_rows
         .await
         .expect("index");
 
+    // `?g` is bound before the GRAPH block runs only where the block is
+    // correlated with the rows binding it: after a subquery, or inside
+    // OPTIONAL. (A plain join evaluates `GRAPH ?g` over the ledger's own named
+    // graphs and never probes a source.)
     let ledger = fluree.graph("crm:main");
-    let sparql = "PREFIX ex: <http://example.org/> \
-                  SELECT ?g ?o WHERE { ?s ex:in ?g GRAPH ?g { ?x ex:p ?o } }";
+    let one_row = |rows: &serde_json::Value, route: &str| {
+        let bindings = rows["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{route}: {rows}"));
+        assert_eq!(
+            bindings.len(),
+            1,
+            "{route}: only urn:g1 is a graph here: {rows}"
+        );
+        assert_eq!(bindings[0]["g"]["value"], "urn:g1", "{route}: {rows}");
+        assert_eq!(bindings[0]["o"]["value"], "in g1", "{route}: {rows}");
+    };
+    let subquery = "PREFIX ex: <http://example.org/> SELECT ?g ?o WHERE { \
+                    { SELECT ?g WHERE { ?s ex:in ?g } } GRAPH ?g { ?x ex:p ?o } }";
     let rows = ledger
         .query()
-        .sparql(sparql)
+        .sparql(subquery)
         .execute_formatted()
         .await
-        .expect("a data-bound GRAPH variable does not fail the query");
+        .expect("SPARQL subquery: a data-bound GRAPH variable does not fail the query");
+    one_row(&rows, "SPARQL subquery");
+    let optional = "PREFIX ex: <http://example.org/> SELECT ?g ?o WHERE { \
+                    ?s ex:in ?g OPTIONAL { GRAPH ?g { ?x ex:p ?o } } }";
+    let rows = ledger
+        .query()
+        .sparql(optional)
+        .execute_formatted()
+        .await
+        .expect("SPARQL OPTIONAL: a data-bound GRAPH variable does not fail the query");
     let bindings = rows["results"]["bindings"].as_array().expect("bindings");
-    assert_eq!(bindings.len(), 1, "only urn:g1 is a graph here: {rows}");
-    assert_eq!(bindings[0]["g"]["value"], "urn:g1", "{rows}");
-    assert_eq!(bindings[0]["o"]["value"], "in g1", "{rows}");
+    assert_eq!(bindings.len(), 4, "every ?g row is kept: {rows}");
+    let matched: Vec<_> = bindings.iter().filter(|b| b.get("o").is_some()).collect();
+    assert_eq!(matched.len(), 1, "only urn:g1 matches inside GRAPH: {rows}");
+    assert_eq!(matched[0]["g"]["value"], "urn:g1", "{rows}");
 
-    let jsonld = serde_json::json!({
+    let jsonld_subquery = serde_json::json!({
         "@context": {"ex": "http://example.org/"},
         "select": ["?g", "?o"],
         "where": [
-            {"@id": "?s", "ex:in": "?g"},
+            ["query", {"select": ["?g"], "where": {"@id": "?s", "http://example.org/in": "?g"}}],
             ["graph", "?g", {"@id": "?x", "ex:p": "?o"}]
         ]
     });
     let rows = ledger
         .query()
-        .jsonld(&jsonld)
+        .jsonld(&jsonld_subquery)
         .execute_formatted()
         .await
-        .expect("a data-bound graph variable does not fail the query");
+        .expect("JSON-LD subquery: a data-bound graph variable does not fail the query");
     let rows = rows.as_array().expect("rows");
     assert_eq!(rows.len(), 1, "only urn:g1 is a graph here: {rows:?}");
     assert!(rows[0].to_string().contains("in g1"), "{rows:?}");
+    let jsonld_optional = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?o"],
+        "where": [
+            {"@id": "?s", "ex:in": "?g"},
+            ["optional", ["graph", "?g", {"@id": "?x", "ex:p": "?o"}]]
+        ]
+    });
+    let rows = ledger
+        .query()
+        .jsonld(&jsonld_optional)
+        .execute_formatted()
+        .await
+        .expect("JSON-LD optional: a data-bound graph variable does not fail the query");
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 4, "every ?g row is kept: {rows:?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.to_string().contains("in g1"))
+            .count(),
+        1,
+        "only urn:g1 matches inside graph: {rows:?}"
+    );
 
     // The same sources named as constants are refused.
     for gs in [unmapped.as_str(), empty.as_str(), "bound-search:main"] {
