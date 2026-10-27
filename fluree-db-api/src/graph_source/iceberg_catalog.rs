@@ -182,10 +182,17 @@ pub(crate) fn identity_query_error(
         },
         // The ambient-AWS bucket allowlist is the `aws` host identity's own
         // restriction: the same 403, naming its own switch.
-        E::AmbientBucketRefused { .. } => Q::HostIdentityRefused {
-            kind: fluree_db_iceberg::HostIdentityKind::Aws
-                .as_str()
-                .to_string(),
+        E::AmbientBucketRefused { .. } | E::AmbientEndpointRefused { .. } => {
+            Q::HostIdentityRefused {
+                kind: fluree_db_iceberg::HostIdentityKind::Aws
+                    .as_str()
+                    .to_string(),
+                message,
+            }
+        }
+        E::SchemeNotServed { scheme, .. } => Q::StorageSchemeNotServed { scheme, message },
+        E::LocalLocationFromCatalog { .. } => Q::StorageSchemeNotServed {
+            scheme: "file".to_string(),
             message,
         },
         E::GoogleTokenHostRefused { kind, host } => Q::GoogleTokenHostRefused {
@@ -193,7 +200,6 @@ pub(crate) fn identity_query_error(
             host,
             message,
         },
-        E::SchemeNotServed { scheme, .. } => Q::StorageSchemeNotServed { scheme, message },
         E::CatalogQuotaProjectRequired { table } => {
             Q::CatalogQuotaProjectRequired { table, message }
         }
@@ -240,7 +246,10 @@ pub(crate) async fn catalog_client(
         }
         CatalogMode::Glue { catalog_id, .. } => {
             // Glue is called with the host's own AWS chain: the `aws` host
-            // identity, which the instance's policy may refuse.
+            // identity, which the instance's policy may refuse. The ambient
+            // bucket allowlist does not govern the catalog call itself (a
+            // catalog lists whatever the host role can see); it governs the
+            // storage reads that follow, which check each table's bucket.
             identity
                 .policy
                 .ensure(fluree_db_iceberg::HostIdentityKind::Aws)
@@ -260,6 +269,7 @@ pub(crate) async fn catalog_client(
         CatalogMode::S3Tables {
             table_bucket_arn, ..
         } => {
+            // As for Glue: gated by `aws`, not by the bucket allowlist.
             identity
                 .policy
                 .ensure(fluree_db_iceberg::HostIdentityKind::Aws)

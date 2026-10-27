@@ -803,6 +803,7 @@ impl ApiError {
                 fluree_db_iceberg::IcebergError::HostIdentityRefused { .. }
                 | fluree_db_iceberg::IcebergError::AmbientBucketRefused { .. }
                 | fluree_db_iceberg::IcebergError::GoogleTokenHostRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientEndpointRefused { .. }
                 | fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => 403,
                 _ => 400,
             },
@@ -991,10 +992,12 @@ impl ApiError {
                 }
                 fluree_db_iceberg::IcebergError::HostIdentityRefused { .. }
                 | fluree_db_iceberg::IcebergError::AmbientBucketRefused { .. }
-                | fluree_db_iceberg::IcebergError::GoogleTokenHostRefused { .. } => {
+                | fluree_db_iceberg::IcebergError::GoogleTokenHostRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientEndpointRefused { .. } => {
                     errors::HOST_IDENTITY_REFUSED
                 }
-                fluree_db_iceberg::IcebergError::SchemeNotServed { .. } => {
+                fluree_db_iceberg::IcebergError::SchemeNotServed { .. }
+                | fluree_db_iceberg::IcebergError::LocalLocationFromCatalog { .. } => {
                     errors::STORAGE_SCHEME_NOT_SERVED
                 }
                 fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => {

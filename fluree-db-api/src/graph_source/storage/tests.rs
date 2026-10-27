@@ -628,3 +628,310 @@ fn a_grant_never_shows_the_credentials_it_carries() {
     assert!(!shown.contains("ya29.vended"), "{shown}");
     assert!(shown.contains("a GCS token"), "{shown}");
 }
+
+#[test]
+fn a_resolved_storage_shows_neither_its_credentials_nor_its_scope() {
+    let catalog = rest_with("https://cat.example", bearer("a"));
+    let resolved = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        plan(&catalog, &IoConfig::default(), S3_META, &open())
+            .await
+            .unwrap()
+            .build(&CatalogGrant::from_load(
+                &load(S3_META, Some(s3_keys())),
+                None,
+            ))
+            .await
+            .unwrap()
+    });
+    let shown = format!("{resolved:?}");
+    assert!(shown.contains("StorageScope(\"<scoped>\")"), "{shown}");
+    // The decision names the catalog; the scope's description (which carries
+    // a digest of the catalog's stored auth) is not shown.
+    for hidden in ["secret", "AKIA", "v1|", "auth="] {
+        assert!(!shown.contains(hidden), "{hidden} in {shown}");
+    }
+}
+
+/// Under a bucket allowlist, an ambient read through an endpoint override is
+/// refused: a virtual-hosted endpoint read path-style names a bucket of its
+/// own, so the bucket checked would not be the bucket read.
+#[tokio::test]
+async fn an_endpoint_override_cannot_redirect_an_allowlisted_ambient_read() {
+    let direct = CatalogConfig::direct("s3://lake/wh/t");
+    let mut redirected = ambient_io();
+    redirected.s3_endpoint = Some("https://secret-bucket.s3.us-east-1.amazonaws.com".to_string());
+    redirected.s3_path_style = true;
+
+    let lake_only = with_policy(HostIdentityPolicy::parse(None, Some("lake")).unwrap());
+    match plan(&direct, &redirected, "s3://lake/wh/t", &lake_only).await {
+        Err(IcebergError::AmbientEndpointRefused { endpoint }) => {
+            assert_eq!(endpoint, "https://secret-bucket.s3.us-east-1.amazonaws.com");
+        }
+        other => panic!("expected AmbientEndpointRefused, got {other:?}"),
+    }
+    // Without an allowlist the endpoint is the operator's to allow, as before.
+    assert!(plan(&direct, &redirected, "s3://lake/wh/t", &open())
+        .await
+        .is_ok());
+
+    // Typed on the API surface: the `aws` host identity's 403.
+    let config = IcebergGsConfig {
+        catalog: direct,
+        table: fluree_db_iceberg::config::TableConfig::Identifier(String::new()),
+        io: redirected,
+        mapping: None,
+        delete: None,
+        order_by: None,
+        model: None,
+        default_allow: None,
+    };
+    let err = crate::FlureeBuilder::memory()
+        .build_memory()
+        .with_host_identity_policy(HostIdentityPolicy::parse(None, Some("lake")).unwrap())
+        .graph_source_storage(&config, &CatalogGrant::direct())
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code(), 403, "{err}");
+    assert_eq!(
+        err.error_type(),
+        fluree_vocab::errors::HOST_IDENTITY_REFUSED
+    );
+    assert!(
+        err.to_string()
+            .contains(fluree_db_iceberg::host_identity::AMBIENT_BUCKETS_ENV),
+        "{err}"
+    );
+}
+
+/// Only an operator-registered Direct source reads this host's disk: a
+/// catalog that places a table there is refused, whatever its mode.
+#[tokio::test]
+async fn a_catalog_cannot_place_a_table_on_the_local_filesystem() {
+    let local_meta = "file:///data/wh/t/metadata/v1.metadata.json";
+    for catalog in [
+        rest_with("https://cat.example", AuthConfig::None),
+        CatalogConfig::glue(Some("us-east-1".to_string()), None),
+        CatalogConfig::s3_tables(None, "arn:aws:s3tables:us-east-1:123456789012:bucket/lake"),
+    ] {
+        match plan(&catalog, &ambient_io(), local_meta, &open()).await {
+            Err(IcebergError::LocalLocationFromCatalog { location }) => {
+                assert_eq!(location, local_meta);
+            }
+            other => panic!("{catalog:?}: expected LocalLocationFromCatalog, got {other:?}"),
+        }
+        // A bare path is the same disk.
+        assert!(
+            matches!(
+                plan(
+                    &catalog,
+                    &ambient_io(),
+                    "/data/wh/t/metadata/v1.metadata.json",
+                    &open()
+                )
+                .await,
+                Err(IcebergError::LocalLocationFromCatalog { .. })
+            ),
+            "{catalog:?}"
+        );
+    }
+    let direct = plan(
+        &CatalogConfig::direct("file:///data/wh/t"),
+        &ambient_io(),
+        "file:///data/wh/t",
+        &open(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct.decision(), StorageDecision::LocalFile);
+
+    // Typed on the API surface.
+    let config = IcebergGsConfig {
+        catalog: rest_with("https://cat.example", AuthConfig::None),
+        table: fluree_db_iceberg::config::TableConfig::Identifier("ns.t".to_string()),
+        io: ambient_io(),
+        mapping: None,
+        delete: None,
+        order_by: None,
+        model: None,
+        default_allow: None,
+    };
+    let err = crate::FlureeBuilder::memory()
+        .build_memory()
+        .graph_source_storage(&config, &CatalogGrant::unvended(local_meta))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        fluree_vocab::errors::STORAGE_SCHEME_NOT_SERVED,
+        "{err}"
+    );
+}
+
+/// Resolves every reference to `secret` for `tenant`, counting its calls.
+#[derive(Debug)]
+struct TenantResolver {
+    tenant: &'static str,
+    secret: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl TenantResolver {
+    fn new(tenant: &'static str, secret: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            tenant,
+            secret: secret.into(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl fluree_db_iceberg::SecretResolver for TenantResolver {
+    async fn resolve_secret(
+        &self,
+        _secret_ref: &str,
+    ) -> Result<String, fluree_db_iceberg::SecretResolveError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.secret.clone())
+    }
+
+    fn scope_id(&self) -> Option<String> {
+        Some(self.tenant.to_string())
+    }
+}
+
+fn secret_ref(name: &str) -> ConfigValue {
+    ConfigValue::SecretRef {
+        secret_ref: name.to_string(),
+    }
+}
+
+/// Two clones whose resolvers differ only in whose secrets they resolve
+/// store the same references, so only the resolver's scope id tells their
+/// caches apart: neither is served the other's catalog client, nor reads
+/// under the other's storage scope (which names every metadata, manifest and
+/// data-file cache entry). One tenant's two resolvers still share them.
+/// The Delta handle's key is pinned in `cache::delta_key_tests`.
+#[tokio::test]
+async fn tenants_whose_resolvers_differ_only_in_scope_id_share_no_client_or_cache() {
+    let base = crate::FlureeBuilder::memory().build_memory();
+    let tenant = |id| base.with_secret_resolver(TenantResolver::new(id, "one-token"));
+    let (a, a_again, b) = (tenant("tenant-a"), tenant("tenant-a"), tenant("tenant-b"));
+
+    let catalog = rest_with(
+        "https://cat.example",
+        AuthConfig::Bearer {
+            token: secret_ref("catalog-token"),
+        },
+    );
+    let config = IcebergGsConfig {
+        catalog: catalog.clone(),
+        table: fluree_db_iceberg::config::TableConfig::Identifier("ns.t".to_string()),
+        io: IoConfig::default(),
+        mapping: None,
+        delete: None,
+        order_by: None,
+        model: None,
+        default_allow: None,
+    };
+    let raw = config.to_json().unwrap();
+    let client = |fluree: crate::Fluree| {
+        let (raw, config) = (raw.clone(), config.clone());
+        async move {
+            super::super::r2rml::shared_catalog_client(&fluree, "gs:shared", &raw, &config)
+                .await
+                .unwrap()
+                .expect("a REST source has a catalog client")
+        }
+    };
+    let same = |x: &Arc<dyn SendCatalogClient>, y: &Arc<dyn SendCatalogClient>| {
+        std::ptr::addr_eq(Arc::as_ptr(x), Arc::as_ptr(y))
+    };
+    let from_a = client(a.clone()).await;
+    assert!(same(&from_a, &client(a_again.clone()).await), "one tenant");
+    assert!(!same(&from_a, &client(b.clone()).await), "another tenant");
+
+    let scope = |fluree: crate::Fluree| {
+        let catalog = catalog.clone();
+        async move {
+            plan(
+                &catalog,
+                &IoConfig::default(),
+                S3_META,
+                fluree.identity_context(),
+            )
+            .await
+            .unwrap()
+            .scope()
+            .clone()
+        }
+    };
+    let (in_a, in_a_again, in_b) = (scope(a).await, scope(a_again).await, scope(b).await);
+    assert_eq!(in_a, in_a_again, "one tenant");
+    assert_ne!(in_a, in_b, "another tenant");
+    // The data-file cache names a file by the scope's segment.
+    assert_ne!(in_a.file_segment(), in_b.file_segment());
+    assert_ne!(in_a.qualify(S3_META), in_b.qualify(S3_META));
+}
+
+/// An AWS subject that counts the WIF exchanges it is asked to sign, and has
+/// no credentials for any of them.
+#[derive(Debug, Default)]
+struct CountingSubject(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl AwsSubjectCredentials for CountingSubject {
+    fn principal_key(&self) -> String {
+        "tenant-c:counting".to_string()
+    }
+
+    async fn credentials(&self) -> fluree_db_iceberg::Result<fluree_db_iceberg::AwsCredentials> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(IcebergError::Credential("subject unavailable".to_string()))
+    }
+
+    fn region(&self) -> Option<String> {
+        Some("us-east-1".to_string())
+    }
+}
+
+/// A warm plan reuses the identity it built: the secret behind a source's
+/// Google identity is resolved (a secret-store call, for an embedder) once,
+/// not once per query. The proof is not cached: each plan asks the identity
+/// for a token again, here signed by a subject that cannot sign it.
+#[tokio::test]
+async fn a_warm_plan_resolves_its_google_identity_once_and_proves_it_every_time() {
+    let resolver = TenantResolver::new(
+        "tenant-c",
+        serde_json::Value::Object(gcloud_wif_config()).to_string(),
+    );
+    let subject = Arc::new(CountingSubject::default());
+    let ctx = IdentityContext {
+        secret_resolver: Some(resolver.clone()),
+        aws_subject: Some(subject.clone()),
+        ..IdentityContext::default()
+    };
+    let io = ambient_io().with_storage_auth(StorageAuth::Google {
+        credentials: GoogleCredentials::ExternalAccount {
+            config: ExternalAccountConfig::Ref(secret_ref("wif-warm-plan")),
+        },
+        quota_project: None,
+    });
+    let direct = CatalogConfig::direct("gs://lake/wh/t");
+    for attempt in 1..=2 {
+        let err = plan(&direct, &io, GS_META, &ctx)
+            .await
+            .expect_err("the subject signs nothing");
+        assert!(err.to_string().contains("subject unavailable"), "{err}");
+        assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), attempt);
+    }
+    assert_eq!(
+        resolver.calls(),
+        1,
+        "the second plan resolved the secret again"
+    );
+}

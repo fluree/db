@@ -81,6 +81,35 @@ pub enum IcebergError {
         served: String,
     },
 
+    /// An ambient-AWS read through an `s3_endpoint` override while the operator
+    /// restricts ambient AWS to a bucket allowlist. An endpoint can name a
+    /// bucket of its own (virtual-hosted or path-style addressing), so the
+    /// bucket a path names is not the bucket read and the allowlist could not
+    /// hold.
+    #[error(
+        "Graph sources on this instance may not read through an S3 endpoint override \
+         ({endpoint}) with the host's ambient AWS identity: ambient reads are restricted to a \
+         bucket allowlist ({env}), and an endpoint can address a bucket of its own",
+        env = crate::host_identity::AMBIENT_BUCKETS_ENV
+    )]
+    AmbientEndpointRefused {
+        /// The refused endpoint.
+        endpoint: String,
+    },
+
+    /// A catalog placed a table on this host's local filesystem. Only a
+    /// catalog-less (Direct) source may read local files: the operator
+    /// registered that location, while a catalog's answer is not the
+    /// operator's to vouch for.
+    #[error(
+        "Refusing to read {location}: the catalog placed the table on the local filesystem, \
+         which only a catalog-less (Direct) source may read"
+    )]
+    LocalLocationFromCatalog {
+        /// The location the catalog returned.
+        location: String,
+    },
+
     /// An ambient-AWS read of a bucket the operator's allowlist
     /// ([`crate::host_identity::AMBIENT_BUCKETS_ENV`]) does not name.
     #[error(

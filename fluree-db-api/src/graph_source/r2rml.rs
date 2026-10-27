@@ -298,7 +298,10 @@ pub(crate) async fn shared_catalog_client(
         .catalog
         .aws_catalog_region(&iceberg_config.io);
     // The native-AWS catalogs call AWS with the host's own credential chain: the
-    // `aws` host identity, which the instance's policy may refuse.
+    // `aws` host identity, which the instance's policy may refuse. The ambient
+    // bucket allowlist does not govern the catalog call (a catalog lists what
+    // the host role can see); the storage reads that follow check each
+    // table's bucket against it.
     if matches!(
         iceberg_config.catalog,
         CatalogConfig::Glue { .. } | CatalogConfig::S3Tables { .. }

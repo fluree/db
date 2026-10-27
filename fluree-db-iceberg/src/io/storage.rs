@@ -129,6 +129,11 @@ pub struct S3IcebergStorage {
     /// The buckets this client may read (the operator's ambient-AWS bucket
     /// allowlist); `None` reads any bucket its credentials reach.
     buckets: Option<std::sync::Arc<[String]>>,
+    /// The endpoint override this client was built with, if any. An endpoint
+    /// can address a bucket of its own (a virtual-hosted
+    /// `https://<bucket>.s3.…` host read path-style), so with one the bucket a
+    /// path names is not the bucket read: an allowlisted client refuses it.
+    endpoint: Option<String>,
 }
 
 #[cfg(feature = "aws")]
@@ -139,6 +144,7 @@ impl Debug for S3IcebergStorage {
             .field("max_concurrent_reads", &self.max_concurrent_reads)
             .field("serves_gs", &self.serves_gs)
             .field("buckets", &self.buckets)
+            .field("endpoint", &self.endpoint)
             .finish()
     }
 }
@@ -460,12 +466,16 @@ impl S3IcebergStorage {
             max_concurrent_reads: 4,
             serves_gs: endpoint.is_some_and(crate::io::location::is_gcs_interop_endpoint),
             buckets: None,
+            endpoint: endpoint.map(str::to_string),
         })
     }
 
     /// Restrict reads to `buckets` (the operator's ambient-AWS allowlist; `None`
     /// leaves every bucket readable). A read of any other bucket is refused
-    /// with [`IcebergError::AmbientBucketRefused`] before a request is made.
+    /// with [`IcebergError::AmbientBucketRefused`] before a request is made,
+    /// and so is every read when this client has an endpoint override
+    /// ([`IcebergError::AmbientEndpointRefused`]): the endpoint, not the path,
+    /// would decide the bucket.
     pub fn with_bucket_allowlist(mut self, buckets: Option<Vec<String>>) -> Self {
         self.buckets = buckets.map(std::sync::Arc::from);
         self
@@ -550,6 +560,11 @@ impl S3IcebergStorage {
                 )
             })?;
         let (bucket, key) = crate::io::location::split_bucket_key(path, rest)?;
+        if let (Some(_), Some(endpoint)) = (&self.buckets, &self.endpoint) {
+            return Err(IcebergError::AmbientEndpointRefused {
+                endpoint: endpoint.clone(),
+            });
+        }
         if let Some(buckets) = &self.buckets {
             if !buckets.iter().any(|allowed| allowed == bucket) {
                 return Err(IcebergError::AmbientBucketRefused {
@@ -1319,6 +1334,37 @@ mod tests {
             message.contains(crate::host_identity::AMBIENT_BUCKETS_ENV),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn an_allowlisted_client_with_an_endpoint_override_reads_nothing() {
+        // `s3://lake/k` path-style against a virtual-hosted endpoint reads
+        // `secret-bucket/lake/k`: the endpoint decides the bucket.
+        let endpointed = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("us-east-1")),
+            None,
+            Some("https://secret-bucket.s3.us-east-1.amazonaws.com"),
+            true,
+        )
+        .await
+        .unwrap();
+        let allowlisted = endpointed
+            .clone()
+            .with_bucket_allowlist(Some(vec!["lake".to_string()]));
+        match allowlisted.locate("s3://lake/k") {
+            Err(IcebergError::AmbientEndpointRefused { endpoint }) => {
+                assert_eq!(endpoint, "https://secret-bucket.s3.us-east-1.amazonaws.com");
+            }
+            other => panic!("expected AmbientEndpointRefused, got {other:?}"),
+        }
+        let message = allowlisted.locate("s3://lake/k").unwrap_err().to_string();
+        assert!(
+            message.contains(crate::host_identity::AMBIENT_BUCKETS_ENV),
+            "{message}"
+        );
+        // Without an allowlist the endpoint is the operator's to use.
+        assert!(endpointed.locate("s3://lake/k").is_ok());
     }
 
     #[tokio::test]

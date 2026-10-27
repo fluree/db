@@ -79,7 +79,7 @@ fn rest_loadtable_ttl_secs() -> u64 {
 const DEFAULT_REST_CLIENT_TTL_SECS: u64 = 900;
 
 #[cfg(feature = "iceberg")]
-fn rest_client_ttl_secs() -> u64 {
+pub(crate) fn rest_client_ttl_secs() -> u64 {
     std::env::var("FLUREE_ICEBERG_REST_CLIENT_TTL_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())

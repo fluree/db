@@ -462,10 +462,25 @@ pub(crate) async fn plan_storage(
     };
     match storage_auth {
         StorageAuth::Ambient => {
-            // A catalog-less local table reads the filesystem: no identity,
-            // and the operator's local-roots allowlist governs it.
             if scheme == LocationScheme::Local {
-                return Ok(plan(Planned::Local, StorageScope::shared()));
+                // A catalog-less local table reads the filesystem: no identity,
+                // and the operator's local-roots allowlist governs it. Only the
+                // operator registers a Direct location; a catalog's answer is
+                // not the operator's to vouch for, so a catalog that places a
+                // table on this host's disk is refused, as before storage
+                // identities (catalog sources always read through S3).
+                return match catalog {
+                    CatalogConfig::Direct { .. } => {
+                        Ok(plan(Planned::Local, StorageScope::shared()))
+                    }
+                    CatalogConfig::Rest { .. }
+                    | CatalogConfig::Glue { .. }
+                    | CatalogConfig::S3Tables { .. } => {
+                        Err(IcebergError::LocalLocationFromCatalog {
+                            location: location.to_string(),
+                        })
+                    }
+                };
             }
             ctx.policy.ensure(HostIdentityKind::Aws)?;
             let endpoint = io.s3_endpoint.as_deref();
@@ -476,6 +491,14 @@ pub(crate) async fn plan_storage(
                 ));
             }
             let buckets = ctx.policy.ambient_aws_buckets.clone();
+            // An endpoint can address a bucket of its own (a virtual-hosted
+            // host read path-style), so under a bucket allowlist the bucket a
+            // path names would not be the bucket read.
+            if let (Some(_), Some(endpoint)) = (&buckets, endpoint) {
+                return Err(IcebergError::AmbientEndpointRefused {
+                    endpoint: endpoint.to_string(),
+                });
+            }
             if let (Some(allowed), Some(bucket)) = (&buckets, bucket_of(location)) {
                 if !allowed.iter().any(|b| b == bucket) {
                     return Err(IcebergError::AmbientBucketRefused {
@@ -533,14 +556,18 @@ pub(crate) async fn plan_storage(
             if scheme != LocationScheme::Gs {
                 return Err(refuse("the catalog's Google identity", "gs://"));
             }
-            let hydrated = auth.hydrate(ctx.secret_resolver.as_ref()).await?;
-            let identity = hydrated.google_identity(ctx)?.ok_or_else(|| {
-                IcebergError::Config(
-                    "io.storage_auth `catalog` needs a REST catalog authenticated with a Google \
-                     identity (auth type `google` or `google_metadata`)"
-                        .to_string(),
-                )
-            })?;
+            let key = identity_key("catalog", auth, ctx);
+            let identity = cached_identity(key, || async {
+                let hydrated = auth.hydrate(ctx.secret_resolver.as_ref()).await?;
+                hydrated.google_identity(ctx)?.ok_or_else(|| {
+                    IcebergError::Config(
+                        "io.storage_auth `catalog` needs a REST catalog authenticated with a \
+                         Google identity (auth type `google` or `google_metadata`)"
+                            .to_string(),
+                    )
+                })
+            })
+            .await?;
             let user_project = identity.quota_project().map(str::to_string);
             google_plan(identity, user_project, true, io, &context).await
         }
@@ -551,12 +578,68 @@ pub(crate) async fn plan_storage(
             if scheme != LocationScheme::Gs {
                 return Err(refuse("the source's Google identity", "gs://"));
             }
-            let hydrated = credentials.hydrate(ctx.secret_resolver.as_ref()).await?;
-            let identity = GoogleIdentity::new(&hydrated, quota_project.as_deref(), ctx)?;
+            let key = identity_key("google", &(&credentials, &quota_project), ctx);
+            let identity = cached_identity(key, || async {
+                let hydrated = credentials.hydrate(ctx.secret_resolver.as_ref()).await?;
+                GoogleIdentity::new(&hydrated, quota_project.as_deref(), ctx)
+            })
+            .await?;
             let user_project = identity.quota_project().map(str::to_string);
             google_plan(identity, user_project, false, io, &context).await
         }
     }
+}
+
+/// The key a built storage identity is cached under: its kind, a digest of
+/// the configuration as stored (references, not resolved secrets) and the
+/// identity context, which names whose secrets the resolver resolves (see
+/// [`fluree_db_iceberg::SecretResolver::scope_id`]), the policy and the AWS
+/// subject. In memory only.
+fn identity_key(kind: &str, stored: &impl serde::Serialize, ctx: &IdentityContext) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(serde_json::to_vec(stored).unwrap_or_default());
+    let digest: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{kind}\u{1f}{digest}\u{1f}{}", ctx.cache_scope())
+}
+
+/// The storage identities planned so far, process-wide, so a warm query's
+/// plan neither hydrates its secret (a secret-store call) nor rebuilds the
+/// identity (a key parse and an HTTP client). Bounded by the catalog-client
+/// TTL (`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`), so a rotated secret behind a
+/// reference is picked up within it, as for catalog clients.
+fn identities() -> &'static moka::sync::Cache<String, Arc<GoogleIdentity>> {
+    static CACHE: std::sync::OnceLock<moka::sync::Cache<String, Arc<GoogleIdentity>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(256)
+            .time_to_live(std::time::Duration::from_secs(
+                super::cache::rest_client_ttl_secs(),
+            ))
+            .build()
+    })
+}
+
+/// The identity cached under `key`, else the one `build` makes (cached when
+/// caching is on). The token proof still runs on every plan
+/// ([`google_plan`]); only the construction is shared.
+async fn cached_identity<F, Fut>(key: String, build: F) -> IcebergResult<Arc<GoogleIdentity>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = IcebergResult<GoogleIdentity>>,
+{
+    let caching =
+        super::catalog_session::cache_enabled() && super::cache::rest_client_ttl_secs() > 0;
+    if caching {
+        if let Some(identity) = identities().get(&key) {
+            return Ok(identity);
+        }
+    }
+    let identity = Arc::new(build().await?);
+    if caching {
+        identities().insert(key, Arc::clone(&identity));
+    }
+    Ok(identity)
 }
 
 /// A Google-identity plan, proven: a storage token for the identity must
@@ -567,7 +650,7 @@ pub(crate) async fn plan_storage(
 /// far, so never reaches the other tenant's cached files. The token is cached
 /// process-wide, so the proof costs a token exchange per identity per hour.
 async fn google_plan(
-    identity: GoogleIdentity,
+    identity: Arc<GoogleIdentity>,
     user_project: Option<String>,
     from_catalog: bool,
     io: &IoConfig,
@@ -582,7 +665,7 @@ async fn google_plan(
     ]);
     Ok(StoragePlan {
         identity: Planned::Google {
-            identity: Arc::new(identity),
+            identity,
             user_project,
             from_catalog,
         },
