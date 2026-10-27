@@ -252,6 +252,14 @@ pub use view::{
 pub use graph_source::sql_auth_from_json;
 #[cfg(feature = "delta")]
 pub use graph_source::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
+/// The one codec every surface turns its graph-source input into the
+/// persisted config with; see [`graph_source::surface`].
+#[cfg(feature = "iceberg")]
+pub use graph_source::{
+    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, secret_field,
+    AuthProfile, CatalogAuthFields, GraphSourceInputError, IcebergConnectionFields, InputErrorKind,
+    SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
+};
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
     guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
@@ -262,14 +270,6 @@ pub use graph_source::{
     ResolvedStorage, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
     StorageAccessReport, StorageDecision, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
     TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
-};
-/// The one codec every surface turns its graph-source input into the
-/// persisted config with; see [`graph_source::surface`].
-#[cfg(feature = "iceberg")]
-pub use graph_source::{
-    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, secret_field,
-    AuthProfile, CatalogAuthFields, GraphSourceInputError, IcebergConnectionFields, InputErrorKind,
-    SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
 };
 
 #[cfg(feature = "delta")]
