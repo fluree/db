@@ -592,6 +592,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::InvalidExpression(_)
         | QueryError::UnsupportedFeature(_)
         | QueryError::R2rmlUnsupportedPattern { .. }
+        | QueryError::GraphSourceNotAGraph { .. }
         | QueryError::Arithmetic(_)
         | QueryError::Comparison(_) => false,
         // The caller names the variables first (`QueryError::name_variables`),
@@ -963,6 +964,13 @@ mod tests {
             QueryError::UnsupportedFeature(_) => false, [QueryError::UnsupportedFeature(s())];
             QueryError::R2rmlUnsupportedPattern { .. } => false, [
                 QueryError::R2rmlUnsupportedPattern { detail: s() },
+            ];
+            QueryError::GraphSourceNotAGraph { .. } => false, [
+                QueryError::GraphSourceNotAGraph {
+                    graph_source_id: s(),
+                    index: s(),
+                    remedy: "r",
+                },
             ];
             QueryError::Arithmetic(_) => false, [
                 QueryError::Arithmetic(ArithmeticError::DivideByZero),

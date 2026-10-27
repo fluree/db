@@ -127,6 +127,11 @@ pub const GRAPH_SOURCE_UNMAPPED: &str = "err:db/GraphSourceUnmapped";
 /// Delta without `delta`), so nothing here can read it (HTTP 501).
 pub const GRAPH_SOURCE_UNSUPPORTED: &str = "err:db/GraphSourceUnsupported";
 
+/// The graph source is an index (BM25, vector, geo), which has no triples, named
+/// where a graph is read: as the query target, in `FROM` / `FROM NAMED`, or in
+/// `GRAPH` (HTTP 400). Its searches name it in their own pattern instead.
+pub const GRAPH_SOURCE_NOT_A_GRAPH: &str = "err:db/GraphSourceNotAGraph";
+
 /// A graph the target ledger does not have
 pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
 

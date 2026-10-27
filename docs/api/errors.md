@@ -89,6 +89,7 @@ The request is malformed or contains invalid data.
 - Type mismatch
 - Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 - A `t` beyond the ledger's current head (`err:api/BadRequest`), such as syncing a search index through a commit that does not exist yet
+- A search index (BM25, vector, geo) named where a graph is read, as the query target or in `FROM`, `FROM NAMED` or `GRAPH` (`err:db/GraphSourceNotAGraph`). Query a BM25 or vector index with an `f:graphSource` pattern, with its source ledger as the dataset
 
 **Error typing:**
 

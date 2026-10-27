@@ -162,6 +162,22 @@ pub enum QueryError {
     )]
     GraphSourceUnmapped { graph_source_id: String },
 
+    /// An index graph source (BM25, vector, geo) named where a graph is read:
+    /// the query target, `FROM` / `FROM NAMED`, or `GRAPH`. An index has no
+    /// triples; its searches find it by the `f:graphSource` id in their own
+    /// pattern, with the source ledger as the dataset.
+    ///
+    /// Typed so the query fails naming the documented form, rather than
+    /// reading the index as an empty graph.
+    #[error("graph source '{graph_source_id}' is {index}, not a graph: {remedy}")]
+    GraphSourceNotAGraph {
+        graph_source_id: String,
+        /// The index kind, with its article ("a BM25 index").
+        index: String,
+        /// How a query reaches it instead.
+        remedy: &'static str,
+    },
+
     /// A registered graph source of a family this build was compiled without
     /// (an Iceberg / R2RML source without the `iceberg` feature, SQL without
     /// `sql`, Delta without `delta`), so no reader for it exists here.

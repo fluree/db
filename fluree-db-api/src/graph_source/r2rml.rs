@@ -133,14 +133,15 @@ pub(crate) fn mapping_source_of(
 /// A mapped record without a mapping (an Iceberg source stored before
 /// registration required one) is [`QueryError::GraphSourceUnmapped`], one of a
 /// family this build does not read (SQL without `sql`, Delta without `delta`)
-/// is [`QueryError::GraphSourceUnsupported`], and one whose config does not
+/// is [`QueryError::GraphSourceUnsupported`], an index source (BM25, vector,
+/// geo) is [`QueryError::GraphSourceNotAGraph`], and one whose config does not
 /// parse is an internal error. Read as `None`, any of them would send its query
 /// to the ledger lookup or to an empty genesis graph. The R2RML probe and the
 /// genesis-view resolver both decide here.
 pub(crate) fn served_mapping_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> QueryResult<Option<fluree_db_iceberg::config::MappingSource>> {
-    super::SourceReaders::BUILT.refuse_unread(record)?;
+    super::refuse_unservable(record)?;
     let graph_source_id = record.graph_source_id.as_str();
     match mapping_reference(record) {
         None => Ok(None),
@@ -2468,8 +2469,9 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     /// parse as a graph-source id names no source, so it is `false` without a
     /// lookup. A failed lookup of a well-formed id fails the query: reading it
     /// as "no mapping" would query an R2RML / Iceberg / SQL source as an empty
-    /// native graph whenever the nameservice is unavailable. A mapped source
-    /// with no mapping fails it for the same reason ([`served_mapping_of`]).
+    /// native graph whenever the nameservice is unavailable. A source no query
+    /// can read as a graph (a mapped one with no mapping, an index) fails it
+    /// for the same reason ([`served_mapping_of`]).
     async fn has_r2rml_mapping(&self, graph_source_id: &str) -> QueryResult<bool> {
         let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
             return Ok(false);

@@ -216,17 +216,59 @@ impl SourceReaders {
     }
 }
 
-/// Refuse a live graph-source record this build cannot answer a query from: a
-/// mapped source whose reader is not compiled in, or one with no mapping. The
-/// genesis-view resolver refuses through here, so no such source reaches a
-/// query as an empty graph.
+/// Refuse an index graph source (BM25, vector, geo) named where a graph is
+/// read. An index has no triples: its searches find it by the `f:graphSource`
+/// id in their own pattern, with the source ledger as the dataset, so as a
+/// query target or dataset member it would read as an empty graph.
+pub(crate) fn refuse_index_source(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> fluree_db_query::error::Result<()> {
+    use fluree_db_nameservice::{GraphSourceKind, GraphSourceType as T};
+    const SEARCH: &str = "query it with an f:graphSource pattern, with its source ledger as \
+                          the dataset";
+    if record.source_type.kind() != GraphSourceKind::Index {
+        return Ok(());
+    }
+    let (index, remedy) = match &record.source_type {
+        T::Bm25 => ("a BM25 index".to_string(), SEARCH),
+        T::Vector => ("a vector index".to_string(), SEARCH),
+        // No `f:graphSource` pattern searches a geo index; geo search reads
+        // the ledger's own index.
+        T::Geo => ("a geo index".to_string(), "query its source ledger instead"),
+        // The nameservice files a type it does not know as an index.
+        other => (
+            format!("an index of unrecognized type '{}'", other.to_type_string()),
+            "this build has no reader for it",
+        ),
+    };
+    Err(fluree_db_query::QueryError::GraphSourceNotAGraph {
+        graph_source_id: record.graph_source_id.to_string(),
+        index,
+        remedy,
+    })
+}
+
+/// Refuse a live graph-source record no query reads as a graph whatever its
+/// config: an index source, or a mapped source whose reader is not compiled
+/// in.
+pub(crate) fn refuse_unservable(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> fluree_db_query::error::Result<()> {
+    refuse_index_source(record)?;
+    SourceReaders::BUILT.refuse_unread(record)
+}
+
+/// Refuse a live graph-source record this build cannot answer a query from as
+/// a graph: an index source, a mapped source whose reader is not compiled in,
+/// or one with no mapping. The genesis-view resolver refuses through here, so
+/// no such source reaches a query as an empty graph.
 pub(crate) fn require_readable(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> fluree_db_query::error::Result<()> {
     #[cfg(feature = "iceberg")]
     r2rml::served_mapping_of(record)?;
     #[cfg(not(feature = "iceberg"))]
-    SourceReaders::BUILT.refuse_unread(record)?;
+    refuse_unservable(record)?;
     Ok(())
 }
 
@@ -431,6 +473,7 @@ mod tests {
             assert!(none.refuse_unread(&record(source_type)).is_ok());
         }
 
+        // Refusing an index source is a separate rule, and every build has it.
         let all = SourceReaders {
             iceberg: true,
             sql: true,
@@ -438,6 +481,38 @@ mod tests {
         };
         for source_type in [T::Iceberg, T::R2rml, T::Sql, T::Delta] {
             assert!(all.refuse_unread(&record(source_type)).is_ok());
+        }
+    }
+
+    /// Each index kind is refused by name, with how a query reaches it; a
+    /// mapped source is not an index.
+    #[test]
+    fn an_index_source_is_refused_as_a_graph_by_its_kind() {
+        for (source_type, index, remedy) in [
+            (T::Bm25, "a BM25 index", "f:graphSource pattern"),
+            (T::Vector, "a vector index", "f:graphSource pattern"),
+            (T::Geo, "a geo index", "its source ledger"),
+            (
+                T::Unknown("f:FutureIndex".into()),
+                "an index of unrecognized type 'f:FutureIndex'",
+                "no reader",
+            ),
+        ] {
+            match super::refuse_index_source(&record(source_type.clone())) {
+                Err(e @ QueryError::GraphSourceNotAGraph { .. }) => {
+                    let message = e.to_string();
+                    assert!(
+                        message.starts_with(&format!(
+                            "graph source 'gs:main' is {index}, not a graph: "
+                        )) && message.contains(remedy),
+                        "{source_type:?}: {message}"
+                    );
+                }
+                other => panic!("{source_type:?}: expected GraphSourceNotAGraph, got {other:?}"),
+            }
+        }
+        for source_type in [T::Iceberg, T::R2rml, T::Sql, T::Delta] {
+            assert!(super::refuse_index_source(&record(source_type)).is_ok());
         }
     }
 }

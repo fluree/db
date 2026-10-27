@@ -684,8 +684,9 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         .await;
     expect_refused(result, "pinned + latest", "two different states");
 
-    // A graph source that is not an Iceberg-backed table (here a BM25 index)
-    // reads its current state only: a pin on it is refused, not ignored.
+    // A BM25 index is not a graph: named as the dataset, pinned or not, it is
+    // refused as one (a pin on a SQL source, which is one, is refused in
+    // it_sql_graph_source).
     let ledger = fluree.create_ledger("bm25-src").await.expect("ledger");
     fluree
         .insert(
@@ -720,7 +721,7 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         expect_refused(
             result,
             &format!("bm25 @{suffix}"),
-            "does not support time-pinned reads",
+            "is a BM25 index, not a graph",
         );
     }
 

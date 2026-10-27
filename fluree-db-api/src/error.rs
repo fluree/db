@@ -904,6 +904,7 @@ impl ApiError {
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
                 QE::GraphSourceUnmapped { .. } => errors::GRAPH_SOURCE_UNMAPPED,
                 QE::GraphSourceUnsupported { .. } => errors::GRAPH_SOURCE_UNSUPPORTED,
+                QE::GraphSourceNotAGraph { .. } => errors::GRAPH_SOURCE_NOT_A_GRAPH,
                 // Typed as `ApiError::NameService` is: the backend's fault.
                 QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
@@ -1055,6 +1056,8 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::ResourceLimit(_)
         | QE::FuelLimitExceeded(_)
         | QE::R2rmlUnsupportedPattern { .. }
+        // The request names an index where a graph is read; the index is fine.
+        | QE::GraphSourceNotAGraph { .. }
         | QE::UnsupportedMode(_)
         | QE::UnsupportedFeature(_)
         | QE::TimeRangeNotCovered { .. }
@@ -1332,6 +1335,15 @@ mod tests {
                 }),
                 501,
                 GRAPH_SOURCE_UNSUPPORTED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceNotAGraph {
+                    graph_source_id: "search:main".into(),
+                    index: "a BM25 index".into(),
+                    remedy: "r",
+                }),
+                400,
+                GRAPH_SOURCE_NOT_A_GRAPH,
             ),
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),

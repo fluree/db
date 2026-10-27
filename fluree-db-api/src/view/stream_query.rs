@@ -548,6 +548,7 @@ fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
         QE::R2rmlUnsupportedPattern { .. } => "r2rml_unsupported_pattern",
         QE::GraphSourceUnmapped { .. } => "graph_source_unmapped",
         QE::GraphSourceUnsupported { .. } => "graph_source_unsupported",
+        QE::GraphSourceNotAGraph { .. } => "graph_source_not_a_graph",
         QE::InvalidQuery(_)
         | QE::UngroupedRead(_)
         | QE::InvalidFilter(_)
