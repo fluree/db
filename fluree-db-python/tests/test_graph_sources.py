@@ -221,13 +221,15 @@ def test_a_google_identity_authenticates_a_rest_catalog_and_reads_its_files(conn
             auth=fluree.Google(UNSET_KEY),
             storage="catalog",
         )
-    # A Direct source on gs:// reads with an identity of its own.
-    conn.map_iceberg(
-        "direct-gcs",
-        ORDERS_MAPPING,
-        table_location="gs://bucket/warehouse/sales/orders",
-        storage=fluree.Google(UNSET_KEY),
-    )
+    # A Direct source on gs:// reads with an identity of its own. Its table's
+    # metadata cannot be read without a token, so it registers with a warning.
+    with pytest.warns(UserWarning, match="could not read a mapped table's metadata"):
+        conn.map_iceberg(
+            "direct-gcs",
+            ORDERS_MAPPING,
+            table_location="gs://bucket/warehouse/sales/orders",
+            storage=fluree.Google(UNSET_KEY),
+        )
     # A Google identity reads gs:// only: one on s3:// could never be read,
     # so it does not register.
     with pytest.raises(fluree.FlureeError, match="serves only gs://"):
