@@ -758,14 +758,18 @@ fn registration_runs_the_engines_own_validation_in_every_mode() {
 }
 
 #[test]
-fn a_mapped_direct_warehouse_root_needs_no_table_of_its_own() {
-    crate::R2rmlCreateConfig::new_direct(
+fn registration_refuses_what_every_query_would() {
+    // A query validates the stored config before it reads anything, and a
+    // Direct location must name a table (`ns/table`) even when a mapping names
+    // them; registration used to accept one that no query could use.
+    let e = crate::R2rmlCreateConfig::new_direct(
         "gs",
         "s3://bucket/dw",
         "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
     )
     .validate()
-    .unwrap();
+    .unwrap_err();
+    assert!(e.to_string().contains("table identifier"), "{e}");
 }
 
 #[test]

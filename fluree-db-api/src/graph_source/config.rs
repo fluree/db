@@ -1054,6 +1054,7 @@ impl IcebergConnectionConfig {
 }
 
 /// The `catalog_type` every registration stores for a REST catalog.
+#[cfg(feature = "iceberg")]
 const REST_CATALOG_TYPE: &str = "polaris";
 
 #[cfg(feature = "iceberg")]
