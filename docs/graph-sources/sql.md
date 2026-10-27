@@ -405,9 +405,12 @@ before `"9"`) where the database sorts the column by value. The lane pushes no
 `ORDER BY … LIMIT`, `MIN`/`MAX` or comparison of such a column, and pushes a
 `GROUP BY`, `SELECT DISTINCT`, `COUNT(DISTINCT …)` or join on it only where the
 database's `=` is the strings' equality: integers, decimals of one scale,
-booleans, dates and bytes. A float renders `-0.0` and `0.0` apart where the
-database groups them, and a timestamp is decoded to the microsecond, so those
-group in the engine.
+booleans, dates, bytes, and timestamps the endpoint declares to at most
+microseconds (`timestamp(6)`, Trino's default `timestamp(3)`). A float renders
+`-0.0` and `0.0` apart where the database groups them, and a `timestamp(9)`
+holds instants a nanosecond apart that decode to one microsecond, so those
+group in the engine. A language-tagged map over such a column follows the same
+rules.
 
 CI replays every lane case against SQLite, Postgres 16 and MySQL 8 behind
 the bridge, the two servers deliberately running five hours off UTC, and
