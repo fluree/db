@@ -373,21 +373,74 @@ async fn a_403_is_storage_access_denied_on_reads_and_listings() {
         }) => {
             assert_eq!(bucket, "lake");
             assert_eq!(key, "data/secret.parquet");
-            assert!(
-                message.contains("gs://lake/data/secret.parquet"),
-                "{message}"
+            // The operation, the path, the status, and GCS's own code and
+            // message, once: not the nested chain, not the XML.
+            assert_eq!(
+                message,
+                "GCS refused the read of gs://lake/data/secret.parquet as Google (metadata): \
+                 HTTP 403 AccessDenied: no storage.objects.get"
             );
-            assert!(!message.contains("Bearer"), "{message}");
         }
         other => panic!("expected StorageAccessDenied, got {other:?}"),
     }
     let err = SendIcebergStorage::list_dir(&store, "gs://lake/warehouse")
         .await
         .unwrap_err();
+    match &err {
+        IcebergError::StorageAccessDenied { message, .. } => assert_eq!(
+            message,
+            "GCS refused the listing of gs://lake/warehouse as Google (metadata): HTTP 403"
+        ),
+        other => panic!("expected StorageAccessDenied, got {other:?}"),
+    }
     assert!(
-        matches!(err, IcebergError::StorageAccessDenied { .. }),
-        "{err:?}"
+        err.to_string().starts_with("Storage access denied"),
+        "{err}"
     );
+}
+
+/// What GCS answered when it refused a request for the bill's project (a
+/// requester-pays or `x-goog-user-project` read without
+/// `serviceusage.services.use`), as observed live: the denial says it once,
+/// in its own words.
+#[tokio::test]
+async fn a_user_project_refusal_says_once_what_gcs_said() {
+    let (google, gcs) = (MockServer::start().await, MockServer::start().await);
+    let store = store_as(identity(&google, "t").await, &gcs, Some("billing-project"));
+    Mock::given(method("GET"))
+        .and(object_at("/lake/wh/t/metadata/v1.metadata.json"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<?xml version='1.0' encoding='UTF-8'?><Error><Code>UserProjectAccessDenied</Code>\
+             <Message>Requester does not have serviceusage.services.use permissions on user \
+             project.</Message><Details>reader@lake-project.iam.gserviceaccount.com does not \
+             have serviceusage.services.use access to the Google Cloud project. Permission \
+             &apos;serviceusage.services.use&apos; denied on resource (or it may not \
+             exist).</Details></Error>",
+        ))
+        .mount(&gcs)
+        .await;
+    let err = SendIcebergStorage::read(&store, "gs://lake/wh/t/metadata/v1.metadata.json")
+        .await
+        .unwrap_err();
+    let shown = err.to_string();
+    assert!(
+        shown.starts_with("Storage access denied reading gs://lake/wh/t/metadata/v1.metadata.json"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "HTTP 403 UserProjectAccessDenied: Requester does not have serviceusage.services.use \
+             permissions on user project."
+        ),
+        "{shown}"
+    );
+    assert_eq!(
+        shown.matches("Requester does not have").count(),
+        1,
+        "{shown}"
+    );
+    assert!(!shown.contains("<Error>"), "{shown}");
+    assert!(!shown.contains("Details"), "{shown}");
 }
 
 #[tokio::test]

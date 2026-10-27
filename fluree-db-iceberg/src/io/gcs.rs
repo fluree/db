@@ -296,7 +296,14 @@ impl GcsIcebergStorage {
 
     /// Run `op`; when GCS refuses the token (401), renew it and run `op` once
     /// more. Every error comes back typed (see [`Self::error`]).
-    async fn call<T, F, Fut>(&self, path: &str, bucket: &str, key: &str, op: F) -> Result<T>
+    async fn call<T, F, Fut>(
+        &self,
+        what: &str,
+        path: &str,
+        bucket: &str,
+        key: &str,
+        op: F,
+    ) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = object_store::Result<T>>,
@@ -308,27 +315,38 @@ impl GcsIcebergStorage {
                     "GCS refused the token (401); renewing and retrying once"
                 );
                 self.inner.source.refresh().await?;
-                op().await.map_err(|e| self.error(path, bucket, key, e))
+                op().await
+                    .map_err(|e| self.error(what, path, bucket, key, e))
             }
-            other => other.map_err(|e| self.error(path, bucket, key, e)),
+            other => other.map_err(|e| self.error(what, path, bucket, key, e)),
         }
     }
 
     /// A GCS failure as a typed error: a refusal (403, or a 401 that survived a
-    /// renewed token) is [`IcebergError::StorageAccessDenied`]; a token that
-    /// could not be minted keeps its own error; anything else is a storage
-    /// error naming the path.
-    fn error(&self, path: &str, bucket: &str, key: &str, err: object_store::Error) -> IcebergError {
-        if refusal_status(&err).is_some() {
+    /// renewed token) is [`IcebergError::StorageAccessDenied`], saying once
+    /// what GCS said (see [`refusal_reason`]); a token that could not be minted
+    /// keeps its own error; anything else is a storage error naming the
+    /// operation and the path. `what` names the operation (`read`, `listing`).
+    fn error(
+        &self,
+        what: &str,
+        path: &str,
+        bucket: &str,
+        key: &str,
+        err: object_store::Error,
+    ) -> IcebergError {
+        if let Some(status) = refusal_status(&err) {
+            let reason = refusal_reason(&err)
+                .map(|reason| format!(" {reason}"))
+                .unwrap_or_default();
             return IcebergError::StorageAccessDenied {
                 scheme: "gs",
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 region: None,
                 message: format!(
-                    "GCS refused {} reading {path}: {}",
+                    "GCS refused the {what} of {path} as {}: HTTP {status}{reason}",
                     self.inner.source.label(),
-                    crate::io::storage::error_chain(&err)
                 ),
             };
         }
@@ -337,8 +355,8 @@ impl GcsIcebergStorage {
                 match source.downcast::<IcebergError>() {
                     Ok(token_error) => *token_error,
                     Err(source) => IcebergError::storage(format!(
-                        "GCS read of {path} failed: {}",
-                        crate::io::storage::error_chain(source.as_ref())
+                        "GCS {what} of {path} failed: {}",
+                        concise_chain(source.as_ref())
                     )),
                 }
             }
@@ -346,8 +364,8 @@ impl GcsIcebergStorage {
                 IcebergError::storage(format!("GCS object not found: {path}"))
             }
             other => IcebergError::storage(format!(
-                "GCS read of {path} failed: {}",
-                crate::io::storage::error_chain(&other)
+                "GCS {what} of {path} failed: {}",
+                concise_chain(&other)
             )),
         }
     }
@@ -356,7 +374,7 @@ impl GcsIcebergStorage {
         let (bucket, key) = self.locate(path)?;
         let location = Self::object_path(path, key)?;
         let store = self.store(bucket)?;
-        self.call(path, bucket, key, || async {
+        self.call("read", path, bucket, key, || async {
             store.get(&location).await?.bytes().await
         })
         .await
@@ -369,7 +387,7 @@ impl GcsIcebergStorage {
         let (bucket, key) = self.locate(path)?;
         let location = Self::object_path(path, key)?;
         let store = self.store(bucket)?;
-        self.call(path, bucket, key, || {
+        self.call("ranged read", path, bucket, key, || {
             store.get_range(&location, range.clone())
         })
         .await
@@ -389,8 +407,10 @@ impl GcsIcebergStorage {
         let store = self.store(bucket)?;
         // `get_ranges` coalesces nearby ranges, fetches them concurrently, and
         // returns the bytes in input order (the sparse assembler's contract).
-        self.call(path, bucket, key, || store.get_ranges(&location, &ranges))
-            .await
+        self.call("ranged read", path, bucket, key, || {
+            store.get_ranges(&location, &ranges)
+        })
+        .await
     }
 
     async fn file_size_impl(&self, path: &str) -> Result<u64> {
@@ -398,7 +418,7 @@ impl GcsIcebergStorage {
         let location = Self::object_path(path, key)?;
         let store = self.store(bucket)?;
         let meta = self
-            .call(path, bucket, key, || store.head(&location))
+            .call("HEAD", path, bucket, key, || store.head(&location))
             .await?;
         Ok(meta.size)
     }
@@ -419,7 +439,7 @@ impl GcsIcebergStorage {
         };
         let store = self.store(bucket)?;
         let listing = self
-            .call(prefix, bucket, key, || {
+            .call("listing", prefix, bucket, key, || {
                 store.list_with_delimiter(location.as_ref())
             })
             .await?;
@@ -437,6 +457,75 @@ impl GcsIcebergStorage {
         files.sort();
         Ok((dirs, files))
     }
+}
+
+/// What GCS said when it refused a request, once: its XML error body's `Code`
+/// and `Message` (`AccessDenied: …`, `UserProjectAccessDenied: …`), else the
+/// body's first line, cut short. `None` for an empty body.
+///
+/// `object_store` renders the response body at every level of its error
+/// chain, so the chain itself repeats it; the deepest level holds it once,
+/// after its status line (`Server returned non-2xx status code: 403
+/// Forbidden: <body>`).
+fn refusal_reason(err: &object_store::Error) -> Option<String> {
+    let mut deepest: &(dyn std::error::Error + 'static) = err;
+    while let Some(source) = deepest.source() {
+        deepest = source;
+    }
+    let rendered = deepest.to_string();
+    let body = rendered
+        .split_once("status code: ")
+        .and_then(|(_, status)| status.split_once(": "))
+        .map_or("", |(_, body)| body.trim());
+    if body.is_empty() {
+        return None;
+    }
+    if let Some(code) = xml_element(body, "Code") {
+        return Some(match xml_element(body, "Message") {
+            Some(message) => format!("{code}: {message}"),
+            None => code,
+        });
+    }
+    const SHOWN: usize = 200;
+    let line = body.lines().next().unwrap_or_default();
+    Some(match line.char_indices().nth(SHOWN) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    })
+}
+
+/// The text of the first `<tag>` element in `xml`, entity-unescaped.
+fn xml_element(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&format!("</{tag}>"))?;
+    let text = xml[start..end]
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// `err`'s message chain without its repeats: `object_store` renders each
+/// wrapper with its source's text appended, so a level whose text the level
+/// above already showed is skipped.
+fn concise_chain(err: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut shown = err.to_string();
+    let mut previous = shown.clone();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !previous.contains(&text) {
+            let _ = write!(shown, ": {text}");
+        }
+        previous = text;
+        source = inner.source();
+    }
+    shown
 }
 
 /// The status of a refusal (401 or 403) `err` reports, if it is one.

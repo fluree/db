@@ -385,7 +385,9 @@ fn denial_hint(scheme: &str) -> &'static str {
     match scheme {
         "gs" => {
             "The identity lacks storage.objects.get (or storage.objects.list) on this object, \
-             or the object no longer exists."
+             or the object no longer exists. UserProjectAccessDenied means the identity lacks \
+             serviceusage.services.use on the project its requests bill to \
+             (x-goog-user-project)."
         }
         _ => {
             "The credentials lack permission for this object, or — without s3:ListBucket — the \
