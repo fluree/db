@@ -6527,6 +6527,23 @@ mod tests {
             config.connection = IcebergConnectionConfig::direct("gs://lake/wh/t");
             config
         };
+        // Every source is registered with its mapping.
+        let mapped = |iceberg: IcebergCreateConfig| R2rmlCreateConfig {
+            iceberg,
+            mapping: crate::graph_source::config::R2rmlMappingInput::Content(
+                r#"
+                @prefix rr: <http://www.w3.org/ns/r2rml#> .
+                @prefix ex: <http://example.org/> .
+                <http://example.org/mapping#T>
+                    a rr:TriplesMap ;
+                    rr:logicalTable [ rr:tableName "t" ] ;
+                    rr:subjectMap [ rr:template "http://example.org/t/{id}" ] ;
+                    rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+                "#
+                .to_string(),
+            ),
+            mapping_media_type: Some("text/turtle".to_string()),
+        };
         // A key in a variable that is never set: nothing to mint at
         // registration, so the identity is proven at query time.
         let mut google = on_gcs("gs-gcs-google");
@@ -6542,13 +6559,13 @@ mod tests {
                     quota_project: None,
                 });
         fluree
-            .create_iceberg_graph_source(google)
+            .create_r2rml_graph_source(mapped(google))
             .await
             .expect("a Google identity reads gs://");
         // The host's AWS identity reads gs:// only through the GCS interop
         // endpoint.
         let err = fluree
-            .create_iceberg_graph_source(on_gcs("gs-gcs-ambient"))
+            .create_r2rml_graph_source(mapped(on_gcs("gs-gcs-ambient")))
             .await
             .map(|_| ())
             .expect_err("ambient AWS does not read gs://");
