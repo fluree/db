@@ -1338,11 +1338,12 @@ mod tests {
     }
 
     /// A store that refuses the object, as GCS or S3 answer a 403: its reads
-    /// (optionally held until released) and its HEAD are denials.
+    /// (optionally held until released) and its HEADs are denials, counted.
     #[derive(Debug, Clone)]
     struct Refusing {
         gate: Option<Arc<tokio::sync::Semaphore>>,
         reads: Arc<std::sync::atomic::AtomicUsize>,
+        heads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     fn denial() -> IcebergError {
@@ -1368,6 +1369,7 @@ mod tests {
             Err(denial())
         }
         async fn file_size(&self, _path: &str) -> Result<u64> {
+            self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(denial())
         }
     }
@@ -1384,6 +1386,7 @@ mod tests {
         let store = Refusing {
             gate: None,
             reads: Arc::default(),
+            heads: Arc::default(),
         };
         let err = SendParquetReader::with_caches(&store, &footers, &cache, &dir, &scope)
             .try_whole_bytes_no_footer(path, 64)
@@ -1393,6 +1396,11 @@ mod tests {
             matches!(err, IcebergError::StorageAccessDenied { .. }),
             "{err:?}"
         );
+        assert_eq!(
+            store.heads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the leader reports the read's own denial, not a HEAD's"
+        );
 
         // Two readers of one file: the second joins the first's fill and is
         // handed only its text, yet still reports the denial typed.
@@ -1400,6 +1408,7 @@ mod tests {
         let held = Refusing {
             gate: Some(Arc::clone(&gate)),
             reads: Arc::default(),
+            heads: Arc::default(),
         };
         let leader = {
             let (held, cache, dir, footers, scope) = (
@@ -1443,6 +1452,11 @@ mod tests {
             held.reads.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the waiter joined the leader's fill rather than reading itself"
+        );
+        assert_eq!(
+            held.heads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the waiter asks the store, once"
         );
     }
 
