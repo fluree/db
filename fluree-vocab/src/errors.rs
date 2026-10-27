@@ -230,8 +230,10 @@ pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVend
 pub const CATALOG_ACCESS_DENIED: &str = "err:catalog/AccessDenied";
 
 /// A Google catalog refused the request because it names no quota project
-/// (`USER_PROJECT_DENIED`): user credentials bill to the project the request
-/// names. The fix is the source's `quota_project`, not a broader grant.
+/// (`USER_PROJECT_DENIED`, or BigLake's "missing `x-goog-user-project`
+/// header"): BigLake bills every request, whatever the identity, to the
+/// project the request names. The fix is the source's `quota_project`, not a
+/// broader grant.
 pub const CATALOG_QUOTA_PROJECT_REQUIRED: &str = "err:catalog/QuotaProjectRequired";
 
 /// Connection error

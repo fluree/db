@@ -258,9 +258,10 @@ impl RestCatalogClient {
 
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
-                    // Google refuses user credentials that name no quota
-                    // project. Still a refusal (fail closed), typed so the hint
-                    // names the fix instead of a broader grant.
+                    // Google (BigLake) refuses a request that names no quota
+                    // project, whatever the identity. Still a refusal (fail
+                    // closed), typed so the hint names the fix instead of a
+                    // broader grant.
                     if status == reqwest::StatusCode::FORBIDDEN && needs_quota_project(&body) {
                         return Err(IcebergError::CatalogQuotaProjectRequired {
                             table: path.to_string(),
@@ -348,13 +349,15 @@ impl RestCatalogClient {
 }
 
 /// Whether a Google 403 is the missing-quota-project refusal: the
-/// `USER_PROJECT_DENIED` reason, or the "requires a quota project" message
-/// Google gives user (ADC) credentials.
+/// `USER_PROJECT_DENIED` reason, the "requires a quota project" message
+/// Google gives user (ADC) credentials, or BigLake's "missing
+/// `x-goog-user-project` header", which it gives every identity (a service
+/// account and WIF too) that names no quota project.
 fn needs_quota_project(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
     body.contains("USER_PROJECT_DENIED")
-        || body
-            .to_ascii_lowercase()
-            .contains("requires a quota project")
+        || lower.contains("requires a quota project")
+        || lower.contains("x-goog-user-project")
 }
 
 /// Route prefix by (catalog URI, warehouse).
@@ -743,6 +746,53 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, IcebergError::CatalogQuotaProjectRequired { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// BigLake refuses a service account's (and WIF's) request that names no
+    /// quota project too, in its own words: the body observed live against
+    /// `/v1/config`.
+    #[tokio::test]
+    async fn biglakes_missing_user_project_header_refusal_is_the_quota_project_error() {
+        let server = mock_catalog().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"error":{"code":403,"message":"Permission denied; missing `x-goog-user-project` header.","status":"PERMISSION_DENIED"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = loads(
+            &warehouse_client(&server.uri(), Some("quota-sa-on-config")),
+            "db",
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            IcebergError::CatalogQuotaProjectRequired { table } => {
+                assert!(table.starts_with("/v1/config"), "{table}");
+            }
+            other => panic!("expected CatalogQuotaProjectRequired, got {other:?}"),
+        }
+        assert!(err.to_string().contains("set quota_project"), "{err}");
+        // A 403 about something else is still the catalog's refusal.
+        let server = mock_catalog().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"error":{"code":403,"message":"Permission 'biglake.catalogs.get' denied","status":"PERMISSION_DENIED"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = loads(
+            &warehouse_client(&server.uri(), Some("quota-sa-other-denial")),
+            "db",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::CatalogAccessDenied { .. }),
             "{err:?}"
         );
     }

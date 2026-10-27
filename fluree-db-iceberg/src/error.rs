@@ -155,12 +155,15 @@ pub enum IcebergError {
     },
 
     /// A catalog on Google refused the request because no quota project was
-    /// named (`USER_PROJECT_DENIED` / "requires a quota project"). User
-    /// credentials bill to a project the request must name; the fix is the
-    /// source's `quota_project`, not a broader grant.
+    /// named (`USER_PROJECT_DENIED`, "requires a quota project", BigLake's
+    /// "missing `x-goog-user-project` header"). BigLake bills every request,
+    /// whatever the identity (user credentials, a service account, WIF), to a
+    /// project the request names; the fix is the source's `quota_project`,
+    /// not a broader grant.
     #[error(
-        "Catalog request for {table} needs a quota project: Google bills user credentials to \
-         the project named in x-goog-user-project; set quota_project on the source's Google auth"
+        "Catalog request for {table} needs a quota project: Google bills the request to the \
+         project named in x-goog-user-project (BigLake requires one for every identity); set \
+         quota_project on the source's Google auth"
     )]
     CatalogQuotaProjectRequired {
         /// The table (or catalog route) the refused request was for.
