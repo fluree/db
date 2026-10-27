@@ -136,6 +136,25 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
 
 For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. With `r2rml`, `table` may be omitted in `glue` and `s3tables` modes, as in `rest`: each `rr:tableName` names a table.
 
+The connection may instead be given structured, as the stored config spells it: a `catalog` object (its `auth` included) and an `io` object (its `storage_auth` included), in place of the flat fields, never beside them. Every Google identity and storage identity is given this way:
+
+```json
+{
+  "name": "orders",
+  "table": "sales.orders",
+  "r2rml": "...",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
+    "warehouse": "bq://projects/lake/locations/us/catalogs/sales",
+    "auth": { "type": "google", "credentials": { "source": "service_account", "key": { "env_var": "LAKE_SA_KEY" } } }
+  },
+  "io": { "storage_auth": { "type": "catalog" } }
+}
+```
+
+An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
+
 Without `r2rml` the source is registered as a plain Iceberg source with no mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
@@ -457,7 +476,7 @@ A signing region is required and must match the bucket location — SigV4 scopes
 
 GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
 
-**BigLake REST catalog (catalog auth, distinct from the storage HMAC above).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token** — separate from the HMAC keys that read the `gs://` data files. A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. (The metadata server is only reachable on GCE/GKE; locally, use a static `auth_bearer`.) The storage HMAC keys are unaffected — they don't expire.
+**BigLake REST catalog (catalog auth, distinct from the storage HMAC above).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token** — separate from the HMAC keys that read the `gs://` data files. A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. Off GCP, a structured `{"type": "google", "credentials": …}` catalog auth refreshes too: a service-account key held in an environment variable, Workload Identity Federation from AWS, or (locally) application-default credentials; see [Iceberg connection](../api/endpoints.md#iceberg-connection). The storage HMAC keys are unaffected — they don't expire.
 
 ## RDF Mapping (R2RML)
 
@@ -465,17 +484,22 @@ Every Iceberg graph source requires an [R2RML mapping](r2rml.md) (Turtle format)
 
 ### Type Mapping
 
-Iceberg types map to XSD types:
+A column's value becomes an RDF literal through its object map. With `rr:datatype`, the literal has that datatype. Without one, the literal's datatype is the column type's entry in the table below, its lexical form the column's value:
 
-| Iceberg Type | RDF Type |
-|--------------|----------|
-| int, long | xsd:integer |
-| float, double | xsd:decimal |
-| string | xsd:string |
-| boolean | xsd:boolean |
-| date | xsd:date |
-| timestamp | xsd:dateTime |
-| uuid | xsd:string |
+| Iceberg type | Datatype of an `rr:column` without `rr:datatype` | `rr:datatype` the generator (`POST /iceberg/r2rml/generate`) emits |
+|--------------|-----------------------------------------------|-------------------------------------|
+| boolean | xsd:string | xsd:boolean |
+| int | xsd:string | xsd:integer (xsd:int with `xsd_long_as_integer: false`) |
+| long | xsd:string | xsd:integer (xsd:long with `xsd_long_as_integer: false`) |
+| float | xsd:string | xsd:float |
+| double | xsd:string | xsd:double |
+| decimal(p, s) | xsd:string | xsd:decimal |
+| date | xsd:string | xsd:date |
+| timestamp, timestamptz | xsd:string | xsd:dateTime |
+| binary, fixed | xsd:string | xsd:hexBinary |
+| string, uuid, time | xsd:string | none (xsd:string) |
+
+An un-annotated numeric, boolean or temporal column therefore compares, sorts and aggregates as text: `FILTER(?score > 80)` compares `"9"` with `80` and finds no match. Give such a column an `rr:datatype`, as a generated mapping does. An `rr:template` object map produces an IRI (or, with `rr:termType rr:Literal`, an `xsd:string` literal), and a reference object map the parent's subject IRI.
 
 ## Querying Iceberg Tables
 
