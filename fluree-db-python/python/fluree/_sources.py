@@ -4,12 +4,14 @@ ledger."""
 
 from __future__ import annotations
 
+import json
 import os
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
+from typing import Literal as _Literal
 
 from fluree.errors import InvalidRequestError
 
@@ -70,17 +72,118 @@ class OAuth2:
         }
 
 
-Auth = Union[Bearer, OAuth2]
+@dataclass(frozen=True, slots=True)
+class Google:
+    """Authenticate as a Google identity, its tokens minted and refreshed
+    automatically: for a Google Iceberg REST catalog (BigLake), a SQL
+    endpoint, or (as ``storage``) the ``gs://`` files of a source.
+
+    ``credentials`` says where the identity comes from:
+
+    - ``"metadata"`` (the default): the GCE/GKE metadata server's service
+      account;
+    - ``"application_default"``: the host's application-default credentials
+      (``GOOGLE_APPLICATION_CREDENTIALS``, else gcloud's), e.g. after
+      ``gcloud auth application-default login``;
+    - an :class:`EnvVar` naming the variable that holds a service-account
+      key's JSON, read where the source is read. A key is never given
+      literally: it would be stored with the source;
+    - a Workload Identity Federation credential configuration, what ``gcloud
+      iam workload-identity-pools create-cred-config ... --aws`` prints: as a
+      dict, or the path of its file. It is not a secret, and is stored.
+
+    The metadata server and application-default credentials are the host's
+    own identity, which an operator can refuse
+    (``FLUREE_GRAPH_SOURCE_HOST_IDENTITIES``). ``quota_project`` is the
+    project requests bill to, which user credentials need; ``scopes`` a
+    comma-separated scope list (default cloud-platform, catalog auth only)."""
+
+    credentials: Union[str, EnvVar, Mapping[str, Any], os.PathLike[str]] = "metadata"
+    quota_project: str | None = None
+    scopes: str | None = None
+
+    def _credentials(self) -> dict[str, Any]:
+        credentials = self.credentials
+        if isinstance(credentials, EnvVar):
+            return {"source": "service_account", "key": {"env_var": credentials.name}}
+        if isinstance(credentials, os.PathLike):
+            text = Path(credentials).read_text(encoding="utf-8")
+            try:
+                config = json.loads(text)
+            except ValueError:
+                config = None
+            if not isinstance(config, dict):
+                raise InvalidRequestError(
+                    f"{os.fspath(credentials)} does not hold a Workload Identity Federation "
+                    "credential configuration (a JSON object)"
+                )
+            return {"source": "external_account", "config": config}
+        if isinstance(credentials, Mapping):
+            return {"source": "external_account", "config": dict(credentials)}
+        if credentials == "metadata":
+            return {"source": "metadata"}
+        if credentials == "application_default":
+            return {"source": "application_default"}
+        if isinstance(credentials, str):
+            raise InvalidRequestError(
+                'Google credentials are "metadata", "application_default", an EnvVar holding a '
+                "service-account key (a key is never given literally, since it would be stored "
+                "with the source), or a Workload Identity Federation configuration (a dict, or "
+                "the path of its file)"
+            )
+        raise TypeError(
+            "Google credentials are a str, an EnvVar, a dict or a path, not "
+            f"{type(credentials).__name__}"
+        )
+
+    def _json(self) -> dict[str, Any]:
+        spec: dict[str, Any] = {"type": "google", "credentials": self._credentials()}
+        if self.scopes is not None:
+            spec["scopes"] = self.scopes
+        if self.quota_project is not None:
+            spec["quota_project"] = self.quota_project
+        return spec
+
+    def _storage_json(self) -> dict[str, Any]:
+        if self.scopes is not None:
+            raise InvalidRequestError(
+                "a storage identity reads with the storage scope; scopes apply to catalog auth"
+            )
+        spec: dict[str, Any] = {"type": "google", "credentials": self._credentials()}
+        if self.quota_project is not None:
+            spec["quota_project"] = self.quota_project
+        return spec
+
+
+Auth = Union[Bearer, OAuth2, Google]
 
 
 def _auth(auth: Auth | None) -> dict[str, Any] | None:
     if auth is None:
         return None
-    if not isinstance(auth, (Bearer, OAuth2)):
-        raise TypeError(f"auth is a fluree.Bearer or fluree.OAuth2, not {type(auth).__name__}")
+    if not isinstance(auth, (Bearer, OAuth2, Google)):
+        raise TypeError(
+            f"auth is a fluree.Bearer, fluree.OAuth2 or fluree.Google, not {type(auth).__name__}"
+        )
     if isinstance(auth, OAuth2) and not auth.token_url:
         raise InvalidRequestError("OAuth2 needs a token_url here")
     return auth._json()
+
+
+StorageIdentity = Union[_Literal["vended", "ambient", "catalog"], Google]
+
+
+def _storage(storage: StorageIdentity | None) -> dict[str, Any] | None:
+    """Which identity reads a source's files, in its stored shape."""
+    if storage is None:
+        return None
+    if isinstance(storage, Google):
+        return storage._storage_json()
+    if storage in ("vended", "ambient", "catalog"):
+        return {"type": storage}
+    raise InvalidRequestError(
+        f'storage is "vended", "ambient", "catalog" or a fluree.Google, not {storage!r}'
+    )
 
 
 @dataclass(frozen=True, slots=True)
