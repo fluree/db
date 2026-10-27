@@ -922,7 +922,10 @@ mod tests {
                 QueryError::NoSnapshotAtTime { table: s(), requested: s(), oldest: None },
             ];
             QueryError::GraphSourceUnmapped { .. } => true, [
-                QueryError::GraphSourceUnmapped { graph_source_id: s() },
+                QueryError::GraphSourceUnmapped {
+                    graph_source_id: s(),
+                    empty_mapping: false,
+                },
             ];
             QueryError::GraphSourceUnsupported { .. } => true, [
                 QueryError::GraphSourceUnsupported {

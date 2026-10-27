@@ -115,6 +115,13 @@ fn require_iceberg_backed(
     Ok(())
 }
 
+/// Refusal for an R2RML mapping that compiles to no `rr:TriplesMap`, naming the
+/// usual cause: the `rr:` prefix without its trailing `#` (or a misspelled
+/// class) parses as other triples, which the loader does not see as maps.
+pub(crate) const EMPTY_MAPPING: &str =
+    "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
+     http://www.w3.org/ns/r2rml# (with the trailing #) and each map is typed rr:TriplesMap";
+
 /// The R2RML mapping reference carried by a mapped graph-source record, per
 /// source family. `None` for a non-mapped type, an unparseable config, or a
 /// record registered without a mapping.
@@ -148,6 +155,7 @@ pub(crate) fn served_mapping_of(
         Some(Ok(Some(mapping))) => Ok(Some(mapping)),
         Some(Ok(None)) => Err(QueryError::GraphSourceUnmapped {
             graph_source_id: graph_source_id.to_string(),
+            empty_mapping: false,
         }),
         Some(Err(e)) => Err(QueryError::Internal(format!(
             "graph source '{graph_source_id}' has a config that cannot be read: {e}"
@@ -1135,15 +1143,18 @@ impl crate::Fluree {
         /// can name dozens of tables, each its own `loadTable`.
         const CONCURRENT_LOADS: usize = 8;
 
+        // A mapping that could not be read names no tables, and nothing else
+        // names one: a catalog source's own `table` is the placeholder that
+        // only satisfies the identifier shape, never a table to load.
+        if table_names.is_empty() {
+            debug!(
+                graph_source_id = %graph_source_id,
+                "No mapped table to load: the mapping could not be read"
+            );
+            return false;
+        }
         let provider = FlureeR2rmlProvider::new(self);
-        // A mapping that could not be read names no tables; the source's own
-        // table is then the one a query would read.
-        let tables: Vec<&str> = if table_names.is_empty() {
-            vec![""]
-        } else {
-            table_names.iter().map(String::as_str).collect()
-        };
-        let loaded = futures::stream::iter(tables.into_iter().map(Ok))
+        let loaded = futures::stream::iter(table_names.iter().map(String::as_str).map(Ok))
             .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
                 let provider = &provider;
                 async move {
@@ -1185,6 +1196,10 @@ impl crate::Fluree {
     ) -> Result<RegisteredMapping> {
         use crate::graph_source::config::R2rmlMappingInput;
         let check = |compiled: &CompiledR2rmlMapping| {
+            // Every query of such a source would answer no rows.
+            if compiled.is_empty() {
+                return Err(crate::ApiError::Config(EMPTY_MAPPING.to_string()));
+            }
             if allow_sql_queries {
                 Ok(())
             } else {
@@ -2608,6 +2623,14 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             }
         };
 
+        // A mapping that defines nothing has nothing to answer from; a source
+        // registered before registration refused one keeps it.
+        if compiled.is_empty() {
+            return Err(QueryError::GraphSourceUnmapped {
+                graph_source_id: graph_source_id.to_string(),
+                empty_mapping: true,
+            });
+        }
         let compiled = Arc::new(compiled);
 
         // Cache the compiled mapping

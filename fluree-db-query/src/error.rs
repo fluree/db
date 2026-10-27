@@ -150,17 +150,19 @@ pub enum QueryError {
     )]
     R2rmlUnsupportedPattern { detail: String },
 
-    /// A registered mapped graph source (Iceberg / R2RML) has no R2RML mapping,
-    /// so nothing defines the triples a query of it reads. Only a record stored
-    /// before registration required a mapping can be in this state.
+    /// A registered mapped graph source (Iceberg / R2RML) whose R2RML mapping
+    /// defines no triples: it has none (`empty_mapping: false`), or the one it
+    /// has compiles to no `rr:TriplesMap` (`true`). Only a record stored before
+    /// registration refused both can be in this state.
     ///
     /// Typed, and raised wherever the query names the source, so the query
     /// fails with its cause rather than reading the source as a ledger that is
     /// not there or as an empty graph.
-    #[error(
-        "graph source '{graph_source_id}' has no R2RML mapping; register it again with a mapping"
-    )]
-    GraphSourceUnmapped { graph_source_id: String },
+    #[error("graph source '{graph_source_id}' {}", unmapped_cause(.empty_mapping))]
+    GraphSourceUnmapped {
+        graph_source_id: String,
+        empty_mapping: bool,
+    },
 
     /// An index graph source (BM25, vector, geo) named where a graph is read:
     /// the query target, `FROM` / `FROM NAMED`, or `GRAPH`. An index has no
@@ -291,6 +293,16 @@ pub enum QueryError {
     /// Comparison error during expression evaluation
     #[error("Comparison error: {0}")]
     Comparison(#[from] ComparisonError),
+}
+
+/// The tail of a [`QueryError::GraphSourceUnmapped`] message.
+fn unmapped_cause(empty_mapping: &bool) -> &'static str {
+    if *empty_mapping {
+        "has an R2RML mapping that defines no rr:TriplesMap; register it again with a mapping \
+         that defines one"
+    } else {
+        "has no R2RML mapping; register it again with a mapping"
+    }
 }
 
 impl QueryError {

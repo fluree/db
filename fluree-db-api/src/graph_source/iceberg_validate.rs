@@ -389,6 +389,16 @@ pub(crate) fn compile_for_validate(
     turtle: &str,
 ) -> std::result::Result<CompiledR2rmlMapping, ValidateR2rmlResponse> {
     match R2rmlLoader::from_turtle(turtle).and_then(R2rmlLoader::compile) {
+        // Registration refuses a mapping that defines nothing, so the dry-run
+        // must not call it clean.
+        Ok(compiled) if compiled.is_empty() => Err(ValidateR2rmlResponse {
+            compiled_ok: false,
+            triples_map_count: 0,
+            table_names: Vec::new(),
+            diagnostics: vec![compile_error_diagnostic(
+                crate::graph_source::r2rml::EMPTY_MAPPING,
+            )],
+        }),
         Ok(compiled) => Ok(compiled),
         Err(e) => Err(ValidateR2rmlResponse {
             compiled_ok: false,
@@ -780,6 +790,29 @@ mod tests {
         assert!(diags
             .iter()
             .any(|d| d.message.contains("Direct catalog mode")));
+    }
+
+    /// A mapping that parses but defines no rr:TriplesMap (here the `rr:`
+    /// prefix without its `#`) is the one registration refuses, so the dry-run
+    /// reports it as a compile error rather than validating it clean.
+    #[test]
+    fn a_mapping_that_defines_no_triples_map_does_not_validate() {
+        let empty = "@prefix rr: <http://www.w3.org/ns/r2rml> .\n\
+                     <http://ex/m#M> a rr:TriplesMap ;\n\
+                     rr:logicalTable [ rr:tableName \"ns.t\" ] .";
+        let response = compile_for_validate(empty)
+            .expect_err("a mapping that defines nothing must not validate");
+        assert!(!response.compiled_ok);
+        assert_eq!(response.triples_map_count, 0);
+        assert!(
+            has_code(&response.diagnostics, DiagCode::CompileError)
+                && response
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("defines no rr:TriplesMap")),
+            "{:?}",
+            response.diagnostics
+        );
     }
 
     #[test]

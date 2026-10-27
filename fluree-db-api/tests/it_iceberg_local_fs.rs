@@ -2046,3 +2046,178 @@ async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
         "one refused table leaves the source unverified"
     );
 }
+
+/// Mappings that parse but define no `rr:TriplesMap`: the `rr:` prefix without
+/// its trailing `#` turns every `rr:` term into another IRI, and a misspelled
+/// class types no map. Every query of a source with one would answer no rows.
+fn mappings_that_define_nothing() -> [(&'static str, String); 2] {
+    [
+        ("no-hash", PEOPLE_R2RML.replace("r2rml#>", "r2rml>")),
+        (
+            "misspelled",
+            PEOPLE_R2RML.replace("a rr:TriplesMap", "a rr:TripleMap"),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_mapping_that_defines_no_triples_map_is_refused_at_registration() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (name, mapping) in mappings_that_define_nothing() {
+        let err = fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, table_location(), mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect_err(name);
+        assert_eq!(err.status_code(), 400, "{name}: {err}");
+        assert!(
+            err.to_string().contains(
+                "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
+                 http://www.w3.org/ns/r2rml#"
+            ),
+            "{name}: {err}"
+        );
+        assert!(
+            fluree
+                .nameservice()
+                .lookup_graph_source(&format!("{name}:main"))
+                .await
+                .expect("lookup")
+                .is_none(),
+            "{name}: a refused registration stores no record"
+        );
+    }
+}
+
+/// A source stored with a mapping that defines nothing (registered before
+/// registration refused one) refuses every query with the cause, rather than
+/// answering no rows.
+#[tokio::test]
+async fn a_stored_mapping_that_defines_no_triples_map_refuses_every_query() {
+    use fluree_db_core::ContentStore;
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (_, empty) = mappings_that_define_nothing().into_iter().next().unwrap();
+    let gs = "empty-mapping:main";
+    let cid = fluree
+        .content_store(gs)
+        .put(
+            fluree_db_core::ContentKind::GraphSourceMapping,
+            empty.as_bytes(),
+        )
+        .await
+        .expect("store the mapping");
+    let config = R2rmlCreateConfig::new_direct("empty-mapping", table_location(), empty)
+        .with_mapping_media_type("text/turtle")
+        .to_iceberg_gs_config(&cid.to_string())
+        .to_json()
+        .expect("serialize config");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_graph_source(
+            "empty-mapping",
+            "main",
+            fluree_db_nameservice::GraphSourceType::Iceberg,
+            &config,
+            &[],
+        )
+        .await
+        .expect("publish");
+    fluree.create_ledger("crm:main").await.expect("ledger");
+
+    let refused = |result: Result<serde_json::Value, ApiError>, route: &str| {
+        let err = match result {
+            Ok(answer) => panic!("{route}: answered instead of refusing: {answer}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.error_type(),
+            "err:db/GraphSourceUnmapped",
+            "{route}: {err}"
+        );
+        assert_eq!(err.status_code(), 409, "{route}: {err}");
+        assert!(
+            err.to_string().contains(&format!(
+                "graph source '{gs}' has an R2RML mapping that defines no rr:TriplesMap"
+            )),
+            "{route}: {err}"
+        );
+    };
+    let from = format!("SELECT ?name FROM <{gs}> WHERE {{ ?s <http://example.org/name> ?name }}");
+    refused(
+        fluree.query_from().sparql(&from).execute_formatted().await,
+        "SPARQL FROM",
+    );
+    let mut from_jsonld = name_jsonld();
+    from_jsonld["from"] = gs.into();
+    refused(
+        fluree
+            .query_from()
+            .jsonld(&from_jsonld)
+            .execute_formatted()
+            .await,
+        "JSON-LD from",
+    );
+    let target = fluree.graph(gs);
+    refused(
+        target.query().sparql(NAME_SPARQL).execute_formatted().await,
+        "SPARQL target",
+    );
+    let jsonld = name_jsonld();
+    refused(
+        target.query().jsonld(&jsonld).execute_formatted().await,
+        "JSON-LD target",
+    );
+    let in_ledger =
+        format!("SELECT ?name WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}");
+    refused(
+        fluree
+            .graph("crm:main")
+            .query()
+            .sparql(&in_ledger)
+            .execute_formatted()
+            .await,
+        "SPARQL GRAPH in a ledger query",
+    );
+}
+
+/// A mapping that cannot be read names no table, and the catalog source's own
+/// `table` is a placeholder: registration loads nothing, so the source is not
+/// verified, and the placeholder never reaches the catalog.
+#[tokio::test]
+async fn a_registration_whose_mapping_cannot_be_read_loads_no_table() {
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let created = fluree
+        .create_r2rml_graph_source(R2rmlCreateConfig {
+            iceberg: fluree_db_api::IcebergCreateConfig::new(
+                "unread-mapping",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+            )
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1"),
+            mapping: fluree_db_api::R2rmlMappingInput::Address("no/such/mapping.ttl".into()),
+            mapping_media_type: Some("text/turtle".into()),
+        })
+        .await
+        .expect("an unreadable mapping address registers unvalidated");
+    assert!(!created.mapping_validated);
+    assert!(!created.connection_tested, "nothing was loaded");
+    let asked: Vec<String> = catalog
+        .received_requests()
+        .await
+        .expect("request recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        !asked.iter().any(|p| p.contains("/tables/")),
+        "no table, placeholder or otherwise, was loaded: {asked:?}"
+    );
+}

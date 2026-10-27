@@ -1323,6 +1323,7 @@ mod tests {
             (
                 ApiError::Query(QE::GraphSourceUnmapped {
                     graph_source_id: "gs:main".into(),
+                    empty_mapping: true,
                 }),
                 409,
                 GRAPH_SOURCE_UNMAPPED,
