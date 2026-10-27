@@ -50,12 +50,28 @@ const FUSED: &str = "fused_r2rml_aggregate";
 const SQL_AGG: &str = "sql_aggregate_pushdown";
 const SQL_BLOCK: &str = "sql_block_pushdown";
 
-/// `Cell` maps every column un-annotated; `Twin` maps the same table again
-/// under its own subjects, reached from a cell by `ex:twin`, so a grouping key
-/// can come from the far side of a join.
-fn cells_mapping(table: &str) -> String {
+/// Annotated maps over the same tables: `xsd:integer` over the long column and
+/// over `ntext`, the string column holding the int column's values as text.
+const TYPED_POMS: &str = "\
+    rr:predicateObjectMap [ rr:predicate ex:i64N ; rr:objectMap [ rr:column \"i64\" ; rr:datatype xsd:integer ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:ntextN ; rr:objectMap [ rr:column \"ntext\" ; rr:datatype xsd:integer ] ] ;
+";
+
+/// The SQL source only: a `timestamp(9)` column, and language-tagged maps
+/// over the double and long columns.
+const SQL_POMS: &str = "\
+    rr:predicateObjectMap [ rr:predicate ex:ts9 ; rr:objectMap [ rr:column \"ts9\" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:f64en ; rr:objectMap [ rr:column \"f64\" ; rr:language \"en\" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:i64en ; rr:objectMap [ rr:column \"i64\" ; rr:language \"en\" ] ] ;
+";
+
+/// `Cell` maps every column un-annotated (plus `extra`); `Twin` maps the same
+/// table again under its own subjects, reached from a cell by `ex:twin`, so a
+/// grouping key can come from the far side of a join.
+fn cells_mapping(table: &str, extra: &str) -> String {
     let mut out = String::from(
-        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n",
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
     );
     let poms = |prefix: &str| -> String {
         std::iter::once("grp")
@@ -72,7 +88,7 @@ fn cells_mapping(table: &str) -> String {
          \x20   rr:logicalTable [ rr:tableName \"{table}\" ] ;\n\
          \x20   rr:subjectMap [ rr:template \"http://example.org/cell/{{id}}\" ; rr:class ex:Cell ] ;\n\
          \x20   rr:predicateObjectMap [ rr:predicate ex:id ; rr:objectMap [ rr:column \"id\" ] ] ;\n\
-         {}\
+         {}{extra}\
          \x20   rr:predicateObjectMap [ rr:predicate ex:twin ; rr:objectMap [\n\
          \x20       rr:parentTriplesMap <http://example.org/mapping#Twin> ;\n\
          \x20       rr:joinCondition [ rr:child \"id\" ; rr:parent \"id\" ] ] ] .\n\
@@ -115,6 +131,8 @@ fn sql_tables() -> FakeSql {
         ("tstz", "timestamp(6) with time zone"),
         ("raw", "varbinary"),
         ("label", "varchar"),
+        ("ntext", "varchar"),
+        ("ts9", "timestamp(9)"),
     ];
     let row = |id: i64,
                grp: &str,
@@ -132,6 +150,16 @@ fn sql_tables() -> FakeSql {
             Value::String(s) => json!(format!("{s} UTC")),
             other => other.clone(),
         };
+        let ntext = match &i {
+            Value::Number(n) => json!(n.to_string()),
+            _ => Value::Null,
+        };
+        // Two instants a nanosecond apart, which decode to one microsecond.
+        let ts9 = match id {
+            1..=4 => json!("2024-01-01 00:00:00.000000001"),
+            5..=7 => json!("2024-01-01 00:00:00.000000002"),
+            _ => Value::Null,
+        };
         vec![
             json!(id),
             json!(grp),
@@ -146,6 +174,8 @@ fn sql_tables() -> FakeSql {
             tstz,
             raw,
             json!(label),
+            ntext,
+            ts9,
         ]
     };
     let n = Value::Null;
@@ -883,6 +913,38 @@ fn iceberg_cases() -> Vec<Case> {
             .expect(&strs(&cell(&[3])))
             .files_read(1),
     );
+    // A numeric datatype over a string column: the terms order by number and
+    // the file bounds by string ("9" above "100"), so the top-k must not prune
+    // by them. Over a long column it still does.
+    cases.push(
+        order_case(src, "ntextN", true, 1)
+            .expect(&["v=100"])
+            .files_read(2),
+    );
+    cases.push(
+        order_case(src, "i64N", true, 1)
+            .expect(&["v=9007199254740993"])
+            .files_read(1),
+    );
+    // Equality with a cell's own rendering prunes by the cell's value, for
+    // every type with an exact round trip. NaN equals nothing by value and -0
+    // equals 0, so those two do not push.
+    for (c, lit, ids, files) in [
+        ("dec", "10.000000000", &[4][..], 1),
+        ("ts", "1969-12-31T23:59:59.999999Z", &[3], 1),
+        ("tstz", "1969-12-31T23:59:59.999999Z", &[3], 1),
+        ("f64", "1000000000000000000000", &[7], 1),
+        ("f32", "2.5", &[6], 1),
+        ("flag", "false", &[2, 5, 7], 2),
+        ("f64", "NaN", &[6], 2),
+        ("f64", "-0", &[3], 2),
+    ] {
+        cases.push(
+            constant_case(src, c, lit)
+                .expect(&strs(&cell(ids)))
+                .files_read(files),
+        );
+    }
     cases
 }
 
@@ -901,8 +963,12 @@ async fn untyped_columns_agree_on_every_iceberg_lane() {
     let fluree = FlureeBuilder::memory().build_memory();
     fluree
         .create_r2rml_graph_source(
-            R2rmlCreateConfig::new_direct("cells", &location, cells_mapping("silver.cells"))
-                .with_mapping_media_type("text/turtle"),
+            R2rmlCreateConfig::new_direct(
+                "cells",
+                &location,
+                cells_mapping("silver.cells", TYPED_POMS),
+            )
+            .with_mapping_media_type("text/turtle"),
         )
         .await
         .expect("create the cells graph source");
@@ -916,8 +982,129 @@ async fn untyped_columns_agree_on_every_iceberg_lane() {
 
 /// The columns whose rendering the database's `=` matches: the aggregate lane
 /// may group them in the statement. A float renders -0.0 and 0.0 apart where
-/// the database groups them; a timestamp is decoded to the microsecond.
-const SQL_EQ_EXACT: &[&str] = &["i32", "i64", "dec", "flag", "day", "raw", "label"];
+/// the database groups them. (The `timestamp(6)` columns qualify; the
+/// `timestamp(9)` one, mapped separately, does not.)
+const SQL_EQ_EXACT: &[&str] = &[
+    "i32", "i64", "dec", "flag", "day", "ts", "tstz", "raw", "label",
+];
+
+/// What each `lab.cells` row (ids 1 to 8) renders as, per column.
+fn sql_rendered(c: &str) -> [Option<&'static str>; 8] {
+    let ts = [
+        Some("2024-01-01T00:00:00Z"),
+        Some("2024-01-01T00:00:00.000001Z"),
+        Some("1969-12-31T23:59:59.999999Z"),
+        Some("2024-01-01T00:00:00Z"),
+        Some("2000-02-29T12:30:00Z"),
+        Some("1970-01-01T00:00:00Z"),
+        Some("2024-01-01T00:00:00.500000Z"),
+        None,
+    ];
+    match c {
+        "i32" => [
+            Some("2"),
+            Some("9"),
+            Some("-3"),
+            Some("9"),
+            Some("10"),
+            Some("100"),
+            Some("10"),
+            None,
+        ],
+        "i64" => [
+            Some("2"),
+            Some("9"),
+            Some("-3"),
+            Some("9"),
+            Some("10"),
+            Some("9007199254740993"),
+            Some("10"),
+            None,
+        ],
+        "f32" => [
+            Some("1.5"),
+            Some("0.1"),
+            Some("-0"),
+            Some("0"),
+            Some("10"),
+            Some("2.5"),
+            Some("1.5"),
+            None,
+        ],
+        "f64" => [
+            Some("1.5"),
+            Some("0.1"),
+            Some("-0"),
+            Some("0"),
+            Some("10"),
+            Some("2.5"),
+            Some("1000000000000000000000"),
+            None,
+        ],
+        "dec" => [
+            Some("0.050000000"),
+            Some("1.500000000"),
+            Some("-0.500000000"),
+            Some("10.000000000"),
+            Some("0.050000000"),
+            Some("2.000000000"),
+            Some("-0.500000000"),
+            None,
+        ],
+        "flag" => [
+            Some("true"),
+            Some("false"),
+            Some("true"),
+            Some("true"),
+            Some("false"),
+            Some("true"),
+            Some("false"),
+            None,
+        ],
+        "day" => [
+            Some("2024-01-09"),
+            Some("2024-01-10"),
+            Some("1969-12-31"),
+            Some("2024-01-09"),
+            Some("2000-02-29"),
+            Some("1970-01-01"),
+            Some("2024-01-10"),
+            None,
+        ],
+        "ts" | "tstz" => ts,
+        "raw" => [
+            Some("0001"),
+            Some("ff"),
+            Some(""),
+            Some("0001"),
+            Some("0a"),
+            Some("ff"),
+            Some("0001"),
+            None,
+        ],
+        "label" => [
+            Some("b"),
+            Some("a"),
+            Some("c"),
+            Some("b"),
+            Some("B"),
+            Some("\u{e9}"),
+            Some("a"),
+            Some("z"),
+        ],
+        other => panic!("no renderings for {other}"),
+    }
+}
+
+/// The `(id, rendering)` rows of column `c` that `keep` holds for.
+fn sql_rows_where(c: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
+    let rows: Vec<(u32, &str)> = sql_rendered(c)
+        .iter()
+        .zip(1..)
+        .filter_map(|(v, id)| v.filter(|v| keep(v)).map(|v| (id, v)))
+        .collect();
+    cell_v(&rows)
+}
 
 fn sql_cases() -> Vec<Case> {
     use Routing::{MustFire, MustNotFire};
@@ -954,9 +1141,72 @@ fn sql_cases() -> Vec<Case> {
         cases.push(distinct_case(src, c).route(SQL_BLOCK, MustFire));
         cases.push(order_case(src, c, false, 2).route(SQL_BLOCK, MustFire));
         cases.push(order_case(src, c, true, 1).route(SQL_BLOCK, MustFire));
-        cases.push(filter_case(src, c, "<", "\"5\"").route(SQL_BLOCK, MustFire));
-        cases.push(filter_case(src, c, "!=", "10").route(SQL_BLOCK, MustFire));
+        // A string compares as a string (by code point), and never equals 10.
+        cases.push(
+            filter_case(src, c, "<", "\"5\"")
+                .route(SQL_BLOCK, MustFire)
+                .expect(&strs(&sql_rows_where(c, |v| v < "5"))),
+        );
+        cases.push(
+            filter_case(src, c, "!=", "10")
+                .route(SQL_BLOCK, MustFire)
+                .expect(&strs(&sql_rows_where(c, |_| true))),
+        );
     }
+    // A `timestamp(6)` groups in the statement (above); a `timestamp(9)` keeps
+    // instants a nanosecond apart that decode, and render, as one.
+    cases.push(
+        group_case(src, "ts9")
+            .route(SQL_AGG, MustNotFire)
+            .route(FUSED, MustFire)
+            .expect(&["n=7 v=2024-01-01T00:00:00Z"]),
+    );
+    cases.push(
+        count_distinct_case(src, "ts9")
+            .route(SQL_AGG, MustNotFire)
+            .expect(&["n=1"]),
+    );
+    // Language-tagged: a double's "-0"@en and "0"@en stay apart, so the
+    // statement may not group them; a long's rendering it may.
+    cases.push(
+        group_case(src, "f64en")
+            .route(SQL_AGG, MustNotFire)
+            .expect(&[
+                "n=1 v=-0",
+                "n=1 v=0",
+                "n=1 v=0.1",
+                "n=1 v=1.5",
+                "n=1 v=10",
+                "n=1 v=1000000000000000000000",
+                "n=1 v=2.5",
+            ]),
+    );
+    cases.push(group_case(src, "i64en").route(SQL_AGG, MustFire).expect(&[
+        "n=1 v=-3",
+        "n=1 v=2",
+        "n=1 v=9007199254740993",
+        "n=2 v=10",
+        "n=2 v=9",
+    ]));
+    // A numeric datatype over a text column: the database orders the text,
+    // the engine the numbers. Over a bigint the extremes still go to the
+    // statement. (The fake orders numeric-looking text as numbers, so only the
+    // routing stamp tells the two apart here; `orders_as` is unit-tested.)
+    cases.push(
+        minmax_case(src, "ntextN")
+            .route(SQL_AGG, MustNotFire)
+            .expect(&["hi=100 lo=-3"]),
+    );
+    cases.push(
+        minmax_case(src, "i64N")
+            .route(SQL_AGG, MustFire)
+            .expect(&["hi=9007199254740993 lo=-3"]),
+    );
+    cases.push(
+        order_case(src, "ntextN", true, 1)
+            .route(SQL_BLOCK, MustFire)
+            .expect(&["v=100"]),
+    );
     let pinned = [
         ("i32: MIN and MAX", vec!["hi=9 lo=-3"]),
         (
@@ -1031,7 +1281,10 @@ async fn untyped_columns_agree_on_every_sql_lane() {
     );
     let server = sql_tables().mount().await;
     let fluree = FlureeBuilder::memory().build_memory();
-    let mapping = format!("{}{REFS_MAPPING}", cells_mapping("lab.cells"));
+    let mapping = format!(
+        "{}{REFS_MAPPING}",
+        cells_mapping("lab.cells", &format!("{TYPED_POMS}{SQL_POMS}"))
+    );
     fluree
         .create_sql_graph_source(SqlCreateConfig::new("cells-sql", server.uri(), mapping))
         .await
