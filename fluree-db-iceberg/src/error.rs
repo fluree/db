@@ -272,6 +272,26 @@ impl IcebergError {
         )
     }
 
+    /// Whether this is a refusal the source's configuration and the
+    /// instance's host-identity policy decide, which no retry or change on the
+    /// remote side lifts: a host identity the policy refuses, an ambient read
+    /// its bucket allowlist refuses (a bucket off it, or an endpoint override
+    /// under it), a host identity's token bound for a host it may not reach, a
+    /// table a catalog placed on this host's disk, or a path the source's
+    /// identity does not serve. Registration refuses a source whose storage it
+    /// can decide and gets one of these, rather than every later query.
+    pub fn is_configuration_refusal(&self) -> bool {
+        matches!(
+            self,
+            IcebergError::HostIdentityRefused { .. }
+                | IcebergError::AmbientBucketRefused { .. }
+                | IcebergError::AmbientEndpointRefused { .. }
+                | IcebergError::GoogleTokenHostRefused { .. }
+                | IcebergError::LocalLocationFromCatalog { .. }
+                | IcebergError::SchemeNotServed { .. }
+        )
+    }
+
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Config(msg.into())
     }
@@ -424,6 +444,68 @@ impl From<reqwest::Error> for IcebergError {
             IcebergError::Http(format!("Connection error: {err}"))
         } else {
             IcebergError::Http(format!("HTTP error: {err}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_identity::HostIdentityKind;
+
+    /// The refusals registration fails on are the ones the configuration and
+    /// policy decide; a denial, a token exchange or a network failure can
+    /// change without the configuration changing, so it is not one.
+    #[test]
+    fn configuration_refusals_are_the_ones_no_retry_lifts() {
+        let refusals = [
+            IcebergError::HostIdentityRefused {
+                kind: HostIdentityKind::Aws,
+            },
+            IcebergError::AmbientBucketRefused {
+                bucket: "b".to_string(),
+            },
+            IcebergError::AmbientEndpointRefused {
+                endpoint: "https://e.example".to_string(),
+            },
+            IcebergError::GoogleTokenHostRefused {
+                kind: HostIdentityKind::GoogleMetadata,
+                host: "h.example".to_string(),
+            },
+            IcebergError::LocalLocationFromCatalog {
+                location: "file:///t".to_string(),
+            },
+            IcebergError::SchemeNotServed {
+                path: "gs://b/k".to_string(),
+                scheme: "gs".to_string(),
+                identity: "ambient AWS".to_string(),
+                served: "s3://".to_string(),
+            },
+        ];
+        for refusal in &refusals {
+            assert!(refusal.is_configuration_refusal(), "{refusal:?}");
+        }
+        let changeable = [
+            IcebergError::StorageAccessDenied {
+                scheme: "s3",
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                region: None,
+                message: "AccessDenied".to_string(),
+            },
+            IcebergError::CatalogAccessDenied {
+                table: "t".to_string(),
+                message: "403".to_string(),
+            },
+            IcebergError::GoogleTokenExchange {
+                stage: GoogleTokenStage::Jwt,
+                status: Some(503),
+                reason: None,
+            },
+            IcebergError::Http("connection refused".to_string()),
+        ];
+        for error in &changeable {
+            assert!(!error.is_configuration_refusal(), "{error:?}");
         }
     }
 }

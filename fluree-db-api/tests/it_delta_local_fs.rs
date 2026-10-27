@@ -876,6 +876,66 @@ async fn registration_reports_a_mapped_column_the_table_lacks() {
     assert!(err.contains("'not_there'"), "{err}");
 }
 
+/// Storage the instance's host-identity policy refuses is a registration
+/// error: the configuration decides it and no later query could read the
+/// table. The error is the typed 403 a query would report, naming what was
+/// refused, and nothing is published. (A table that fails to probe for any
+/// other reason still registers with a warning; see above.)
+#[tokio::test]
+async fn a_path_source_the_host_identity_policy_refuses_is_not_registered() {
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <http://example.org/mapping#Store>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "dim_store" ] ;
+            rr:subjectMap [ rr:template "http://example.org/store/{store_id}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+    "#;
+    let source = |name: &str, root: &str| {
+        let mut config = DeltaCreateConfig::new(name, root, mapping);
+        config.mapping_media_type = Some("text/turtle".to_string());
+        config.io.s3_region = Some("us-east-1".to_string());
+        config
+    };
+    for (policy, name, named) in [
+        (
+            fluree_db_api::HostIdentityPolicy::deny_all(),
+            "delta-no-aws",
+            "aws",
+        ),
+        (
+            fluree_db_api::HostIdentityPolicy::parse(None, Some("lake")).unwrap(),
+            "delta-off-allowlist",
+            "stack-internal",
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(policy);
+        let err = fluree
+            .create_delta_graph_source(source(name, "s3://stack-internal/wh"))
+            .await
+            .expect_err("the policy refuses the table's storage");
+        assert_eq!(err.status_code(), 403, "{err}");
+        assert_eq!(
+            err.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED,
+            "{err}"
+        );
+        assert!(err.to_string().contains(named), "{err}");
+        assert!(
+            fluree
+                .nameservice()
+                .lookup_graph_source(&format!("{name}:main"))
+                .await
+                .unwrap()
+                .is_none(),
+            "{name} was published"
+        );
+    }
+}
+
 /// A literal service-principal secret is stored with the source; the info view
 /// every client can read must not return it.
 #[tokio::test]

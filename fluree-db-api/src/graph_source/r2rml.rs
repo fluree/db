@@ -1100,6 +1100,8 @@ impl crate::Fluree {
 
         // 3. Convert config to storage format
         let iceberg_config = config.to_iceberg_gs_config();
+        self.refuse_direct_storage_the_policy_refuses(&graph_source_id, &iceberg_config)
+            .await?;
         let config_json = iceberg_config
             .to_json()
             .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
@@ -1146,6 +1148,11 @@ impl crate::Fluree {
         let model_warnings = self
             .validate_source_model(config.iceberg.model.as_deref())
             .await?;
+        self.refuse_direct_storage_the_policy_refuses(
+            &graph_source_id,
+            &config.iceberg.to_iceberg_gs_config(),
+        )
+        .await?;
 
         let registered = self
             .register_r2rml_mapping(
@@ -1196,6 +1203,47 @@ impl crate::Fluree {
             connection_tested,
             mapping_validated,
         })
+    }
+
+    /// Refuse to register a Direct source whose storage this instance's policy
+    /// refuses. A Direct source's location is its configuration, so its storage
+    /// is decided here as a query would decide it ([`plan_storage`]; a Google
+    /// identity still proves itself by minting a token). A refusal the
+    /// configuration and policy decide
+    /// ([`IcebergError::is_configuration_refusal`]) fails the registration with
+    /// the typed error a query would report. Any other failure (a token
+    /// exchange that failed) is left to query time, as the location's
+    /// reachability always was. A catalog source learns its location only from
+    /// the catalog, so its storage is decided at query time.
+    async fn refuse_direct_storage_the_policy_refuses(
+        &self,
+        graph_source_id: &str,
+        config: &IcebergGsConfig,
+    ) -> Result<()> {
+        let fluree_db_iceberg::config::CatalogConfig::Direct { table_location } = &config.catalog
+        else {
+            return Ok(());
+        };
+        match plan_storage(
+            &config.catalog,
+            &config.storage_io(),
+            table_location,
+            self.identity_context(),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(refusal) if refusal.is_configuration_refusal() => Err(
+                match super::iceberg_catalog::identity_query_error(refusal) {
+                    Ok(typed) => crate::ApiError::Query(typed),
+                    Err(other) => crate::ApiError::Config(other.to_string()),
+                },
+            ),
+            Err(other) => {
+                warn!(graph_source_id = %graph_source_id, error = %other, "Could not decide the Direct source's storage; it is decided again at query time");
+                Ok(())
+            }
+        }
     }
 
     /// Test connection to an Iceberg REST catalog.
@@ -5946,6 +5994,133 @@ mod tests {
             assert_eq!(code, fluree_vocab::errors::HOST_IDENTITY_REFUSED);
             assert_eq!(status, 403);
         }
+    }
+
+    /// A Direct source's storage is decided at registration: one the
+    /// instance's policy refuses (or its identity cannot serve) fails to
+    /// register with the typed error a query would report, and nothing is
+    /// published, for both registration surfaces. Storage the policy allows
+    /// registers.
+    #[tokio::test]
+    async fn a_direct_source_whose_storage_is_refused_is_not_registered() {
+        use crate::graph_source::config::{
+            IcebergConnectionConfig, IcebergCreateConfig, R2rmlCreateConfig,
+        };
+        use fluree_db_iceberg::HostIdentityPolicy;
+        let direct = |name: &str, location: &str| IcebergCreateConfig::new_direct(name, location);
+        let redirected = {
+            let mut config = direct("gs-redirected", "s3://lake/wh/t");
+            config.connection = IcebergConnectionConfig::direct("s3://lake/wh/t")
+                .with_s3_endpoint("https://stack-internal.s3.us-east-1.amazonaws.com")
+                .with_s3_path_style(true);
+            config
+        };
+        // A Google identity serves gs:// only.
+        let google_on_s3 = {
+            let mut config = direct("gs-unserved", "s3://lake/wh/t");
+            config.connection = IcebergConnectionConfig::direct("s3://lake/wh/t")
+                .with_storage_auth(fluree_db_iceberg::StorageAuth::Google {
+                    credentials: fluree_db_iceberg::auth::GoogleCredentials::Metadata,
+                    quota_project: None,
+                });
+            config
+        };
+        let lake_only = || HostIdentityPolicy::parse(None, Some("lake")).unwrap();
+        let cases = [
+            (
+                HostIdentityPolicy::deny_all(),
+                direct("gs-no-aws", "s3://lake/wh/t"),
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED,
+                "aws",
+            ),
+            (
+                lake_only(),
+                direct("gs-off-allowlist", "s3://stack-internal/wh/t"),
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED,
+                "stack-internal",
+            ),
+            (
+                lake_only(),
+                redirected,
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED,
+                "stack-internal.s3.us-east-1.amazonaws.com",
+            ),
+            (
+                HostIdentityPolicy::allow_all(),
+                google_on_s3,
+                fluree_vocab::errors::STORAGE_SCHEME_NOT_SERVED,
+                "s3://lake/wh/t",
+            ),
+        ];
+        for (policy, config, code, named) in cases {
+            let fluree = crate::FlureeBuilder::memory()
+                .build_memory()
+                .with_host_identity_policy(policy);
+            let id = config.graph_source_id();
+            let err = fluree
+                .create_iceberg_graph_source(config)
+                .await
+                .map(|_| ())
+                .expect_err("the source's storage is refused");
+            assert_eq!(err.error_type(), code, "{id}: {err}");
+            assert!(err.to_string().contains(named), "{id}: {err}");
+            assert!(
+                fluree
+                    .nameservice()
+                    .lookup_graph_source(&id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{id} was published"
+            );
+        }
+
+        // The mapping-carrying surface refuses the same way, before it stores
+        // the mapping.
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+            <http://example.org/mapping#T>
+                a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [ rr:template "http://example.org/t/{id}" ] ;
+                rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+        "#;
+        let closed = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(HostIdentityPolicy::deny_all());
+        let mut r2rml = R2rmlCreateConfig::new_direct("gs-r2rml-no-aws", "s3://lake/wh/t", mapping);
+        r2rml.mapping_media_type = Some("text/turtle".to_string());
+        let err = closed
+            .create_r2rml_graph_source(r2rml)
+            .await
+            .map(|_| ())
+            .expect_err("the policy refuses ambient AWS");
+        assert_eq!(err.status_code(), 403, "{err}");
+        assert_eq!(
+            err.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+        assert!(closed
+            .nameservice()
+            .lookup_graph_source("gs-r2rml-no-aws:main")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Storage the policy allows registers.
+        let open = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(lake_only());
+        open.create_iceberg_graph_source(direct("gs-allowed", "s3://lake/wh/t"))
+            .await
+            .expect("the policy allows the bucket");
+        assert!(open
+            .nameservice()
+            .lookup_graph_source("gs-allowed:main")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

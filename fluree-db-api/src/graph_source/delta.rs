@@ -319,6 +319,15 @@ impl crate::Fluree {
                 // A name the config cannot place is a registration error, not a
                 // table that might appear later.
                 Err(DeltaError::Config(e)) => return Err(crate::ApiError::Config(e)),
+                // So is storage the instance's policy refuses (a host identity,
+                // a bucket off the allowlist): the configuration decides it,
+                // and no later query could read the table. The typed refusal a
+                // query would report.
+                Err(DeltaError::Identity(refusal)) if refusal.is_configuration_refusal() => {
+                    return Err(super::delta_catalog::config_error(DeltaError::Identity(
+                        refusal,
+                    )))
+                }
                 Err(e) => {
                     warn!(graph_source_id = %graph_source_id, table = %table_name, error = %e, "Delta table probe failed; registering anyway");
                     table_warnings.push(format!("table '{table_name}': {e}"));
