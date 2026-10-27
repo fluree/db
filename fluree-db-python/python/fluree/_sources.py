@@ -95,7 +95,11 @@ class Google:
     The metadata server and application-default credentials are the host's
     own identity, which an operator can refuse
     (``FLUREE_GRAPH_SOURCE_HOST_IDENTITIES``). ``quota_project`` is the
-    project requests bill to, which user credentials need; ``scopes`` a
+    project requests bill to (``x-goog-user-project``). BigLake requires one
+    for every identity; as a catalog's auth it defaults to the project a
+    ``bq://projects/<P>/...`` or ``bl://projects/<P>/...`` warehouse names,
+    and it bills the catalog only, never storage reads. As ``storage`` it is
+    the requester-pays billing project, never defaulted. ``scopes`` is a
     comma-separated scope list (default cloud-platform, catalog auth only)."""
 
     credentials: Union[str, EnvVar, Mapping[str, Any], os.PathLike[str]] = "metadata"

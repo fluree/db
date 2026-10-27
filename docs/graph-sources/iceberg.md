@@ -147,13 +147,13 @@ The connection may instead be given structured, as the stored config spells it: 
     "type": "rest",
     "uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
     "warehouse": "bq://projects/lake/locations/us/catalogs/sales",
-    "auth": { "type": "google", "credentials": { "source": "service_account", "key": { "env_var": "LAKE_SA_KEY" } } }
+    "auth": { "type": "google", "credentials": { "source": "service_account", "key": { "env_var": "LAKE_SA_KEY" } }, "quota_project": "lake" }
   },
   "io": { "storage_auth": { "type": "catalog" } }
 }
 ```
 
-The server stores the `storage_auth` it is sent and infers none: `fluree iceberg map` and Python's `map_iceberg` default a `bq://` warehouse to `catalog` and a `bl://` one to `vended`, but an HTTP request that omits it reads as `vended_credentials` says. An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
+The server stores the `storage_auth` it is sent and infers none: `fluree iceberg map` and Python's `map_iceberg` default a `bq://` warehouse to `catalog` and a `bl://` one to `vended`, but an HTTP request that omits it reads as `vended_credentials` says. The same holds for the catalog's quota project, which BigLake requires (see [Google BigLake](#google-biglake)): the CLI and Python default it to the warehouse's project, and an HTTP request names it. An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
 
 Without `r2rml` the source is registered as a plain Iceberg source with no mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
@@ -476,7 +476,28 @@ A signing region is required and must match the bucket location — SigV4 scopes
 
 GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
 
-**BigLake REST catalog (catalog auth, distinct from the storage HMAC above).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token** — separate from the HMAC keys that read the `gs://` data files. A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. Off GCP, a structured `{"type": "google", "credentials": …}` catalog auth refreshes too: a service-account key held in an environment variable, Workload Identity Federation from AWS, or (locally) application-default credentials; see [Iceberg connection](../api/endpoints.md#iceberg-connection). The storage HMAC keys are unaffected — they don't expire.
+**BigLake REST catalog (catalog auth, distinct from the storage HMAC above; see also [Google BigLake](#google-biglake)).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token** — separate from the HMAC keys that read the `gs://` data files. A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. Off GCP, a structured `{"type": "google", "credentials": …}` catalog auth refreshes too: a service-account key held in an environment variable, Workload Identity Federation from AWS, or (locally) application-default credentials; see [Iceberg connection](../api/endpoints.md#iceberg-connection). The storage HMAC keys are unaffected — they don't expire.
+
+### Google BigLake
+
+Google's BigLake Iceberg REST catalog (`https://biglake.googleapis.com/iceberg/v1/restcatalog`) serves two kinds of warehouse: BigLake federation (`bq://projects/<P>/locations/<L>…`, tables BigQuery manages, which never vends credentials, so the files are read with the catalog's own Google identity, `storage_auth: catalog`) and BigLake runtime catalogs (`bl://projects/<P>/catalogs/<C>`, which vend).
+
+**A quota project is required, whatever the identity.** BigLake bills every request to the project named in `x-goog-user-project` and refuses a request that names none: `403` "missing `x-goog-user-project` header" for a service account or Workload Identity Federation, "requires a quota project" for user credentials. Fluree reports it as `err:catalog/QuotaProjectRequired`. Set `quota_project` on the catalog's Google auth (`--auth-google-quota-project`). `fluree iceberg map` and Python's `map_iceberg` default it, when not given, to the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names, and store it with the source; an HTTP request names it, since the server infers none.
+
+**The catalog's quota project bills the catalog only.** With `storage_auth: catalog`, the files are read with the catalog's identity but not its quota project: sent to GCS, `x-goog-user-project` is a requester-pays billing project, which would make every read need `serviceusage.services.use` on it. A storage read names a billing project only when one is configured for storage: `storage_auth: google`'s `quota_project` (`--storage-google-quota-project`) for a requester-pays bucket, or the `gcs.user-project` a catalog vends.
+
+**Minimum roles for the catalog identity**, as validated against BigLake federation with a service-account identity:
+
+| Role | Granted on | For |
+|------|------------|-----|
+| `roles/biglake.viewer` | the project | the catalog's `/v1/config` and `loadTable` |
+| `roles/bigquery.metadataViewer` | the project | the BigQuery-managed tables' metadata |
+| `roles/serviceusage.serviceUsageConsumer` | the quota project | billing BigLake's requests to it |
+| `roles/storage.objectViewer` | the bucket | reading the table's metadata and data files (`storage_auth: catalog`) |
+
+GCS reads need no `serviceusage` grant unless the bucket is requester-pays, in which case the reading identity needs `roles/serviceusage.serviceUsageConsumer` on the storage quota project. A refused read says what GCS said, once: `AccessDenied` (a missing `storage.objects.get`) or `UserProjectAccessDenied` (no `serviceusage.services.use` on the billed project).
+
+Tests and private deployments can point the Google endpoints at their own hosts with the operator-only overrides `FLUREE_GOOGLE_METADATA_URL`, `FLUREE_GOOGLE_TOKEN_HOSTS` and `FLUREE_GCS_ENDPOINT` (see [configuration](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)); no source can.
 
 ## RDF Mapping (R2RML)
 

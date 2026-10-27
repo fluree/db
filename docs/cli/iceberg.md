@@ -84,7 +84,7 @@ These options, and `--warehouse`, configure a REST catalog: any other `--mode` r
 | `--auth-google-adc` | Authenticate with the host's application-default credentials (`GOOGLE_APPLICATION_CREDENTIALS`, else gcloud's, e.g. after `gcloud auth application-default login`). A host identity |
 | `--auth-google-service-account-env <VAR>` | Authenticate as the service account whose key JSON this environment variable holds, read by the process that reads the tables. The key is not stored, and is never taken literally |
 | `--auth-google-wif-config <FILE>` | Authenticate through Workload Identity Federation from AWS: the credential configuration that `gcloud iam workload-identity-pools create-cred-config … --aws` prints. Not a secret: the file is read and stored with the graph source |
-| `--auth-google-quota-project <PROJECT>` | The Google Cloud project requests bill to (`x-goog-user-project`); user credentials need one |
+| `--auth-google-quota-project <PROJECT>` | The Google Cloud project catalog requests bill to (`x-goog-user-project`). BigLake requires one for every identity; default: the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names. It bills the catalog only, never storage reads |
 | `--auth-google-scopes <SCOPES>` | OAuth scopes, comma-separated (default: `cloud-platform`) |
 
 Give one way to authenticate: a bearer token, OAuth2 client credentials, or one Google source. Two at once are refused, and so is a partial OAuth2 set: OAuth2 needs `--oauth2-token-url` and the client secret (`--oauth2-client-id` defaults to empty, as Snowflake Horizon needs).
@@ -98,7 +98,7 @@ Give one way to authenticate: a bearer token, OAuth2 client credentials, or one 
 | `--storage-google-adc` | Read the files with the host's application-default credentials |
 | `--storage-google-service-account-env <VAR>` | Read the files as the service account whose key JSON this variable holds |
 | `--storage-google-wif-config <FILE>` | Read the files through this Workload Identity Federation configuration |
-| `--storage-google-quota-project <PROJECT>` | The project storage requests bill to (requester pays) |
+| `--storage-google-quota-project <PROJECT>` | The project storage requests bill to (requester pays). Never defaulted, and never the catalog's quota project |
 
 The default is the CLI's (Python's `map_iceberg` has the same one); the server stores what it is sent, so a remote map sends the identity the default chose. A `--storage-google-*` source alone means `--storage-identity google`. A `bq://` warehouse never vends, so its default needs a Google catalog identity: without one, `map` refuses and names the options to give.
 

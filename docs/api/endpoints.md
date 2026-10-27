@@ -3112,7 +3112,7 @@ where `<google>` is where the Google identity comes from:
 { "source": "external_account", "config": { …the configuration `gcloud iam workload-identity-pools create-cred-config … --aws` prints… } }
 ```
 
-`metadata` is the GCE/GKE metadata server's service account and `application_default` the server's own application-default credentials; both are host identities, which the operator can refuse (see [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)). `quota_project` is the project requests bill to (`x-goog-user-project`), which user credentials need. The `external_account` configuration (Workload Identity Federation from AWS) is not a secret.
+`metadata` is the GCE/GKE metadata server's service account and `application_default` the server's own application-default credentials; both are host identities, which the operator can refuse (see [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)). `quota_project` is the project requests bill to (`x-goog-user-project`). BigLake requires one for every identity (a missing one is `403` `err:catalog/QuotaProjectRequired`); the server infers none, so a request to a BigLake catalog names it (the CLI and the Python package default it to the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names). A catalog auth's quota project bills the catalog only: storage reads never send it. The `external_account` configuration (Workload Identity Federation from AWS) is not a secret.
 
 The structured `io`:
 
