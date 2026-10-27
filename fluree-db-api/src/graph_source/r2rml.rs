@@ -4625,19 +4625,29 @@ pub(crate) async fn catalog_table_metadata(
             .await;
         return Ok(cached);
     }
-    let storage = catalog_storage(
-        &cfg.storage_io(),
-        load.credentials.as_ref(),
-        cfg.catalog.catalog_label(),
-        cfg.catalog.vends_credentials(),
-    )
-    .await?;
+    let storage = catalog_read_storage(cfg, load).await?;
     resolve_table_metadata(
         cache,
         storage.as_ref(),
         &load.metadata_location,
         None,
         &disk,
+    )
+    .await
+}
+
+/// The storage a catalog-loaded table's files are read through, for a reader
+/// outside the query path: the `loadTable` response's vended credentials (or
+/// the ambient chain) under the source's own §2 decision, as a query builds it.
+pub(crate) async fn catalog_read_storage(
+    cfg: &IcebergGsConfig,
+    load: &LoadTableResponse,
+) -> QueryResult<Arc<IcebergStorageBackend>> {
+    catalog_storage(
+        &cfg.storage_io(),
+        load.credentials.as_ref(),
+        cfg.catalog.catalog_label(),
+        cfg.catalog.vends_credentials(),
     )
     .await
 }
