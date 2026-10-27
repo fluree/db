@@ -998,11 +998,13 @@ pub(crate) fn storage_query_error(
 ) -> fluree_db_query::QueryError {
     match err {
         fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            scheme,
             bucket,
             key,
             region,
             message,
         } => fluree_db_query::QueryError::StorageAccessDenied {
+            scheme,
             bucket,
             key,
             region,
@@ -1080,7 +1082,11 @@ pub(crate) fn storage_api_error(
     err: fluree_db_iceberg::IcebergError,
 ) -> crate::ApiError {
     match err {
+        // An S3 denial keeps the variant hosts construct and match; any other
+        // store's is the query variant, the same 403 and wire code, whose
+        // message names the object by its own scheme.
         fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            scheme: "s3",
             bucket,
             key,
             region,
@@ -1091,6 +1097,19 @@ pub(crate) fn storage_api_error(
             region,
             message,
         },
+        fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            scheme,
+            bucket,
+            key,
+            region,
+            message,
+        } => crate::ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+            scheme,
+            bucket,
+            key,
+            region,
+            message,
+        }),
         // A catalog's refusal (REST 401/403, AWS Glue / S3 Tables access denied)
         // is the same 403 the query path reports.
         fluree_db_iceberg::IcebergError::CatalogAccessDenied { table, message } => {
@@ -1515,6 +1534,7 @@ mod tests {
         ));
 
         let storage = fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "lake".to_string(),
             key: "t/data/0.parquet".to_string(),
             region: None,
@@ -1572,6 +1592,53 @@ mod tests {
             other.to_string(),
             crate::ApiError::config("Failed to load table sales.orders: Catalog error: boom")
                 .to_string()
+        );
+    }
+
+    /// A storage denial names the object by its own store's scheme on both
+    /// paths, with the one 403 and wire code; an S3 denial keeps the variant
+    /// hosts construct and match.
+    #[test]
+    fn a_storage_denial_names_its_own_scheme_with_one_403() {
+        let denied = |scheme: &'static str| fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            scheme,
+            bucket: "lake".to_string(),
+            key: "wh/t/data/f.parquet".to_string(),
+            region: None,
+            message: "403 Forbidden".to_string(),
+        };
+        let gs = super::storage_api_error("Failed to read", denied("gs"));
+        assert!(
+            matches!(
+                &gs,
+                crate::ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied { .. })
+            ),
+            "{gs:?}"
+        );
+        let s3 = super::storage_api_error("Failed to read", denied("s3"));
+        assert!(
+            matches!(&s3, crate::ApiError::StorageAccessDenied { .. }),
+            "{s3:?}"
+        );
+        for (api, uri) in [
+            (&gs, "gs://lake/wh/t/data/f.parquet"),
+            (&s3, "s3://lake/wh/t/data/f.parquet"),
+        ] {
+            let shown = api.to_string();
+            assert!(shown.contains(uri), "{shown}");
+            // Hosts classify verify failures by this wording.
+            assert!(shown.contains("Storage access denied"), "{shown}");
+            assert_eq!(api.status_code(), 403, "{shown}");
+            assert_eq!(
+                api.error_type(),
+                fluree_vocab::errors::STORAGE_ACCESS_DENIED,
+                "{shown}"
+            );
+        }
+        let query = super::storage_query_error("Failed to read", denied("gs"));
+        assert!(
+            query.to_string().contains("gs://lake/wh/t/data/f.parquet"),
+            "{query}"
         );
     }
 
@@ -2077,6 +2144,7 @@ mod tests {
     /// error-lift is exercised end to end (StorageAccessDenied → 403).
     fn denied(path: &str) -> fluree_db_iceberg::IcebergError {
         fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "bucket".to_string(),
             key: path.to_string(),
             region: Some("us-east-1".to_string()),

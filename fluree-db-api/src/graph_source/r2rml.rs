@@ -3092,11 +3092,13 @@ async fn plan_for(
 fn builder_channel_error(error: QueryError) -> IcebergError {
     match error {
         QueryError::StorageAccessDenied {
+            scheme,
             bucket,
             key,
             region,
             message,
         } => IcebergError::StorageAccessDenied {
+            scheme,
             bucket,
             key,
             region,
@@ -5775,6 +5777,7 @@ mod tests {
         };
 
         match ferry(QueryError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".to_string(),
             key: "k".to_string(),
             region: Some("us-east-2".to_string()),

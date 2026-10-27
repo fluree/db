@@ -211,6 +211,18 @@ fn is_s3_access_denied(error_code: Option<&str>, http_status: Option<u16>) -> bo
         || http_status == Some(403)
 }
 
+/// The scheme `path` is written in (`s3`, `s3a`, `gs`), for messages.
+#[cfg(feature = "aws")]
+fn scheme_of(path: &str) -> &'static str {
+    if path.starts_with("s3a://") {
+        "s3a"
+    } else if path.starts_with("gs://") {
+        "gs"
+    } else {
+        "s3"
+    }
+}
+
 /// Build an [`IcebergError`] from a failed S3 read.
 ///
 /// Returns the structured [`IcebergError::StorageAccessDenied`] (which the API/
@@ -219,8 +231,10 @@ fn is_s3_access_denied(error_code: Option<&str>, http_status: Option<u16>) -> bo
 /// `"S3 {op} failed: …"` message — so every non-denial failure is byte-for-byte
 /// unchanged from before.
 #[cfg(any(feature = "aws", test))]
+#[allow(clippy::too_many_arguments)] // every field of the denial it builds
 fn s3_read_error(
     op: &str,
+    scheme: &'static str,
     bucket: &str,
     key: &str,
     region: Option<String>,
@@ -230,6 +244,7 @@ fn s3_read_error(
 ) -> IcebergError {
     if is_s3_access_denied(error_code, http_status) {
         IcebergError::StorageAccessDenied {
+            scheme,
             bucket: bucket.to_string(),
             key: key.to_string(),
             region,
@@ -285,7 +300,7 @@ impl S3IcebergStorage {
     ///
     /// Path-style (`io.s3_path_style`) is the exception: it is the logical OR of the
     /// vended and override flags, so an override can only force it on, never back to
-    /// `false`. See [`resolve_io`](Self::resolve_io).
+    /// `false` (see `resolve_io`).
     ///
     /// The credentials are used as given until they expire; see
     /// [`Self::from_renewing_vended`] for a store that renews them.
@@ -546,7 +561,13 @@ impl S3IcebergStorage {
     }
 
     /// Read a byte range from S3.
-    async fn get_object_range(&self, bucket: &str, key: &str, range: Range<u64>) -> Result<Bytes> {
+    async fn get_object_range(
+        &self,
+        scheme: &'static str,
+        bucket: &str,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
         let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
 
         let response = self
@@ -561,6 +582,7 @@ impl S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "GetObject",
+                    scheme,
                     bucket,
                     key,
                     self.configured_region(),
@@ -594,11 +616,12 @@ impl S3IcebergStorage {
         use tokio::sync::Semaphore;
 
         let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
 
         if !parallel_range_gets_enabled() {
             let mut out = Vec::with_capacity(ranges.len());
             for range in ranges {
-                out.push(self.get_object_range(bucket, key, range).await?);
+                out.push(self.get_object_range(scheme, bucket, key, range).await?);
             }
             return Ok(out);
         }
@@ -614,7 +637,7 @@ impl S3IcebergStorage {
                         .acquire()
                         .await
                         .map_err(|_| IcebergError::storage("Semaphore closed"))?;
-                    self.get_object_range(&bucket, &key, range).await
+                    self.get_object_range(scheme, &bucket, &key, range).await
                 }
             })
             // `buffered` (not `buffer_unordered`) yields IN INPUT ORDER, so the
@@ -649,6 +672,7 @@ pub(crate) fn parallel_range_gets_enabled() -> bool {
 impl IcebergStorage for S3IcebergStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
         let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
 
         let response = self
             .client
@@ -661,6 +685,7 @@ impl IcebergStorage for S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "GetObject",
+                    scheme,
                     bucket,
                     key,
                     self.configured_region(),
@@ -679,11 +704,13 @@ impl IcebergStorage for S3IcebergStorage {
 
     async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
         let (bucket, key) = self.locate(path)?;
-        self.get_object_range(bucket, key, range).await
+        let scheme = scheme_of(path);
+        self.get_object_range(scheme, bucket, key, range).await
     }
 
     async fn file_size(&self, path: &str) -> Result<u64> {
         let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
 
         let response = self
             .client
@@ -696,6 +723,7 @@ impl IcebergStorage for S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "HeadObject",
+                    scheme,
                     bucket,
                     key,
                     self.configured_region(),
@@ -712,7 +740,7 @@ impl IcebergStorage for S3IcebergStorage {
     }
 
     /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
-    /// [`S3IcebergStorage::read_ranges_bounded`], which honors the
+    /// `S3IcebergStorage::read_ranges_bounded`, which honors the
     /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
     async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
         self.read_ranges_bounded(path, ranges).await
@@ -724,6 +752,7 @@ impl IcebergStorage for S3IcebergStorage {
 impl SendIcebergStorage for S3IcebergStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
         let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
 
         let response = self
             .client
@@ -736,6 +765,7 @@ impl SendIcebergStorage for S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "GetObject",
+                    scheme,
                     bucket,
                     key,
                     self.configured_region(),
@@ -754,11 +784,13 @@ impl SendIcebergStorage for S3IcebergStorage {
 
     async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
         let (bucket, key) = self.locate(path)?;
-        self.get_object_range(bucket, key, range).await
+        let scheme = scheme_of(path);
+        self.get_object_range(scheme, bucket, key, range).await
     }
 
     async fn file_size(&self, path: &str) -> Result<u64> {
         let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
 
         let response = self
             .client
@@ -771,6 +803,7 @@ impl SendIcebergStorage for S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "HeadObject",
+                    scheme,
                     bucket,
                     key,
                     self.configured_region(),
@@ -787,7 +820,7 @@ impl SendIcebergStorage for S3IcebergStorage {
     }
 
     /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
-    /// [`S3IcebergStorage::read_ranges_bounded`], which honors the
+    /// `S3IcebergStorage::read_ranges_bounded`, which honors the
     /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
     async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
         self.read_ranges_bounded(path, ranges).await
@@ -797,6 +830,7 @@ impl SendIcebergStorage for S3IcebergStorage {
     /// names under `prefix` (from the response's common prefixes), paginated.
     async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
         let (bucket, key) = self.locate(prefix)?;
+        let scheme = scheme_of(prefix);
         let list_prefix = if key.is_empty() || key.ends_with('/') {
             key.to_string()
         } else {
@@ -818,6 +852,7 @@ impl SendIcebergStorage for S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "ListObjectsV2",
+                    scheme,
                     bucket,
                     &list_prefix,
                     self.configured_region(),
@@ -1433,6 +1468,7 @@ mod tests {
     fn s3_read_error_maps_denied_to_structured_variant() {
         let err = s3_read_error(
             "GetObject",
+            "s3",
             "my-bucket",
             "path/to/data.parquet",
             Some("us-east-2".to_string()),
@@ -1442,11 +1478,13 @@ mod tests {
         );
         match err {
             IcebergError::StorageAccessDenied {
+                scheme,
                 bucket,
                 key,
                 region,
                 message,
             } => {
+                assert_eq!(scheme, "s3");
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(key, "path/to/data.parquet");
                 assert_eq!(region.as_deref(), Some("us-east-2"));
@@ -1458,21 +1496,38 @@ mod tests {
         // Display is actionable: names the object, the region, and the
         // ListBucket caveat (no-permission OR object-moved).
         let shown = IcebergError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".into(),
             key: "k".into(),
             region: Some("us-west-1".into()),
             message: "svc".into(),
         }
         .to_string();
+        assert!(shown.starts_with("Storage access denied"), "shown: {shown}");
         assert!(shown.contains("s3://b/k"), "shown: {shown}");
         assert!(shown.contains("region us-west-1"), "shown: {shown}");
         assert!(shown.contains("s3:ListBucket"), "shown: {shown}");
+
+        // A GCS object is named by its own scheme, with GCS's own hint.
+        let gcs = IcebergError::StorageAccessDenied {
+            scheme: "gs",
+            bucket: "lake".into(),
+            key: "d/f.parquet".into(),
+            region: None,
+            message: "403".into(),
+        }
+        .to_string();
+        assert!(gcs.starts_with("Storage access denied"), "shown: {gcs}");
+        assert!(gcs.contains("gs://lake/d/f.parquet"), "shown: {gcs}");
+        assert!(!gcs.contains("s3://"), "shown: {gcs}");
+        assert!(gcs.contains("storage.objects.get"), "shown: {gcs}");
     }
 
     #[test]
     fn s3_read_error_preserves_legacy_message_for_non_denied() {
         let err = s3_read_error(
             "HeadObject",
+            "s3",
             "b",
             "k",
             None,

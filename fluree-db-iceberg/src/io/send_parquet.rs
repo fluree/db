@@ -486,9 +486,31 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         Ok(metadata)
     }
 
+    /// The error a failed disk-cache fill of `path` reports, typed.
+    ///
+    /// The fill's leader gets the store's own error back (the fetch wraps it,
+    /// it does not stringify it), so a denial stays
+    /// [`IcebergError::StorageAccessDenied`] and a 403 surfaces as one. A
+    /// waiter that joined the leader's fill is handed only the leader's text,
+    /// so it asks the store once (a HEAD): a denial comes back typed from that,
+    /// and anything else keeps the fill's message.
+    async fn fill_error(&self, path: &str, error: std::io::Error) -> IcebergError {
+        let message = error.to_string();
+        if let Some(typed) = error
+            .into_inner()
+            .and_then(|inner| inner.downcast::<IcebergError>().ok())
+        {
+            return *typed;
+        }
+        match self.storage.file_size(path).await {
+            Err(typed @ IcebergError::StorageAccessDenied { .. }) => typed,
+            _ => IcebergError::Storage(format!("disk-cache fill: {message}")),
+        }
+    }
+
     /// Read a file scan task into column batches.
     ///
-    /// Decodes via the Arrow reader ([`crate::io::arrow_reader`]) with:
+    /// Decodes via the Arrow reader (`crate::io::arrow_reader`) with:
     /// - projection pushdown (only the requested columns are read),
     /// - row-group pruning + exact row filtering from `task.residual_filter`.
     ///
@@ -546,10 +568,13 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                             .read(path)
                             .await
                             .map(|b| b.to_vec())
-                            .map_err(|e| std::io::Error::other(e.to_string()))
+                            .map_err(std::io::Error::other)
                     })
-                    .await
-                    .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                    .await;
+                let data = match data {
+                    Ok(data) => data,
+                    Err(e) => return Err(self.fill_error(path, e).await),
+                };
                 tracing::debug!(
                     path,
                     file_size,
@@ -707,16 +732,19 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 let projected_bytes = projected_chunk_bytes(task, &metadata)?;
                 if admit_whole_file(file_size, projected_bytes) {
                     let local = dc.local_path(&path, file_size);
-                    dc.cache
+                    let filled = dc
+                        .cache
                         .coalesced_fetch(local.clone(), || async {
                             self.storage
                                 .read(&path)
                                 .await
                                 .map(|b| b.to_vec())
-                                .map_err(|e| std::io::Error::other(e.to_string()))
+                                .map_err(std::io::Error::other)
                         })
-                        .await
-                        .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                        .await;
+                    if let Err(e) = filled {
+                        return Err(self.fill_error(&path, e).await);
+                    }
                     tracing::debug!(path = %path, file_size, "Iceberg disk-cache fill (large, broad)");
                     let storage = Arc::new(LocalFileStorage {
                         path: local,
@@ -856,7 +884,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     /// Unlike [`Self::read_task`], this never reads the whole file: it drives the
     /// range-backed chunk reader against the source store, and the row-group-0
     /// restriction + row budget in
-    /// [`decode_batches_arrow`](crate::io::arrow_reader::decode_batches_arrow)
+    /// `crate::io::arrow_reader::decode_batches_arrow`
     /// mean only the footer plus the first row group's projected column chunks are
     /// fetched, whatever the file size. It therefore returns at most
     /// `min(max_rows, rows-in-first-row-group)` rows and does **not** fill the
@@ -933,11 +961,13 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                             .read(path)
                             .await
                             .map(|b| b.to_vec())
-                            .map_err(|e| std::io::Error::other(e.to_string()))
+                            .map_err(std::io::Error::other)
                     })
-                    .await
-                    .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
-                return Ok(Bytes::from(data));
+                    .await;
+                return match data {
+                    Ok(data) => Ok(Bytes::from(data)),
+                    Err(e) => Err(self.fill_error(path, e).await),
+                };
             }
         } else if file_size < MIN_SPARSE_FILE_BYTES {
             // No disk cache: keep the small-file correctness behavior (read whole
@@ -1307,6 +1337,115 @@ mod tests {
         assert!(alice_fill.await.unwrap().iter().all(|b| *b == b'A'));
     }
 
+    /// A store that refuses the object, as GCS or S3 answer a 403: its reads
+    /// (optionally held until released) and its HEAD are denials.
+    #[derive(Debug, Clone)]
+    struct Refusing {
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn denial() -> IcebergError {
+        IcebergError::StorageAccessDenied {
+            scheme: "gs",
+            bucket: "lake".to_string(),
+            key: "data/small.parquet".to_string(),
+            region: None,
+            message: "403".to_string(),
+        }
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for Refusing {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let _permit = gate.acquire().await.expect("gate open");
+            }
+            Err(denial())
+        }
+        async fn read_range(&self, _path: &str, _range: Range<u64>) -> Result<Bytes> {
+            Err(denial())
+        }
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            Err(denial())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_small_file_fill_is_a_typed_denial_for_its_leader_and_its_waiters() {
+        let dir = fresh_cache_dir("denied_fill");
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let footers = Arc::new(ParquetFooterCache::new(8));
+        let scope = StorageScope::shared();
+        let path = "gs://lake/data/small.parquet";
+
+        // One reader: the fill's leader gets the store's own denial back.
+        let store = Refusing {
+            gate: None,
+            reads: Arc::default(),
+        };
+        let err = SendParquetReader::with_caches(&store, &footers, &cache, &dir, &scope)
+            .try_whole_bytes_no_footer(path, 64)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::StorageAccessDenied { .. }),
+            "{err:?}"
+        );
+
+        // Two readers of one file: the second joins the first's fill and is
+        // handed only its text, yet still reports the denial typed.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = Refusing {
+            gate: Some(Arc::clone(&gate)),
+            reads: Arc::default(),
+        };
+        let leader = {
+            let (held, cache, dir, footers, scope) = (
+                held.clone(),
+                Arc::clone(&cache),
+                dir.clone(),
+                Arc::clone(&footers),
+                scope.clone(),
+            );
+            tokio::spawn(async move {
+                SendParquetReader::with_caches(&held, &footers, &cache, &dir, &scope)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waiter = {
+            let (held, cache, dir, footers, scope) = (
+                held.clone(),
+                Arc::clone(&cache),
+                dir.clone(),
+                Arc::clone(&footers),
+                scope.clone(),
+            );
+            tokio::spawn(async move {
+                SendParquetReader::with_caches(&held, &footers, &cache, &dir, &scope)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.add_permits(2);
+        for outcome in [leader.await.unwrap(), waiter.await.unwrap()] {
+            let err = outcome.unwrap_err();
+            assert!(
+                matches!(err, IcebergError::StorageAccessDenied { .. }),
+                "{err:?}"
+            );
+        }
+        assert_eq!(
+            held.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the waiter joined the leader's fill rather than reading itself"
+        );
+    }
+
     #[tokio::test]
     async fn a_cached_footer_is_served_only_after_the_store_answers_the_head() {
         /// A store that refuses every request, as one whose identity cannot
@@ -1326,6 +1465,7 @@ mod tests {
             async fn file_size(&self, _path: &str) -> Result<u64> {
                 self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(IcebergError::StorageAccessDenied {
+                    scheme: "gs",
                     bucket: "lake".to_string(),
                     key: "data/f.parquet".to_string(),
                     region: None,

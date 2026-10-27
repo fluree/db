@@ -901,6 +901,7 @@ mod tests {
             ];
             QueryError::StorageAccessDenied { .. } => true, [
                 QueryError::StorageAccessDenied {
+                    scheme: "s3",
                     bucket: s(),
                     key: s(),
                     region: None,

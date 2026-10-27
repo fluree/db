@@ -76,6 +76,7 @@ pub mod stats;
 /// the reverse), so the falsy-spelling set is duplicated here ONCE, and the crate's
 /// kill switches call this instead of each hand-rolling the same match. Call sites
 /// cache the result in a per-switch `OnceLock` — set switches at process startup.
+#[cfg(feature = "aws")]
 pub(crate) fn env_switch_enabled(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => !matches!(

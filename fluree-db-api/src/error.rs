@@ -1738,6 +1738,7 @@ mod tests {
         );
         assert_eq!(
             ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+                scheme: "s3",
                 bucket: "b".into(),
                 key: "k".into(),
                 region: Some("us-east-2".into()),

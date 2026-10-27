@@ -31,9 +31,12 @@ pub struct StorageScope {
     segment: Arc<str>,
 }
 
+/// Redacting `Debug`: a scope's description carries digests of the stored
+/// auth it was built from, so only whether it is the shared scope is shown.
 impl std::fmt::Debug for StorageScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("StorageScope").field(&self.repr).finish()
+        let shown = if self.is_shared() { SHARED } else { "<scoped>" };
+        f.debug_tuple("StorageScope").field(&shown).finish()
     }
 }
 
@@ -119,6 +122,17 @@ mod tests {
         assert_eq!(
             a,
             StorageScope::of(&[("kind", "google"), ("principal", "a@p.iam")])
+        );
+    }
+
+    #[test]
+    fn debug_shows_no_part_of_the_description() {
+        let scoped = StorageScope::of(&[("auth", "d1g3st"), ("principal", "a@p.iam")]);
+        let shown = format!("{scoped:?}");
+        assert_eq!(shown, "StorageScope(\"<scoped>\")");
+        assert_eq!(
+            format!("{:?}", StorageScope::shared()),
+            "StorageScope(\"shared\")"
         );
     }
 

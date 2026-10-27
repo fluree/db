@@ -14,7 +14,7 @@ use std::time::Duration;
 /// Configuration for REST catalog client.
 #[derive(Debug, Clone)]
 pub struct RestCatalogConfig {
-    /// Base URI for the REST catalog (e.g., "https://polaris.example.com")
+    /// Base URI for the REST catalog (e.g., `https://polaris.example.com`)
     pub uri: String,
     /// Optional warehouse identifier
     pub warehouse: Option<String>,

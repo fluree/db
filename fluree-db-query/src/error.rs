@@ -159,10 +159,12 @@ pub enum QueryError {
     /// `AccessDenied` for a missing object without `s3:ListBucket`, this means
     /// the credentials lack access **or** the object was moved/removed.
     #[error(
-        "Storage access denied for s3://{bucket}/{key}{region_suffix}: {message}",
+        "Storage access denied for {scheme}://{bucket}/{key}{region_suffix}: {message}",
         region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
     )]
     StorageAccessDenied {
+        /// The object path's scheme as written (`s3`, `s3a`, `gs`).
+        scheme: &'static str,
         /// Bucket parsed from the object path.
         bucket: String,
         /// Object key parsed from the object path.
@@ -424,6 +426,7 @@ mod tests {
     #[test]
     fn storage_access_denied_display_names_object_and_region() {
         let e = QueryError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".to_string(),
             key: "warehouse/t/data/f.parquet".to_string(),
             region: Some("us-east-2".to_string()),
@@ -438,6 +441,7 @@ mod tests {
 
         // Region is omitted cleanly when unknown.
         let no_region = QueryError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".to_string(),
             key: "k".to_string(),
             region: None,
@@ -447,6 +451,16 @@ mod tests {
             no_region.to_string(),
             "Storage access denied for s3://b/k: m"
         );
+
+        // A GCS object is named by its own scheme.
+        let gcs = QueryError::StorageAccessDenied {
+            scheme: "gs",
+            bucket: "lake".to_string(),
+            key: "k".to_string(),
+            region: None,
+            message: "m".to_string(),
+        };
+        assert_eq!(gcs.to_string(), "Storage access denied for gs://lake/k: m");
     }
 
     #[test]

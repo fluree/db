@@ -33,7 +33,8 @@ pub enum IcebergError {
     #[error("Storage error: {0}")]
     Storage(String),
 
-    /// Object storage denied a read (S3 403 / `AccessDenied`).
+    /// Object storage denied a read (S3 or GCS 403, or a 401 that survived a
+    /// renewed credential).
     ///
     /// Structured so callers can surface a 403 (rather than a generic 400/500)
     /// and name the exact object. AWS returns `AccessDenied` both for a genuine
@@ -41,12 +42,14 @@ pub enum IcebergError {
     /// missing object (S3 cannot reveal 404 vs 403 without list permission), so
     /// this means the credentials lack access **or** the object was moved/removed.
     #[error(
-        "S3 access denied reading s3://{bucket}/{key}{region_suffix}: {message}. \
-         The credentials lack permission for this object, or — without s3:ListBucket — \
-         the object no longer exists (a missing object also surfaces as AccessDenied).",
-        region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
+        "Storage access denied reading {scheme}://{bucket}/{key}{region_suffix}: {message}. {hint}",
+        region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default(),
+        hint = denial_hint(.scheme)
     )]
     StorageAccessDenied {
+        /// The path's scheme as written (`s3`, `s3a`, `gs`, the schemes a
+        /// store reads): what the message names the object by.
+        scheme: &'static str,
         /// Bucket parsed from the `s3://`/`gs://` path.
         bucket: String,
         /// Object key parsed from the path.
@@ -325,6 +328,20 @@ impl GoogleTokenStage {
 impl std::fmt::Display for GoogleTokenStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// What a denial most likely means, by store.
+fn denial_hint(scheme: &str) -> &'static str {
+    match scheme {
+        "gs" => {
+            "The identity lacks storage.objects.get (or storage.objects.list) on this object, \
+             or the object no longer exists."
+        }
+        _ => {
+            "The credentials lack permission for this object, or — without s3:ListBucket — the \
+             object no longer exists (a missing object also surfaces as AccessDenied)."
+        }
     }
 }
 

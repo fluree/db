@@ -305,6 +305,7 @@ impl GcsIcebergStorage {
     fn error(&self, path: &str, bucket: &str, key: &str, err: object_store::Error) -> IcebergError {
         if refusal_status(&err).is_some() {
             return IcebergError::StorageAccessDenied {
+                scheme: "gs",
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 region: None,

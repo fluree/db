@@ -387,7 +387,7 @@ pub enum CatalogConfig {
     Rest {
         /// Catalog type identifier (e.g., "polaris", "rest").
         catalog_type: String,
-        /// Base URI of the catalog (e.g., "https://polaris.example.com").
+        /// Base URI of the catalog (e.g., `https://polaris.example.com`).
         uri: String,
         /// Authentication configuration.
         auth: AuthConfig,
