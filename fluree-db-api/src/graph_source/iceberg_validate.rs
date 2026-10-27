@@ -45,7 +45,7 @@ use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
 
 use super::config::IcebergConnectionConfig;
 use super::iceberg_catalog::{
-    preview_iceberg_table, ColumnInfo, StatsTier, TableIdentifier, TableSchema,
+    preview_iceberg_table_in, ColumnInfo, StatsTier, TableIdentifier, TableSchema,
 };
 use crate::Result;
 
@@ -453,7 +453,14 @@ impl crate::Fluree {
                 requested_snapshot = ?snapshot,
                 "validate_r2rml: previewing table current snapshot for cross-check"
             );
-            match preview_iceberg_table(conn.clone(), table_id, StatsTier::Stats).await {
+            match preview_iceberg_table_in(
+                conn.clone(),
+                table_id,
+                StatsTier::Stats,
+                self.identity_context(),
+            )
+            .await
+            {
                 Ok(preview) => {
                     schemas.insert(name.clone(), preview.schema);
                 }

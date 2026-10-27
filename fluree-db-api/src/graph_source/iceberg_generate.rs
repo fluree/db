@@ -1,7 +1,7 @@
 //! End-to-end deterministic R2RML generation (PR-1 item (c), the capstone).
 //!
 //! This module glues the two halves already on the branch: track (a)'s
-//! metadata-only [`preview_iceberg_table`] API (the INPUT) and the deterministic
+//! metadata-only [`crate::Fluree::preview_iceberg_table`] API (the INPUT) and the deterministic
 //! [`emit_r2rml`] engine (the ENGINE). For each requested table it fetches the
 //! Tier-A schema + Tier-B stats preview, maps that preview onto the emitter's
 //! self-contained input model ([`EmitTableSchema`] / [`EmitColumn`] /
@@ -32,7 +32,7 @@ use fluree_db_r2rml::emit::{
 
 use crate::graph_source::config::IcebergConnectionConfig;
 use crate::graph_source::iceberg_catalog::{
-    preview_iceberg_table, ColumnInfo, ColumnStats, SnapshotRef, StatsTier, TableIdentifier,
+    preview_iceberg_table_in, ColumnInfo, ColumnStats, SnapshotRef, StatsTier, TableIdentifier,
     TablePreview,
 };
 use crate::Result;
@@ -332,7 +332,7 @@ fn assemble_generate_response(
 impl crate::Fluree {
     /// Deterministically generate an R2RML mapping over a set of Iceberg tables.
     ///
-    /// For each requested table it fetches the Tier-A+B [`preview_iceberg_table`]
+    /// For each requested table it fetches the Tier-A+B [`Self::preview_iceberg_table`]
     /// at the table's current snapshot, maps the preview onto the emitter's input
     /// model, runs the deterministic emitter with the request's
     /// `per_table_overrides`, and returns the authoritative
@@ -374,9 +374,13 @@ impl crate::Fluree {
                 .map(|table| {
                     let connection = connection.clone();
                     async move {
-                        let preview =
-                            preview_iceberg_table(connection, table.clone(), StatsTier::Stats)
-                                .await?;
+                        let preview = preview_iceberg_table_in(
+                            connection,
+                            table.clone(),
+                            StatsTier::Stats,
+                            self.identity_context(),
+                        )
+                        .await?;
                         Ok::<_, crate::ApiError>((table, preview))
                     }
                 })

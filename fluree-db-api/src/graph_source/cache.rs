@@ -22,7 +22,9 @@ use super::catalog_session::CachedLoadTable;
 #[cfg(feature = "iceberg")]
 use fluree_db_iceberg::catalog::SendCatalogClient;
 #[cfg(feature = "iceberg")]
-use fluree_db_iceberg::{io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile};
+use fluree_db_iceberg::{
+    io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile, StorageScope,
+};
 #[cfg(feature = "sql")]
 use fluree_db_sql::TrinoClient;
 #[cfg(feature = "iceberg")]
@@ -244,35 +246,54 @@ impl R2rmlCache {
         self.compiled_mappings.insert(cache_key, mapping);
     }
 
-    /// Get table metadata from cache.
+    /// Get table metadata from cache, as read under the storage identity
+    /// `scope` (see [`StorageScope`]: an entry is only ever served to the
+    /// identity that read it).
     #[cfg(feature = "iceberg")]
-    pub async fn get_metadata(&self, metadata_location: &str) -> Option<Arc<TableMetadata>> {
-        self.table_metadata.get(metadata_location)
+    pub async fn get_metadata(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+    ) -> Option<Arc<TableMetadata>> {
+        self.table_metadata
+            .get(scope.qualify(metadata_location).as_ref())
     }
 
-    /// Store table metadata in cache.
+    /// Store table metadata in cache, as read under `scope`.
     #[cfg(feature = "iceberg")]
-    pub async fn put_metadata(&self, metadata_location: String, metadata: Arc<TableMetadata>) {
-        self.table_metadata.insert(metadata_location, metadata);
+    pub async fn put_metadata(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+        metadata: Arc<TableMetadata>,
+    ) {
+        self.table_metadata
+            .insert(scope.qualify(metadata_location).into_owned(), metadata);
     }
 
-    /// Get cached scan file selections for a metadata location.
+    /// Get cached scan file selections for a metadata location, as read under
+    /// `scope`.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn get_scan_files(
         &self,
+        scope: &StorageScope,
         metadata_location: &str,
     ) -> Option<Arc<CachedScanFiles>> {
-        self.scan_files.get(metadata_location)
+        self.scan_files
+            .get(scope.qualify(metadata_location).as_ref())
     }
 
-    /// Store manifest-derived scan file selections for a metadata location.
+    /// Store manifest-derived scan file selections for a metadata location, as
+    /// read under `scope`.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn put_scan_files(
         &self,
-        metadata_location: String,
+        scope: &StorageScope,
+        metadata_location: &str,
         scan_files: Arc<CachedScanFiles>,
     ) {
-        self.scan_files.insert(metadata_location, scan_files);
+        self.scan_files
+            .insert(scope.qualify(metadata_location).into_owned(), scan_files);
     }
 
     /// Get the shared Parquet footer cache (clone the `Arc` to share into
@@ -285,23 +306,30 @@ impl R2rmlCache {
     /// Get a recently resolved direct-catalog metadata location.
     ///
     /// Entries auto-expire after `DIRECT_METADATA_LOCATION_TTL` via moka's native TTL.
+    /// Keyed by the storage identity `scope` too: the location is read from
+    /// storage (`version-hint.text`), so another identity must read it itself.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn get_direct_metadata_location(
         &self,
+        scope: &StorageScope,
         table_location: &str,
     ) -> Option<String> {
-        self.direct_metadata_locations.get(table_location)
+        self.direct_metadata_locations
+            .get(scope.qualify(table_location).as_ref())
     }
 
-    /// Store a resolved direct-catalog metadata location.
+    /// Store a resolved direct-catalog metadata location, as read under `scope`.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn put_direct_metadata_location(
         &self,
-        table_location: String,
+        scope: &StorageScope,
+        table_location: &str,
         metadata_location: String,
     ) {
-        self.direct_metadata_locations
-            .insert(table_location, metadata_location);
+        self.direct_metadata_locations.insert(
+            scope.qualify(table_location).into_owned(),
+            metadata_location,
+        );
     }
 
     /// Get a process-wide catalog client for a source config `fingerprint`, or

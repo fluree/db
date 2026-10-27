@@ -569,6 +569,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::ResourceLimit(_)
         | QueryError::NeedFetch(_)
         | QueryError::StorageAccessDenied { .. }
+        | QueryError::StorageSchemeNotServed { .. }
         | QueryError::Nameservice(_)
         | QueryError::CatalogCredentialsNotVended { .. }
         | QueryError::CatalogAccessDenied { .. }
@@ -902,6 +903,12 @@ mod tests {
                     bucket: s(),
                     key: s(),
                     region: None,
+                    message: s(),
+                },
+            ];
+            QueryError::StorageSchemeNotServed { .. } => true, [
+                QueryError::StorageSchemeNotServed {
+                    scheme: s(),
                     message: s(),
                 },
             ];

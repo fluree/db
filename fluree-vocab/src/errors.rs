@@ -202,6 +202,13 @@ pub const STORAGE_WRITE: &str = "err:storage/WriteFailure";
 /// credentials lack access **or** the object was moved/removed.
 pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
 
+/// A graph source's storage identity was asked to read a path whose scheme it
+/// does not serve (HTTP 400): `gs://` on an AWS identity without a GCS interop
+/// endpoint, `s3://` on a Google identity. The identity is decided by the
+/// source's `io.storage_auth`, never by the path, so this is refused rather
+/// than read with whatever client accepts the scheme.
+pub const STORAGE_SCHEME_NOT_SERVED: &str = "err:storage/SchemeNotServed";
+
 /// The catalog authorized the table but vended no storage credentials while the
 /// source is configured to require them (`vended_credentials = true`).
 ///

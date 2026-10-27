@@ -248,15 +248,14 @@ pub use view::{
 
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
-    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
-    sample_column_values, sample_iceberg_rows, verify_storage_access, BrowseDepth, CatalogBrowse,
-    CatalogMode, CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic,
-    FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse,
-    IcebergConnectionConfig, IcebergCreateConfig, IcebergCreateResult, MaterializeResult,
-    PartitionFieldInfo, PersistedMaterializeJob, R2rmlCreateConfig, R2rmlCreateResult,
-    R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    StorageAccessReport, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride,
-    TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
+    CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider,
+    GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
+    IcebergCreateConfig, IcebergCreateResult, MaterializeResult, PartitionFieldInfo,
+    PersistedMaterializeJob, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput,
+    ResolvedStorage, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
+    StorageAccessReport, StorageDecision, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
+    TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 #[cfg(feature = "delta")]

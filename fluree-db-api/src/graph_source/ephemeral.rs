@@ -75,6 +75,8 @@ pub(crate) struct EphemeralR2rmlProvider {
     catalog: Arc<dyn SendCatalogClient>,
     /// The candidate mapping under test, returned to the operator verbatim.
     mapping: Arc<CompiledR2rmlMapping>,
+    /// The instance's identity context, which decides the tables' storage.
+    identity: fluree_db_iceberg::IdentityContext,
 }
 
 impl std::fmt::Debug for EphemeralR2rmlProvider {
@@ -120,13 +122,17 @@ impl EphemeralR2rmlProvider {
             )
         })?;
 
-        // Build S3 storage exactly as the preview/sample paths do: vended creds
-        // when the catalog delegated them, else the ambient AWS chain.
-        let storage = build_preview_storage(&self.conn, load.credentials.as_ref())
+        // Build storage exactly as the preview/sample paths do: the source's
+        // storage decision under the instance's identity context.
+        let storage = build_preview_storage(&self.conn, &load, &self.identity)
             .await
-            .map_err(|e| {
-                QueryError::Internal(format!("Failed to create storage for '{table_name}': {e}"))
-            })?;
+            .map_err(|e| match e {
+                crate::ApiError::Query(typed) => typed,
+                other => QueryError::Internal(format!(
+                    "Failed to create storage for '{table_name}': {other}"
+                )),
+            })?
+            .backend;
 
         // Prefer the catalog's inline metadata (no extra round-trip); fall back to
         // reading the metadata file from object storage when it is omitted.
@@ -306,6 +312,7 @@ impl crate::Fluree {
             conn,
             catalog,
             mapping: Arc::new(compiled),
+            identity: self.identity_context().clone(),
         };
 
         // A minimal genesis view tagged with the synthetic graph-source id, so

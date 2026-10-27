@@ -1,13 +1,13 @@
 //! Bounded, cheap row/column **sampler** over an Iceberg table.
 //!
 //! This is the data-peek complement to the metadata-only
-//! [`preview_iceberg_table`](super::iceberg_catalog::preview_iceberg_table): it
+//! [`crate::Fluree::preview_iceberg_table`]: it
 //! actually reads a handful of *values*. Two entry points:
 //!
-//! - [`sample_iceberg_rows`] — the first `n` rows, projected to some (or all)
-//!   columns, each row as a JSON object keyed by column name.
-//! - [`sample_column_values`] — the first `n` values of a single column, as a
-//!   JSON array.
+//! - [`crate::Fluree::sample_iceberg_rows`] — the first `n` rows, projected to
+//!   some (or all) columns, each row as a JSON object keyed by column name.
+//! - [`crate::Fluree::sample_column_values`] — the first `n` values of a single
+//!   column, as a JSON array.
 //!
 //! It powers the LLM agent's "look at the data" tool and solo #756 (row
 //! preview). **Bounded by construction**: it mirrors `preview_iceberg_table`'s
@@ -43,28 +43,15 @@ use crate::graph_source::iceberg_catalog::{
 };
 use crate::{ApiError, Result};
 
-/// Sample the first `n` rows of `table`, projected to `projection` (column names;
-/// `None` or an empty list means all non-nested columns). Each row is a JSON
-/// object keyed by column name; nulls are JSON `null`.
+/// Sample the first `n` rows of `table` under `identity`, projected to
+/// `projection` (column names; `None` or an empty list means all non-nested
+/// columns). Each row is a JSON object keyed by column name; nulls are JSON
+/// `null`.
 ///
 /// Cheap peek — see the [module docs](self). Returns at most
 /// `min(n, rows-in-first-row-group)` rows; an empty table (no data files) yields
-/// an empty vector.
-///
-/// Builds the catalog's auth with the default identity context (every host
-/// identity allowed, the host's own AWS chain for WIF). An instance with a
-/// host-identity policy or an AWS subject governs this through the `Fluree`
-/// method of the same name.
-pub async fn sample_iceberg_rows(
-    conn: IcebergConnectionConfig,
-    table: TableIdentifier,
-    projection: Option<Vec<String>>,
-    n: usize,
-) -> Result<Vec<Value>> {
-    sample_iceberg_rows_in(conn, table, projection, n, &IdentityContext::default()).await
-}
-
-/// [`sample_iceberg_rows`] under `identity`.
+/// an empty vector. Public as [`crate::Fluree::sample_iceberg_rows`], under the
+/// instance's context.
 pub(crate) async fn sample_iceberg_rows_in(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
@@ -86,26 +73,12 @@ pub(crate) async fn sample_iceberg_rows_in(
     Ok(rows_from_batches(&batches, n))
 }
 
-/// Sample the first `n` values of a single `column` of `table`, as a JSON array
-/// (nulls are JSON `null`).
+/// Sample the first `n` values of a single `column` of `table` under
+/// `identity`, as a JSON array (nulls are JSON `null`).
 ///
 /// Cheap peek — see the [module docs](self). Returns at most
-/// `min(n, rows-in-first-row-group)` values.
-///
-/// Builds the catalog's auth with the default identity context (every host
-/// identity allowed, the host's own AWS chain for WIF). An instance with a
-/// host-identity policy or an AWS subject governs this through the `Fluree`
-/// method of the same name.
-pub async fn sample_column_values(
-    conn: IcebergConnectionConfig,
-    table: TableIdentifier,
-    column: String,
-    n: usize,
-) -> Result<Vec<Value>> {
-    sample_column_values_in(conn, table, column, n, &IdentityContext::default()).await
-}
-
-/// [`sample_column_values`] under `identity`.
+/// `min(n, rows-in-first-row-group)` values. Public as
+/// [`crate::Fluree::sample_column_values`], under the instance's context.
 pub(crate) async fn sample_column_values_in(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
@@ -165,7 +138,7 @@ where
 
     // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
     // S3 Tables return only the location).
-    let metadata = &load_response_metadata(conn, &mut load).await?;
+    let metadata = &load_response_metadata(conn, &mut load, identity).await?;
 
     let schema = metadata
         .current_schema()
@@ -173,9 +146,9 @@ where
 
     let field_ids = resolve_field_ids(schema)?;
 
-    // Build S3 storage the same way the preview/scan paths do (vended creds when
-    // the catalog delegated them, else the ambient AWS chain).
-    let storage = build_preview_storage(conn, load.credentials.as_ref()).await?;
+    // The source's storage decision, the preview/scan paths' (vended
+    // credentials, the catalog's or the source's Google identity, ambient AWS).
+    let storage = build_preview_storage(conn, &load, identity).await?.backend;
 
     // Plan a projected scan over the current snapshot. A table with no current
     // snapshot / no data files yields no tasks → an empty sample.
@@ -306,8 +279,8 @@ fn column_cell_to_json(col: &Column, idx: usize) -> Value {
 }
 
 impl crate::Fluree {
-    /// Sample the first `n` rows of an Iceberg table as JSON objects. Convenience
-    /// wrapper over the stateless [`sample_iceberg_rows`] free function.
+    /// Sample the first `n` rows of an Iceberg table as JSON objects, under
+    /// this instance's identity context.
     pub async fn sample_iceberg_rows(
         &self,
         conn: IcebergConnectionConfig,
@@ -319,9 +292,8 @@ impl crate::Fluree {
         sample_iceberg_rows_in(conn, table, projection, n, self.identity_context()).await
     }
 
-    /// Sample the first `n` values of a single Iceberg column as a JSON array.
-    /// Convenience wrapper over the stateless [`sample_column_values`] free
-    /// function.
+    /// Sample the first `n` values of a single Iceberg column as a JSON array,
+    /// under this instance's identity context.
     pub async fn sample_column_values(
         &self,
         conn: IcebergConnectionConfig,

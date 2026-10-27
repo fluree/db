@@ -15,10 +15,11 @@
 
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::primitives::ByteStream;
+use fluree_db_api::{CatalogGrant, FlureeBuilder, StorageDecision};
 use fluree_db_iceberg::catalog::SendCatalogClient;
 use fluree_db_iceberg::catalog::TableIdentifier;
 use fluree_db_iceberg::metadata::TableMetadata;
-use fluree_db_iceberg::{S3IcebergStorage, SendDirectCatalogClient, SendIcebergStorage};
+use fluree_db_iceberg::{SendDirectCatalogClient, SendIcebergStorage};
 use fs2::FileExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -209,6 +210,36 @@ fn table_location() -> String {
     format!("s3://{BUCKET}/{TABLE_PREFIX}")
 }
 
+/// The storage the engine itself decides for this Direct table (ambient AWS
+/// pointed at LocalStack), through the one constructor graph sources use.
+async fn direct_storage(endpoint: &str) -> fluree_db_iceberg::IcebergStorageBackend {
+    let config = fluree_db_iceberg::IcebergGsConfig {
+        catalog: fluree_db_iceberg::CatalogConfig::direct(table_location()),
+        table: fluree_db_iceberg::TableConfig::Identifier(String::new()),
+        io: fluree_db_iceberg::IoConfig {
+            vended_credentials: false,
+            s3_region: Some(REGION.to_string()),
+            s3_endpoint: Some(endpoint.to_string()),
+            s3_path_style: true,
+            storage_auth: None,
+        },
+        mapping: None,
+        delete: None,
+        order_by: None,
+        model: None,
+        default_allow: None,
+    };
+    let resolved = FlureeBuilder::memory()
+        .build_memory()
+        .graph_source_storage(&config, &CatalogGrant::direct())
+        .await
+        .expect("the engine decides ambient storage for a Direct S3 table");
+    assert_eq!(resolved.decision, StorageDecision::Ambient);
+    // An endpoint override is a store of its own, so its caches are scoped.
+    assert!(!resolved.scope.is_shared());
+    resolved.backend
+}
+
 fn table_id() -> TableIdentifier {
     TableIdentifier {
         namespace: "ns".to_string(),
@@ -253,11 +284,7 @@ async fn direct_catalog_full_lifecycle() {
     .await;
 
     // -- Step 2: Create storage + DirectCatalogClient and resolve --
-    #[allow(deprecated)]
-    let storage = S3IcebergStorage::from_default_chain(Some(REGION), Some(&endpoint), true)
-        .await
-        .expect("S3IcebergStorage created");
-    let storage = Arc::new(storage);
+    let storage = Arc::new(direct_storage(&endpoint).await);
 
     let catalog = SendDirectCatalogClient::new(table_location(), Arc::clone(&storage));
     let response = catalog
@@ -337,10 +364,7 @@ async fn direct_catalog_missing_version_hint() {
     ensure_bucket(&sdk_config, BUCKET).await;
 
     // No version-hint.text written — table location exists but is empty
-    #[allow(deprecated)]
-    let storage = S3IcebergStorage::from_default_chain(Some(REGION), Some(&endpoint), true)
-        .await
-        .expect("storage");
+    let storage = direct_storage(&endpoint).await;
     let catalog = SendDirectCatalogClient::new(table_location(), Arc::new(storage));
 
     let result = catalog.load_table(&table_id(), false).await;

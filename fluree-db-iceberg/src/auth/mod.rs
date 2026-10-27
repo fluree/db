@@ -212,12 +212,40 @@ impl AuthConfig {
         }
     }
 
+    /// The Google identity a `google` or `google_metadata` config authenticates
+    /// as, built under `ctx` (its host-identity policy applies); `None` for the
+    /// other variants. The config must be hydrated. No network I/O.
+    ///
+    /// This is the identity a source with `io.storage_auth = catalog` reads its
+    /// `gs://` files as: the catalog's own, as Google's model for BigLake
+    /// federation has it.
+    pub fn google_identity(&self, ctx: &IdentityContext) -> Result<Option<GoogleIdentity>> {
+        match self {
+            AuthConfig::GoogleMetadata { .. } | AuthConfig::Google { .. } => self
+                .google_identity_with(ctx, google::GoogleEndpoints::process())
+                .map(|(identity, _)| Some(identity)),
+            AuthConfig::None
+            | AuthConfig::Bearer { .. }
+            | AuthConfig::OAuth2ClientCredentials { .. } => Ok(None),
+        }
+    }
+
     /// The Google provider for the two Google variants.
     fn google_auth(
         &self,
         ctx: &IdentityContext,
         endpoints: &google::GoogleEndpoints,
     ) -> Result<GoogleCatalogAuth> {
+        let (identity, scopes) = self.google_identity_with(ctx, endpoints)?;
+        Ok(GoogleCatalogAuth::new(Arc::new(identity), scopes))
+    }
+
+    /// The identity and scopes of the two Google variants.
+    fn google_identity_with(
+        &self,
+        ctx: &IdentityContext,
+        endpoints: &google::GoogleEndpoints,
+    ) -> Result<(GoogleIdentity, Vec<String>)> {
         let (credentials, scopes, quota_project) = match self {
             AuthConfig::GoogleMetadata {
                 scopes,
@@ -241,7 +269,7 @@ impl AuthConfig {
         };
         let scopes = google::parse_scopes(scopes.as_deref())?;
         let identity = GoogleIdentity::with_endpoints(credentials, quota_project, ctx, endpoints)?;
-        Ok(GoogleCatalogAuth::new(Arc::new(identity), scopes))
+        Ok((identity, scopes))
     }
 
     fn oauth2_config(&self) -> Result<OAuth2Config> {

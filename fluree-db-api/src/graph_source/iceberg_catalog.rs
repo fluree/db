@@ -17,16 +17,18 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::graph_source::config::{CatalogMode, IcebergConnectionConfig};
+use crate::graph_source::storage::{
+    connection_catalog, plan_storage, CatalogGrant, ResolvedStorage,
+};
 use crate::Result;
 
 use fluree_db_iceberg::catalog::{
     GlueSdkCatalogClient, LoadTableResponse, RestCatalogClient, RestCatalogConfig,
     S3TablesSdkCatalogClient, SendCatalogClient,
 };
+use fluree_db_iceberg::config::CatalogConfig;
 use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
-use fluree_db_iceberg::io::{
-    FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage, SendIcebergStorage,
-};
+use fluree_db_iceberg::io::{IcebergStorageBackend, SendIcebergStorage};
 use fluree_db_iceberg::manifest::DataFile;
 use fluree_db_iceberg::metadata::{
     PartitionField, Schema, SchemaField, Snapshot, SortField, TableMetadata,
@@ -178,6 +180,15 @@ pub(crate) fn identity_query_error(
             kind: kind.as_str().to_string(),
             message,
         },
+        // The ambient-AWS bucket allowlist is the `aws` host identity's own
+        // restriction: the same 403, naming its own switch.
+        E::AmbientBucketRefused { .. } => Q::HostIdentityRefused {
+            kind: fluree_db_iceberg::HostIdentityKind::Aws
+                .as_str()
+                .to_string(),
+            message,
+        },
+        E::SchemeNotServed { scheme, .. } => Q::StorageSchemeNotServed { scheme, message },
         E::CatalogQuotaProjectRequired { table } => {
             Q::CatalogQuotaProjectRequired { table, message }
         }
@@ -223,6 +234,12 @@ pub(crate) async fn catalog_client(
             ))
         }
         CatalogMode::Glue { catalog_id, .. } => {
+            // Glue is called with the host's own AWS chain: the `aws` host
+            // identity, which the instance's policy may refuse.
+            identity
+                .policy
+                .ensure(fluree_db_iceberg::HostIdentityKind::Aws)
+                .map_err(auth_provider_error)?;
             let region = conn.aws_catalog_region()?;
             let catalog = GlueSdkCatalogClient::new(region.as_deref(), catalog_id.clone())
                 .await
@@ -238,6 +255,10 @@ pub(crate) async fn catalog_client(
         CatalogMode::S3Tables {
             table_bucket_arn, ..
         } => {
+            identity
+                .policy
+                .ensure(fluree_db_iceberg::HostIdentityKind::Aws)
+                .map_err(auth_provider_error)?;
             let region = conn.aws_catalog_region()?;
             let catalog =
                 S3TablesSdkCatalogClient::new(region.as_deref(), table_bucket_arn.clone())
@@ -264,11 +285,12 @@ pub(crate) async fn catalog_client(
 pub(crate) async fn load_response_metadata(
     conn: &IcebergConnectionConfig,
     load: &mut LoadTableResponse,
+    identity: &IdentityContext,
 ) -> Result<TableMetadata> {
     if let Some(metadata) = load.metadata.take() {
         return Ok(metadata);
     }
-    let storage = build_preview_storage(conn, load.credentials.as_ref()).await?;
+    let storage = build_preview_storage(conn, load, identity).await?.backend;
     read_load_response_metadata(&storage, load).await
 }
 
@@ -289,25 +311,13 @@ pub(crate) async fn read_load_response_metadata(
         .map_err(|e| crate::ApiError::config(format!("Failed to parse table metadata: {e}")))
 }
 
-/// Browse an Iceberg catalog (REST, AWS Glue, or S3 Tables): list namespaces
-/// and, at `depth = Tables`, the tables in each namespace.
+/// Browse an Iceberg catalog (REST, AWS Glue, or S3 Tables) under `identity`:
+/// list namespaces and, at `depth = Tables`, the tables in each namespace.
 ///
-/// **Metadata-only** and stateless — it needs no `Fluree` instance and reads no
-/// S3 objects (Glue / S3 Tables list via their native SDK APIs). Direct catalog
-/// mode returns a clear [`crate::ApiError::Config`] (there is nothing to browse).
-///
-/// Builds the catalog's auth with the default identity context (every host
-/// identity allowed, the host's own AWS chain for WIF). An instance with a
-/// host-identity policy or an AWS subject governs this through the `Fluree`
-/// method of the same name.
-pub async fn browse_iceberg_catalog(
-    conn: IcebergConnectionConfig,
-    depth: BrowseDepth,
-) -> Result<CatalogBrowse> {
-    browse_iceberg_catalog_in(conn, depth, &IdentityContext::default()).await
-}
-
-/// [`browse_iceberg_catalog`] under `identity`.
+/// **Metadata-only** — it reads no S3 objects (Glue / S3 Tables list via their
+/// native SDK APIs). Direct catalog mode returns a clear
+/// [`crate::ApiError::Config`] (there is nothing to browse). Public as
+/// [`crate::Fluree::browse_iceberg_catalog`], under the instance's context.
 pub(crate) async fn browse_iceberg_catalog_in(
     conn: IcebergConnectionConfig,
     depth: BrowseDepth,
@@ -386,9 +396,9 @@ impl crate::Fluree {
         Ok(conn)
     }
 
-    /// Browse an Iceberg REST catalog (namespaces, and tables at
-    /// `depth = Tables`). Convenience wrapper over the stateless
-    /// [`browse_iceberg_catalog`] free function — browse needs no engine state.
+    /// Browse an Iceberg catalog (namespaces, and tables at `depth = Tables`),
+    /// under this instance's identity context: its host-identity policy, AWS
+    /// subject and secret resolver govern the catalog auth.
     pub async fn browse_iceberg_catalog(
         &self,
         conn: IcebergConnectionConfig,
@@ -803,27 +813,15 @@ fn preview_counts_are_upper_bounds(
 }
 
 /// Preview an Iceberg table's schema (Tier-A) and, at `tier = Stats`, its
-/// per-column statistics (Tier-B).
+/// per-column statistics (Tier-B), under `identity`.
 ///
 /// **Metadata-only**: Tier-A reads the table metadata JSON — inline from the
 /// REST `loadTable` response, or (for the AWS SDK catalogs, which return only a
 /// `metadata_location`) fetched + parsed from S3 — never a Parquet/data file.
 /// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files.
 /// Direct catalog mode returns a clear typed error (there is no catalog to load).
-///
-/// Builds the catalog's auth with the default identity context (every host
-/// identity allowed, the host's own AWS chain for WIF). An instance with a
-/// host-identity policy or an AWS subject governs this through the `Fluree`
-/// method of the same name.
-pub async fn preview_iceberg_table(
-    conn: IcebergConnectionConfig,
-    table: TableIdentifier,
-    tier: StatsTier,
-) -> Result<TablePreview> {
-    preview_iceberg_table_in(conn, table, tier, &IdentityContext::default()).await
-}
-
-/// [`preview_iceberg_table`] under `identity`.
+/// Public as [`crate::Fluree::preview_iceberg_table`], under the instance's
+/// context.
 pub(crate) async fn preview_iceberg_table_in(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
@@ -841,7 +839,7 @@ pub(crate) async fn preview_iceberg_table_in(
 
     // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
     // S3 Tables return only the location).
-    let metadata = &load_response_metadata(&conn, &mut load).await?;
+    let metadata = &load_response_metadata(&conn, &mut load, identity).await?;
 
     // W2: name BOTH the catalog-qualified table and its storage location, so an
     // operator grepping logs finds the same identifier the scan planners emit
@@ -892,10 +890,8 @@ pub(crate) async fn preview_iceberg_table_in(
                         ))
                     })?;
 
-                    // Build S3 storage from vended credentials (if the catalog
-                    // delegated them) or the ambient AWS chain — same policy as
-                    // the scan path.
-                    let storage = build_preview_storage(&conn, load.credentials.as_ref()).await?;
+                    // The source's storage decision — the scan path's.
+                    let storage = build_preview_storage(&conn, &load, identity).await?.backend;
 
                     // Metadata-only: reads the manifest-list + manifests, never
                     // a Parquet/data file (see fluree_db_iceberg::stats).
@@ -1096,6 +1092,10 @@ pub(crate) fn storage_api_error(
                 message,
             })
         }
+        // §2 fail-closed: the catalog vended nothing for a source that requires it.
+        fluree_db_iceberg::IcebergError::CatalogCredentialsNotVended { catalog_uri } => {
+            crate::ApiError::CatalogCredentialsNotVended { catalog_uri }
+        }
         other => match identity_query_error(other) {
             Ok(typed) => crate::ApiError::Query(typed),
             Err(other) => crate::ApiError::config(format!("{context}: {other}")),
@@ -1103,117 +1103,33 @@ pub(crate) fn storage_api_error(
     }
 }
 
-/// Which credential source a scan/preview should use, given the source's
-/// `vended_credentials` flag, whether the catalog actually vended credentials,
-/// and whether this is a REST catalog. See [`decide_credential_source`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CredentialSource {
-    /// Use the catalog-vended credentials (they are present).
-    Vended,
-    /// Use the ambient AWS credential chain (explicit `vended_credentials =
-    /// false` opt-in, or Direct mode which never vends).
-    Ambient,
-    /// Refuse: the REST source requires vending but the catalog vended none.
-    FailClosed,
-}
-
-/// §2 credential-source decision — the single source of truth for the scan and
-/// preview paths, factored out so the full matrix is unit-testable.
-///
-/// | `vended_credentials` | vended creds present | REST | decision |
-/// |----------------------|----------------------|------|----------|
-/// | any                  | yes                  | any  | `Vended` (response-driven) |
-/// | true                 | no                   | yes  | `FailClosed` |
-/// | true                 | no                   | no (Direct) | `Ambient` (Direct never vends) |
-/// | false                | no                   | any  | `Ambient` (explicit opt-in) |
-///
-/// The `(false, present)` case stays `Vended` to preserve today's
-/// response-driven behavior: `vended_credentials = false` suppresses the
-/// delegation request, so credentials should not arrive — but if a catalog vends
-/// them anyway, using them (rather than ignoring them) matches prior behavior.
-pub(crate) fn decide_credential_source(
-    vended_credentials_cfg: bool,
-    has_vended_creds: bool,
-    is_rest_catalog: bool,
-) -> CredentialSource {
-    if has_vended_creds {
-        CredentialSource::Vended
-    } else if vended_credentials_cfg && is_rest_catalog {
-        CredentialSource::FailClosed
-    } else {
-        CredentialSource::Ambient
-    }
-}
-
-/// Build S3 storage for reading manifests during a Tier-B preview, mirroring the
-/// scan path's policy via [`decide_credential_source`]: vended credentials when
-/// the catalog delegated them, otherwise — for `vended_credentials = false` or
-/// Direct mode — the ambient AWS credential chain.
-///
-/// §2 fail-closed: a REST source configured to require vended credentials
-/// (`io.vended_credentials = true`, the default) must NOT silently downgrade to
-/// ambient credentials when the catalog vended none — that would read from
-/// whatever ambient identity the process happens to have. Direct mode never
-/// vends (it sends no delegation request), so it is exempt.
+/// The storage an onboarding read (preview, verify, sample, a provisional
+/// query) of `load`'s table uses: the same decision the query path makes
+/// ([`crate::graph_source::storage`]), under `identity`. §2 fail-closed
+/// included: a REST source that requires vended credentials, whose catalog
+/// vended none, is refused (`err:catalog/CredentialsNotVended`) rather than
+/// probed with the host's identity.
 pub(crate) async fn build_preview_storage(
     conn: &IcebergConnectionConfig,
-    credentials: Option<&fluree_db_iceberg::credential::VendedCredentials>,
-) -> Result<IcebergStorageBackend> {
-    // A local (`file://` / absolute-path) Direct table reads the filesystem —
-    // no SDK client, no credential decision to make.
-    if let CatalogMode::Direct { table_location } = &conn.catalog_mode {
-        if FileIcebergStorage::is_local_location(table_location) {
-            return Ok(IcebergStorageBackend::File(FileIcebergStorage::new()));
+    load: &LoadTableResponse,
+    identity: &IdentityContext,
+) -> Result<ResolvedStorage> {
+    let catalog = connection_catalog(conn);
+    let (location, grant) = match &catalog {
+        CatalogConfig::Direct { table_location } => {
+            (table_location.clone(), CatalogGrant::direct())
         }
-    }
-    // Glue / S3 Tables read S3 in the catalog's region unless `s3_region` says
-    // otherwise (see `IoConfig::with_catalog_region`).
-    let io = &conn.storage_io();
-    let is_rest = matches!(conn.catalog_mode, CatalogMode::Rest(_));
-    let storage =
-        match decide_credential_source(io.vended_credentials, credentials.is_some(), is_rest) {
-            CredentialSource::Vended => {
-                let creds = credentials.expect("Vended decision implies credentials are present");
-                let fluree_db_iceberg::credential::VendedCredentials::S3(creds) = creds else {
-                    return Err(crate::ApiError::config(
-                        "the catalog vended a GCS token; this read path builds S3 storage only",
-                    ));
-                };
-                S3IcebergStorage::from_vended_credentials(
-                    creds,
-                    io.s3_region.as_deref(),
-                    io.s3_endpoint.as_deref(),
-                    io.s3_path_style,
-                )
-                .await
-            }
-            CredentialSource::Ambient =>
-            {
-                #[allow(deprecated)]
-                S3IcebergStorage::from_default_chain(
-                    io.s3_region.as_deref(),
-                    io.s3_endpoint.as_deref(),
-                    io.s3_path_style,
-                )
-                .await
-            }
-            CredentialSource::FailClosed => {
-                // FailClosed only arises for a REST catalog (see the decision table),
-                // so this destructure always matches.
-                let catalog_uri = match &conn.catalog_mode {
-                    CatalogMode::Rest(rest) => rest.catalog_uri.clone(),
-                    CatalogMode::Direct { .. }
-                    | CatalogMode::Glue { .. }
-                    | CatalogMode::S3Tables { .. } => {
-                        unreachable!("FailClosed is only produced for REST catalogs")
-                    }
-                };
-                return Err(crate::ApiError::CatalogCredentialsNotVended { catalog_uri });
-            }
-        };
-    storage
-        .map(IcebergStorageBackend::S3)
-        .map_err(|e| crate::ApiError::config(format!("Failed to create S3 storage: {e}")))
+        _ => (
+            load.metadata_location.clone(),
+            CatalogGrant::from_load(load, None),
+        ),
+    };
+    let plan = plan_storage(&catalog, &conn.storage_io(), &location, identity)
+        .await
+        .map_err(|e| storage_api_error("Failed to decide storage", e))?;
+    plan.build(&grant)
+        .await
+        .map_err(|e| storage_api_error("Failed to create storage", e))
 }
 
 /// Map an iceberg-crate [`AggregatedColumnStats`] onto the API [`ColumnStats`].
@@ -1233,8 +1149,7 @@ fn to_api_column_stats(a: &AggregatedColumnStats) -> ColumnStats {
 
 impl crate::Fluree {
     /// Preview an Iceberg table's schema (Tier-A) and optionally its per-column
-    /// statistics (Tier-B). Convenience wrapper over the stateless
-    /// [`preview_iceberg_table`] free function.
+    /// statistics (Tier-B), under this instance's identity context.
     pub async fn preview_iceberg_table(
         &self,
         conn: IcebergConnectionConfig,
@@ -1454,21 +1369,9 @@ fn parse_qualified_table(table: &str) -> TableIdentifier {
 /// queries use.
 ///
 /// Catalog modes only (REST, Glue, S3 Tables): Direct mode returns the same clear
-/// typed error as [`preview_iceberg_table`] (there is no catalog to authorize the
-/// read).
-///
-/// Builds the catalog's auth with the default identity context (every host
-/// identity allowed, the host's own AWS chain for WIF). An instance with a
-/// host-identity policy or an AWS subject governs this through the `Fluree`
-/// method of the same name.
-pub async fn verify_storage_access(
-    conn: IcebergConnectionConfig,
-    table: &str,
-) -> Result<StorageAccessReport> {
-    verify_storage_access_in(conn, table, &IdentityContext::default()).await
-}
-
-/// [`verify_storage_access`] under `identity`.
+/// typed error as [`preview_iceberg_table_in`] (there is no catalog to authorize
+/// the read). Public as [`crate::Fluree::verify_iceberg_storage_access`], under
+/// the instance's context.
 pub(crate) async fn verify_storage_access_in(
     conn: IcebergConnectionConfig,
     table: &str,
@@ -1498,14 +1401,9 @@ pub(crate) async fn verify_storage_access_in(
     // whose catalog vended none is refused (ApiError::CatalogCredentialsNotVended)
     // rather than silently probing with ambient credentials — which is exactly the
     // "validated on a different credential path than queries use" bug this guards.
-    let storage = match build_preview_storage(&conn, load.credentials.as_ref()).await {
-        Ok(storage) => storage,
+    let (storage, credential_source) = match build_preview_storage(&conn, &load, identity).await {
+        Ok(resolved) => (resolved.backend, resolved.decision.source_name()),
         Err(e) => return storage_failure(e, load.metadata_location),
-    };
-    let credential_source = if load.credentials.is_some() {
-        "vended"
-    } else {
-        "ambient"
     };
 
     // The current snapshot comes from the inline `loadTable` metadata, or (Glue /
@@ -1558,8 +1456,8 @@ pub(crate) async fn verify_storage_access_in(
 
 impl crate::Fluree {
     /// Verify that a connection's resolved credentials can read an Iceberg table's
-    /// storage (the onboarding "Test" probe). Resolver-aware wrapper over
-    /// [`verify_storage_access`]: hydrates any `SecretRef` catalog auth via this
+    /// storage (the onboarding "Test" probe). Hydrates any `SecretRef` catalog
+    /// auth via this
     /// instance's secret resolver FIRST (mirroring the browse/preview wrappers),
     /// then runs the probe through the engine's own credential + storage path.
     pub async fn verify_iceberg_storage_access(
@@ -1670,61 +1568,15 @@ mod tests {
 
     use super::*;
 
-    // ── §2 credential-source decision (pure; the full matrix) ──
-
-    #[test]
-    fn creds_present_always_vended() {
-        // Response-driven: if the catalog vended credentials, use them —
-        // regardless of the flag or catalog kind.
-        for &cfg in &[true, false] {
-            for &rest in &[true, false] {
-                assert_eq!(
-                    decide_credential_source(cfg, true, rest),
-                    CredentialSource::Vended,
-                    "cfg={cfg} rest={rest}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rest_requires_vending_fails_closed_when_none() {
-        // vended_credentials = true (default) + REST + no creds → refuse.
-        assert_eq!(
-            decide_credential_source(true, false, true),
-            CredentialSource::FailClosed
-        );
-    }
-
-    #[test]
-    fn direct_mode_never_fails_closed() {
-        // Direct never vends; vended_credentials = true must NOT start failing —
-        // it uses the ambient chain (item 8).
-        assert_eq!(
-            decide_credential_source(true, false, false),
-            CredentialSource::Ambient
-        );
-    }
-
-    #[test]
-    fn explicit_opt_in_uses_ambient() {
-        // vended_credentials = false + no creds → ambient (both catalog kinds).
-        assert_eq!(
-            decide_credential_source(false, false, true),
-            CredentialSource::Ambient
-        );
-        assert_eq!(
-            decide_credential_source(false, false, false),
-            CredentialSource::Ambient
-        );
-    }
+    // The §2 credential-source decision matrix lives with the decision itself,
+    // in `graph_source::storage` (its tests).
 
     #[tokio::test]
     async fn browse_direct_mode_errors() {
         // Direct mode has no catalog to browse — must return a clear typed error
         // without any network access.
         let conn = IcebergConnectionConfig::direct("s3://bucket/warehouse/ns/table");
-        let err = browse_iceberg_catalog(conn, BrowseDepth::Tables)
+        let err = browse_iceberg_catalog_in(conn, BrowseDepth::Tables, &IdentityContext::default())
             .await
             .expect_err("Direct mode must not be browsable");
         let msg = err.to_string();
@@ -1922,10 +1774,14 @@ mod tests {
     #[tokio::test]
     async fn preview_direct_mode_errors() {
         let conn = IcebergConnectionConfig::direct("s3://bucket/warehouse/ns/table");
-        let err =
-            preview_iceberg_table(conn, TableIdentifier::new("ns", "table"), StatsTier::Schema)
-                .await
-                .expect_err("Direct mode must not be previewable");
+        let err = preview_iceberg_table_in(
+            conn,
+            TableIdentifier::new("ns", "table"),
+            StatsTier::Schema,
+            &IdentityContext::default(),
+        )
+        .await
+        .expect_err("Direct mode must not be previewable");
         assert!(err.to_string().contains("Direct catalog mode"));
     }
 
@@ -2447,7 +2303,7 @@ mod tests {
         // Direct mode has no catalog to authorize the read — mirror preview and
         // reject with a clear typed error, without any network access.
         let conn = IcebergConnectionConfig::direct("s3://bucket/warehouse/ns/table");
-        let err = verify_storage_access(conn, "ns.table")
+        let err = verify_storage_access_in(conn, "ns.table", &IdentityContext::default())
             .await
             .expect_err("Direct mode must not be verifiable");
         assert!(

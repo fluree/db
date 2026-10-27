@@ -173,6 +173,17 @@ pub enum QueryError {
         message: String,
     },
 
+    /// The source's storage identity does not serve this path's scheme (an
+    /// AWS identity asked for `gs://` without a GCS interop endpoint, a Google
+    /// identity asked for `s3://`). Refused, never re-routed.
+    #[error("{message}")]
+    StorageSchemeNotServed {
+        /// The refused path's scheme (`s3`, `gs`, `file`, …).
+        scheme: String,
+        /// The rendered refusal, naming the path and the identity.
+        message: String,
+    },
+
     /// The catalog authorized the table but vended no storage credentials while
     /// the source requires them (`vended_credentials = true`).
     ///

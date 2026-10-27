@@ -791,6 +791,7 @@ impl ApiError {
                     google_token_exchange_status(*status)
                 }
                 fluree_db_iceberg::IcebergError::HostIdentityRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientBucketRefused { .. }
                 | fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => 403,
                 _ => 400,
             },
@@ -902,6 +903,7 @@ impl ApiError {
             ApiError::Query(e) => match e {
                 QE::Cancelled { .. } => errors::QUERY_CANCELLED,
                 QE::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
+                QE::StorageSchemeNotServed { .. } => errors::STORAGE_SCHEME_NOT_SERVED,
                 QE::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
                 QE::CatalogAccessDenied { .. } => errors::CATALOG_ACCESS_DENIED,
                 QE::CatalogQuotaProjectRequired { .. } => errors::CATALOG_QUOTA_PROJECT_REQUIRED,
@@ -970,8 +972,12 @@ impl ApiError {
                 fluree_db_iceberg::IcebergError::GoogleCredentialsInvalid(_) => {
                     errors::GOOGLE_CREDENTIALS_INVALID
                 }
-                fluree_db_iceberg::IcebergError::HostIdentityRefused { .. } => {
+                fluree_db_iceberg::IcebergError::HostIdentityRefused { .. }
+                | fluree_db_iceberg::IcebergError::AmbientBucketRefused { .. } => {
                     errors::HOST_IDENTITY_REFUSED
+                }
+                fluree_db_iceberg::IcebergError::SchemeNotServed { .. } => {
+                    errors::STORAGE_SCHEME_NOT_SERVED
                 }
                 fluree_db_iceberg::IcebergError::CatalogQuotaProjectRequired { .. } => {
                     errors::CATALOG_QUOTA_PROJECT_REQUIRED
@@ -1047,6 +1053,9 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         QE::GoogleTokenExchange { status, .. } => google_token_exchange_status(*status),
         // Registration-time configuration the caller supplied.
         QE::GoogleCredentialsInvalid(_) => 400,
+        // The source's storage identity cannot serve the path: its
+        // configuration, not a transient fault.
+        QE::StorageSchemeNotServed { .. } => 400,
         // Engine and storage faults no change to the query can clear.
         QE::Core(_)
         | QE::OperatorNotOpened
