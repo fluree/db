@@ -1608,3 +1608,174 @@ async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
         );
     }
 }
+
+/// BigQuery writes a snapshot summary of only `{"operation": "overwrite"}`, so
+/// the summary has no delete counters for the zero-I/O guard to read. A
+/// merge-on-read delete manifest in such a snapshot's manifest list must still
+/// refuse every read that would return rows (the scan, a `COUNT(*)`, a
+/// materialize read) with the merge-on-read refusal, never return the rows the
+/// delete files remove.
+///
+/// The staged table is the `people` fixture with its current snapshot's summary
+/// replaced by BigQuery's and its manifest list replaced by the same list plus
+/// one delete manifest (`content = 1`), which does not exist: refusing must not
+/// need to read it. The control is the same summary over the original list.
+#[tokio::test]
+async fn a_delete_manifest_a_bigquery_summary_does_not_report_refuses_every_read() {
+    use apache_avro::types::Value as AvroValue;
+
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let stage = |name: &str, with_delete_manifest: bool| -> String {
+        let table_dir = staging.path().join(name);
+        copy_dir_all(&fixtures_dir().join("silver/people"), &table_dir);
+        let metadata_dir = table_dir.join("metadata");
+        let mut metadata_files: Vec<std::path::PathBuf> = std::fs::read_dir(&metadata_dir)
+            .expect("metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .collect();
+        metadata_files.sort();
+        let newest = metadata_files.last().expect("a metadata file").clone();
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&newest).expect("read metadata"))
+                .expect("parse metadata");
+        let current = meta["current-snapshot-id"].clone();
+        let snapshot = meta["snapshots"]
+            .as_array_mut()
+            .expect("snapshots")
+            .iter_mut()
+            .find(|s| s["snapshot-id"] == current)
+            .expect("current snapshot");
+        snapshot["summary"] = serde_json::json!({"operation": "overwrite"});
+        if with_delete_manifest {
+            // The list, as written: the fixture's `file:///tmp/...` path, which
+            // the provider remaps onto the staged location.
+            let list_ref = snapshot["manifest-list"]
+                .as_str()
+                .expect("list")
+                .to_string();
+            let list_name = list_ref.rsplit('/').next().expect("list file name");
+            let original = std::fs::read(metadata_dir.join(list_name)).expect("read list");
+            let reader = apache_avro::Reader::new(&original[..]).expect("avro list");
+            let schema = reader.writer_schema().clone();
+            let records: Vec<AvroValue> = reader.map(|r| r.expect("record")).collect();
+            let AvroValue::Record(data) = records[0].clone() else {
+                panic!("a manifest_file record");
+            };
+            let delete: Vec<(String, AvroValue)> = data
+                .into_iter()
+                .map(|(k, v)| match k.as_str() {
+                    "manifest_path" => {
+                        let AvroValue::String(p) = v else {
+                            panic!("manifest_path")
+                        };
+                        (k, AvroValue::String(p.replace(".avro", "-deletes.avro")))
+                    }
+                    "content" => (k, AvroValue::Int(1)),
+                    _ => (k, v),
+                })
+                .collect();
+            let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+            for record in records {
+                writer.append(record).expect("copy a record");
+            }
+            writer
+                .append(AvroValue::Record(delete))
+                .expect("add the delete manifest");
+            let with_deletes = "snap-with-delete-manifest.avro";
+            std::fs::write(
+                metadata_dir.join(with_deletes),
+                writer.into_inner().expect("avro bytes"),
+            )
+            .expect("write list");
+            snapshot["manifest-list"] =
+                serde_json::json!(list_ref.replace(list_name, with_deletes));
+        }
+        std::fs::write(&newest, serde_json::to_vec(&meta).expect("metadata json"))
+            .expect("write metadata");
+        format!("file://{}", table_dir.display())
+    };
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let query = |gs: &str| {
+        serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": gs,
+            "select": ["?name"],
+            "where": {"@id": "?s", "ex:name": "?name"},
+        })
+    };
+    let count = |gs: &str| {
+        serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": gs,
+            "select": ["(count ?s)"],
+            "where": {"@id": "?s", "@type": "ex:Person"},
+        })
+    };
+    let refused = |result: Result<serde_json::Value, ApiError>, what: &str| {
+        let err = result.expect_err(what);
+        assert!(
+            err.to_string()
+                .contains("Merge-on-read deletes not applied"),
+            "{what}: {err}"
+        );
+    };
+
+    // Control: BigQuery's summary over a list with no delete manifest reads.
+    let clean = stage("clean", false);
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("bq-clean", &clean, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("register the clean table");
+    let rows = fluree
+        .query_from()
+        .jsonld(&query("bq-clean:main"))
+        .execute_formatted()
+        .await
+        .expect("the clean table reads");
+    assert_eq!(rows.as_array().expect("rows").len(), 5);
+
+    // The delete manifest refuses each read, though the summary says nothing.
+    let mor = stage("mor", true);
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("bq-mor", &mor, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("register the table (registration reads no data)");
+    refused(
+        fluree
+            .query_from()
+            .jsonld(&query("bq-mor:main"))
+            .execute_formatted()
+            .await,
+        "the scan",
+    );
+    refused(
+        fluree
+            .query_from()
+            .jsonld(&count("bq-mor:main"))
+            .execute_formatted()
+            .await,
+        "COUNT(*)",
+    );
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    match provider
+        .scan_for_materialize_stream("bq-mor:main", "silver.people", &[], None, None, None)
+        .await
+    {
+        Ok(_) => panic!("a materialize read must be refused"),
+        Err(err) => assert!(
+            err.to_string()
+                .contains("Merge-on-read deletes not applied"),
+            "materialize: {err}"
+        ),
+    }
+}
