@@ -189,7 +189,11 @@ async fn iceberg_map_without_a_mapping_is_a_400_and_stores_nothing() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
-    assert!(text.contains("missing field `r2rml`"), "{text}");
+    assert!(
+        text.contains("an R2RML mapping is required: send `r2rml`"),
+        "{text}"
+    );
+    assert!(!text.contains("Invalid JSON"), "{text}");
     assert!(
         state
             .fluree

@@ -37,8 +37,10 @@ pub struct IcebergMapRequest {
     /// AWS S3 Tables table-bucket ARN (s3tables mode)
     pub table_bucket_arn: Option<String>,
     /// Inline R2RML mapping content (required): a source is queried through
-    /// its mapping, which also names its tables.
-    pub r2rml: String,
+    /// its mapping, which also names its tables. Optional here only so a
+    /// request without it is refused by [`required_mapping`], in words, rather
+    /// than by the JSON parser.
+    pub r2rml: Option<String>,
     /// R2RML mapping media type
     pub r2rml_type: Option<String>,
     /// Branch name
@@ -165,12 +167,13 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
             req.s3_endpoint.as_deref(),
         )?;
 
+        let mapping = required_mapping(&req)?;
         let fluree = &state.fluree;
         let iceberg_config = build_iceberg_config(&req)?;
 
         let config = fluree_db_api::R2rmlCreateConfig {
             iceberg: iceberg_config,
-            mapping: fluree_db_api::R2rmlMappingInput::Content(req.r2rml.clone()),
+            mapping: fluree_db_api::R2rmlMappingInput::Content(mapping.to_string()),
             mapping_media_type: req.r2rml_type.clone(),
         };
         let result = fluree
@@ -648,6 +651,19 @@ fn given_rest_only(fields: &[(&'static str, bool)]) -> Vec<&'static str> {
         .iter()
         .filter_map(|&(name, given)| given.then_some(name))
         .collect()
+}
+
+/// The request's R2RML mapping, which every Iceberg source needs: its queries
+/// are answered from it. A missing or blank one is a 400 that says so.
+fn required_mapping(req: &IcebergMapRequest) -> Result<&str> {
+    req.r2rml
+        .as_deref()
+        .filter(|mapping| !mapping.trim().is_empty())
+        .ok_or_else(|| {
+            ServerError::bad_request(
+                "an R2RML mapping is required: send `r2rml`, the mapping's Turtle content",
+            )
+        })
 }
 
 fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
@@ -1615,14 +1631,19 @@ mod tests {
         assert!(config.connection.is_glue());
         config.validate().unwrap();
 
-        // A request without a mapping is not a map request at all: the
-        // mapping is what a source's queries are answered from.
-        let body = serde_json::json!({ "name": "orders", "mode": "glue", "table": "db.t" });
-        let err = serde_json::from_value::<IcebergMapRequest>(body)
-            .err()
-            .expect("a map request needs r2rml")
-            .to_string();
-        assert!(err.contains("missing field `r2rml`"), "{err}");
+        // A request without a mapping, or with a blank one, is refused in
+        // words: the mapping is what a source's queries are answered from.
+        for body in [
+            serde_json::json!({ "name": "orders", "mode": "glue", "table": "db.t" }),
+            serde_json::json!({ "name": "orders", "mode": "glue", "table": "db.t", "r2rml": "  " }),
+        ] {
+            let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+            let err = required_mapping(&req).unwrap_err().to_string();
+            assert!(
+                err.contains("an R2RML mapping is required: send `r2rml`"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
