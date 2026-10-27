@@ -802,6 +802,22 @@ pub fn default_storage_auth(warehouse: Option<&str>) -> Option<StorageAuth> {
     }
 }
 
+/// The Google Cloud project a BigLake `warehouse` names
+/// (`bq://projects/<P>/…` or `bl://projects/<P>/…`), which a surface defaults
+/// a Google catalog identity's quota project to when the caller names none:
+/// BigLake bills every request, whatever the identity, to the project named
+/// in `x-goog-user-project`, and refuses one that names none. Only the CLI
+/// and Python call this; the engine and the HTTP routes never infer a quota
+/// project. It bills the catalog only, never storage reads.
+pub fn default_google_quota_project(warehouse: Option<&str>) -> Option<String> {
+    let warehouse = warehouse?;
+    let rest = warehouse
+        .strip_prefix("bq://")
+        .or_else(|| warehouse.strip_prefix("bl://"))?;
+    let project = rest.strip_prefix("projects/")?.split('/').next()?;
+    (!project.is_empty()).then(|| project.to_string())
+}
+
 // =============================================================================
 // Iceberg
 // =============================================================================

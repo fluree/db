@@ -242,9 +242,9 @@ pub use surface::sql_auth_from_json;
 pub use surface::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
 #[cfg(feature = "iceberg")]
 pub use surface::{
-    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, secret_field,
-    AuthProfile, CatalogAuthFields, GraphSourceInputError, IcebergConnectionFields, InputErrorKind,
-    SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
+    default_google_quota_project, default_storage_auth, iceberg_connection_from_json,
+    iceberg_create_from_json, secret_field, AuthProfile, CatalogAuthFields, GraphSourceInputError,
+    IcebergConnectionFields, InputErrorKind, SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
 };
 
 #[cfg(feature = "sql")]
