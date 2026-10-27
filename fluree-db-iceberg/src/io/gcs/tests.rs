@@ -409,6 +409,38 @@ fn a_store_that_names_no_valid_project_is_refused() {
     );
 }
 
+/// A store keeps one client per bucket it reads, reused, and at most
+/// [`MAX_BUCKET_CLIENTS`] of them: the least recently used is dropped (and
+/// rebuilt if read again).
+#[test]
+fn a_store_keeps_a_bounded_set_of_bucket_clients() {
+    let source = TokenSource::Vended(Arc::new(RenewingVendedCredentials::new(
+        VendedCredentials::Gcs(GcsCredentials {
+            token: "t".to_string(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            user_project: None,
+        }),
+        None,
+    )));
+    let storage = GcsIcebergStorage::build(source, None, "http://127.0.0.1:9").unwrap();
+    let first = storage.store("bucket-0").unwrap();
+    assert!(Arc::ptr_eq(&first, &storage.store("bucket-0").unwrap()));
+    for i in 1..=MAX_BUCKET_CLIENTS {
+        storage.store(&format!("bucket-{i}")).unwrap();
+    }
+    let held = storage
+        .inner
+        .stores
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len();
+    assert_eq!(held, MAX_BUCKET_CLIENTS);
+    assert!(
+        !Arc::ptr_eq(&first, &storage.store("bucket-0").unwrap()),
+        "the least recently used client was dropped"
+    );
+}
+
 // ── vended tokens renewed inside the store ──
 
 /// A vended-token GCS: accepts `t1` until `t1` expires, `t2` always, and

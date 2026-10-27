@@ -23,7 +23,6 @@
 //!   other), and a ranged read must come back as exactly that range (206 with a
 //!   matching `Content-Range`): `object_store` refuses anything else.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -152,8 +151,14 @@ struct Inner {
     source: TokenSource,
     user_project: Option<String>,
     endpoint: String,
-    stores: Mutex<HashMap<String, Arc<GoogleCloudStorage>>>,
+    /// One client per bucket, least recently used evicted past
+    /// [`MAX_BUCKET_CLIENTS`]: a table whose manifests name many buckets must
+    /// not grow a store's memory (and its connection pools) without bound.
+    stores: Mutex<lru::LruCache<String, Arc<GoogleCloudStorage>>>,
 }
+
+/// How many per-bucket clients one store keeps.
+const MAX_BUCKET_CLIENTS: usize = 64;
 
 impl std::fmt::Debug for GcsIcebergStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -206,7 +211,9 @@ impl GcsIcebergStorage {
                 source,
                 user_project,
                 endpoint: endpoint.to_string(),
-                stores: Mutex::new(HashMap::new()),
+                stores: Mutex::new(lru::LruCache::new(
+                    std::num::NonZeroUsize::new(MAX_BUCKET_CLIENTS).expect("non-zero"),
+                )),
             }),
         })
     }
@@ -274,7 +281,7 @@ impl GcsIcebergStorage {
             Arc::new(builder.with_client_options(options).build().map_err(|e| {
                 IcebergError::storage(format!("Failed to build the GCS client: {e}"))
             })?);
-        stores.insert(bucket.to_string(), Arc::clone(&store));
+        stores.put(bucket.to_string(), Arc::clone(&store));
         Ok(store)
     }
 
