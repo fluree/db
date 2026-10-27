@@ -63,6 +63,8 @@ pub enum InputErrorKind {
     Incomplete { needs: Vec<String> },
     /// Says the same thing as `other`, or something it contradicts.
     Conflict { other: String },
+    /// A second way to authenticate (or a second credential), beside `other`.
+    TwoWays { other: String },
     /// Names environment variable `name`, which the operator does not list in
     /// [`SECRET_ENV_VARS_ENV`].
     EnvNotAllowed { name: String },
@@ -82,14 +84,14 @@ pub enum InputErrorKind {
 }
 
 impl GraphSourceInputError {
-    pub(crate) fn new(field: impl Into<String>, kind: InputErrorKind) -> Self {
+    pub fn new(field: impl Into<String>, kind: InputErrorKind) -> Self {
         Self {
             field: field.into(),
             kind,
         }
     }
 
-    pub(crate) fn invalid(field: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn invalid(field: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::new(
             field,
             InputErrorKind::Invalid {
@@ -98,7 +100,7 @@ impl GraphSourceInputError {
         )
     }
 
-    pub(crate) fn incomplete(field: impl Into<String>, needs: &[&str]) -> Self {
+    pub fn incomplete(field: impl Into<String>, needs: &[&str]) -> Self {
         Self::new(
             field,
             InputErrorKind::Incomplete {
@@ -107,10 +109,19 @@ impl GraphSourceInputError {
         )
     }
 
-    pub(crate) fn conflict(field: impl Into<String>, other: impl Into<String>) -> Self {
+    pub fn conflict(field: impl Into<String>, other: impl Into<String>) -> Self {
         Self::new(
             field,
             InputErrorKind::Conflict {
+                other: other.into(),
+            },
+        )
+    }
+
+    fn two_ways(field: impl Into<String>, other: impl Into<String>) -> Self {
+        Self::new(
+            field,
+            InputErrorKind::TwoWays {
                 other: other.into(),
             },
         )
@@ -136,6 +147,10 @@ impl GraphSourceInputError {
             ),
             InputErrorKind::Conflict { other } => format!(
                 "{field} and {} say the same thing two ways, or contradict each other: give one",
+                spell(other)
+            ),
+            InputErrorKind::TwoWays { other } => format!(
+                "{field} and {} are two ways to authenticate: give one",
                 spell(other)
             ),
             InputErrorKind::EnvNotAllowed { name } => format!(
@@ -236,10 +251,20 @@ impl SecretRules {
     }
 
     fn check(&self, path: &str, field: &ConfigValueField<'_>) -> Result<(), GraphSourceInputError> {
+        self.check_value(path, field.value, field.class)
+    }
+
+    /// Check one value at `path`: a flat field's own name, or a stored path.
+    pub fn check_value(
+        &self,
+        path: &str,
+        value: &ConfigValue,
+        class: ValueClass,
+    ) -> Result<(), GraphSourceInputError> {
         use InputErrorKind as K;
         let refuse = |kind| Err(GraphSourceInputError::new(path, kind));
-        match field.value {
-            ConfigValue::Literal(_) if field.class == ValueClass::ServiceAccountKey => {
+        match value {
+            ConfigValue::Literal(_) if class == ValueClass::ServiceAccountKey => {
                 refuse(K::LiteralKey)
             }
             ConfigValue::Literal(_) => Ok(()),
@@ -511,6 +536,24 @@ const GOOGLE_SOURCES: [&str; 4] = [
 ];
 
 impl CatalogAuthFields {
+    /// Check each value under the field it came from (`auth_bearer_env`
+    /// rather than `catalog.auth.token`), so a refusal names what the caller
+    /// sent.
+    pub fn check(&self, rules: &SecretRules) -> Result<(), GraphSourceInputError> {
+        for (field, value) in [&self.bearer, &self.oauth2_client_secret]
+            .into_iter()
+            .flatten()
+        {
+            rules.check_value(field, value, ValueClass::Secret)?;
+        }
+        for (field, credentials) in &self.google {
+            for value in credentials.config_values() {
+                rules.check_value(field, value.value, value.class)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every field given, in a fixed order: for a mode that takes no catalog
     /// auth to refuse rather than ignore.
     pub fn given(&self) -> Vec<&'static str> {
@@ -565,7 +608,7 @@ impl CatalogAuthFields {
         .flatten()
         .collect();
         if let [first, second, ..] = modes.as_slice() {
-            return Err(GraphSourceInputError::conflict(*second, *first));
+            return Err(GraphSourceInputError::two_ways(*second, *first));
         }
 
         if let Some((_, token)) = self.bearer {
@@ -644,7 +687,7 @@ impl CatalogAuthFields {
             ));
         }
         if self.google.len() > 1 {
-            return Err(GraphSourceInputError::conflict(
+            return Err(GraphSourceInputError::two_ways(
                 self.google[1].0,
                 self.google[0].0,
             ));
@@ -720,7 +763,7 @@ impl StorageAuthFields {
         };
         debug_assert_eq!(identity, "google");
         if self.google.len() > 1 {
-            return Err(GraphSourceInputError::conflict(
+            return Err(GraphSourceInputError::two_ways(
                 self.google[1].0,
                 self.google[0].0,
             ));
@@ -809,7 +852,7 @@ pub fn iceberg_connection_from_json(
                 .ok_or_else(|| GraphSourceInputError::incomplete("io", &["catalog"]))?;
             structured_iceberg(catalog, Form::take(&mut parts, "io"))?
         }
-        Form::Flat(input) => flat_iceberg(strict("", Value::Object(input))?)?,
+        Form::Flat(input) => flat_iceberg(strict("", Value::Object(input))?, rules)?,
     };
     rules.check_iceberg(&conn)?;
     Ok(conn)
@@ -879,6 +922,7 @@ fn structured_iceberg(
 
 fn flat_iceberg(
     flat: FlatIcebergConnection,
+    rules: &SecretRules,
 ) -> Result<IcebergConnectionConfig, GraphSourceInputError> {
     let auth = CatalogAuthFields {
         bearer: secret_field(
@@ -919,6 +963,7 @@ fn flat_iceberg(
         rest_only: &rest_only,
     })?;
     if conn.is_rest() {
+        auth.check(rules)?;
         conn = conn.with_auth(auth.into_auth(AuthProfile::Catalog)?);
         if let Some(warehouse) = flat.warehouse {
             conn = conn.with_warehouse(warehouse);
@@ -972,7 +1017,7 @@ pub fn sql_auth_from_json(
         }
         Form::Flat(input) => {
             let flat: FlatSqlAuth = strict("", Value::Object(input))?;
-            CatalogAuthFields {
+            let auth = CatalogAuthFields {
                 bearer: secret_field(
                     "auth_bearer",
                     flat.auth_bearer,
@@ -990,8 +1035,9 @@ pub fn sql_auth_from_json(
                 oauth2_scope: flat.oauth2_scope,
                 oauth2_audience: flat.oauth2_audience,
                 ..CatalogAuthFields::default()
-            }
-            .into_auth(AuthProfile::Catalog)?
+            };
+            auth.check(rules)?;
+            auth.into_auth(AuthProfile::Catalog)?
         }
     };
     rules.check_auth("auth", &auth)?;
@@ -1078,12 +1124,12 @@ pub fn delta_connection_from_json(
         Form::Flat(input) if reads_storage => {
             let flat: FlatDelta = strict("", Value::Object(input))?;
             DeltaConnection {
-                unity: flat_unity(flat.unity)?,
-                io: flat_delta_io(flat.io)?,
+                unity: flat_unity(flat.unity, rules)?,
+                io: flat_delta_io(flat.io, rules)?,
             }
         }
         Form::Flat(input) => DeltaConnection {
-            unity: flat_unity(strict("", Value::Object(input))?)?,
+            unity: flat_unity(strict("", Value::Object(input))?, rules)?,
             io: Default::default(),
         },
     };
@@ -1099,6 +1145,7 @@ pub fn delta_connection_from_json(
 #[cfg(feature = "delta")]
 fn flat_unity(
     flat: FlatUnity,
+    rules: &SecretRules,
 ) -> Result<Option<fluree_db_delta::UnityConfig>, GraphSourceInputError> {
     let auth = CatalogAuthFields {
         bearer: secret_field(
@@ -1118,6 +1165,7 @@ fn flat_unity(
         oauth2_scope: flat.oauth2_scope,
         ..CatalogAuthFields::default()
     };
+    auth.check(rules)?;
     unity_config(flat.unity_uri, flat.unity_catalog, flat.unity_schema, auth)
 }
 
@@ -1156,21 +1204,22 @@ pub fn unity_config(
 #[cfg(feature = "delta")]
 fn flat_delta_io(
     flat: FlatDeltaIo,
+    rules: &SecretRules,
 ) -> Result<fluree_db_delta::DeltaIoConfig, GraphSourceInputError> {
+    let client_secret = secret_field(
+        "azure_client_secret",
+        flat.azure_client_secret,
+        "azure_client_secret_env",
+        flat.azure_client_secret_env,
+    )?;
+    if let Some((field, value)) = &client_secret {
+        rules.check_value(field, value, ValueClass::Secret)?;
+    }
     Ok(fluree_db_delta::DeltaIoConfig {
         s3_region: flat.s3_region,
         s3_endpoint: flat.s3_endpoint,
         s3_path_style: flat.s3_path_style,
-        azure: azure_auth(
-            flat.azure_tenant_id,
-            flat.azure_client_id,
-            secret_field(
-                "azure_client_secret",
-                flat.azure_client_secret,
-                "azure_client_secret_env",
-                flat.azure_client_secret_env,
-            )?,
-        )?,
+        azure: azure_auth(flat.azure_tenant_id, flat.azure_client_id, client_secret)?,
     })
 }
 

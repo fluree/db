@@ -228,7 +228,10 @@ fn two_auth_modes_at_once_are_refused() {
     ] {
         let e = refused(body.clone());
         assert!(
-            matches!(e.kind, InputErrorKind::Conflict { .. }),
+            matches!(
+                e.kind,
+                InputErrorKind::TwoWays { .. } | InputErrorKind::Conflict { .. }
+            ),
             "{body}: {e}"
         );
     }
@@ -259,6 +262,22 @@ fn a_variable_the_operator_did_not_list_is_refused_in_either_form() {
         &local(),
     )
     .unwrap();
+}
+
+#[test]
+fn a_flat_refusal_names_the_field_the_caller_sent() {
+    let e = refused(json!({"catalog_uri": URI, "auth_bearer_env": "AWS_SECRET_ACCESS_KEY"}));
+    assert_eq!(e.field, "auth_bearer_env");
+    let e = refused(json!({"catalog_uri": URI, "oauth2_token_url": "https://t",
+        "oauth2_client_secret_env": "AWS_SECRET_ACCESS_KEY"}));
+    assert_eq!(e.field, "oauth2_client_secret_env");
+    #[cfg(feature = "delta")]
+    {
+        let e = delta(json!({"azure_tenant_id": "t", "azure_client_id": "c",
+            "azure_client_secret_env": "AWS_SECRET_ACCESS_KEY"}))
+        .unwrap_err();
+        assert_eq!(e.field, "azure_client_secret_env");
+    }
 }
 
 #[test]
@@ -398,7 +417,7 @@ fn sql_auth_is_the_same_in_both_forms_and_names_variables_like_iceberg() {
     let e = sql(json!({"auth_bearer": "t", "oauth2_token_url": "https://t",
         "oauth2_client_secret": "s"}))
     .unwrap_err();
-    assert!(matches!(e.kind, InputErrorKind::Conflict { .. }), "{e}");
+    assert!(matches!(e.kind, InputErrorKind::TwoWays { .. }), "{e}");
     let e = sql(json!({"auth_bearer_env": "OTHER"})).unwrap_err();
     assert!(
         matches!(e.kind, InputErrorKind::EnvNotAllowed { .. }),
@@ -533,7 +552,7 @@ fn the_flat_google_sources_and_their_quota_project() {
     .unwrap_err();
     assert_eq!(
         e,
-        GraphSourceInputError::conflict("auth_google_adc", "auth_google_metadata")
+        GraphSourceInputError::two_ways("auth_google_adc", "auth_google_metadata")
     );
     let e = fields(Vec::new(), Some("lake")).unwrap_err();
     assert_eq!(e.field, "auth_google_quota_project");

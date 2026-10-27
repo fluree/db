@@ -351,6 +351,10 @@ impl crate::Fluree {
         // the per-table previews below each clone this hydrated, literal-auth
         // connection so no per-table resolver calls happen.
         let connection = self.hydrate_conn(req.connection.clone()).await?;
+        // This instance's host-identity policy and AWS subject: the free
+        // `preview_iceberg_table` would build every preview's auth under the
+        // default, allow-everything context instead.
+        let identity = self.identity_context();
 
         // Fetch each requested table's Tier-A+B preview (metadata-only) with
         // BOUNDED CONCURRENCY. Each preview is an independent chain of network
@@ -378,7 +382,7 @@ impl crate::Fluree {
                             connection,
                             table.clone(),
                             StatsTier::Stats,
-                            self.identity_context(),
+                            identity,
                         )
                         .await?;
                         Ok::<_, crate::ApiError>((table, preview))

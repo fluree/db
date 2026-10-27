@@ -296,6 +296,13 @@ pub use graph_source::{
 #[cfg(feature = "sql")]
 pub use graph_source::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 
+/// A REST catalog's (or SQL endpoint's) auth, in its stored shape.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::auth::AuthConfig as IcebergAuthConfig;
+/// A Workload Identity Federation credential configuration, inline or held by
+/// a [`IcebergConfigValue`].
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::auth::ExternalAccountConfig;
 /// A graph-source secret: a literal, a secret reference, or the name of an
 /// environment variable of the reading process.
 #[cfg(feature = "iceberg")]

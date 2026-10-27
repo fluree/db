@@ -453,14 +453,14 @@ impl crate::Fluree {
                 requested_snapshot = ?snapshot,
                 "validate_r2rml: previewing table current snapshot for cross-check"
             );
-            match preview_iceberg_table_in(
+            // Under this instance's identity context, as every catalog read is.
+            let preview = preview_iceberg_table_in(
                 conn.clone(),
                 table_id,
                 StatsTier::Stats,
                 self.identity_context(),
-            )
-            .await
-            {
+            );
+            match preview.await {
                 Ok(preview) => {
                     schemas.insert(name.clone(), preview.schema);
                 }
