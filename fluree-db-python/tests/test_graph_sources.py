@@ -151,15 +151,18 @@ ORDERS_MAPPING = f"""
 
 
 def test_glue_and_s3_tables_sources_register(conn):
-    # Registering reads no catalog (only a REST catalog is connection-tested),
-    # so these register offline; the mapping's rr:tableName names each table.
-    # Reading them end to end is covered by fluree-db-api's it_iceberg_glue_moto.
-    glue = conn.map_iceberg(
-        "glue-orders", ORDERS_MAPPING, glue=fluree.Glue(region="us-east-1", catalog_id="123456789012")
-    )
+    # Registering loads each table the mapping's rr:tableName names through the
+    # catalog; with no reachable AWS catalog it warns and still registers, so
+    # these register offline. Reading them end to end is covered by
+    # fluree-db-api's it_iceberg_glue_moto.
+    with pytest.warns(UserWarning, match="could not reach the catalog at 123456789012"):
+        glue = conn.map_iceberg(
+            "glue-orders", ORDERS_MAPPING, glue=fluree.Glue(region="us-east-1", catalog_id="123456789012")
+        )
     assert (glue.id, glue.kind) == ("glue-orders:main", "iceberg")
     arn = "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"
-    tables = conn.map_iceberg("s3t-orders", ORDERS_MAPPING, s3_tables=fluree.S3Tables(arn))
+    with pytest.warns(UserWarning, match="could not reach the catalog at arn:aws:s3tables"):
+        tables = conn.map_iceberg("s3t-orders", ORDERS_MAPPING, s3_tables=fluree.S3Tables(arn))
     assert (tables.id, tables.kind) == ("s3t-orders:main", "iceberg")
 
 
@@ -187,7 +190,8 @@ def test_glue_and_s3_tables_mistakes_are_refused(conn):
             auth=Bearer("t"),
         )
     # Turning vending off agrees with every mode.
-    conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
+    with pytest.warns(UserWarning, match="could not reach the catalog"):
+        conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
 
 
 # A service-account key named by a variable that is never set: registration

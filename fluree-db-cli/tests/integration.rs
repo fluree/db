@@ -4053,6 +4053,39 @@ fn iceberg_map_remote_uses_remote_client() {
         .stderr(predicate::str::contains("connection failed"));
 }
 
+/// `iceberg map` needs `--r2rml`: a source's queries are answered from its
+/// mapping. Without one the command is refused before it registers anything
+/// locally or contacts a remote.
+#[test]
+fn iceberg_map_without_a_mapping_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:19999"])
+        .assert()
+        .success();
+
+    let map = ["iceberg", "map", "warehouse-orders", "--mode", "direct"];
+    let location = ["--table-location", "s3://bucket/warehouse/sales/orders"];
+    for remote in [&[][..], &["--remote", "origin"][..]] {
+        fluree_cmd(&tmp)
+            .args(map)
+            .args(location)
+            .args(remote)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--r2rml <R2RML>"))
+            .stderr(predicate::str::contains("required"))
+            .stderr(predicate::str::contains("connection failed").not());
+    }
+
+    fluree_cmd(&tmp)
+        .args(["iceberg", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No Iceberg graph sources found."));
+}
+
 #[test]
 fn iceberg_list_remote_uses_remote_client() {
     let tmp = TempDir::new().unwrap();

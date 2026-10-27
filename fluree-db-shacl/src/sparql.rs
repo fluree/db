@@ -582,6 +582,8 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
         | QueryError::NoSnapshotAtTime { .. }
+        | QueryError::GraphSourceUnmapped { .. }
+        | QueryError::GraphSourceUnsupported { .. }
         | QueryError::R2rml(_)
         | QueryError::Core(_)
         | QueryError::Batch(_)
@@ -596,6 +598,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::InvalidExpression(_)
         | QueryError::UnsupportedFeature(_)
         | QueryError::R2rmlUnsupportedPattern { .. }
+        | QueryError::GraphSourceNotAGraph { .. }
         | QueryError::Arithmetic(_)
         | QueryError::Comparison(_) => false,
         // The caller names the variables first (`QueryError::name_variables`),
@@ -951,6 +954,19 @@ mod tests {
             QueryError::NoSnapshotAtTime { .. } => true, [
                 QueryError::NoSnapshotAtTime { table: s(), requested: s(), oldest: None },
             ];
+            QueryError::GraphSourceUnmapped { .. } => true, [
+                QueryError::GraphSourceUnmapped {
+                    graph_source_id: s(),
+                    empty_mapping: false,
+                },
+            ];
+            QueryError::GraphSourceUnsupported { .. } => true, [
+                QueryError::GraphSourceUnsupported {
+                    graph_source_id: s(),
+                    family: "an Iceberg".into(),
+                    cause: "c".into(),
+                },
+            ];
             QueryError::R2rml(_) => true, [
                 QueryError::R2rml(fluree_db_r2rml::R2rmlError::Parse(s())),
             ];
@@ -984,6 +1000,13 @@ mod tests {
             QueryError::UnsupportedFeature(_) => false, [QueryError::UnsupportedFeature(s())];
             QueryError::R2rmlUnsupportedPattern { .. } => false, [
                 QueryError::R2rmlUnsupportedPattern { detail: s() },
+            ];
+            QueryError::GraphSourceNotAGraph { .. } => false, [
+                QueryError::GraphSourceNotAGraph {
+                    graph_source_id: s(),
+                    index: s(),
+                    remedy: "r",
+                },
             ];
             QueryError::Arithmetic(_) => false, [
                 QueryError::Arithmetic(ArithmeticError::DivideByZero),

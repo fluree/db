@@ -187,7 +187,7 @@ pub(crate) fn map_iceberg<'py>(
         rest_only: &[],
     };
     let mut iceberg =
-        IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref(), true)
+        IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref())
             .map_err(|e| invalid_request(e.message(str::to_string)))?;
     // Through the builders, which refuse at registration what this catalog
     // mode would ignore (REST-only auth, warehouse, a request to vend).
@@ -250,14 +250,26 @@ pub(crate) fn map_iceberg<'py>(
         mapping: R2rmlMappingInput::Content(common.mapping),
         mapping_media_type: common.mapping_type,
     };
+    // Registration loads each mapped table the way a query does: through the
+    // catalog, or at a Direct table's location.
+    let direct = config.iceberg.is_direct();
     let created = block_on(py, fluree.create_r2rml_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.model_warnings;
-    if rest && !created.connection_tested {
-        warnings.push(format!(
-            "could not reach the catalog at {}; the source is registered, and queries will \
-             fail until it can be reached",
-            created.catalog_uri
-        ));
+    if !created.connection_tested {
+        // The catalog wording predates Direct's check; callers match on it.
+        warnings.push(if direct {
+            format!(
+                "could not read a mapped table's metadata at {}; the source is registered, \
+                 and queries will fail until it can be read",
+                created.catalog_uri
+            )
+        } else {
+            format!(
+                "could not reach the catalog at {}; the source is registered, and queries \
+                 will fail until it can be reached",
+                created.catalog_uri
+            )
+        });
     }
     registered(py, &created.graph_source_id, &created.table_names, warnings)
 }

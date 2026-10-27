@@ -118,6 +118,20 @@ pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
 /// The graph source was dropped, so it can no longer be synced (HTTP 409)
 pub const GRAPH_SOURCE_RETRACTED: &str = "err:db/GraphSourceRetracted";
 
+/// The graph source has no R2RML mapping, so it has nothing to answer a query
+/// from (HTTP 409). Registering it again with a mapping clears it.
+pub const GRAPH_SOURCE_UNMAPPED: &str = "err:db/GraphSourceUnmapped";
+
+/// The graph source is of a family this build was compiled without (an
+/// Iceberg / R2RML source without the `iceberg` feature, SQL without `sql`,
+/// Delta without `delta`), so nothing here can read it (HTTP 501).
+pub const GRAPH_SOURCE_UNSUPPORTED: &str = "err:db/GraphSourceUnsupported";
+
+/// The graph source is an index (BM25, vector, geo), which has no triples, named
+/// where a graph is read: as the query target, in `FROM` / `FROM NAMED`, or in
+/// `GRAPH` (HTTP 400). Its searches name it in their own pattern instead.
+pub const GRAPH_SOURCE_NOT_A_GRAPH: &str = "err:db/GraphSourceNotAGraph";
+
 /// A graph the target ledger does not have
 pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
 

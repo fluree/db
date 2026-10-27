@@ -18,7 +18,7 @@ Map an Iceberg table as a queryable graph source.
 ### Usage
 
 ```bash
-fluree iceberg map <NAME> [OPTIONS]
+fluree iceberg map <NAME> --r2rml <PATH> [OPTIONS]
 ```
 
 ### Arguments
@@ -40,7 +40,7 @@ fluree iceberg map <NAME> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--catalog-uri <URI>` | REST catalog URI (required for rest mode) |
-| `--table <ID>` | Table identifier in `namespace.table` format (required if not specified in R2RML mapping) |
+| `--table <ID>` | Table identifier in `namespace.table` format. Optional: the `--r2rml` mapping's `rr:tableName` entries name the tables |
 | `--warehouse <NAME>` | Warehouse (or catalog) name as the REST catalog knows it; the catalog's own route prefix is looked up from it |
 | `--no-vended-credentials` | Disable vended credentials (enabled by default); the same as `--storage-identity ambient`, and not given with it |
 
@@ -54,7 +54,7 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--table <ID>` | Table identifier `namespace.table`; required unless `--r2rml` is given, whose `rr:tableName` entries then name the tables. For `glue`, `namespace` is the Glue database. |
+| `--table <ID>` | Table identifier `namespace.table`. Optional: the `--r2rml` mapping's `rr:tableName` entries name the tables. For `glue`, `namespace` is the Glue database. |
 | `--region <REGION>` | AWS region of the Glue / S3 Tables API. Glue falls back to `--s3-region`, then the AWS SDK's region chain; S3 Tables defaults to the table bucket ARN's region and refuses a `--region` that contradicts it. S3 data reads use `--s3-region` when given, else this region. Must be an AWS region code (e.g. `us-east-1`). |
 | `--catalog-id <ID>` | Glue catalog id for cross-account access (`glue` mode; defaults to the caller's account) |
 | `--table-bucket-arn <ARN>` | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required for `s3tables` mode; any AWS partition) |
@@ -132,7 +132,7 @@ Four catalog modes are supported:
 - **AWS Glue mode** (`--mode glue`): Looks the table up in the AWS Glue Data Catalog (Glue `GetTable`) and reads the metadata file its `metadata_location` parameter names. The Glue database is the namespace; `--catalog-id` reads another account's catalog.
 - **AWS S3 Tables mode** (`--mode s3tables`): Resolves the table's metadata file in an S3 Tables table bucket (`--table-bucket-arn`) with `GetTableMetadataLocation`.
 
-Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` tests the connection for REST catalogs only: for Glue and S3 Tables it reports `Connection: not tested`, and catalog errors surface at query time. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` loads each table the mapping names the way a query will: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata at the location (Direct). It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail `map`: it reports `Connection: not verified` and registers the source. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`). A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
 
 ### Examples
 

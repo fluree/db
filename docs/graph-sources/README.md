@@ -80,7 +80,7 @@ sql-db:main → R2RML → PostgreSQL tables
 
 ## Query Transparency
 
-Graph sources are queried like regular ledgers:
+Graph sources are queried through the same query interface as ledgers. A mapped source (Iceberg, R2RML, SQL, Delta) is addressed like a ledger, in `FROM` or as the query target. A search index is named by a search pattern, with its source ledger as the dataset:
 
 ```json
 {
@@ -286,31 +286,40 @@ Graph sources registered in nameservice:
 
 ### Query Routing
 
-Query engine routes to appropriate backend:
+How a query reaches a graph source depends on its kind:
 
 ```text
-Query: FROM <products-search:main>
-  ↓
-Nameservice lookup: type=bm25
-  ↓
-Route to BM25 query engine
-  ↓
-Execute against inverted index
-  ↓
-Return results
+Mapped source (Iceberg, R2RML, SQL, Delta):
+  FROM <warehouse-orders:main>             (or GRAPH <...>, or the query target)
+    ↓
+  Nameservice lookup: a mapped source with its R2RML mapping
+    ↓
+  Triple patterns rewritten to table scans
+    ↓
+  Rows materialized as triples
+
+Search index (BM25, vector):
+  FROM <products:main>                     (its source ledger is the dataset)
+  WHERE { "f:graphSource": "products-search:main", "f:searchText": "..." }
+    ↓
+  The search pattern loads the index by its f:graphSource id
+    ↓
+  Results bind the matching subjects of products:main
 ```
+
+A search index is never a dataset member: `FROM <products-search:main>` is
+refused with `err:db/GraphSourceNotAGraph` (HTTP 400).
 
 ### Result Integration
 
-Results from graph sources join with regular graphs:
+Search results join with the source ledger's graph on the subjects they bind:
 
 ```text
-FROM <products:main>, <products-search:main>
+FROM <products:main>
+WHERE f:graphSource products-search:main → ?product, ?score
+      ?product ex:name ?name               (read from products:main)
   ↓
-Execute subquery on products:main → Results A
-Execute subquery on products-search:main → Results B
-  ↓
-Join Results A + B on ?product
+Join on ?product
   ↓
 Return combined results
 ```

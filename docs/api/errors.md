@@ -90,6 +90,7 @@ The request is malformed or contains invalid data.
 - Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 - A `t` beyond the ledger's current head (`err:api/BadRequest`), such as syncing a search index through a commit that does not exist yet
 - A graph source's connection, auth or storage identity refused before anything is built (`err:api/InvalidGraphSourceConfig`): an unknown field, flat and structured fields mixed, auth given two ways or only partly, or an environment variable the server does not list. The message names the field, never its value. See [Iceberg connection](endpoints.md#iceberg-connection)
+- A search index (BM25, vector, geo) named where a graph is read, as the query target or in `FROM`, `FROM NAMED` or `GRAPH` (`err:db/GraphSourceNotAGraph`). Query a BM25 or vector index with an `f:graphSource` pattern, with its source ledger as the dataset
 
 **Error typing:**
 
@@ -251,6 +252,7 @@ The request conflicts with current server state.
 - Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
 - The ledger advanced while a reindex ran (`err:system/ReindexConflict`)
 - Syncing a graph source that has been dropped (`err:db/GraphSourceRetracted`)
+- Querying a graph source that has no R2RML mapping, or one that defines no `rr:TriplesMap` (`err:db/GraphSourceUnmapped`): one registered before registration refused both. Register it again under the same name, with a mapping that defines one, to replace it
 - An Iceberg table that carries merge-on-read delete files (`err:iceberg/MergeOnReadDeletes`)
 
 **Example:**
@@ -433,6 +435,30 @@ An unexpected error occurred on the server.
 - Report to system administrator
 - Retry request
 - Contact support if persists
+
+#### 501 Not Implemented
+
+The server was built without a capability the request needs.
+
+**Common Causes:**
+- Querying a graph source whose reader this build was compiled without
+  (`err:db/GraphSourceUnsupported`): an Iceberg or R2RML source on a build
+  without the `iceberg` feature, a SQL source without `sql`, a Delta source
+  without `delta`. The record was registered by a build that had the reader
+  and shares this nameservice.
+
+**Example:**
+```json
+{
+  "error": "Query error: graph source 'orders:main' is an Iceberg graph source, which this build cannot read: it was compiled without the 'iceberg' feature",
+  "status": 501,
+  "@type": "err:db/GraphSourceUnsupported"
+}
+```
+
+**How to Fix:**
+- Query the source through a server built with the feature the message names
+- Rebuild with that feature
 
 #### 502 Bad Gateway
 

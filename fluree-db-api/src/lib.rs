@@ -265,11 +265,11 @@ pub use graph_source::{
     guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
     CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider,
     GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
-    IcebergCreateConfig, IcebergCreateResult, MaterializeResult, PartitionFieldInfo,
-    PersistedMaterializeJob, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput,
-    ResolvedStorage, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    StorageAccessReport, StorageDecision, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
-    TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    IcebergCreateConfig, MaterializeResult, PartitionFieldInfo, PersistedMaterializeJob,
+    R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, ResolvedStorage, RestCatalogMode,
+    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StorageDecision,
+    StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride, TablePreview,
+    TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 #[cfg(feature = "delta")]

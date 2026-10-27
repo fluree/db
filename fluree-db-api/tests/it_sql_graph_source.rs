@@ -132,6 +132,23 @@ async fn sql_graph_source_end_to_end() {
     );
     assert!(names.iter().any(|n| n.contains("alice")) && names.iter().any(|n| n.contains("bob")));
 
+    // A SQL source reads its live tables: a pin on it is refused, not ignored.
+    for suffix in ["time:2026-01-01T00:00:00Z", "snapshot:1"] {
+        let mut pinned = query.clone();
+        pinned["from"] = json!(format!("people-sql:main@{suffix}"));
+        let err = fluree
+            .query_from()
+            .jsonld(&pinned)
+            .execute_formatted()
+            .await
+            .expect_err(suffix);
+        assert!(
+            err.to_string()
+                .contains("does not support time-pinned reads"),
+            "@{suffix}: {err}"
+        );
+    }
+
     let sent = statements(&server).await;
     let probe = sent
         .iter()

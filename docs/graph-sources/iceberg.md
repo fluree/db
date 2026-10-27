@@ -134,7 +134,7 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
   }'
 ```
 
-For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. With `r2rml`, `table` may be omitted in `glue` and `s3tables` modes, as in `rest`: each `rr:tableName` names a table.
+For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. `table` may be omitted in every mode: each `rr:tableName` in the `r2rml` mapping names a table.
 
 The connection may instead be given structured, as the stored config spells it: a `catalog` object (its `auth` included) and an `io` object (its `storage_auth` included), in place of the flat fields, never beside them. Every Google identity and storage identity is given this way:
 
@@ -155,7 +155,7 @@ The connection may instead be given structured, as the stored config spells it: 
 
 The server stores the `storage_auth` it is sent and infers none: `fluree iceberg map` and Python's `map_iceberg` default a `bq://` warehouse to `catalog` and a `bl://` one to `vended`, but an HTTP request that omits it reads as `vended_credentials` says. An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
 
-Without `r2rml` the source is registered as a plain Iceberg source with no mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+`r2rml` is required: a source's queries are answered from its mapping, so a request without one is a 400 and registers nothing. A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused the same way. (A source registered before registration refused both has no mapping, or one that defines nothing; every query that names it answers `409` with `err:db/GraphSourceUnmapped`. Map it again under the same name, with a mapping, to replace it.) An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
 
@@ -230,7 +230,7 @@ fluree.create_r2rml_graph_source(config).await?;
 
 Iceberg graph sources are persisted as an `IcebergGsConfig` JSON document in the nameservice record’s `config` field.
 
-Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Optional top-level fields not shown below: `mapping` (the stored R2RML address and media type), `delete` and `order_by` (materialization conventions), and `model` (the governing model ledger, see [Access policy](#access-policy)).
+Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Top-level fields not shown below: `mapping` (the stored R2RML address and media type, which registration always writes; a record without one cannot be queried), and the optional `delete` and `order_by` (materialization conventions) and `model` (the governing model ledger, see [Access policy](#access-policy)).
 
 **REST catalog config:**
 
@@ -1262,7 +1262,7 @@ triples map a scan skipped because its predicates were hidden.
 
 ### Connection Issues
 
-**AWS Glue / S3 Tables.** `fluree iceberg map` tests the connection for REST catalogs only; for these modes it reports `Connection: not tested`, and catalog errors first surface on the first query. To check a connection before querying, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
+**AWS Glue / S3 Tables.** `fluree iceberg map` loads each mapped table through the Glue or S3 Tables catalog, as a query will, and reports `Connection: not verified` when one cannot be loaded; the source is still registered. To check that the credentials can also read the table's storage, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
 
 | Error | Cause |
 |---|---|

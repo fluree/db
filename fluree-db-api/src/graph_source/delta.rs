@@ -850,11 +850,14 @@ fn delta_query_error(graph_source_id: &str, table_name: &str, error: DeltaError)
     }
 }
 
-/// The mapping reference of a Delta record, if it has one.
-pub(crate) fn mapping_source(record: &GraphSourceRecord) -> Option<MappingSource> {
+/// The mapping reference of a Delta record, if it has one; `Err` when
+/// its config does not parse.
+pub(crate) fn mapping_source(
+    record: &GraphSourceRecord,
+) -> std::result::Result<Option<MappingSource>, String> {
     DeltaGsConfig::from_json(&record.config)
-        .ok()
-        .and_then(|c| c.mapping)
+        .map(|c| c.mapping)
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Option<bool>) {

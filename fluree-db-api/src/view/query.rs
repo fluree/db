@@ -2649,31 +2649,37 @@ mod graph_source_guard_tests {
     /// top-level pattern with a `["graph", …]` block, the shape that suppresses
     /// the auto-wrap and reaches the guard, so an accidental refusal would
     /// surface here as an error rather than as an empty result.
+    ///
+    /// Only a mapped source is a dataset member (an index source is refused as
+    /// one), so this needs the iceberg reader. Its catalog does not exist:
+    /// registration's table check is non-fatal, and the `graph` block asks for
+    /// a predicate the mapping does not map, so nothing is scanned.
+    #[cfg(feature = "iceberg")]
     #[tokio::test]
     async fn a_named_only_graph_source_query_is_answered_not_refused() {
         let fluree = FlureeBuilder::memory().build_memory();
-        let ledger = fluree.create_ledger("gsguard-src").await.unwrap();
-        let txn = serde_json::json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "insert": [{"@id": "ex:a1", "@type": "ex:Article", "ex:title": "Graph sources"}]
-        });
-        let _ledger = fluree.insert(ledger, &txn).await.unwrap().ledger;
-
-        // A BM25 source registers in the nameservice without the iceberg
-        // feature, so the dataset resolves a real graph-source view.
-        let index_query = serde_json::json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "where": [{"@id": "?x", "@type": "ex:Article"}],
-            "select": {"?x": ["@id", "ex:title"]}
-        });
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/ns/mapping#Edge> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "ns.edge" ] ;
+                rr:subjectMap [ rr:template "http://example.org/ns/{src}" ] ;
+                rr:predicateObjectMap [
+                    rr:predicate <http://example.org/ns/edge> ;
+                    rr:objectMap [ rr:column "dst" ]
+                ] .
+        "#;
         let gs = fluree
-            .create_full_text_index(crate::Bm25CreateConfig::new(
-                "gsguard-search",
-                "gsguard-src:main",
-                index_query,
-            ))
+            .create_r2rml_graph_source(
+                crate::R2rmlCreateConfig::new(
+                    "gsguard-mapped",
+                    "https://example.invalid",
+                    "ns.edge",
+                    mapping,
+                )
+                .with_mapping_media_type("text/turtle"),
+            )
             .await
-            .expect("register the BM25 graph source");
+            .expect("register the mapped graph source");
 
         let body = serde_json::json!({
             "@context": {"ex": "http://example.org/ns/"},

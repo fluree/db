@@ -194,27 +194,6 @@ pub struct VectorDropResult {
 // Iceberg/R2RML Results
 // =============================================================================
 
-/// Result of creating an Iceberg graph source.
-#[cfg(feature = "iceberg")]
-#[derive(Debug, Clone)]
-pub struct IcebergCreateResult {
-    /// Graph source ID (name:branch)
-    pub graph_source_id: String,
-
-    /// Table identifier that was registered
-    pub table_identifier: String,
-
-    /// Catalog URI
-    pub catalog_uri: String,
-
-    /// Whether the catalog connection was tested successfully
-    pub connection_tested: bool,
-
-    /// Warnings about the `model` reference (policies a virtual source cannot
-    /// evaluate). Empty when no model is set or nothing is amiss.
-    pub model_warnings: Vec<String>,
-}
-
 /// Result of creating an R2RML graph source.
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone)]
@@ -240,7 +219,10 @@ pub struct R2rmlCreateResult {
     /// Names of the distinct logical tables referenced by the mapping (sorted)
     pub table_names: Vec<String>,
 
-    /// Whether the catalog connection was tested successfully
+    /// Whether every table the mapping reads loaded at registration, the way
+    /// a query loads it: through the catalog for REST, AWS Glue and S3 Tables,
+    /// and by resolving its current metadata for Direct. A `false` never fails
+    /// registration.
     pub connection_tested: bool,
 
     /// Whether the mapping was validated successfully
