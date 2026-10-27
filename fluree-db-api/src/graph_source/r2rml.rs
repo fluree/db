@@ -6235,8 +6235,11 @@ mod tests {
             .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
             .max()
             .expect("a metadata file");
-        let metadata: serde_json::Value =
+        let mut metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
+        // On S3, with its metadata inline: a catalog that places a table on
+        // this host's disk is refused, and the load reads nothing there.
+        metadata["location"] = "s3://lake/warehouse/silver/people".into();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
@@ -6249,7 +6252,10 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_delay(Duration::from_millis(600))
                     .set_body_json(json!({
-                        "metadata-location": format!("file://{}", current.display()),
+                        "metadata-location": format!(
+                            "s3://lake/warehouse/silver/people/metadata/{}",
+                            current.file_name().unwrap().to_string_lossy()
+                        ),
                         "metadata": metadata,
                     })),
             )

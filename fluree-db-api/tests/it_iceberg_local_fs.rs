@@ -2043,10 +2043,11 @@ async fn a_direct_registration_reports_whether_its_tables_resolve() {
 
 /// A REST catalog that serves the committed `people` fixture's current
 /// metadata inline at `silver.people` and refuses `silver.refused` (403).
-async fn people_catalog() -> wiremock::MockServer {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
+/// A catalog's `loadTable` answer for the people fixture, its metadata inline.
+/// The table is placed on S3: a catalog that places a table on this host's
+/// disk is refused (only a catalog-less source may read local files), and a
+/// load with inline metadata reads nothing at the location.
+fn people_load_table() -> serde_json::Value {
     let metadata_dir = fixtures_dir().join("silver/people/metadata");
     let current = std::fs::read_dir(&metadata_dir)
         .expect("people metadata dir")
@@ -2054,9 +2055,22 @@ async fn people_catalog() -> wiremock::MockServer {
         .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
         .max()
         .expect("a metadata file");
-    let metadata: serde_json::Value =
+    let mut metadata: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&current).expect("read metadata"))
             .expect("parse metadata");
+    metadata["location"] = "s3://lake/warehouse/silver/people".into();
+    serde_json::json!({
+        "metadata-location": format!(
+            "s3://lake/warehouse/silver/people/metadata/{}",
+            current.file_name().unwrap().to_string_lossy()
+        ),
+        "metadata": metadata,
+    })
+}
+
+async fn people_catalog() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -2066,10 +2080,7 @@ async fn people_catalog() -> wiremock::MockServer {
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/namespaces/silver/tables/people"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "metadata-location": format!("file://{}", current.display()),
-            "metadata": metadata,
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(people_load_table()))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -2381,21 +2392,9 @@ async fn a_registration_builds_one_catalog_client_for_all_its_tables() {
     {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, ResponseTemplate};
-        let metadata_dir = fixtures_dir().join("silver/people/metadata");
-        let current = std::fs::read_dir(&metadata_dir)
-            .expect("people metadata dir")
-            .map(|e| e.expect("entry").path())
-            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
-            .max()
-            .expect("a metadata file");
-        let metadata: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
         Mock::given(method("GET"))
             .and(path_regex(r"^/v1/namespaces/silver/tables/people_[0-9]+$"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "metadata-location": format!("file://{}", current.display()),
-                "metadata": metadata,
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(people_load_table()))
             .mount(&catalog)
             .await;
     }
