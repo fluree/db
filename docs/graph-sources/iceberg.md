@@ -153,7 +153,7 @@ The connection may instead be given structured, as the stored config spells it: 
 }
 ```
 
-An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
+The server stores the `storage_auth` it is sent and infers none: `fluree iceberg map` and Python's `map_iceberg` default a `bq://` warehouse to `catalog` and a `bl://` one to `vended`, but an HTTP request that omits it reads as `vended_credentials` says. An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
 
 Without `r2rml` the source is registered as a plain Iceberg source with no mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 

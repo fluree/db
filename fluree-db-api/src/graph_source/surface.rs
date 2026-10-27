@@ -433,12 +433,14 @@ fn keys_of<T: Default + Serialize>() -> Vec<String> {
 
 /// Split a request into its structured part (the keys in `structured`) and
 /// the rest, refusing a flat key beside a structured one and a key that is in
-/// neither form.
+/// neither form. A key whose value is `null` is absent: clients that send
+/// every field send the unused ones as `null`, and a null says nothing.
 fn split_forms(
     mut input: Map<String, Value>,
     structured: &[&str],
     flat: &[String],
 ) -> Result<Form, GraphSourceInputError> {
+    input.retain(|_, value| !value.is_null());
     let Some(given) = structured.iter().find(|k| input.contains_key(**k)).copied() else {
         return Ok(Form::Flat(input));
     };

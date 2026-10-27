@@ -180,6 +180,57 @@ fn an_unknown_field_is_refused_with_its_path() {
 }
 
 #[test]
+fn an_explicit_null_is_an_absent_field() {
+    // The canonical form omits these (`skip_serializing_if`), and a client
+    // that sends every field sends the unused ones as null.
+    let with_nulls = connection(json!({
+        "catalog": {"type": "rest", "uri": URI, "warehouse": null,
+            "auth": {"type": "google", "credentials": {"source": "metadata"},
+                "scopes": null, "quota_project": null}},
+        "io": {"storage_auth": null, "s3_endpoint": null, "s3_region": null},
+        "catalog_uri": null, "auth_bearer": null, "mode": null,
+    }))
+    .unwrap();
+    let without = connection(json!({
+        "catalog": {"type": "rest", "uri": URI,
+            "auth": {"type": "google", "credentials": {"source": "metadata"}}},
+    }))
+    .unwrap();
+    assert_eq!(stored(with_nulls), stored(without));
+    // Likewise in the flat form, and for the structured key itself.
+    let flat = connection(json!({"catalog_uri": URI, "catalog": null, "io": null,
+        "auth_bearer_env": "TOKEN", "oauth2_scope": null, "warehouse": null}))
+    .unwrap();
+    assert_eq!(stored(flat)["catalog"]["auth"]["token"]["env_var"], "TOKEN");
+    // A null cannot hide an unknown key that carries a value.
+    let e = refused(json!({"catalog_uri": URI, "auth_bearer": null, "warehose": "wh"}));
+    assert_eq!(e.field, "warehose");
+}
+
+#[test]
+fn the_legacy_untagged_catalog_a_stored_record_may_hold_is_accepted() {
+    // `CatalogConfig` reads a catalog with no `type` as REST (records written
+    // before the catalog modes); a read-out of one can be sent back.
+    let legacy = connection(json!({"catalog": {"uri": URI, "warehouse": "wh",
+        "auth": {"type": "bearer", "token": {"env_var": "TOKEN"}}}}))
+    .unwrap();
+    let tagged = connection(
+        json!({"catalog": {"type": "rest", "uri": URI, "warehouse": "wh",
+        "auth": {"type": "bearer", "token": {"env_var": "TOKEN"}}}}),
+    )
+    .unwrap();
+    assert_eq!(stored(legacy), stored(tagged));
+    // Its compat read path does not make it lenient.
+    let e = refused(json!({"catalog": {"uri": URI, "warehose": "wh"}}));
+    assert_eq!(e.field, "catalog.warehose");
+    // A WIF configuration may be its JSON text, as Phase 1 documents.
+    let text = connection(json!({"catalog": {"type": "rest", "uri": URI, "auth": {
+        "type": "google", "credentials": {"source": "external_account",
+            "config": "{\"type\": \"external_account\"}"}}}}));
+    assert!(text.is_ok(), "{text:?}");
+}
+
+#[test]
 fn flat_and_structured_fields_may_not_be_mixed() {
     let e = refused(json!({"catalog": {"type": "rest", "uri": URI}, "auth_bearer": "t"}));
     assert_eq!(e.field, "auth_bearer");

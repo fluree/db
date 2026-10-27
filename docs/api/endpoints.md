@@ -3118,9 +3118,11 @@ The structured `io`:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `storage_auth` | object | Which identity reads the table's files: `{"type": "vended"}` (the REST catalog's per-table credentials, required), `{"type": "ambient"}` (the server's AWS credential chain), `{"type": "catalog"}` (the REST catalog's own Google identity reads `gs://`; what BigLake federation, `bq://`, needs, since it never vends), or `{"type": "google", "credentials": <google>, "quota_project": "…"}` (a Google identity of the source's own). Absent: what `vended_credentials` says |
+| `storage_auth` | object | Which identity reads the table's files: `{"type": "vended"}` (the REST catalog's per-table credentials, required), `{"type": "ambient"}` (the server's AWS credential chain), `{"type": "catalog"}` (the REST catalog's own Google identity reads `gs://`; what BigLake federation, `bq://`, needs, since it never vends), or `{"type": "google", "credentials": <google>, "quota_project": "…"}` (a Google identity of the source's own). Absent: what `vended_credentials` says. The server stores exactly what it is sent and never picks one for a warehouse; the CLI and the Python package do (`catalog` for `bq://`, `vended` for `bl://`), so an HTTP client wanting that names it |
 | `vended_credentials` | bool | The older form of `storage_auth` (`true`: `vended`, `false`: `ambient`); default `true` for a REST catalog. Set to agree with `storage_auth` when that is given; a contradicting value is refused |
 | `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
+
+An explicit `null` is an absent field, in either form. The legacy untagged catalog a stored record may hold (`{"uri": …, "auth": …}` with no `type`, read as REST) is accepted, so a read-out of an old record can be sent back.
 
 A `<secret>` is a literal (stored with the source) or `{"env_var": "NAME"}`, an environment variable of the server that the operator lists in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) (the value is not stored). A service-account key is never a literal: it would be stored with the source. `{"secret_ref": …}` is accepted only by an embedded `Fluree` with a secret resolver, and `default_val`, `java_property` and a `google_metadata` `metadata_url` never.
 

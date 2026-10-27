@@ -100,7 +100,7 @@ Give one way to authenticate: a bearer token, OAuth2 client credentials, or one 
 | `--storage-google-wif-config <FILE>` | Read the files through this Workload Identity Federation configuration |
 | `--storage-google-quota-project <PROJECT>` | The project storage requests bill to (requester pays) |
 
-A `--storage-google-*` source alone means `--storage-identity google`. A `bq://` warehouse never vends, so its default needs a Google catalog identity: without one, `map` refuses and names the options to give.
+The default is the CLI's (Python's `map_iceberg` has the same one); the server stores what it is sent, so a remote map sends the identity the default chose. A `--storage-google-*` source alone means `--storage-identity google`. A `bq://` warehouse never vends, so its default needs a Google catalog identity: without one, `map` refuses and names the options to give.
 
 **S3 overrides:**
 
