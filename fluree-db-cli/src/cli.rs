@@ -3884,8 +3884,10 @@ pub struct GoogleAuthArgs {
     #[arg(long, value_name = "FILE")]
     pub auth_google_wif_config: Option<PathBuf>,
 
-    /// The Google Cloud project requests bill to (x-goog-user-project); needed
-    /// for user credentials (--auth-google-adc after a user login)
+    /// The Google Cloud project catalog requests bill to (x-goog-user-project).
+    /// BigLake requires one for every identity; default: the project a
+    /// bq://projects/<P>/… or bl://projects/<P>/… warehouse names. Never sent
+    /// with storage reads
     #[arg(long, value_name = "PROJECT")]
     pub auth_google_quota_project: Option<String>,
 
@@ -3938,7 +3940,8 @@ pub struct StorageIdentityArgs {
     #[arg(long, value_name = "FILE")]
     pub storage_google_wif_config: Option<PathBuf>,
 
-    /// The project storage requests bill to (requester pays)
+    /// The project storage requests bill to (requester pays). Never defaulted,
+    /// and never the catalog's quota project
     #[arg(long, value_name = "PROJECT")]
     pub storage_google_quota_project: Option<String>,
 }

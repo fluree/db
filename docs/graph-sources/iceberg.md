@@ -486,14 +486,15 @@ Google's BigLake Iceberg REST catalog (`https://biglake.googleapis.com/iceberg/v
 
 **The catalog's quota project bills the catalog only.** With `storage_auth: catalog`, the files are read with the catalog's identity but not its quota project: sent to GCS, `x-goog-user-project` is a requester-pays billing project, which would make every read need `serviceusage.services.use` on it. A storage read names a billing project only when one is configured for storage: `storage_auth: google`'s `quota_project` (`--storage-google-quota-project`) for a requester-pays bucket, or the `gcs.user-project` a catalog vends.
 
-**Minimum roles for the catalog identity**, as validated against BigLake federation with a service-account identity:
+**Minimum roles for the catalog identity**, as validated against BigLake federation with a service-account identity and `storage_auth: catalog` (WIF impersonating the same service account reads the same way):
 
 | Role | Granted on | For |
 |------|------------|-----|
 | `roles/biglake.viewer` | the project | the catalog's `/v1/config` and `loadTable` |
 | `roles/bigquery.metadataViewer` | the project | the BigQuery-managed tables' metadata |
-| `roles/serviceusage.serviceUsageConsumer` | the quota project | billing BigLake's requests to it |
 | `roles/storage.objectViewer` | the bucket | reading the table's metadata and data files (`storage_auth: catalog`) |
+
+Billing BigLake to the project that holds the tables needed no further grant. Naming a different project as the quota project needs `serviceusage.services.use` on that project (`roles/serviceusage.serviceUsageConsumer`), which is Google's rule for quota projects.
 
 **Token scopes.** A service account, Workload Identity Federation and the metadata server mint storage tokens for `devstorage.read_only` only. User credentials (gcloud's `application-default login`, an `authorized_user` file) cannot be narrowed that way: a refresh grant may ask only for scopes the user consented to, and gcloud's login consents to `cloud-platform`, so asking for `devstorage.read_only` is refused (`invalid_scope`). A user's token therefore carries the user's own `cloud-platform` scope, for the catalog and for storage alike (one token serves both). User credentials are for development on your own machine; on a server they are a host identity the operator can refuse (`google-adc` in `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`).
 
