@@ -6,7 +6,7 @@
 //! A table handle remembers the last version it resolved. The next unpinned
 //! read lists the log for commits past it instead of replaying the log, so it
 //! still sees every new commit; a version's file listing is kept with it (see
-//! [`crate::listing`]).
+//! `crate::listing`).
 
 use std::collections::VecDeque;
 use std::num::NonZero;
