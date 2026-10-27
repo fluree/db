@@ -2,6 +2,7 @@
 
 use crate::binding::BatchError;
 use crate::eval::{ArithmeticError, ComparisonError};
+use std::borrow::Cow;
 use thiserror::Error;
 
 /// Query execution errors
@@ -180,22 +181,25 @@ pub enum QueryError {
         remedy: &'static str,
     },
 
-    /// A registered graph source of a family this build was compiled without
-    /// (an Iceberg / R2RML source without the `iceberg` feature, SQL without
-    /// `sql`, Delta without `delta`), so no reader for it exists here.
+    /// A registered graph source no reader in this build exists for: a family
+    /// it was compiled without (an Iceberg / R2RML source without the
+    /// `iceberg` feature, SQL without `sql`, Delta without `delta`), or a type
+    /// it does not recognize (one a newer build registered).
     ///
     /// Typed so the query fails naming what the build lacks, rather than
     /// reading the source as an empty graph.
     #[error(
         "graph source '{graph_source_id}' is {family} graph source, which this build cannot \
-         read: it was compiled without the '{feature}' feature"
+         read: {cause}"
     )]
     GraphSourceUnsupported {
         graph_source_id: String,
-        /// The family, with its article ("an Iceberg").
-        family: &'static str,
-        /// The cargo feature that reads it.
-        feature: &'static str,
+        /// The family, with its article ("an Iceberg"), or the unrecognized
+        /// type ("a 'f:FutureSource'").
+        family: Cow<'static, str>,
+        /// Why: the cargo feature it was compiled without, or that it does
+        /// not recognize the type.
+        cause: Cow<'static, str>,
     },
 
     /// Object storage denied a read of an external table's data (S3 403 /

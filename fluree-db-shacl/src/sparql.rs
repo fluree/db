@@ -930,8 +930,8 @@ mod tests {
             QueryError::GraphSourceUnsupported { .. } => true, [
                 QueryError::GraphSourceUnsupported {
                     graph_source_id: s(),
-                    family: "an Iceberg",
-                    feature: "iceberg",
+                    family: "an Iceberg".into(),
+                    cause: "c".into(),
                 },
             ];
             QueryError::R2rml(_) => true, [

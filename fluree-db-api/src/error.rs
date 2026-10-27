@@ -1331,8 +1331,8 @@ mod tests {
             (
                 ApiError::Query(QE::GraphSourceUnsupported {
                     graph_source_id: "gs:main".into(),
-                    family: "an Iceberg",
-                    feature: "iceberg",
+                    family: "a 'f:FutureSource'".into(),
+                    cause: "it does not recognize that type".into(),
                 }),
                 501,
                 GRAPH_SOURCE_UNSUPPORTED,

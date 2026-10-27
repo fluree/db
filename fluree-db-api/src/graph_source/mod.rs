@@ -191,25 +191,35 @@ impl SourceReaders {
         delta: cfg!(feature = "delta"),
     };
 
-    /// Refuse a graph source of a mapped family these readers lack. Read by
-    /// nothing, its genesis view would answer every query as an empty graph.
+    /// Refuse a graph source no reader here exists for: a mapped family these
+    /// readers lack, or a type this version does not recognize (one a newer
+    /// build registered). Read by nothing, its genesis view would answer every
+    /// query as an empty graph.
     pub(crate) fn refuse_unread(
         self,
         record: &fluree_db_nameservice::GraphSourceRecord,
     ) -> fluree_db_query::error::Result<()> {
         use fluree_db_nameservice::GraphSourceType as T;
-        let missing = match record.source_type {
-            T::Iceberg if !self.iceberg => Some(("an Iceberg", "iceberg")),
-            T::R2rml if !self.iceberg => Some(("an R2RML", "iceberg")),
-            T::Sql if !self.sql => Some(("a SQL", "sql")),
-            T::Delta if !self.delta => Some(("a Delta", "delta")),
+        use std::borrow::Cow;
+        let without = |feature: &str| -> Cow<'static, str> {
+            format!("it was compiled without the '{feature}' feature").into()
+        };
+        let missing: Option<(Cow<'static, str>, Cow<'static, str>)> = match &record.source_type {
+            T::Iceberg if !self.iceberg => Some(("an Iceberg".into(), without("iceberg"))),
+            T::R2rml if !self.iceberg => Some(("an R2RML".into(), without("iceberg"))),
+            T::Sql if !self.sql => Some(("a SQL".into(), without("sql"))),
+            T::Delta if !self.delta => Some(("a Delta".into(), without("delta"))),
+            T::Unknown(type_name) => Some((
+                format!("a '{type_name}'").into(),
+                "it does not recognize that type".into(),
+            )),
             _ => None,
         };
         match missing {
-            Some((family, feature)) => Err(fluree_db_query::QueryError::GraphSourceUnsupported {
+            Some((family, cause)) => Err(fluree_db_query::QueryError::GraphSourceUnsupported {
                 graph_source_id: record.graph_source_id.to_string(),
                 family,
-                feature,
+                cause,
             }),
             None => Ok(()),
         }
@@ -223,23 +233,19 @@ impl SourceReaders {
 pub(crate) fn refuse_index_source(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> fluree_db_query::error::Result<()> {
-    use fluree_db_nameservice::{GraphSourceKind, GraphSourceType as T};
+    use fluree_db_nameservice::GraphSourceType as T;
     const SEARCH: &str = "query it with an f:graphSource pattern, with its source ledger as \
                           the dataset";
-    if record.source_type.kind() != GraphSourceKind::Index {
-        return Ok(());
-    }
+    // By type, not `kind()`: the nameservice files a type it does not know as
+    // an index, but nothing says it is one; `SourceReaders::refuse_unread`
+    // refuses it instead.
     let (index, remedy) = match &record.source_type {
         T::Bm25 => ("a BM25 index".to_string(), SEARCH),
         T::Vector => ("a vector index".to_string(), SEARCH),
         // No `f:graphSource` pattern searches a geo index; geo search reads
         // the ledger's own index.
         T::Geo => ("a geo index".to_string(), "query its source ledger instead"),
-        // The nameservice files a type it does not know as an index.
-        other => (
-            format!("an index of unrecognized type '{}'", other.to_type_string()),
-            "this build has no reader for it",
-        ),
+        _ => return Ok(()),
     };
     Err(fluree_db_query::QueryError::GraphSourceNotAGraph {
         graph_source_id: record.graph_source_id.to_string(),
@@ -457,14 +463,14 @@ mod tests {
             (T::Delta, "a Delta", "delta"),
         ] {
             match none.refuse_unread(&record(source_type.clone())) {
-                Err(QueryError::GraphSourceUnsupported {
-                    graph_source_id,
-                    family: f,
-                    feature: g,
-                }) => {
-                    assert_eq!(graph_source_id, "gs:main");
-                    assert_eq!((f, g), (family, feature), "{source_type:?}");
-                }
+                Err(e @ QueryError::GraphSourceUnsupported { .. }) => assert_eq!(
+                    e.to_string(),
+                    format!(
+                        "graph source 'gs:main' is {family} graph source, which this build \
+                         cannot read: it was compiled without the '{feature}' feature"
+                    ),
+                    "{source_type:?}"
+                ),
                 other => panic!("{source_type:?}: expected GraphSourceUnsupported, got {other:?}"),
             }
         }
@@ -482,6 +488,19 @@ mod tests {
         for source_type in [T::Iceberg, T::R2rml, T::Sql, T::Delta] {
             assert!(all.refuse_unread(&record(source_type)).is_ok());
         }
+
+        // A type this version does not recognize has no reader whatever the
+        // features.
+        for readers in [none, all] {
+            match readers.refuse_unread(&record(T::Unknown("f:FutureSource".into()))) {
+                Err(e @ QueryError::GraphSourceUnsupported { .. }) => assert_eq!(
+                    e.to_string(),
+                    "graph source 'gs:main' is a 'f:FutureSource' graph source, which this \
+                     build cannot read: it does not recognize that type"
+                ),
+                other => panic!("expected GraphSourceUnsupported, got {other:?}"),
+            }
+        }
     }
 
     /// Each index kind is refused by name, with how a query reaches it; a
@@ -492,11 +511,6 @@ mod tests {
             (T::Bm25, "a BM25 index", "f:graphSource pattern"),
             (T::Vector, "a vector index", "f:graphSource pattern"),
             (T::Geo, "a geo index", "its source ledger"),
-            (
-                T::Unknown("f:FutureIndex".into()),
-                "an index of unrecognized type 'f:FutureIndex'",
-                "no reader",
-            ),
         ] {
             match super::refuse_index_source(&record(source_type.clone())) {
                 Err(e @ QueryError::GraphSourceNotAGraph { .. }) => {
@@ -511,7 +525,15 @@ mod tests {
                 other => panic!("{source_type:?}: expected GraphSourceNotAGraph, got {other:?}"),
             }
         }
-        for source_type in [T::Iceberg, T::R2rml, T::Sql, T::Delta] {
+        // An unrecognized type is not known to be an index, whatever the
+        // nameservice files it as; `refuse_unread` refuses it.
+        for source_type in [
+            T::Iceberg,
+            T::R2rml,
+            T::Sql,
+            T::Delta,
+            T::Unknown("f:FutureSource".into()),
+        ] {
             assert!(super::refuse_index_source(&record(source_type)).is_ok());
         }
     }
