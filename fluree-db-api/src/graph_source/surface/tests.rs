@@ -993,3 +993,87 @@ fn a_read_out_masks_what_its_type_does_not_know_and_refuses_what_it_cannot_read(
         plain
     );
 }
+
+// ---- the flat Iceberg converter's storage identity ----------------------------
+
+fn rest_fields() -> IcebergConnectionFields {
+    IcebergConnectionFields {
+        catalog_uri: Some(URI.into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_surface_default_storage_identity_applies_only_when_none_is_named() {
+    let with_default = |fields: IcebergConnectionFields| {
+        IcebergConnectionFields {
+            default_storage_auth: Some(StorageAuth::Vended),
+            ..fields
+        }
+        .into_connection(&local())
+        .unwrap()
+        .io
+        .storage_auth
+    };
+    assert_eq!(with_default(rest_fields()), Some(StorageAuth::Vended));
+    // Turning vending off is a choice; so is naming an identity.
+    assert_eq!(
+        with_default(IcebergConnectionFields {
+            no_vended_credentials: true,
+            ..rest_fields()
+        }),
+        None
+    );
+    let named = with_default(IcebergConnectionFields {
+        storage_auth: StorageAuthFields {
+            identity: Some("ambient".into()),
+            ..Default::default()
+        },
+        ..rest_fields()
+    });
+    assert_eq!(named, Some(StorageAuth::Ambient));
+    // Never for a mode that has no catalog to vend.
+    let direct = with_default(IcebergConnectionFields {
+        mode: "direct".into(),
+        table_location: Some("s3://b/w/ns/t".into()),
+        ..Default::default()
+    });
+    assert_eq!(direct, None);
+}
+
+#[test]
+fn a_flat_storage_identity_is_checked_like_any_other_value() {
+    let e = IcebergConnectionFields {
+        no_vended_credentials: true,
+        storage_auth: StorageAuthFields {
+            identity: Some("ambient".into()),
+            ..Default::default()
+        },
+        ..rest_fields()
+    }
+    .into_connection(&local())
+    .unwrap_err();
+    assert_eq!(
+        e,
+        GraphSourceInputError::conflict("no_vended_credentials", "storage_identity")
+    );
+    let e = IcebergConnectionFields {
+        storage_auth: StorageAuthFields {
+            google: vec![(
+                "storage_google_service_account_env",
+                GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::from_env("AWS_SECRET_ACCESS_KEY"),
+                },
+            )],
+            ..Default::default()
+        },
+        ..rest_fields()
+    }
+    .into_connection(&SecretRules::listed("SA_KEY", false))
+    .unwrap_err();
+    assert_eq!(e.field, "storage_google_service_account_env");
+    assert!(
+        matches!(e.kind, InputErrorKind::EnvNotAllowed { .. }),
+        "{e}"
+    );
+}

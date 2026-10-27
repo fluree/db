@@ -250,6 +250,8 @@ pub use view::{
 
 #[cfg(feature = "sql")]
 pub use graph_source::sql_auth_from_json;
+#[cfg(feature = "delta")]
+pub use graph_source::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
     guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
@@ -265,12 +267,10 @@ pub use graph_source::{
 /// persisted config with; see [`graph_source::surface`].
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
-    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, AuthProfile,
-    CatalogAuthFields, GraphSourceInputError, InputErrorKind, SecretRules, StorageAuthFields,
-    SECRET_ENV_VARS_ENV,
+    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, secret_field,
+    AuthProfile, CatalogAuthFields, GraphSourceInputError, IcebergConnectionFields, InputErrorKind,
+    SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
 };
-#[cfg(feature = "delta")]
-pub use graph_source::{delta_connection_from_json, DeltaConnection};
 
 #[cfg(feature = "delta")]
 pub use fluree_db_delta::{

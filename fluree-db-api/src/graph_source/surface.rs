@@ -924,64 +924,153 @@ fn flat_iceberg(
     flat: FlatIcebergConnection,
     rules: &SecretRules,
 ) -> Result<IcebergConnectionConfig, GraphSourceInputError> {
-    let auth = CatalogAuthFields {
-        bearer: secret_field(
-            "auth_bearer",
-            flat.auth_bearer,
-            "auth_bearer_env",
-            flat.auth_bearer_env,
-        )?,
-        oauth2_token_url: flat.oauth2_token_url,
-        oauth2_client_id: flat.oauth2_client_id,
-        oauth2_client_secret: secret_field(
-            "oauth2_client_secret",
-            flat.oauth2_client_secret,
-            "oauth2_client_secret_env",
-            flat.oauth2_client_secret_env,
-        )?,
-        oauth2_scope: flat.oauth2_scope,
-        oauth2_audience: flat.oauth2_audience,
-        google: if flat.auth_google_metadata {
-            vec![("auth_google_metadata", GoogleCredentials::Metadata)]
-        } else {
-            Vec::new()
+    IcebergConnectionFields {
+        mode: flat.mode.unwrap_or_default(),
+        catalog_uri: flat.catalog_uri,
+        table_location: flat.table_location,
+        region: flat.region,
+        catalog_id: flat.catalog_id,
+        table_bucket_arn: flat.table_bucket_arn,
+        auth: CatalogAuthFields {
+            bearer: secret_field(
+                "auth_bearer",
+                flat.auth_bearer,
+                "auth_bearer_env",
+                flat.auth_bearer_env,
+            )?,
+            oauth2_token_url: flat.oauth2_token_url,
+            oauth2_client_id: flat.oauth2_client_id,
+            oauth2_client_secret: secret_field(
+                "oauth2_client_secret",
+                flat.oauth2_client_secret,
+                "oauth2_client_secret_env",
+                flat.oauth2_client_secret_env,
+            )?,
+            oauth2_scope: flat.oauth2_scope,
+            oauth2_audience: flat.oauth2_audience,
+            google: if flat.auth_google_metadata {
+                vec![("auth_google_metadata", GoogleCredentials::Metadata)]
+            } else {
+                Vec::new()
+            },
+            google_scopes: flat.auth_google_scopes,
+            google_quota_project: None,
         },
-        google_scopes: flat.auth_google_scopes,
-        google_quota_project: None,
-    };
-    let mut rest_only = auth.given();
-    if flat.warehouse.is_some() {
-        rest_only.push("warehouse");
+        warehouse: flat.warehouse,
+        no_vended_credentials: flat.no_vended_credentials,
+        s3_region: flat.s3_region,
+        s3_endpoint: flat.s3_endpoint,
+        s3_path_style: flat.s3_path_style,
+        storage_auth: StorageAuthFields::default(),
+        default_storage_auth: None,
     }
-    let mut conn = IcebergConnectionConfig::from_mode(CatalogModeArgs {
-        mode: flat.mode.as_deref().unwrap_or(""),
-        catalog_uri: flat.catalog_uri.as_deref(),
-        table_location: flat.table_location.as_deref(),
-        region: flat.region.as_deref(),
-        catalog_id: flat.catalog_id.as_deref(),
-        table_bucket_arn: flat.table_bucket_arn.as_deref(),
-        rest_only: &rest_only,
-    })?;
-    if conn.is_rest() {
-        auth.check(rules)?;
-        conn = conn.with_auth(auth.into_auth(AuthProfile::Catalog)?);
-        if let Some(warehouse) = flat.warehouse {
-            conn = conn.with_warehouse(warehouse);
+    .into_connection(rules)
+}
+
+/// An Iceberg connection's flat spelling: what the legacy HTTP fields and the
+/// CLI's flags collect. [`Self::into_connection`] is the one conversion both
+/// go through.
+#[derive(Debug, Clone, Default)]
+pub struct IcebergConnectionFields {
+    /// `rest` (also when empty), `direct`, `glue` or `s3tables`.
+    pub mode: String,
+    pub catalog_uri: Option<String>,
+    pub table_location: Option<String>,
+    pub region: Option<String>,
+    pub catalog_id: Option<String>,
+    pub table_bucket_arn: Option<String>,
+    pub auth: CatalogAuthFields,
+    pub warehouse: Option<String>,
+    pub no_vended_credentials: bool,
+    pub s3_region: Option<String>,
+    pub s3_endpoint: Option<String>,
+    pub s3_path_style: bool,
+    pub storage_auth: StorageAuthFields,
+    /// The storage identity a REST catalog reads with when the caller names
+    /// none and does not turn vending off: a surface's own default (see
+    /// [`default_storage_auth`]). Never inferred here.
+    pub default_storage_auth: Option<StorageAuth>,
+}
+
+impl IcebergConnectionFields {
+    /// The connection these fields describe, every value checked against
+    /// `rules`: the catalog mode refuses REST-only settings, the auth is one
+    /// mode or none, and the storage identity is one or none.
+    pub fn into_connection(
+        self,
+        rules: &SecretRules,
+    ) -> Result<IcebergConnectionConfig, GraphSourceInputError> {
+        let Self {
+            mode,
+            catalog_uri,
+            table_location,
+            region,
+            catalog_id,
+            table_bucket_arn,
+            auth,
+            warehouse,
+            no_vended_credentials,
+            s3_region,
+            s3_endpoint,
+            s3_path_style,
+            storage_auth,
+            default_storage_auth,
+        } = self;
+        let mut rest_only = auth.given();
+        if warehouse.is_some() {
+            rest_only.push("warehouse");
         }
+        let mut conn = IcebergConnectionConfig::from_mode(CatalogModeArgs {
+            mode: &mode,
+            catalog_uri: catalog_uri.as_deref(),
+            table_location: table_location.as_deref(),
+            region: region.as_deref(),
+            catalog_id: catalog_id.as_deref(),
+            table_bucket_arn: table_bucket_arn.as_deref(),
+            rest_only: &rest_only,
+        })?;
+        if conn.is_rest() {
+            auth.check(rules)?;
+            conn = conn.with_auth(auth.into_auth(AuthProfile::Catalog)?);
+            if let Some(warehouse) = warehouse {
+                conn = conn.with_warehouse(warehouse);
+            }
+        }
+        if no_vended_credentials {
+            conn = conn.with_vended_credentials(false);
+        }
+        if let Some(region) = s3_region {
+            conn = conn.with_s3_region(region);
+        }
+        if let Some(endpoint) = s3_endpoint {
+            conn = conn.with_s3_endpoint(endpoint);
+        }
+        if s3_path_style {
+            conn = conn.with_s3_path_style(true);
+        }
+        for (field, credentials) in &storage_auth.google {
+            for value in credentials.config_values() {
+                rules.check_value(field, value.value, value.class)?;
+            }
+        }
+        let given = !storage_auth.is_empty();
+        match storage_auth.into_storage_auth()? {
+            Some(_) if no_vended_credentials => {
+                return Err(GraphSourceInputError::conflict(
+                    "no_vended_credentials",
+                    "storage_identity",
+                ))
+            }
+            Some(storage_auth) => conn = conn.with_storage_auth(storage_auth),
+            None if !given && !no_vended_credentials && conn.is_rest() => {
+                if let Some(storage_auth) = default_storage_auth {
+                    conn = conn.with_storage_auth(storage_auth);
+                }
+            }
+            None => {}
+        }
+        Ok(conn)
     }
-    if flat.no_vended_credentials {
-        conn = conn.with_vended_credentials(false);
-    }
-    if let Some(region) = flat.s3_region {
-        conn = conn.with_s3_region(region);
-    }
-    if let Some(endpoint) = flat.s3_endpoint {
-        conn = conn.with_s3_endpoint(endpoint);
-    }
-    if flat.s3_path_style {
-        conn = conn.with_s3_path_style(true);
-    }
-    Ok(conn)
 }
 
 // =============================================================================
@@ -1063,6 +1152,7 @@ struct FlatUnity {
     oauth2_client_secret_env: Option<String>,
     oauth2_token_url: Option<String>,
     oauth2_scope: Option<String>,
+    oauth2_audience: Option<String>,
 }
 
 /// The flat storage fields of the Delta routes that read tables.
@@ -1163,6 +1253,7 @@ fn flat_unity(
             flat.oauth2_client_secret_env,
         )?,
         oauth2_scope: flat.oauth2_scope,
+        oauth2_audience: flat.oauth2_audience,
         ..CatalogAuthFields::default()
     };
     auth.check(rules)?;
