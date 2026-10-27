@@ -44,7 +44,7 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_r2rml::mapping::{
     extract_template_columns, CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, RefObjectMap,
-    TriplesMap,
+    TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{
     canonical_join, expand_template, get_join_key_from_batch, materialize_object_from_batch,
@@ -667,6 +667,7 @@ impl R2rmlScanOperator {
             sort_column: col.to_string(),
             k,
             ascending,
+            lexical: compares_as_string(&pom.object_map),
         })
     }
 
@@ -1844,6 +1845,24 @@ impl LiteralEncoder {
     }
 }
 
+/// Whether the engine compares `om`'s terms by a string: an IRI or blank node,
+/// or a literal with no `rr:datatype` (or `xsd:string`), whose value is the
+/// rendered cell (`"10"`, `"-0"`, `"2024-01-01T00:00:00Z"`). A pushdown that
+/// compares the physical column — by its file bounds or a cast comparison —
+/// agrees with that only where the column holds the same strings.
+pub(crate) fn compares_as_string(om: &ObjectMap) -> bool {
+    match om {
+        ObjectMap::Column {
+            term_type: TermType::Iri | TermType::BlankNode,
+            ..
+        } => true,
+        ObjectMap::Column { datatype, .. } => {
+            datatype.as_deref().is_none_or(|dt| dt == xsd::STRING)
+        }
+        _ => false,
+    }
+}
+
 /// The backing column of an object map whose materialized literal value is the
 /// raw column value *verbatim*, so a column-level scan filter comparing that
 /// value cannot drop a row the operator would keep. Only plain `rr:column`
@@ -1925,8 +1944,8 @@ fn is_xsd_integer_datatype(iri: &str) -> bool {
 /// rows. Non-canonical forms (`"01"`, `"1.0"`, a non-numeric string) are ambiguous
 /// and DECLINED. A value already carrying a pushable, residual-matched type
 /// (`Int`/`Bool`/`Date`) pushes as-is; a string against any non-integer column
-/// pushes as-is too — a string column prunes lexicographically, and the reader
-/// safely ignores a string filter on a numeric physical column (pre-existing).
+/// pushes as-is too — the provider applies a string only to a string column, or
+/// by equality to a cell that renders as exactly that string.
 fn coerce_scalar_for_pushdown(
     value: &crate::r2rml::ScanValue,
     om: &ObjectMap,
@@ -1997,6 +2016,16 @@ pub(crate) fn pattern_scan_filters(
         let Some(col) = value_pushdown_column(&pom.object_map) else {
             continue;
         };
+        // A string term never equals a non-string literal (equality does not
+        // coerce), so `!=` holds on every row, and the physical comparison
+        // (`i32 != 10` for an un-annotated column's `"10"`) would prune rows the
+        // FILTER keeps.
+        if pd.op == crate::r2rml::ScanCmpOp::NotEq
+            && !matches!(pd.value, crate::r2rml::ScanValue::Str(_))
+            && compares_as_string(&pom.object_map)
+        {
+            continue;
+        }
         out.push(crate::r2rml::ScanFilter {
             column: col.to_string(),
             op: pd.op,
@@ -4004,6 +4033,84 @@ mod tests {
             &ScanValue::Str("1".into()),
         );
         assert!(out.is_empty());
+    }
+
+    /// An un-annotated column's term is the string of its cell, which never
+    /// equals a non-string literal: `FILTER(?v != 10)` keeps every row, so the
+    /// physical `!=` must not push. A string literal, or a typed column, still
+    /// pushes `!=`.
+    #[test]
+    fn not_equal_to_a_typed_literal_stays_off_a_string_term() {
+        use crate::r2rml::{ScanCmpOp, ScanValue};
+        use crate::seed::EmptyOperator;
+
+        let tm = TriplesMap::new("#Cell", "CELLS")
+            .with_subject_template("http://ex/cell/{ID}")
+            .with_predicate_object(pom("http://ex/plain", "PLAIN"))
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/typed"),
+                object_map: ObjectMap::column_typed("TYPED", fluree_vocab::xsd::INTEGER),
+            });
+        let pushed = |pred: &str, op: ScanCmpOp, value: ScanValue| {
+            let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+            pattern.predicate_filter = Some(pred.to_string());
+            pattern.scan_filters = vec![crate::ir::adapters::ScanPushdown {
+                var: VarId(1),
+                op,
+                value,
+            }];
+            R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern)
+                .build_scan_filters(&tm)
+                .len()
+        };
+        assert_eq!(
+            pushed("http://ex/plain", ScanCmpOp::NotEq, ScanValue::Int(10)),
+            0
+        );
+        assert_eq!(
+            pushed("http://ex/plain", ScanCmpOp::NotEq, ScanValue::Bool(true)),
+            0
+        );
+        assert_eq!(
+            pushed(
+                "http://ex/plain",
+                ScanCmpOp::NotEq,
+                ScanValue::Str("10".into())
+            ),
+            1
+        );
+        assert_eq!(
+            pushed("http://ex/plain", ScanCmpOp::Lt, ScanValue::Int(10)),
+            1
+        );
+        assert_eq!(
+            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Int(10)),
+            1
+        );
+    }
+
+    #[test]
+    fn compares_as_string_reads_the_object_map() {
+        use fluree_db_r2rml::mapping::ObjectMap;
+        assert!(compares_as_string(&ObjectMap::column("C")));
+        assert!(compares_as_string(&ObjectMap::column_typed(
+            "C",
+            fluree_vocab::xsd::STRING
+        )));
+        assert!(!compares_as_string(&ObjectMap::column_typed(
+            "C",
+            fluree_vocab::xsd::INTEGER
+        )));
+        assert!(!compares_as_string(&ObjectMap::column_typed(
+            "C",
+            fluree_vocab::xsd::DATE
+        )));
+        assert!(compares_as_string(&ObjectMap::Column {
+            column: "C".into(),
+            datatype: None,
+            language: None,
+            term_type: TermType::Iri,
+        }));
     }
 
     // W4-1 PRIMARY end-to-end: a scalar constant-object member of a same-subject

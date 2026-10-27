@@ -155,6 +155,12 @@ pub struct ScanTopK {
     /// `true` for an `ASC` sort (admitted only for a required column; the provider
     /// re-checks nullability), `false` for `DESC`.
     pub ascending: bool,
+    /// `true` when the engine orders the column's rendered string rather than its
+    /// value — an un-annotated or `xsd:string` object map, whose literal is the
+    /// `xsd:string` of the cell (`"10"` sorts before `"9"`). Only a string
+    /// column's bounds order that way, so the provider admits such a directive
+    /// on a string column alone.
+    pub lexical: bool,
 }
 
 /// The table state a time-pinned graph-source query reads, in the source

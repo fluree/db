@@ -845,7 +845,7 @@ fn build_iceberg_filter(
         // dropped (a partial `In` could prune a file a missing member's rows need).
         if f.op == ScanCmpOp::In {
             if let ScanValue::Set(members) = &f.value {
-                if let Some(values) = set_members_to_literals(field.type_string(), members) {
+                if let Some(values) = set_members_to_literals(field.type_string(), members, true) {
                     comparisons.push(Expression::In {
                         field_id: field.id,
                         column: f.column.clone(),
@@ -865,7 +865,8 @@ fn build_iceberg_filter(
             // Handled above; `In` never reaches the scalar `ComparisonOp` mapping.
             ScanCmpOp::In => continue,
         };
-        let Some(value) = scan_value_to_literal(field.type_string(), &f.value) else {
+        let equality = op == ComparisonOp::Eq;
+        let Some(value) = scan_value_to_literal(field.type_string(), &f.value, equality) else {
             continue;
         };
         comparisons.push(Expression::Comparison {
@@ -890,10 +891,11 @@ fn build_iceberg_filter(
 fn set_members_to_literals(
     field_type: Option<&str>,
     members: &[ScanValue],
+    equality: bool,
 ) -> Option<Vec<LiteralValue>> {
     let mut out = Vec::with_capacity(members.len());
     for m in members {
-        out.push(scan_value_to_literal(field_type, m)?);
+        out.push(scan_value_to_literal(field_type, m, equality)?);
     }
     Some(out)
 }
@@ -901,9 +903,17 @@ fn set_members_to_literals(
 /// Translate one scalar [`ScanValue`] to an Iceberg pushdown [`LiteralValue`]
 /// against a column of the given physical type, or `None` to skip the push
 /// (leaving the in-engine FILTER as the authority). Shared by the single-value
-/// `Comparison` path and the set-membership `In` path.
-fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<LiteralValue> {
+/// `Comparison` path and the set-membership `In` path; `equality` says the value
+/// is compared by `=` or `IN`.
+fn scan_value_to_literal(
+    field_type: Option<&str>,
+    value: &ScanValue,
+    equality: bool,
+) -> Option<LiteralValue> {
     Some(match value {
+        // Not against a string column: the reader would compare the cast text
+        // `"true"`, where the operator matches a constant loosely (`"1"` too).
+        ScanValue::Bool(_) if field_type == Some("string") => return None,
         ScanValue::Bool(b) => LiteralValue::Boolean(*b),
         // Push a Date literal only against a physically-`date` column. The
         // Arrow reader applies it as an exact row filter (casting the column
@@ -919,8 +929,21 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
         // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
         // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
         // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
+        // Nor against a string column: the cast text "10" misses a cell "010"
+        // the operator's integer parse matches, and "10" < "5" as text.
+        ScanValue::Int(_) if field_type == Some("string") => return None,
         ScanValue::Int(n) => int_pushdown_literal(*n, field_type, iceberg_numeric_stats_enabled())?,
-        ScanValue::Str(s) => LiteralValue::String(s.clone()),
+        // A string literal compares as a string. The reader would cast it to a
+        // non-string column's type and compare values instead, which is another
+        // comparison: an un-annotated integer column's literal is "10", and
+        // "10" < "5". So a string goes to a string column, or, by equality, to a
+        // column whose cell renders as exactly that string (see
+        // `rendered_cell_literal`).
+        ScanValue::Str(s) => match field_type {
+            Some("string") => LiteralValue::String(s.clone()),
+            _ if equality => rendered_cell_literal(field_type, s)?,
+            _ => return None,
+        },
         // xsd:double / xsd:float FILTER value. Push only against a physically
         // `double` column (exact f64 bounds); a `float` column would need an
         // f64→f32 narrowing that can round the literal and over-prune a range,
@@ -1011,6 +1034,35 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
         // a well-formed filter; declining defensively is never wrong).
         ScanValue::Set(_) => return None,
     })
+}
+
+/// The cell value of a `field_type` column that an un-annotated mapping renders
+/// as exactly `s`, as a pushdown literal: `"10"` → 10 on an integer column, but
+/// nothing for `"010"`, which no cell renders. Rendered through the materializer
+/// itself, so the cell equals `s` as a string exactly when it equals the literal
+/// as a value. Integer and date columns only; any other declines.
+fn rendered_cell_literal(field_type: Option<&str>, s: &str) -> Option<LiteralValue> {
+    use fluree_db_tabular::Column;
+    let (cell, literal) = match field_type? {
+        "int" => {
+            let n: i32 = s.parse().ok()?;
+            (Column::Int32(vec![Some(n)]), LiteralValue::Int32(n))
+        }
+        "long" => {
+            let n: i64 = s.parse().ok()?;
+            (Column::Int64(vec![Some(n)]), LiteralValue::Int64(n))
+        }
+        "date" => {
+            let days = fluree_db_core::Date::parse(s).ok()?.days_since_epoch();
+            (Column::Date(vec![Some(days)]), LiteralValue::Date(days))
+        }
+        _ => return None,
+    };
+    let rendered = fluree_db_r2rml::materialize::lexical_column(&cell);
+    let Column::String(rendered) = rendered.as_ref() else {
+        return None;
+    };
+    (rendered.first()?.as_deref() == Some(s)).then_some(literal)
 }
 
 // =============================================================================
@@ -4272,9 +4324,12 @@ impl FlureeR2rmlProvider<'_> {
             // DESC is sound for any column (unbound sorts last). A declined directive
             // simply falls through to the normal parallel scan below (ignoring a
             // top-k is always correct — the `SortOperator` above is authoritative).
+            // A lexical directive orders the cell's rendered string, which only a
+            // string column's bounds order the same way ("10" sorts before "9").
             let admitted = schema
                 .field_by_name(&tk.sort_column)
-                .filter(|field| !tk.ascending || field.required);
+                .filter(|field| !tk.ascending || field.required)
+                .filter(|field| !tk.lexical || field.type_string() == Some("string"));
             if let Some(field) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
@@ -5063,6 +5118,104 @@ mod tests {
         assert!(matches!(
             only_literal(&[key_filter("str_key", "west/5")], &s),
             Some(LiteralValue::String(v)) if v == "west/5"
+        ));
+    }
+
+    fn cmp_filter(col: &str, op: ScanCmpOp, value: ScanValue) -> ScanFilter {
+        ScanFilter {
+            column: col.to_string(),
+            op,
+            value,
+        }
+    }
+
+    /// A string literal compares as a string, so it pushes to a string column,
+    /// and to another column only by equality with a cell that renders as
+    /// exactly that string. An un-annotated integer column's literal is "10",
+    /// and "10" < "5": casting the literal to the column's type and comparing
+    /// values would prune rows the FILTER keeps.
+    #[test]
+    fn string_literal_pushes_only_where_it_compares_as_a_string() {
+        let s = key_schema();
+        let str_lit = |v: &str| ScanValue::Str(v.to_string());
+        assert!(matches!(
+            only_literal(&[cmp_filter("str_key", ScanCmpOp::Lt, str_lit("5"))], &s),
+            Some(LiteralValue::String(v)) if v == "5"
+        ));
+        for col in [
+            "int_key",
+            "long_key",
+            "dec_key",
+            "date_key",
+            "double_key",
+            "float_key",
+        ] {
+            for op in [ScanCmpOp::Lt, ScanCmpOp::GtEq, ScanCmpOp::NotEq] {
+                assert!(
+                    build_iceberg_filter(&[cmp_filter(col, op, str_lit("5"))], &s).is_none(),
+                    "{col} {op:?}"
+                );
+            }
+        }
+        // Equality with an integer's own rendering is equality with the integer.
+        assert!(matches!(
+            only_literal(&[cmp_filter("int_key", ScanCmpOp::Eq, str_lit("10"))], &s),
+            Some(LiteralValue::Int32(10))
+        ));
+        assert!(matches!(
+            only_literal(&[cmp_filter("long_key", ScanCmpOp::Eq, str_lit("-3"))], &s),
+            Some(LiteralValue::Int64(-3))
+        ));
+        assert!(matches!(
+            only_literal(
+                &[cmp_filter("date_key", ScanCmpOp::Eq, str_lit("1969-12-31"))],
+                &s
+            ),
+            Some(LiteralValue::Date(-1))
+        ));
+        // No cell renders as these, so there is no value to push.
+        for (col, v) in [
+            ("int_key", "010"),
+            ("int_key", "+10"),
+            ("long_key", "1e3"),
+            ("date_key", "2024-01-15Z"),
+            ("double_key", "1.5"),
+            ("dec_key", "5"),
+        ] {
+            assert!(
+                build_iceberg_filter(&[cmp_filter(col, ScanCmpOp::Eq, str_lit(v))], &s).is_none(),
+                "{col} = {v:?}"
+            );
+        }
+        // A set pushes whole only when every member does.
+        let set = |vs: &[&str]| ScanValue::Set(vs.iter().map(|v| str_lit(v)).collect());
+        assert!(matches!(
+            build_iceberg_filter(&[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "10"]))], &s),
+            Some(Expression::In { values, .. })
+                if values == [LiteralValue::Int64(9), LiteralValue::Int64(10)]
+        ));
+        assert!(build_iceberg_filter(
+            &[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "09"]))],
+            &s
+        )
+        .is_none());
+    }
+
+    /// A boolean or integer constant is matched loosely by the operator (`"1"`
+    /// is true, `"010"` is 10), which the cast text compared against a string
+    /// column would miss.
+    #[test]
+    fn typed_scalar_skips_a_string_column() {
+        let s = key_schema();
+        for v in [ScanValue::Bool(true), ScanValue::Int(10)] {
+            assert!(build_iceberg_filter(&[cmp_filter("str_key", ScanCmpOp::Eq, v)], &s).is_none());
+        }
+        assert!(matches!(
+            only_literal(
+                &[cmp_filter("long_key", ScanCmpOp::Eq, ScanValue::Int(10))],
+                &s
+            ),
+            Some(LiteralValue::Int64(10))
         ));
     }
 
