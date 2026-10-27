@@ -173,9 +173,11 @@ pub enum AuthConfig {
         /// BigLake accepts (as does `bigquery`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scopes: Option<String>,
-        /// The project requests bill to. Wins over the credential JSON's
-        /// `quota_project_id`. Needed for user credentials (ADC), which
-        /// Google refuses without one.
+        /// The project catalog requests bill to. Wins over the credential
+        /// JSON's `quota_project_id`. BigLake requires one for every identity
+        /// (user credentials, a service account, WIF). It bills the catalog
+        /// only: `storage_auth: catalog` reads with this identity but never
+        /// sends this project to storage.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quota_project: Option<String>,
     },

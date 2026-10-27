@@ -142,6 +142,69 @@ async fn a_ranged_read_returns_exactly_the_range_as_the_identity() {
     );
 }
 
+/// A store bills its reads to the project it was built with, never to the
+/// identity's own quota project: that one bills the catalog's API (BigLake),
+/// and sent to GCS it would make every read a requester-pays read needing
+/// `serviceusage.services.use` on it.
+#[tokio::test]
+async fn a_store_bills_only_the_project_configured_for_storage() {
+    let (google, gcs) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .and(path(METADATA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "t", "expires_in": 3600, "token_type": "Bearer"
+        })))
+        .mount(&google)
+        .await;
+    // The catalog's identity, with the quota project its catalog calls bill to.
+    let catalog_identity = Arc::new(
+        GoogleIdentity::with_endpoints(
+            &GoogleCredentials::Metadata,
+            Some("catalog-billing"),
+            &IdentityContext::default(),
+            &endpoints_at(&google),
+        )
+        .unwrap(),
+    );
+    assert_eq!(catalog_identity.quota_project(), Some("catalog-billing"));
+    Mock::given(method("GET"))
+        .and(object_at("/lake/f"))
+        .respond_with(object(BODY))
+        .mount(&gcs)
+        .await;
+    let billed_to = |requests: &[Request]| -> Vec<Option<String>> {
+        requests
+            .iter()
+            .map(|r| {
+                r.headers
+                    .get("x-goog-user-project")
+                    .map(|v| v.to_str().unwrap().to_string())
+            })
+            .collect()
+    };
+
+    let unbilled = store_as(Arc::clone(&catalog_identity), &gcs, None);
+    SendIcebergStorage::read(&unbilled, "gs://lake/f")
+        .await
+        .unwrap();
+    assert_eq!(billed_to(&gcs.received_requests().await.unwrap()), [None]);
+
+    gcs.reset().await;
+    Mock::given(method("GET"))
+        .and(object_at("/lake/f"))
+        .respond_with(object(BODY))
+        .mount(&gcs)
+        .await;
+    let billed = store_as(catalog_identity, &gcs, Some("storage-billing"));
+    SendIcebergStorage::read(&billed, "gs://lake/f")
+        .await
+        .unwrap();
+    assert_eq!(
+        billed_to(&gcs.received_requests().await.unwrap()),
+        [Some("storage-billing".to_string())]
+    );
+}
+
 #[tokio::test]
 async fn ranges_come_back_in_input_order_and_whole_reads_are_whole() {
     let (google, gcs) = (MockServer::start().await, MockServer::start().await);

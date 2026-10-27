@@ -274,6 +274,9 @@ enum Planned {
     },
     Google {
         identity: Arc<GoogleIdentity>,
+        /// The billing project storage reads name (`x-goog-user-project`):
+        /// only one configured for storage (`StorageAuth::Google`'s
+        /// `quota_project`), never the catalog's.
         user_project: Option<String>,
         from_catalog: bool,
     },
@@ -568,8 +571,12 @@ pub(crate) async fn plan_storage(
                 })
             })
             .await?;
-            let user_project = identity.quota_project().map(str::to_string);
-            google_plan(identity, user_project, true, io, &context, gcs_endpoint()).await
+            // The catalog's quota project bills its BigLake calls; storage
+            // reads use the catalog's identity but not its quota project.
+            // Sent to GCS, `x-goog-user-project` is a requester-pays billing
+            // project, which needs serviceusage.services.use on it: a storage
+            // read bills to a project only when one is configured for storage.
+            google_plan(identity, None, true, io, &context, gcs_endpoint()).await
         }
         StorageAuth::Google {
             credentials,
@@ -584,7 +591,9 @@ pub(crate) async fn plan_storage(
                 GoogleIdentity::new(&hydrated, quota_project.as_deref(), ctx)
             })
             .await?;
-            let user_project = identity.quota_project().map(str::to_string);
+            // Only the quota project configured for storage bills its reads,
+            // not one a credential file names for itself.
+            let user_project = quota_project.clone();
             google_plan(identity, user_project, false, io, &context, gcs_endpoint()).await
         }
     }
