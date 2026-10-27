@@ -1054,12 +1054,15 @@ fn bound_order(field_type: Option<&str>) -> Option<TermOrder> {
 
 /// The cell value of a `field_type` column that an un-annotated mapping renders
 /// as exactly `s`, as a pushdown literal: `"10"` → 10 on an integer column, but
-/// nothing for `"010"`, which no cell renders. Rendered through the materializer
-/// itself, so the cell equals `s` as a string exactly when it equals the literal
-/// as a value. Integer and date columns only; any other declines.
+/// nothing for `"010"`, which no cell renders. The constant is read as the
+/// column's type and rendered back through the materializer itself, so a cell
+/// equals `s` as a string exactly when it equals the literal as a value. A
+/// float pushes only a finite, non-zero value: `NaN` equals nothing by value,
+/// and `-0` and `0` render apart but compare equal. Any other type declines.
 fn rendered_cell_literal(field_type: Option<&str>, s: &str) -> Option<LiteralValue> {
     use fluree_db_tabular::Column;
-    let (cell, literal) = match field_type? {
+    let field_type = field_type?;
+    let (cell, literal) = match field_type {
         "int" => {
             let n: i32 = s.parse().ok()?;
             (Column::Int32(vec![Some(n)]), LiteralValue::Int32(n))
@@ -1068,9 +1071,56 @@ fn rendered_cell_literal(field_type: Option<&str>, s: &str) -> Option<LiteralVal
             let n: i64 = s.parse().ok()?;
             (Column::Int64(vec![Some(n)]), LiteralValue::Int64(n))
         }
+        "boolean" => {
+            let b: bool = s.parse().ok()?;
+            (Column::Boolean(vec![Some(b)]), LiteralValue::Boolean(b))
+        }
         "date" => {
             let days = fluree_db_core::Date::parse(s).ok()?.days_since_epoch();
             (Column::Date(vec![Some(days)]), LiteralValue::Date(days))
+        }
+        "timestamp" | "timestamptz" => {
+            let micros = fluree_db_core::DateTime::parse(s).ok()?.epoch_micros();
+            if field_type == "timestamp" {
+                (
+                    Column::Timestamp(vec![Some(micros)]),
+                    LiteralValue::Timestamp(micros),
+                )
+            } else {
+                (
+                    Column::TimestampTz(vec![Some(micros)]),
+                    LiteralValue::TimestampTz(micros),
+                )
+            }
+        }
+        "double" => {
+            let f: f64 = s
+                .parse()
+                .ok()
+                .filter(|f: &f64| f.is_finite() && *f != 0.0)?;
+            (Column::Float64(vec![Some(f)]), LiteralValue::Float64(f))
+        }
+        "float" => {
+            let f: f32 = s
+                .parse()
+                .ok()
+                .filter(|f: &f32| f.is_finite() && *f != 0.0)?;
+            (Column::Float32(vec![Some(f)]), LiteralValue::Float32(f))
+        }
+        t if t.starts_with("decimal(") => {
+            let (precision, scale) = decimal_precision_scale(t)?;
+            let unscaled = decimal_unscaled(s, scale)?;
+            let cell = Column::Decimal {
+                values: vec![Some(unscaled)],
+                precision,
+                scale,
+            };
+            let literal = LiteralValue::Decimal {
+                unscaled,
+                precision,
+                scale,
+            };
+            (cell, literal)
         }
         _ => return None,
     };
@@ -1079,6 +1129,29 @@ fn rendered_cell_literal(field_type: Option<&str>, s: &str) -> Option<LiteralVal
         return None;
     };
     (rendered.first()?.as_deref() == Some(s)).then_some(literal)
+}
+
+/// `(precision, scale)` of an Iceberg `decimal(p,s)` type string.
+fn decimal_precision_scale(type_string: &str) -> Option<(u8, i8)> {
+    let args = type_string.strip_prefix("decimal(")?.strip_suffix(')')?;
+    let (p, s) = args.split_once(',')?;
+    Some((p.trim().parse().ok()?, s.trim().parse().ok()?))
+}
+
+/// The unscaled value of a plain decimal string (`-0.05`) at `scale`, or
+/// `None` when it has more fractional digits than the scale holds.
+fn decimal_unscaled(s: &str, scale: i8) -> Option<i128> {
+    let width = usize::try_from(scale).ok()?;
+    let (negative, digits) = s.strip_prefix('-').map_or((false, s), |d| (true, d));
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if int.is_empty()
+        || frac.len() > width
+        || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let n: i128 = format!("{int}{frac:0<width$}").parse().ok()?;
+    Some(if negative { -n } else { n })
 }
 
 // =============================================================================
@@ -5195,8 +5268,10 @@ mod tests {
             ("int_key", "+10"),
             ("long_key", "1e3"),
             ("date_key", "2024-01-15Z"),
-            ("double_key", "1.5"),
-            ("dec_key", "5"),
+            ("double_key", "1.50"),
+            ("double_key", "1e1"),
+            ("dec_key", "5.0"),
+            ("dec_key", "05"),
         ] {
             assert!(
                 build_iceberg_filter(&[cmp_filter(col, ScanCmpOp::Eq, str_lit(v))], &s).is_none(),
@@ -5238,6 +5313,69 @@ mod tests {
             assert_eq!(bound_order(Some(ty)), order, "{ty}");
         }
         assert_eq!(bound_order(None), None);
+    }
+
+    /// Equality with a cell's own rendering pushes as that cell's value for
+    /// every type with an exact round trip; a float only when finite and
+    /// non-zero.
+    #[test]
+    fn string_equality_round_trips_through_the_rendering() {
+        let s = Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: vec![
+                field(1, "flag", json!("boolean")),
+                field(2, "amt", json!("decimal(38,9)")),
+                field(3, "at", json!("timestamp")),
+                field(4, "at_tz", json!("timestamptz")),
+                field(5, "d", json!("double")),
+                field(6, "f", json!("float")),
+            ],
+        };
+        let eq = |col: &str, v: &str| {
+            only_literal(
+                &[cmp_filter(
+                    col,
+                    ScanCmpOp::Eq,
+                    ScanValue::Str(v.to_string()),
+                )],
+                &s,
+            )
+        };
+        assert_eq!(eq("flag", "true"), Some(LiteralValue::Boolean(true)));
+        assert_eq!(eq("flag", "1"), None);
+        assert_eq!(
+            eq("amt", "-0.050000000"),
+            Some(LiteralValue::Decimal {
+                unscaled: -50_000_000,
+                precision: 38,
+                scale: 9
+            })
+        );
+        assert_eq!(eq("amt", "0.05"), None);
+        assert_eq!(
+            eq("at", "1969-12-31T23:59:59.999999Z"),
+            Some(LiteralValue::Timestamp(-1))
+        );
+        assert_eq!(
+            eq("at_tz", "1970-01-01T00:00:00Z"),
+            Some(LiteralValue::TimestampTz(0))
+        );
+        assert_eq!(eq("at", "1970-01-01T00:00:00.000000Z"), None);
+        assert_eq!(eq("at", "1970-01-01T00:00:00+00:00"), None);
+        assert_eq!(
+            eq("d", "1000000000000000000000"),
+            Some(LiteralValue::Float64(1e21))
+        );
+        assert_eq!(eq("f", "0.1"), Some(LiteralValue::Float32(0.1)));
+        for v in ["0", "-0", "NaN", "INF", "-INF"] {
+            assert_eq!(eq("d", v), None, "{v}");
+        }
+        // Ordering by a string never pushes to these columns.
+        for col in ["flag", "amt", "at", "d"] {
+            let lt = cmp_filter(col, ScanCmpOp::Lt, ScanValue::Str("5".into()));
+            assert!(build_iceberg_filter(&[lt], &s).is_none(), "{col}");
+        }
     }
 
     /// A boolean or integer constant is matched loosely by the operator (`"1"`
