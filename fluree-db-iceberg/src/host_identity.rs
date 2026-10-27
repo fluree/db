@@ -2,13 +2,14 @@
 //!
 //! Some graph-source identities are not carried by the source at all: they are
 //! the identity of the process reading it. The ambient AWS credential chain,
-//! the GCE/GKE metadata server, the host's gcloud application-default
-//! credentials, and a Workload Identity Federation exchange signed with the
-//! host's own AWS identity all hand a source whatever the host can reach. On a
-//! single-tenant install that is the point; on a stack that serves several
-//! tenants it lets one tenant's source read with an identity the operator never
-//! granted it (the WIF config is not secret, so tenant B can paste tenant A's
-//! and become A on Google).
+//! the ambient Azure credentials (a Delta table's storage with no service
+//! principal of its own), the GCE/GKE metadata server, the host's gcloud
+//! application-default credentials, and a Workload Identity Federation
+//! exchange signed with the host's own AWS identity all hand a source
+//! whatever the host can reach. On a single-tenant install that is the point;
+//! on a stack that serves several tenants it lets one tenant's source read
+//! with an identity the operator never granted it (the WIF config is not
+//! secret, so tenant B can paste tenant A's and become A on Google).
 //!
 //! So the operator decides which of these a graph source may use, modelled on
 //! [`crate::local_guard`]: a deployment-time switch read once from the
@@ -21,8 +22,8 @@ use std::sync::OnceLock;
 use crate::error::{IcebergError, Result};
 
 /// Which host-derived identities graph sources may use: a comma-separated list
-/// of [`HostIdentityKind`] names (`aws`, `google-metadata`, `google-adc`,
-/// `google-wif`), or `all` (the default when unset) or `none`.
+/// of [`HostIdentityKind`] names (`aws`, `azure`, `google-metadata`,
+/// `google-adc`, `google-wif`), or `all` (the default when unset) or `none`.
 ///
 /// Fail closed: a value that does not parse (an unknown name, `all` mixed with
 /// names) allows nothing, and set-but-empty allows nothing.
@@ -37,6 +38,9 @@ pub const AMBIENT_BUCKETS_ENV: &str = "FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS";
 pub enum HostIdentityKind {
     /// The process's ambient AWS credential chain, reading object storage.
     Aws,
+    /// The process's ambient Azure credentials (environment, managed identity),
+    /// reading Azure storage for a Delta source with no `io.azure` of its own.
+    Azure,
     /// The GCE/GKE metadata server's attached service account.
     GoogleMetadata,
     /// The host's gcloud application-default credentials file.
@@ -48,8 +52,9 @@ pub enum HostIdentityKind {
 
 impl HostIdentityKind {
     /// Every kind, in the order [`HOST_IDENTITIES_ENV`] documents them.
-    pub const ALL: [HostIdentityKind; 4] = [
+    pub const ALL: [HostIdentityKind; 5] = [
         HostIdentityKind::Aws,
+        HostIdentityKind::Azure,
         HostIdentityKind::GoogleMetadata,
         HostIdentityKind::GoogleApplicationDefault,
         HostIdentityKind::GoogleHostSignedWif,
@@ -59,6 +64,7 @@ impl HostIdentityKind {
     pub fn as_str(self) -> &'static str {
         match self {
             HostIdentityKind::Aws => "aws",
+            HostIdentityKind::Azure => "azure",
             HostIdentityKind::GoogleMetadata => "google-metadata",
             HostIdentityKind::GoogleApplicationDefault => "google-adc",
             HostIdentityKind::GoogleHostSignedWif => "google-wif",
@@ -86,7 +92,13 @@ impl std::fmt::Display for HostIdentityKind {
 pub struct HostIdentityPolicy {
     /// The ambient AWS credential chain may read object storage.
     pub ambient_aws: bool,
-    /// The buckets ambient AWS may read; `None` means any bucket.
+    /// The ambient Azure credentials may read Azure storage.
+    pub ambient_azure: bool,
+    /// The buckets ambient AWS may read; `None` means any bucket. Under an
+    /// allowlist an ambient read that names an endpoint override is refused
+    /// (the endpoint, not the URI, would choose the bucket). It governs
+    /// storage reads only: an AWS Glue or S3 Tables catalog call is gated by
+    /// `aws` alone, and lists whatever the host role can see.
     pub ambient_aws_buckets: Option<Vec<String>>,
     /// The GCE/GKE metadata server may mint Google tokens.
     pub google_metadata: bool,
@@ -107,6 +119,7 @@ impl HostIdentityPolicy {
     pub fn allow_all() -> Self {
         Self {
             ambient_aws: true,
+            ambient_azure: true,
             ambient_aws_buckets: None,
             google_metadata: true,
             google_application_default: true,
@@ -118,6 +131,7 @@ impl HostIdentityPolicy {
     pub fn deny_all() -> Self {
         Self {
             ambient_aws: false,
+            ambient_azure: false,
             ambient_aws_buckets: None,
             google_metadata: false,
             google_application_default: false,
@@ -160,8 +174,8 @@ impl HostIdentityPolicy {
                     let kind = HostIdentityKind::from_name(name).ok_or_else(|| {
                         IcebergError::Config(format!(
                             "{HOST_IDENTITIES_ENV}: '{name}' is not a host identity (expected a \
-                             comma-separated list of aws, google-metadata, google-adc, google-wif, \
-                             or exactly `all` or `none`)"
+                             comma-separated list of aws, azure, google-metadata, google-adc, \
+                             google-wif, or exactly `all` or `none`)"
                         ))
                     })?;
                     policy.set(kind, true);
@@ -183,6 +197,7 @@ impl HostIdentityPolicy {
     pub fn allows(&self, kind: HostIdentityKind) -> bool {
         match kind {
             HostIdentityKind::Aws => self.ambient_aws,
+            HostIdentityKind::Azure => self.ambient_azure,
             HostIdentityKind::GoogleMetadata => self.google_metadata,
             HostIdentityKind::GoogleApplicationDefault => self.google_application_default,
             HostIdentityKind::GoogleHostSignedWif => self.google_host_signed_wif,
@@ -201,6 +216,7 @@ impl HostIdentityPolicy {
     fn set(&mut self, kind: HostIdentityKind, allowed: bool) {
         match kind {
             HostIdentityKind::Aws => self.ambient_aws = allowed,
+            HostIdentityKind::Azure => self.ambient_azure = allowed,
             HostIdentityKind::GoogleMetadata => self.google_metadata = allowed,
             HostIdentityKind::GoogleApplicationDefault => {
                 self.google_application_default = allowed;
@@ -246,6 +262,26 @@ mod tests {
         assert!(policy.allows(HostIdentityKind::GoogleHostSignedWif));
         assert!(!policy.allows(HostIdentityKind::GoogleMetadata));
         assert!(!policy.allows(HostIdentityKind::GoogleApplicationDefault));
+    }
+
+    #[test]
+    fn azure_is_a_host_identity_of_its_own_and_part_of_all() {
+        assert!(HostIdentityPolicy::parse(None, None)
+            .unwrap()
+            .allows(HostIdentityKind::Azure));
+        assert!(HostIdentityPolicy::parse(Some("all"), None)
+            .unwrap()
+            .allows(HostIdentityKind::Azure));
+        let azure_only = HostIdentityPolicy::parse(Some("azure"), None).unwrap();
+        assert!(azure_only.allows(HostIdentityKind::Azure));
+        assert!(!azure_only.allows(HostIdentityKind::Aws));
+        let aws_only = HostIdentityPolicy::parse(Some("aws"), None).unwrap();
+        assert!(!aws_only.allows(HostIdentityKind::Azure));
+        assert!(HostIdentityPolicy::deny_all()
+            .ensure(HostIdentityKind::Azure)
+            .unwrap_err()
+            .to_string()
+            .contains("'azure'"));
     }
 
     #[test]

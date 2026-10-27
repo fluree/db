@@ -109,7 +109,14 @@ impl IdentityContext {
         };
         #[cfg(not(feature = "aws"))]
         let subject = "host".to_string();
-        format!("subject={subject};policy={}", self.policy.cache_scope())
+        let scope = format!("subject={subject};policy={}", self.policy.cache_scope());
+        // Whose secrets the resolver resolves (see `SecretResolver::scope_id`):
+        // absent for a resolver that names none, which keeps the scope of every
+        // context built before scope ids existed.
+        match self.secret_resolver.as_ref().and_then(|r| r.scope_id()) {
+            Some(secrets) => format!("{scope};secrets={secrets}"),
+            None => scope,
+        }
     }
 }
 
@@ -605,6 +612,37 @@ mod tests {
             },
         };
         assert!(auth.hydrate(None).await.is_err());
+    }
+
+    #[test]
+    fn identity_context_cache_scope_tracks_whose_secrets_the_resolver_resolves() {
+        #[derive(Debug)]
+        struct Tenant(Option<&'static str>);
+        #[async_trait]
+        impl SecretResolver for Tenant {
+            async fn resolve_secret(
+                &self,
+                secret_ref: &str,
+            ) -> std::result::Result<String, crate::config_value::SecretResolveError> {
+                Ok(format!("{:?}:{secret_ref}", self.0))
+            }
+            fn scope_id(&self) -> Option<String> {
+                self.0.map(str::to_string)
+            }
+        }
+        let with = |tenant| IdentityContext {
+            secret_resolver: Some(Arc::new(Tenant(tenant))),
+            ..IdentityContext::default()
+        };
+        assert_ne!(
+            with(Some("tenant-a")).cache_scope(),
+            with(Some("tenant-b")).cache_scope()
+        );
+        // A resolver that names no scope keeps the scope it always had.
+        assert_eq!(
+            with(None).cache_scope(),
+            IdentityContext::default().cache_scope()
+        );
     }
 
     #[test]
