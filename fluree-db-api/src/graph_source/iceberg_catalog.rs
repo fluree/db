@@ -383,6 +383,8 @@ impl crate::Fluree {
         &self,
         mut conn: IcebergConnectionConfig,
     ) -> Result<IcebergConnectionConfig> {
+        // What registration refuses, every catalog read refuses first.
+        conn.validate()?;
         if let CatalogMode::Rest(ref mut rest) = conn.catalog_mode {
             let hydrated = rest
                 .auth

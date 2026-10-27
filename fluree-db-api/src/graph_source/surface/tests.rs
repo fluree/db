@@ -1132,3 +1132,24 @@ fn a_flat_storage_identity_is_checked_like_any_other_value() {
         "{e}"
     );
 }
+
+#[tokio::test]
+async fn every_catalog_read_refuses_what_registration_refuses() {
+    // Recorded by the builder, refused before anything connects: browse
+    // (and preview, verify, generate, validate, which share the entry).
+    let fluree = crate::FlureeBuilder::memory().build_memory();
+    let conn = IcebergConnectionConfig::rest("https://catalog.invalid").with_oauth2_audience("a");
+    let e = fluree
+        .browse_iceberg_catalog(conn, crate::BrowseDepth::Namespaces)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("oauth2_audience needs"), "{e}");
+    let conn = IcebergConnectionConfig::rest("https://catalog.invalid")
+        .with_auth_bearer("t")
+        .with_storage_auth(StorageAuth::Catalog);
+    let e = fluree
+        .browse_iceberg_catalog(conn, crate::BrowseDepth::Namespaces)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("io.storage_auth `catalog`"), "{e}");
+}
