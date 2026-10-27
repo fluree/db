@@ -1448,24 +1448,11 @@ impl IcebergCreateConfig {
                         "Table location cannot be empty for direct catalog mode",
                     ));
                 }
-                let is_object_store =
-                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
-                // Local catalog-less tables: `file://` URIs (incl. the
-                // `file:/abs` single-slash variant) or bare absolute paths.
-                // Mirrors `fluree_db_iceberg::config`'s Direct validation.
-                let is_local = fluree_db_iceberg::is_local_location(table_location);
-                if !is_object_store && !is_local {
-                    return Err(crate::ApiError::config(format!(
-                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
-                         file:// URI, or an absolute local path, got: {table_location}"
-                    )));
-                }
-                // Local locations are fail-closed behind the operator allowlist
-                // (`FLUREE_ICEBERG_LOCAL_ROOTS`). Both validation gates enforce
-                // it — this one and `fluree_db_iceberg::config` — because a
-                // config can reach either first.
-                fluree_db_iceberg::ensure_local_location_allowed(table_location)
-                    .map_err(|e| crate::ApiError::config(e.to_string()))?;
+                // Which locations a Direct source may name (s3://, gs:// read
+                // by an identity that serves it, a local path under the
+                // operator's FLUREE_ICEBERG_LOCAL_ROOTS) is the engine's rule,
+                // checked below on the stored config, not restated here: a
+                // second copy had drifted and refused every gs:// table.
             }
             CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
                 if self.table_identifier.trim().is_empty() {

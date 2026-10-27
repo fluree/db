@@ -220,9 +220,18 @@ def test_a_google_identity_authenticates_a_rest_catalog_and_reads_its_files(conn
     conn.map_iceberg(
         "direct-gcs",
         ORDERS_MAPPING,
-        table_location="s3://bucket/warehouse/sales/orders",
+        table_location="gs://bucket/warehouse/sales/orders",
         storage=fluree.Google(UNSET_KEY),
     )
+    # A Google identity reads gs:// only: one on s3:// could never be read,
+    # so it does not register.
+    with pytest.raises(fluree.FlureeError, match="serves only gs://"):
+        conn.map_iceberg(
+            "direct-gcs-on-s3",
+            ORDERS_MAPPING,
+            table_location="s3://bucket/warehouse/sales/orders",
+            storage=fluree.Google(UNSET_KEY),
+        )
 
 
 def test_a_storage_identity_the_catalog_cannot_serve_is_refused(conn):
