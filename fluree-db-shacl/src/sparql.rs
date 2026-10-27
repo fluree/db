@@ -577,6 +577,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::GoogleTokenExchange { .. }
         | QueryError::GoogleCredentialsInvalid(_)
         | QueryError::HostIdentityRefused { .. }
+        | QueryError::GoogleTokenHostRefused { .. }
         | QueryError::Policy(_)
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
@@ -935,6 +936,9 @@ mod tests {
             ];
             QueryError::HostIdentityRefused { .. } => true, [
                 QueryError::HostIdentityRefused { kind: s(), message: s() },
+            ];
+            QueryError::GoogleTokenHostRefused { .. } => true, [
+                QueryError::GoogleTokenHostRefused { kind: s(), host: s(), message: s() },
             ];
             QueryError::Policy(_) => true, [QueryError::Policy(s())];
             QueryError::TimeRangeNotCovered { .. } => true, [

@@ -17,6 +17,10 @@
 //!
 //! Metadata, ADC and host-signed WIF are host identities, gated by the
 //! instance's [`HostIdentityPolicy`](crate::host_identity::HostIdentityPolicy).
+//! A host identity is the server's own, so its token is attached only to
+//! requests for Google's APIs (`https://*.googleapis.com`, or a host the
+//! operator names in [`TOKEN_HOSTS_ENV`]), never to whatever URL a source's
+//! configuration names; see [`GoogleIdentity::ensure_token_destination`].
 //! Signing (service-account JWTs, WIF subject tokens) needs the `aws` feature,
 //! which every shipped build enables; without it those sources refuse.
 
@@ -57,6 +61,12 @@ pub const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-pl
 /// unusual deployments. Never settable per source.
 pub const METADATA_URL_ENV: &str = "FLUREE_GOOGLE_METADATA_URL";
 
+/// Hosts, beyond Google's own APIs, that a token minted from a host identity
+/// may be sent to: a comma-separated list of host names (`host` matches that
+/// host exactly, `*.example.com` its subdomains), for tests and private
+/// endpoints. Operator-only, read once; never settable per source.
+pub const TOKEN_HOSTS_ENV: &str = "FLUREE_GOOGLE_TOKEN_HOSTS";
+
 /// Google's OAuth token endpoint (service-account assertions, refresh tokens).
 pub(crate) const OAUTH2_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// Google's Security Token Service (Workload Identity Federation).
@@ -81,6 +91,9 @@ pub(crate) struct GoogleEndpoints {
     /// Google gets its own, because mock servers are pooled and reuse their
     /// URLs, so the URLs alone would let one test see another's tokens.
     pub(crate) cache_partition: String,
+    /// Hosts beyond `*.googleapis.com` a host identity's token may go to
+    /// ([`TOKEN_HOSTS_ENV`]), lowercased.
+    pub(crate) token_hosts: Vec<String>,
 }
 
 impl GoogleEndpoints {
@@ -97,6 +110,7 @@ impl GoogleEndpoints {
                 .filter(|url| !url.is_empty())
                 .unwrap_or_else(|| METADATA_TOKEN_URL.to_string()),
             cache_partition: String::new(),
+            token_hosts: parse_token_hosts(std::env::var(TOKEN_HOSTS_ENV).ok().as_deref()),
         })
     }
 
@@ -115,7 +129,45 @@ impl GoogleEndpoints {
                 "test-{}",
                 PARTITION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ),
+            token_hosts: Vec::new(),
         }
+    }
+}
+
+/// The [`TOKEN_HOSTS_ENV`] list: trimmed, lowercased, empty entries dropped.
+pub(crate) fn parse_token_hosts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect()
+}
+
+/// Whether a host identity's token may go to `url`: an `https` URL on
+/// `googleapis.com` or a subdomain of it (which covers BigLake, BigQuery and
+/// Private Service Connect's `*.p.googleapis.com`), or any URL on a host the
+/// operator listed. `Err` carries the host to name in the refusal.
+fn token_destination_allowed(
+    url: &str,
+    operator_hosts: &[String],
+) -> std::result::Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "(not a URL)".to_string())?;
+    let host = parsed
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .ok_or_else(|| "(no host)".to_string())?;
+    let google_api = parsed.scheme() == "https"
+        && (host == "googleapis.com" || host.ends_with(".googleapis.com"));
+    let operator_listed = operator_hosts
+        .iter()
+        .any(|listed| match listed.strip_prefix("*.") {
+            Some(domain) => host.ends_with(&format!(".{domain}")),
+            None => *listed == host,
+        });
+    if google_api || operator_listed {
+        Ok(())
+    } else {
+        Err(host)
     }
 }
 
@@ -319,12 +371,17 @@ impl GoogleIdentity {
     }
 
     /// Mint a fresh token for `scopes`, replacing the cached one (after a
-    /// server refused it).
+    /// server refused it), at most once per 30 s per cached token: within that
+    /// window of the last forced renewal the held token is kept, and the
+    /// caller's retry reports the server's refusal. This keeps one source's
+    /// 401s from re-minting, over and over, a token many sources share.
     pub async fn refresh(&self, scopes: &[&str]) -> Result<()> {
         let scopes = normalize_scopes(scopes);
         let adc = self.read_adc()?;
         let slot = cache::slot(&self.key(&scopes, adc.as_ref()));
-        slot.refetch(|| self.fetch(&scopes, adc.as_ref())).await
+        slot.refetch(|| self.fetch(&scopes, adc.as_ref()))
+            .await
+            .map(|_minted| ())
     }
 
     /// The ADC file as it is now, for an application-default identity (`None`
@@ -363,6 +420,38 @@ impl GoogleIdentity {
     /// What kind of credential this is.
     pub fn source(&self) -> GoogleSource {
         self.source
+    }
+
+    /// The host identity this credential is, if it is one: the metadata
+    /// server, the host's ADC file, or WIF signed with the host's own AWS
+    /// chain. `None` for a source's own service-account key or a WIF exchange
+    /// signed with an embedder's (per-tenant) subject.
+    pub fn host_kind(&self) -> Option<HostIdentityKind> {
+        match self.source {
+            GoogleSource::Metadata => Some(HostIdentityKind::GoogleMetadata),
+            GoogleSource::ApplicationDefault => Some(HostIdentityKind::GoogleApplicationDefault),
+            GoogleSource::ExternalAccount { host_signed: true } => {
+                Some(HostIdentityKind::GoogleHostSignedWif)
+            }
+            GoogleSource::ServiceAccount | GoogleSource::ExternalAccount { host_signed: false } => {
+                None
+            }
+        }
+    }
+
+    /// Refuse, before any token is minted, to send this identity's token to
+    /// `url` when it is a host identity and `url` is not one of Google's APIs
+    /// (or a host the operator listed in [`TOKEN_HOSTS_ENV`]). A host identity
+    /// is the server's own: a source naming `https://attacker.example` as its
+    /// catalog must not receive the server's token. A source's own
+    /// credential (service-account key, embedder-signed WIF) goes wherever
+    /// the source points: it is the tenant's to give.
+    pub fn ensure_token_destination(&self, url: &str) -> Result<()> {
+        let Some(kind) = self.host_kind() else {
+            return Ok(());
+        };
+        token_destination_allowed(url, &self.endpoints.token_hosts)
+            .map_err(|host| IcebergError::GoogleTokenHostRefused { kind, host })
     }
 
     fn key(&self, scopes: &[String], adc: Option<&adc::AdcFile>) -> cache::TokenKey {
@@ -643,7 +732,10 @@ impl GoogleCatalogAuth {
         self.scopes.iter().map(String::as_str).collect()
     }
 
-    async fn headers(&self) -> Result<HeaderMap> {
+    /// The headers for a request to `url`. The destination is checked first,
+    /// so a token that may not go there is never even minted.
+    async fn headers(&self, url: &str) -> Result<HeaderMap> {
+        self.identity.ensure_token_destination(url)?;
         let token = self.identity.access_token(&self.scope_refs()).await?;
         let mut headers = HeaderMap::new();
         let mut bearer =
@@ -667,8 +759,8 @@ impl GoogleCatalogAuth {
 
 #[async_trait(?Send)]
 impl CatalogAuth for GoogleCatalogAuth {
-    async fn request_headers(&self) -> Result<HeaderMap> {
-        self.headers().await
+    async fn request_headers(&self, url: &str) -> Result<HeaderMap> {
+        self.headers(url).await
     }
 
     async fn refresh(&self) -> Result<()> {
@@ -678,8 +770,8 @@ impl CatalogAuth for GoogleCatalogAuth {
 
 #[async_trait]
 impl SendCatalogAuth for GoogleCatalogAuth {
-    async fn request_headers(&self) -> Result<HeaderMap> {
-        self.headers().await
+    async fn request_headers(&self, url: &str) -> Result<HeaderMap> {
+        self.headers(url).await
     }
 
     async fn refresh(&self) -> Result<()> {

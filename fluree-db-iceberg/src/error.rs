@@ -174,6 +174,24 @@ pub enum IcebergError {
         kind: crate::host_identity::HostIdentityKind,
     },
 
+    /// A token minted from a host identity was about to go to a host that is
+    /// not one of Google's APIs. A host identity is the server's own, so its
+    /// token goes only to `https://*.googleapis.com` (or a host the operator
+    /// names), never to wherever a source's configuration points.
+    #[error(
+        "A token from the host identity '{kind}' is only sent to Google APIs \
+         (https://googleapis.com and its subdomains); refusing to send it to '{host}'. An \
+         operator can name more hosts in {env}; a source's own service-account key or \
+         Workload Identity Federation subject is not restricted this way",
+        env = crate::auth::google::TOKEN_HOSTS_ENV
+    )]
+    GoogleTokenHostRefused {
+        /// The host identity the token is from.
+        kind: crate::host_identity::HostIdentityKind,
+        /// The host the request was for (never the token).
+        host: String,
+    },
+
     /// Snapshot not found
     #[error("Snapshot not found: {0}")]
     SnapshotNotFound(String),
@@ -217,6 +235,7 @@ impl IcebergError {
             IcebergError::GoogleTokenExchange { .. }
                 | IcebergError::GoogleCredentialsInvalid(_)
                 | IcebergError::HostIdentityRefused { .. }
+                | IcebergError::GoogleTokenHostRefused { .. }
                 | IcebergError::CatalogQuotaProjectRequired { .. }
         )
     }

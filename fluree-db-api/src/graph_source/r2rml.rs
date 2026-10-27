@@ -3133,6 +3133,14 @@ fn builder_channel_error(error: QueryError) -> IcebergError {
                 None => IcebergError::Catalog(message),
             }
         }
+        QueryError::GoogleTokenHostRefused {
+            kind,
+            host,
+            message,
+        } => match fluree_db_iceberg::HostIdentityKind::from_name(&kind) {
+            Some(kind) => IcebergError::GoogleTokenHostRefused { kind, host },
+            None => IcebergError::Catalog(message),
+        },
         other => IcebergError::Catalog(other.to_string()),
     }
 }
@@ -5816,6 +5824,10 @@ mod tests {
                 },
                 IcebergError::CatalogQuotaProjectRequired {
                     table: "db.events".to_string(),
+                },
+                IcebergError::GoogleTokenHostRefused {
+                    kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+                    host: "attacker.example".to_string(),
                 },
             ]
         };

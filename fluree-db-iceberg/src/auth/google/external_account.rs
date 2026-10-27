@@ -452,9 +452,13 @@ mod exchange {
             }
             let parsed: Impersonated =
                 serde_json::from_slice(&body).map_err(|_| wire::unreadable(stage))?;
+            // Believed up to the same ceiling as an `expires_in`.
             let expires_at = DateTime::parse_from_rfc3339(&parsed.expire_time)
                 .map_err(|_| wire::unreadable(stage))?
-                .with_timezone(&Utc);
+                .with_timezone(&Utc)
+                .min(crate::auth::token::expires_at_in(
+                    crate::auth::token::MAX_TOKEN_LIFETIME_SECS,
+                ));
             if parsed.access_token.is_empty() {
                 return Err(wire::unreadable(stage));
             }

@@ -247,6 +247,18 @@ pub enum QueryError {
         message: String,
     },
 
+    /// A token from a host identity was not sent to a host that is not one of
+    /// Google's APIs (the source's catalog or endpoint pointed elsewhere).
+    #[error("{message}")]
+    GoogleTokenHostRefused {
+        /// The host identity the token is from (`google-metadata`, …).
+        kind: String,
+        /// The host the request was for.
+        host: String,
+        /// The rendered refusal, naming the setting that governs it.
+        message: String,
+    },
+
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),

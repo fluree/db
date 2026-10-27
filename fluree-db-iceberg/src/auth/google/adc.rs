@@ -5,6 +5,15 @@
 //! Read when the identity is built (to learn its principal and quota project)
 //! and again at every token exchange, so a refreshed login is picked up. A file
 //! that changed identity in between is refused rather than followed.
+//!
+//! One host-global identity: there is one ADC file per host, every source that
+//! names `application_default` reads it, and the host-identity policy gates
+//! it (`google-adc`). So sources sharing its principal (and the storage scope
+//! keyed on it) is by design, not a confusion between tenants: no tenant
+//! supplies or distinguishes it. Its principal is weak on its own: gcloud's
+//! user credentials carry gcloud's public OAuth client id, the same for
+//! every user, so the `account` gcloud records is used instead when the file
+//! names one (current gcloud writes the field but leaves it empty).
 
 use std::path::PathBuf;
 
@@ -35,6 +44,8 @@ pub(super) struct AuthorizedUser {
     client_secret: String,
     refresh_token: String,
     quota_project_id: Option<String>,
+    /// The user gcloud logged in, when the file says (an email; not secret).
+    account: Option<String>,
 }
 
 /// Redacting `Debug`: the client secret and refresh token never print.
@@ -42,15 +53,22 @@ impl std::fmt::Debug for AuthorizedUser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedUser")
             .field("client_id", &self.client_id)
+            .field("account", &self.account)
             .field("quota_project_id", &self.quota_project_id)
             .finish_non_exhaustive()
     }
 }
 
 impl AdcFile {
-    /// `adc:<client id>` for user credentials, `adc:<SA email>` for a key.
+    /// `adc:<account>` for user credentials whose file names the account,
+    /// else `adc:<client id>` (gcloud's public client id: the same for every
+    /// user, see the module docs); `adc:<SA email>` for a key.
     pub(super) fn principal(&self) -> String {
         match self {
+            AdcFile::AuthorizedUser(AuthorizedUser {
+                account: Some(account),
+                ..
+            }) => format!("adc:{account}"),
             AdcFile::AuthorizedUser(user) => format!("adc:{}", user.client_id),
             AdcFile::ServiceAccount(key) => format!("adc:{}", key.client_email),
         }
@@ -142,11 +160,21 @@ pub(super) fn parse(text: &str) -> Result<AdcFile> {
                 }
                 project => project.map(str::to_string),
             };
+            // Only an email-shaped account names a principal; an empty one
+            // (what current gcloud writes) or anything else is ignored.
+            let account = value
+                .get("account")
+                .and_then(serde_json::Value::as_str)
+                .filter(|a| {
+                    a.len() <= 254 && a.contains('@') && a.bytes().all(|b| b.is_ascii_graphic())
+                })
+                .map(str::to_string);
             Ok(AdcFile::AuthorizedUser(AuthorizedUser {
                 client_id: field("client_id")?,
                 client_secret: field("client_secret")?,
                 refresh_token: field("refresh_token")?,
                 quota_project_id,
+                account,
             }))
         }
         Some("service_account") => Ok(AdcFile::ServiceAccount(ServiceAccountKey::parse(

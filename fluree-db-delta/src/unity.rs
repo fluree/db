@@ -452,7 +452,7 @@ impl UnityClient {
                 Some(body) => self.http.post(&url).json(body),
                 None => self.http.get(&url),
             };
-            request = request.headers(self.auth.request_headers().await.map_err(auth_failed)?);
+            request = request.headers(self.auth.request_headers(&url).await.map_err(auth_failed)?);
             let response = request
                 .send()
                 .await
@@ -815,6 +815,7 @@ mod tests {
         impl SendCatalogAuth for Refused {
             async fn request_headers(
                 &self,
+                _url: &str,
             ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
                 Err(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
                     stage: fluree_db_iceberg::GoogleTokenStage::Sts,
@@ -851,6 +852,7 @@ mod tests {
         impl SendCatalogAuth for WithQuotaProject {
             async fn request_headers(
                 &self,
+                _url: &str,
             ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("authorization", "Bearer catalog-token".parse().unwrap());

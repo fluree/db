@@ -302,7 +302,10 @@ async fn every_auth_header_reaches_the_statement_endpoint() {
     struct WithQuotaProject;
     #[async_trait::async_trait]
     impl SendCatalogAuth for WithQuotaProject {
-        async fn request_headers(&self) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+        async fn request_headers(
+            &self,
+            _url: &str,
+        ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert("authorization", "Bearer ya29.minted".parse().unwrap());
             headers.insert("x-goog-user-project", "lake-project".parse().unwrap());
@@ -336,7 +339,10 @@ async fn an_identity_refusal_from_the_auth_provider_stays_typed() {
     struct Refused;
     #[async_trait::async_trait]
     impl SendCatalogAuth for Refused {
-        async fn request_headers(&self) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+        async fn request_headers(
+            &self,
+            _url: &str,
+        ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
             Err(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
                 stage: fluree_db_iceberg::GoogleTokenStage::Sts,
                 status: Some(403),

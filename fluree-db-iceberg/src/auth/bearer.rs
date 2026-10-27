@@ -31,7 +31,7 @@ impl BearerTokenAuth {
 
 #[async_trait(?Send)]
 impl CatalogAuth for BearerTokenAuth {
-    async fn request_headers(&self) -> Result<HeaderMap> {
+    async fn request_headers(&self, _url: &str) -> Result<HeaderMap> {
         crate::auth::authorization(&format!("Bearer {}", self.token))
     }
 
@@ -43,7 +43,7 @@ impl CatalogAuth for BearerTokenAuth {
 
 #[async_trait]
 impl SendCatalogAuth for BearerTokenAuth {
-    async fn request_headers(&self) -> Result<HeaderMap> {
+    async fn request_headers(&self, _url: &str) -> Result<HeaderMap> {
         crate::auth::authorization(&format!("Bearer {}", self.token))
     }
 
@@ -66,7 +66,9 @@ mod tests {
     async fn test_bearer_auth() {
         let auth = BearerTokenAuth::new("test-token".to_string());
         // Use SendCatalogAuth trait explicitly to avoid ambiguity
-        let headers = SendCatalogAuth::request_headers(&auth).await.unwrap();
+        let headers = SendCatalogAuth::request_headers(&auth, "https://catalog.example/v1/config")
+            .await
+            .unwrap();
         assert_eq!(authorization(&headers), Some("Bearer test-token"));
         assert_eq!(headers.len(), 1, "a bearer sends nothing else");
         assert!(headers[reqwest::header::AUTHORIZATION].is_sensitive());
@@ -78,14 +80,18 @@ mod tests {
         // Should not error - use SendCatalogAuth trait explicitly
         SendCatalogAuth::refresh(&auth).await.unwrap();
         // Token should be unchanged
-        let headers = SendCatalogAuth::request_headers(&auth).await.unwrap();
+        let headers = SendCatalogAuth::request_headers(&auth, "https://catalog.example/v1/config")
+            .await
+            .unwrap();
         assert_eq!(authorization(&headers), Some("Bearer test-token"));
     }
 
     #[tokio::test]
     async fn a_token_that_is_not_a_header_value_is_refused_without_echoing_it() {
         let auth = BearerTokenAuth::new("bad\ntoken-secret".to_string());
-        let err = SendCatalogAuth::request_headers(&auth).await.unwrap_err();
+        let err = SendCatalogAuth::request_headers(&auth, "https://catalog.example/v1/config")
+            .await
+            .unwrap_err();
         assert!(!err.to_string().contains("token-secret"), "{err}");
     }
 

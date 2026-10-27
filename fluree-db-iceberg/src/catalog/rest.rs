@@ -210,7 +210,7 @@ impl RestCatalogClient {
 
                 // The provider's headers: Authorization, plus any it adds
                 // (Google's x-goog-user-project).
-                request = request.headers(self.auth.request_headers().await?);
+                request = request.headers(self.auth.request_headers(&url).await?);
 
                 // Add custom headers
                 for (name, value) in headers {
@@ -753,7 +753,7 @@ mod tests {
         struct TwoHeaders;
         #[async_trait]
         impl SendCatalogAuth for TwoHeaders {
-            async fn request_headers(&self) -> Result<reqwest::header::HeaderMap> {
+            async fn request_headers(&self, _url: &str) -> Result<reqwest::header::HeaderMap> {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("authorization", "Bearer t".parse().unwrap());
                 headers.insert("x-goog-user-project", "p".parse().unwrap());

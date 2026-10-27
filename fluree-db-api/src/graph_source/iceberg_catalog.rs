@@ -188,6 +188,11 @@ pub(crate) fn identity_query_error(
                 .to_string(),
             message,
         },
+        E::GoogleTokenHostRefused { kind, host } => Q::GoogleTokenHostRefused {
+            kind: kind.as_str().to_string(),
+            host,
+            message,
+        },
         E::SchemeNotServed { scheme, .. } => Q::StorageSchemeNotServed { scheme, message },
         E::CatalogQuotaProjectRequired { table } => {
             Q::CatalogQuotaProjectRequired { table, message }
@@ -1963,6 +1968,37 @@ mod tests {
         // Each derived context keys the shared client caches apart.
         assert_ne!(restricted.identity_context().cache_scope(), original);
         assert_ne!(tenant.identity_context().cache_scope(), original);
+    }
+
+    /// The reported attack, end to end: under the default policy (every host
+    /// identity allowed), browsing a catalog the caller names with a host
+    /// identity does not ship the server's token there. Refused before any
+    /// request, typed 403 `err:auth/HostIdentityRefused`, naming the host.
+    #[tokio::test]
+    async fn a_host_token_never_goes_to_a_catalog_the_caller_names() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let conn = IcebergConnectionConfig::rest("https://attacker.example")
+            .with_auth_google_metadata(None);
+        let err = fluree
+            .browse_iceberg_catalog(conn, BrowseDepth::Namespaces)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::ApiError::Query(fluree_db_query::QueryError::GoogleTokenHostRefused {
+                    kind,
+                    host,
+                    ..
+                }) if kind == "google-metadata" && host == "attacker.example"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.status_code(), 403);
+        assert_eq!(
+            err.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
     }
 
     /// The instance's host-identity policy reaches the providers its onboarding

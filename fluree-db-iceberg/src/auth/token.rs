@@ -9,6 +9,18 @@
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
 
+/// The longest lifetime a token response is believed for. Token endpoints say
+/// an hour; a value past this (or one too large to add to a time) is clamped,
+/// so a hostile or broken `expires_in` neither panics nor pins a token for
+/// years.
+pub(crate) const MAX_TOKEN_LIFETIME_SECS: i64 = 24 * 60 * 60;
+
+/// When a token whose response said `expires_in` seconds expires: clamped to
+/// `0..=MAX_TOKEN_LIFETIME_SECS` (a negative lifetime is already expired).
+pub(crate) fn expires_at_in(expires_in: i64) -> DateTime<Utc> {
+    Utc::now() + Duration::seconds(expires_in.clamp(0, MAX_TOKEN_LIFETIME_SECS))
+}
+
 /// A cached access token with its expiry.
 #[derive(Clone)]
 pub(crate) struct CachedToken {

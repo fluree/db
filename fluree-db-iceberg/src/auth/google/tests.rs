@@ -17,6 +17,9 @@ use crate::auth::AuthConfig;
 use crate::config_value::ConfigValue;
 use crate::host_identity::{HostIdentityPolicy, HOST_IDENTITIES_ENV};
 
+/// A BigLake catalog request: where a host identity's token may go.
+const BIGLAKE: &str = "https://biglake.googleapis.com/iceberg/v1/restcatalog/v1/config";
+
 fn ctx() -> IdentityContext {
     IdentityContext::default()
 }
@@ -75,7 +78,9 @@ async fn metadata_sends_the_flavor_header_and_scopes_and_caches() {
         Arc::new(metadata_identity_with(&endpoints)),
         vec![CLOUD_PLATFORM_SCOPE.to_string()],
     );
-    let headers = SendCatalogAuth::request_headers(&auth).await.unwrap();
+    let headers = SendCatalogAuth::request_headers(&auth, BIGLAKE)
+        .await
+        .unwrap();
     assert_eq!(headers[AUTHORIZATION], "Bearer ya29.md");
     assert!(headers[AUTHORIZATION].is_sensitive());
     assert!(
@@ -85,7 +90,9 @@ async fn metadata_sends_the_flavor_header_and_scopes_and_caches() {
 
     // A second call, and a second identity with the same fingerprint, reuse
     // the cached token.
-    SendCatalogAuth::request_headers(&auth).await.unwrap();
+    SendCatalogAuth::request_headers(&auth, BIGLAKE)
+        .await
+        .unwrap();
     metadata_identity_with(&endpoints)
         .access_token(&[CLOUD_PLATFORM_SCOPE])
         .await
@@ -165,7 +172,7 @@ async fn a_stored_metadata_url_equal_to_the_operators_is_used() {
     }
     .create_provider_arc_with(&ctx(), &endpoints)
     .unwrap();
-    let headers = auth.request_headers().await.unwrap();
+    let headers = auth.request_headers(BIGLAKE).await.unwrap();
     assert_eq!(headers[AUTHORIZATION], "Bearer ya29.op");
 }
 
@@ -263,7 +270,7 @@ async fn a_failed_refresh_with_an_expired_token_fails() {
 }
 
 #[tokio::test]
-async fn refresh_replaces_the_cached_token() {
+async fn a_refusal_re_mints_a_shared_token_at_most_once_per_window() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(METADATA_PATH))
@@ -278,14 +285,254 @@ async fn refresh_replaces_the_cached_token() {
         .await;
     let auth = GoogleCatalogAuth::new(Arc::new(metadata_identity(&server)), Vec::new());
     assert_eq!(
-        SendCatalogAuth::request_headers(&auth).await.unwrap()[AUTHORIZATION],
+        SendCatalogAuth::request_headers(&auth, BIGLAKE)
+            .await
+            .unwrap()[AUTHORIZATION],
         "Bearer ya29.first"
     );
-    SendCatalogAuth::refresh(&auth).await.unwrap();
+    // The first refusal re-mints; the rest within 30 s keep that token,
+    // however many sources sharing it see a refusal, so a refusal storm cannot
+    // drive the shared host token's exchanges. The window passing is pinned in
+    // `cache::tests`.
+    for _ in 0..5 {
+        SendCatalogAuth::refresh(&auth).await.unwrap();
+    }
     assert_eq!(
-        SendCatalogAuth::request_headers(&auth).await.unwrap()[AUTHORIZATION],
+        SendCatalogAuth::request_headers(&auth, BIGLAKE)
+            .await
+            .unwrap()[AUTHORIZATION],
         "Bearer ya29.second"
     );
+    assert_eq!(requests_to(&server, METADATA_PATH).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_token_lifetime_past_the_ceiling_is_clamped_not_a_panic() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(METADATA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body("ya29.long", i64::MAX)))
+        .mount(&server)
+        .await;
+    let token = metadata_identity(&server).access_token(&[]).await.unwrap();
+    let ceiling = Utc::now()
+        + chrono::Duration::seconds(crate::auth::token::MAX_TOKEN_LIFETIME_SECS)
+        + chrono::Duration::seconds(5);
+    assert!(token.expires_at <= ceiling, "{:?}", token.expires_at);
+}
+
+// ── where a host identity's token may go ───────────────────────────────────
+
+/// A host identity's token goes only to Google's APIs over https; anything
+/// else is refused before a token is even minted, naming the host and never
+/// the token.
+#[tokio::test]
+async fn a_host_identitys_token_goes_only_to_google_apis() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(METADATA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body("ya29.HOST", 3599)))
+        .mount(&server)
+        .await;
+    let auth = GoogleCatalogAuth::new(Arc::new(metadata_identity(&server)), Vec::new());
+
+    for (url, host) in [
+        ("https://attacker.example/v1/config", "attacker.example"),
+        (
+            "http://biglake.googleapis.com/v1/config",
+            "biglake.googleapis.com",
+        ),
+        (
+            "https://googleapis.com.attacker.example/",
+            "googleapis.com.attacker.example",
+        ),
+        ("https://attackergoogleapis.com/", "attackergoogleapis.com"),
+        (
+            "https://biglake.googleapis.com@attacker.example/",
+            "attacker.example",
+        ),
+        ("https://169.254.169.254/", "169.254.169.254"),
+        ("not a url", "(not a URL)"),
+    ] {
+        let err = SendCatalogAuth::request_headers(&auth, url)
+            .await
+            .unwrap_err();
+        match &err {
+            IcebergError::GoogleTokenHostRefused {
+                kind,
+                host: refused,
+            } => {
+                assert_eq!(*kind, HostIdentityKind::GoogleMetadata, "{url}");
+                assert_eq!(refused, host, "{url}");
+            }
+            other => panic!("{url}: expected a refusal, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains(host), "{message}");
+        assert!(message.contains(TOKEN_HOSTS_ENV), "{message}");
+        assert!(!message.contains("ya29"), "{message}");
+    }
+    assert!(
+        requests_to(&server, METADATA_PATH).await.is_empty(),
+        "a refused destination mints nothing"
+    );
+
+    for url in [
+        "https://biglake.googleapis.com/iceberg/v1/restcatalog/v1/config",
+        "https://bigquery.googleapis.com/bigquery/v2/projects/p/queries",
+        "https://biglake-endpoint.p.googleapis.com/iceberg/v1/restcatalog",
+        "https://googleapis.com/x",
+        "https://BIGLAKE.GOOGLEAPIS.COM./v1/config",
+    ] {
+        let headers = SendCatalogAuth::request_headers(&auth, url).await.unwrap();
+        assert_eq!(headers[AUTHORIZATION], "Bearer ya29.HOST", "{url}");
+    }
+}
+
+/// Every host kind is held to it; a source's own identity is not.
+#[cfg(feature = "aws")]
+#[test]
+fn only_host_identities_are_held_to_google_apis() {
+    let endpoints = GoogleEndpoints::at("http://127.0.0.1:9");
+    let tenant_host = "https://catalog.tenant.example/v1/config";
+
+    let metadata = metadata_identity_with(&endpoints);
+    assert_eq!(metadata.host_kind(), Some(HostIdentityKind::GoogleMetadata));
+    assert!(metadata.ensure_token_destination(tenant_host).is_err());
+
+    let host_signed =
+        GoogleIdentity::with_endpoints(&wif_credentials(), None, &ctx(), &endpoints).unwrap();
+    assert_eq!(
+        host_signed.host_kind(),
+        Some(HostIdentityKind::GoogleHostSignedWif)
+    );
+    assert!(matches!(
+        host_signed.ensure_token_destination(tenant_host),
+        Err(IcebergError::GoogleTokenHostRefused {
+            kind: HostIdentityKind::GoogleHostSignedWif,
+            ..
+        })
+    ));
+
+    // The tenant's own: a service-account key, WIF signed with an embedder's
+    // per-tenant subject. They go wherever the source points.
+    let service_account = GoogleIdentity::with_endpoints(
+        &sa_credentials("tenant@p.iam.gserviceaccount.com", TEST_PRIVATE_KEY, None),
+        None,
+        &ctx(),
+        &endpoints,
+    )
+    .unwrap();
+    assert_eq!(service_account.host_kind(), None);
+    service_account
+        .ensure_token_destination(tenant_host)
+        .unwrap();
+    let embedder_signed = GoogleIdentity::with_endpoints(
+        &wif_credentials(),
+        None,
+        &wif::subject("tenant-a"),
+        &endpoints,
+    )
+    .unwrap();
+    assert_eq!(embedder_signed.host_kind(), None);
+    embedder_signed
+        .ensure_token_destination(tenant_host)
+        .unwrap();
+}
+
+#[test]
+fn the_operator_can_name_more_token_hosts() {
+    assert_eq!(
+        parse_token_hosts(Some(" 127.0.0.1, *.Corp.Example ,, private.example. ")),
+        vec!["127.0.0.1", "*.corp.example", "private.example"]
+    );
+    assert!(parse_token_hosts(None).is_empty());
+    let mut endpoints = GoogleEndpoints::at("http://127.0.0.1:9");
+    endpoints.token_hosts = parse_token_hosts(Some("127.0.0.1,*.corp.example"));
+    let identity = metadata_identity_with(&endpoints);
+    for allowed in [
+        "http://127.0.0.1:8080/v1/config",
+        "https://catalog.corp.example/v1/config",
+        "https://biglake.googleapis.com/v1/config",
+    ] {
+        identity.ensure_token_destination(allowed).unwrap();
+    }
+    for refused in [
+        "https://corp.example/v1/config",
+        "https://evilcorp.example/",
+        "http://127.0.0.2/",
+    ] {
+        assert!(
+            identity.ensure_token_destination(refused).is_err(),
+            "{refused}"
+        );
+    }
+}
+
+/// End to end through the REST catalog: a host identity pointed at a catalog
+/// that is not Google's sends nothing at all; the operator naming the host
+/// lets the same catalog through.
+#[tokio::test]
+async fn a_catalog_off_google_never_receives_a_host_token() {
+    use crate::catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(METADATA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body("ya29.HOST", 3599)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"namespaces": []})),
+        )
+        .mount(&server)
+        .await;
+    let client = |endpoints: &GoogleEndpoints| {
+        let auth = AuthConfig::GoogleMetadata {
+            scopes: None,
+            metadata_url: None,
+        }
+        .create_provider_arc_with(&ctx(), endpoints)
+        .unwrap();
+        RestCatalogClient::new(
+            RestCatalogConfig {
+                uri: server.uri(),
+                // A warehouse no other test uses (pooled servers reuse URLs).
+                warehouse: Some("host-token-destination".to_string()),
+                ..Default::default()
+            },
+            auth,
+        )
+        .unwrap()
+    };
+
+    let endpoints = GoogleEndpoints::at(&server.uri());
+    let err = SendCatalogClient::list_namespaces(&client(&endpoints))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, IcebergError::GoogleTokenHostRefused { .. }),
+        "{err:?}"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "nothing reaches a catalog off Google, not even a token request"
+    );
+
+    let mut operator = GoogleEndpoints::at(&server.uri());
+    operator.token_hosts = parse_token_hosts(Some("127.0.0.1"));
+    SendCatalogClient::list_namespaces(&client(&operator))
+        .await
+        .unwrap();
+    let listed = requests_to(&server, "/v1/namespaces").await;
+    assert_eq!(listed[0].headers["authorization"], "Bearer ya29.HOST");
 }
 
 // ── policy ────────────────────────────────────────────────────────────────
@@ -457,12 +704,22 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
         "adc:gcloud-client.apps.googleusercontent.com"
     );
     assert_eq!(identity.source(), GoogleSource::ApplicationDefault);
+    // The host's user credentials go to Google's APIs only.
+    assert!(matches!(
+        identity.ensure_token_destination("https://attacker.example/v1/config"),
+        Err(IcebergError::GoogleTokenHostRefused {
+            kind: HostIdentityKind::GoogleApplicationDefault,
+            ..
+        })
+    ));
     assert_eq!(identity.quota_project(), Some("user-project"));
     let dbg = format!("{identity:?}");
     assert!(!dbg.contains("SECRET"), "{dbg}");
 
     let auth = GoogleCatalogAuth::new(Arc::new(identity), Vec::new());
-    let headers = SendCatalogAuth::request_headers(&auth).await.unwrap();
+    let headers = SendCatalogAuth::request_headers(&auth, BIGLAKE)
+        .await
+        .unwrap();
     assert_eq!(headers[AUTHORIZATION], "Bearer ya29.user");
     assert_eq!(headers[QUOTA_PROJECT_HEADER], "user-project");
     let sent = form(&requests_to(&server, "/token").await[0].body);
@@ -471,7 +728,9 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
     assert_eq!(sent["scope"], CLOUD_PLATFORM_SCOPE);
 
     // Same identity, cached: no second exchange.
-    SendCatalogAuth::request_headers(&auth).await.unwrap();
+    SendCatalogAuth::request_headers(&auth, BIGLAKE)
+        .await
+        .unwrap();
     assert_eq!(requests_to(&server, "/token").await.len(), 1);
 
     // A new login for the same identity (a new refresh token) never serves
@@ -481,7 +740,9 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
         "authorized_user",
         "REFRESH-SECRET-ROTATED",
     );
-    SendCatalogAuth::request_headers(&auth).await.unwrap();
+    SendCatalogAuth::request_headers(&auth, BIGLAKE)
+        .await
+        .unwrap();
     let exchanges = requests_to(&server, "/token").await;
     assert_eq!(exchanges.len(), 2, "the rotated refresh token is exchanged");
     assert_eq!(
@@ -513,6 +774,39 @@ async fn application_default_user_credentials_refresh_and_carry_their_quota_proj
 
     std::env::remove_var(adc::APPLICATION_CREDENTIALS_ENV);
     let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn an_adc_file_naming_its_account_uses_it_as_the_principal() {
+    let file = |account: serde_json::Value| {
+        adc::parse(
+            &serde_json::json!({
+                "type": "authorized_user",
+                "client_id": "gcloud-client.apps.googleusercontent.com",
+                "client_secret": "s",
+                "refresh_token": "r",
+                "account": account,
+            })
+            .to_string(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        file("analyst@lake.example".into()).principal(),
+        "adc:analyst@lake.example"
+    );
+    // What current gcloud writes (an empty account), or anything that is not
+    // an email, falls back to gcloud's client id.
+    for unusable in [
+        serde_json::json!(""),
+        serde_json::json!("not an email"),
+        serde_json::json!(5),
+    ] {
+        assert_eq!(
+            file(unusable).principal(),
+            "adc:gcloud-client.apps.googleusercontent.com"
+        );
+    }
 }
 
 // ── service accounts ──────────────────────────────────────────────────────
@@ -1022,6 +1316,9 @@ mod wif {
     async fn impersonation_exchanges_the_federated_token_and_reads_expire_time() {
         let server = MockServer::start().await;
         sts(&server, "ya29.federated").await;
+        // Within the 24 h ceiling, so read as Google states it.
+        let expire_time = (Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/v1/projects/-/serviceAccounts/reader@lake-project\.iam\.gserviceaccount\.com:generateAccessToken$",
@@ -1029,7 +1326,7 @@ mod wif {
             .and(header("authorization", "Bearer ya29.federated"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "accessToken": "ya29.impersonated",
-                "expireTime": "2099-01-02T03:04:05Z",
+                "expireTime": expire_time,
             })))
             .mount(&server)
             .await;
@@ -1053,7 +1350,7 @@ mod wif {
         assert_eq!(token.token, "ya29.impersonated");
         assert_eq!(
             token.expires_at,
-            DateTime::parse_from_rfc3339("2099-01-02T03:04:05Z").unwrap()
+            DateTime::parse_from_rfc3339(&expire_time).unwrap()
         );
 
         // STS mints a cloud-platform federated token; the requested scope goes
@@ -1072,6 +1369,37 @@ mod wif {
             body,
             serde_json::json!({"scope": ["https://www.googleapis.com/auth/bigquery"], "lifetime": "3600s"})
         );
+    }
+
+    /// A far-future `expireTime` is believed only up to the 24 h ceiling.
+    #[tokio::test]
+    async fn a_far_future_expire_time_is_clamped() {
+        let server = MockServer::start().await;
+        sts(&server, "ya29.federated").await;
+        Mock::given(method("POST"))
+            .and(path_regex(r":generateAccessToken$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "ya29.impersonated",
+                "expireTime": "9999-12-31T23:59:59Z",
+            })))
+            .mount(&server)
+            .await;
+        let token = GoogleIdentity::with_endpoints(
+            &GoogleCredentials::ExternalAccount {
+                config: ExternalAccountConfig::Inline(external_account::tests::gcloud_aws_config()),
+            },
+            None,
+            &subject("tenant-a"),
+            &GoogleEndpoints::at(&server.uri()),
+        )
+        .unwrap()
+        .access_token(&[])
+        .await
+        .unwrap();
+        let ceiling = Utc::now()
+            + chrono::Duration::seconds(crate::auth::token::MAX_TOKEN_LIFETIME_SECS)
+            + chrono::Duration::seconds(5);
+        assert!(token.expires_at <= ceiling, "{:?}", token.expires_at);
     }
 
     #[tokio::test]

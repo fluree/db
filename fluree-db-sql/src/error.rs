@@ -72,6 +72,10 @@ mod tests {
                 kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
             },
             IcebergError::GoogleCredentialsInvalid("field".to_string()),
+            IcebergError::GoogleTokenHostRefused {
+                kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+                host: "attacker.example".to_string(),
+            },
         ];
         for refusal in refusals {
             assert!(matches!(SqlError::from(refusal), SqlError::Identity(_)));

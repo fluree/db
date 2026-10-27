@@ -311,14 +311,16 @@ impl Inner {
         }
     }
 
-    /// The protocol headers plus every header the auth provider sends
-    /// (`Authorization`, and e.g. Google's `x-goog-user-project`); the
-    /// provider's replace any protocol header of the same name.
-    async fn auth_headers(&self) -> Result<HeaderMap> {
+    /// The protocol headers plus every header the auth provider sends for a
+    /// request to `url` (`Authorization`, and e.g. Google's
+    /// `x-goog-user-project`); the provider's replace any protocol header of
+    /// the same name. `url` is the request's own: a page's `nextUri` is the
+    /// endpoint's to name, so each page is checked where it goes.
+    async fn auth_headers(&self, url: &str) -> Result<HeaderMap> {
         let mut headers = self.base_headers.clone();
         headers.extend(
             self.auth
-                .request_headers()
+                .request_headers(url)
                 .await
                 .map_err(SqlError::from_auth)?,
         );
@@ -328,7 +330,7 @@ impl Inner {
     async fn post_statement(&self, sql: &str) -> Result<StatementResponse> {
         let mut attempt = 0;
         loop {
-            let headers = self.auth_headers().await?;
+            let headers = self.auth_headers(&self.statement_url).await?;
             let resp = self
                 .http
                 .post(&self.statement_url)
@@ -348,7 +350,7 @@ impl Inner {
     async fn get_page(&self, uri: &str) -> Result<StatementResponse> {
         let mut attempt = 0;
         loop {
-            let headers = self.auth_headers().await?;
+            let headers = self.auth_headers(uri).await?;
             let resp = self
                 .http
                 .get(uri)
@@ -401,7 +403,7 @@ impl Inner {
     }
 
     async fn cancel(&self, uri: &str) {
-        match self.auth_headers().await {
+        match self.auth_headers(uri).await {
             Ok(headers) => {
                 if let Err(e) = self.http.delete(uri).headers(headers).send().await {
                     warn!(error = %e, "failed to cancel abandoned SQL statement");

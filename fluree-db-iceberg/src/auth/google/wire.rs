@@ -1,8 +1,6 @@
 //! The HTTP shapes every Google token exchange shares: the token response, the
 //! typed error, and Google's error code (never its body).
 
-use chrono::{Duration, Utc};
-
 use crate::auth::token::CachedToken;
 use crate::error::{GoogleTokenStage, IcebergError, Result};
 
@@ -58,7 +56,7 @@ pub(super) async fn read_token(
     Ok(CachedToken {
         access_token: parsed.access_token,
         token_type: "Bearer".to_string(),
-        expires_at: Utc::now() + Duration::seconds(expires_in),
+        expires_at: crate::auth::token::expires_at_in(expires_in),
     })
 }
 

@@ -47,13 +47,20 @@ use std::sync::Arc;
 /// (e.g., `Arc<dyn CatalogAuth + Send + Sync>` in server code) as needed.
 #[async_trait(?Send)]
 pub trait CatalogAuth: Debug {
-    /// The headers every request carries: `Authorization` (when the provider
-    /// authenticates at all) plus any provider headers, e.g. Google's
+    /// The headers a request to `url` carries: `Authorization` (when the
+    /// provider authenticates at all) plus any provider headers, e.g. Google's
     /// `x-goog-user-project`. One method rather than a separate extra-headers
     /// hook, so no caller can send the token and drop the rest.
     ///
+    /// `url` is the full URL the request goes to (the clients follow no
+    /// redirects, so it is the only host the headers reach). It is a required
+    /// argument so that no caller can obtain a credential without saying where
+    /// it is going: a provider whose credential may only go to some hosts (a
+    /// Google host identity: Google's APIs only) refuses the rest here, before
+    /// minting anything.
+    ///
     /// Implementations should handle token refresh internally.
-    async fn request_headers(&self) -> Result<HeaderMap>;
+    async fn request_headers(&self, url: &str) -> Result<HeaderMap>;
 
     /// Force a token refresh (e.g., after a 401 response).
     async fn refresh(&self) -> Result<()>;
@@ -65,8 +72,9 @@ pub trait CatalogAuth: Debug {
 /// `Send` futures. Use this for server-side code that needs to spawn tasks.
 #[async_trait]
 pub trait SendCatalogAuth: Debug + Send + Sync {
-    /// The headers every request carries; see [`CatalogAuth::request_headers`].
-    async fn request_headers(&self) -> Result<HeaderMap>;
+    /// The headers a request to `url` carries; see
+    /// [`CatalogAuth::request_headers`].
+    async fn request_headers(&self, url: &str) -> Result<HeaderMap>;
 
     /// Force a token refresh.
     async fn refresh(&self) -> Result<()>;
@@ -389,7 +397,7 @@ pub struct NoAuth;
 
 #[async_trait(?Send)]
 impl CatalogAuth for NoAuth {
-    async fn request_headers(&self) -> Result<HeaderMap> {
+    async fn request_headers(&self, _url: &str) -> Result<HeaderMap> {
         Ok(HeaderMap::new())
     }
 
@@ -400,7 +408,7 @@ impl CatalogAuth for NoAuth {
 
 #[async_trait]
 impl SendCatalogAuth for NoAuth {
-    async fn request_headers(&self) -> Result<HeaderMap> {
+    async fn request_headers(&self, _url: &str) -> Result<HeaderMap> {
         Ok(HeaderMap::new())
     }
 
