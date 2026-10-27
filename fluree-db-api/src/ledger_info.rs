@@ -1855,40 +1855,20 @@ where
     let Some(snapshot) = metadata.current_snapshot() else {
         return (None, summary_mor);
     };
-    let Some(list) = snapshot.manifest_list_location() else {
-        return (None, summary_mor);
-    };
-    let totals = match cache.get_manifest_list_totals(list) {
-        Some(totals) => totals,
-        None => {
-            let storage = match open_storage().await {
-                Ok(storage) => storage,
-                Err(e) => {
-                    tracing::debug!(table, error = %e, "virtual ledger-info: no storage for the manifest list; count omitted");
-                    return (None, summary_mor);
-                }
-            };
-            match fluree_db_iceberg::stats::send_read_manifest_list_totals(
-                storage.as_ref(),
-                snapshot,
-            )
-            .await
-            {
-                Ok(totals) => {
-                    cache.put_manifest_list_totals(list.to_string(), totals);
-                    totals
-                }
-                Err(e) => {
-                    tracing::debug!(table, manifest_list = list, error = %e, "virtual ledger-info: manifest list unreadable; count omitted");
-                    return (None, summary_mor);
-                }
-            }
-        }
-    };
-    (
-        totals.row_count,
-        summary_mor || totals.has_delete_manifests(),
+    match crate::graph_source::cached_manifest_list_totals(
+        Some(cache),
+        table,
+        snapshot,
+        open_storage,
     )
+    .await
+    {
+        Some(totals) => (
+            totals.row_count,
+            summary_mor || totals.has_delete_manifests(),
+        ),
+        None => (None, summary_mor),
+    }
 }
 
 /// Whether a virtual (Iceberg) table's snapshot-summary row count must be treated
