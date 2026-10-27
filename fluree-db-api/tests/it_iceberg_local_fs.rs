@@ -18,6 +18,9 @@
 //! - `people_window` — the same five appends with every snapshot RETAINED: a
 //!   healthy source that got ahead of its job, so the window resolves and is
 //!   read incrementally, and is too large to commit in one pass.
+//! - `amounts` — decimal columns for FILTER pushdown: `ratio` is `decimal(38,9)`
+//!   (BigQuery's `NUMERIC`) with values one grid step either side of 0.05 and
+//!   1.05; `price` is `decimal(5,2)`, too narrow to hold a literal like 1000.
 //!
 //! The fixtures' metadata carries the ABSOLUTE paths they were written under
 //! (`file:///tmp/...`), so reading them from a checkout also proves the
@@ -31,6 +34,7 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/people fluree-db-api/tests/fixtures/iceberg/silver/people
 //! cp -r /tmp/fluree-local-iceberg/silver/people_backlog fluree-db-api/tests/fixtures/iceberg/silver/people_backlog
 //! cp -r /tmp/fluree-local-iceberg/silver/people_window fluree-db-api/tests/fixtures/iceberg/silver/people_window
+//! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
 //! ```
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
@@ -1607,4 +1611,120 @@ async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
             "JSON-LD OFFSET {offset}: {result}"
         );
     }
+}
+
+const AMOUNTS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#AmountsMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.amounts" ] ;
+        rr:subjectMap [ rr:template "http://example.org/amount/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:ratio ;
+            rr:objectMap [ rr:column "ratio" ; rr:datatype xsd:decimal ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:price ;
+            rr:objectMap [ rr:column "price" ; rr:datatype xsd:decimal ]
+        ] .
+"#;
+
+/// The ids (sorted) a SPARQL `FILTER(?v <filter>)` over `ex:<column>` returns.
+async fn sparql_amount_ids(fluree: &fluree_db_api::Fluree, column: &str, filter: &str) -> Vec<i64> {
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?id FROM <amounts:main> \
+         WHERE {{ ?s ex:id ?id ; ex:{column} ?v FILTER(?v {filter}) }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut ids: Vec<i64> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| b["id"]["value"].as_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A decimal FILTER over a `decimal(38,9)` / `decimal(5,2)` column answers
+/// exactly what the in-engine FILTER would. The pushdown evaluates the
+/// literal against each decoded batch before the engine sees it, so a literal
+/// the column cannot hold exactly must widen that filter to every row, never
+/// narrow it: a row it drops is lost. Each case below failed on main: the
+/// first two panicked the reader ("scale 2 is greater than precision 1"), the
+/// next two lost a row to Arrow's rounding cast, and the last lost every row
+/// to a cast that overflowed to NULL.
+#[tokio::test]
+async fn decimal_filters_answer_exactly() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/amounts",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("amounts", &location, AMOUNTS_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create decimal graph source");
+
+    // ratio: 1=0.049999999 2=0.050000000 3=0.050000001 4=1.050000000 5=-0.05
+    // price: 1=999.99 2=1.00 3=12.34 4=0.05 5=-999.99
+    let cases: [(&str, &str, &[i64]); 6] = [
+        ("ratio", ">= 0.05", &[2, 3, 4]),
+        ("price", ">= 0.05", &[1, 2, 3, 4]),
+        ("ratio", "< 1.0500000001", &[1, 2, 3, 4, 5]),
+        ("ratio", "> 1.0499999999", &[4]),
+        ("price", "< 1000", &[1, 2, 3, 4, 5]),
+        ("ratio", "= 0.05", &[2]),
+    ];
+    for (column, filter, want) in cases {
+        assert_eq!(
+            sparql_amount_ids(&fluree, column, filter).await,
+            want,
+            "FILTER(?{column} {filter})"
+        );
+    }
+
+    // JSON-LD has no decimal FILTER literal (a fractional number is a double,
+    // which is not pushed against a decimal column), so its route into the
+    // same row filter is an integer literal against a decimal column: the
+    // overflow case above.
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "amounts:main",
+        "select": ["?id"],
+        "where": [
+            {"@id": "?s", "ex:id": "?id", "ex:price": "?p"},
+            ["filter", "(< ?p 1000)"]
+        ],
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .expect("JSON-LD decimal filter");
+    let mut ids: Vec<i64> = rows
+        .as_array()
+        .unwrap_or_else(|| panic!("array result: {rows}"))
+        .iter()
+        .map(|row| row[0].as_i64().unwrap_or_else(|| panic!("id in {rows}")))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2, 3, 4, 5], "JSON-LD (< ?p 1000): {rows}");
 }

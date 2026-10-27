@@ -10,8 +10,13 @@
   RETAINED. This is the shape of a healthy source that got ahead of its
   materialize job: the watermark still resolves, so the window is read
   incrementally, and it is too large to commit in one pass.
+- `silver.amounts`: one snapshot of decimal columns for FILTER pushdown —
+  `ratio` is `decimal(38,9)` (BigQuery's `NUMERIC`), with values on either
+  side of 0.05 and 1.05 one grid step apart; `price` is `decimal(5,2)`, the
+  narrow column a literal like 1000 does not fit.
 """
 import shutil, sys
+from decimal import Decimal
 from pathlib import Path
 
 import pyarrow as pa
@@ -116,3 +121,24 @@ print("window snapshots:", [
     (s.snapshot_id, s.sequence_number, s.parent_snapshot_id, s.summary.get("added-records"))
     for s in sorted(window.snapshots(), key=lambda s: s.sequence_number)
 ])
+
+# ---------------------------------------------------------------------------
+# silver.amounts: decimal columns for FILTER pushdown.
+# ---------------------------------------------------------------------------
+amounts_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("ratio", pa.decimal128(38, 9)),
+    pa.field("price", pa.decimal128(5, 2)),
+])
+amounts = catalog.create_table("silver.amounts", schema=amounts_schema)
+amounts.append(pa.table({
+    "id": pa.array([1, 2, 3, 4, 5], pa.int64()),
+    "ratio": pa.array([Decimal(v) for v in [
+        "0.049999999", "0.050000000", "0.050000001", "1.050000000", "-0.050000000",
+    ]], pa.decimal128(38, 9)),
+    "price": pa.array([Decimal(v) for v in [
+        "999.99", "1.00", "12.34", "0.05", "-999.99",
+    ]], pa.decimal128(5, 2)),
+}, schema=amounts_schema))
+amounts = catalog.load_table("silver.amounts")
+print("amounts table_location:", amounts.location())
