@@ -806,23 +806,17 @@ async fn preview_iceberg_table_in(
             // `total-records`, else the manifest list; both over-count a MoR
             // snapshot. Under the override the guard proceeded, so caveat the count.
             let mut warnings = Vec::new();
-            let has_delete_files = schema_counts_from_manifest_list(
-                cache,
-                &mut schema,
-                metadata,
-                &table_display,
-                allow_mor,
-                || async {
+            let has_delete_files =
+                schema_counts_from_manifest_list(cache, &mut schema, metadata, || async {
                     build_preview_storage(&conn, load.credentials.as_ref())
                         .await
                         .map(Arc::new)
-                },
-            )
-            .await?;
+                })
+                .await;
             let summary_deletes = metadata
                 .current_snapshot()
                 .is_some_and(fluree_db_iceberg::summary_indicates_deletes);
-            if preview_counts_are_upper_bounds(allow_mor, has_delete_files, summary_deletes) {
+            if schema_counts_are_upper_bounds(allow_mor, has_delete_files, summary_deletes) {
                 warnings.push(MOR_UPPER_BOUND_WARNING.to_string());
             }
             Ok(TablePreview {
@@ -942,18 +936,17 @@ async fn preview_iceberg_table_in(
 ///
 /// Best-effort: when the list cannot be read the fields stay `None` and the
 /// preview proceeds. A list that shows delete manifests is a merge-on-read
-/// snapshot, and is refused unless the operator override is on, as the Stats
-/// tier's manifest backstop refuses it; the summary guard already refuses the
-/// same snapshot when its summary says so. Returns whether the list showed
-/// delete manifests.
+/// snapshot: the totals are still filled, as the upper bounds they are, and
+/// the return is `true` so the preview flags them (`has_delete_files` and the
+/// upper-bound warning). This tier is display-only, so it does not refuse; a
+/// query of the same snapshot is refused by the scan planner, which reads the
+/// same list.
 async fn schema_counts_from_manifest_list<S, E, F, Fut>(
     cache: Option<&super::R2rmlCache>,
     schema: &mut TableSchema,
     metadata: &TableMetadata,
-    table_display: &str,
-    allow_mor: bool,
     open_storage: F,
-) -> Result<bool>
+) -> bool
 where
     S: SendIcebergStorage + ?Sized,
     E: std::fmt::Display,
@@ -961,26 +954,31 @@ where
     Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
 {
     if schema.row_count.is_some() && schema.data_file_count.is_some() {
-        return Ok(false);
+        return false;
     }
     let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(false);
+        return false;
     };
     let Some(totals) =
         super::cached_manifest_list_totals(cache, &schema.table, snapshot, open_storage).await
     else {
-        return Ok(false);
+        return false;
     };
-    if totals.has_delete_manifests() {
-        fluree_db_iceberg::ensure_no_delete_manifests(
-            totals.delete_manifests,
-            table_display,
-            allow_mor,
-        )?;
-    }
     schema.row_count = schema.row_count.or(totals.row_count);
     schema.data_file_count = schema.data_file_count.or(totals.data_file_count);
-    Ok(totals.has_delete_manifests())
+    totals.has_delete_manifests()
+}
+
+/// Whether a Schema-tier preview must caveat its counts as upper bounds: the
+/// manifest list it filled them from shows delete manifests (the tier reports
+/// these rather than refusing them), or the summary reports deletes and the
+/// read proceeded under the override (without it the summary guard refused).
+fn schema_counts_are_upper_bounds(
+    allow_mor: bool,
+    list_deletes: bool,
+    summary_deletes: bool,
+) -> bool {
+    list_deletes || preview_counts_are_upper_bounds(allow_mor, false, summary_deletes)
 }
 
 /// Lift an [`IcebergError`](fluree_db_iceberg::IcebergError) raised at a
@@ -2422,22 +2420,14 @@ mod tests {
         cache: Option<&super::super::R2rmlCache>,
         metadata: &TableMetadata,
         storage: &Arc<ListStorage>,
-        allow_mor: bool,
-    ) -> (TableSchema, Result<bool>, usize) {
+    ) -> (TableSchema, bool, usize) {
         let mut schema =
             table_schema_from_metadata(&TableIdentifier::new("ns", "big"), metadata).unwrap();
         let opened = std::sync::atomic::AtomicUsize::new(0);
-        let out = schema_counts_from_manifest_list(
-            cache,
-            &mut schema,
-            metadata,
-            "ns.big (gs://b/big)",
-            allow_mor,
-            || {
-                opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::future::ready(Ok::<_, String>(Arc::clone(storage)))
-            },
-        )
+        let out = schema_counts_from_manifest_list(cache, &mut schema, metadata, || {
+            opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok::<_, String>(Arc::clone(storage)))
+        })
         .await;
         (schema, out, opened.into_inner())
     }
@@ -2448,8 +2438,8 @@ mod tests {
         let storage = bq_list_storage(&metadata);
         let cache = super::super::R2rmlCache::with_defaults();
 
-        let (schema, out, opened) = schema_fill(Some(&cache), &metadata, &storage, false).await;
-        assert!(!out.unwrap(), "no delete manifest");
+        let (schema, out, opened) = schema_fill(Some(&cache), &metadata, &storage).await;
+        assert!(!out, "no delete manifest");
         assert_eq!(schema.row_count, Some(2_000_000));
         assert_eq!(schema.data_file_count, Some(4));
         assert_eq!(
@@ -2459,7 +2449,7 @@ mod tests {
         assert_eq!((opened, storage.reads()), (1, 1));
 
         // A repeat preview of the same snapshot reads nothing.
-        let (schema, _, opened) = schema_fill(Some(&cache), &metadata, &storage, false).await;
+        let (schema, _, opened) = schema_fill(Some(&cache), &metadata, &storage).await;
         assert_eq!(schema.row_count, Some(2_000_000));
         assert_eq!((opened, storage.reads()), (0, 1));
     }
@@ -2472,8 +2462,8 @@ mod tests {
         summary.insert("total-data-files".to_string(), "1".to_string());
         let storage = bq_list_storage(&metadata);
 
-        let (schema, out, opened) = schema_fill(None, &metadata, &storage, false).await;
-        assert!(!out.unwrap());
+        let (schema, out, opened) = schema_fill(None, &metadata, &storage).await;
+        assert!(!out);
         assert_eq!(schema.row_count, Some(10), "the summary's, not the list's");
         assert_eq!(schema.data_file_count, Some(1));
         assert_eq!((opened, storage.reads()), (0, 0));
@@ -2484,17 +2474,19 @@ mod tests {
         let metadata = bq_metadata();
         let unreadable = Arc::new(ListStorage::default());
 
-        let (schema, out, _) = schema_fill(None, &metadata, &unreadable, false).await;
-        assert!(!out.expect("a failed read does not fail the preview"));
+        let (schema, out, _) = schema_fill(None, &metadata, &unreadable).await;
+        assert!(!out, "a failed read does not fail the preview");
         assert_eq!(schema.row_count, None);
         assert_eq!(schema.data_file_count, None);
         assert_eq!(unreadable.reads(), 1);
     }
 
-    /// A list with a delete manifest is refused, as the Stats tier refuses it,
-    /// unless the override is on; then the counts are filled and flagged.
+    /// A list with a delete manifest does not refuse this display-only tier:
+    /// the totals are filled and flagged as the upper bounds they are, with or
+    /// without the override. (A query of the snapshot is refused by the scan
+    /// planner, which reads the same list.)
     #[tokio::test]
-    async fn schema_tier_refuses_a_manifest_list_with_delete_manifests_unless_overridden() {
+    async fn schema_tier_reports_a_delete_bearing_list_as_upper_bounds() {
         let metadata = bq_metadata();
         let storage = bq_list_storage(&metadata);
         let cache = super::super::R2rmlCache::with_defaults();
@@ -2511,13 +2503,26 @@ mod tests {
             },
         );
 
-        let (schema, out, _) = schema_fill(Some(&cache), &metadata, &storage, false).await;
-        let err = out.expect_err("delete manifests are refused by default");
-        assert_eq!(err.status_code(), 409, "{err}");
-        assert_eq!(schema.row_count, None, "no count surfaced");
-
-        let (schema, out, _) = schema_fill(Some(&cache), &metadata, &storage, true).await;
-        assert!(out.unwrap(), "flagged under the override");
+        let (schema, list_deletes, _) = schema_fill(Some(&cache), &metadata, &storage).await;
+        assert!(list_deletes, "flagged");
         assert_eq!(schema.row_count, Some(1000));
+        assert_eq!(schema.data_file_count, Some(1));
+        for allow_mor in [false, true] {
+            assert!(
+                schema_counts_are_upper_bounds(allow_mor, list_deletes, false),
+                "caveated with allow_mor = {allow_mor}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_counts_are_upper_bounds_only_when_a_delete_signal_fired() {
+        // Neither signal: exact.
+        assert!(!schema_counts_are_upper_bounds(false, false, false));
+        assert!(!schema_counts_are_upper_bounds(true, false, false));
+        // The list: always an upper bound (this tier does not refuse it).
+        assert!(schema_counts_are_upper_bounds(false, true, false));
+        // The summary: an upper bound once the override let the read proceed.
+        assert!(schema_counts_are_upper_bounds(true, false, true));
     }
 }
