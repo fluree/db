@@ -749,11 +749,13 @@ mod tests {
 
     #[tokio::test]
     async fn every_provider_header_reaches_the_catalog() {
-        #[derive(Debug)]
-        struct TwoHeaders;
+        /// Records the URL each request names, to check it is the request's own.
+        #[derive(Debug, Default)]
+        struct TwoHeaders(std::sync::Mutex<Vec<String>>);
         #[async_trait]
         impl SendCatalogAuth for TwoHeaders {
-            async fn request_headers(&self, _url: &str) -> Result<reqwest::header::HeaderMap> {
+            async fn request_headers(&self, url: &str) -> Result<reqwest::header::HeaderMap> {
+                self.0.lock().unwrap().push(url.to_string());
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("authorization", "Bearer t".parse().unwrap());
                 headers.insert("x-goog-user-project", "p".parse().unwrap());
@@ -768,12 +770,26 @@ mod tests {
         serve_table(&server, "/v1/namespaces/db/tables/events").await;
         // A warehouse no other test uses (pooled mock servers reuse URLs).
         let mut client = warehouse_client(&server.uri(), Some("two-provider-headers"));
-        client.auth = Arc::new(TwoHeaders);
+        let auth = Arc::new(TwoHeaders::default());
+        client.auth = auth.clone();
         loads(&client, "db").await.unwrap();
-        for request in server.received_requests().await.unwrap() {
+        let received = server.received_requests().await.unwrap();
+        for request in &received {
             assert_eq!(request.headers["authorization"], "Bearer t");
             assert_eq!(request.headers["x-goog-user-project"], "p");
         }
+        // Each request named its own URL to the provider (which decides where
+        // its credential may go).
+        // (wiremock reports the host as `localhost`; the path and query are
+        // the request's.)
+        let sent: Vec<String> = received
+            .iter()
+            .map(|r| {
+                let query = r.url.query().map(|q| format!("?{q}")).unwrap_or_default();
+                format!("{}{}{query}", server.uri(), r.url.path())
+            })
+            .collect();
+        assert_eq!(*auth.0.lock().unwrap(), sent);
     }
 
     #[tokio::test]

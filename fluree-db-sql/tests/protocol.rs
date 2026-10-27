@@ -366,3 +366,57 @@ async fn an_identity_refusal_from_the_auth_provider_stays_typed() {
         "nothing is sent without the provider's headers"
     );
 }
+
+/// Every request names its own URL to the auth provider (which decides where
+/// its credential may go): the statement, and each page at the `nextUri` the
+/// endpoint chose.
+#[tokio::test]
+async fn every_request_names_its_own_url_to_the_auth_provider() {
+    #[derive(Debug, Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl SendCatalogAuth for Recording {
+        async fn request_headers(
+            &self,
+            url: &str,
+        ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+            self.0.lock().unwrap().push(url.to_string());
+            Ok(reqwest::header::HeaderMap::new())
+        }
+        async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    let base = server.uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            "q",
+            Some(format!("{base}/v1/statement/q/1")),
+            true,
+            json!([[1, "a"]]),
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/statement/q/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            "q",
+            None,
+            false,
+            json!([[2, "b"]]),
+        )))
+        .mount(&server)
+        .await;
+    let auth = Arc::new(Recording::default());
+    let c = TrinoClient::new(&SqlGsConfig::new(server.uri()), auth.clone()).unwrap();
+    c.execute_collect("SELECT 1").await.unwrap();
+    assert_eq!(
+        *auth.0.lock().unwrap(),
+        vec![
+            format!("{base}/v1/statement"),
+            format!("{base}/v1/statement/q/1")
+        ]
+    );
+}

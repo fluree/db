@@ -846,14 +846,16 @@ mod tests {
     /// `Authorization`: a Google identity's quota project rides along.
     #[tokio::test]
     async fn every_auth_header_reaches_unity() {
-        #[derive(Debug)]
-        struct WithQuotaProject;
+        /// Records the URL each request names, to check it is the request's own.
+        #[derive(Debug, Default)]
+        struct WithQuotaProject(std::sync::Mutex<Vec<String>>);
         #[async_trait]
         impl SendCatalogAuth for WithQuotaProject {
             async fn request_headers(
                 &self,
-                _url: &str,
+                url: &str,
             ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+                self.0.lock().unwrap().push(url.to_string());
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("authorization", "Bearer catalog-token".parse().unwrap());
                 headers.insert("x-goog-user-project", "lake-project".parse().unwrap());
@@ -874,12 +876,27 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        let auth = Arc::new(WithQuotaProject::default());
         let unity = UnityClient {
             base: server.uri(),
-            auth: Arc::new(WithQuotaProject),
+            auth: auth.clone(),
             http: reqwest::Client::new(),
         };
         assert_eq!(unity.table("main.sales.orders").await.unwrap().id, "t-1");
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            // (wiremock reports the host as `localhost`; the path is the
+            // request's.)
+            .map(|r| format!("{}{}", server.uri(), r.url.path()))
+            .collect();
+        assert_eq!(
+            *auth.0.lock().unwrap(),
+            sent,
+            "each request names its own URL"
+        );
     }
 
     #[tokio::test]
