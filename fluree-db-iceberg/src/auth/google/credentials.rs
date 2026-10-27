@@ -127,6 +127,12 @@ pub enum ExternalAccountConfig {
 /// The keys a [`ConfigValue`] object can carry.
 const CONFIG_VALUE_KEYS: [&str; 4] = ["secret_ref", "env_var", "java_property", "default_val"];
 
+/// Why a value is not an [`ExternalAccountConfig`], as its deserializer says
+/// it. It names the accepted forms and nothing of the value, so a surface that
+/// never repeats serde's own text can repeat this.
+pub const EXTERNAL_ACCOUNT_CONFIG_FORMS: &str = "external_account.config must be the credential \
+    configuration object, its JSON text, or an env_var / secret_ref holding it";
+
 impl<'de> Deserialize<'de> for ExternalAccountConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         use serde::de::Error;
@@ -148,10 +154,7 @@ impl<'de> Deserialize<'de> for ExternalAccountConfig {
                     .map(ExternalAccountConfig::Ref)
                     .map_err(D::Error::custom)
             }
-            _ => Err(D::Error::custom(
-                "external_account.config must be the credential configuration object, its JSON \
-                 text, or an env_var / secret_ref holding it",
-            )),
+            _ => Err(D::Error::custom(EXTERNAL_ACCOUNT_CONFIG_FORMS)),
         }
     }
 }

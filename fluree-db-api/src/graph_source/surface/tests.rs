@@ -299,13 +299,9 @@ fn a_variable_the_operator_did_not_list_is_refused_in_either_form() {
                 "key": {"env_var": "AWS_SECRET_ACCESS_KEY"}}}}}),
     ] {
         let e = refused(body);
-        assert_eq!(
-            e.kind,
-            InputErrorKind::EnvNotAllowed {
-                name: "AWS_SECRET_ACCESS_KEY".into()
-            }
-        );
+        assert_eq!(e.kind, InputErrorKind::EnvNotAllowed);
         assert!(e.to_string().contains(SECRET_ENV_VARS_ENV), "{e}");
+        assert!(!e.to_string().contains("AWS_SECRET_ACCESS_KEY"), "{e}");
     }
     // The CLI and Python name their own process's variables.
     iceberg_connection_from_json(
@@ -433,10 +429,134 @@ fn rest_only_fields_are_refused_by_other_modes_and_named() {
     }
 }
 
+/// A value no refusal may repeat.
+const MARKER: &str = "MARKER-7f3a";
+
+/// A service-account key file's JSON text, as pasted where an object belongs.
+fn key_file_text() -> String {
+    json!({"type": "service_account", "client_email": "sa@p.iam.gserviceaccount.com",
+        "private_key": MARKER})
+    .to_string()
+}
+
+/// A bearer auth object encoded once more, as a string.
+fn bearer_text() -> String {
+    json!({"type": "bearer", "token": MARKER}).to_string()
+}
+
+/// A value with quotes of its own around the marker.
+fn quoted() -> String {
+    format!("x\" {MARKER} \"y")
+}
+
+/// Asserts `e`, in every spelling a surface renders, says nothing of MARKER.
+fn assert_quiet(body: &Value, e: &GraphSourceInputError) {
+    for message in [
+        e.to_string(),
+        e.message(|f| format!("--{}", f.replace('_', "-"))),
+    ] {
+        assert!(!message.contains(MARKER), "{body}: {message}");
+        assert!(!message.contains("private_key"), "{body}: {message}");
+    }
+}
+
 #[test]
-fn a_serde_message_never_echoes_a_value() {
-    let e = refused(json!({"catalog_uri": URI, "s3_path_style": "sk-live-secret"}));
-    assert!(!e.to_string().contains("sk-live-secret"), "{e}");
+fn an_iceberg_refusal_never_repeats_a_value() {
+    for body in [
+        // A key file's text where the credentials object belongs.
+        json!({"catalog": {"type": "rest", "uri": URI, "auth": {"type": "google",
+            "credentials": key_file_text()}}}),
+        json!({"catalog": {"type": "rest", "uri": URI}, "io": {"storage_auth": {
+            "type": "google", "credentials": key_file_text()}}}),
+        json!({"catalog": {"type": "rest", "uri": URI}, "io": {"storage_auth": key_file_text()}}),
+        // Auth encoded twice.
+        json!({"catalog": {"type": "rest", "uri": URI, "auth": bearer_text()}}),
+        // A variant name with quotes in it.
+        json!({"catalog": {"type": "rest", "uri": URI}, "io": {"storage_auth": {
+            "type": quoted()}}}),
+        json!({"catalog": {"type": "rest", "uri": URI, "auth": {"type": quoted()}}}),
+        json!({"catalog": {"type": quoted()}}),
+        // Quoted text where a boolean or a list belongs.
+        json!({"catalog_uri": URI, "s3_path_style": quoted()}),
+        json!({"catalog": {"type": "rest", "uri": URI}, "io": {"vended_credentials": quoted()}}),
+        json!({"catalog": {"type": "rest", "uri": URI, "auth": {"type": "google",
+            "credentials": {"source": "metadata"}, "scopes": {"k": quoted()}}}}),
+        // Values the codec reads itself.
+        json!({"catalog_uri": URI, "storage_identity": quoted()}),
+        json!({"mode": quoted(), "catalog_uri": URI}),
+        json!({"catalog_uri": URI, "auth_bearer_env": MARKER}),
+        json!({"catalog": {"type": "rest", "uri": URI}, "io": {"storage_auth": {
+            "type": "google", "credentials": {"source": "service_account",
+                "key": {"env_var": MARKER}}}}}),
+        json!({"catalog": {"type": "rest", "uri": URI, "auth": {"type": "google",
+            "credentials": {"source": "external_account", "config": [MARKER]}}}}),
+    ] {
+        let e = refused(body.clone());
+        assert_quiet(&body, &e);
+    }
+}
+
+/// The refusal is said by reading the input again; that reading must accept
+/// every form serde_json does, or a refusal could only say "not a valid value".
+#[test]
+fn the_refusal_reading_accepts_every_stored_form() {
+    for (_, structured) in iceberg_pairs() {
+        for (key, value) in object(structured) {
+            let why = match key.as_str() {
+                "catalog" => refusal::why_not::<CatalogConfig>(&value),
+                "io" => refusal::why_not::<IoConfig>(&value),
+                other => panic!("unexpected key {other}"),
+            };
+            assert!(why.is_none(), "{value}: {why:?}");
+        }
+    }
+    for auth in every_auth("SECRET-VALUE") {
+        let value = serde_json::to_value(&auth).unwrap();
+        let why = refusal::why_not::<AuthConfig>(&value);
+        assert!(why.is_none(), "{value}: {why:?}");
+    }
+    for storage_auth in every_storage_auth("SECRET-VALUE") {
+        let value = serde_json::to_value(&storage_auth).unwrap();
+        let why = refusal::why_not::<StorageAuth>(&value);
+        assert!(why.is_none(), "{value}: {why:?}");
+    }
+}
+
+#[test]
+fn a_refusal_says_where_and_what_was_expected() {
+    let e = refused(json!({"catalog": {"type": "rest", "uri": URI},
+        "io": {"storage_auth": {"type": quoted()}}}));
+    assert_eq!(e.field, "io.storage_auth.type");
+    assert!(e.to_string().contains("unknown variant"), "{e}");
+    assert!(e.to_string().contains("`catalog`"), "{e}");
+
+    let e = refused(json!({"catalog": {"type": "rest", "uri": URI},
+        "io": {"storage_auth": key_file_text()}}));
+    assert_eq!(e.field, "io.storage_auth");
+    assert!(
+        e.to_string()
+            .contains("invalid type: a string, expected internally tagged enum StorageAuth"),
+        "{e}"
+    );
+
+    // A flat field is named, not the whole request.
+    let e = refused(json!({"catalog_uri": URI, "s3_path_style": quoted()}));
+    assert_eq!(e.field, "s3_path_style");
+    assert!(
+        e.to_string().contains("a string, expected a boolean"),
+        "{e}"
+    );
+
+    // A deserializer's own message that names only the forms it takes is kept.
+    let e = refused(
+        json!({"catalog": {"type": "rest", "uri": URI}, "io": {"storage_auth": {
+        "type": "google", "credentials": {"source": "external_account", "config": [MARKER]}}}}),
+    );
+    assert!(
+        e.to_string()
+            .contains(fluree_db_iceberg::auth::google::EXTERNAL_ACCOUNT_CONFIG_FORMS),
+        "{e}"
+    );
 }
 
 // ---- SQL ---------------------------------------------------------------------
@@ -470,12 +590,27 @@ fn sql_auth_is_the_same_in_both_forms_and_names_variables_like_iceberg() {
     .unwrap_err();
     assert!(matches!(e.kind, InputErrorKind::TwoWays { .. }), "{e}");
     let e = sql(json!({"auth_bearer_env": "OTHER"})).unwrap_err();
-    assert!(
-        matches!(e.kind, InputErrorKind::EnvNotAllowed { .. }),
-        "{e}"
-    );
+    assert!(matches!(e.kind, InputErrorKind::EnvNotAllowed), "{e}");
     let e = sql(json!({"auth": {"type": "none"}, "auth_bearer": "t"})).unwrap_err();
     assert!(matches!(e.kind, InputErrorKind::Mixed { .. }), "{e}");
+}
+
+#[cfg(feature = "sql")]
+#[test]
+fn a_sql_refusal_never_repeats_a_value() {
+    let rules = SecretRules::listed("SQL_TOKEN", false);
+    for body in [
+        json!({"auth": bearer_text()}),
+        json!({"auth": key_file_text()}),
+        json!({"auth": {"type": "google", "credentials": key_file_text()}}),
+        json!({"auth": {"type": quoted()}}),
+        json!({"auth": {"type": "bearer", "token": [quoted()]}}),
+        json!({"auth_bearer": [quoted()]}),
+        json!({"auth_bearer_env": MARKER}),
+    ] {
+        let e = sql_auth_from_json(object(body.clone()), &rules).unwrap_err();
+        assert_quiet(&body, &e);
+    }
 }
 
 // ---- Delta -------------------------------------------------------------------
@@ -519,6 +654,24 @@ fn delta_connections_are_the_same_in_both_forms() {
 
 #[cfg(feature = "delta")]
 #[test]
+fn a_delta_refusal_never_repeats_a_value() {
+    let unity = |auth: Value| json!({"unity": {"uri": "https://ws.example.com", "catalog": "main", "auth": auth}});
+    for body in [
+        unity(json!(bearer_text())),
+        unity(json!({"type": quoted()})),
+        json!({"unity": bearer_text()}),
+        json!({"io": {"azure": key_file_text()}}),
+        json!({"io": {"azure": {"type": quoted()}}}),
+        json!({"io": {"s3_region": [quoted()]}}),
+        json!({"azure_tenant_id": "t", "azure_client_id": "c", "azure_client_secret_env": MARKER}),
+    ] {
+        let e = delta(body.clone()).unwrap_err();
+        assert_quiet(&body, &e);
+    }
+}
+
+#[cfg(feature = "delta")]
+#[test]
 fn an_azure_secret_variable_goes_through_the_allowlist() {
     // `azure_client_secret_env` used to skip it.
     for body in [
@@ -528,10 +681,7 @@ fn an_azure_secret_variable_goes_through_the_allowlist() {
             "client_secret": {"env_var": "AWS_SECRET_ACCESS_KEY"}}}}),
     ] {
         let e = delta(body).unwrap_err();
-        assert!(
-            matches!(e.kind, InputErrorKind::EnvNotAllowed { .. }),
-            "{e}"
-        );
+        assert!(matches!(e.kind, InputErrorKind::EnvNotAllowed), "{e}");
     }
     let e = delta(json!({"azure_tenant_id": "t"})).unwrap_err();
     assert!(matches!(e.kind, InputErrorKind::Incomplete { .. }), "{e}");
@@ -666,6 +816,7 @@ fn a_storage_identity_from_flags() {
     assert!(matches!(e.kind, InputErrorKind::Incomplete { .. }), "{e}");
     let e = fields(Some("hmac"), Vec::new()).unwrap_err();
     assert!(matches!(e.kind, InputErrorKind::Invalid { .. }), "{e}");
+    assert!(!e.to_string().contains("hmac"), "{e}");
 }
 
 #[test]
@@ -1145,10 +1296,7 @@ fn a_flat_storage_identity_is_checked_like_any_other_value() {
     .into_connection(&SecretRules::listed("SA_KEY", false))
     .unwrap_err();
     assert_eq!(e.field, "storage_google_service_account_env");
-    assert!(
-        matches!(e.kind, InputErrorKind::EnvNotAllowed { .. }),
-        "{e}"
-    );
+    assert!(matches!(e.kind, InputErrorKind::EnvNotAllowed), "{e}");
 }
 
 #[tokio::test]

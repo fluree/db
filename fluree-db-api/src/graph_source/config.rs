@@ -532,7 +532,8 @@ pub struct CatalogModeArgs<'a> {
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogModeError {
-    /// `mode` is not a catalog mode.
+    /// `mode` is not a catalog mode. The message does not repeat it, since a
+    /// refusal names fields, never the values given.
     UnknownMode(String),
     /// The mode needs `field`.
     MissingField {
@@ -553,9 +554,9 @@ impl CatalogModeError {
     /// The error message, with each field name rendered by `spell`.
     pub fn message(&self, spell: impl Fn(&str) -> String) -> String {
         match self {
-            CatalogModeError::UnknownMode(mode) => format!(
-                "unknown catalog mode '{mode}'. Use 'rest', 'direct', 'glue', or 's3tables'."
-            ),
+            CatalogModeError::UnknownMode(_) => {
+                "unknown catalog mode. Use 'rest', 'direct', 'glue', or 's3tables'.".to_string()
+            }
             CatalogModeError::MissingField { mode, field } => {
                 format!("{} is required for {mode} mode", spell(field))
             }

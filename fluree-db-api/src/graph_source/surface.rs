@@ -65,9 +65,11 @@ pub enum InputErrorKind {
     Conflict { other: String },
     /// A second way to authenticate (or a second credential), beside `other`.
     TwoWays { other: String },
-    /// Names environment variable `name`, which the operator does not list in
-    /// [`SECRET_ENV_VARS_ENV`].
-    EnvNotAllowed { name: String },
+    /// Names an environment variable the operator does not list in
+    /// [`SECRET_ENV_VARS_ENV`]. The name is not kept: a refusal names fields,
+    /// never the values given, and a credential pasted where a variable's
+    /// name belongs is a value.
+    EnvNotAllowed,
     /// A secret reference, and this instance has no resolver for one.
     SecretRefUnsupported,
     /// A Google service-account key given literally.
@@ -153,9 +155,9 @@ impl GraphSourceInputError {
                 "{field} and {} are two ways to authenticate: give one",
                 spell(other)
             ),
-            InputErrorKind::EnvNotAllowed { name } => format!(
-                "{field} names environment variable '{name}', which this server does not list \
-                 in {SECRET_ENV_VARS_ENV}"
+            InputErrorKind::EnvNotAllowed => format!(
+                "{field} names an environment variable this server does not list in \
+                 {SECRET_ENV_VARS_ENV}"
             ),
             InputErrorKind::SecretRefUnsupported => format!(
                 "{field} is a secret reference (secret_ref), and this instance has no secret \
@@ -275,9 +277,7 @@ impl SecretRules {
                 java_property: None,
                 default_val: None,
             } if !name.trim().is_empty() => match &self.env {
-                Some(listed) if !listed.iter().any(|l| l == name) => {
-                    refuse(K::EnvNotAllowed { name: name.clone() })
-                }
+                Some(listed) if !listed.iter().any(|l| l == name) => refuse(K::EnvNotAllowed),
                 _ => Ok(()),
             },
             ConfigValue::Dynamic { .. } => refuse(K::UnsupportedReference),
@@ -356,10 +356,11 @@ pub(crate) fn strict<T: DeserializeOwned + Serialize>(
     field: &str,
     value: Value,
 ) -> Result<T, GraphSourceInputError> {
-    let parsed: T = serde_json::from_value(value.clone())
-        .map_err(|e| GraphSourceInputError::invalid(field, scrub(&e.to_string())))?;
+    let Ok(parsed) = serde_json::from_value::<T>(value.clone()) else {
+        return Err(not_a::<T>(field, &value));
+    };
     let canonical = serde_json::to_value(&parsed)
-        .map_err(|e| GraphSourceInputError::invalid(field, scrub(&e.to_string())))?;
+        .map_err(|_| GraphSourceInputError::invalid(field, "cannot be stored as given"))?;
     match unknown_key(&value, &canonical) {
         Some(path) => Err(GraphSourceInputError::new(
             join(field, &path),
@@ -403,24 +404,18 @@ fn unknown_key(input: &Value, canonical: &Value) -> Option<String> {
     }
 }
 
-/// A serde message with every quoted string replaced: serde quotes the value it
-/// could not parse, and that value may be a secret in the wrong field.
-fn scrub(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut quoted = false;
-    for c in message.chars() {
-        if c == '"' {
-            if quoted {
-                out.push_str("…\"");
-            } else {
-                out.push('"');
-            }
-            quoted = !quoted;
-        } else if !quoted {
-            out.push(c);
-        }
+/// Why `value` (at `field`) is not a `T`, at the key or index where it stops
+/// being one. serde's own message quotes the value, which may be a credential
+/// in the wrong field, so the refusal is built from `T`'s terms alone (see
+/// [`refusal`]): the path, the kind of value found, and what `T` expected.
+fn not_a<T: DeserializeOwned>(field: &str, value: &Value) -> GraphSourceInputError {
+    match refusal::why_not::<T>(value) {
+        Some(refusal) => GraphSourceInputError::invalid(
+            join(field, &refusal.path.join(".")),
+            refusal.to_string(),
+        ),
+        None => GraphSourceInputError::invalid(field, "not a valid value here"),
     }
-    out
 }
 
 /// The keys `T`'s default serializes to: every field of a flat form.
@@ -756,10 +751,10 @@ impl StorageAuthFields {
             Some("vended") => return Ok(Some(StorageAuth::Vended)),
             Some("ambient") => return Ok(Some(StorageAuth::Ambient)),
             Some("catalog") => return Ok(Some(StorageAuth::Catalog)),
-            Some(other) => {
+            Some(_) => {
                 return Err(GraphSourceInputError::invalid(
                     "storage_identity",
-                    format!("'{other}' is not vended, ambient, catalog or google"),
+                    "must be vended, ambient, catalog or google",
                 ))
             }
         };
@@ -1551,5 +1546,6 @@ fn mask_all(value: &mut Value) -> bool {
     }
 }
 
+mod refusal;
 #[cfg(test)]
 mod tests;

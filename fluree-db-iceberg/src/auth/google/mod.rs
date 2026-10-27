@@ -40,7 +40,7 @@ mod wire;
 pub use aws_credential_types::Credentials as AwsCredentials;
 #[cfg(feature = "aws")]
 pub use aws_subject::AwsSubjectCredentials;
-pub use credentials::{ExternalAccountConfig, GoogleCredentials};
+pub use credentials::{ExternalAccountConfig, GoogleCredentials, EXTERNAL_ACCOUNT_CONFIG_FORMS};
 
 use std::sync::{Arc, OnceLock};
 
