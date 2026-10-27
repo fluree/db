@@ -12,7 +12,7 @@
   incrementally, and it is too large to commit in one pass.
 - `silver.cells`: one column of every physical type the R2RML materializer
   renders (int, long, float, double, decimal, boolean, date, timestamp,
-  timestamptz, binary, string), in two files, with values whose lexical order
+  timestamptz, binary, string, and numeric text), in two files, with values whose lexical order
   differs from their natural order, duplicates to group on, and a row that is
   null in every typed column.
 """
@@ -132,7 +132,9 @@ print("window snapshots:", [
 # before "9", -0.0 and 0.0 are different strings. The second file holds only
 # integers of two or more digits, so a file-level prune by the column's
 # numeric bounds (a scan-side top-k, a pushed comparison) reaches a different
-# answer from the string comparison.
+# answer from the string comparison. `ntext` holds `i32`'s values as text, for
+# a mapping that declares a numeric datatype over a string column: its terms
+# order by number, its file bounds by string ("9" above "100").
 cells_schema = pa.schema([
     pa.field("id", pa.int64()),
     pa.field("grp", pa.string()),
@@ -147,6 +149,7 @@ cells_schema = pa.schema([
     pa.field("tstz", pa.timestamp("us", tz="UTC")),
     pa.field("raw", pa.binary()),
     pa.field("label", pa.string()),
+    pa.field("ntext", pa.string()),
 ])
 cells = catalog.create_table("silver.cells", schema=cells_schema)
 utc = timezone.utc
@@ -187,6 +190,7 @@ def cells_batch(rows):
                          pa.timestamp("us", tz="UTC")),
         "raw": pa.array(col(10), pa.binary()),
         "label": pa.array(col(11)),
+        "ntext": pa.array([None if v is None else str(v) for v in col(2)]),
     }, schema=cells_schema)
 
 cells.append(cells_batch(cells_rows[:4]))
