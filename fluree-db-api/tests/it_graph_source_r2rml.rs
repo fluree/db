@@ -997,16 +997,16 @@ impl R2rmlTableProvider for IcebergDirectProvider {
                     scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
                     audience: None,
                 }
-                .create_provider_arc()
+                .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
                 .map_err(|e| QueryError::Internal(format!("OAuth2 auth error: {e}")))?
             } else {
                 AuthConfig::None
-                    .create_provider_arc()
+                    .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
                     .map_err(|e| QueryError::Internal(format!("Auth error: {e}")))?
             }
         } else {
             AuthConfig::None
-                .create_provider_arc()
+                .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
                 .map_err(|e| QueryError::Internal(format!("Auth error: {e}")))?
         };
 
@@ -1031,8 +1031,12 @@ impl R2rmlTableProvider for IcebergDirectProvider {
             load_response.credentials.is_some()
         );
 
-        // Create S3 storage
-        let storage = if let Some(creds) = load_response.credentials {
+        // Create S3 storage (a live-catalog test double, outside the engine's
+        // storage decision).
+        #[allow(deprecated)]
+        let storage = if let Some(fluree_db_iceberg::credential::VendedCredentials::S3(creds)) =
+            load_response.credentials
+        {
             eprintln!("  Using vended credentials");
             eprintln!("    Endpoint from creds: {:?}", creds.endpoint);
             eprintln!("    Region from creds: {:?}", creds.region);

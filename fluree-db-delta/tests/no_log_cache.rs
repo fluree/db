@@ -7,6 +7,7 @@ use std::path::Path;
 use fluree_db_delta::{
     ColumnFilter, DeltaIoConfig, DeltaTable, FilterOp, FilterValue, VersionSelector,
 };
+use fluree_db_iceberg::auth::IdentityContext;
 use futures::StreamExt;
 
 #[tokio::test]
@@ -25,6 +26,7 @@ async fn with_no_budget_every_read_replays_the_log() {
         "partitioned",
         root.to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap();
     let latest = table.snapshot(VersionSelector::Latest).await.unwrap();

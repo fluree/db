@@ -3461,7 +3461,10 @@ async fn live_differential(backend: &LiveBackend) {
     let mut cfg = fluree_db_sql::SqlGsConfig::new(url.clone());
     cfg.dialect = backend.dialect;
     let cfg = cfg.hydrate(None).await.expect("hydrate");
-    let auth = cfg.auth.create_provider_arc().expect("auth");
+    let auth = cfg
+        .auth
+        .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+        .expect("auth");
     let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
     for stmt in backend.seed {
         client

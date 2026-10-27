@@ -13,8 +13,7 @@
 #![cfg(feature = "iceberg")]
 
 use fluree_db_api::{
-    browse_iceberg_catalog, preview_iceberg_table, BrowseDepth, IcebergConnectionConfig, StatsTier,
-    TableIdentifier,
+    BrowseDepth, FlureeBuilder, IcebergConnectionConfig, StatsTier, TableIdentifier,
 };
 
 fn env(k: &str) -> Option<String> {
@@ -34,7 +33,9 @@ async fn glue_browse_lists_database_and_tables() {
         eprintln!("skip glue_browse: set FLUREE_GLUE_IT_DATABASE");
         return;
     };
-    let browse = browse_iceberg_catalog(conn(), BrowseDepth::Tables)
+    let browse = FlureeBuilder::memory()
+        .build_memory()
+        .browse_iceberg_catalog(conn(), BrowseDepth::Tables)
         .await
         .expect("browse should succeed for a Glue catalog");
     assert!(
@@ -62,13 +63,15 @@ async fn glue_preview_returns_schema() {
     };
     let name =
         env("FLUREE_GLUE_IT_TABLE").expect("FLUREE_GLUE_IT_TABLE required when DATABASE set");
-    let preview = preview_iceberg_table(
-        conn(),
-        TableIdentifier { namespace, name },
-        StatsTier::Schema,
-    )
-    .await
-    .expect("preview should succeed for a Glue table (via the S3 metadata fallback)");
+    let preview = FlureeBuilder::memory()
+        .build_memory()
+        .preview_iceberg_table(
+            conn(),
+            TableIdentifier { namespace, name },
+            StatsTier::Schema,
+        )
+        .await
+        .expect("preview should succeed for a Glue table (via the S3 metadata fallback)");
     assert!(
         !preview.schema.columns.is_empty(),
         "preview schema should list columns"

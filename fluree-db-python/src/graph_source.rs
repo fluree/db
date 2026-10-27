@@ -5,9 +5,9 @@ use crate::convert::to_json;
 use crate::error::{api_error, invalid_request};
 use crate::runtime::block_on;
 use fluree_db_api::{
-    CatalogMode, CatalogModeArgs, DeltaAzureFields, DeltaCreateConfig, DeltaUnityFields, DropMode,
-    Fluree, IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput, SqlAuthConfig,
-    SqlConfigValue, SqlCreateConfig,
+    CatalogModeArgs, DeltaAzureFields, DeltaCreateConfig, DeltaUnityFields, DropMode, Fluree,
+    GraphSourceInputError, IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput, SecretRules,
+    SqlAuthConfig, SqlConfigValue, SqlCreateConfig, StorageAuth,
 };
 use fluree_db_nameservice::GraphSourceType;
 use pyo3::prelude::*;
@@ -40,6 +40,8 @@ pub(crate) struct IcebergSpec {
     auth: Option<Py<PyAny>>,
     /// `None` = REST's default (on); only REST can vend.
     vended_credentials: Option<bool>,
+    /// Which identity reads the files, in its stored shape.
+    storage: Option<Py<PyAny>>,
     s3_region: Option<String>,
     s3_endpoint: Option<String>,
     s3_path_style: bool,
@@ -120,6 +122,16 @@ fn auth(py: Python<'_>, auth: Option<&Py<PyAny>>) -> PyResult<SqlAuthConfig> {
     auth.map_or(Ok(SqlAuthConfig::None), |a| from_py(py, a, "auth"))
 }
 
+/// The values this process may name for `fluree`: any of its own
+/// environment variables, and secret references only with a resolver.
+fn rules(fluree: &Fluree) -> SecretRules {
+    SecretRules::local(fluree.has_secret_resolver())
+}
+
+fn refused(e: GraphSourceInputError) -> PyErr {
+    invalid_request(e.to_string())
+}
+
 /// The registered source, and whatever the registration noticed but did not
 /// refuse: a table it could not read, an endpoint it could not reach.
 fn registered<'py>(
@@ -159,17 +171,6 @@ pub(crate) fn map_iceberg<'py>(
             ))
         }
     };
-    // Settings only a REST catalog uses: refused by any other mode rather than
-    // silently ignored. Turning vending off agrees with every mode, so only an
-    // explicit request for it counts.
-    let rest_only: Vec<&'static str> = [
-        ("warehouse", spec.warehouse.is_some()),
-        ("auth", spec.auth.is_some()),
-        ("vended_credentials", spec.vended_credentials == Some(true)),
-    ]
-    .into_iter()
-    .filter_map(|(name, given)| given.then_some(name))
-    .collect();
     // The same parse the CLI and server use: the mapping names the tables, so a
     // catalog mode needs no `table` of its own.
     let mode_args = CatalogModeArgs {
@@ -183,31 +184,72 @@ pub(crate) fn map_iceberg<'py>(
             .or_else(|| spec.s3_tables.as_ref().and_then(|t| t.region.as_deref())),
         catalog_id: spec.glue.as_ref().and_then(|g| g.catalog_id.as_deref()),
         table_bucket_arn: spec.s3_tables.as_ref().map(|t| t.table_bucket_arn.as_str()),
-        rest_only: &rest_only,
+        rest_only: &[],
     };
-    let iceberg =
+    let mut iceberg =
         IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref(), true)
             .map_err(|e| invalid_request(e.message(str::to_string)))?;
-    let mut config = R2rmlCreateConfig {
+    // Through the builders, which refuse at registration what this catalog
+    // mode would ignore (REST-only auth, warehouse, a request to vend).
+    let rules = rules(fluree);
+    let rest = spec.catalog_uri.is_some();
+    if let Some(auth) = spec.auth.as_ref() {
+        let auth = from_py(py, auth, "auth")?;
+        rules.check_auth("auth", &auth).map_err(refused)?;
+        iceberg = iceberg.with_auth(auth);
+    }
+    let default_storage = fluree_db_api::default_storage_auth(spec.warehouse.as_deref());
+    if let Some(warehouse) = spec.warehouse {
+        iceberg = iceberg.with_warehouse(warehouse);
+    }
+    let storage: Option<StorageAuth> = spec
+        .storage
+        .as_ref()
+        .map(|storage| from_py(py, storage, "storage"))
+        .transpose()?;
+    match (storage, spec.vended_credentials) {
+        (Some(_), Some(_)) => {
+            return Err(invalid_request(
+                "give storage or vended_credentials, not both: storage says which identity reads",
+            ))
+        }
+        (Some(storage), None) => {
+            rules
+                .check_storage_auth("storage", &storage)
+                .map_err(refused)?;
+            iceberg = iceberg.with_storage_auth(storage);
+        }
+        (None, Some(vended)) => iceberg = iceberg.with_vended_credentials(vended),
+        // A BigLake warehouse names the identity that can read it.
+        (None, None) if rest => {
+            if let Some(storage) = default_storage {
+                iceberg = iceberg.with_storage_auth(storage);
+            }
+        }
+        (None, None) => {}
+    }
+    if let Some(region) = spec.s3_region {
+        iceberg = iceberg.with_s3_region(region);
+    }
+    if let Some(endpoint) = spec.s3_endpoint {
+        iceberg = iceberg.with_s3_endpoint(endpoint);
+    }
+    if spec.s3_path_style {
+        iceberg = iceberg.with_s3_path_style(true);
+    }
+    if let Some(branch) = common.branch {
+        iceberg = iceberg.with_branch(branch);
+    }
+    if let Some(order_by) = spec.order_by {
+        iceberg = iceberg.with_order_by(order_by);
+    }
+    iceberg.model = common.model;
+    iceberg.default_allow = common.default_allow;
+    let config = R2rmlCreateConfig {
         iceberg,
         mapping: R2rmlMappingInput::Content(common.mapping),
-        mapping_media_type: None,
+        mapping_media_type: common.mapping_type,
     };
-    let rest = spec.catalog_uri.is_some();
-    if let CatalogMode::Rest(catalog) = &mut config.iceberg.connection.catalog_mode {
-        catalog.warehouse = spec.warehouse;
-        catalog.auth = auth(py, spec.auth.as_ref())?;
-        config.iceberg.connection.io.vended_credentials = spec.vended_credentials.unwrap_or(true);
-    }
-    let io = &mut config.iceberg.connection.io;
-    io.s3_region = spec.s3_region;
-    io.s3_endpoint = spec.s3_endpoint;
-    io.s3_path_style = spec.s3_path_style;
-    config.iceberg.branch = common.branch;
-    config.iceberg.order_by = spec.order_by;
-    config.iceberg.model = common.model;
-    config.iceberg.default_allow = common.default_allow;
-    config.mapping_media_type = common.mapping_type;
     let created = block_on(py, fluree.create_r2rml_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.model_warnings;
     if rest && !created.connection_tested {
@@ -261,6 +303,12 @@ pub(crate) fn map_delta<'py>(
         })
         .transpose()?
         .flatten();
+    let rules = rules(fluree);
+    if let Some(unity) = &unity {
+        rules
+            .check_auth("unity.auth", &unity.auth)
+            .map_err(refused)?;
+    }
     let mut config = DeltaCreateConfig::new(&common.name, String::new(), common.mapping);
     config.root = spec.root;
     config.tables = spec.tables;
@@ -294,6 +342,9 @@ pub(crate) fn map_sql<'py>(
     config.schema = spec.schema;
     config.user = spec.user;
     config.auth = auth(py, spec.auth.as_ref())?;
+    rules(fluree)
+        .check_auth("auth", &config.auth)
+        .map_err(refused)?;
     config.session = spec.session;
     config.allow_duplicate_subjects = spec.allow_duplicate_subjects;
     config.branch = common.branch;

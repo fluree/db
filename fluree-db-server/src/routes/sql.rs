@@ -39,14 +39,6 @@ pub struct SqlMapRequest {
     pub schema: Option<String>,
     /// `X-Trino-User` (defaults to `fluree`)
     pub user: Option<String>,
-    /// Static bearer token
-    pub auth_bearer: Option<String>,
-    /// OAuth2 client-credentials token URL
-    pub oauth2_token_url: Option<String>,
-    pub oauth2_client_id: Option<String>,
-    pub oauth2_client_secret: Option<String>,
-    pub oauth2_scope: Option<String>,
-    pub oauth2_audience: Option<String>,
     /// Session properties (`X-Trino-Session`)
     #[serde(default)]
     pub session: BTreeMap<String, String>,
@@ -58,6 +50,14 @@ pub struct SqlMapRequest {
     /// Accept subject keys the registration probe finds non-unique.
     #[serde(default)]
     pub allow_duplicate_subjects: Option<bool>,
+    /// The endpoint's auth: the structured `auth` (exactly the stored
+    /// config's shape, Google identities included), or the flat fields
+    /// `auth_bearer` / `auth_bearer_env` / `oauth2_token_url` /
+    /// `oauth2_client_id` / `oauth2_client_secret` / `oauth2_client_secret_env`
+    /// / `oauth2_scope` / `oauth2_audience`. See
+    /// [`fluree_db_api::sql_auth_from_json`].
+    #[serde(flatten)]
+    pub auth: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Response for `POST /v1/fluree/sql/map`
@@ -115,11 +115,8 @@ async fn sql_map_local(state: Arc<AppState>, request: Request) -> Result<impl In
         // private hosts are legitimate — a sidecar is the common deployment.)
         fluree_db_api::validate_sql_endpoint(&req.endpoint)
             .map_err(|e| ServerError::bad_request(e.to_string()))?;
-        if let Some(url) = &req.oauth2_token_url {
-            super::iceberg_ssrf::guard_connection_urls(None, Some(url), None)?;
-        }
 
-        let config = build_sql_config(&req)?;
+        let config = build_sql_config(&req, &fluree_db_api::SecretRules::server(&state.fluree))?;
         let result = state
             .fluree
             .create_sql_graph_source(config)
@@ -151,8 +148,11 @@ async fn sql_map_local(state: Arc<AppState>, request: Request) -> Result<impl In
     .await
 }
 
-fn build_sql_config(req: &SqlMapRequest) -> Result<fluree_db_api::SqlCreateConfig> {
-    use fluree_db_api::{SqlAuthConfig, SqlDialect, WireProtocol};
+fn build_sql_config(
+    req: &SqlMapRequest,
+    rules: &fluree_db_api::SecretRules,
+) -> Result<fluree_db_api::SqlCreateConfig> {
+    use fluree_db_api::{SqlDialect, WireProtocol};
 
     let mut config = fluree_db_api::SqlCreateConfig::new(&req.name, &req.endpoint, &req.r2rml);
     config.branch = req.branch.clone();
@@ -190,22 +190,110 @@ fn build_sql_config(req: &SqlMapRequest) -> Result<fluree_db_api::SqlCreateConfi
         };
     }
 
-    if let (Some(url), Some(secret)) = (&req.oauth2_token_url, &req.oauth2_client_secret) {
-        config.auth = SqlAuthConfig::OAuth2ClientCredentials {
-            token_url: url.clone(),
-            client_id: fluree_db_sql_config_value(req.oauth2_client_id.as_deref().unwrap_or("")),
-            client_secret: fluree_db_sql_config_value(secret),
-            scope: req.oauth2_scope.clone(),
-            audience: req.oauth2_audience.clone(),
-        };
-    } else if let Some(token) = &req.auth_bearer {
-        config.auth = SqlAuthConfig::Bearer {
-            token: fluree_db_sql_config_value(token),
-        };
+    config.auth = fluree_db_api::sql_auth_from_json(req.auth.clone(), rules)
+        .map_err(super::iceberg::input_error)?;
+    // The token URL reaches an outbound HTTP client.
+    if let Some(url) = super::iceberg_ssrf::token_url(&config.auth) {
+        super::iceberg_ssrf::guard_connection_urls(None, Some(url), None)?;
     }
     Ok(config)
 }
 
-fn fluree_db_sql_config_value(literal: &str) -> fluree_db_api::SqlConfigValue {
-    fluree_db_api::SqlConfigValue::Literal(literal.to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(extra: serde_json::Value) -> SqlMapRequest {
+        let mut body = serde_json::json!({
+            "name": "orders", "endpoint": "https://trino.example.com", "r2rml": "",
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    }
+
+    fn stored_auth(req: &SqlMapRequest, listed: &str) -> Result<serde_json::Value> {
+        let rules = fluree_db_api::SecretRules::listed(listed, false);
+        Ok(serde_json::to_value(build_sql_config(req, &rules)?.auth).unwrap())
+    }
+
+    #[test]
+    fn a_sql_secret_can_name_a_listed_variable() {
+        // SQL secrets were literal-only over HTTP.
+        let auth = stored_auth(
+            &request(serde_json::json!({"auth_bearer_env": "TRINO_TOKEN"})),
+            "TRINO_TOKEN",
+        )
+        .unwrap();
+        assert_eq!(auth["token"]["env_var"], "TRINO_TOKEN");
+        let refused = stored_auth(
+            &request(
+                serde_json::json!({"oauth2_token_url": "https://t.example.com/token",
+                "oauth2_client_secret_env": "AWS_SECRET_ACCESS_KEY"}),
+            ),
+            "TRINO_TOKEN",
+        );
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains(fluree_db_api::SECRET_ENV_VARS_ENV));
+    }
+
+    #[test]
+    fn sql_auth_is_the_same_flat_or_structured_and_takes_google() {
+        let flat = stored_auth(
+            &request(
+                serde_json::json!({"oauth2_token_url": "https://t.example.com/token",
+                "oauth2_client_id": "app", "oauth2_client_secret": "s"}),
+            ),
+            "",
+        )
+        .unwrap();
+        let structured = stored_auth(
+            &request(
+                serde_json::json!({"auth": {"type": "oauth2_client_credentials",
+                "token_url": "https://t.example.com/token", "client_id": "app",
+                "client_secret": "s"}}),
+            ),
+            "",
+        )
+        .unwrap();
+        assert_eq!(flat, structured);
+        let google = stored_auth(
+            &request(serde_json::json!({"auth": {"type": "google",
+                "credentials": {"source": "metadata"}}})),
+            "",
+        )
+        .unwrap();
+        assert_eq!(google["type"], "google");
+    }
+
+    #[test]
+    fn a_sql_auth_given_two_ways_or_half_given_is_refused() {
+        for extra in [
+            // OAuth2 used to win over the bearer silently.
+            serde_json::json!({"auth_bearer": "t", "oauth2_token_url": "https://t.example.com",
+                "oauth2_client_secret": "s"}),
+            // A token URL alone used to store no auth.
+            serde_json::json!({"oauth2_token_url": "https://t.example.com"}),
+            serde_json::json!({"auth_bearr": "t"}),
+        ] {
+            assert!(stored_auth(&request(extra.clone()), "").is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn a_structured_token_url_is_held_to_the_ssrf_guard() {
+        let e = stored_auth(
+            &request(
+                serde_json::json!({"auth": {"type": "oauth2_client_credentials",
+                "token_url": "http://169.254.169.254/token", "client_id": "",
+                "client_secret": "s"}}),
+            ),
+            "",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("SSRF guard"), "{e}");
+    }
 }

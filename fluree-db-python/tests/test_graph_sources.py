@@ -190,6 +190,97 @@ def test_glue_and_s3_tables_mistakes_are_refused(conn):
     conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
 
 
+# A service-account key named by a variable that is never set: registration
+# cannot mint a token, so nothing connects, and the source registers with a
+# warning as an unreachable catalog does.
+UNSET_KEY = fluree.EnvVar("FLUREE_TEST_PY_SA_KEY_NEVER_SET")
+CATALOG = "http://127.0.0.1:9/catalog"
+
+
+def test_a_google_identity_authenticates_a_rest_catalog_and_reads_its_files(conn, monkeypatch):
+    monkeypatch.delenv(UNSET_KEY.name, raising=False)
+    with pytest.warns(UserWarning, match="could not reach the catalog"):
+        source = conn.map_iceberg(
+            "biglake",
+            ORDERS_MAPPING,
+            catalog_uri=CATALOG,
+            warehouse="bq://projects/lake/locations/us/catalogs/sales",
+            auth=fluree.Google(UNSET_KEY, quota_project="lake"),
+        )
+    assert source.kind == "iceberg"
+    with pytest.warns(UserWarning, match="could not reach the catalog"):
+        conn.map_iceberg(
+            "biglake-explicit",
+            ORDERS_MAPPING,
+            catalog_uri=CATALOG,
+            auth=fluree.Google(UNSET_KEY),
+            storage="catalog",
+        )
+    # A Direct source on gs:// reads with an identity of its own.
+    conn.map_iceberg(
+        "direct-gcs",
+        ORDERS_MAPPING,
+        table_location="s3://bucket/warehouse/sales/orders",
+        storage=fluree.Google(UNSET_KEY),
+    )
+
+
+def test_a_storage_identity_the_catalog_cannot_serve_is_refused(conn):
+    # `catalog` reads with the catalog's Google identity; a bearer has none.
+    with pytest.raises(InvalidRequestError, match="storage_auth `catalog`"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=Bearer("t"), storage="catalog")
+    # A bq:// warehouse defaults to `catalog`, so it needs a Google identity too.
+    with pytest.raises(InvalidRequestError, match="storage_auth `catalog`"):
+        conn.map_iceberg(
+            "x",
+            ORDERS_MAPPING,
+            catalog_uri=CATALOG,
+            warehouse="bq://projects/lake/locations/us/catalogs/sales",
+            auth=Bearer("t"),
+        )
+    # Only a REST catalog vends.
+    with pytest.raises(InvalidRequestError, match="REST catalog"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), storage="vended")
+    with pytest.raises(InvalidRequestError, match="not both"):
+        conn.map_iceberg(
+            "x", ORDERS_MAPPING, catalog_uri=CATALOG, storage="ambient", vended_credentials=False
+        )
+    with pytest.raises(InvalidRequestError, match="storage is"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, storage="hmac")
+
+
+def test_a_google_identity_is_never_a_literal_key_and_its_config_is_checked(conn, tmp_path):
+    with pytest.raises(InvalidRequestError, match="never given literally"):
+        conn.map_iceberg(
+            "x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google('{"private_key": "k"}')
+        )
+    # A WIF configuration reaches the engine, which refuses a credential
+    # source outside the accepted subset (a local file here).
+    wif = {
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+        "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {"file": "/etc/passwd"},
+    }
+    with pytest.raises(InvalidRequestError, match="credential_source"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(wif))
+    path = tmp_path / "wif.json"
+    path.write_text("[]")
+    with pytest.raises(InvalidRequestError, match="Workload Identity Federation"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(path))
+    with pytest.raises(InvalidRequestError, match="storage scope"):
+        conn.map_iceberg(
+            "x",
+            ORDERS_MAPPING,
+            table_location="s3://bucket/warehouse/sales/orders",
+            storage=fluree.Google(UNSET_KEY, scopes="https://www.googleapis.com/auth/bigquery"),
+        )
+    # Unity Catalog takes a token or a service principal, not a Google identity.
+    with pytest.raises(TypeError):
+        conn.map_delta("x", ORDERS_MAPPING, unity=fluree.Unity("https://ws.example.com", auth=fluree.Google()))
+
+
 def test_a_rest_catalog_source_can_take_its_tables_from_the_mapping(conn):
     # No `table`: the mapping's rr:tableName names it, as on the CLI and server.
     # The catalog is unreachable (a refused loopback address), so registration

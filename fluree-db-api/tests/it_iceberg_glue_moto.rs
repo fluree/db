@@ -43,9 +43,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use fluree_db_api::{
-    browse_iceberg_catalog, preview_iceberg_table, BrowseDepth, FlureeBuilder, FlureeR2rmlProvider,
-    IcebergConnectionConfig, IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput, StatsTier,
-    TableIdentifier,
+    BrowseDepth, FlureeBuilder, FlureeR2rmlProvider, IcebergConnectionConfig, IcebergCreateConfig,
+    R2rmlCreateConfig, R2rmlMappingInput, StatsTier, TableIdentifier,
 };
 use futures::TryStreamExt;
 
@@ -692,7 +691,10 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
     }
 
     // Onboarding: browse lists the database and only its Iceberg tables.
-    match browse_iceberg_catalog(glue_connection(&endpoint), BrowseDepth::Tables).await {
+    match fluree
+        .browse_iceberg_catalog(glue_connection(&endpoint), BrowseDepth::Tables)
+        .await
+    {
         Ok(browse) => {
             let tables: Vec<String> = browse
                 .tables
@@ -714,7 +716,10 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
     }
 
     // S3 Tables browse: the namespace and its table.
-    match browse_iceberg_catalog(s3t(), BrowseDepth::Tables).await {
+    match fluree
+        .browse_iceberg_catalog(s3t(), BrowseDepth::Tables)
+        .await
+    {
         Ok(browse) => {
             let ok = browse.namespaces.iter().any(|n| n == db)
                 && browse
@@ -738,7 +743,10 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
         namespace: db.to_string(),
         name: "customers".to_string(),
     };
-    match preview_iceberg_table(glue_connection(&endpoint), table, StatsTier::Stats).await {
+    match fluree
+        .preview_iceberg_table(glue_connection(&endpoint), table, StatsTier::Stats)
+        .await
+    {
         Ok(preview) => {
             let columns: Vec<&str> = preview
                 .schema

@@ -122,8 +122,9 @@ principal per source, give its tenant id, client id and secret:
 ```
 
 `azure_client_secret_env` names an environment variable of the reading
-process, so the secret is never stored; `azure_client_secret` is a literal
-that is stored with the graph source. An embedding application can instead
+process, so the secret is never stored; a server accepts only names listed in
+[`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning).
+`azure_client_secret` is a literal that is stored with the graph source. An embedding application can instead
 supply a secret reference, resolved through its `SecretResolver`. Tokens are
 requested for the storage audience and refreshed automatically.
 
@@ -178,7 +179,10 @@ needs no storage credentials of its own.
   default to the workspace's own endpoint and `all-apis`. A secret is given as
   a literal, stored with the source, or as the name of an environment variable
   of the reading process; a server accepts only names listed in
-  [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](iceberg.md#stored-configuration-format-nameservice).
+  [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning).
+  The catalog and storage fields may also be given structured, as the stored
+  config spells them (`unity`, `io`); see
+  [`delta/map`](../api/endpoints.md#post-api_base_urldeltamap).
 - **Credentials.** Unity issues them per table, scoped to that table's path,
   for an hour. Each table's are kept until a few minutes before they expire
   and then requested again; concurrent queries share one request. The table's

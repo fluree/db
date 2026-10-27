@@ -3423,41 +3423,9 @@ pub struct DeltaUnityArgs {
     #[arg(long, requires = "unity_uri")]
     pub unity_schema: Option<String>,
 
-    /// Databricks token for Unity Catalog (stored with the graph source;
-    /// prefer --auth-bearer-env)
-    #[arg(long, requires = "unity_uri", conflicts_with = "auth_bearer_env")]
-    pub auth_bearer: Option<String>,
-
-    /// Environment variable holding the Databricks token, read by the process
-    /// that reads the tables. With --remote, the server must list the variable
-    /// in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
-    #[arg(long, value_name = "VAR", requires = "unity_uri")]
-    pub auth_bearer_env: Option<String>,
-
-    /// Application id of a Databricks service principal
-    #[arg(long, requires = "unity_uri")]
-    pub oauth2_client_id: Option<String>,
-
-    /// The service principal's OAuth secret (stored with the graph source;
-    /// prefer --oauth2-client-secret-env)
-    #[arg(
-        long,
-        requires = "unity_uri",
-        conflicts_with = "oauth2_client_secret_env"
-    )]
-    pub oauth2_client_secret: Option<String>,
-
-    /// Environment variable holding the OAuth secret; as --auth-bearer-env
-    #[arg(long, value_name = "VAR", requires = "unity_uri")]
-    pub oauth2_client_secret_env: Option<String>,
-
-    /// OAuth2 token URL (default: the workspace's own, <unity-uri>/oidc/v1/token)
-    #[arg(long, requires = "unity_uri")]
-    pub oauth2_token_url: Option<String>,
-
-    /// OAuth2 scope (default: all-apis)
-    #[arg(long, requires = "unity_uri")]
-    pub oauth2_scope: Option<String>,
+    // A Databricks token, or a service principal's OAuth2 client id and secret.
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 }
 
 /// S3 options for tables read with credentials that name no region.
@@ -3705,29 +3673,11 @@ pub struct SqlMapArgs {
     #[arg(long)]
     pub user: Option<String>,
 
-    /// Bearer token for endpoint authentication
-    #[arg(long)]
-    pub auth_bearer: Option<String>,
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 
-    /// OAuth2 token URL for client credentials auth
-    #[arg(long)]
-    pub oauth2_token_url: Option<String>,
-
-    /// OAuth2 client ID
-    #[arg(long)]
-    pub oauth2_client_id: Option<String>,
-
-    /// OAuth2 client secret
-    #[arg(long)]
-    pub oauth2_client_secret: Option<String>,
-
-    /// OAuth2 scope
-    #[arg(long)]
-    pub oauth2_scope: Option<String>,
-
-    /// OAuth2 audience
-    #[arg(long)]
-    pub oauth2_audience: Option<String>,
+    #[command(flatten)]
+    pub google: GoogleAuthArgs,
 
     /// Session property (repeatable): --session query_max_run_time=5m
     #[arg(long = "session", value_name = "KEY=VALUE")]
@@ -3833,49 +3783,23 @@ pub struct IcebergMapArgs {
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
 
-    /// Bearer token for REST catalog authentication. Stored with the graph
-    /// source; prefer --auth-bearer-env
-    #[arg(long, conflicts_with = "auth_bearer_env")]
-    pub auth_bearer: Option<String>,
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 
-    /// Environment variable holding the bearer token, read by the process that
-    /// reads the tables. The token is not stored. With --remote, the server
-    /// must list the variable in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
-    #[arg(long, value_name = "VAR")]
-    pub auth_bearer_env: Option<String>,
-
-    /// OAuth2 token URL for client credentials auth
-    #[arg(long)]
-    pub oauth2_token_url: Option<String>,
-
-    /// OAuth2 client ID
-    #[arg(long)]
-    pub oauth2_client_id: Option<String>,
-
-    /// OAuth2 client secret. Stored with the graph source; prefer
-    /// --oauth2-client-secret-env
-    #[arg(long, conflicts_with = "oauth2_client_secret_env")]
-    pub oauth2_client_secret: Option<String>,
-
-    /// Environment variable holding the OAuth2 client secret; as --auth-bearer-env
-    #[arg(long, value_name = "VAR")]
-    pub oauth2_client_secret_env: Option<String>,
-
-    /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon / Polaris)
-    #[arg(long)]
-    pub oauth2_scope: Option<String>,
-
-    /// OAuth2 audience
-    #[arg(long)]
-    pub oauth2_audience: Option<String>,
+    #[command(flatten)]
+    pub google: GoogleAuthArgs,
 
     /// Warehouse identifier (REST mode)
     #[arg(long)]
     pub warehouse: Option<String>,
 
-    /// Disable vended credentials (REST mode, enabled by default)
-    #[arg(long)]
+    /// Disable vended credentials (REST mode, enabled by default); the same
+    /// as --storage-identity ambient
+    #[arg(long, conflicts_with = "storage_identity")]
     pub no_vended_credentials: bool,
+
+    #[command(flatten)]
+    pub storage: StorageIdentityArgs,
 
     /// S3 region override
     #[arg(long)]
@@ -3888,6 +3812,135 @@ pub struct IcebergMapArgs {
     /// Use path-style S3 URLs
     #[arg(long)]
     pub s3_path_style: bool,
+}
+
+/// How a catalog or SQL endpoint is authenticated: a bearer token, or OAuth2
+/// client credentials (or, for an Iceberg REST catalog or SQL endpoint, a
+/// Google identity; see [`GoogleAuthArgs`]). At most one; a partial OAuth2
+/// set is refused.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct CatalogAuthArgs {
+    /// Bearer token. Stored with the graph source; prefer --auth-bearer-env
+    #[arg(long, conflicts_with = "auth_bearer_env")]
+    pub auth_bearer: Option<String>,
+
+    /// Environment variable holding the bearer token, read by the process that
+    /// reads the tables. The token is not stored. With --remote, the server
+    /// must list the variable in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
+    #[arg(long, value_name = "VAR")]
+    pub auth_bearer_env: Option<String>,
+
+    /// OAuth2 token URL for client credentials auth (for a Unity Catalog,
+    /// defaults to the workspace's own, <unity-uri>/oidc/v1/token)
+    #[arg(long)]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 client ID (a Databricks service principal's application id)
+    #[arg(long)]
+    pub oauth2_client_id: Option<String>,
+
+    /// OAuth2 client secret. Stored with the graph source; prefer
+    /// --oauth2-client-secret-env
+    #[arg(long, conflicts_with = "oauth2_client_secret_env")]
+    pub oauth2_client_secret: Option<String>,
+
+    /// Environment variable holding the OAuth2 client secret; as --auth-bearer-env
+    #[arg(long, value_name = "VAR")]
+    pub oauth2_client_secret_env: Option<String>,
+
+    /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon /
+    /// Polaris; for a Unity Catalog, defaults to all-apis)
+    #[arg(long)]
+    pub oauth2_scope: Option<String>,
+
+    /// OAuth2 audience
+    #[arg(long)]
+    pub oauth2_audience: Option<String>,
+}
+
+/// A Google identity for an Iceberg REST catalog (BigLake) or SQL endpoint:
+/// one credential source, refreshed automatically.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct GoogleAuthArgs {
+    /// Authenticate with the GCE/GKE metadata server's service account (a host
+    /// identity: the operator can refuse it with FLUREE_GRAPH_SOURCE_HOST_IDENTITIES)
+    #[arg(long)]
+    pub auth_google_metadata: bool,
+
+    /// Authenticate with the host's application-default credentials
+    /// (GOOGLE_APPLICATION_CREDENTIALS, else gcloud's), e.g. after
+    /// `gcloud auth application-default login`; a host identity
+    #[arg(long)]
+    pub auth_google_adc: bool,
+
+    /// Environment variable holding a service-account key's JSON, read by the
+    /// process that reads the tables. The key is not stored
+    #[arg(long, value_name = "VAR")]
+    pub auth_google_service_account_env: Option<String>,
+
+    /// A Workload Identity Federation credential configuration (what
+    /// `gcloud iam workload-identity-pools create-cred-config ... --aws`
+    /// prints). Not a secret: it is stored with the graph source
+    #[arg(long, value_name = "FILE")]
+    pub auth_google_wif_config: Option<PathBuf>,
+
+    /// The Google Cloud project requests bill to (x-goog-user-project); needed
+    /// for user credentials (--auth-google-adc after a user login)
+    #[arg(long, value_name = "PROJECT")]
+    pub auth_google_quota_project: Option<String>,
+
+    /// OAuth scopes, comma-separated (default: cloud-platform)
+    #[arg(long, value_name = "SCOPES")]
+    pub auth_google_scopes: Option<String>,
+}
+
+/// Which identity reads an Iceberg source's metadata and data files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StorageIdentity {
+    /// The catalog's per-table vended credentials, required (the default for
+    /// a REST catalog, and for a bl:// BigLake warehouse)
+    Vended,
+    /// The host's ambient AWS credential chain
+    Ambient,
+    /// The REST catalog's own Google identity reads gs:// (the default for a
+    /// bq:// BigLake federation warehouse, which never vends)
+    Catalog,
+    /// A Google identity of the source's own (--storage-google-*), e.g. for
+    /// --mode direct on gs://
+    Google,
+}
+
+/// Which identity reads a source's files, and the source's own Google
+/// identity when it is `google`.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct StorageIdentityArgs {
+    /// Which identity reads the table's files. Default: catalog for a bq://
+    /// warehouse, vended for a bl:// one, otherwise vended for a REST catalog
+    /// (unless --no-vended-credentials) and ambient for the other modes
+    #[arg(long, value_enum)]
+    pub storage_identity: Option<StorageIdentity>,
+
+    /// Read the files as the GCE/GKE metadata server's service account
+    #[arg(long)]
+    pub storage_google_metadata: bool,
+
+    /// Read the files with the host's application-default credentials
+    #[arg(long)]
+    pub storage_google_adc: bool,
+
+    /// Read the files as the service account whose key JSON this environment
+    /// variable holds (the key is not stored)
+    #[arg(long, value_name = "VAR")]
+    pub storage_google_service_account_env: Option<String>,
+
+    /// Read the files through this Workload Identity Federation credential
+    /// configuration (stored with the graph source)
+    #[arg(long, value_name = "FILE")]
+    pub storage_google_wif_config: Option<PathBuf>,
+
+    /// The project storage requests bill to (requester pays)
+    #[arg(long, value_name = "PROJECT")]
+    pub storage_google_quota_project: Option<String>,
 }
 
 #[cfg(test)]

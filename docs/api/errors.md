@@ -89,6 +89,7 @@ The request is malformed or contains invalid data.
 - Type mismatch
 - Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 - A `t` beyond the ledger's current head (`err:api/BadRequest`), such as syncing a search index through a commit that does not exist yet
+- A graph source's connection, auth or storage identity refused before anything is built (`err:api/InvalidGraphSourceConfig`): an unknown field, flat and structured fields mixed, auth given two ways or only partly, or an environment variable the server does not list. The message names the field, never its value. See [Iceberg connection](endpoints.md#iceberg-connection)
 
 **Error typing:**
 

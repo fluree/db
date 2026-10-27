@@ -10,7 +10,7 @@
 //! storage credentials, and must have none for the result to mean anything.
 
 use fluree_db_delta::{DeltaIoConfig, DeltaTable, UnityConfig, VersionSelector};
-use fluree_db_iceberg::auth::AuthConfig;
+use fluree_db_iceberg::auth::{AuthConfig, IdentityContext};
 use fluree_db_iceberg::ConfigValue;
 use fluree_db_tabular::ColumnBatch;
 use futures::StreamExt;
@@ -34,7 +34,7 @@ async fn tables_are_read_by_name_with_credentials_unity_issues() {
 
     for entry in var("UNITY_TABLES").split(',') {
         let (name, expected) = entry.split_once('=').expect("name=rows");
-        let table = DeltaTable::open_in_unity(name, &unity, name, &io)
+        let table = DeltaTable::open_in_unity(name, &unity, name, &io, &IdentityContext::default())
             .await
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let snapshot = table.snapshot(VersionSelector::Latest).await.unwrap();
@@ -66,9 +66,13 @@ async fn a_catalog_is_listed_and_its_tables_described() {
         catalog: std::env::var("UNITY_CATALOG").ok(),
         schema: std::env::var("UNITY_SCHEMA").ok(),
     };
-    let listing = fluree_db_delta::browse_unity(&unity, fluree_db_delta::BrowseDepth::Tables)
-        .await
-        .unwrap();
+    let listing = fluree_db_delta::browse_unity(
+        &unity,
+        fluree_db_delta::BrowseDepth::Tables,
+        &IdentityContext::default(),
+    )
+    .await
+    .unwrap();
     println!(
         "catalogs: {:?}\nschemas: {:?}",
         listing.catalogs, listing.schemas
@@ -86,9 +90,10 @@ async fn a_catalog_is_listed_and_its_tables_described() {
         if name.is_empty() {
             continue;
         }
-        let table = fluree_db_delta::describe_unity_table(&unity, name)
-            .await
-            .unwrap();
+        let table =
+            fluree_db_delta::describe_unity_table(&unity, name, &IdentityContext::default())
+                .await
+                .unwrap();
         println!(
             "{} pk={:?} fks={:?} rule={:?}",
             table.full_name, table.primary_key, table.foreign_keys, table.access_rule

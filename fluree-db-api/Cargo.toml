@@ -221,6 +221,14 @@ name = "it_iceberg_policy"
 path = "tests/it_iceberg_policy.rs"
 required-features = ["iceberg", "native"]
 
+# Standalone: re-executes itself so the child reads the host-identity policy
+# from an environment of the test's choosing (the policy is read once per
+# process).
+[[test]]
+name = "it_host_identity_env_default"
+path = "tests/it_host_identity_env_default.rs"
+required-features = ["iceberg"]
+
 # Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
 # every Direct entry point, against the committed fixture's parent directory.
 [[test]]

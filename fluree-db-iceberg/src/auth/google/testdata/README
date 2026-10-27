@@ -1,0 +1,3 @@
+Test-only RSA keys for the Google identity unit tests. Not credentials for anything.
+test_rsa_*.pem: copied from fluree-db-credential/tests/fixtures (the OIDC tests' pair).
+other_rsa_private.pem: a second key, so a test can present one service account's email and key id with a different private key.

@@ -263,6 +263,14 @@ people.select("PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name 
   to any Trino-protocol endpoint.
 - Secrets can be `fluree.EnvVar("NAME")`, read where the tables are read,
   rather than stored with the source.
+- A Google catalog (BigLake) or SQL endpoint authenticates with
+  `auth=fluree.Google(...)`: the metadata server (the default),
+  `"application_default"`, a service-account key in an `EnvVar` (never a
+  literal key), or a Workload Identity Federation configuration (a dict or its
+  file). `storage=` says which identity reads an Iceberg table's files:
+  `"vended"`, `"ambient"`, `"catalog"` (the catalog's own Google identity, the
+  default for a `bq://` warehouse) or a `fluree.Google(...)` of the source's
+  own.
 - `conn.graph_sources()` lists them, `conn.graph_source(name)` finds one, and
   `source.drop()` removes it (the tables are untouched).
 - To join a source with a ledger, name the source with `FROM NAMED` and read it

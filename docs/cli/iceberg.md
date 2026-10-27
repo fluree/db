@@ -42,7 +42,7 @@ fluree iceberg map <NAME> [OPTIONS]
 | `--catalog-uri <URI>` | REST catalog URI (required for rest mode) |
 | `--table <ID>` | Table identifier in `namespace.table` format (required if not specified in R2RML mapping) |
 | `--warehouse <NAME>` | Warehouse (or catalog) name as the REST catalog knows it; the catalog's own route prefix is looked up from it |
-| `--no-vended-credentials` | Disable vended credentials (enabled by default) |
+| `--no-vended-credentials` | Disable vended credentials (enabled by default); the same as `--storage-identity ambient`, and not given with it |
 
 **Direct S3 mode options:**
 
@@ -68,7 +68,7 @@ fluree iceberg map <NAME> [OPTIONS]
 
 **Authentication:**
 
-These options, and `--warehouse`, configure a REST catalog: any other `--mode` refuses them rather than ignore them.
+These options, and `--warehouse`, configure a REST catalog: any other `--mode` refuses them rather than ignore them. With `--remote`, the CLI sends the server the structured connection its local map would store (see [Iceberg connection](../api/endpoints.md#iceberg-connection)), so the two register the same record.
 
 | Option | Description |
 |--------|-------------|
@@ -78,6 +78,29 @@ These options, and `--warehouse`, configure a REST catalog: any other `--mode` r
 | `--oauth2-client-id <ID>` | OAuth2 client ID |
 | `--oauth2-client-secret <SECRET>` | OAuth2 client secret. Stored with the graph source; prefer the option below |
 | `--oauth2-client-secret-env <VAR>` | Environment variable holding the OAuth2 client secret; as `--auth-bearer-env` |
+| `--oauth2-scope <SCOPE>` | OAuth2 scope (e.g. `session:role:ICEBERG_READER` for Snowflake Horizon / Polaris) |
+| `--oauth2-audience <AUDIENCE>` | OAuth2 audience |
+| `--auth-google-metadata` | Authenticate as the GCE/GKE metadata server's service account (GKE Workload Identity). A host identity: an operator can refuse it with [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
+| `--auth-google-adc` | Authenticate with the host's application-default credentials (`GOOGLE_APPLICATION_CREDENTIALS`, else gcloud's, e.g. after `gcloud auth application-default login`). A host identity |
+| `--auth-google-service-account-env <VAR>` | Authenticate as the service account whose key JSON this environment variable holds, read by the process that reads the tables. The key is not stored, and is never taken literally |
+| `--auth-google-wif-config <FILE>` | Authenticate through Workload Identity Federation from AWS: the credential configuration that `gcloud iam workload-identity-pools create-cred-config … --aws` prints. Not a secret: the file is read and stored with the graph source |
+| `--auth-google-quota-project <PROJECT>` | The Google Cloud project requests bill to (`x-goog-user-project`); user credentials need one |
+| `--auth-google-scopes <SCOPES>` | OAuth scopes, comma-separated (default: `cloud-platform`) |
+
+Give one way to authenticate: a bearer token, OAuth2 client credentials, or one Google source. Two at once are refused, and so is a partial OAuth2 set: OAuth2 needs `--oauth2-token-url` and the client secret (`--oauth2-client-id` defaults to empty, as Snowflake Horizon needs).
+
+**Storage identity:**
+
+| Option | Description |
+|--------|-------------|
+| `--storage-identity <IDENTITY>` | Which identity reads the table's files: `vended` (the REST catalog's per-table vended credentials, required), `ambient` (the ambient AWS credential chain), `catalog` (the REST catalog's own Google identity reads `gs://`, as BigLake federation needs), or `google` (a Google identity of the source's own, the options below). Default: `catalog` for a `bq://` warehouse, `vended` for a `bl://` one; otherwise vended credentials for a REST catalog (unless `--no-vended-credentials`) and the ambient chain for the other modes |
+| `--storage-google-metadata` | Read the files as the metadata server's service account |
+| `--storage-google-adc` | Read the files with the host's application-default credentials |
+| `--storage-google-service-account-env <VAR>` | Read the files as the service account whose key JSON this variable holds |
+| `--storage-google-wif-config <FILE>` | Read the files through this Workload Identity Federation configuration |
+| `--storage-google-quota-project <PROJECT>` | The project storage requests bill to (requester pays) |
+
+The default is the CLI's (Python's `map_iceberg` has the same one); the server stores what it is sent, so a remote map sends the identity the default chose. A `--storage-google-*` source alone means `--storage-identity google`. A `bq://` warehouse never vends, so its default needs a Google catalog identity: without one, `map` refuses and names the options to give.
 
 **S3 overrides:**
 
@@ -162,6 +185,24 @@ fluree iceberg map orders \
   --oauth2-token-url https://auth.example.com/token \
   --oauth2-client-id my-client \
   --oauth2-client-secret $CLIENT_SECRET
+
+# BigLake federation (bq://): a service account's key in LAKE_SA_KEY
+# authenticates the catalog, and the same identity reads the gs:// files
+# (--storage-identity catalog, the bq:// default)
+fluree iceberg map orders \
+  --catalog-uri https://biglake.googleapis.com/iceberg/v1/restcatalog \
+  --warehouse bq://projects/lake/locations/us/catalogs/sales \
+  --table sales.orders \
+  --r2rml mappings/orders.ttl \
+  --auth-google-service-account-env LAKE_SA_KEY
+
+# The same through Workload Identity Federation from AWS: no stored secret
+fluree iceberg map orders \
+  --catalog-uri https://biglake.googleapis.com/iceberg/v1/restcatalog \
+  --warehouse bq://projects/lake/locations/us/catalogs/sales \
+  --table sales.orders \
+  --r2rml mappings/orders.ttl \
+  --auth-google-wif-config wif-aws.json
 
 # Create the graph source on a remote Fluree server
 fluree iceberg map warehouse-orders \

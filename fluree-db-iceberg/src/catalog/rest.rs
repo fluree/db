@@ -14,7 +14,7 @@ use std::time::Duration;
 /// Configuration for REST catalog client.
 #[derive(Debug, Clone)]
 pub struct RestCatalogConfig {
-    /// Base URI for the REST catalog (e.g., "https://polaris.example.com")
+    /// Base URI for the REST catalog (e.g., `https://polaris.example.com`)
     pub uri: String,
     /// Optional warehouse identifier
     pub warehouse: Option<String>,
@@ -152,6 +152,26 @@ impl RestCatalogClient {
         })
     }
 
+    /// A client for a mock catalog on loopback, which the production client's
+    /// SSRF guard refuses. Tests only.
+    #[cfg(all(test, feature = "aws"))]
+    pub(crate) fn for_mock(
+        uri: &str,
+        warehouse: Option<&str>,
+        auth: Arc<dyn SendCatalogAuth>,
+    ) -> Self {
+        Self {
+            config: RestCatalogConfig {
+                uri: uri.to_string(),
+                warehouse: warehouse.map(str::to_string),
+                ..Default::default()
+            },
+            auth,
+            http_client: reqwest::Client::new(),
+            catalog_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
+
     /// Make a GET request to the catalog API.
     ///
     /// Handles authentication headers and 401 retry with token refresh.
@@ -188,10 +208,9 @@ impl RestCatalogClient {
                     .get(&url)
                     .header("Accept", "application/json");
 
-                // Add auth header if available
-                if let Some(auth_header) = self.auth.authorization_header().await? {
-                    request = request.header("Authorization", auth_header);
-                }
+                // The provider's headers: Authorization, plus any it adds
+                // (Google's x-goog-user-project).
+                request = request.headers(self.auth.request_headers(&url).await?);
 
                 // Add custom headers
                 for (name, value) in headers {
@@ -239,6 +258,14 @@ impl RestCatalogClient {
 
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
+                    // Google refuses user credentials that name no quota
+                    // project. Still a refusal (fail closed), typed so the hint
+                    // names the fix instead of a broader grant.
+                    if status == reqwest::StatusCode::FORBIDDEN && needs_quota_project(&body) {
+                        return Err(IcebergError::CatalogQuotaProjectRequired {
+                            table: path.to_string(),
+                        });
+                    }
                     let message = format!("Catalog request failed ({status}): {body}");
                     // A 403, or a 401 that survived the token refresh above, is the
                     // catalog refusing this principal: typed, so a query reports it as
@@ -318,6 +345,16 @@ impl RestCatalogClient {
         };
         Ok(named("overrides").or_else(|| named("defaults")))
     }
+}
+
+/// Whether a Google 403 is the missing-quota-project refusal: the
+/// `USER_PROJECT_DENIED` reason, or the "requires a quota project" message
+/// Google gives user (ADC) credentials.
+fn needs_quota_project(body: &str) -> bool {
+    body.contains("USER_PROJECT_DENIED")
+        || body
+            .to_ascii_lowercase()
+            .contains("requires a quota project")
 }
 
 /// Route prefix by (catalog URI, warehouse).
@@ -491,6 +528,33 @@ impl super::SendCatalogClient for RestCatalogClient {
 
         parse_load_table_response(&response)
     }
+
+    /// `GET …/tables/{table}/credentials` (the Iceberg REST `loadCredentials`
+    /// route), which re-vends without re-reading the table. A catalog without
+    /// that route (404) is asked for a fresh `loadTable` instead.
+    async fn load_credentials(
+        &self,
+        table_id: &TableIdentifier,
+        metadata_location: &str,
+    ) -> Result<Option<VendedCredentials>> {
+        let path = format!("{}/credentials", self.table_path(table_id).await?);
+        match self
+            .get(
+                &path,
+                &[("X-Iceberg-Access-Delegation", "vended-credentials")],
+            )
+            .await
+        {
+            Ok(response) => {
+                VendedCredentials::from_load_table_response(&response, metadata_location)
+            }
+            Err(IcebergError::TableNotFound(_)) => {
+                let load = super::SendCatalogClient::load_table(self, table_id, true).await?;
+                Ok(load.credentials)
+            }
+            Err(e) => Err(super::name_denied_table(e, table_id)),
+        }
+    }
 }
 
 /// Build a [`LoadTableResponse`] from a REST `loadTable` JSON response.
@@ -547,6 +611,14 @@ mod tests {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+    /// A mock catalog on a port of its own. Not `MockServer::start()`: that
+    /// hands out pooled servers, so a test can get a URL an earlier test
+    /// used, and the process-wide route-prefix cache (`lock_prefixes`, keyed
+    /// by catalog URL + warehouse) would answer it with that test's prefix.
+    async fn mock_catalog() -> MockServer {
+        MockServer::builder().start().await
+    }
+
     /// A test client pointed at a wiremock server. Uses a PLAIN reqwest client so
     /// the loopback mock is reachable (the production `new` hardens against
     /// loopback for SSRF), and injects `sem` as the catalog semaphore.
@@ -601,7 +673,7 @@ mod tests {
         // 403 on loadTable (and 401 surviving the token refresh, with NoAuth's
         // no-op refresh) is the catalog refusing this principal.
         for status in [403, 401] {
-            let server = MockServer::start().await;
+            let server = mock_catalog().await;
             serve_config(&server, serde_json::json!({})).await;
             Mock::given(method("GET"))
                 .and(path("/v1/namespaces/db/tables/events"))
@@ -627,8 +699,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn googles_missing_quota_project_refusal_is_typed_with_the_fix() {
+        // On loadTable (named by table) and on /v1/config (still fail closed:
+        // the lookup errors rather than reading the catalog without a prefix).
+        // Warehouses no other test uses: mock servers are pooled, so a URL
+        // can come with another test's cached route prefix.
+        let user_project_denied = serde_json::json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "USER_PROJECT_DENIED"}]}});
+        let server = mock_catalog().await;
+        serve_config(&server, serde_json::json!({})).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/db/tables/events"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(user_project_denied))
+            .mount(&server)
+            .await;
+        let err = loads(
+            &warehouse_client(&server.uri(), Some("quota-on-load-table")),
+            "db",
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            IcebergError::CatalogQuotaProjectRequired { table } => assert_eq!(table, "db.events"),
+            other => panic!("expected CatalogQuotaProjectRequired, got {other:?}"),
+        }
+        assert!(err.to_string().contains("quota_project"), "{err}");
+
+        let server = mock_catalog().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "Your application is authenticating by using local Application Default Credentials. \
+                 The biglake.googleapis.com API Requires a quota project, which is not set by default.",
+            ))
+            .mount(&server)
+            .await;
+        serve_table(&server, "/v1/quota-on-config/namespaces/db/tables/events").await;
+        let err = loads(
+            &warehouse_client(&server.uri(), Some("quota-on-config")),
+            "db",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::CatalogQuotaProjectRequired { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_provider_header_reaches_the_catalog() {
+        /// Records the URL each request names, to check it is the request's own.
+        #[derive(Debug, Default)]
+        struct TwoHeaders(std::sync::Mutex<Vec<String>>);
+        #[async_trait]
+        impl SendCatalogAuth for TwoHeaders {
+            async fn request_headers(&self, url: &str) -> Result<reqwest::header::HeaderMap> {
+                self.0.lock().unwrap().push(url.to_string());
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("authorization", "Bearer t".parse().unwrap());
+                headers.insert("x-goog-user-project", "p".parse().unwrap());
+                Ok(headers)
+            }
+            async fn refresh(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let server = mock_catalog().await;
+        serve_config(&server, serde_json::json!({})).await;
+        serve_table(&server, "/v1/namespaces/db/tables/events").await;
+        // A warehouse no other test uses (pooled mock servers reuse URLs).
+        let mut client = warehouse_client(&server.uri(), Some("two-provider-headers"));
+        let auth = Arc::new(TwoHeaders::default());
+        client.auth = auth.clone();
+        loads(&client, "db").await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        for request in &received {
+            assert_eq!(request.headers["authorization"], "Bearer t");
+            assert_eq!(request.headers["x-goog-user-project"], "p");
+        }
+        // Each request named its own URL to the provider (which decides where
+        // its credential may go).
+        // (wiremock reports the host as `localhost`; the path and query are
+        // the request's.)
+        let sent: Vec<String> = received
+            .iter()
+            .map(|r| {
+                let query = r.url.query().map(|q| format!("?{q}")).unwrap_or_default();
+                format!("{}{}{query}", server.uri(), r.url.path())
+            })
+            .collect();
+        assert_eq!(*auth.0.lock().unwrap(), sent);
+    }
+
+    #[tokio::test]
     async fn a_prefix_the_catalog_names_is_used_whole() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
             .and(query_param("warehouse", "lake&x=y"))
@@ -650,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_default_prefix_is_used_when_nothing_overrides_it() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(
             &server,
             serde_json::json!({"defaults": {"prefix": "main"}, "overrides": {}}),
@@ -665,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_catalog_naming_no_prefix_is_read_without_one() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(
             &server,
             serde_json::json!({"defaults": {}, "overrides": {}}),
@@ -681,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_catalog_without_a_config_route_keeps_the_warehouse_as_its_prefix() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
 
         loads(&warehouse_client(&server.uri(), Some("lake")), "db")
@@ -691,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_route_that_fails_is_not_read_as_no_prefix() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
             .respond_with(ResponseTemplate::new(403).set_body_string("no"))
@@ -712,7 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_catalog_is_asked_for_its_prefix_once() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         serve_config(&server, serde_json::json!({"overrides": {"prefix": "p"}})).await;
         serve_table(&server, "/v1/p/namespaces/db/tables/events").await;
 
@@ -731,7 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_config_route_is_asked_again_not_cached() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
             .respond_with(ResponseTemplate::new(404))
@@ -805,7 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_on_429_then_succeeds() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         let calls = Arc::new(AtomicUsize::new(0));
         Mock::given(method("GET"))
             .respond_with(FlakyResponder {
@@ -826,7 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn gives_up_after_max_retries_and_surfaces_the_error() {
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
             .mount(&server)
@@ -853,7 +1019,7 @@ mod tests {
         // Each response is delayed, so with a 2-permit semaphore, 6 requests run in
         // 3 waves ≈ 3×delay; an unbounded (6-permit) client finishes in ≈1×delay.
         let delay = Duration::from_millis(120);
-        let server = MockServer::start().await;
+        let server = mock_catalog().await;
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)

@@ -433,6 +433,7 @@ mod tests {
 
     fn storage_denied_via_query() -> ApiError {
         ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".into(),
             key: "warehouse/t/data/f.parquet".into(),
             region: Some("us-east-2".into()),

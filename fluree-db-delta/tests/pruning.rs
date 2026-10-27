@@ -9,6 +9,7 @@ use fluree_db_delta::{
     rows_decoded, ColumnFilter, DeltaIoConfig, DeltaSnapshot, DeltaTable, FilterOp, FilterValue,
     VersionSelector,
 };
+use fluree_db_iceberg::auth::IdentityContext;
 use futures::StreamExt;
 
 fn fixtures() -> PathBuf {
@@ -81,6 +82,7 @@ async fn row_groups_and_pages_no_filter_can_match_are_not_decoded() {
         "deletion_vectors",
         fixtures().join("deletion_vectors").to_str().unwrap(),
         &DeltaIoConfig::default(),
+        &IdentityContext::default(),
     )
     .unwrap();
     let plain = table.snapshot(VersionSelector::Version(0)).await.unwrap();
@@ -179,11 +181,16 @@ async fn row_groups_and_pages_no_filter_can_match_are_not_decoded() {
             .collect();
         std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
     }
-    let types = DeltaTable::open("types", types.to_str().unwrap(), &DeltaIoConfig::default())
-        .unwrap()
-        .snapshot(VersionSelector::Latest)
-        .await
-        .unwrap();
+    let types = DeltaTable::open(
+        "types",
+        types.to_str().unwrap(),
+        &DeltaIoConfig::default(),
+        &IdentityContext::default(),
+    )
+    .unwrap()
+    .snapshot(VersionSelector::Latest)
+    .await
+    .unwrap();
     let timestamp = |micros, tz| FilterValue::Timestamp { micros, tz };
     for (column, op, value, decoded_rows) in [
         ("small", FilterOp::Eq, int(300), 1),
@@ -234,11 +241,16 @@ async fn row_groups_and_pages_no_filter_can_match_are_not_decoded() {
         std::env::set_var("FLUREE_DELTA_FOOTER_CACHE_MB", budget);
         let root = staged.path().canonicalize().unwrap().join(name);
         copy_dir_all(&fixtures().join("dim_store"), &root);
-        let snapshot = DeltaTable::open(name, root.to_str().unwrap(), &DeltaIoConfig::default())
-            .unwrap()
-            .snapshot(VersionSelector::Latest)
-            .await
-            .unwrap();
+        let snapshot = DeltaTable::open(
+            name,
+            root.to_str().unwrap(),
+            &DeltaIoConfig::default(),
+            &IdentityContext::default(),
+        )
+        .unwrap()
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
         let read = || {
             let snapshot = snapshot.clone();
             async move {

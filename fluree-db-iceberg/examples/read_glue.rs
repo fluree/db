@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("vended credentials: {}", load.credentials.is_some());
 
     // 2. Read metadata from S3 with the ambient credential chain.
+    #[allow(deprecated)] // an SDK example, not a graph-source read
     let storage = S3IcebergStorage::from_default_chain(Some(&region), None, false).await?;
     let metadata_bytes = storage.read(&load.metadata_location).await?;
     let metadata = TableMetadata::from_json(&metadata_bytes)?;

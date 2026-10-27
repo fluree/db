@@ -48,11 +48,13 @@ curl -X POST http://localhost:8090/v1/fluree/sql/map \
   "endpoint": "https://trino.example.com:8443",
   "catalog": "hive",
   "schema": "sales",
-  "auth_bearer": "…",
+  "auth_bearer_env": "TRINO_TOKEN",
   "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . …"
 }
 JSON
 ```
+
+`auth_bearer_env` names a server environment variable that the operator lists in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`; `auth_bearer` is the token itself, stored with the source. The auth may instead be given as a structured `auth`, the stored shape, which is also how a Google identity is given. A body that gives auth two ways, or only partly, is refused with `400`.
 
 === Rust
 
@@ -80,7 +82,7 @@ be fixed later; the first query surfaces the real error.
 | `protocol` | `trino` | Header family: `trino` (`X-Trino-*`) or `presto` (`X-Presto-*`) |
 | `catalog`, `schema` | — | Defaults for unqualified `rr:tableName`s |
 | `user` | `fluree` | The protocol's user header; required even with a bearer token |
-| `auth` | none | `bearer` (static token) or `oauth2_client_credentials`; values accept the same `env_var` / `secret_ref` indirection as Iceberg catalog auth |
+| `auth` | none | `bearer` (static token), `oauth2_client_credentials`, or `google` (a Google identity), in the shape of an Iceberg REST catalog's auth (see [Iceberg connection](../api/endpoints.md#iceberg-connection)). A secret may be `{"env_var": "NAME"}` (`--auth-bearer-env`, `auth_bearer_env`), which over HTTP the server must list in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`; a `{"secret_ref": …}` resolves only in an embedded `Fluree` with a secret resolver |
 | `session` | `{}` | Session properties, e.g. `{"query_max_run_time": "5m"}` |
 | `request_timeout_secs` | `120` | Per page fetch |
 | `model` | — | Model ledger (`name:branch`) whose default graph supplies view policies and the class/property hierarchy; must exist. See [Access policy](iceberg.md#access-policy) |

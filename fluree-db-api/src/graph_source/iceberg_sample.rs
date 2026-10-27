@@ -1,13 +1,13 @@
 //! Bounded, cheap row/column **sampler** over an Iceberg table.
 //!
 //! This is the data-peek complement to the metadata-only
-//! [`preview_iceberg_table`](super::iceberg_catalog::preview_iceberg_table): it
+//! [`crate::Fluree::preview_iceberg_table`]: it
 //! actually reads a handful of *values*. Two entry points:
 //!
-//! - [`sample_iceberg_rows`] — the first `n` rows, projected to some (or all)
-//!   columns, each row as a JSON object keyed by column name.
-//! - [`sample_column_values`] — the first `n` values of a single column, as a
-//!   JSON array.
+//! - [`crate::Fluree::sample_iceberg_rows`] — the first `n` rows, projected to
+//!   some (or all) columns, each row as a JSON object keyed by column name.
+//! - [`crate::Fluree::sample_column_values`] — the first `n` values of a single
+//!   column, as a JSON array.
 //!
 //! It powers the LLM agent's "look at the data" tool and solo #756 (row
 //! preview). **Bounded by construction**: it mirrors `preview_iceberg_table`'s
@@ -32,8 +32,8 @@ use serde_json::{Map, Value};
 use fluree_db_iceberg::catalog::SendCatalogClient;
 use fluree_db_iceberg::metadata::Schema;
 use fluree_db_iceberg::{
-    typed_value_to_json, Column, ColumnBatch, ScanConfig, SendParquetReader, SendScanPlanner,
-    TypedValue,
+    typed_value_to_json, Column, ColumnBatch, IdentityContext, ScanConfig, SendParquetReader,
+    SendScanPlanner, TypedValue,
 };
 
 use crate::graph_source::config::IcebergConnectionConfig;
@@ -43,53 +43,68 @@ use crate::graph_source::iceberg_catalog::{
 };
 use crate::{ApiError, Result};
 
-/// Sample the first `n` rows of `table`, projected to `projection` (column names;
-/// `None` or an empty list means all non-nested columns). Each row is a JSON
-/// object keyed by column name; nulls are JSON `null`.
+/// Sample the first `n` rows of `table` under `identity`, projected to
+/// `projection` (column names; `None` or an empty list means all non-nested
+/// columns). Each row is a JSON object keyed by column name; nulls are JSON
+/// `null`.
 ///
 /// Cheap peek — see the [module docs](self). Returns at most
 /// `min(n, rows-in-first-row-group)` rows; an empty table (no data files) yields
-/// an empty vector.
-pub async fn sample_iceberg_rows(
+/// an empty vector. Public as [`crate::Fluree::sample_iceberg_rows`], under the
+/// instance's context.
+pub(crate) async fn sample_iceberg_rows_in(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     projection: Option<Vec<String>>,
     n: usize,
+    identity: &IdentityContext,
 ) -> Result<Vec<Value>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let batches = sample_table_batches(&conn, &table, n, |schema| {
-        resolve_projection(schema, projection.as_deref(), &table)
-    })
+    let batches = sample_table_batches(
+        &conn,
+        &table,
+        n,
+        |schema| resolve_projection(schema, projection.as_deref(), &table),
+        identity,
+    )
     .await?;
     Ok(rows_from_batches(&batches, n))
 }
 
-/// Sample the first `n` values of a single `column` of `table`, as a JSON array
-/// (nulls are JSON `null`).
+/// Sample the first `n` values of a single `column` of `table` under
+/// `identity`, as a JSON array (nulls are JSON `null`).
 ///
 /// Cheap peek — see the [module docs](self). Returns at most
-/// `min(n, rows-in-first-row-group)` values.
-pub async fn sample_column_values(
+/// `min(n, rows-in-first-row-group)` values. Public as
+/// [`crate::Fluree::sample_column_values`], under the instance's context.
+pub(crate) async fn sample_column_values_in(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     column: String,
     n: usize,
+    identity: &IdentityContext,
 ) -> Result<Vec<Value>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let batches = sample_table_batches(&conn, &table, n, |schema| {
-        let field = schema.field_by_name(&column).ok_or_else(|| {
-            ApiError::config(format!(
-                "Column {column:?} not found in table {}. Available: {:?}",
-                table.qualified(),
-                schema.field_names()
-            ))
-        })?;
-        Ok(vec![field.id])
-    })
+    let batches = sample_table_batches(
+        &conn,
+        &table,
+        n,
+        |schema| {
+            let field = schema.field_by_name(&column).ok_or_else(|| {
+                ApiError::config(format!(
+                    "Column {column:?} not found in table {}. Available: {:?}",
+                    table.qualified(),
+                    schema.field_names()
+                ))
+            })?;
+            Ok(vec![field.id])
+        },
+        identity,
+    )
     .await?;
     Ok(column_values_from_batches(&batches, n))
 }
@@ -99,19 +114,19 @@ pub async fn sample_column_values(
 /// schema to the projected field IDs (so projection errors reference the real
 /// schema). Returns the decoded batches (≤ `n` rows total).
 ///
-/// Mirrors [`preview_iceberg_table`](super::iceberg_catalog::preview_iceberg_table):
-/// same REST catalog client, inline `loadTable` metadata, and vended-vs-ambient
-/// storage policy.
+/// Mirrors [`preview_iceberg_table_in`](super::iceberg_catalog::preview_iceberg_table_in):
+/// same catalog client, inline `loadTable` metadata, and storage decision.
 async fn sample_table_batches<F>(
     conn: &IcebergConnectionConfig,
     table: &TableIdentifier,
     n: usize,
     resolve_field_ids: F,
+    identity: &IdentityContext,
 ) -> Result<Vec<ColumnBatch>>
 where
     F: FnOnce(&Schema) -> Result<Vec<i32>>,
 {
-    let (catalog, _uri, _wh) = catalog_client(conn, "table sample").await?;
+    let (catalog, _uri, _wh) = catalog_client(conn, "table sample", identity).await?;
     let table_id = table.to_catalog();
 
     let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
@@ -122,7 +137,7 @@ where
 
     // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
     // S3 Tables return only the location).
-    let metadata = &load_response_metadata(conn, &mut load).await?;
+    let metadata = &load_response_metadata(conn, &mut load, identity).await?;
 
     let schema = metadata
         .current_schema()
@@ -130,9 +145,9 @@ where
 
     let field_ids = resolve_field_ids(schema)?;
 
-    // Build S3 storage the same way the preview/scan paths do (vended creds when
-    // the catalog delegated them, else the ambient AWS chain).
-    let storage = build_preview_storage(conn, load.credentials.as_ref()).await?;
+    // The source's storage decision, the preview/scan paths' (vended
+    // credentials, the catalog's or the source's Google identity, ambient AWS).
+    let storage = build_preview_storage(conn, &load, identity).await?.backend;
 
     // Plan a projected scan over the current snapshot. A table with no current
     // snapshot / no data files yields no tasks → an empty sample.
@@ -260,8 +275,8 @@ fn column_cell_to_json(col: &Column, idx: usize) -> Value {
 }
 
 impl crate::Fluree {
-    /// Sample the first `n` rows of an Iceberg table as JSON objects. Convenience
-    /// wrapper over the stateless [`sample_iceberg_rows`] free function.
+    /// Sample the first `n` rows of an Iceberg table as JSON objects, under
+    /// this instance's identity context.
     pub async fn sample_iceberg_rows(
         &self,
         conn: IcebergConnectionConfig,
@@ -270,12 +285,11 @@ impl crate::Fluree {
         n: usize,
     ) -> Result<Vec<Value>> {
         let conn = self.hydrate_conn(conn).await?;
-        sample_iceberg_rows(conn, table, projection, n).await
+        sample_iceberg_rows_in(conn, table, projection, n, self.identity_context()).await
     }
 
-    /// Sample the first `n` values of a single Iceberg column as a JSON array.
-    /// Convenience wrapper over the stateless [`sample_column_values`] free
-    /// function.
+    /// Sample the first `n` values of a single Iceberg column as a JSON array,
+    /// under this instance's identity context.
     pub async fn sample_column_values(
         &self,
         conn: IcebergConnectionConfig,
@@ -284,7 +298,7 @@ impl crate::Fluree {
         n: usize,
     ) -> Result<Vec<Value>> {
         let conn = self.hydrate_conn(conn).await?;
-        sample_column_values(conn, table, column, n).await
+        sample_column_values_in(conn, table, column, n, self.identity_context()).await
     }
 }
 

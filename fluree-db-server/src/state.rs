@@ -526,6 +526,12 @@ async fn build_direct_fluree(
     if config.storage_lock && config.owns_storage_root() && wal_owner.is_none() {
         builder = builder.with_storage_lock();
     }
+    // Which host identities graph sources may borrow is the operator's call
+    // (FLUREE_GRAPH_SOURCE_HOST_IDENTITIES / _AMBIENT_BUCKETS).
+    #[cfg(feature = "iceberg")]
+    {
+        builder = builder.with_host_identity_policy(fluree_db_api::HostIdentityPolicy::from_env());
+    }
     // Server-level overrides take precedence over connection config defaults.
     if let Some(owner) = wal_owner {
         // Voters share one payload root, so each node journals it under a
@@ -669,7 +675,10 @@ fn build_proxy_fluree(
     let nameservice = ProxyNameService::new(tx_url, token);
 
     let ns_mode = NameServiceMode::ReadOnly(Arc::new(nameservice));
-    let fluree = FlureeBuilder::memory().build_with(storage, ns_mode);
+    let builder = FlureeBuilder::memory();
+    #[cfg(feature = "iceberg")]
+    let builder = builder.with_host_identity_policy(fluree_db_api::HostIdentityPolicy::from_env());
+    let fluree = builder.build_with(storage, ns_mode);
 
     tracing::info!("Initialized peer with proxy storage mode");
     let fluree = Arc::new(fluree);

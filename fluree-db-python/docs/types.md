@@ -73,4 +73,12 @@ variable to read it from.
 (type-auth)=
 ## Auth
 
-{py:class}`fluree.Bearer` or {py:class}`fluree.OAuth2`.
+{py:class}`fluree.Bearer`, {py:class}`fluree.OAuth2` or {py:class}`fluree.Google`
+(a Google identity: an Iceberg REST catalog or a SQL endpoint, not a Unity
+Catalog).
+
+(type-storageidentity)=
+## StorageIdentity
+
+`"vended" | "ambient" | "catalog" | Google`: which identity reads an Iceberg
+source's files; see {py:meth}`fluree.Connection.map_iceberg`.

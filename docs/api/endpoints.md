@@ -3042,51 +3042,124 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 ```json
 {
   "name": "warehouse-orders",
-  "mode": "rest",
-  "catalog_uri": "https://polaris.example.com/api/catalog",
   "table": "sales.orders",
-  "branch": "main",
   "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "r2rml_type": "text/turtle",
-  "warehouse": "prod",
-  "auth_bearer": "…",
-  "oauth2_token_url": "https://idp.example.com/token",
-  "oauth2_client_id": "…",
-  "oauth2_client_secret": "…",
-  "no_vended_credentials": false,
-  "s3_region": "us-east-1",
-  "s3_endpoint": "https://s3.example.com",
-  "s3_path_style": false,
-  "table_location": "s3://bucket/warehouse/sales/orders"
+  "catalog": {
+    "type": "rest",
+    "uri": "https://polaris.example.com/api/catalog",
+    "warehouse": "prod",
+    "auth": {
+      "type": "oauth2_client_credentials",
+      "token_url": "https://idp.example.com/token",
+      "client_id": "fluree",
+      "client_secret": { "env_var": "POLARIS_SECRET" }
+    }
+  },
+  "io": { "s3_region": "us-east-1" }
 }
 ```
+
+The source's own fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Graph source name (required) |
-| `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
-| `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
 | `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
-| `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
-| `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
-| `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
-| `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
 | `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
 | `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
-| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
-| `auth_bearer_env` | string | In place of `auth_bearer`: the name of an environment variable of the server holding the token, so the token is not stored. The name must be listed in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning); any other is refused with 400 |
-| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes). `oauth2_client_secret_env` names a server environment variable in place of `oauth2_client_secret`, under the same rule as `auth_bearer_env` |
-| `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
-| `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
-| `warehouse` | string | Warehouse identifier |
-| `no_vended_credentials` | bool | Disable vended credentials (`rest` mode; `direct`, `glue` and `s3tables` never use them) |
-| `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
 | `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
 | `delete_column` | string | Column that marks a row as a delete (tombstone) during materialization |
 | `delete_values` | (string\|null)[] | Values of `delete_column` that mean "deleted"; a `null` entry matches a NULL column (null-payload delete). Required when `delete_column` is set. |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+
+Every other field is the source's [connection](#iceberg-connection), which every Iceberg route (`map`, `catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) takes the same way.
+
+#### Iceberg connection
+
+A request gives its connection in one of two forms, never both:
+
+- **Structured** (recommended): `catalog` and `io` objects, exactly as the stored config spells them, so a config read back from a source can be sent again. The catalog's auth is `catalog.auth`, the storage identity is `io.storage_auth`. Every Google identity and storage identity is given this way.
+- **Flat** (legacy): the fields below, kept for existing callers.
+
+The structured `catalog` is one of:
+
+```json
+{ "type": "rest", "uri": "https://…", "warehouse": "prod", "auth": { … } }
+{ "type": "direct", "table_location": "s3://bucket/warehouse/ns/table" }
+{ "type": "glue", "region": "us-east-1", "catalog_id": "123456789012" }
+{ "type": "s3tables", "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics" }
+```
+
+A REST catalog's `auth` is one of:
+
+```json
+{ "type": "none" }
+{ "type": "bearer", "token": <secret> }
+{ "type": "oauth2_client_credentials", "token_url": "https://…", "client_id": "…", "client_secret": <secret>, "scope": "…", "audience": "…" }
+{ "type": "google_metadata", "scopes": "…" }
+{ "type": "google", "credentials": <google>, "scopes": "…", "quota_project": "…" }
+```
+
+where `<google>` is where the Google identity comes from:
+
+```json
+{ "source": "metadata" }
+{ "source": "application_default" }
+{ "source": "service_account", "key": { "env_var": "SA_KEY" } }
+{ "source": "external_account", "config": { …the configuration `gcloud iam workload-identity-pools create-cred-config … --aws` prints… } }
+```
+
+`metadata` is the GCE/GKE metadata server's service account and `application_default` the server's own application-default credentials; both are host identities, which the operator can refuse (see [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)). `quota_project` is the project requests bill to (`x-goog-user-project`), which user credentials need. The `external_account` configuration (Workload Identity Federation from AWS) is not a secret.
+
+The structured `io`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `storage_auth` | object | Which identity reads the table's files: `{"type": "vended"}` (the REST catalog's per-table credentials, required), `{"type": "ambient"}` (the server's AWS credential chain), `{"type": "catalog"}` (the REST catalog's own Google identity reads `gs://`; what BigLake federation, `bq://`, needs, since it never vends), or `{"type": "google", "credentials": <google>, "quota_project": "…"}` (a Google identity of the source's own). Absent: what `vended_credentials` says. The server stores exactly what it is sent and never picks one for a warehouse; the CLI and the Python package do (`catalog` for `bq://`, `vended` for `bl://`), so an HTTP client wanting that names it |
+| `vended_credentials` | bool | The older form of `storage_auth` (`true`: `vended`, `false`: `ambient`); default `true` for a REST catalog. Set to agree with `storage_auth` when that is given; a contradicting value is refused |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
+
+An explicit `null` is an absent field, in either form. The legacy untagged catalog a stored record may hold (`{"uri": …, "auth": …}` with no `type`, read as REST) is accepted, so a read-out of an old record can be sent back.
+
+A `<secret>` is a literal (stored with the source) or `{"env_var": "NAME"}`, an environment variable of the server that the operator lists in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) (the value is not stored). A service-account key is never a literal: it would be stored with the source. `{"secret_ref": …}` is accepted only by an embedded `Fluree` with a secret resolver, and `default_val`, `java_property` and a `google_metadata` `metadata_url` never.
+
+The flat fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
+| `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
+| `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
+| `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
+| `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
+| `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
+| `auth_bearer` / `auth_bearer_env` | string | A static bearer token (does not refresh; a Google OAuth token expires after ~1h), or the name of a listed server environment variable holding it |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` / `oauth2_client_secret_env`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client credentials (refreshes). Needs the token URL and the secret; the client id defaults to empty (Snowflake Horizon) |
+| `auth_google_metadata`, `auth_google_scopes` | bool, string | The GCE/GKE metadata server's identity (stored as `google_metadata`) and its scopes (default `cloud-platform`) |
+| `warehouse` | string | Warehouse identifier |
+| `no_vended_credentials` | bool | Disable vended credentials (`rest` mode; `direct`, `glue` and `s3tables` never use them) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | | As in the structured `io` |
+
+Refused with `400` and `err:api/InvalidGraphSourceConfig`, the message naming the field: an unknown field (also inside `catalog` and `io`); flat and structured fields together; two ways to authenticate at once (a bearer beside OAuth2 or a Google identity, two Google sources); auth given only partly (an OAuth2 token URL without its secret, `auth_google_scopes` without `auth_google_metadata`); a literal and its `_env` together; an environment variable the operator does not list; a REST-only setting (auth, warehouse, vended credentials) in another mode. A storage identity the catalog cannot serve (`catalog` without a Google catalog identity, `vended` outside a REST catalog) and a malformed Google configuration are refused at registration with `400` (`err:system/ConfigError`, `err:auth/GoogleCredentialsInvalid`).
+
+BigLake federation with a Workload Identity Federation identity, which needs no stored secret:
+
+```json
+{
+  "name": "orders",
+  "table": "sales.orders",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
+    "warehouse": "bq://projects/lake/locations/us/catalogs/sales",
+    "auth": { "type": "google", "credentials": { "source": "external_account", "config": { "type": "external_account", "audience": "//iam.googleapis.com/projects/…", "…": "…" } } }
+  },
+  "io": { "storage_auth": { "type": "catalog" } }
+}
+```
 
 In `glue` and `s3tables` modes the catalog is called through the native AWS SDK, and both the catalog call and the S3 reads use the server's ambient AWS credential chain:
 
@@ -3122,8 +3195,9 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — missing required fields, or an `r2rml` that does not parse or compile
+- `400 Bad Request` — a [connection](#iceberg-connection) the server refuses, missing required fields, or an `r2rml` that does not parse or compile
 - `401/403` — admin auth required
+- `403 Forbidden` (`err:auth/HostIdentityRefused`) — a host identity the operator's policy refuses
 - `500 Internal Server Error` — the graph source could not be published
 
 A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
@@ -3134,7 +3208,7 @@ See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
 Checks that a catalog connection's credentials (`rest`, `glue` or `s3tables` mode) can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. When the catalog returns no inline table metadata (AWS Glue and S3 Tables never do), the metadata file at `metadata_location` is read from storage first, with the same credentials. It is read-only and admin-protected.
 
-The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
+The body takes the [connection](#iceberg-connection), structured or flat, and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
 
 ### Verify response
 
@@ -3400,7 +3474,9 @@ POST {api_base_url}/delta/map
 | `unity_catalog`, `unity_schema` | string | Complete a mapped table name of fewer than three parts |
 | `oauth2_client_id`, `oauth2_client_secret_env` / `oauth2_client_secret` | string | A Databricks service principal: its application id, and its OAuth secret as the name of a server environment variable (not stored; must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) or a literal (stored) |
 | `auth_bearer_env` / `auth_bearer` | string | A Databricks token in place of a service principal, under the same rule. It does not renew |
-| `oauth2_token_url`, `oauth2_scope` | string | Default to the workspace's own token endpoint and `all-apis` |
+| `oauth2_token_url`, `oauth2_scope`, `oauth2_audience` | string | Default to the workspace's own token endpoint, `all-apis` and none |
+
+The catalog and storage fields may instead be given structured, as the stored config spells them: `unity` (`{"uri", "catalog", "schema", "auth"}`, its `auth` a bearer or OAuth2 client credentials as on [`iceberg/map`](#iceberg-connection)) and `io` (`{"s3_region", "s3_endpoint", "s3_path_style", "azure"}`, `azure` being `{"type": "client_secret", "tenant_id", "client_id", "client_secret"}`). Not both forms at once. Every environment variable a request names, `azure_client_secret_env` included, must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. An unknown field, a catalog field without `unity_uri`, a partial Azure principal and two ways to authenticate are refused with `400` (`err:api/InvalidGraphSourceConfig`).
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
 | `delete_column`, `delete_values` | string, array | Materialization: the column and values that mark a row as deleted, as on `/iceberg/map`. With either this or `order_by`, a key's latest change replaces its subject whole; a change feed's deletes retract in either mode. See [Delta → Materialization](../graph-sources/delta.md#materialization). |
@@ -3428,7 +3504,7 @@ See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map
 
 Five read-only endpoints that lead up to `delta/map` on Unity Catalog. None registers anything. All are admin-protected, since each carries a catalog credential and calls out, and are available only when the server is built with the `delta` feature. See [From a catalog to a mapping](../graph-sources/delta.md#from-a-catalog-to-a-mapping).
 
-Every body takes the Unity connection fields of `delta/map`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
+Every body takes the Unity connection fields of `delta/map`, flat or as a structured `unity`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`, `oauth2_audience`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. `catalog/preview` and `catalog/verify` also take the S3 options (`s3_region`, `s3_endpoint`, `s3_path_style`, or a structured `io`), but no Azure principal: Unity issues the table's credentials. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
 
 | Endpoint | Further fields | Answer |
 |---|---|---|
@@ -3519,8 +3595,9 @@ POST {api_base_url}/sql/map
 | `protocol` | string | `trino` (default, `X-Trino-*` headers) or `presto` |
 | `catalog`, `schema` | string | Defaults for unqualified table names |
 | `user` | string | Protocol user header (default `fluree`) |
-| `auth_bearer` | string | Static bearer token |
-| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes); `oauth2_token_url` is guarded against internal hosts |
+| `auth` | object | The endpoint's auth, structured as on [`iceberg/map`](#iceberg-connection): a bearer, OAuth2 client credentials, or a Google identity (`{"type": "google", …}`). In place of the flat fields below, not beside them |
+| `auth_bearer` / `auth_bearer_env` | string | Static bearer token, or the name of a server environment variable holding it (listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` / `oauth2_client_secret_env`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes): needs the token URL and the secret. `oauth2_token_url` is guarded against internal hosts |
 | `session` | object | Session properties sent as `X-Trino-Session` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
@@ -3546,7 +3623,7 @@ POST {api_base_url}/sql/map
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — invalid body, unknown `dialect`/`protocol`, endpoint refused by the SSRF guard, or an invalid mapping
+- `400 Bad Request` — invalid body, unknown `dialect`/`protocol`, endpoint refused by the SSRF guard, or an invalid mapping. Auth given two ways or only partly, an unknown field and an unlisted environment variable are `err:api/InvalidGraphSourceConfig`
 - `401 Unauthorized` — admin token required
 
 ---

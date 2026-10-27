@@ -207,6 +207,9 @@ mod disk_catalog_cache;
 mod lazy_storage;
 
 #[cfg(feature = "iceberg")]
+pub(crate) mod storage;
+
+#[cfg(feature = "iceberg")]
 pub(crate) mod crawl;
 
 #[cfg(feature = "iceberg")]
@@ -229,6 +232,20 @@ mod ephemeral;
 
 #[cfg(feature = "iceberg")]
 mod r2rml_materialize;
+
+#[cfg(feature = "iceberg")]
+pub mod surface;
+
+#[cfg(feature = "sql")]
+pub use surface::sql_auth_from_json;
+#[cfg(feature = "delta")]
+pub use surface::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
+#[cfg(feature = "iceberg")]
+pub use surface::{
+    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, secret_field,
+    AuthProfile, CatalogAuthFields, GraphSourceInputError, IcebergConnectionFields, InputErrorKind,
+    SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
+};
 
 #[cfg(feature = "sql")]
 mod sql;
@@ -263,16 +280,19 @@ pub use config::{
     RestCatalogMode,
 };
 
+// Browse, preview, verify and sample run only as `Fluree` methods, under the
+// instance's identity context (host-identity policy, AWS subject, secret
+// resolver): a free function would have to invent one, and the default allows
+// every host identity.
 #[cfg(feature = "iceberg")]
 pub use iceberg_catalog::{
-    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
-    verify_storage_access, BrowseDepth, CatalogBrowse, ColumnInfo, ColumnStats, PartitionFieldInfo,
-    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, TableIdentifier,
-    TablePreview, TableRef, TableSchema,
+    guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, ColumnInfo, ColumnStats,
+    PartitionFieldInfo, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
+    StorageAccessReport, TableIdentifier, TablePreview, TableRef, TableSchema,
 };
 
 #[cfg(feature = "iceberg")]
-pub use iceberg_sample::{sample_column_values, sample_iceberg_rows};
+pub use storage::{CatalogGrant, ResolvedStorage, StorageDecision};
 
 // Internal-only: the virtual-dataset `/info` row-count fetch (ledger_info.rs)
 // reuses the shared REST-client cache key and the metadata→schema extraction that

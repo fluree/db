@@ -3,12 +3,19 @@
 //! This module provides structures and traits for handling temporary
 //! credentials vended by Iceberg REST catalogs (like Polaris).
 
+mod renewal;
 mod vended;
 
 #[cfg(feature = "aws")]
 mod aws_provider;
 
-pub use vended::{CredentialCacheKey, OperationScope, VendedCredentialCache, VendedCredentials};
+pub use renewal::{
+    CatalogVendedSource, RenewingVendedCredentials, VendedCredentialSource, DEFAULT_RENEWAL_MARGIN,
+};
+pub use vended::{
+    CredentialCacheKey, GcsCredentials, OperationScope, S3Credentials, VendedCredentialCache,
+    VendedCredentials,
+};
 
 #[cfg(feature = "aws")]
 pub use aws_provider::VendedAwsCredentialProvider;
