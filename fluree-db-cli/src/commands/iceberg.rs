@@ -329,15 +329,16 @@ async fn run_iceberg_map_remote(
 
 /// The `Connection:` line of a `map` report: whether every mapped table loaded
 /// the way a query will load it, through the catalog or, in Direct mode, at the
-/// table's location. Neither outcome fails `map`.
+/// table's location, within the registration check's time budget. Neither
+/// outcome fails `map`.
 fn connection_summary(tested: bool, mode: &str) -> &'static str {
     match (tested, mode.eq_ignore_ascii_case("direct")) {
         (true, _) => "verified",
         (false, true) => {
-            "not verified (a mapped table's metadata could not be read; queries will fail until it can be)"
+            "not verified (not every mapped table's metadata was read; queries fail on a table that cannot be)"
         }
         (false, false) => {
-            "not verified (the catalog could not load a mapped table; queries will fail until it can)"
+            "not verified (not every mapped table loaded through the catalog; queries fail on a table that cannot)"
         }
     }
 }

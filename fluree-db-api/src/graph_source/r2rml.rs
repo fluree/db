@@ -122,6 +122,26 @@ pub(crate) const EMPTY_MAPPING: &str =
     "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
      http://www.w3.org/ns/r2rml# (with the trailing #) and each map is typed rr:TriplesMap";
 
+/// How long registration spends loading a new source's tables. A map request
+/// can sit behind a gateway with its own deadline (API Gateway's is 29 s), and a
+/// mapping over a warehouse can name many tables, so past this the source is
+/// registered unverified rather than the request held open.
+pub(crate) const REGISTRATION_PROBE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// What loading a new source's tables at registration found.
+#[derive(Debug)]
+pub(crate) enum TableProbe {
+    /// Every table loaded.
+    Loaded,
+    /// The mapping named no table to load.
+    NoTables,
+    /// `table` did not load (empty when the catalog client could not be built).
+    Failed { table: String, error: QueryError },
+    /// The budget ran out with `loaded` of `total` tables loaded.
+    TimedOut { loaded: usize, total: usize },
+}
+
 /// The R2RML mapping reference carried by a mapped graph-source record, per
 /// source family. `None` for a non-mapped type, an unparseable config, or a
 /// record registered without a mapping.
@@ -1130,15 +1150,59 @@ impl crate::Fluree {
         })
     }
 
-    /// Load each table a just-published source reads, the way its queries do
-    /// (`load_table_context`): through the catalog's `loadTable` for REST, AWS
-    /// Glue and S3 Tables, and by resolving the table's current metadata at
-    /// its location for Direct (a warehouse root's per-table directory, the
-    /// local-root guard, version-hint or metadata listing). Table metadata
-    /// only, never a manifest or data file. `true` when every table loads. A
-    /// failure is logged and never returned, so it cannot fail registration.
+    /// Load each table a just-published source reads, the way its queries do,
+    /// within [`REGISTRATION_PROBE_BUDGET`]. `true` when every table loads. A
+    /// failure or an expired budget is logged and never returned, so it cannot
+    /// fail registration.
     async fn probe_tables(&self, graph_source_id: &str, table_names: &[String]) -> bool {
+        match self
+            .probe_tables_within(graph_source_id, table_names, REGISTRATION_PROBE_BUDGET)
+            .await
+        {
+            TableProbe::Loaded => true,
+            TableProbe::NoTables => {
+                debug!(
+                    graph_source_id = %graph_source_id,
+                    "No mapped table to load: the mapping could not be read"
+                );
+                false
+            }
+            TableProbe::Failed { table, error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    table = %table,
+                    error = %error,
+                    "Could not load a mapped table - graph source was created but may fail at query time"
+                );
+                false
+            }
+            TableProbe::TimedOut { loaded, total } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    loaded,
+                    total,
+                    budget_secs = REGISTRATION_PROBE_BUDGET.as_secs(),
+                    "Loading the mapped tables ran past the registration budget ({loaded} of {total} loaded) - graph source was created but is not verified"
+                );
+                false
+            }
+        }
+    }
+
+    /// Load each named table the way its queries do (`load_table_context`):
+    /// through the catalog's `loadTable` for REST, AWS Glue and S3 Tables, and
+    /// by resolving the table's current metadata at its location for Direct (a
+    /// warehouse root's per-table directory, the local-root guard, version-hint
+    /// or metadata listing). Table metadata only, never a manifest or data
+    /// file; the first failure ends it, and so does `budget`.
+    pub(crate) async fn probe_tables_within(
+        &self,
+        graph_source_id: &str,
+        table_names: &[String],
+        budget: std::time::Duration,
+    ) -> TableProbe {
         use futures::TryStreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         /// Catalog round trips in flight at once: a mapping over a warehouse
         /// can name dozens of tables, each its own `loadTable`.
         const CONCURRENT_LOADS: usize = 8;
@@ -1147,36 +1211,40 @@ impl crate::Fluree {
         // names one: a catalog source's own `table` is the placeholder that
         // only satisfies the identifier shape, never a table to load.
         if table_names.is_empty() {
-            debug!(
-                graph_source_id = %graph_source_id,
-                "No mapped table to load: the mapping could not be read"
-            );
-            return false;
+            return TableProbe::NoTables;
         }
         let provider = FlureeR2rmlProvider::new(self);
-        let loaded = futures::stream::iter(table_names.iter().map(String::as_str).map(Ok))
-            .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
-                let provider = &provider;
-                async move {
-                    provider
-                        .load_table_context(graph_source_id, table)
-                        .await
-                        .map(drop)
-                        .map_err(|e| (table, e))
-                }
-            })
-            .await;
-        match loaded {
-            Ok(()) => true,
-            Err((table, e)) => {
-                warn!(
-                    graph_source_id = %graph_source_id,
-                    table = %table,
-                    error = %e,
-                    "Could not load a mapped table - graph source was created but may fail at query time"
-                );
-                false
-            }
+        let loaded = AtomicUsize::new(0);
+        let probe = async {
+            // One catalog client for every load below. The client cache does
+            // not coalesce concurrent misses, and each build hydrates the
+            // auth's secrets, so loads that each found it cold would build
+            // one apiece.
+            provider
+                .warm_catalog_client(graph_source_id)
+                .await
+                .map_err(|error| (String::new(), error))?;
+            futures::stream::iter(table_names.iter().map(Ok))
+                .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
+                    let (provider, loaded) = (&provider, &loaded);
+                    async move {
+                        provider
+                            .load_table_context(graph_source_id, table)
+                            .await
+                            .map_err(|error| (table.clone(), error))?;
+                        loaded.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                })
+                .await
+        };
+        match tokio::time::timeout(budget, probe).await {
+            Ok(Ok(())) => TableProbe::Loaded,
+            Ok(Err((table, error))) => TableProbe::Failed { table, error },
+            Err(_elapsed) => TableProbe::TimedOut {
+                loaded: loaded.load(Ordering::Relaxed),
+                total: table_names.len(),
+            },
         }
     }
 
@@ -3494,6 +3562,36 @@ impl FlureeR2rmlProvider<'_> {
         Ok(format!("{root}/{matched}"))
     }
 
+    /// Build (or find cached) the shared catalog client a source's table loads
+    /// use, so loads issued together share one. A Direct source has none.
+    async fn warm_catalog_client(&self, graph_source_id: &str) -> QueryResult<()> {
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
+            .ok_or_else(|| {
+                QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
+            })?;
+        require_iceberg_backed(&record, graph_source_id)?;
+        let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
+            QueryError::Internal(format!(
+                "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+        shared_catalog_client(
+            self.fluree,
+            graph_source_id,
+            &record.config,
+            &iceberg_config,
+        )
+        .await
+        .map(drop)
+    }
+
     async fn load_table_context(
         &self,
         graph_source_id: &str,
@@ -5778,6 +5876,91 @@ mod tests {
             "fallback path must perform exactly one storage read"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The registration probe stops at its budget, reporting how far it got,
+    /// rather than holding the map request open; given room, the same catalog
+    /// answers and the table loads, so the budget is what stopped it.
+    #[tokio::test]
+    async fn the_registration_probe_stops_at_its_budget() {
+        use std::time::{Duration, Instant};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let metadata_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/iceberg/silver/people/metadata");
+        let current = std::fs::read_dir(&metadata_dir)
+            .expect("people metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .max()
+            .expect("a metadata file");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/silver/tables/people"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(600))
+                    .set_body_json(json!({
+                        "metadata-location": format!("file://{}", current.display()),
+                        "metadata": metadata,
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let config = R2rmlCreateConfig::new("slow-catalog", server.uri(), "silver.people", "")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .to_iceberg_gs_config("unused-mapping-address")
+            .to_json()
+            .expect("serialize");
+        fluree
+            .publisher()
+            .unwrap()
+            .publish_graph_source(
+                "slow-catalog",
+                "main",
+                GraphSourceType::Iceberg,
+                &config,
+                &[],
+            )
+            .await
+            .unwrap();
+        let tables = vec!["silver.people".to_string()];
+
+        let started = Instant::now();
+        let probe = fluree
+            .probe_tables_within("slow-catalog:main", &tables, Duration::from_millis(100))
+            .await;
+        assert!(
+            matches!(
+                probe,
+                TableProbe::TimedOut {
+                    loaded: 0,
+                    total: 1
+                }
+            ),
+            "{probe:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the probe returned at its budget, not at the catalog's answer: {:?}",
+            started.elapsed()
+        );
+
+        let probe = fluree
+            .probe_tables_within("slow-catalog:main", &tables, Duration::from_secs(10))
+            .await;
+        assert!(matches!(probe, TableProbe::Loaded), "{probe:?}");
     }
 
     // ── ORDERING-TRAP GUARD: catalog_client_cache_key must fingerprint the RAW,

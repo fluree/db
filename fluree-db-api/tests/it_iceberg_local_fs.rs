@@ -2221,3 +2221,87 @@ async fn a_registration_whose_mapping_cannot_be_read_loads_no_table() {
         "no table, placeholder or otherwise, was loaded: {asked:?}"
     );
 }
+
+/// Registration loads a mapping's tables together, through one catalog client
+/// built before the loads: the client cache does not coalesce concurrent
+/// misses, so loads that each found it cold would each build one, resolving
+/// the catalog's token reference once per table.
+#[tokio::test]
+async fn a_registration_builds_one_catalog_client_for_all_its_tables() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CountingResolver(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::SecretResolver for CountingResolver {
+        async fn resolve_secret(
+            &self,
+            _secret_ref: &str,
+        ) -> Result<String, fluree_db_iceberg::SecretResolveError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            // Hold the build open, as a real resolver's round trip does, so
+            // loads issued together would overlap it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok("catalog-token".to_string())
+        }
+    }
+
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        let metadata_dir = fixtures_dir().join("silver/people/metadata");
+        let current = std::fs::read_dir(&metadata_dir)
+            .expect("people metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .max()
+            .expect("a metadata file");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v1/namespaces/silver/tables/people_[0-9]+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": format!("file://{}", current.display()),
+                "metadata": metadata,
+            })))
+            .mount(&catalog)
+            .await;
+    }
+    let resolver = std::sync::Arc::new(CountingResolver::default());
+    let fluree = FlureeBuilder::memory()
+        .with_secret_resolver(resolver.clone())
+        .build_memory();
+    let mapping = (1..=4)
+        .map(|i| {
+            PEOPLE_R2RML
+                .replace("silver.people", &format!("silver.people_{i}"))
+                .replace("mapping#PeopleMapping", &format!("mapping#People{i}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let created = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "wide",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                mapping,
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .with_auth_bearer_token_ref("catalog/token"),
+        )
+        .await
+        .expect("register");
+    assert_eq!(created.table_count, 4, "{:?}", created.table_names);
+    assert!(created.connection_tested, "every table loaded");
+    assert_eq!(
+        resolver.0.load(Ordering::SeqCst),
+        1,
+        "one client, so the token reference was resolved once"
+    );
+}
