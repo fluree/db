@@ -6724,4 +6724,165 @@ mod tests {
         }
         assert_eq!(read(loadtable_gs.clone(), None).await, Ok(old_loc.clone()));
     }
+
+    /// Two sources whose catalogs grant different identities, naming one table
+    /// location, never share what the query path cached for it: the pointer
+    /// rung serves the metadata, and the COUNT(*) shortcut its manifest stats,
+    /// only to the identity that read them. (The catalog is unreachable, so a
+    /// miss is a catalog load that fails, and a hit needs no network.)
+    #[tokio::test]
+    async fn two_identities_naming_one_table_never_share_its_cached_metadata_or_count() {
+        use crate::graph_source::catalog_session::IcebergCatalogSession;
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_as = |token: &str| {
+            fluree_db_iceberg::IcebergGsConfig {
+                catalog: CatalogConfig::Rest {
+                    catalog_type: "rest".to_string(),
+                    uri: "http://127.0.0.1:1".to_string(),
+                    auth: fluree_db_iceberg::auth::AuthConfig::Bearer {
+                        token: fluree_db_iceberg::ConfigValue::literal(token),
+                    },
+                    warehouse: None,
+                },
+                table: TableConfig::Identifier("ns.t".to_string()),
+                io: IoConfig::default(),
+                mapping: None,
+                delete: None,
+                order_by: None,
+                model: None,
+                default_allow: None,
+            }
+            .to_json()
+            .unwrap()
+        };
+        let loc = format!("s3://b/shared-{nanos}/metadata/00001.metadata.json");
+        let metadata = Arc::new(
+            TableMetadata::from_json_str(
+                &json!({
+                    "format-version": 2,
+                    "location": "s3://b/shared",
+                    "last-sequence-number": 1,
+                    "last-updated-ms": 1000,
+                    "last-column-id": 1,
+                    "current-schema-id": 0,
+                    "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                        {"id": 1, "name": "id", "required": true, "type": "long"}
+                    ]}],
+                    "current-snapshot-id": 1,
+                    "snapshots": [{
+                        "snapshot-id": 1,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1000,
+                        "manifest-list": "s3://b/shared/snap-1.avro",
+                        "summary": {"operation": "append"},
+                    }],
+                    "snapshot-log": [{"snapshot-id": 1, "timestamp-ms": 1000}],
+                    "default-spec-id": 0,
+                    "partition-specs": [],
+                    "last-partition-id": 0,
+                    "sort-orders": [],
+                    "default-sort-order-id": 0,
+                    "properties": {}
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+
+        let provider = FlureeR2rmlProvider::new(&fluree);
+        let mut sources = Vec::new();
+        for who in ["alice", "bob"] {
+            let config = config_as(who);
+            let name = format!("shared-{who}-{}-{nanos}", std::process::id());
+            fluree
+                .publisher()
+                .unwrap()
+                .publish_graph_source(&name, "main", GraphSourceType::Iceberg, &config, &[])
+                .await
+                .unwrap();
+            let gs_id = format!("{name}:main");
+            let xq_key = cross_query_key(
+                &IcebergCatalogSession::load_table_key(&gs_id, "ns", "t"),
+                &config,
+                fluree.identity_context(),
+            );
+            // Both catalogs point at the same metadata.
+            provider
+                .catalog_disk_cache()
+                .put_metadata_location(&xq_key, &loc, 1000);
+            let parsed = IcebergGsConfig::from_json(&config).unwrap();
+            let plan = plan_storage(
+                &parsed.catalog,
+                &parsed.storage_io(),
+                &loc,
+                fluree.identity_context(),
+            )
+            .await
+            .unwrap();
+            sources.push((gs_id, plan));
+        }
+        let (alice, alice_plan) = &sources[0];
+        let (bob, bob_plan) = &sources[1];
+        assert_ne!(alice_plan.scope(), bob_plan.scope());
+
+        // Alice read the table: its metadata and manifest stats are cached under
+        // her identity.
+        fluree
+            .r2rml_cache()
+            .put_metadata(alice_plan.scope(), &loc, Arc::clone(&metadata))
+            .await;
+        provider.catalog_disk_cache().put_count_stats(
+            alice_plan.scope(),
+            &loc,
+            &[count_data_file(7, None)],
+            false,
+        );
+
+        let resolve = |gs_id: &str| {
+            let fluree = &fluree;
+            let gs_id = gs_id.to_string();
+            async move {
+                FlureeR2rmlProvider::new(fluree)
+                    .load_table_context(&gs_id, "ns.t")
+                    .await
+                    .map(|ctx| ctx.metadata_location)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        assert_eq!(resolve(alice).await, Ok(loc.clone()));
+        let bobs = resolve(bob)
+            .await
+            .expect_err("Bob is not served Alice's metadata");
+        assert!(bobs.contains("Failed to load table from catalog"), "{bobs}");
+
+        // Bob's own metadata read, but not the manifests: his COUNT(*) must read
+        // them himself rather than take Alice's stats.
+        fluree
+            .r2rml_cache()
+            .put_metadata(bob_plan.scope(), &loc, Arc::clone(&metadata))
+            .await;
+        let count = |gs_id: &str| {
+            let fluree = &fluree;
+            let gs_id = gs_id.to_string();
+            async move {
+                FlureeR2rmlProvider::new(fluree)
+                    .table_row_count_inner(&gs_id, "ns.t", &[], None)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        };
+        if crate::graph_source::disk_catalog_cache::disk_catalog_cache_enabled() {
+            assert_eq!(count(alice).await, Ok(Some(7)));
+        }
+        let bobs = count(bob)
+            .await
+            .expect_err("Bob is not served Alice's count");
+        assert!(bobs.contains("Failed to load table from catalog"), "{bobs}");
+    }
 }

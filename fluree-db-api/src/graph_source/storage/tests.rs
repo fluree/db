@@ -265,14 +265,16 @@ async fn an_explicitly_ambient_source_never_reads_with_vended_credentials() {
     let catalog = rest_with("https://cat.example", bearer("a"));
     let io = IoConfig::default().with_storage_auth(StorageAuth::Ambient);
     let plan = plan(&catalog, &io, S3_META, &open()).await.unwrap();
-    let built = plan
-        .build(&CatalogGrant::from_load(
-            &load(S3_META, Some(s3_keys())),
-            None,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(built.decision, StorageDecision::Ambient);
+    for vended in [s3_keys(), gcs_token()] {
+        let built = plan
+            .build(&CatalogGrant::from_load(&load(S3_META, Some(vended)), None))
+            .await
+            .unwrap();
+        assert_eq!(built.decision, StorageDecision::Ambient);
+        // Whatever the catalog vended, the store is the host's AWS client (a
+        // vended GCS token would have built a GCS store).
+        assert!(matches!(built.backend, IcebergStorageBackend::S3(_)));
+    }
 }
 
 #[tokio::test]
