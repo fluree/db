@@ -747,6 +747,17 @@ fn registration_refuses_a_malformed_google_identity_before_storing_it() {
 }
 
 #[test]
+fn registration_runs_the_engines_own_validation_in_every_mode() {
+    // A Direct location must name its table when no mapping does; only the
+    // stored config's validation knew that, and REST/Direct registration
+    // never ran it.
+    let e = IcebergCreateConfig::new_direct("gs", "s3://bucket/t")
+        .validate()
+        .unwrap_err();
+    assert!(e.to_string().contains("table identifier"), "{e}");
+}
+
+#[test]
 fn a_mapped_direct_warehouse_root_needs_no_table_of_its_own() {
     crate::R2rmlCreateConfig::new_direct(
         "gs",
