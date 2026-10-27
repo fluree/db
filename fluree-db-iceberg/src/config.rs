@@ -164,6 +164,7 @@ impl IcebergGsConfig {
             let path = table_location
                 .trim_start_matches("s3://")
                 .trim_start_matches("s3a://")
+                .trim_start_matches("gs://")
                 .trim_start_matches("file://");
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if segments.len() >= 3 {
@@ -229,17 +230,37 @@ impl IcebergGsConfig {
                         "catalog.table_location is required".to_string(),
                     ));
                 }
-                let is_object_store =
-                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
+                use crate::io::location::LocationScheme;
+                let scheme = LocationScheme::of(table_location);
                 // `file:///abs/path` (and the `file:/abs` single-slash variant) or a
                 // bare absolute path: a catalog-less LOCAL table, read from the
                 // filesystem with no object store or catalog service involved.
-                let is_local = crate::local_guard::is_local_location(table_location);
-                if !is_object_store && !is_local {
+                if scheme == LocationScheme::Other {
                     return Err(IcebergError::Config(format!(
                         "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
-                         file:// URI, or an absolute local path, got: {table_location}"
+                         GCS URI (gs://), a file:// URI, or an absolute local path, got: \
+                         {table_location}"
                     )));
+                }
+                // A gs:// table is read by a Google identity (io.storage_auth
+                // `google`), or by AWS only through the GCS interop endpoint;
+                // refused here rather than at the first read.
+                if scheme == LocationScheme::Gs {
+                    let served = match &self.io.storage_auth {
+                        Some(StorageAuth::Google { .. }) => true,
+                        None | Some(StorageAuth::Ambient) => {
+                            crate::io::location::s3_serves(scheme, self.io.s3_endpoint.as_deref())
+                        }
+                        Some(StorageAuth::Vended | StorageAuth::Catalog) => false,
+                    };
+                    if !served {
+                        return Err(IcebergError::Config(format!(
+                            "Direct catalog table_location {table_location} is a gs:// URI, which \
+                             this source's storage identity does not read: set io.storage_auth to \
+                             `google` (a Google identity), or io.s3_endpoint to the GCS interop \
+                             endpoint (https://storage.googleapis.com)"
+                        )));
+                    }
                 }
                 // Local locations are fail-closed: permitted only under an
                 // operator-allowlisted root. Refuse at creation rather than
@@ -1745,6 +1766,39 @@ mod tests {
             assert_eq!(config.io.vended_credentials, vended);
             config.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn a_direct_gs_table_needs_an_identity_that_reads_gs() {
+        let direct = |io: IoConfig| IcebergGsConfig {
+            catalog: CatalogConfig::direct("gs://lake/warehouse/ns/orders"),
+            table: TableConfig::Identifier(String::new()),
+            io,
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        };
+        let ambient = IoConfig {
+            vended_credentials: false,
+            ..IoConfig::default()
+        };
+        // AWS without the interop endpoint would read gs:// as s3:// on AWS.
+        let err = direct(ambient.clone()).validate().unwrap_err().to_string();
+        assert!(err.contains("gs://"), "{err}");
+        let interop = IoConfig {
+            s3_endpoint: Some("https://storage.googleapis.com".to_string()),
+            ..ambient.clone()
+        };
+        assert!(direct(interop).validate().is_ok());
+        let google = ambient.with_storage_auth(StorageAuth::Google {
+            credentials: GoogleCredentials::Metadata,
+            quota_project: None,
+        });
+        let config = direct(google);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.table_identifier().unwrap().table, "orders");
     }
 
     #[test]
