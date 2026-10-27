@@ -854,7 +854,7 @@ impl<'a> Lowerer<'a> {
         let mut order_columns = HashMap::new();
         for (v, src) in &self.vars {
             if let (Some(KeyShape::Column { col, class }), false) = (&src.key, src.nullable) {
-                if orders_as(class, self.field_type(col), &self.caps)
+                if orders_as(class, self.field_type(col), self.caps)
                     && self
                         .required_columns
                         .contains(&(col.alias.clone(), col.column.clone()))
