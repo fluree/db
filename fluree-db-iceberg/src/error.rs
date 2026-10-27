@@ -155,12 +155,15 @@ pub enum IcebergError {
     },
 
     /// A catalog on Google refused the request because no quota project was
-    /// named (`USER_PROJECT_DENIED` / "requires a quota project"). User
-    /// credentials bill to a project the request must name; the fix is the
-    /// source's `quota_project`, not a broader grant.
+    /// named (`USER_PROJECT_DENIED`, "requires a quota project", BigLake's
+    /// "missing `x-goog-user-project` header"). BigLake bills every request,
+    /// whatever the identity (user credentials, a service account, WIF), to a
+    /// project the request names; the fix is the source's `quota_project`,
+    /// not a broader grant.
     #[error(
-        "Catalog request for {table} needs a quota project: Google bills user credentials to \
-         the project named in x-goog-user-project; set quota_project on the source's Google auth"
+        "Catalog request for {table} needs a quota project: Google bills the request to the \
+         project named in x-goog-user-project (BigLake requires one for every identity); set \
+         quota_project on the source's Google auth"
     )]
     CatalogQuotaProjectRequired {
         /// The table (or catalog route) the refused request was for.
@@ -381,11 +384,34 @@ impl std::fmt::Display for GoogleTokenStage {
 }
 
 /// What a denial most likely means, by store.
+/// `err` and every error that caused it, each once: `err: cause: cause`.
+/// Only `Display` text, never `Debug`. A level whose text the level above it
+/// already showed is skipped, since a wrapper that renders its source's text
+/// (as `object_store` does) would otherwise print it twice.
+#[cfg(feature = "aws")]
+pub(crate) fn concise_chain(err: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut shown = err.to_string();
+    let mut previous = shown.clone();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !previous.contains(&text) {
+            let _ = write!(shown, ": {text}");
+        }
+        previous = text;
+        source = inner.source();
+    }
+    shown
+}
+
 fn denial_hint(scheme: &str) -> &'static str {
     match scheme {
         "gs" => {
             "The identity lacks storage.objects.get (or storage.objects.list) on this object, \
-             or the object no longer exists."
+             or the object no longer exists. UserProjectAccessDenied means the identity lacks \
+             serviceusage.services.use on the project its requests bill to \
+             (x-goog-user-project)."
         }
         _ => {
             "The credentials lack permission for this object, or — without s3:ListBucket — the \

@@ -8,6 +8,7 @@ Trino-protocol endpoint backed by sqlite3."""
 import asyncio
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -224,9 +225,97 @@ def test_a_google_identity_authenticates_a_rest_catalog_and_reads_its_files(conn
     conn.map_iceberg(
         "direct-gcs",
         ORDERS_MAPPING,
-        table_location="s3://bucket/warehouse/sales/orders",
+        table_location="gs://bucket/warehouse/sales/orders",
         storage=fluree.Google(UNSET_KEY),
     )
+    # A Google identity reads gs:// only: one on s3:// could never be read,
+    # so it does not register.
+    with pytest.raises(fluree.FlureeError, match="serves only gs://"):
+        conn.map_iceberg(
+            "direct-gcs-on-s3",
+            ORDERS_MAPPING,
+            table_location="s3://bucket/warehouse/sales/orders",
+            storage=fluree.Google(UNSET_KEY),
+        )
+
+
+# A child process with a mock of Google's metadata server and of a BigLake
+# catalog, which records the `x-goog-user-project` each catalog request names.
+# A child, because the engine reads the metadata-server and token-host
+# overrides once per process.
+QUOTA_CHILD = r"""
+import http.server, json, os, sys, threading
+
+seen = []
+
+class Mock(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/computeMetadata/"):
+            body = {"access_token": "ya29.host", "expires_in": 3600, "token_type": "Bearer"}
+        else:
+            seen.append(self.headers.get("x-goog-user-project"))
+            body = {} if self.path.startswith("/v1/config") else {
+                "metadata-location": "gs://lake/wh/orders/metadata/v1.metadata.json"
+            }
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{server.server_address[1]}"
+os.environ["FLUREE_GOOGLE_METADATA_URL"] = (
+    base + "/computeMetadata/v1/instance/service-accounts/default/token"
+)
+os.environ["FLUREE_GOOGLE_TOKEN_HOSTS"] = "127.0.0.1"
+
+import fluree
+
+mapping, warehouse, quota_project = json.loads(sys.argv[1])
+with fluree.connect(":memory:") as conn:
+    conn.map_iceberg(
+        "biglake",
+        mapping,
+        catalog_uri=base,
+        warehouse=warehouse,
+        table="sales.orders",
+        auth=fluree.Google(quota_project=quota_project),
+        storage="catalog",
+    )
+print(json.dumps(seen))
+"""
+
+
+def catalog_billed_to(warehouse, quota_project=None):
+    """The `x-goog-user-project` each of the registration's catalog requests
+    named, for a source on `warehouse`."""
+    child = subprocess.run(
+        [sys.executable, "-c", QUOTA_CHILD, json.dumps([ORDERS_MAPPING, warehouse, quota_project])],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child.returncode == 0, child.stderr
+    seen = json.loads(child.stdout.strip().splitlines()[-1])
+    assert seen, "the registration's connection test reached the catalog"
+    return set(seen)
+
+
+def test_a_biglake_warehouse_names_the_catalogs_quota_project():
+    # BigLake refuses a request naming no quota project, whatever the identity.
+    assert catalog_billed_to("bq://projects/lake-project/locations/us-central1") == {"lake-project"}
+    assert catalog_billed_to("bl://projects/123456789012/catalogs/c") == {"123456789012"}
+    # The caller's own project wins; another warehouse names none.
+    assert catalog_billed_to(
+        "bq://projects/lake-project/locations/us-central1", "billing-project"
+    ) == {"billing-project"}
+    assert catalog_billed_to("wh") == {None}
 
 
 def test_a_storage_identity_the_catalog_cannot_serve_is_refused(conn):

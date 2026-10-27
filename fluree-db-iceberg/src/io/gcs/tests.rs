@@ -142,6 +142,69 @@ async fn a_ranged_read_returns_exactly_the_range_as_the_identity() {
     );
 }
 
+/// A store bills its reads to the project it was built with, never to the
+/// identity's own quota project: that one bills the catalog's API (BigLake),
+/// and sent to GCS it would make every read a requester-pays read needing
+/// `serviceusage.services.use` on it.
+#[tokio::test]
+async fn a_store_bills_only_the_project_configured_for_storage() {
+    let (google, gcs) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("GET"))
+        .and(path(METADATA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "t", "expires_in": 3600, "token_type": "Bearer"
+        })))
+        .mount(&google)
+        .await;
+    // The catalog's identity, with the quota project its catalog calls bill to.
+    let catalog_identity = Arc::new(
+        GoogleIdentity::with_endpoints(
+            &GoogleCredentials::Metadata,
+            Some("catalog-billing"),
+            &IdentityContext::default(),
+            &endpoints_at(&google),
+        )
+        .unwrap(),
+    );
+    assert_eq!(catalog_identity.quota_project(), Some("catalog-billing"));
+    Mock::given(method("GET"))
+        .and(object_at("/lake/f"))
+        .respond_with(object(BODY))
+        .mount(&gcs)
+        .await;
+    let billed_to = |requests: &[Request]| -> Vec<Option<String>> {
+        requests
+            .iter()
+            .map(|r| {
+                r.headers
+                    .get("x-goog-user-project")
+                    .map(|v| v.to_str().unwrap().to_string())
+            })
+            .collect()
+    };
+
+    let unbilled = store_as(Arc::clone(&catalog_identity), &gcs, None);
+    SendIcebergStorage::read(&unbilled, "gs://lake/f")
+        .await
+        .unwrap();
+    assert_eq!(billed_to(&gcs.received_requests().await.unwrap()), [None]);
+
+    gcs.reset().await;
+    Mock::given(method("GET"))
+        .and(object_at("/lake/f"))
+        .respond_with(object(BODY))
+        .mount(&gcs)
+        .await;
+    let billed = store_as(catalog_identity, &gcs, Some("storage-billing"));
+    SendIcebergStorage::read(&billed, "gs://lake/f")
+        .await
+        .unwrap();
+    assert_eq!(
+        billed_to(&gcs.received_requests().await.unwrap()),
+        [Some("storage-billing".to_string())]
+    );
+}
+
 #[tokio::test]
 async fn ranges_come_back_in_input_order_and_whole_reads_are_whole() {
     let (google, gcs) = (MockServer::start().await, MockServer::start().await);
@@ -373,21 +436,74 @@ async fn a_403_is_storage_access_denied_on_reads_and_listings() {
         }) => {
             assert_eq!(bucket, "lake");
             assert_eq!(key, "data/secret.parquet");
-            assert!(
-                message.contains("gs://lake/data/secret.parquet"),
-                "{message}"
+            // The operation, the path, the status, and GCS's own code and
+            // message, once: not the nested chain, not the XML.
+            assert_eq!(
+                message,
+                "GCS refused the read of gs://lake/data/secret.parquet as Google (metadata): \
+                 HTTP 403 AccessDenied: no storage.objects.get"
             );
-            assert!(!message.contains("Bearer"), "{message}");
         }
         other => panic!("expected StorageAccessDenied, got {other:?}"),
     }
     let err = SendIcebergStorage::list_dir(&store, "gs://lake/warehouse")
         .await
         .unwrap_err();
+    match &err {
+        IcebergError::StorageAccessDenied { message, .. } => assert_eq!(
+            message,
+            "GCS refused the listing of gs://lake/warehouse as Google (metadata): HTTP 403"
+        ),
+        other => panic!("expected StorageAccessDenied, got {other:?}"),
+    }
     assert!(
-        matches!(err, IcebergError::StorageAccessDenied { .. }),
-        "{err:?}"
+        err.to_string().starts_with("Storage access denied"),
+        "{err}"
     );
+}
+
+/// What GCS answered when it refused a request for the bill's project (a
+/// requester-pays or `x-goog-user-project` read without
+/// `serviceusage.services.use`), as observed live: the denial says it once,
+/// in its own words.
+#[tokio::test]
+async fn a_user_project_refusal_says_once_what_gcs_said() {
+    let (google, gcs) = (MockServer::start().await, MockServer::start().await);
+    let store = store_as(identity(&google, "t").await, &gcs, Some("billing-project"));
+    Mock::given(method("GET"))
+        .and(object_at("/lake/wh/t/metadata/v1.metadata.json"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<?xml version='1.0' encoding='UTF-8'?><Error><Code>UserProjectAccessDenied</Code>\
+             <Message>Requester does not have serviceusage.services.use permissions on user \
+             project.</Message><Details>reader@lake-project.iam.gserviceaccount.com does not \
+             have serviceusage.services.use access to the Google Cloud project. Permission \
+             &apos;serviceusage.services.use&apos; denied on resource (or it may not \
+             exist).</Details></Error>",
+        ))
+        .mount(&gcs)
+        .await;
+    let err = SendIcebergStorage::read(&store, "gs://lake/wh/t/metadata/v1.metadata.json")
+        .await
+        .unwrap_err();
+    let shown = err.to_string();
+    assert!(
+        shown.starts_with("Storage access denied reading gs://lake/wh/t/metadata/v1.metadata.json"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "HTTP 403 UserProjectAccessDenied: Requester does not have serviceusage.services.use \
+             permissions on user project."
+        ),
+        "{shown}"
+    );
+    assert_eq!(
+        shown.matches("Requester does not have").count(),
+        1,
+        "{shown}"
+    );
+    assert!(!shown.contains("<Error>"), "{shown}");
+    assert!(!shown.contains("Details"), "{shown}");
 }
 
 #[tokio::test]

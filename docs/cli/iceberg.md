@@ -81,10 +81,10 @@ These options, and `--warehouse`, configure a REST catalog: any other `--mode` r
 | `--oauth2-scope <SCOPE>` | OAuth2 scope (e.g. `session:role:ICEBERG_READER` for Snowflake Horizon / Polaris) |
 | `--oauth2-audience <AUDIENCE>` | OAuth2 audience |
 | `--auth-google-metadata` | Authenticate as the GCE/GKE metadata server's service account (GKE Workload Identity). A host identity: an operator can refuse it with [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
-| `--auth-google-adc` | Authenticate with the host's application-default credentials (`GOOGLE_APPLICATION_CREDENTIALS`, else gcloud's, e.g. after `gcloud auth application-default login`). A host identity |
+| `--auth-google-adc` | Authenticate with the host's application-default credentials (`GOOGLE_APPLICATION_CREDENTIALS`, else gcloud's, e.g. after `gcloud auth application-default login`). A host identity. User credentials carry the user's own `cloud-platform` scope, which a refresh cannot narrow |
 | `--auth-google-service-account-env <VAR>` | Authenticate as the service account whose key JSON this environment variable holds, read by the process that reads the tables. The key is not stored, and is never taken literally |
 | `--auth-google-wif-config <FILE>` | Authenticate through Workload Identity Federation from AWS: the credential configuration that `gcloud iam workload-identity-pools create-cred-config … --aws` prints. Not a secret: the file is read and stored with the graph source |
-| `--auth-google-quota-project <PROJECT>` | The Google Cloud project requests bill to (`x-goog-user-project`); user credentials need one |
+| `--auth-google-quota-project <PROJECT>` | The Google Cloud project catalog requests bill to (`x-goog-user-project`). BigLake requires one for every identity; default: the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names. It bills the catalog only, never storage reads |
 | `--auth-google-scopes <SCOPES>` | OAuth scopes, comma-separated (default: `cloud-platform`) |
 
 Give one way to authenticate: a bearer token, OAuth2 client credentials, or one Google source. Two at once are refused, and so is a partial OAuth2 set: OAuth2 needs `--oauth2-token-url` and the client secret (`--oauth2-client-id` defaults to empty, as Snowflake Horizon needs).
@@ -95,10 +95,10 @@ Give one way to authenticate: a bearer token, OAuth2 client credentials, or one 
 |--------|-------------|
 | `--storage-identity <IDENTITY>` | Which identity reads the table's files: `vended` (the REST catalog's per-table vended credentials, required), `ambient` (the ambient AWS credential chain), `catalog` (the REST catalog's own Google identity reads `gs://`, as BigLake federation needs), or `google` (a Google identity of the source's own, the options below). Default: `catalog` for a `bq://` warehouse, `vended` for a `bl://` one; otherwise vended credentials for a REST catalog (unless `--no-vended-credentials`) and the ambient chain for the other modes |
 | `--storage-google-metadata` | Read the files as the metadata server's service account |
-| `--storage-google-adc` | Read the files with the host's application-default credentials |
+| `--storage-google-adc` | Read the files with the host's application-default credentials. User credentials read with the user's own `cloud-platform` scope (a refresh grant cannot narrow it to read-only storage); a service-account key file is minted read-only |
 | `--storage-google-service-account-env <VAR>` | Read the files as the service account whose key JSON this variable holds |
 | `--storage-google-wif-config <FILE>` | Read the files through this Workload Identity Federation configuration |
-| `--storage-google-quota-project <PROJECT>` | The project storage requests bill to (requester pays) |
+| `--storage-google-quota-project <PROJECT>` | The project storage requests bill to (requester pays). Never defaulted, and never the catalog's quota project |
 
 The default is the CLI's (Python's `map_iceberg` has the same one); the server stores what it is sent, so a remote map sends the identity the default chose. A `--storage-google-*` source alone means `--storage-identity google`. A `bq://` warehouse never vends, so its default needs a Google catalog identity: without one, `map` refuses and names the options to give.
 

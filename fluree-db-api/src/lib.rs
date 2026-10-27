@@ -256,9 +256,9 @@ pub use graph_source::{azure_auth, delta_connection_from_json, unity_config, Del
 /// persisted config with; see [`graph_source::surface`].
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
-    default_storage_auth, iceberg_connection_from_json, iceberg_create_from_json, secret_field,
-    AuthProfile, CatalogAuthFields, GraphSourceInputError, IcebergConnectionFields, InputErrorKind,
-    SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
+    default_google_quota_project, default_storage_auth, iceberg_connection_from_json,
+    iceberg_create_from_json, secret_field, AuthProfile, CatalogAuthFields, GraphSourceInputError,
+    IcebergConnectionFields, InputErrorKind, SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
 };
 #[cfg(feature = "iceberg")]
 pub use graph_source::{

@@ -84,7 +84,9 @@ class Google:
       account;
     - ``"application_default"``: the host's application-default credentials
       (``GOOGLE_APPLICATION_CREDENTIALS``, else gcloud's), e.g. after
-      ``gcloud auth application-default login``;
+      ``gcloud auth application-default login``. A user's credentials carry
+      the user's own cloud-platform scope, which a refresh cannot narrow to
+      read-only storage, so use them for development;
     - an :class:`EnvVar` naming the variable that holds a service-account
       key's JSON, read where the source is read. A key is never given
       literally: it would be stored with the source;
@@ -95,7 +97,11 @@ class Google:
     The metadata server and application-default credentials are the host's
     own identity, which an operator can refuse
     (``FLUREE_GRAPH_SOURCE_HOST_IDENTITIES``). ``quota_project`` is the
-    project requests bill to, which user credentials need; ``scopes`` a
+    project requests bill to (``x-goog-user-project``). BigLake requires one
+    for every identity; as a catalog's auth it defaults to the project a
+    ``bq://projects/<P>/...`` or ``bl://projects/<P>/...`` warehouse names,
+    and it bills the catalog only, never storage reads. As ``storage`` it is
+    the requester-pays billing project, never defaulted. ``scopes`` is a
     comma-separated scope list (default cloud-platform, catalog auth only)."""
 
     credentials: Union[str, EnvVar, Mapping[str, Any], os.PathLike[str]] = "metadata"

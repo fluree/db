@@ -756,14 +756,18 @@ pub enum StorageAuth {
     /// The host's ambient AWS credential chain (a host identity).
     Ambient,
     /// The REST catalog's own Google identity reads `gs://` — Google's model
-    /// for BigLake federation (`bq://`), which never vends.
+    /// for BigLake federation (`bq://`), which never vends. The identity, not
+    /// its quota project: the catalog auth's `quota_project` bills BigLake's
+    /// API, and is never sent with a storage read (to GCS,
+    /// `x-goog-user-project` is a requester-pays billing project).
     Catalog,
     /// A Google identity of the source's own, for `gs://` (e.g. Direct mode).
     Google {
         /// Where the credential comes from.
         credentials: GoogleCredentials,
-        /// The project storage requests bill to (requester pays); wins over
-        /// the credential JSON's `quota_project_id`.
+        /// The project storage requests bill to (requester pays), sent as
+        /// `x-goog-user-project`; unset, a read names no billing project. A
+        /// credential JSON's own `quota_project_id` is not used for storage.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quota_project: Option<String>,
     },

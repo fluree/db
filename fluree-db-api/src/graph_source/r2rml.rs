@@ -6190,6 +6190,46 @@ mod tests {
             .is_some());
     }
 
+    /// A Direct table on `gs://` registers when its storage identity reads
+    /// `gs://` (a Google identity of its own), by the engine's one location
+    /// rule; one whose identity cannot read it is refused at registration.
+    #[tokio::test]
+    async fn a_direct_gcs_source_registers_when_its_identity_reads_gcs() {
+        use crate::graph_source::config::{IcebergConnectionConfig, IcebergCreateConfig};
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let on_gcs = |name: &str| {
+            let mut config = IcebergCreateConfig::new_direct(name, "gs://lake/wh/t");
+            config.connection = IcebergConnectionConfig::direct("gs://lake/wh/t");
+            config
+        };
+        // A key in a variable that is never set: nothing to mint at
+        // registration, so the identity is proven at query time.
+        let mut google = on_gcs("gs-gcs-google");
+        google.connection =
+            google
+                .connection
+                .with_storage_auth(fluree_db_iceberg::StorageAuth::Google {
+                    credentials: fluree_db_iceberg::auth::GoogleCredentials::ServiceAccount {
+                        key: fluree_db_iceberg::ConfigValue::from_env(
+                            "FLUREE_TEST_GCS_SA_KEY_NEVER_SET",
+                        ),
+                    },
+                    quota_project: None,
+                });
+        fluree
+            .create_iceberg_graph_source(google)
+            .await
+            .expect("a Google identity reads gs://");
+        // The host's AWS identity reads gs:// only through the GCS interop
+        // endpoint.
+        let err = fluree
+            .create_iceberg_graph_source(on_gcs("gs-gcs-ambient"))
+            .await
+            .map(|_| ())
+            .expect_err("ambient AWS does not read gs://");
+        assert!(err.to_string().contains("io.storage_auth"), "{err}");
+    }
+
     #[tokio::test]
     async fn no_inline_metadata_falls_back_to_storage_read() {
         let cache = R2rmlCache::new(4, 4);

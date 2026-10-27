@@ -194,8 +194,18 @@ pub(crate) fn map_iceberg<'py>(
     let rules = rules(fluree);
     let rest = spec.catalog_uri.is_some();
     if let Some(auth) = spec.auth.as_ref() {
-        let auth = from_py(py, auth, "auth")?;
+        let mut auth = from_py(py, auth, "auth")?;
         rules.check_auth("auth", &auth).map_err(refused)?;
+        // BigLake refuses a request that names no quota project, whatever
+        // the identity: a Google identity that names none bills to the
+        // project its `bq://` / `bl://` warehouse names.
+        if let fluree_db_api::IcebergAuthConfig::Google {
+            quota_project: quota_project @ None,
+            ..
+        } = &mut auth
+        {
+            *quota_project = fluree_db_api::default_google_quota_project(spec.warehouse.as_deref());
+        }
         iceberg = iceberg.with_auth(auth);
     }
     let default_storage = fluree_db_api::default_storage_auth(spec.warehouse.as_deref());

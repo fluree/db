@@ -229,6 +229,13 @@ name = "it_host_identity_env_default"
 path = "tests/it_host_identity_env_default.rs"
 required-features = ["iceberg"]
 
+# Standalone: points the operator-only Google/GCS overrides at mocks, which
+# are read once per process.
+[[test]]
+name = "it_google_storage_billing"
+path = "tests/it_google_storage_billing.rs"
+required-features = ["iceberg"]
+
 # Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
 # every Direct entry point, against the committed fixture's parent directory.
 [[test]]

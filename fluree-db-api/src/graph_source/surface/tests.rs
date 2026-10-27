@@ -683,6 +683,24 @@ fn a_biglake_warehouse_picks_its_default_storage_identity() {
 }
 
 #[test]
+fn a_biglake_warehouse_names_its_quota_project() {
+    use super::default_google_quota_project as project;
+    assert_eq!(
+        project(Some("bq://projects/lake-project/locations/us-central1")),
+        Some("lake-project".to_string())
+    );
+    assert_eq!(
+        project(Some("bl://projects/123456789012/catalogs/c")),
+        Some("123456789012".to_string())
+    );
+    assert_eq!(project(Some("bq://projects/")), None);
+    assert_eq!(project(Some("bq://lake-project/us")), None);
+    assert_eq!(project(Some("projects/p/locations/us")), None);
+    assert_eq!(project(Some("wh")), None);
+    assert_eq!(project(None), None);
+}
+
+#[test]
 fn the_error_names_fields_in_the_callers_spelling() {
     let e = GraphSourceInputError::incomplete(
         "oauth2_token_url",

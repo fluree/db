@@ -629,12 +629,20 @@ async fn run_iceberg_map_local(_args: IcebergMapArgs, _dirs: &FlureeDir) -> CliR
 /// surface uses ([`fluree_db_api::IcebergConnectionFields`]). A REST catalog
 /// with no storage flag reads with the identity its warehouse implies (see
 /// [`fluree_db_api::default_storage_auth`]): `catalog` for `bq://`, `vended`
-/// for `bl://`.
+/// for `bl://`. A Google catalog identity with no
+/// `--auth-google-quota-project` bills to the project a `bq://projects/<P>/…`
+/// or `bl://projects/<P>/…` warehouse names
+/// ([`fluree_db_api::default_google_quota_project`]): BigLake refuses a
+/// request that names none, whatever the identity.
 #[cfg(feature = "iceberg")]
 pub(crate) fn connection_fields(
     args: &IcebergMapArgs,
 ) -> CliResult<fluree_db_api::IcebergConnectionFields> {
-    let auth = args.auth.fields(Some(&args.google))?;
+    let mut auth = args.auth.fields(Some(&args.google))?;
+    if !auth.google.is_empty() && auth.google_quota_project.is_none() {
+        auth.google_quota_project =
+            fluree_db_api::default_google_quota_project(args.warehouse.as_deref());
+    }
     let default_storage_auth = if args.storage.is_given() || args.no_vended_credentials {
         None
     } else {
@@ -974,6 +982,64 @@ mod tests {
             "t",
         ]));
         assert!(e.contains("never vends"), "{e}");
+    }
+
+    /// BigLake refuses a request that names no quota project, whatever the
+    /// identity: a Google catalog identity with none bills to the project its
+    /// `bq://` or `bl://` warehouse names. The default is stored, so a remote
+    /// map sends it; the server infers none.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_biglake_warehouse_defaults_the_catalog_quota_project() {
+        let federation = rest(&[
+            "--warehouse",
+            "bq://projects/lake-project/locations/us-central1",
+            "--auth-google-metadata",
+        ]);
+        let auth = &stored(&federation)["catalog"]["auth"];
+        assert_eq!(auth["type"], "google", "{auth}");
+        assert_eq!(auth["credentials"]["source"], "metadata", "{auth}");
+        assert_eq!(auth["quota_project"], "lake-project", "{auth}");
+        assert_eq!(
+            args_to_json(&federation).unwrap()["catalog"]["auth"]["quota_project"],
+            "lake-project"
+        );
+        let runtime = stored(&rest(&[
+            "--warehouse",
+            "bl://projects/123456789012/catalogs/c",
+            "--auth-google-adc",
+        ]));
+        assert_eq!(runtime["catalog"]["auth"]["quota_project"], "123456789012");
+        // A project the caller names wins.
+        let named = stored(&rest(&[
+            "--warehouse",
+            "bq://projects/lake-project/locations/us-central1",
+            "--auth-google-metadata",
+            "--auth-google-quota-project",
+            "billing-project",
+        ]));
+        assert_eq!(named["catalog"]["auth"]["quota_project"], "billing-project");
+        // Another warehouse names no project, so none is defaulted, and an
+        // identity that is not Google's takes none.
+        let plain = stored(&rest(&["--warehouse", "wh", "--auth-google-metadata"]));
+        assert!(
+            plain["catalog"]["auth"].get("quota_project").is_none(),
+            "{}",
+            plain["catalog"]["auth"]
+        );
+        let bearer = stored(&rest(&[
+            "--warehouse",
+            "bq://projects/lake-project/locations/us-central1",
+            "--auth-bearer",
+            "t",
+            "--storage-identity",
+            "ambient",
+        ]));
+        assert!(bearer["catalog"]["auth"].get("quota_project").is_none());
+        // Storage reads never inherit it.
+        assert!(stored(&federation)["io"]["storage_auth"]
+            .get("quota_project")
+            .is_none());
     }
 
     #[cfg(feature = "iceberg")]
