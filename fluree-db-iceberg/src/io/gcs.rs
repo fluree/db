@@ -356,7 +356,7 @@ impl GcsIcebergStorage {
                     Ok(token_error) => *token_error,
                     Err(source) => IcebergError::storage(format!(
                         "GCS {what} of {path} failed: {}",
-                        concise_chain(source.as_ref())
+                        crate::error::concise_chain(source.as_ref())
                     )),
                 }
             }
@@ -365,7 +365,7 @@ impl GcsIcebergStorage {
             }
             other => IcebergError::storage(format!(
                 "GCS {what} of {path} failed: {}",
-                concise_chain(&other)
+                crate::error::concise_chain(&other)
             )),
         }
     }
@@ -507,25 +507,6 @@ fn xml_element(xml: &str, tag: &str) -> Option<String> {
         .replace("&amp;", "&");
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())
-}
-
-/// `err`'s message chain without its repeats: `object_store` renders each
-/// wrapper with its source's text appended, so a level whose text the level
-/// above already showed is skipped.
-fn concise_chain(err: &dyn std::error::Error) -> String {
-    use std::fmt::Write;
-    let mut shown = err.to_string();
-    let mut previous = shown.clone();
-    let mut source = err.source();
-    while let Some(inner) = source {
-        let text = inner.to_string();
-        if !previous.contains(&text) {
-            let _ = write!(shown, ": {text}");
-        }
-        previous = text;
-        source = inner.source();
-    }
-    shown
 }
 
 /// The status of a refusal (401 or 403) `err` reports, if it is one.

@@ -31,6 +31,21 @@ pub trait AwsSubjectCredentials: std::fmt::Debug + Send + Sync {
     fn region(&self) -> Option<String>;
 }
 
+/// The host chain's failure to provide credentials, with every cause it
+/// gives: `CredentialsError` says only "an error occurred while loading
+/// credentials", and the reason (an expired SSO session, a missing profile)
+/// is in its sources. Their `Display` text is the providers' diagnostics,
+/// which name profiles, sessions and endpoints; a failed load holds no key
+/// material to show, and no `Debug` rendering is used.
+fn no_subject_credentials(
+    error: &aws_credential_types::provider::error::CredentialsError,
+) -> IcebergError {
+    IcebergError::Credential(format!(
+        "the host's AWS credential chain provided no credentials for the WIF subject token: {}",
+        crate::error::concise_chain(error)
+    ))
+}
+
 /// The host's aws-config default chain, loaded on first use.
 #[derive(Debug, Default)]
 pub(crate) struct HostAwsSubject {
@@ -57,12 +72,10 @@ impl AwsSubjectCredentials for HostAwsSubject {
                 "the host has no AWS credential chain to sign the WIF subject token".to_string(),
             )
         })?;
-        provider.provide_credentials().await.map_err(|e| {
-            IcebergError::Credential(format!(
-                "the host's AWS credential chain provided no credentials for the WIF subject \
-                 token: {e}"
-            ))
-        })
+        provider
+            .provide_credentials()
+            .await
+            .map_err(|e| no_subject_credentials(&e))
     }
 
     fn region(&self) -> Option<String> {
@@ -70,5 +83,51 @@ impl AwsSubjectCredentials for HostAwsSubject {
             .get()
             .and_then(aws_config::SdkConfig::region)
             .map(ToString::to_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_credential_types::provider::error::CredentialsError;
+
+    /// The cause of an error, with a cause of its own.
+    #[derive(Debug)]
+    struct Cause(&'static str, Option<Box<Cause>>);
+
+    impl std::fmt::Display for Cause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Cause {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|cause| cause as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// An expired SSO session says so: the provider error's own text is a
+    /// generic "an error occurred while loading credentials", and the reason
+    /// is in its sources, each shown once.
+    #[test]
+    fn the_subject_credential_error_names_its_causes() {
+        let expired = CredentialsError::provider_error(Cause(
+            "failed to load SSO token",
+            Some(Box::new(Cause(
+                "Token has expired and refresh failed",
+                None,
+            ))),
+        ));
+        let shown = super::no_subject_credentials(&expired).to_string();
+        assert!(
+            shown.contains(
+                "an error occurred while loading credentials: failed to load SSO token: Token \
+                 has expired and refresh failed"
+            ),
+            "{shown}"
+        );
+        assert_eq!(shown.matches("Token has expired").count(), 1, "{shown}");
     }
 }

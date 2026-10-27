@@ -384,6 +384,27 @@ impl std::fmt::Display for GoogleTokenStage {
 }
 
 /// What a denial most likely means, by store.
+/// `err` and every error that caused it, each once: `err: cause: cause`.
+/// Only `Display` text, never `Debug`. A level whose text the level above it
+/// already showed is skipped, since a wrapper that renders its source's text
+/// (as `object_store` does) would otherwise print it twice.
+#[cfg(feature = "aws")]
+pub(crate) fn concise_chain(err: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut shown = err.to_string();
+    let mut previous = shown.clone();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !previous.contains(&text) {
+            let _ = write!(shown, ": {text}");
+        }
+        previous = text;
+        source = inner.source();
+    }
+    shown
+}
+
 fn denial_hint(scheme: &str) -> &'static str {
     match scheme {
         "gs" => {
