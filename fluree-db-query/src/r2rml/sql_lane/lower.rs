@@ -854,14 +854,7 @@ impl<'a> Lowerer<'a> {
         let mut order_columns = HashMap::new();
         for (v, src) in &self.vars {
             if let (Some(KeyShape::Column { col, class }), false) = (&src.key, src.nullable) {
-                let orderable = match class {
-                    RdfClass::Numeric | RdfClass::Date | RdfClass::DateTime | RdfClass::Bool => {
-                        true
-                    }
-                    RdfClass::Str => self.caps.string_order_is_codepoint,
-                    _ => false,
-                };
-                if orderable
+                if orders_as(class, self.field_type(col), &self.caps)
                     && self
                         .required_columns
                         .contains(&(col.alias.clone(), col.column.clone()))
@@ -3713,6 +3706,30 @@ fn parse_triple(tp: &TriplePattern, snapshot: &LedgerSnapshot) -> Lowering<Tp> {
     Ok(Tp { s, p, o })
 }
 
+/// Whether the database orders a column of physical type `ty` as the engine
+/// orders terms of `class`: the type must hold the class natively (an
+/// `xsd:integer` over a text column sorts "9" above "100" in the database and
+/// below it in the engine), and a string orders by code point only where the
+/// dialect does. A rendered string never orders as its column.
+pub(crate) fn orders_as(
+    class: &RdfClass,
+    ty: Option<FieldType>,
+    caps: &PushdownCapabilities,
+) -> bool {
+    use FieldType as F;
+    match class {
+        RdfClass::Numeric => matches!(
+            ty,
+            Some(F::Int32 | F::Int64 | F::Float32 | F::Float64 | F::Decimal { .. })
+        ),
+        RdfClass::Date => ty == Some(F::Date),
+        RdfClass::DateTime => matches!(ty, Some(F::Timestamp | F::TimestampTz)),
+        RdfClass::Bool => ty == Some(F::Boolean),
+        RdfClass::Str => caps.string_order_is_codepoint,
+        _ => false,
+    }
+}
+
 /// The RDF class of an object map's values.
 pub(crate) fn class_of(
     datatype: Option<&str>,
@@ -4071,6 +4088,52 @@ fn triple_is_admissible(tp: &TriplePattern) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caps(codepoint: bool) -> PushdownCapabilities {
+        PushdownCapabilities {
+            left_join: true,
+            keyset_max_rows: 1000,
+            statement_max_bytes: 1 << 20,
+            string_eq_is_binary: true,
+            string_distinct_is_binary: true,
+            string_order_is_codepoint: codepoint,
+            union_null_is_typed: true,
+            timestamp_is_text: false,
+        }
+    }
+
+    /// The database orders a column as the engine orders its terms only when
+    /// the physical type holds the term's class; a rendered string never.
+    #[test]
+    fn orders_as_needs_the_physical_type_to_hold_the_class() {
+        use FieldType as F;
+        let c = caps(true);
+        assert!(orders_as(&RdfClass::Numeric, Some(F::Int64), &c));
+        assert!(orders_as(
+            &RdfClass::Numeric,
+            Some(F::Decimal {
+                precision: 38,
+                scale: 2
+            }),
+            &c
+        ));
+        assert!(!orders_as(&RdfClass::Numeric, Some(F::String), &c));
+        assert!(!orders_as(&RdfClass::Numeric, None, &c));
+        assert!(orders_as(&RdfClass::Date, Some(F::Date), &c));
+        assert!(!orders_as(&RdfClass::Date, Some(F::String), &c));
+        assert!(orders_as(&RdfClass::DateTime, Some(F::TimestampTz), &c));
+        assert!(!orders_as(&RdfClass::DateTime, Some(F::String), &c));
+        assert!(orders_as(&RdfClass::Bool, Some(F::Boolean), &c));
+        assert!(!orders_as(&RdfClass::Bool, Some(F::Int32), &c));
+        assert!(orders_as(&RdfClass::Str, Some(F::String), &c));
+        assert!(!orders_as(&RdfClass::Str, Some(F::String), &caps(false)));
+        let rendered = RdfClass::Rendered {
+            ty: Some(F::Int64),
+            lang: None,
+            eq_exact: true,
+        };
+        assert!(!orders_as(&rendered, Some(F::Int64), &c));
+    }
 
     /// Equality on a rendered column is the strings' equality where the
     /// rendering is one-to-one and the decode lossless.

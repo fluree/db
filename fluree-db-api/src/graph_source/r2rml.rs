@@ -37,7 +37,7 @@ use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
     ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanTopK,
-    ScanValue, SourceTime,
+    ScanValue, SourceTime, TermOrder,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
@@ -1033,6 +1033,22 @@ fn scan_value_to_literal(
         // member (each member IS a scalar `ScanValue`, so this is unreachable for
         // a well-formed filter; declining defensively is never wrong).
         ScanValue::Set(_) => return None,
+    })
+}
+
+/// The order an Iceberg column's file bounds sort in, as the engine's
+/// [`TermOrder`] they agree with; `None` for a type the scan-side top-k does
+/// not order by (nanosecond timestamps, whose cells hold microseconds, among
+/// them).
+fn bound_order(field_type: Option<&str>) -> Option<TermOrder> {
+    Some(match field_type? {
+        "string" => TermOrder::Lexical,
+        "int" | "long" | "float" | "double" => TermOrder::Numeric,
+        t if t.starts_with("decimal") => TermOrder::Numeric,
+        "date" => TermOrder::Date,
+        "timestamp" | "timestamptz" => TermOrder::Instant,
+        "boolean" => TermOrder::Boolean,
+        _ => return None,
     })
 }
 
@@ -4324,12 +4340,12 @@ impl FlureeR2rmlProvider<'_> {
             // DESC is sound for any column (unbound sorts last). A declined directive
             // simply falls through to the normal parallel scan below (ignoring a
             // top-k is always correct — the `SortOperator` above is authoritative).
-            // A lexical directive orders the cell's rendered string, which only a
-            // string column's bounds order the same way ("10" sorts before "9").
+            // The bounds must sort as the terms do: a string column's "9" bound
+            // sits above its "100", an integer column's 10 above its 9.
             let admitted = schema
                 .field_by_name(&tk.sort_column)
                 .filter(|field| !tk.ascending || field.required)
-                .filter(|field| !tk.lexical || field.type_string() == Some("string"));
+                .filter(|field| bound_order(field.type_string()) == Some(tk.order));
             if let Some(field) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
@@ -5199,6 +5215,29 @@ mod tests {
             &s
         )
         .is_none());
+    }
+
+    /// A scan-side top-k prunes by bounds only when the column's type sorts its
+    /// bounds as the engine sorts the terms.
+    #[test]
+    fn bound_order_by_iceberg_type() {
+        for (ty, order) in [
+            ("string", Some(TermOrder::Lexical)),
+            ("int", Some(TermOrder::Numeric)),
+            ("long", Some(TermOrder::Numeric)),
+            ("double", Some(TermOrder::Numeric)),
+            ("decimal(38,9)", Some(TermOrder::Numeric)),
+            ("date", Some(TermOrder::Date)),
+            ("timestamp", Some(TermOrder::Instant)),
+            ("timestamptz", Some(TermOrder::Instant)),
+            ("boolean", Some(TermOrder::Boolean)),
+            ("timestamp_ns", None),
+            ("binary", None),
+            ("uuid", None),
+        ] {
+            assert_eq!(bound_order(Some(ty)), order, "{ty}");
+        }
+        assert_eq!(bound_order(None), None);
     }
 
     /// A boolean or integer constant is matched loosely by the operator (`"1"`

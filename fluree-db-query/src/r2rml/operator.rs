@@ -667,7 +667,7 @@ impl R2rmlScanOperator {
             sort_column: col.to_string(),
             k,
             ascending,
-            lexical: compares_as_string(&pom.object_map),
+            order: term_order(&pom.object_map)?,
         })
     }
 
@@ -1845,21 +1845,37 @@ impl LiteralEncoder {
     }
 }
 
-/// Whether the engine compares `om`'s terms by a string: an IRI or blank node,
-/// or a literal with no `rr:datatype` (or `xsd:string`), whose value is the
-/// rendered cell (`"10"`, `"-0"`, `"2024-01-01T00:00:00Z"`). A pushdown that
-/// compares the physical column — by its file bounds or a cast comparison —
-/// agrees with that only where the column holds the same strings.
-pub(crate) fn compares_as_string(om: &ObjectMap) -> bool {
-    match om {
-        ObjectMap::Column {
-            term_type: TermType::Iri | TermType::BlankNode,
-            ..
-        } => true,
-        ObjectMap::Column { datatype, .. } => {
-            datatype.as_deref().is_none_or(|dt| dt == xsd::STRING)
-        }
-        _ => false,
+/// The order the engine sorts a plain `rr:column` object map's terms in, from
+/// its term type and datatype; `None` for another kind of map or a datatype
+/// with no order a column's bounds could match.
+pub(crate) fn term_order(om: &ObjectMap) -> Option<crate::r2rml::TermOrder> {
+    use crate::r2rml::TermOrder;
+    let ObjectMap::Column {
+        datatype,
+        language,
+        term_type,
+        ..
+    } = om
+    else {
+        return None;
+    };
+    if *term_type != TermType::Literal || language.is_some() {
+        return Some(TermOrder::Lexical);
+    }
+    match datatype.as_deref() {
+        None | Some(xsd::STRING) => Some(TermOrder::Lexical),
+        Some(dt) if is_xsd_integer_datatype(dt) => Some(TermOrder::Numeric),
+        Some(
+            xsd::NON_POSITIVE_INTEGER
+            | xsd::NEGATIVE_INTEGER
+            | xsd::DECIMAL
+            | xsd::DOUBLE
+            | xsd::FLOAT,
+        ) => Some(TermOrder::Numeric),
+        Some(xsd::DATE) => Some(TermOrder::Date),
+        Some(xsd::DATE_TIME) => Some(TermOrder::Instant),
+        Some(xsd::BOOLEAN) => Some(TermOrder::Boolean),
+        Some(_) => None,
     }
 }
 
@@ -2022,7 +2038,7 @@ pub(crate) fn pattern_scan_filters(
         // FILTER keeps.
         if pd.op == crate::r2rml::ScanCmpOp::NotEq
             && !matches!(pd.value, crate::r2rml::ScanValue::Str(_))
-            && compares_as_string(&pom.object_map)
+            && term_order(&pom.object_map) == Some(crate::r2rml::TermOrder::Lexical)
         {
             continue;
         }
@@ -4090,27 +4106,45 @@ mod tests {
     }
 
     #[test]
-    fn compares_as_string_reads_the_object_map() {
+    fn term_order_reads_the_object_map() {
+        use crate::r2rml::TermOrder;
         use fluree_db_r2rml::mapping::ObjectMap;
-        assert!(compares_as_string(&ObjectMap::column("C")));
-        assert!(compares_as_string(&ObjectMap::column_typed(
-            "C",
-            fluree_vocab::xsd::STRING
-        )));
-        assert!(!compares_as_string(&ObjectMap::column_typed(
-            "C",
-            fluree_vocab::xsd::INTEGER
-        )));
-        assert!(!compares_as_string(&ObjectMap::column_typed(
-            "C",
-            fluree_vocab::xsd::DATE
-        )));
-        assert!(compares_as_string(&ObjectMap::Column {
+        use fluree_vocab::xsd;
+        let typed = |dt: &str| term_order(&ObjectMap::column_typed("C", dt));
+        assert_eq!(
+            term_order(&ObjectMap::column("C")),
+            Some(TermOrder::Lexical)
+        );
+        assert_eq!(typed(xsd::STRING), Some(TermOrder::Lexical));
+        for dt in [
+            xsd::INTEGER,
+            xsd::LONG,
+            xsd::NEGATIVE_INTEGER,
+            xsd::DECIMAL,
+            xsd::DOUBLE,
+            xsd::FLOAT,
+        ] {
+            assert_eq!(typed(dt), Some(TermOrder::Numeric), "{dt}");
+        }
+        assert_eq!(typed(xsd::DATE), Some(TermOrder::Date));
+        assert_eq!(typed(xsd::DATE_TIME), Some(TermOrder::Instant));
+        assert_eq!(typed(xsd::BOOLEAN), Some(TermOrder::Boolean));
+        assert_eq!(typed(xsd::TIME), None);
+        let other = |language: Option<&str>, term_type| ObjectMap::Column {
             column: "C".into(),
             datatype: None,
-            language: None,
-            term_type: TermType::Iri,
-        }));
+            language: language.map(Into::into),
+            term_type,
+        };
+        assert_eq!(
+            term_order(&other(Some("en"), TermType::Literal)),
+            Some(TermOrder::Lexical)
+        );
+        assert_eq!(
+            term_order(&other(None, TermType::Iri)),
+            Some(TermOrder::Lexical)
+        );
+        assert!(term_order(&ObjectMap::template("P-{C}", vec!["C".to_string()])).is_none());
     }
 
     // W4-1 PRIMARY end-to-end: a scalar constant-object member of a same-subject

@@ -155,12 +155,31 @@ pub struct ScanTopK {
     /// `true` for an `ASC` sort (admitted only for a required column; the provider
     /// re-checks nullability), `false` for `DESC`.
     pub ascending: bool,
-    /// `true` when the engine orders the column's rendered string rather than its
-    /// value — an un-annotated or `xsd:string` object map, whose literal is the
-    /// `xsd:string` of the cell (`"10"` sorts before `"9"`). Only a string
-    /// column's bounds order that way, so the provider admits such a directive
-    /// on a string column alone.
-    pub lexical: bool,
+    /// How the engine orders the column's terms. The provider prunes by the
+    /// column's bounds only when the physical type's bounds sort the same way:
+    /// an un-annotated column's `"10"` sorts before `"9"`, which no integer bound
+    /// does, and an `xsd:integer` over a string column's `"9"` bound sits above
+    /// its `"100"`.
+    pub order: TermOrder,
+}
+
+/// The order the engine sorts an object map's terms in, from its datatype. A
+/// datatype with none of these (`xsd:time`, `xsd:gYear`, a custom IRI) is
+/// never offered to a scan as a top-k.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermOrder {
+    /// By code point: an un-annotated or `xsd:string` literal (the rendered
+    /// cell), a language-tagged literal, an IRI.
+    Lexical,
+    /// By number: the `xsd:integer` family, `xsd:decimal`, `xsd:double`,
+    /// `xsd:float`.
+    Numeric,
+    /// `xsd:date`, by day.
+    Date,
+    /// `xsd:dateTime`, by instant.
+    Instant,
+    /// `xsd:boolean`, false before true.
+    Boolean,
 }
 
 /// The table state a time-pinned graph-source query reads, in the source

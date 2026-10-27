@@ -410,7 +410,9 @@ microseconds (`timestamp(6)`, Trino's default `timestamp(3)`). A float renders
 `-0.0` and `0.0` apart where the database groups them, and a `timestamp(9)`
 holds instants a nanosecond apart that decode to one microsecond, so those
 group in the engine. A language-tagged map over such a column follows the same
-rules.
+rules. Conversely, a mapping that declares a numeric, date or boolean
+`rr:datatype` over a text column orders as text in the database ("9" after
+"100"), so its `ORDER BY … LIMIT` and `MIN`/`MAX` stay in the engine.
 
 CI replays every lane case against SQLite, Postgres 16 and MySQL 8 behind
 the bridge, the two servers deliberately running five hours off UTC, and

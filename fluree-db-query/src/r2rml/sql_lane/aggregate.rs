@@ -310,14 +310,9 @@ pub(super) fn group_plan(
                     return Err("MIN/MAX over a subject");
                 };
                 let orderable = match &src.key {
-                    Some(KeyShape::Column { class, .. }) => match class {
-                        RdfClass::Numeric
-                        | RdfClass::Date
-                        | RdfClass::DateTime
-                        | RdfClass::Bool => true,
-                        RdfClass::Str => caps.string_order_is_codepoint,
-                        _ => false,
-                    },
+                    Some(KeyShape::Column { class, .. }) => {
+                        super::lower::orders_as(class, field_type(col), caps)
+                    }
                     _ => false,
                 };
                 if !orderable {
