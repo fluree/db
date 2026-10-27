@@ -1845,6 +1845,22 @@ impl LiteralEncoder {
     }
 }
 
+/// The [`TermOrder`](crate::r2rml::TermOrder) a FILTER literal's own kind
+/// compares in; `None` for a value that is not a scalar literal.
+fn literal_order(value: &crate::r2rml::ScanValue) -> Option<crate::r2rml::TermOrder> {
+    use crate::r2rml::{ScanValue, TermOrder};
+    match value {
+        ScanValue::Str(_) => Some(TermOrder::Lexical),
+        ScanValue::Int(_) | ScanValue::Double(_) | ScanValue::Decimal { .. } => {
+            Some(TermOrder::Numeric)
+        }
+        ScanValue::Date(_) => Some(TermOrder::Date),
+        ScanValue::Timestamp { .. } => Some(TermOrder::Instant),
+        ScanValue::Bool(_) => Some(TermOrder::Boolean),
+        ScanValue::TemplateKey(_) | ScanValue::Set(_) => None,
+    }
+}
+
 /// The order the engine sorts a plain `rr:column` object map's terms in, from
 /// its term type and datatype; `None` for another kind of map or a datatype
 /// with no order a column's bounds could match.
@@ -2032,13 +2048,14 @@ pub(crate) fn pattern_scan_filters(
         let Some(col) = value_pushdown_column(&pom.object_map) else {
             continue;
         };
-        // A string term never equals a non-string literal (equality does not
-        // coerce), so `!=` holds on every row, and the physical comparison
-        // (`i32 != 10` for an un-annotated column's `"10"`) would prune rows the
-        // FILTER keeps.
+        // Defensive, unreachable today: `rewrite::cmp_op` pushes no `!=`. A term
+        // never equals a literal of another kind (equality does not coerce: an
+        // un-annotated column's "10" is not 10, an `xsd:integer` term is not
+        // "10"), so `!=` holds on every row, and the physical comparison
+        // (`i32 != 10`, or `text != '10'` under an `xsd:integer` map) would
+        // prune rows the FILTER keeps.
         if pd.op == crate::r2rml::ScanCmpOp::NotEq
-            && !matches!(pd.value, crate::r2rml::ScanValue::Str(_))
-            && term_order(&pom.object_map) == Some(crate::r2rml::TermOrder::Lexical)
+            && literal_order(&pd.value) != term_order(&pom.object_map)
         {
             continue;
         }
@@ -4051,12 +4068,12 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// An un-annotated column's term is the string of its cell, which never
-    /// equals a non-string literal: `FILTER(?v != 10)` keeps every row, so the
-    /// physical `!=` must not push. A string literal, or a typed column, still
-    /// pushes `!=`.
+    /// A term never equals a literal of another kind, so `FILTER(?v != 10)` over
+    /// an un-annotated column, or `!= "10"` over an `xsd:integer` one, keeps every
+    /// row and its physical `!=` must not push. (Defensive: the rewrite pushes no
+    /// `!=` today, so only this test reaches the gate.)
     #[test]
-    fn not_equal_to_a_typed_literal_stays_off_a_string_term() {
+    fn not_equal_pushes_only_between_terms_and_literals_of_one_kind() {
         use crate::r2rml::{ScanCmpOp, ScanValue};
         use crate::seed::EmptyOperator;
 
@@ -4066,6 +4083,10 @@ mod tests {
             .with_predicate_object(PredicateObjectMap {
                 predicate_map: PredicateMap::constant("http://ex/typed"),
                 object_map: ObjectMap::column_typed("TYPED", fluree_vocab::xsd::INTEGER),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/time"),
+                object_map: ObjectMap::column_typed("TIME", fluree_vocab::xsd::TIME),
             });
         let pushed = |pred: &str, op: ScanCmpOp, value: ScanValue| {
             let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
@@ -4079,6 +4100,8 @@ mod tests {
                 .build_scan_filters(&tm)
                 .len()
         };
+        let str10 = || ScanValue::Str("10".into());
+        // A string term and a typed literal, either way round: `!=` keeps every row.
         assert_eq!(
             pushed("http://ex/plain", ScanCmpOp::NotEq, ScanValue::Int(10)),
             0
@@ -4087,20 +4110,25 @@ mod tests {
             pushed("http://ex/plain", ScanCmpOp::NotEq, ScanValue::Bool(true)),
             0
         );
+        assert_eq!(pushed("http://ex/typed", ScanCmpOp::NotEq, str10()), 0);
         assert_eq!(
-            pushed(
-                "http://ex/plain",
-                ScanCmpOp::NotEq,
-                ScanValue::Str("10".into())
-            ),
+            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Bool(true)),
+            0
+        );
+        // A datatype with no order class never pushes `!=`.
+        assert_eq!(pushed("http://ex/time", ScanCmpOp::NotEq, str10()), 0);
+        // Matching kinds still push, and other operators are untouched.
+        assert_eq!(pushed("http://ex/plain", ScanCmpOp::NotEq, str10()), 1);
+        assert_eq!(
+            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Int(10)),
+            1
+        );
+        assert_eq!(
+            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Double(10.0)),
             1
         );
         assert_eq!(
             pushed("http://ex/plain", ScanCmpOp::Lt, ScanValue::Int(10)),
-            1
-        );
-        assert_eq!(
-            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Int(10)),
             1
         );
     }
