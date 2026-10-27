@@ -1020,10 +1020,9 @@ pub(crate) fn storage_query_error(
             region,
             message: query_safe_denial(context, message),
         },
-        // §2's fail-closed error, raised inside a deferred `LazyS3Storage` build and
-        // ferried out through the builder's `IcebergError` channel. Lift it back so
-        // the 403 + `err:catalog/CredentialsNotVended` wire code survives the lazy
-        // path exactly as it does the eager one.
+        // §2's fail-closed error, raised by the storage step on the eager path
+        // and inside a deferred `LazyS3Storage` build alike: the 403 +
+        // `err:catalog/CredentialsNotVended` wire code either way.
         fluree_db_iceberg::IcebergError::CatalogCredentialsNotVended { catalog_uri } => {
             fluree_db_query::QueryError::CatalogCredentialsNotVended { catalog_uri }
         }
@@ -1038,6 +1037,19 @@ pub(crate) fn storage_query_error(
             Err(other) => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
         },
     }
+}
+
+/// Whether [`storage_query_error`] reports `err` as a typed error of its own
+/// (a refusal with its status and wire code) rather than an internal one. The
+/// same arms, without rendering anything.
+pub(crate) fn is_typed_storage_error(err: &fluree_db_iceberg::IcebergError) -> bool {
+    use fluree_db_iceberg::IcebergError as E;
+    matches!(
+        err,
+        E::StorageAccessDenied { .. }
+            | E::CatalogCredentialsNotVended { .. }
+            | E::CatalogAccessDenied { .. }
+    ) || identity_query_error(err.clone()).is_ok()
 }
 
 /// The reason a storage or catalog denial gives a QUERY client. AWS phrases a

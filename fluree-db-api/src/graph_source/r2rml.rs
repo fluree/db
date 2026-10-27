@@ -3040,13 +3040,25 @@ async fn session_storage(
     plan: &StoragePlan,
     grant: &CatalogGrant,
 ) -> QueryResult<Arc<IcebergStorageBackend>> {
+    session_storage_inner(session, lt_key, plan, grant)
+        .await
+        .map_err(step_query_error)
+}
+
+/// [`session_storage`], failing with the store's own error.
+async fn session_storage_inner(
+    session: &super::catalog_session::IcebergCatalogSession,
+    lt_key: &str,
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
+) -> StepResult<Arc<IcebergStorageBackend>> {
     plan.check_grant(grant)
-        .map_err(|e| storage_query_error("Failed to create storage", e))?;
+        .map_err(|e| ("Failed to create storage", e))?;
     if let Some(cached) = session.cached_storage(lt_key) {
         debug!("storage client reused (query-scoped)");
         return Ok(cached);
     }
-    let built = fresh_storage(plan, grant).await?;
+    let built = fresh_storage_inner(plan, grant).await?;
     session.store_storage(lt_key.to_string(), Arc::clone(&built));
     Ok(built)
 }
@@ -3060,11 +3072,35 @@ async fn fresh_storage(
     plan: &StoragePlan,
     grant: &CatalogGrant,
 ) -> QueryResult<Arc<IcebergStorageBackend>> {
+    fresh_storage_inner(plan, grant)
+        .await
+        .map_err(step_query_error)
+}
+
+/// [`fresh_storage`], failing with the store's own error.
+async fn fresh_storage_inner(
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
+) -> StepResult<Arc<IcebergStorageBackend>> {
     let resolved = plan
         .build(grant)
         .await
-        .map_err(|e| storage_query_error("Failed to create storage", e))?;
+        .map_err(|e| ("Failed to create storage", e))?;
     Ok(Arc::new(resolved.backend))
+}
+
+/// A storage step's failure before it is a query's: the step, as the eager
+/// arm names it, and the store's own error. The eager arm converts it once,
+/// at its edge ([`step_query_error`]). The deferred [`LazyS3Storage`] builder
+/// hands the error itself to the read that forced it, which converts it as it
+/// converts any store error: there is no conversion back from a
+/// [`QueryError`] to flatten a typed refusal on the way.
+type StepError = (&'static str, IcebergError);
+type StepResult<T> = std::result::Result<T, StepError>;
+
+/// The query error a failed storage step reports on the eager arm.
+fn step_query_error((context, error): StepError) -> QueryError {
+    storage_query_error(context, error)
 }
 
 /// The storage plan for a read of `location` by the source `config`, under
@@ -3082,72 +3118,6 @@ async fn plan_for(
     )
     .await
     .map_err(|e| storage_query_error("Failed to decide storage", e))
-}
-
-/// Carry a [`QueryError`] through a deferred [`LazyS3Storage`] builder, whose
-/// `Result` channel is `IcebergError`-typed, without losing its type:
-/// [`storage_query_error`] lifts these variants straight back to their
-/// `QueryError` counterparts, so a lazy-forced build reports the same status and
-/// wire code (`err:storage/AccessDenied`, `err:catalog/CredentialsNotVended`,
-/// `err:catalog/AccessDenied`, `err:catalog/QuotaProjectRequired`, and the
-/// `err:auth/*` identity codes) as the eager path. A blanket `to_string()` here
-/// would flatten them into an opaque string and put hosts back to regex-guessing.
-fn builder_channel_error(error: QueryError) -> IcebergError {
-    match error {
-        QueryError::StorageAccessDenied {
-            scheme,
-            bucket,
-            key,
-            region,
-            message,
-        } => IcebergError::StorageAccessDenied {
-            scheme,
-            bucket,
-            key,
-            region,
-            message,
-        },
-        QueryError::CatalogCredentialsNotVended { catalog_uri } => {
-            IcebergError::CatalogCredentialsNotVended { catalog_uri }
-        }
-        QueryError::CatalogAccessDenied { table, message } => {
-            IcebergError::CatalogAccessDenied { table, message }
-        }
-        QueryError::CatalogQuotaProjectRequired { table, .. } => {
-            IcebergError::CatalogQuotaProjectRequired { table }
-        }
-        QueryError::GoogleCredentialsInvalid(detail) => {
-            IcebergError::GoogleCredentialsInvalid(detail)
-        }
-        QueryError::GoogleTokenExchange {
-            stage,
-            status,
-            reason,
-            message,
-        } => match fluree_db_iceberg::GoogleTokenStage::from_name(&stage) {
-            Some(stage) => IcebergError::GoogleTokenExchange {
-                stage,
-                status,
-                reason,
-            },
-            None => IcebergError::Catalog(message),
-        },
-        QueryError::HostIdentityRefused { kind, message } => {
-            match fluree_db_iceberg::HostIdentityKind::from_name(&kind) {
-                Some(kind) => IcebergError::HostIdentityRefused { kind },
-                None => IcebergError::Catalog(message),
-            }
-        }
-        QueryError::GoogleTokenHostRefused {
-            kind,
-            host,
-            message,
-        } => match fluree_db_iceberg::HostIdentityKind::from_name(&kind) {
-            Some(kind) => IcebergError::GoogleTokenHostRefused { kind, host },
-            None => IcebergError::Catalog(message),
-        },
-        other => IcebergError::Catalog(other.to_string()),
-    }
 }
 
 /// The lower bound a cached pointer's current snapshot must meet to answer
@@ -3205,6 +3175,62 @@ fn read_schema<'m>(
     Some(Cow::Owned(schema))
 }
 
+/// The deferred builder of a table's store on the pointer rung: the same
+/// session-pin ladder as the eager arm ([`resolve_catalog_load_and_storage`]),
+/// run by the first read that misses every cache. A typed refusal is the
+/// store's own [`IcebergError`], unconverted (see [`StepError`]), so the read
+/// reports the same type, status and wire code the eager arm would; any other
+/// failure keeps its message and gains the step's name.
+#[allow(clippy::too_many_arguments)] // the owned captures of a `'static` builder
+fn deferred_storage_builder(
+    catalog: Arc<dyn SendCatalogClient>,
+    catalog_vends: bool,
+    cache: Arc<R2rmlCache>,
+    session: Arc<super::catalog_session::IcebergCatalogSession>,
+    table_id: TableIdentifier,
+    io: IoConfig,
+    lt_key: String,
+    xq_key: String,
+    plan: StoragePlan,
+    loc: String,
+) -> super::lazy_storage::StorageBuilder<'static, IcebergStorageBackend> {
+    Arc::new(move || {
+        let catalog = Arc::clone(&catalog);
+        let cache = Arc::clone(&cache);
+        let session = Arc::clone(&session);
+        let io = io.clone();
+        let table_id = table_id.clone();
+        let lt_key = lt_key.clone();
+        let xq_key = xq_key.clone();
+        let plan = plan.clone();
+        let loc = loc.clone();
+        Box::pin(async move {
+            let built = if catalog_vends {
+                resolve_catalog_load_and_storage(
+                    catalog, cache, session, table_id, io, lt_key, xq_key, plan,
+                )
+                .await
+                .map(|(storage, _)| storage)
+            } else {
+                // A catalog that never vends (Glue, S3 Tables) grants nothing
+                // beyond the location, and the pointer already pinned this
+                // snapshot: a forced build needs no catalog call at all.
+                session_storage_inner(&session, &lt_key, &plan, &CatalogGrant::unvended(loc)).await
+            };
+            built.map_err(|(step, error)| {
+                if super::iceberg_catalog::is_typed_storage_error(&error) {
+                    error
+                } else {
+                    // Not a refusal of its own, so the read reports it as an
+                    // internal error: name the step that failed in it, as the
+                    // eager arm's message does.
+                    IcebergError::Storage(format!("{step}: {error}"))
+                }
+            })
+        })
+    })
+}
+
 /// Resolve `loadTable` (the catalog call — REST GET, Glue `GetTable`, or S3 Tables
 /// `GetTableMetadataLocation` — honoring the query pin + the cross-query cache) and
 /// build the S3 storage — the SAME session-pin path the eager scan used before the
@@ -3231,7 +3257,7 @@ async fn resolve_catalog_load_and_storage(
     lt_key: String,
     cross_query_key: String,
     plan: StoragePlan,
-) -> QueryResult<(Arc<IcebergStorageBackend>, LoadTableResponse)> {
+) -> StepResult<(Arc<IcebergStorageBackend>, LoadTableResponse)> {
     // (1) Resolve the loadTable response, cheapest first: the per-query pin, then
     // the cross-query cache (skips the ~1–3s GET), then a real catalog load.
     let load_response = if let Some(cached) = session.cached_load_table(&lt_key) {
@@ -3256,7 +3282,7 @@ async fn resolve_catalog_load_and_storage(
                     table = %table_id.table,
                 ))
                 .await
-                .map_err(|e| storage_query_error("Failed to load table from catalog", e))?;
+                .map_err(|e| ("Failed to load table from catalog", e))?;
             cache.put_rest_load_table(
                 cross_query_key.clone(),
                 Arc::new(super::catalog_session::CachedLoadTable::from_response(
@@ -3282,7 +3308,7 @@ async fn resolve_catalog_load_and_storage(
     // §2 fail-closed and session reuse included, shared verbatim with the eager
     // arm.
     let grant = CatalogGrant::from_load(&load_response, Some((&catalog, &table_id)));
-    let storage = session_storage(&session, &lt_key, &plan, &grant).await?;
+    let storage = session_storage_inner(&session, &lt_key, &plan, &grant).await?;
 
     Ok((storage, load_response))
 }
@@ -3667,54 +3693,19 @@ impl FlureeR2rmlProvider<'_> {
                     .expect("a non-Direct source has a catalog client");
                     // Owned captures for the `'static` deferred builder (the
                     // provider's `fluree: &'a` borrow can't cross the Parquet
-                    // `tokio::spawn`). The builder runs the SAME session-pin ladder
-                    // as the eager path (`resolve_catalog_load_and_storage`), deferred.
-                    let cache = Arc::clone(self.fluree.r2rml_cache());
-                    let session = Arc::clone(&self.session);
-                    let io = storage_io.clone();
-                    let table_id = table_id.clone();
-                    let lt_key_b = lt_key.clone();
-                    let xq_key_b = xq_key.clone();
-                    let plan_b = plan.clone();
-                    let loc_b = loc.clone();
-                    let builder: super::lazy_storage::StorageBuilder<
-                        'static,
-                        IcebergStorageBackend,
-                    > = Arc::new(move || {
-                        let catalog = Arc::clone(&catalog);
-                        let cache = Arc::clone(&cache);
-                        let session = Arc::clone(&session);
-                        let io = io.clone();
-                        let table_id = table_id.clone();
-                        let lt_key = lt_key_b.clone();
-                        let xq_key = xq_key_b.clone();
-                        let plan = plan_b.clone();
-                        let loc = loc_b.clone();
-                        Box::pin(async move {
-                            let built = if catalog_vends {
-                                resolve_catalog_load_and_storage(
-                                    catalog, cache, session, table_id, io, lt_key, xq_key, plan,
-                                )
-                                .await
-                                .map(|(storage, _)| storage)
-                            } else {
-                                // A catalog that never vends (Glue, S3 Tables)
-                                // grants nothing beyond the location, and the
-                                // pointer above already pinned this snapshot: a
-                                // forced build needs no catalog call at all.
-                                session_storage(
-                                    &session,
-                                    &lt_key,
-                                    &plan,
-                                    &CatalogGrant::unvended(loc),
-                                )
-                                .await
-                            };
-                            // Preserve the TYPED errors across the builder's
-                            // `IcebergError` channel (see `builder_channel_error`).
-                            built.map_err(builder_channel_error)
-                        })
-                    });
+                    // `tokio::spawn`).
+                    let builder = deferred_storage_builder(
+                        catalog,
+                        catalog_vends,
+                        Arc::clone(self.fluree.r2rml_cache()),
+                        Arc::clone(&self.session),
+                        table_id.clone(),
+                        storage_io.clone(),
+                        lt_key.clone(),
+                        xq_key.clone(),
+                        plan.clone(),
+                        loc.clone(),
+                    );
                     return Ok(TableContext {
                         storage: Arc::new(LazyS3Storage::deferred(builder)),
                         metadata: md,
@@ -5769,82 +5760,191 @@ mod tests {
             .expect("a non-vending catalog reads with the ambient chain");
     }
 
-    /// §5 across the deferred builder's `IcebergError` channel: the typed errors must
-    /// round-trip back to their `QueryError` counterparts (and thus their 403 wire
-    /// codes) instead of being flattened to an opaque string by a blanket
-    /// `to_string()`. Mirrors the `map_err` the `LazyS3Storage` builder applies.
-    #[test]
-    fn typed_storage_errors_survive_the_lazy_builder_channel() {
-        let ferry = |e: QueryError| {
-            super::super::iceberg_catalog::storage_query_error("ctx", builder_channel_error(e))
-        };
+    /// A catalog whose `loadTable` fails with `error`.
+    #[derive(Debug)]
+    struct RefusingCatalog(IcebergError);
 
-        match ferry(QueryError::StorageAccessDenied {
-            scheme: "s3",
-            bucket: "b".to_string(),
-            key: "k".to_string(),
-            region: Some("us-east-2".to_string()),
-            message: "AccessDenied ... no identity-based policy allows".to_string(),
-        }) {
-            QueryError::StorageAccessDenied { bucket, key, .. } => {
-                assert_eq!((bucket.as_str(), key.as_str()), ("b", "k"));
-            }
-            other => panic!("StorageAccessDenied must survive the builder: {other:?}"),
+    #[async_trait]
+    impl SendCatalogClient for RefusingCatalog {
+        async fn list_namespaces(&self) -> fluree_db_iceberg::Result<Vec<String>> {
+            Ok(Vec::new())
         }
-
-        match ferry(QueryError::CatalogCredentialsNotVended {
-            catalog_uri: "https://cat.example/v1".to_string(),
-        }) {
-            QueryError::CatalogCredentialsNotVended { catalog_uri } => {
-                assert_eq!(catalog_uri, "https://cat.example/v1");
-            }
-            other => panic!("CatalogCredentialsNotVended must survive the builder: {other:?}"),
+        async fn list_tables(&self, _namespace: &str) -> fluree_db_iceberg::Result<Vec<String>> {
+            Ok(Vec::new())
         }
-
-        match ferry(QueryError::CatalogAccessDenied {
-            table: "Glue table demo.orders".to_string(),
-            message: "Glue GetTable: AccessDeniedException".to_string(),
-        }) {
-            QueryError::CatalogAccessDenied { table, .. } => {
-                assert_eq!(table, "Glue table demo.orders");
-            }
-            other => panic!("CatalogAccessDenied must survive the builder: {other:?}"),
+        async fn load_table(
+            &self,
+            _table_id: &TableIdentifier,
+            _request_credentials: bool,
+        ) -> fluree_db_iceberg::Result<LoadTableResponse> {
+            Err(self.0.clone())
         }
+    }
 
-        // The graph-source identity errors, each as the eager path types it.
-        let typed = |e: IcebergError| {
-            super::super::iceberg_catalog::identity_query_error(e).expect("an identity error")
-        };
-        let identity_errors = || {
-            [
-                IcebergError::GoogleTokenExchange {
-                    stage: fluree_db_iceberg::GoogleTokenStage::Impersonation,
-                    status: Some(403),
-                    reason: Some("PERMISSION_DENIED".to_string()),
-                },
-                IcebergError::GoogleCredentialsInvalid(
-                    "external_account.config.token_url".to_string(),
-                ),
-                IcebergError::HostIdentityRefused {
-                    kind: fluree_db_iceberg::HostIdentityKind::GoogleApplicationDefault,
-                },
-                IcebergError::CatalogQuotaProjectRequired {
-                    table: "db.events".to_string(),
-                },
-                IcebergError::GoogleTokenHostRefused {
-                    kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
-                    host: "attacker.example".to_string(),
-                },
-            ]
-        };
-        for (error, again) in identity_errors().into_iter().zip(identity_errors()) {
-            let eager = typed(error);
-            let lazy = ferry(typed(again));
-            assert_eq!(
-                format!("{lazy:?}"),
-                format!("{eager:?}"),
-                "an identity error must survive the builder unchanged"
+    /// Every typed refusal a storage step can raise, as the store raises it.
+    fn typed_storage_refusals() -> Vec<IcebergError> {
+        use fluree_db_iceberg::HostIdentityKind as K;
+        vec![
+            IcebergError::StorageAccessDenied {
+                scheme: "s3",
+                bucket: "lake".to_string(),
+                key: "wh/t/data/f.parquet".to_string(),
+                region: Some("us-east-2".to_string()),
+                message: "AccessDenied ... no identity-based policy allows".to_string(),
+            },
+            IcebergError::StorageAccessDenied {
+                scheme: "gs",
+                bucket: "lake".to_string(),
+                key: "wh/t/data/f.parquet".to_string(),
+                region: None,
+                message: "403 Forbidden".to_string(),
+            },
+            IcebergError::CatalogCredentialsNotVended {
+                catalog_uri: "https://cat.example/v1".to_string(),
+            },
+            IcebergError::CatalogAccessDenied {
+                table: "Glue table demo.orders".to_string(),
+                message: "Glue GetTable: AccessDeniedException".to_string(),
+            },
+            IcebergError::CatalogQuotaProjectRequired {
+                table: "db.events".to_string(),
+            },
+            IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Impersonation,
+                status: Some(403),
+                reason: Some("PERMISSION_DENIED".to_string()),
+            },
+            IcebergError::GoogleCredentialsInvalid("external_account.config.token_url".to_string()),
+            IcebergError::HostIdentityRefused {
+                kind: K::GoogleApplicationDefault,
+            },
+            IcebergError::GoogleTokenHostRefused {
+                kind: K::GoogleMetadata,
+                host: "attacker.example".to_string(),
+            },
+            IcebergError::AmbientBucketRefused {
+                bucket: "stack-internal".to_string(),
+            },
+            IcebergError::AmbientEndpointRefused {
+                endpoint: "https://stack-internal.s3.us-east-1.amazonaws.com".to_string(),
+            },
+            IcebergError::SchemeNotServed {
+                path: "gs://lake/wh/t/data/f.parquet".to_string(),
+                scheme: "gs".to_string(),
+                identity: "the host's ambient AWS identity".to_string(),
+                served: "s3:// and s3a://".to_string(),
+            },
+            IcebergError::LocalLocationFromCatalog {
+                location: "file:///etc/wh/t/metadata/v1.metadata.json".to_string(),
+            },
+        ]
+    }
+
+    /// The deferred builder hands the read that forced it the store's own
+    /// error, so a lazy read reports every typed refusal exactly as the eager
+    /// arm does: the same message, wire code and status. Run through the real
+    /// builder and `LazyS3Storage`, from both of its failure points (the
+    /// catalog's `loadTable`, and the storage step when the catalog vends
+    /// nothing), and converted where a scan converts a read's error.
+    #[tokio::test]
+    async fn every_typed_refusal_reads_the_same_on_the_lazy_path_as_the_eager() {
+        let loc = "s3://lake/wh/t/metadata/v1.metadata.json";
+        let io = IoConfig::default();
+        let plan = rest_plan("https://cat.example/v1", &io, loc).await;
+        let lazy_read = |catalog: Arc<dyn SendCatalogClient>, catalog_vends: bool| {
+            let builder = deferred_storage_builder(
+                catalog,
+                catalog_vends,
+                Arc::new(R2rmlCache::new(4, 4)),
+                Arc::new(super::super::catalog_session::IcebergCatalogSession::default()),
+                TableIdentifier::new("ns", "t"),
+                io.clone(),
+                "lt".to_string(),
+                "xq".to_string(),
+                plan.clone(),
+                loc.to_string(),
             );
+            async move {
+                let storage = LazyS3Storage::deferred(builder);
+                let error = SendIcebergStorage::read(&storage, "s3://lake/wh/t/data/f.parquet")
+                    .await
+                    .expect_err("the build fails");
+                storage_query_error("Failed to read Parquet file 'f.parquet'", error)
+            }
+        };
+        let shown = |error: QueryError| {
+            let api = crate::ApiError::Query(error);
+            (api.to_string(), api.error_type(), api.status_code())
+        };
+
+        let mut cases: Vec<(IcebergError, QueryError)> = Vec::new();
+        for refusal in typed_storage_refusals() {
+            let lazy = lazy_read(Arc::new(RefusingCatalog(refusal.clone())), true).await;
+            cases.push((refusal, lazy));
+        }
+        // A catalog that never vends, read by a plan that needs vended
+        // credentials: the storage step itself refuses.
+        let never_vends = lazy_read(
+            Arc::new(RefusingCatalog(IcebergError::Catalog("unused".to_string()))),
+            false,
+        )
+        .await;
+        cases.push((
+            IcebergError::CatalogCredentialsNotVended {
+                catalog_uri: "https://cat.example/v1".to_string(),
+            },
+            never_vends,
+        ));
+
+        // An error of no type of its own is internal on both paths, and the
+        // lazy one still names the step that failed.
+        let unreachable = IcebergError::Http("connection refused".to_string());
+        let (message, _, status) =
+            shown(lazy_read(Arc::new(RefusingCatalog(unreachable.clone())), true).await);
+        assert_eq!(status, 500);
+        assert!(
+            message.contains("Failed to load table from catalog"),
+            "{message}"
+        );
+        assert!(message.contains("connection refused"), "{message}");
+        assert!(!super::super::iceberg_catalog::is_typed_storage_error(
+            &unreachable
+        ));
+
+        for (refusal, lazy) in cases {
+            assert!(
+                super::super::iceberg_catalog::is_typed_storage_error(&refusal),
+                "{refusal:?}"
+            );
+            let what = format!("{refusal:?}");
+            let eager = shown(storage_query_error(
+                "Failed to load table from catalog",
+                refusal,
+            ));
+            let lazy = shown(lazy);
+            assert_eq!(lazy, eager, "{what}");
+            assert_ne!(lazy.2, 500, "{what} was flattened to an internal error");
+        }
+        // The ambient-AWS restrictions name what they refused.
+        for (refusal, named) in [
+            (
+                IcebergError::AmbientBucketRefused {
+                    bucket: "stack-internal".to_string(),
+                },
+                "stack-internal",
+            ),
+            (
+                IcebergError::AmbientEndpointRefused {
+                    endpoint: "https://stack-internal.s3.us-east-1.amazonaws.com".to_string(),
+                },
+                "https://stack-internal.s3.us-east-1.amazonaws.com",
+            ),
+        ] {
+            let (message, code, status) =
+                shown(lazy_read(Arc::new(RefusingCatalog(refusal)), true).await);
+            assert!(message.contains(named), "{message}");
+            assert_eq!(code, fluree_vocab::errors::HOST_IDENTITY_REFUSED);
+            assert_eq!(status, 403);
         }
     }
 
