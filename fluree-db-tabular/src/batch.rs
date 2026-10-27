@@ -54,6 +54,11 @@ pub struct BatchSchema {
     field_id_to_index: HashMap<i32, usize>,
     /// Convenience lookup by name (debug/UX).
     name_to_index: HashMap<String, usize>,
+    /// Fractional-second digits a temporal field holds at its source, by field
+    /// id, where the source reports them (`timestamp(3)`). A `Column` keeps
+    /// microseconds, so a field with more digits decodes distinct source
+    /// values to one cell.
+    fractional_digits: HashMap<i32, u8>,
 }
 
 impl BatchSchema {
@@ -74,7 +79,23 @@ impl BatchSchema {
             fields,
             field_id_to_index,
             name_to_index,
+            fractional_digits: HashMap::new(),
         }
+    }
+
+    /// The schema with the source-reported fractional-second digits of its
+    /// temporal fields, as `(field_id, digits)`.
+    #[must_use]
+    pub fn with_fractional_digits(mut self, digits: impl IntoIterator<Item = (i32, u8)>) -> Self {
+        self.fractional_digits.extend(digits);
+        self
+    }
+
+    /// The fractional-second digits the source reported for the named field,
+    /// if it reported any.
+    pub fn fractional_digits(&self, name: &str) -> Option<u8> {
+        let field = self.field_by_name(name)?;
+        self.fractional_digits.get(&field.field_id).copied()
     }
 
     /// Get field index by field_id (canonical).

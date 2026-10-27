@@ -399,6 +399,23 @@ points, instants) and declines rather than approximate:
   DECIMAL columns at the scale it was started with (`--decimal-scale`,
   default 6), and SQLite's `NUMERIC` is a double.
 
+**An un-annotated column the database does not hold as text** — a `bigint`,
+`double`, `decimal`, `date`, `timestamp` or `varbinary` mapped with no
+`rr:datatype` — reads as the `xsd:string` of its rendered value (`10`, `-0`,
+`0.050000000`, `2024-01-01T00:00:00Z`, hex bytes), so it sorts as text (`"10"`
+before `"9"`) where the database sorts the column by value. The lane pushes no
+`ORDER BY … LIMIT`, `MIN`/`MAX` or comparison of such a column, and pushes a
+`GROUP BY`, `SELECT DISTINCT`, `COUNT(DISTINCT …)` or join on it only where the
+database's `=` is the strings' equality: integers, decimals of one scale,
+booleans, dates, bytes, and timestamps the endpoint declares to at most
+microseconds (`timestamp(6)`, Trino's default `timestamp(3)`). A float renders
+`-0.0` and `0.0` apart where the database groups them, and a `timestamp(9)`
+holds instants a nanosecond apart that decode to one microsecond, so those
+group in the engine. A language-tagged map over such a column follows the same
+rules. Conversely, a mapping that declares a numeric, date or boolean
+`rr:datatype` over a text column orders as text in the database ("9" after
+"100"), so its `ORDER BY … LIMIT` and `MIN`/`MAX` stay in the engine.
+
 CI replays every lane case against SQLite, Postgres 16 and MySQL 8 behind
 the bridge, the two servers deliberately running five hours off UTC, and
 pins both the rows and which of these forms each statement took.

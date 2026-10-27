@@ -44,7 +44,7 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_r2rml::mapping::{
     extract_template_columns, CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, RefObjectMap,
-    TriplesMap,
+    TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{
     canonical_join, expand_template, get_join_key_from_batch, materialize_object_from_batch,
@@ -667,6 +667,7 @@ impl R2rmlScanOperator {
             sort_column: col.to_string(),
             k,
             ascending,
+            order: term_order(&pom.object_map)?,
         })
     }
 
@@ -1844,6 +1845,56 @@ impl LiteralEncoder {
     }
 }
 
+/// The [`TermOrder`](crate::r2rml::TermOrder) a FILTER literal's own kind
+/// compares in; `None` for a value that is not a scalar literal.
+fn literal_order(value: &crate::r2rml::ScanValue) -> Option<crate::r2rml::TermOrder> {
+    use crate::r2rml::{ScanValue, TermOrder};
+    match value {
+        ScanValue::Str(_) => Some(TermOrder::Lexical),
+        ScanValue::Int(_) | ScanValue::Double(_) | ScanValue::Decimal { .. } => {
+            Some(TermOrder::Numeric)
+        }
+        ScanValue::Date(_) => Some(TermOrder::Date),
+        ScanValue::Timestamp { .. } => Some(TermOrder::Instant),
+        ScanValue::Bool(_) => Some(TermOrder::Boolean),
+        ScanValue::TemplateKey(_) | ScanValue::Set(_) => None,
+    }
+}
+
+/// The order the engine sorts a plain `rr:column` object map's terms in, from
+/// its term type and datatype; `None` for another kind of map or a datatype
+/// with no order a column's bounds could match.
+pub(crate) fn term_order(om: &ObjectMap) -> Option<crate::r2rml::TermOrder> {
+    use crate::r2rml::TermOrder;
+    let ObjectMap::Column {
+        datatype,
+        language,
+        term_type,
+        ..
+    } = om
+    else {
+        return None;
+    };
+    if *term_type != TermType::Literal || language.is_some() {
+        return Some(TermOrder::Lexical);
+    }
+    match datatype.as_deref() {
+        None | Some(xsd::STRING) => Some(TermOrder::Lexical),
+        Some(dt) if is_xsd_integer_datatype(dt) => Some(TermOrder::Numeric),
+        Some(
+            xsd::NON_POSITIVE_INTEGER
+            | xsd::NEGATIVE_INTEGER
+            | xsd::DECIMAL
+            | xsd::DOUBLE
+            | xsd::FLOAT,
+        ) => Some(TermOrder::Numeric),
+        Some(xsd::DATE) => Some(TermOrder::Date),
+        Some(xsd::DATE_TIME) => Some(TermOrder::Instant),
+        Some(xsd::BOOLEAN) => Some(TermOrder::Boolean),
+        Some(_) => None,
+    }
+}
+
 /// The backing column of an object map whose materialized literal value is the
 /// raw column value *verbatim*, so a column-level scan filter comparing that
 /// value cannot drop a row the operator would keep. Only plain `rr:column`
@@ -1925,8 +1976,8 @@ fn is_xsd_integer_datatype(iri: &str) -> bool {
 /// rows. Non-canonical forms (`"01"`, `"1.0"`, a non-numeric string) are ambiguous
 /// and DECLINED. A value already carrying a pushable, residual-matched type
 /// (`Int`/`Bool`/`Date`) pushes as-is; a string against any non-integer column
-/// pushes as-is too — a string column prunes lexicographically, and the reader
-/// safely ignores a string filter on a numeric physical column (pre-existing).
+/// pushes as-is too — the provider applies a string only to a string column, or
+/// by equality to a cell that renders as exactly that string.
 fn coerce_scalar_for_pushdown(
     value: &crate::r2rml::ScanValue,
     om: &ObjectMap,
@@ -1997,6 +2048,17 @@ pub(crate) fn pattern_scan_filters(
         let Some(col) = value_pushdown_column(&pom.object_map) else {
             continue;
         };
+        // Defensive, unreachable today: `rewrite::cmp_op` pushes no `!=`. A term
+        // never equals a literal of another kind (equality does not coerce: an
+        // un-annotated column's "10" is not 10, an `xsd:integer` term is not
+        // "10"), so `!=` holds on every row, and the physical comparison
+        // (`i32 != 10`, or `text != '10'` under an `xsd:integer` map) would
+        // prune rows the FILTER keeps.
+        if pd.op == crate::r2rml::ScanCmpOp::NotEq
+            && literal_order(&pd.value) != term_order(&pom.object_map)
+        {
+            continue;
+        }
         out.push(crate::r2rml::ScanFilter {
             column: col.to_string(),
             op: pd.op,
@@ -4002,6 +4064,113 @@ mod tests {
             &ScanValue::Str("1".into()),
         );
         assert!(out.is_empty());
+    }
+
+    /// A term never equals a literal of another kind, so `FILTER(?v != 10)` over
+    /// an un-annotated column, or `!= "10"` over an `xsd:integer` one, keeps every
+    /// row and its physical `!=` must not push. (Defensive: the rewrite pushes no
+    /// `!=` today, so only this test reaches the gate.)
+    #[test]
+    fn not_equal_pushes_only_between_terms_and_literals_of_one_kind() {
+        use crate::r2rml::{ScanCmpOp, ScanValue};
+        use crate::seed::EmptyOperator;
+
+        let tm = TriplesMap::new("#Cell", "CELLS")
+            .with_subject_template("http://ex/cell/{ID}")
+            .with_predicate_object(pom("http://ex/plain", "PLAIN"))
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/typed"),
+                object_map: ObjectMap::column_typed("TYPED", fluree_vocab::xsd::INTEGER),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/time"),
+                object_map: ObjectMap::column_typed("TIME", fluree_vocab::xsd::TIME),
+            });
+        let pushed = |pred: &str, op: ScanCmpOp, value: ScanValue| {
+            let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+            pattern.predicate_filter = Some(pred.to_string());
+            pattern.scan_filters = vec![crate::ir::adapters::ScanPushdown {
+                var: VarId(1),
+                op,
+                value,
+            }];
+            R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern)
+                .build_scan_filters(&tm)
+                .len()
+        };
+        let str10 = || ScanValue::Str("10".into());
+        // A string term and a typed literal, either way round: `!=` keeps every row.
+        assert_eq!(
+            pushed("http://ex/plain", ScanCmpOp::NotEq, ScanValue::Int(10)),
+            0
+        );
+        assert_eq!(
+            pushed("http://ex/plain", ScanCmpOp::NotEq, ScanValue::Bool(true)),
+            0
+        );
+        assert_eq!(pushed("http://ex/typed", ScanCmpOp::NotEq, str10()), 0);
+        assert_eq!(
+            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Bool(true)),
+            0
+        );
+        // A datatype with no order class never pushes `!=`.
+        assert_eq!(pushed("http://ex/time", ScanCmpOp::NotEq, str10()), 0);
+        // Matching kinds still push, and other operators are untouched.
+        assert_eq!(pushed("http://ex/plain", ScanCmpOp::NotEq, str10()), 1);
+        assert_eq!(
+            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Int(10)),
+            1
+        );
+        assert_eq!(
+            pushed("http://ex/typed", ScanCmpOp::NotEq, ScanValue::Double(10.0)),
+            1
+        );
+        assert_eq!(
+            pushed("http://ex/plain", ScanCmpOp::Lt, ScanValue::Int(10)),
+            1
+        );
+    }
+
+    #[test]
+    fn term_order_reads_the_object_map() {
+        use crate::r2rml::TermOrder;
+        use fluree_db_r2rml::mapping::ObjectMap;
+        use fluree_vocab::xsd;
+        let typed = |dt: &str| term_order(&ObjectMap::column_typed("C", dt));
+        assert_eq!(
+            term_order(&ObjectMap::column("C")),
+            Some(TermOrder::Lexical)
+        );
+        assert_eq!(typed(xsd::STRING), Some(TermOrder::Lexical));
+        for dt in [
+            xsd::INTEGER,
+            xsd::LONG,
+            xsd::NEGATIVE_INTEGER,
+            xsd::DECIMAL,
+            xsd::DOUBLE,
+            xsd::FLOAT,
+        ] {
+            assert_eq!(typed(dt), Some(TermOrder::Numeric), "{dt}");
+        }
+        assert_eq!(typed(xsd::DATE), Some(TermOrder::Date));
+        assert_eq!(typed(xsd::DATE_TIME), Some(TermOrder::Instant));
+        assert_eq!(typed(xsd::BOOLEAN), Some(TermOrder::Boolean));
+        assert_eq!(typed(xsd::TIME), None);
+        let other = |language: Option<&str>, term_type| ObjectMap::Column {
+            column: "C".into(),
+            datatype: None,
+            language: language.map(Into::into),
+            term_type,
+        };
+        assert_eq!(
+            term_order(&other(Some("en"), TermType::Literal)),
+            Some(TermOrder::Lexical)
+        );
+        assert_eq!(
+            term_order(&other(None, TermType::Iri)),
+            Some(TermOrder::Lexical)
+        );
+        assert!(term_order(&ObjectMap::template("P-{C}", vec!["C".to_string()])).is_none());
     }
 
     // W4-1 PRIMARY end-to-end: a scalar constant-object member of a same-subject
