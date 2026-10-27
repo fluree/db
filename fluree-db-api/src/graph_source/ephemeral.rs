@@ -14,7 +14,7 @@
 //! # Reuse / duplication
 //!
 //! The provider's own table scan mirrors the catalog/storage/plan/read drive of
-//! the WP-DB2 sampler ([`sample_iceberg_rows`](super::iceberg_sample)): it reuses
+//! the WP-DB2 sampler ([`crate::Fluree::sample_iceberg_rows`]): it reuses
 //! the shared [`catalog_client`] + [`build_preview_storage`] helpers and the
 //! `SendScanPlanner` + `read_task` primitives, but streams **all** of a table's
 //! data files (not a bounded first-row-group peek). It deliberately does NOT call

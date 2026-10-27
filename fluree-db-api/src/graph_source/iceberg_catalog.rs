@@ -1164,8 +1164,8 @@ impl crate::Fluree {
 // =============================================================================
 // (c) Storage-access verification (§6)
 //
-// A config-time probe that goes through the ENGINE'S OWN credential decision
-// ([`decide_credential_source`], §2 fail-closed included) and storage
+// A config-time probe that goes through the ENGINE'S OWN storage decision
+// (`graph_source::storage`, §2 fail-closed included) and storage
 // construction, then proves BOTH S3 prefixes a query needs — the `metadata/`
 // prefix (manifest-list + manifests) and the `data/` prefix (a `HeadObject` on
 // the first data file). It never reads a Parquet/data file's bytes. A green
@@ -1188,9 +1188,11 @@ pub struct StorageAccessReport {
     pub readable: bool,
     /// Why not, in the catalog's or the store's own words; `None` when readable.
     pub error: Option<String>,
-    /// Which credential source the probe used: `"vended"` (catalog-delegated) or
-    /// `"ambient"` (the process AWS credential chain). This is the SAME decision
-    /// the scan/preview paths make (see [`decide_credential_source`]), so a green
+    /// Which storage identity the probe used: `"vended"` (catalog-delegated),
+    /// `"ambient"` (the process AWS credential chain), `"catalog"` (the catalog's
+    /// Google identity), `"google"` (the source's own) or `"local"`
+    /// ([`StorageDecision::source_name`](crate::StorageDecision::source_name)).
+    /// This is the SAME decision the scan/preview paths make, so a green
     /// probe proves a query authenticates to storage the same way. `None` when
     /// the probe failed before the decision was made.
     pub credential_source: Option<&'static str>,
@@ -1360,8 +1362,8 @@ fn parse_qualified_table(table: &str) -> TableIdentifier {
 /// Verify that this connection's resolved credentials can actually READ a table's
 /// storage — the config-time probe behind solo's onboarding "Test" button.
 ///
-/// It goes through the ENGINE'S OWN credential decision
-/// ([`decide_credential_source`], including §2 fail-closed) and storage
+/// It goes through the ENGINE'S OWN storage decision
+/// ([`crate::graph_source::storage`], including §2 fail-closed) and storage
 /// construction, then proves both S3 prefixes a query needs: the `metadata/`
 /// prefix (manifest-list + manifests) and the `data/` prefix (a `HeadObject` on
 /// the first data file — never a byte read). A green report therefore proves a

@@ -270,7 +270,7 @@ fn cross_query_key(
 /// or AWS S3 Tables — or `None` for Direct, which has no catalog. Every query-path
 /// client comes from here, so all three catalogs share one client cache, one
 /// `loadTable` ladder ([`resolve_catalog_load_and_storage`]) and one storage
-/// decision ([`catalog_session_storage`]).
+/// decision ([`session_storage`]).
 ///
 /// Construction does no network I/O beyond what each client defers: the REST
 /// client's OAuth exchange rides its first catalog op, and the AWS SDK clients

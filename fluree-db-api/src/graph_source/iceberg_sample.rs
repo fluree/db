@@ -114,9 +114,8 @@ pub(crate) async fn sample_column_values_in(
 /// schema to the projected field IDs (so projection errors reference the real
 /// schema). Returns the decoded batches (≤ `n` rows total).
 ///
-/// Mirrors [`preview_iceberg_table`](super::iceberg_catalog::preview_iceberg_table):
-/// same REST catalog client, inline `loadTable` metadata, and vended-vs-ambient
-/// storage policy.
+/// Mirrors [`preview_iceberg_table_in`](super::iceberg_catalog::preview_iceberg_table_in):
+/// same catalog client, inline `loadTable` metadata, and storage decision.
 async fn sample_table_batches<F>(
     conn: &IcebergConnectionConfig,
     table: &TableIdentifier,
