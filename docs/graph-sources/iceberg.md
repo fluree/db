@@ -493,8 +493,9 @@ Google's BigLake Iceberg REST catalog (`https://biglake.googleapis.com/iceberg/v
 | `roles/biglake.viewer` | the project | the catalog's `/v1/config` and `loadTable` |
 | `roles/bigquery.metadataViewer` | the project | the BigQuery-managed tables' metadata |
 | `roles/storage.objectViewer` | the bucket | reading the table's metadata and data files (`storage_auth: catalog`) |
+| `roles/serviceusage.serviceUsageConsumer` | the quota project, only if it is not the project that holds the tables | billing BigLake's requests to another project |
 
-Billing BigLake to the project that holds the tables needed no further grant. Naming a different project as the quota project needs `serviceusage.services.use` on that project (`roles/serviceusage.serviceUsageConsumer`), which is Google's rule for quota projects.
+None is needed when the quota project is the project that holds the tables (the default from the warehouse); if you bill a different project, the identity also needs `roles/serviceusage.serviceUsageConsumer` there. The first case was validated live; the second is Google's rule for `x-goog-user-project` and was not tested.
 
 **Token scopes.** A service account, Workload Identity Federation and the metadata server mint storage tokens for `devstorage.read_only` only. User credentials (gcloud's `application-default login`, an `authorized_user` file) cannot be narrowed that way: a refresh grant may ask only for scopes the user consented to, and gcloud's login consents to `cloud-platform`, so asking for `devstorage.read_only` is refused (`invalid_scope`). A user's token therefore carries the user's own `cloud-platform` scope, for the catalog and for storage alike (one token serves both). User credentials are for development on your own machine; on a server they are a host identity the operator can refuse (`google-adc` in `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`).
 
