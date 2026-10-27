@@ -492,8 +492,9 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     /// it does not stringify it), so a denial stays
     /// [`IcebergError::StorageAccessDenied`] and a 403 surfaces as one. A
     /// waiter that joined the leader's fill is handed only the leader's text,
-    /// so it asks the store once (a HEAD): a denial comes back typed from that,
-    /// and anything else keeps the fill's message.
+    /// so it asks the store once (a HEAD) and reports the store's own error
+    /// from that: a denial, a refused identity, a deferred store whose build
+    /// failed. Only a store that answers the HEAD leaves the fill's message.
     async fn fill_error(&self, path: &str, error: std::io::Error) -> IcebergError {
         let message = error.to_string();
         if let Some(typed) = error
@@ -503,8 +504,8 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             return *typed;
         }
         match self.storage.file_size(path).await {
-            Err(typed @ IcebergError::StorageAccessDenied { .. }) => typed,
-            _ => IcebergError::Storage(format!("disk-cache fill: {message}")),
+            Err(own) => own,
+            Ok(_) => IcebergError::Storage(format!("disk-cache fill: {message}")),
         }
     }
 
@@ -1337,10 +1338,12 @@ mod tests {
         assert!(alice_fill.await.unwrap().iter().all(|b| *b == b'A'));
     }
 
-    /// A store that refuses the object, as GCS or S3 answer a 403: its reads
-    /// (optionally held until released) and its HEADs are denials, counted.
+    /// A store that refuses the object with `refusal` (a 403's denial, a
+    /// refused identity, a deferred build's failure): its reads (optionally
+    /// held until released) and its HEADs fail with it, counted.
     #[derive(Debug, Clone)]
     struct Refusing {
+        refusal: IcebergError,
         gate: Option<Arc<tokio::sync::Semaphore>>,
         reads: Arc<std::sync::atomic::AtomicUsize>,
         heads: Arc<std::sync::atomic::AtomicUsize>,
@@ -1363,27 +1366,50 @@ mod tests {
             if let Some(gate) = &self.gate {
                 let _permit = gate.acquire().await.expect("gate open");
             }
-            Err(denial())
+            Err(self.refusal.clone())
         }
         async fn read_range(&self, _path: &str, _range: Range<u64>) -> Result<Bytes> {
-            Err(denial())
+            Err(self.refusal.clone())
         }
         async fn file_size(&self, _path: &str) -> Result<u64> {
             self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(denial())
+            Err(self.refusal.clone())
         }
     }
 
     #[tokio::test]
     async fn a_denied_small_file_fill_is_a_typed_denial_for_its_leader_and_its_waiters() {
-        let dir = fresh_cache_dir("denied_fill");
+        let refusals = [
+            ("denied_fill", denial()),
+            (
+                "refused_identity_fill",
+                IcebergError::HostIdentityRefused {
+                    kind: crate::host_identity::HostIdentityKind::Aws,
+                },
+            ),
+            (
+                "unvended_fill",
+                IcebergError::CatalogCredentialsNotVended {
+                    catalog_uri: "https://cat.example/v1".to_string(),
+                },
+            ),
+        ];
+        for (name, refusal) in refusals {
+            refused_fill_reports_the_stores_own_error(name, refusal).await;
+        }
+    }
+
+    async fn refused_fill_reports_the_stores_own_error(name: &str, refusal: IcebergError) {
+        let expected = format!("{refusal:?}");
+        let dir = fresh_cache_dir(name);
         let cache = DiskArtifactCache::for_dir(&dir);
         let footers = Arc::new(ParquetFooterCache::new(8));
         let scope = StorageScope::shared();
         let path = "gs://lake/data/small.parquet";
 
-        // One reader: the fill's leader gets the store's own denial back.
+        // One reader: the fill's leader gets the store's own error back.
         let store = Refusing {
+            refusal: refusal.clone(),
             gate: None,
             reads: Arc::default(),
             heads: Arc::default(),
@@ -1392,20 +1418,18 @@ mod tests {
             .try_whole_bytes_no_footer(path, 64)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, IcebergError::StorageAccessDenied { .. }),
-            "{err:?}"
-        );
+        assert_eq!(format!("{err:?}"), expected);
         assert_eq!(
             store.heads.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the leader reports the read's own denial, not a HEAD's"
+            "the leader reports the read's own error, not a HEAD's"
         );
 
         // Two readers of one file: the second joins the first's fill and is
-        // handed only its text, yet still reports the denial typed.
+        // handed only its text, yet still reports the store's error typed.
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let held = Refusing {
+            refusal,
             gate: Some(Arc::clone(&gate)),
             reads: Arc::default(),
             heads: Arc::default(),
@@ -1443,10 +1467,7 @@ mod tests {
         gate.add_permits(2);
         for outcome in [leader.await.unwrap(), waiter.await.unwrap()] {
             let err = outcome.unwrap_err();
-            assert!(
-                matches!(err, IcebergError::StorageAccessDenied { .. }),
-                "{err:?}"
-            );
+            assert_eq!(format!("{err:?}"), expected);
         }
         assert_eq!(
             held.reads.load(std::sync::atomic::Ordering::SeqCst),
