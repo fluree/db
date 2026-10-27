@@ -841,7 +841,12 @@ impl Operator for GraphOperator {
                                     }
                                     // else: graph not found → no output
                                 } else {
-                                    // Single-db: same resolution as the concrete arm.
+                                    // Single-db: same resolution as the concrete arm,
+                                    // except for an IRI the data supplied that names a
+                                    // graph source no query reads as a graph. A
+                                    // constant naming it is refused; here it is a graph
+                                    // outside the dataset, so this binding yields no
+                                    // rows (SPARQL's answer) and the query goes on.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
                                     let is_alias = ctx.single_db_names_default_graph(&bound_iri);
@@ -850,20 +855,32 @@ impl Operator for GraphOperator {
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
                                             true
                                         } else if let Some(provider) = ctx.r2rml_provider {
-                                            provider.has_r2rml_mapping(&bound_iri).await?
+                                            match provider.has_r2rml_mapping(&bound_iri).await {
+                                                Err(e) if e.is_unreadable_graph_source() => false,
+                                                probed => probed?,
+                                            }
                                         } else {
                                             false
                                         };
 
                                     if is_user_graph || is_alias || is_r2rml_gs {
-                                        self.execute_in_graph(
-                                            ctx,
-                                            &parent_batch,
-                                            row_idx,
-                                            bound_iri,
-                                            None,
-                                        )
-                                        .await?;
+                                        match self
+                                            .execute_in_graph(
+                                                ctx,
+                                                &parent_batch,
+                                                row_idx,
+                                                bound_iri,
+                                                None,
+                                            )
+                                            .await
+                                        {
+                                            // An empty mapping surfaces only when the
+                                            // rewrite compiles it.
+                                            Err(e)
+                                                if is_r2rml_gs
+                                                    && e.is_unreadable_graph_source() => {}
+                                            ran => ran?,
+                                        }
                                     }
                                 }
                             }

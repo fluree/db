@@ -2092,25 +2092,22 @@ async fn a_mapping_that_defines_no_triples_map_is_refused_at_registration() {
     }
 }
 
-/// A source stored with a mapping that defines nothing (registered before
-/// registration refused one) refuses every query with the cause, rather than
-/// answering no rows.
-#[tokio::test]
-async fn a_stored_mapping_that_defines_no_triples_map_refuses_every_query() {
+/// Store a source whose mapping defines no `rr:TriplesMap`, as registration
+/// once allowed: the mapping is in the content store, as a registration would
+/// have put it, and the record points at it.
+async fn publish_empty_mapping_source(fluree: &fluree_db_api::Fluree, name: &str) -> String {
     use fluree_db_core::ContentStore;
-    allow_fixture_roots();
-    let fluree = FlureeBuilder::memory().build_memory();
     let (_, empty) = mappings_that_define_nothing().into_iter().next().unwrap();
-    let gs = "empty-mapping:main";
+    let gs = format!("{name}:main");
     let cid = fluree
-        .content_store(gs)
+        .content_store(&gs)
         .put(
             fluree_db_core::ContentKind::GraphSourceMapping,
             empty.as_bytes(),
         )
         .await
         .expect("store the mapping");
-    let config = R2rmlCreateConfig::new_direct("empty-mapping", table_location(), empty)
+    let config = R2rmlCreateConfig::new_direct(name, table_location(), empty)
         .with_mapping_media_type("text/turtle")
         .to_iceberg_gs_config(&cid.to_string())
         .to_json()
@@ -2119,7 +2116,7 @@ async fn a_stored_mapping_that_defines_no_triples_map_refuses_every_query() {
         .publisher()
         .expect("read-write nameservice")
         .publish_graph_source(
-            "empty-mapping",
+            name,
             "main",
             fluree_db_nameservice::GraphSourceType::Iceberg,
             &config,
@@ -2127,6 +2124,18 @@ async fn a_stored_mapping_that_defines_no_triples_map_refuses_every_query() {
         )
         .await
         .expect("publish");
+    gs
+}
+
+/// A source stored with a mapping that defines nothing (registered before
+/// registration refused one) refuses every query with the cause, rather than
+/// answering no rows.
+#[tokio::test]
+async fn a_stored_mapping_that_defines_no_triples_map_refuses_every_query() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_empty_mapping_source(&fluree, "empty-mapping").await;
+    let gs = gs.as_str();
     fluree.create_ledger("crm:main").await.expect("ledger");
 
     let refused = |result: Result<serde_json::Value, ApiError>, route: &str| {
@@ -2304,4 +2313,96 @@ async fn a_registration_builds_one_catalog_client_for_all_its_tables() {
         1,
         "one client, so the token reference was resolved once"
     );
+}
+
+/// `GRAPH ?g` with `?g` bound from data. A binding that names a source no
+/// query reads as a graph (no mapping, an empty mapping, a BM25 index) is a
+/// graph outside the dataset: it yields no rows, SPARQL's answer, and the query
+/// goes on, answering for the other bindings. A constant `GRAPH <source>`
+/// naming the same source is refused.
+#[tokio::test]
+async fn a_graph_variable_bound_from_data_to_an_unreadable_source_yields_no_rows() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let unmapped = publish_unmapped_source(&fluree, "bound-unmapped").await;
+    let empty = publish_empty_mapping_source(&fluree, "bound-empty").await;
+    fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .graph("crm:main")
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX ex: <http://example.org/> \
+             INSERT DATA {{ \
+               <urn:a> ex:in <{unmapped}> . <urn:b> ex:in <{empty}> . \
+               <urn:c> ex:in <bound-search:main> . <urn:d> ex:in <urn:g1> . \
+               <urn:doc> a ex:Doc ; ex:title \"hello\" . \
+               GRAPH <urn:g1> {{ <urn:x> ex:p \"in g1\" }} }}"
+        ))
+        .commit()
+        .await
+        .expect("seed");
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "bound-search",
+            "crm:main",
+            serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": [{"@id": "?x", "@type": "ex:Doc", "ex:title": "?t"}],
+                "select": {"?x": ["@id", "ex:title"]}
+            }),
+        ))
+        .await
+        .expect("index");
+
+    let ledger = fluree.graph("crm:main");
+    let sparql = "PREFIX ex: <http://example.org/> \
+                  SELECT ?g ?o WHERE { ?s ex:in ?g GRAPH ?g { ?x ex:p ?o } }";
+    let rows = ledger
+        .query()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("a data-bound GRAPH variable does not fail the query");
+    let bindings = rows["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(bindings.len(), 1, "only urn:g1 is a graph here: {rows}");
+    assert_eq!(bindings[0]["g"]["value"], "urn:g1", "{rows}");
+    assert_eq!(bindings[0]["o"]["value"], "in g1", "{rows}");
+
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?o"],
+        "where": [
+            {"@id": "?s", "ex:in": "?g"},
+            ["graph", "?g", {"@id": "?x", "ex:p": "?o"}]
+        ]
+    });
+    let rows = ledger
+        .query()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .expect("a data-bound graph variable does not fail the query");
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "only urn:g1 is a graph here: {rows:?}");
+    assert!(rows[0].to_string().contains("in g1"), "{rows:?}");
+
+    // The same sources named as constants are refused.
+    for gs in [unmapped.as_str(), empty.as_str(), "bound-search:main"] {
+        let constant = format!(
+            "PREFIX ex: <http://example.org/> SELECT ?o WHERE {{ GRAPH <{gs}> {{ ?x ex:p ?o }} }}"
+        );
+        let err = ledger
+            .query()
+            .sparql(&constant)
+            .execute_formatted()
+            .await
+            .expect_err(gs);
+        assert!(
+            matches!(
+                err.error_type(),
+                "err:db/GraphSourceUnmapped" | "err:db/GraphSourceNotAGraph"
+            ),
+            "{gs}: {err}"
+        );
+    }
 }

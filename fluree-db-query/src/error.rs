@@ -358,6 +358,20 @@ impl QueryError {
         }
     }
 
+    /// A refusal naming a graph source no query reads as a graph: one with no
+    /// mapping or an empty one, an index, or one this build has no reader for.
+    /// A query that names the source fails with it; a `GRAPH ?g` whose `?g`
+    /// took the source's IRI from data reads it instead as a graph outside the
+    /// dataset, which yields no rows for that binding.
+    pub fn is_unreadable_graph_source(&self) -> bool {
+        matches!(
+            self,
+            Self::GraphSourceUnmapped { .. }
+                | Self::GraphSourceNotAGraph { .. }
+                | Self::GraphSourceUnsupported { .. }
+        )
+    }
+
     /// Create an [`Self::R2rmlUnsupportedPattern`] refusal with an actionable
     /// detail (the shape that was refused and the supported alternative). Used by
     /// the R2RML rewrite refusal sites and the graph-source crawl guard.
