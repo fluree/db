@@ -580,4 +580,185 @@ mod mor_guard_tests {
             "a delete-free snapshot must NOT be refused as merge-on-read; got {err:?}"
         );
     }
+
+    // ------------------------------------------------------------------
+    // BigQuery's shape: no delete counters in the summary at all, so only
+    // the manifest list can show a delete manifest.
+    // ------------------------------------------------------------------
+
+    /// A BigQuery-written table (summary `{"operation": "overwrite"}`), its
+    /// manifest list and its one data manifest: 2,000,000 rows in 4 files.
+    const BQ_METADATA: &[u8] = include_bytes!("../../tests/fixtures/bigquery/big.metadata.json");
+    const BQ_MANIFEST_LIST: &[u8] =
+        include_bytes!("../../tests/fixtures/bigquery/big.manifest-list.avro");
+    const BQ_MANIFEST: &[u8] = include_bytes!("../../tests/fixtures/bigquery/big.manifest.avro");
+
+    /// Serves fixed files and records every path read.
+    #[derive(Debug, Default)]
+    struct FixedFiles {
+        files: HashMap<String, Bytes>,
+        reads: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FixedFiles {
+        fn read_paths(&self) -> Vec<String> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for FixedFiles {
+        async fn read(&self, path: &str) -> Result<Bytes> {
+            self.reads.lock().unwrap().push(path.to_string());
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| IcebergError::storage(format!("no {path}")))
+        }
+        async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+            Ok(self
+                .read(path)
+                .await?
+                .slice(range.start as usize..range.end as usize))
+        }
+        async fn file_size(&self, path: &str) -> Result<u64> {
+            Ok(self.read(path).await?.len() as u64)
+        }
+    }
+
+    /// The BigQuery manifest list with a delete manifest (`content = 1`)
+    /// added beside its data manifest, in the spec field names BigQuery
+    /// writes. The delete manifest itself does not exist: it must never be
+    /// read.
+    fn bq_manifest_list_with_a_delete_manifest() -> Bytes {
+        use apache_avro::types::{Record, Value as AvroValue};
+        let data = crate::manifest::parse_manifest_list(&Bytes::from_static(BQ_MANIFEST_LIST))
+            .unwrap()
+            .remove(0);
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type": "record", "name": "manifest_file", "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"},
+                {"name": "content", "type": "int"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "min_sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_files_count", "type": "int"},
+                {"name": "existing_files_count", "type": "int"},
+                {"name": "deleted_files_count", "type": "int"},
+                {"name": "added_rows_count", "type": "long"},
+                {"name": "existing_rows_count", "type": "long"},
+                {"name": "deleted_rows_count", "type": "long"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        let delete_path = data.manifest_path.replace(".avro", "-deletes.avro");
+        for (path, content) in [(&data.manifest_path, 0i32), (&delete_path, 1i32)] {
+            let mut record = Record::new(writer.schema()).unwrap();
+            record.put("manifest_path", AvroValue::String(path.clone()));
+            record.put("manifest_length", 100i64);
+            record.put("partition_spec_id", 0i32);
+            record.put("content", content);
+            record.put("sequence_number", 0i64);
+            record.put("min_sequence_number", 0i64);
+            record.put("added_snapshot_id", data.added_snapshot_id);
+            record.put("added_files_count", if content == 0 { 4i32 } else { 1i32 });
+            record.put("existing_files_count", 0i32);
+            record.put("deleted_files_count", 0i32);
+            record.put(
+                "added_rows_count",
+                if content == 0 { 2_000_000i64 } else { 7i64 },
+            );
+            record.put("existing_rows_count", 0i64);
+            record.put("deleted_rows_count", 0i64);
+            writer.append(record).unwrap();
+        }
+        Bytes::from(writer.into_inner().unwrap())
+    }
+
+    fn bq_table(list: Bytes) -> (TableMetadata, FixedFiles) {
+        let metadata = TableMetadata::from_json(BQ_METADATA).unwrap();
+        let snapshot = metadata.current_snapshot().unwrap();
+        assert!(
+            !crate::mor_guard::summary_indicates_deletes(snapshot),
+            "fixture precondition: the summary reports no deletes"
+        );
+        let list_path = snapshot.manifest_list_location().unwrap().to_string();
+        let data_manifest =
+            crate::manifest::parse_manifest_list(&Bytes::from_static(BQ_MANIFEST_LIST))
+                .unwrap()
+                .remove(0)
+                .manifest_path;
+        let mut files = HashMap::new();
+        files.insert(list_path, list);
+        files.insert(data_manifest, Bytes::from_static(BQ_MANIFEST));
+        (
+            metadata,
+            FixedFiles {
+                files,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The control: the same table with no delete manifest plans its four
+    /// files, so a refusal below comes from the manifest list alone.
+    #[tokio::test]
+    async fn a_bigquery_snapshot_without_delete_manifests_plans() {
+        let (metadata, storage) = bq_table(Bytes::from_static(BQ_MANIFEST_LIST));
+        let plan = SendScanPlanner::new(&storage, &metadata, ScanConfig::new())
+            .plan_scan()
+            .await
+            .unwrap();
+        assert_eq!(plan.files_selected, 4);
+        assert_eq!(plan.estimated_row_count, 2_000_000);
+        assert!(!plan.has_delete_manifests);
+    }
+
+    /// A delete manifest the summary does not report is refused by the scan
+    /// and by the materialize path, with the summary guard's typed error, from
+    /// the manifest list the planner already reads: no manifest is read.
+    #[tokio::test]
+    async fn a_delete_manifest_the_summary_does_not_report_is_refused() {
+        let (metadata, storage) = bq_table(bq_manifest_list_with_a_delete_manifest());
+        let snapshot_id = metadata.current_snapshot().unwrap().snapshot_id;
+        let list_path = metadata
+            .current_snapshot()
+            .and_then(|s| s.manifest_list_location())
+            .unwrap()
+            .to_string();
+        let planner = SendScanPlanner::new(&storage, &metadata, ScanConfig::new());
+
+        let err = planner
+            .plan_scan()
+            .await
+            .expect_err("the scan must fail closed");
+        assert!(
+            matches!(err, IcebergError::MergeOnReadDeletes(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            storage.read_paths(),
+            vec![list_path.clone()],
+            "only the list is read"
+        );
+
+        for from in [None, Some(snapshot_id)] {
+            let err = planner
+                .plan_incremental(from, snapshot_id)
+                .await
+                .expect_err("materialize must fail closed");
+            assert!(
+                matches!(err, IcebergError::MergeOnReadDeletes(_)),
+                "{err:?}"
+            );
+        }
+        assert!(
+            storage.read_paths().iter().all(|p| p == &list_path),
+            "no manifest is read: {:?}",
+            storage.read_paths()
+        );
+    }
 }

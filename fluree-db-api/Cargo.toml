@@ -162,6 +162,8 @@ fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 wiremock = { workspace = true }
+# it_iceberg_local_fs writes a modified manifest list into a staged table copy.
+apache-avro = { workspace = true }
 # Residency-mode read arms for the wasm read-path recovery tests
 # (it_residency_retry): dev-only feature unification — production native
 # builds keep the feature off and compile the pre-residency read path.
