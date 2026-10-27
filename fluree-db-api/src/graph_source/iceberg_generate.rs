@@ -383,6 +383,7 @@ impl crate::Fluree {
                             table.clone(),
                             StatsTier::Stats,
                             identity,
+                            None,
                         )
                         .await?;
                         Ok::<_, crate::ApiError>((table, preview))

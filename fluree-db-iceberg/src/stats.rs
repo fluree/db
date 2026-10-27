@@ -418,6 +418,97 @@ pub async fn send_snapshot_has_delete_manifests<S: crate::io::SendIcebergStorage
     Ok(false)
 }
 
+/// A table's totals as its snapshot's **manifest list** states them, without
+/// opening a single manifest.
+///
+/// The snapshot summary's `total-records` and `total-data-files` are optional
+/// in the Iceberg spec, and some writers (BigQuery) write only `operation`.
+/// Every v2 `manifest_file` entry carries `added_rows_count` and
+/// `existing_rows_count` (and the matching file counters), so the live totals
+/// are their sums over the data manifests: one small read, never a manifest
+/// or data file.
+///
+/// Byte size is not here. The manifest list records each manifest's own
+/// length, not the size of the data files it lists, so a byte total needs
+/// every manifest read (see [`aggregate_column_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestListTotals {
+    /// Live rows: the sum of `added_rows_count + existing_rows_count` over the
+    /// data manifests (`content = 0`). `None` when any data manifest leaves
+    /// either counter out (they are optional in v1) or one is negative or the
+    /// sum overflows. A partial sum would read as an exact smaller count.
+    pub row_count: Option<i64>,
+    /// Live data files: the sum of `added_files_count + existing_files_count`
+    /// over the data manifests, under the same rules as `row_count`.
+    pub data_file_count: Option<i64>,
+    /// Delete manifests (`content = 1`) in the list. Fluree does not apply
+    /// merge-on-read deletes, so when this is non-zero `row_count` is an
+    /// **upper bound**, not an exact count.
+    pub delete_manifests: usize,
+}
+
+impl ManifestListTotals {
+    /// Totals over parsed manifest-list entries. Private because the entries
+    /// must include the delete manifests (`parse_manifest_list` drops them), or
+    /// a merge-on-read snapshot would read as exact.
+    fn from_entries(entries: &[crate::manifest::ManifestListEntry]) -> Self {
+        let mut row_count = Some(0i64);
+        let mut data_file_count = Some(0i64);
+        let mut delete_manifests = 0usize;
+        for entry in entries {
+            if entry.is_deletes() {
+                delete_manifests += 1;
+                continue;
+            }
+            row_count = row_count
+                .zip(entry.live_rows_count())
+                .and_then(|(a, b)| a.checked_add(b));
+            data_file_count = data_file_count
+                .zip(entry.live_files_count())
+                .and_then(|(a, b)| a.checked_add(b));
+        }
+        Self {
+            row_count,
+            data_file_count,
+            delete_manifests,
+        }
+    }
+
+    /// Totals from a manifest list's raw Avro bytes, delete manifests included.
+    pub fn from_manifest_list(data: &bytes::Bytes) -> Result<Self> {
+        Ok(Self::from_entries(&parse_manifest_list_with_deletes(
+            data, true,
+        )?))
+    }
+
+    /// Whether the snapshot carries merge-on-read deletes, which make
+    /// `row_count` an upper bound.
+    pub fn has_delete_manifests(&self) -> bool {
+        self.delete_manifests > 0
+    }
+}
+
+/// Read a snapshot's [`ManifestListTotals`]: one read of its manifest list.
+///
+/// A manifest list is immutable once written (its path names the snapshot),
+/// so a caller that asks repeatedly should cache the result by
+/// [`Snapshot::manifest_list_location`]. Prefer the summary when it has the
+/// totals; this is for the writers that leave them out.
+///
+/// Send-safe, for server-side use.
+#[cfg(feature = "aws")]
+pub async fn send_read_manifest_list_totals<S: crate::io::SendIcebergStorage + ?Sized>(
+    storage: &S,
+    snapshot: &Snapshot,
+) -> Result<ManifestListTotals> {
+    let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
+        crate::error::IcebergError::Manifest(
+            "Snapshot has no manifest list (v1 format not supported)".to_string(),
+        )
+    })?;
+    ManifestListTotals::from_manifest_list(&storage.read(manifest_list_path).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,5 +1109,156 @@ mod tests {
         assert!(matches!(err, crate::IcebergError::MergeOnReadDeletes(_)));
         // Operator opted out: proceed (upper-bound counts, with a logged warning).
         assert!(ensure_no_delete_manifests(usize::from(has_deletes), "dw.fact", true).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Manifest-list totals: a table's live rows/files from the manifest
+    // list alone, for writers whose snapshot summary carries no totals.
+    // ------------------------------------------------------------------
+
+    /// A BigQuery-written table, copied read-only from the live bucket: its
+    /// snapshot summary is only `{"operation": "overwrite"}`, and its manifest
+    /// list uses the spec counter names (`added_files_count`, not
+    /// `added_data_files_count`). The data is synthetic.
+    const BQ_METADATA: &[u8] = include_bytes!("../tests/fixtures/bigquery/big.metadata.json");
+    const BQ_MANIFEST_LIST: &[u8] =
+        include_bytes!("../tests/fixtures/bigquery/big.manifest-list.avro");
+    const BQ_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/bigquery/big.manifest.avro");
+    /// Oracles outside the Avro files: the table was created with 2,000,000
+    /// rows, and `gcloud storage ls -l …/iceberg/big/data/` lists its data files.
+    const BQ_ROWS: i64 = 2_000_000;
+    const BQ_DATA_FILES: i64 = 4;
+    const BQ_DATA_BYTES: i64 = 24_526_336;
+
+    #[test]
+    fn bigquery_manifest_list_states_the_rows_its_summary_omits() {
+        let metadata = crate::metadata::TableMetadata::from_json(BQ_METADATA).unwrap();
+        let snapshot = metadata.current_snapshot().unwrap();
+        assert_eq!(
+            snapshot.total_records(),
+            None,
+            "fixture precondition: the summary has no total-records"
+        );
+
+        let totals =
+            ManifestListTotals::from_manifest_list(&Bytes::from_static(BQ_MANIFEST_LIST)).unwrap();
+
+        // Cross-check against the manifest it points at: the per-file
+        // `record_count`s must add up to the manifest list's row total.
+        let data_files: Vec<DataFile> = parse_manifest(&Bytes::from_static(BQ_MANIFEST))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.data_file)
+            .collect();
+        let manifest_rows: i64 = data_files.iter().map(|f| f.record_count).sum();
+        let manifest_bytes: i64 = data_files.iter().map(|f| f.file_size_in_bytes).sum();
+        assert_eq!(data_files.len() as i64, BQ_DATA_FILES);
+        assert_eq!(manifest_bytes, BQ_DATA_BYTES);
+
+        assert_eq!(manifest_rows, BQ_ROWS);
+        assert_eq!(totals.row_count, Some(BQ_ROWS));
+        assert_eq!(totals.data_file_count, Some(BQ_DATA_FILES));
+        assert_eq!(totals.delete_manifests, 0);
+        assert!(!totals.has_delete_manifests());
+    }
+
+    #[test]
+    fn manifest_list_totals_count_data_manifests_and_flag_delete_manifests() {
+        // Both manifests carry added_rows_count = 1000: the delete manifest's
+        // are delete records, which must not be added to the table's rows.
+        let data = build_manifest_list_with_delete("s3://b/m-data.avro", "s3://b/m-del.avro");
+        let totals = ManifestListTotals::from_manifest_list(&data).unwrap();
+        assert_eq!(totals.row_count, Some(1000));
+        assert_eq!(totals.data_file_count, Some(1));
+        assert_eq!(totals.delete_manifests, 1);
+        assert!(totals.has_delete_manifests());
+    }
+
+    #[test]
+    fn manifest_list_totals_are_unknown_when_a_data_manifest_omits_its_counters() {
+        // Two data manifests; the second (a v1-style writer) leaves the row
+        // counters out. Summing only the first would report a confident 1000.
+        let schema = AvroSchema::parse_str(
+            r#"{"type": "record", "name": "manifest_file", "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_rows_count", "type": ["null", "long"]},
+                {"name": "existing_rows_count", "type": ["null", "long"]}
+            ]}"#,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        for (path, rows) in [("s3://b/m1.avro", Some(1000i64)), ("s3://b/m2.avro", None)] {
+            let counter = |v: Option<i64>| match v {
+                Some(n) => AvroValue::Union(1, Box::new(AvroValue::Long(n))),
+                None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+            };
+            let mut record = Record::new(writer.schema()).unwrap();
+            record.put("manifest_path", path);
+            record.put("manifest_length", 100i64);
+            record.put("partition_spec_id", 0i32);
+            record.put("added_snapshot_id", 1i64);
+            record.put("added_rows_count", counter(rows));
+            record.put("existing_rows_count", counter(rows.map(|_| 0)));
+            writer.append(record).unwrap();
+        }
+        let data = Bytes::from(writer.into_inner().unwrap());
+        let totals = ManifestListTotals::from_manifest_list(&data).unwrap();
+        assert_eq!(totals.row_count, None);
+        assert_eq!(totals.data_file_count, None);
+    }
+
+    /// The Send reader reads the manifest list once, and nothing else.
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn send_read_manifest_list_totals_reads_only_the_manifest_list() {
+        /// One file, and a log of every path read.
+        #[derive(Debug)]
+        struct OneFile {
+            path: String,
+            data: Bytes,
+            reads: Mutex<Vec<String>>,
+        }
+        impl OneFile {
+            fn get(&self, path: &str) -> Result<Bytes> {
+                self.reads.lock().unwrap().push(path.to_string());
+                if path == self.path {
+                    Ok(self.data.clone())
+                } else {
+                    Err(crate::IcebergError::Storage(format!("not found: {path}")))
+                }
+            }
+        }
+        #[async_trait]
+        impl crate::io::SendIcebergStorage for OneFile {
+            async fn read(&self, path: &str) -> Result<Bytes> {
+                self.get(path)
+            }
+            async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+                Ok(self
+                    .get(path)?
+                    .slice(range.start as usize..range.end as usize))
+            }
+            async fn file_size(&self, path: &str) -> Result<u64> {
+                Ok(self.get(path)?.len() as u64)
+            }
+        }
+
+        let metadata = crate::metadata::TableMetadata::from_json(BQ_METADATA).unwrap();
+        let snapshot = metadata.current_snapshot().unwrap();
+        let list_path = snapshot.manifest_list_location().unwrap();
+        let storage = OneFile {
+            path: list_path.to_string(),
+            data: Bytes::from_static(BQ_MANIFEST_LIST),
+            reads: Mutex::new(Vec::new()),
+        };
+
+        let totals = send_read_manifest_list_totals(&storage, snapshot)
+            .await
+            .unwrap();
+        assert_eq!(totals.data_file_count, Some(BQ_DATA_FILES));
+        assert_eq!(*storage.reads.lock().unwrap(), vec![list_path.to_string()]);
     }
 }

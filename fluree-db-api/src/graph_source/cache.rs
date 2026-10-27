@@ -23,7 +23,8 @@ use super::catalog_session::CachedLoadTable;
 use fluree_db_iceberg::catalog::SendCatalogClient;
 #[cfg(feature = "iceberg")]
 use fluree_db_iceberg::{
-    io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile, StorageScope,
+    io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile, ManifestListTotals,
+    StorageScope,
 };
 #[cfg(feature = "sql")]
 use fluree_db_sql::TrinoClient;
@@ -47,6 +48,12 @@ pub(crate) struct CachedScanFiles {
 
 #[cfg(feature = "iceberg")]
 const DIRECT_METADATA_LOCATION_TTL: Duration = Duration::from_secs(2);
+
+/// Entries in the manifest-list totals cache. An entry is a manifest-list path
+/// plus three integers (a few hundred bytes), so the bound is generous: a
+/// dataset wider than it would re-read some manifest lists on every `/info`.
+#[cfg(feature = "iceberg")]
+const MANIFEST_LIST_TOTALS_CAPACITY: u64 = 4096;
 
 /// Default cross-query `loadTable`-response cache TTL. A REST `loadTable` GET
 /// costs ~1.3–3s against Snowflake Horizon, so caching it across queries lets a
@@ -114,6 +121,15 @@ pub struct R2rmlCache {
     /// Cache for manifest-derived file selections keyed by metadata location.
     #[cfg(feature = "iceberg")]
     scan_files: SyncCache<String, Arc<CachedScanFiles>>,
+
+    /// Table totals read from a snapshot's manifest list, keyed by the
+    /// manifest-list location qualified by the [`StorageScope`] that read it.
+    /// A manifest list is immutable once written and its path names one
+    /// snapshot, so an entry never goes stale and needs no TTL. Serves the
+    /// virtual `/info` row counts and the Schema-tier preview for tables whose
+    /// snapshot summary has no `total-records`.
+    #[cfg(feature = "iceberg")]
+    manifest_list_totals: SyncCache<String, ManifestListTotals>,
 
     /// Shared Parquet footer cache for repeated scans of the same files.
     /// `Arc` so it can be shared into per-file read workers.
@@ -189,6 +205,7 @@ impl R2rmlCache {
                 compiled_mappings: SyncCache::new(mapping_cap),
                 table_metadata: SyncCache::new(metadata_cap),
                 scan_files: SyncCache::new(metadata_cap),
+                manifest_list_totals: SyncCache::new(MANIFEST_LIST_TOTALS_CAPACITY),
                 parquet_footers: Arc::new(ParquetFooterCache::new(
                     (metadata_capacity.max(1) / 2).max(32),
                 )),
@@ -294,6 +311,31 @@ impl R2rmlCache {
     ) {
         self.scan_files
             .insert(scope.qualify(metadata_location).into_owned(), scan_files);
+    }
+
+    /// Get the totals read from the manifest list at `manifest_list_location`,
+    /// as read under `scope`.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn get_manifest_list_totals(
+        &self,
+        scope: &StorageScope,
+        manifest_list_location: &str,
+    ) -> Option<ManifestListTotals> {
+        self.manifest_list_totals
+            .get(scope.qualify(manifest_list_location).as_ref())
+    }
+
+    /// Store the totals read from the manifest list at `manifest_list_location`,
+    /// as read under `scope`.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn put_manifest_list_totals(
+        &self,
+        scope: &StorageScope,
+        manifest_list_location: &str,
+        totals: ManifestListTotals,
+    ) {
+        self.manifest_list_totals
+            .insert(scope.qualify(manifest_list_location).into_owned(), totals);
     }
 
     /// Get the shared Parquet footer cache (clone the `Arc` to share into
@@ -447,6 +489,7 @@ impl R2rmlCache {
         {
             self.table_metadata.invalidate_all();
             self.scan_files.invalidate_all();
+            self.manifest_list_totals.invalidate_all();
             self.parquet_footers.clear().await;
             self.direct_metadata_locations.invalidate_all();
             self.catalog_clients.invalidate_all();

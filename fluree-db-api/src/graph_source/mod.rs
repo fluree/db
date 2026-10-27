@@ -406,7 +406,10 @@ pub use storage::{CatalogGrant, ResolvedStorage, StorageDecision};
 #[cfg(feature = "iceberg")]
 pub(crate) use iceberg_catalog::table_schema_from_metadata;
 #[cfg(feature = "iceberg")]
-pub(crate) use r2rml::{catalog_table_metadata, mapping_source_of, shared_catalog_client};
+pub(crate) use r2rml::{
+    cached_manifest_list_totals, catalog_read_plan, catalog_read_storage, catalog_table_metadata,
+    mapping_source_of, shared_catalog_client,
+};
 
 #[cfg(feature = "iceberg")]
 pub use iceberg_generate::{

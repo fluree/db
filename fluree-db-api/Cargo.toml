@@ -236,6 +236,14 @@ name = "it_google_storage_billing"
 path = "tests/it_google_storage_billing.rs"
 required-features = ["iceberg"]
 
+# Standalone for the same reason: a warm `/info` of a BigQuery table counted
+# from its manifest list makes no GCS read and mints no token, against mocks
+# of the metadata server, a BigLake-style catalog and GCS.
+[[test]]
+name = "it_iceberg_info_warm_google"
+path = "tests/it_iceberg_info_warm_google.rs"
+required-features = ["iceberg"]
+
 # Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
 # every Direct entry point, against the committed fixture's parent directory.
 [[test]]

@@ -4,8 +4,9 @@
 //! feeds the deterministic R2RML generator (PR-1 item (c), a separate lane) and
 //! the solo onboarding flow (PR-2). Everything here is **metadata-only**: browse
 //! lists namespaces/tables via the REST catalog, Tier-A preview reads the inline
-//! `metadata` object the REST `loadTable` response already carries (no S3), and
-//! Tier-B preview aggregates per-column statistics from the snapshot's
+//! `metadata` object the REST `loadTable` response already carries (no S3, but
+//! for one cached manifest-list read when the snapshot summary omits the row
+//! and file totals), and Tier-B preview aggregates per-column statistics from the snapshot's
 //! manifest-list + manifest Avro files (never a Parquet/data file).
 //!
 //! All entry points accept an inline [`IcebergConnectionConfig`] so onboarding
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph_source::config::{CatalogMode, IcebergConnectionConfig};
 use crate::graph_source::storage::{
-    connection_catalog, plan_storage, CatalogGrant, ResolvedStorage,
+    connection_catalog, plan_storage, CatalogGrant, ResolvedStorage, StoragePlan,
 };
 use crate::Result;
 
@@ -36,7 +37,7 @@ use fluree_db_iceberg::metadata::{
 use fluree_db_iceberg::stats::{
     aggregate_column_stats, send_read_snapshot_data_files, AggregatedColumnStats,
 };
-use fluree_db_iceberg::{FieldType, IdentityContext};
+use fluree_db_iceberg::{FieldType, IdentityContext, StorageScope};
 // The emitter owns the canonical `FieldType → xsd:` map; the preview lane reuses
 // it (single source of truth) rather than duplicating it here.
 use fluree_db_r2rml::emit::naming::xsd_datatype;
@@ -450,7 +451,9 @@ const MOR_UPPER_BOUND_WARNING: &str =
 #[serde(rename_all = "lowercase")]
 pub enum StatsTier {
     /// Tier-A: schema only (columns/types/partition/sort/snapshot), from the
-    /// inline REST `loadTable` metadata. No S3 reads.
+    /// inline REST `loadTable` metadata. Manifest-free: the one storage read is
+    /// of the snapshot's manifest list, cached, and only when the snapshot
+    /// summary omits the row or data-file total.
     Schema,
     /// Tier-A + Tier-B: additionally aggregate per-column statistics from the
     /// snapshot's manifest-list + manifest Avro files (never a data file).
@@ -558,11 +561,14 @@ pub struct TableSchema {
     pub current_schema_id: i32,
     /// The current snapshot.
     pub snapshot: SnapshotRef,
-    /// Authoritative row count from the snapshot summary.
+    /// Authoritative row count: the snapshot summary's `total-records`, else
+    /// the manifest list's live-row total (Schema tier) or the manifests' sum
+    /// (Stats tier).
     pub row_count: Option<i64>,
-    /// Authoritative data-file count from the snapshot summary.
+    /// Authoritative data-file count, from the same sources as `row_count`.
     pub data_file_count: Option<i64>,
-    /// Authoritative on-disk byte count from the snapshot summary.
+    /// Authoritative on-disk byte count: the summary's `total-files-size`, else
+    /// the manifests' sum (Stats tier only; the manifest list does not carry it).
     pub total_bytes: Option<i64>,
     /// Iceberg row-identity hint (equality-delete identity) — the primary PK signal.
     pub identifier_field_ids: Vec<i32>,
@@ -588,8 +594,10 @@ pub struct StatsCompleteness {
     pub manifests_read: usize,
     /// Whether any column carried lower/upper bounds in the manifests read.
     pub had_column_bounds: bool,
-    /// Whether the snapshot carries **merge-on-read delete files**. When `true`,
-    /// the aggregated `row_count` / value / null counts are **upper bounds**:
+    /// Whether the snapshot carries **merge-on-read delete files**, as its
+    /// manifest list shows (read by the Stats tier, and by the Schema tier when
+    /// it fills counts from the list). When `true`, the `row_count` / value /
+    /// null counts are **upper bounds**:
     /// they sum live data-file records without subtracting position/equality
     /// deletes, so they are not exact.
     #[serde(default)]
@@ -835,15 +843,20 @@ fn preview_counts_are_upper_bounds(
 /// **Metadata-only**: Tier-A reads the table metadata JSON — inline from the
 /// REST `loadTable` response, or (for the AWS SDK catalogs, which return only a
 /// `metadata_location`) fetched + parsed from S3 — never a Parquet/data file.
+/// Tier-A is manifest-free: when the snapshot summary omits the totals
+/// (BigQuery writes only `operation`), it makes one read of the snapshot's
+/// manifest list for them (see [`schema_counts_from_manifest_list`]).
 /// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files.
 /// Direct catalog mode returns a clear typed error (there is no catalog to load).
 /// Public as [`crate::Fluree::preview_iceberg_table`], under the instance's
-/// context.
+/// context. `cache` holds Tier-A's manifest-list totals (the cache virtual
+/// `/info` uses); `None` reads the list on every call.
 pub(crate) async fn preview_iceberg_table_in(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     tier: StatsTier,
     identity: &IdentityContext,
+    cache: Option<&super::R2rmlCache>,
 ) -> Result<TablePreview> {
     let (catalog, _uri, _wh) = catalog_client(&conn, "table preview", identity).await?;
     let table_id = table.to_catalog();
@@ -872,14 +885,32 @@ pub(crate) async fn preview_iceberg_table_in(
 
     match tier {
         StatsTier::Schema => {
-            // Schema tier reads no manifests (`has_delete_files` stays false), but
-            // its `row_count` comes from `total-records`, which over-counts a MoR
+            // Schema tier reads no manifests, but its `row_count` comes from
+            // `total-records`, else the manifest list; both over-count a MoR
             // snapshot. Under the override the guard proceeded, so caveat the count.
             let mut warnings = Vec::new();
+            let has_delete_files = schema_counts_from_manifest_list(
+                cache,
+                &mut schema,
+                metadata,
+                &table_display,
+                allow_mor,
+                || async {
+                    let (plan, grant) = preview_storage_plan(&conn, &load, identity).await?;
+                    let scope = plan.scope().clone();
+                    Ok::<_, crate::ApiError>((scope, move || async move {
+                        plan.build(&grant)
+                            .await
+                            .map(|resolved| Arc::new(resolved.backend))
+                            .map_err(|e| storage_api_error("Failed to create storage", e))
+                    }))
+                },
+            )
+            .await?;
             let summary_deletes = metadata
                 .current_snapshot()
                 .is_some_and(fluree_db_iceberg::summary_indicates_deletes);
-            if preview_counts_are_upper_bounds(allow_mor, false, summary_deletes) {
+            if preview_counts_are_upper_bounds(allow_mor, has_delete_files, summary_deletes) {
                 warnings.push(MOR_UPPER_BOUND_WARNING.to_string());
             }
             Ok(TablePreview {
@@ -888,7 +919,7 @@ pub(crate) async fn preview_iceberg_table_in(
                     tier: "schema".to_string(),
                     manifests_read: 0,
                     had_column_bounds: false,
-                    has_delete_files: false,
+                    has_delete_files,
                 },
                 warnings,
             })
@@ -988,6 +1019,69 @@ pub(crate) async fn preview_iceberg_table_in(
             })
         }
     }
+}
+
+/// Schema tier: fill the row and data-file totals the snapshot summary omits
+/// from the snapshot's manifest list, one read cached by its location (through
+/// [`super::cached_manifest_list_totals`], as virtual `/info` does), never a
+/// manifest. A summary with both totals reads nothing.
+///
+/// `plan` decides the storage identity (proving a Google one) before the
+/// cache is consulted, so a total is served only under the identity that read
+/// it; it runs only when a total is missing, and the store it returns is built
+/// only on a cache miss.
+///
+/// Best-effort: when no storage can be planned or the list cannot be read the
+/// fields stay `None` and the preview proceeds. A list that shows delete manifests is a merge-on-read
+/// snapshot, and is refused unless the operator override is on, as the Stats
+/// tier's manifest backstop refuses it; the summary guard already refuses the
+/// same snapshot when its summary says so. Returns whether the list showed
+/// delete manifests.
+async fn schema_counts_from_manifest_list<S, E, P, PFut, O, OFut>(
+    cache: Option<&super::R2rmlCache>,
+    schema: &mut TableSchema,
+    metadata: &TableMetadata,
+    table_display: &str,
+    allow_mor: bool,
+    plan: P,
+) -> Result<bool>
+where
+    S: SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    P: FnOnce() -> PFut,
+    PFut: std::future::Future<Output = std::result::Result<(StorageScope, O), E>>,
+    O: FnOnce() -> OFut,
+    OFut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    if schema.row_count.is_some() && schema.data_file_count.is_some() {
+        return Ok(false);
+    }
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(false);
+    };
+    let (scope, open_storage) = match plan().await {
+        Ok(planned) => planned,
+        Err(e) => {
+            tracing::debug!(table = %schema.table, error = %e, "Schema-tier totals: no storage plan for the manifest list");
+            return Ok(false);
+        }
+    };
+    let Some(totals) =
+        super::cached_manifest_list_totals(cache, &scope, &schema.table, snapshot, open_storage)
+            .await
+    else {
+        return Ok(false);
+    };
+    if totals.has_delete_manifests() {
+        fluree_db_iceberg::ensure_no_delete_manifests(
+            totals.delete_manifests,
+            table_display,
+            allow_mor,
+        )?;
+    }
+    schema.row_count = schema.row_count.or(totals.row_count);
+    schema.data_file_count = schema.data_file_count.or(totals.data_file_count);
+    Ok(totals.has_delete_manifests())
 }
 
 /// Lift an [`IcebergError`](fluree_db_iceberg::IcebergError) raised at a
@@ -1162,6 +1256,20 @@ pub(crate) async fn build_preview_storage(
     load: &LoadTableResponse,
     identity: &IdentityContext,
 ) -> Result<ResolvedStorage> {
+    let (plan, grant) = preview_storage_plan(conn, load, identity).await?;
+    plan.build(&grant)
+        .await
+        .map_err(|e| storage_api_error("Failed to create storage", e))
+}
+
+/// The decision [`build_preview_storage`] builds from, and the catalog's grant,
+/// before anything is built: its scope keys the caches an onboarding read
+/// consults (a Google identity is proven here, with its token cached).
+pub(crate) async fn preview_storage_plan(
+    conn: &IcebergConnectionConfig,
+    load: &LoadTableResponse,
+    identity: &IdentityContext,
+) -> Result<(StoragePlan, CatalogGrant)> {
     let catalog = connection_catalog(conn);
     let (location, grant) = match &catalog {
         CatalogConfig::Direct { table_location } => {
@@ -1175,9 +1283,7 @@ pub(crate) async fn build_preview_storage(
     let plan = plan_storage(&catalog, &conn.storage_io(), &location, identity)
         .await
         .map_err(|e| storage_api_error("Failed to decide storage", e))?;
-    plan.build(&grant)
-        .await
-        .map_err(|e| storage_api_error("Failed to create storage", e))
+    Ok((plan, grant))
 }
 
 /// Map an iceberg-crate [`AggregatedColumnStats`] onto the API [`ColumnStats`].
@@ -1197,7 +1303,10 @@ fn to_api_column_stats(a: &AggregatedColumnStats) -> ColumnStats {
 
 impl crate::Fluree {
     /// Preview an Iceberg table's schema (Tier-A) and optionally its per-column
-    /// statistics (Tier-B), under this instance's identity context.
+    /// statistics (Tier-B), under this instance's identity context. Tier-A's
+    /// manifest-list totals are cached in this instance's
+    /// [`R2rmlCache`](super::R2rmlCache), so a repeat preview of the same
+    /// snapshot reads nothing.
     pub async fn preview_iceberg_table(
         &self,
         conn: IcebergConnectionConfig,
@@ -1205,7 +1314,14 @@ impl crate::Fluree {
         tier: StatsTier,
     ) -> Result<TablePreview> {
         let conn = self.hydrate_conn(conn).await?;
-        preview_iceberg_table_in(conn, table, tier, self.identity_context()).await
+        preview_iceberg_table_in(
+            conn,
+            table,
+            tier,
+            self.identity_context(),
+            Some(self.r2rml_cache()),
+        )
+        .await
     }
 }
 
@@ -1877,6 +1993,7 @@ mod tests {
             TableIdentifier::new("ns", "table"),
             StatsTier::Schema,
             &IdentityContext::default(),
+            None,
         )
         .await
         .expect_err("Direct mode must not be previewable");
@@ -2440,5 +2557,179 @@ mod tests {
             err.to_string().contains("Direct catalog mode"),
             "error should explain Direct mode is unsupported, got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Schema tier: totals from the manifest list when the summary omits them.
+    // ------------------------------------------------------------------
+
+    /// A BigQuery-written table: its snapshot summary is only
+    /// `{"operation": "overwrite"}`; its manifest list states 2,000,000 rows in
+    /// 4 data files.
+    const BQ_METADATA: &[u8] =
+        include_bytes!("../../../fluree-db-iceberg/tests/fixtures/bigquery/big.metadata.json");
+    const BQ_MANIFEST_LIST: &[u8] =
+        include_bytes!("../../../fluree-db-iceberg/tests/fixtures/bigquery/big.manifest-list.avro");
+
+    /// One readable file (or none), and a count of reads.
+    #[derive(Debug, Default)]
+    struct ListStorage {
+        file: Option<(String, bytes::Bytes)>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ListStorage {
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for ListStorage {
+        async fn read(&self, path: &str) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &self.file {
+                Some((p, data)) if p == path => Ok(data.clone()),
+                _ => Err(fluree_db_iceberg::IcebergError::storage(format!(
+                    "no {path}"
+                ))),
+            }
+        }
+        async fn read_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            Ok(self
+                .read(path)
+                .await?
+                .slice(range.start as usize..range.end as usize))
+        }
+        async fn file_size(&self, path: &str) -> fluree_db_iceberg::Result<u64> {
+            Ok(self.read(path).await?.len() as u64)
+        }
+    }
+
+    fn bq_metadata() -> TableMetadata {
+        TableMetadata::from_json(BQ_METADATA).unwrap()
+    }
+
+    fn bq_list_storage(metadata: &TableMetadata) -> Arc<ListStorage> {
+        let path = metadata
+            .current_snapshot()
+            .and_then(|s| s.manifest_list_location())
+            .unwrap()
+            .to_string();
+        Arc::new(ListStorage {
+            file: Some((path, bytes::Bytes::from_static(BQ_MANIFEST_LIST))),
+            ..Default::default()
+        })
+    }
+
+    /// Run the Schema-tier fill over `metadata`; returns the schema, the
+    /// outcome, and how many times storage was asked for.
+    async fn schema_fill(
+        cache: Option<&super::super::R2rmlCache>,
+        metadata: &TableMetadata,
+        storage: &Arc<ListStorage>,
+        allow_mor: bool,
+    ) -> (TableSchema, Result<bool>, usize) {
+        let mut schema =
+            table_schema_from_metadata(&TableIdentifier::new("ns", "big"), metadata).unwrap();
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let out = schema_counts_from_manifest_list(
+            cache,
+            &mut schema,
+            metadata,
+            "ns.big (gs://b/big)",
+            allow_mor,
+            || {
+                std::future::ready(Ok::<_, String>((StorageScope::shared(), || {
+                    opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(Ok::<_, String>(Arc::clone(storage)))
+                })))
+            },
+        )
+        .await;
+        (schema, out, opened.into_inner())
+    }
+
+    #[tokio::test]
+    async fn schema_tier_takes_totals_the_summary_omits_from_the_manifest_list() {
+        let metadata = bq_metadata();
+        let storage = bq_list_storage(&metadata);
+        let cache = super::super::R2rmlCache::with_defaults();
+
+        let (schema, out, opened) = schema_fill(Some(&cache), &metadata, &storage, false).await;
+        assert!(!out.unwrap(), "no delete manifest");
+        assert_eq!(schema.row_count, Some(2_000_000));
+        assert_eq!(schema.data_file_count, Some(4));
+        assert_eq!(
+            schema.total_bytes, None,
+            "the manifest list has no byte total"
+        );
+        assert_eq!((opened, storage.reads()), (1, 1));
+
+        // A repeat preview of the same snapshot reads nothing.
+        let (schema, _, opened) = schema_fill(Some(&cache), &metadata, &storage, false).await;
+        assert_eq!(schema.row_count, Some(2_000_000));
+        assert_eq!((opened, storage.reads()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn schema_tier_with_summary_totals_reads_no_manifest_list() {
+        let mut metadata = bq_metadata();
+        let summary = &mut metadata.snapshots.last_mut().unwrap().summary;
+        summary.insert("total-records".to_string(), "10".to_string());
+        summary.insert("total-data-files".to_string(), "1".to_string());
+        let storage = bq_list_storage(&metadata);
+
+        let (schema, out, opened) = schema_fill(None, &metadata, &storage, false).await;
+        assert!(!out.unwrap());
+        assert_eq!(schema.row_count, Some(10), "the summary's, not the list's");
+        assert_eq!(schema.data_file_count, Some(1));
+        assert_eq!((opened, storage.reads()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn schema_tier_failed_manifest_list_read_leaves_counts_unknown() {
+        let metadata = bq_metadata();
+        let unreadable = Arc::new(ListStorage::default());
+
+        let (schema, out, _) = schema_fill(None, &metadata, &unreadable, false).await;
+        assert!(!out.expect("a failed read does not fail the preview"));
+        assert_eq!(schema.row_count, None);
+        assert_eq!(schema.data_file_count, None);
+        assert_eq!(unreadable.reads(), 1);
+    }
+
+    /// A list with a delete manifest is refused, as the Stats tier refuses it,
+    /// unless the override is on; then the counts are filled and flagged.
+    #[tokio::test]
+    async fn schema_tier_refuses_a_manifest_list_with_delete_manifests_unless_overridden() {
+        let metadata = bq_metadata();
+        let storage = bq_list_storage(&metadata);
+        let cache = super::super::R2rmlCache::with_defaults();
+        cache.put_manifest_list_totals(
+            &StorageScope::shared(),
+            metadata
+                .current_snapshot()
+                .and_then(|s| s.manifest_list_location())
+                .unwrap(),
+            fluree_db_iceberg::ManifestListTotals {
+                row_count: Some(1000),
+                data_file_count: Some(1),
+                delete_manifests: 1,
+            },
+        );
+
+        let (schema, out, _) = schema_fill(Some(&cache), &metadata, &storage, false).await;
+        let err = out.expect_err("delete manifests are refused by default");
+        assert_eq!(err.status_code(), 409, "{err}");
+        assert_eq!(schema.row_count, None, "no count surfaced");
+
+        let (schema, out, _) = schema_fill(Some(&cache), &metadata, &storage, true).await;
+        assert!(out.unwrap(), "flagged under the override");
+        assert_eq!(schema.row_count, Some(1000));
     }
 }

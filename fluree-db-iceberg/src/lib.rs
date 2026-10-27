@@ -117,7 +117,7 @@ pub use scan::{
 };
 pub use stats::{
     aggregate_column_stats, read_snapshot_data_files, typed_value_to_json, AggregatedColumnStats,
-    TableStatsAggregation,
+    ManifestListTotals, TableStatsAggregation,
 };
 
 // AWS/Send-safe types

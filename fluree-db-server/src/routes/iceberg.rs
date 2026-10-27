@@ -729,6 +729,9 @@ pub struct IcebergPreviewRequest {
     /// Table name (e.g. "DIM_STORE")
     pub name: String,
     /// Stats tier: "schema" (Tier-A) or "stats" (Tier-A + Tier-B). Default "schema".
+    /// Tier-A reads no manifest; when the snapshot summary omits the row and
+    /// file totals it reads the snapshot's manifest list for them, once per
+    /// snapshot.
     pub tier: Option<String>,
 }
 

@@ -4914,6 +4914,81 @@ pub(crate) async fn catalog_table_metadata(
     .await
 }
 
+/// The storage plan a reader outside the query path (the `/info` row counts)
+/// reads a catalog-loaded table's files under: the source's own decision for
+/// its metadata location, under the instance's identity context, as
+/// [`catalog_table_metadata`] makes it. Its scope keys every cache that reader
+/// consults; a Google identity is proven here (its token is cached
+/// process-wide, so a warm plan makes no remote call).
+pub(crate) async fn catalog_read_plan(
+    fluree: &crate::Fluree,
+    cfg: &IcebergGsConfig,
+    load: &LoadTableResponse,
+) -> QueryResult<StoragePlan> {
+    plan_for(fluree, cfg, &load.metadata_location).await
+}
+
+/// The store `plan` decided, built from what the catalog granted.
+pub(crate) async fn catalog_read_storage(
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
+) -> QueryResult<Arc<IcebergStorageBackend>> {
+    fresh_storage(plan, grant).await
+}
+
+/// The totals a snapshot's manifest list states ([`ManifestListTotals`]), for
+/// a reader that needs a table's size when its snapshot summary leaves the
+/// totals out: virtual `/info` and the Schema-tier preview.
+///
+/// Served from `cache` when it holds them, keyed by the manifest-list
+/// location under `scope`, the identity the caller's storage plan reads with:
+/// a total read under one identity is never served to another. A manifest list
+/// never changes once written, so a hit is always current. Otherwise
+/// `open_storage` builds the storage for one read of the list (never a
+/// manifest) and the result is cached for the next caller under the same
+/// scope. `None` when the snapshot has no manifest list (v1) or the storage or
+/// read fails. A failure is logged at debug and caches nothing.
+///
+/// [`ManifestListTotals`]: fluree_db_iceberg::ManifestListTotals
+pub(crate) async fn cached_manifest_list_totals<S, E, F, Fut>(
+    cache: Option<&R2rmlCache>,
+    scope: &fluree_db_iceberg::StorageScope,
+    table: &str,
+    snapshot: &fluree_db_iceberg::metadata::Snapshot,
+    open_storage: F,
+) -> Option<fluree_db_iceberg::ManifestListTotals>
+where
+    S: SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    let list = snapshot.manifest_list_location()?;
+    if let Some(hit) = cache.and_then(|c| c.get_manifest_list_totals(scope, list)) {
+        return Some(hit);
+    }
+    let storage = match open_storage().await {
+        Ok(storage) => storage,
+        Err(e) => {
+            debug!(table, error = %e, "manifest-list totals: no storage to read the list");
+            return None;
+        }
+    };
+    match fluree_db_iceberg::stats::send_read_manifest_list_totals(storage.as_ref(), snapshot).await
+    {
+        Ok(totals) => {
+            if let Some(cache) = cache {
+                cache.put_manifest_list_totals(scope, list, totals);
+            }
+            Some(totals)
+        }
+        Err(e) => {
+            debug!(table, manifest_list = list, error = %e, "manifest-list totals: list unreadable");
+            None
+        }
+    }
+}
+
 async fn resolve_table_metadata<S: SendIcebergStorage>(
     cache: &R2rmlCache,
     storage: &S,
