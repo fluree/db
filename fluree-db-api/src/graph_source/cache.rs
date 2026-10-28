@@ -126,6 +126,15 @@ pub struct R2rmlCache {
     /// its path names one snapshot, so an entry never goes stale and needs no
     /// TTL. Serves the virtual `/info` row counts for tables whose snapshot
     /// summary has no `total-records`.
+    ///
+    /// Storage-gated: its value comes from an object behind the storage gate,
+    /// like `scan_files` (see the per-layer verdict on
+    /// `disk_catalog_cache::CACHE_SCOPE`). Main has no per-source storage
+    /// identity to key by, so this is keyed by location alone. Whichever of
+    /// #2198 and #2196 (per-source storage identities) merges second must key
+    /// it by `(StorageScope, location)`, as #2196 keys `table_metadata` and
+    /// `scan_files`. The compiler will not catch a resolution that keeps this
+    /// key, because #2196 scopes every cache in its accessor.
     #[cfg(feature = "iceberg")]
     manifest_list_totals: SyncCache<String, ManifestListTotals>,
 
