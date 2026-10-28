@@ -13,7 +13,7 @@ use crate::r2rml::{R2rmlProvider, R2rmlTableProvider};
 use crate::remote_service::RemoteServiceExecutor;
 use crate::var_registry::VarRegistry;
 use crate::vector::VectorIndexProvider;
-use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena, TermView};
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
@@ -1412,13 +1412,15 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// Return a `BinaryGraphView` for the current graph, combining the binary store
-    /// with `binary_g_id`.
+    /// The view of the one graph this scope reads through the binary index
+    /// ([`Self::has_binary_store`]): its terms, and its own rows' values by
+    /// `o_type`. `None` over a default graph of several graphs, which has no
+    /// one graph; a reader that only decodes bindings takes
+    /// [`Self::term_view`] instead.
     ///
-    /// Returns `None` if no binary store is attached. Callers should grab this
-    /// once at operator construction and store it — not call it in tight loops
-    /// (each call clones an Arc).
-    pub fn graph_view(&self) -> Option<BinaryGraphView> {
+    /// Callers should grab this once at operator construction and store it —
+    /// not call it in tight loops (each call clones an Arc).
+    pub fn one_graph_view(&self) -> Option<BinaryGraphView> {
         if !self.has_binary_store() {
             return None;
         }
@@ -1428,6 +1430,32 @@ impl<'a> ExecutionContext<'a> {
             .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
             .with_tracker(self.tracker.clone());
         Some(view)
+    }
+
+    /// The decoder for this scope's encoded bindings: its store's terms,
+    /// which are the same in every graph of the store, and each arena
+    /// literal through the graph it carries. `Some` wherever this scope's
+    /// encoded bindings name one store's ids: one graph read through the
+    /// index, or a default graph whose members are all read through this
+    /// context's store and dictionary novelty ([`IndexScope::Union`]).
+    ///
+    /// It has no graph, so it cannot read any graph's index; a reader of one
+    /// graph takes [`Self::one_graph_view`].
+    pub fn term_view(&self) -> Option<TermView> {
+        let union = || {
+            matches!(
+                self.index_scope_policy_cleared(),
+                Some(IndexScope::Union(_))
+            )
+        };
+        if !self.has_binary_store() && !union() {
+            return None;
+        }
+        let store = self.binary_store.as_ref()?;
+        let terms = TermView::new(Arc::clone(store), self.dict_novelty.clone())
+            .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
+            .with_tracker(self.tracker.clone());
+        Some(terms)
     }
 
     /// Decode an `EncodedLit` binding value using DictNovelty-aware routing.
@@ -1468,7 +1496,7 @@ impl<'a> ExecutionContext<'a> {
         {
             return Some(Ok(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64())));
         }
-        let gv = self.graph_view()?;
+        let gv = self.one_graph_view()?;
         Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id))
     }
 
@@ -1530,7 +1558,7 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Returns `None` if no binary store is attached.
     pub fn resolve_subject_iri(&self, s_id: u64) -> Option<std::io::Result<String>> {
-        let gv = self.graph_view()?;
+        let gv = self.one_graph_view()?;
         Some(gv.resolve_subject_iri(s_id))
     }
 

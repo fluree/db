@@ -164,7 +164,7 @@ impl S2SearchOperator {
                         }
 
                         // Decode the literal using the binary store
-                        let gv = ctx.graph_view()?;
+                        let gv = ctx.one_graph_view()?;
                         match gv.decode_value_from_kind(
                             *o_kind,
                             *o_key,

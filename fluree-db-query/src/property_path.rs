@@ -1602,8 +1602,10 @@ impl PropertyPathOperator {
         let decoded;
         let term = match term {
             Binding::EncodedLit { .. } => {
-                decoded =
-                    crate::group_aggregate::materialize_encoded(term, ctx.graph_view().as_ref());
+                decoded = crate::group_aggregate::materialize_encoded(
+                    term,
+                    ctx.one_graph_view().as_ref(),
+                );
                 &decoded
             }
             other => other,
@@ -1696,7 +1698,7 @@ impl PropertyPathOperator {
                     // unbound endpoint.
                     Some(b @ Binding::EncodedSid { s_id, .. }) => {
                         let view = ctx
-                            .graph_view()
+                            .one_graph_view()
                             .or_else(|| {
                                 binary_store.map(|store| {
                                     store

@@ -734,7 +734,7 @@ impl R2rmlScanOperator {
             return JoinPlan::Cross;
         }
         let dicts = crate::object_binding::TermDicts::of(ctx);
-        let gv = ctx.graph_view();
+        let gv = ctx.one_graph_view();
         let gv = gv.as_ref();
 
         let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
@@ -1727,7 +1727,7 @@ fn emit_produced_window(
             partial_rows,
         } => {
             let dicts = crate::object_binding::TermDicts::of(ctx);
-            let gv = ctx.graph_view();
+            let gv = ctx.one_graph_view();
             let gv = gv.as_ref();
             for prod in produced {
                 // A produced row always binds every pattern var, so its join key

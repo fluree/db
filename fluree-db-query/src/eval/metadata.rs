@@ -51,7 +51,7 @@ pub(crate) fn binding_subject_sid(
     match binding {
         Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
         Binding::EncodedSid { s_id, .. } => {
-            let Some(gv) = ctx.graph_view() else {
+            let Some(gv) = ctx.one_graph_view() else {
                 return Ok(None);
             };
             Ok(gv.resolve_subject_sid(*s_id).ok())
@@ -59,7 +59,7 @@ pub(crate) fn binding_subject_sid(
         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
             if let Some(store) = ctx.binary_store.as_ref() {
                 if let Ok(Some(s_id)) = store.find_subject_id(iri) {
-                    if let Some(gv) = ctx.graph_view() {
+                    if let Some(gv) = ctx.one_graph_view() {
                         return Ok(gv.resolve_subject_sid(s_id).ok());
                     }
                 }
@@ -325,7 +325,7 @@ fn lookup_ref_objects(
                 subject_ref_object_keys_merged(ctx, store, predicate, p_id, subject_s_id)?;
             let mut out = Vec::with_capacity(ref_s_ids.len());
             for s_id in ref_s_ids {
-                if let Some(gv) = ctx.graph_view() {
+                if let Some(gv) = ctx.one_graph_view() {
                     if let Ok(sid) = gv.resolve_subject_sid(s_id) {
                         out.push(sid);
                     }

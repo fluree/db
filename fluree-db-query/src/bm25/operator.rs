@@ -290,7 +290,7 @@ impl Bm25SearchOperator {
                     ..
                 }) => {
                     // Late materialization: decode only when BM25 needs the target string.
-                    if let Some(gv) = ctx.graph_view() {
+                    if let Some(gv) = ctx.one_graph_view() {
                         let val = gv
                             .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                             .map_err(|e| {
@@ -332,7 +332,7 @@ impl Bm25SearchOperator {
                 ) => Ok(None),
                 // EncodedSid/EncodedPid: decode to IRI string if store available
                 Some(Binding::EncodedSid { s_id, .. }) => {
-                    // Novelty-aware: use graph_view() for subject resolution.
+                    // Novelty-aware: use one_graph_view() for subject resolution.
                     match ctx.resolve_subject_iri(*s_id) {
                         Some(Ok(iri)) => Ok(Some(iri)),
                         Some(Err(e)) => {

@@ -1126,7 +1126,7 @@ impl CyclicBgpOperator {
             CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx),
             CyclicJoinMode::EncodedObject => {
                 // Emit-side decoder for string-dictionary objects: same view
-                // construction as `ExecutionContext::graph_view`, against the
+                // construction as `ExecutionContext::one_graph_view`, against the
                 // one `(store, g_id)` pair the relation scans below read.
                 self.emit_view = ctx.binary_store.as_ref().map(|store| {
                     store

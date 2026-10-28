@@ -1563,7 +1563,7 @@ impl Operator for NestedLoopJoinOperator {
 
         // Built once for the whole next_batch call (avoids repeated Arc::clone
         // + construction per row).
-        let cached_view = ctx.graph_view();
+        let cached_view = ctx.one_graph_view();
 
         // Process until we have output or exhaust input
         loop {
@@ -1833,7 +1833,7 @@ impl Operator for NestedLoopJoinOperator {
             output_columns,
             groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
-            graph_view: ctx.graph_view(),
+            graph_view: ctx.one_graph_view(),
             counted_rows: 0,
         });
         let result: Result<u64> = async {
@@ -2355,7 +2355,7 @@ impl NestedLoopJoinOperator {
                 ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
                 _ => None,
             };
-            let view = member_ctx.graph_view();
+            let view = member_ctx.one_graph_view();
             self.scan_matches(
                 &member_ctx,
                 store,
@@ -3185,7 +3185,7 @@ impl NestedLoopJoinOperator {
                 ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
                 _ => None,
             };
-            let view = member_ctx.graph_view();
+            let view = member_ctx.one_graph_view();
             // Charged as the one-graph lane charges: per emitted row, by the
             // flush.
             for_each_object_probe_match(
@@ -3251,7 +3251,7 @@ impl NestedLoopJoinOperator {
                 _ => None,
             };
             let dict_overlay = make_dict_overlay(&member_ctx, store);
-            let view = member_ctx.graph_view();
+            let view = member_ctx.one_graph_view();
             let found = batched_subject_probe_binary(
                 &member_ctx,
                 store,

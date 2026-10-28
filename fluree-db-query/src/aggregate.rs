@@ -189,7 +189,7 @@ impl Operator for AggregateOperator {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
         if self.graph_view.is_none() {
-            self.graph_view = ctx.graph_view();
+            self.graph_view = ctx.one_graph_view();
         }
         Ok(())
     }

@@ -1096,7 +1096,7 @@ impl SqlBlockSource {
         if lowered.seeds.is_empty() {
             return vec![None];
         }
-        let gv = ctx.graph_view();
+        let gv = ctx.one_graph_view();
         let child_schema = child_batch.schema();
         // Resolved once per batch, not once per seed per row.
         let mut seed_positions: Vec<usize> = Vec::with_capacity(lowered.seeds.len());
@@ -1388,7 +1388,7 @@ fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> GroupKeyOwned {
     match terms::iri_of_binding(b, Some(ctx.active_snapshot)) {
         Some(iri) => GroupKeyOwned::MaterializedSid(0, iri.into()),
         None => {
-            let gv = ctx.graph_view();
+            let gv = ctx.one_graph_view();
             binding_to_group_key_normalized(
                 b,
                 crate::object_binding::TermDicts::of(ctx),

@@ -389,7 +389,7 @@ impl DatasetOperator {
     ///
     /// Members that are several graphs of one ledger keep the binary cursor,
     /// but their rows leave for a scope of several graphs, which has no single
-    /// graph view to decode an encoded binding against (`ctx.graph_view()` is
+    /// graph view to decode an encoded binding against (`ctx.one_graph_view()` is
     /// `None`). A join substituting an undecodable `EncodedSid` would leave the
     /// position unbound and pair every row with every other, and a NUM_BIG
     /// handle decodes only against its own graph's arena. So such members

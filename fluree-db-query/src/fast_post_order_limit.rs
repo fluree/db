@@ -248,7 +248,7 @@ pub fn post_order_desc_limit_operator(
             // through a novelty-aware graph view instead. The base lane keeps the
             // lazy encoded form (all subjects are persisted there).
             let view = if overlay_present {
-                Some(ctx.graph_view().ok_or_else(|| {
+                Some(ctx.one_graph_view().ok_or_else(|| {
                     QueryError::Internal("graph view unavailable for overlay subjects".into())
                 })?)
             } else {

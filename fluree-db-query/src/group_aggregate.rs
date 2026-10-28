@@ -737,7 +737,7 @@ pub struct GroupAggregateOperator {
     /// Iterator for emitting results.
     emit_iter: Option<GroupEmitIter>,
     /// Graph view for materializing encoded bindings (used for MIN/MAX semantic ordering).
-    /// When novelty-aware (via `ExecutionContext::graph_view()`), watermark routing
+    /// When novelty-aware (via `ExecutionContext::one_graph_view()`), watermark routing
     /// for novelty-only subject/string IDs is handled internally.
     graph_view: Option<BinaryGraphView>,
     /// Normalization for group keys and `COUNT(DISTINCT)`, so the forms one
@@ -954,7 +954,7 @@ impl Operator for GroupAggregateOperator {
         // If the execution context has a binary store, use it to materialize
         // encoded bindings for correct MIN/MAX comparison semantics.
         if self.graph_view.is_none() {
-            self.graph_view = ctx.graph_view();
+            self.graph_view = ctx.one_graph_view();
         }
         self.norm = crate::object_binding::equality_norm(ctx);
         Ok(())

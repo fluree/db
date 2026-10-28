@@ -712,7 +712,7 @@ pub fn eval_fulltext<R: RowAccess>(
 
                         // Doc not in arena (novelty doc appearing as EncodedLit — rare).
                         // Decode string, analyze, score with unified BM25.
-                        if let Some(gv) = ctx.graph_view() {
+                        if let Some(gv) = ctx.one_graph_view() {
                             if let Ok(FlakeValue::String(text)) = gv.decode_value_from_kind(
                                 *o_kind,
                                 *o_key,
@@ -742,7 +742,7 @@ pub fn eval_fulltext<R: RowAccess>(
             if !is_fulltext_dt {
                 return Ok(None);
             }
-            let gv = match ctx.and_then(super::super::context::ExecutionContext::graph_view) {
+            let gv = match ctx.and_then(super::super::context::ExecutionContext::one_graph_view) {
                 Some(gv) => gv,
                 None => return Ok(None),
             };

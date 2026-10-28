@@ -629,7 +629,7 @@ impl PatternOptionalBuilder {
                     | Binding::EncodedLit { .. }
             );
             let view = if encoded {
-                view.get_or_insert_with(|| ctx.graph_view()).as_ref()
+                view.get_or_insert_with(|| ctx.one_graph_view()).as_ref()
             } else {
                 None
             };
@@ -2281,7 +2281,7 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
         {
             return Ok(None);
         }
-        let view = ctx.graph_view();
+        let view = ctx.one_graph_view();
         let view = view.as_ref();
 
         // One pass over each reifies predicate (overlay-merged, policy-

@@ -714,7 +714,7 @@ impl HashJoinOperator {
         mut build: BoxedOperator,
     ) -> Result<()> {
         let dicts = TermDicts::of(ctx);
-        let gv = ctx.graph_view();
+        let gv = ctx.one_graph_view();
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
         while let Some(batch) = build.next_batch(ctx).await? {
@@ -823,7 +823,7 @@ impl Operator for HashJoinOperator {
             return fallback.next_batch(ctx).await;
         }
         let dicts = TermDicts::of(ctx);
-        let gv = ctx.graph_view();
+        let gv = ctx.one_graph_view();
         let ncols = self.full_schema.len();
         let build_cols = self.build_schema.len();
         let probe = self.probe.as_mut().expect("hash join probe");
@@ -936,7 +936,7 @@ impl Operator for HashJoinOperator {
             return fallback.drain_count(ctx).await;
         }
         let dicts = TermDicts::of(ctx);
-        let gv = ctx.graph_view();
+        let gv = ctx.one_graph_view();
         let probe = self.probe.as_mut().expect("hash join probe");
         let mut count: u64 = 0;
         loop {

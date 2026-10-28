@@ -262,7 +262,7 @@ pub struct Materializer {
     /// Graph-scoped view (store + graph ID) for decoding.
     ///
     /// When constructed with a novelty-aware `BinaryGraphView` (via
-    /// `ExecutionContext::graph_view()`), all decode methods automatically
+    /// `ExecutionContext::one_graph_view()`), all decode methods automatically
     /// handle watermark routing for novelty-only subject/string IDs.
     graph_view: BinaryGraphView,
     /// Cache: s_id -> Sid (for terminal output)

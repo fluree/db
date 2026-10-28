@@ -610,7 +610,7 @@ impl Operator for SortOperator {
         self.buffer = None;
         self.emit_idx = 0;
         self.assume_lex_sorted_string_ids = ctx
-            .graph_view()
+            .one_graph_view()
             .map(|gv| gv.store().lex_sorted_string_ids())
             .unwrap_or(false);
         self.state = OperatorState::Open;
@@ -664,7 +664,7 @@ impl Operator for SortOperator {
                 let k = self.topk.unwrap_or(0);
 
                 // Build novelty-aware graph view once for the entire drain loop.
-                let cached_gv = ctx.graph_view();
+                let cached_gv = ctx.one_graph_view();
 
                 loop {
                     ctx.check_cancelled()?;
@@ -738,7 +738,7 @@ impl Operator for SortOperator {
                         all_rows.len()
                     },
                     sort_columns = self.sort_col_indices.len(),
-                    materialize = ctx.graph_view().is_some(),
+                    materialize = ctx.one_graph_view().is_some(),
                 );
                 let _sort_exec_guard = sort_execute_span.enter();
                 ctx.check_cancelled()?;

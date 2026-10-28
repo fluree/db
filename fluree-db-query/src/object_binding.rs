@@ -685,7 +685,7 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
         novel_subjects,
         novel_strings,
         novel_predicate_subjects: NovelPredicateSubjects::default(),
-        gv: ctx.graph_view(),
+        gv: ctx.one_graph_view(),
     })
 }
 
@@ -912,8 +912,8 @@ impl ArenaCrossing {
             };
         }
         Self {
-            enter: outer.graph_view(),
-            leave: scope.graph_view(),
+            enter: outer.one_graph_view(),
+            leave: scope.one_graph_view(),
             leave_all: !outer.has_binary_store(),
         }
     }

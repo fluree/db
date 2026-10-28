@@ -482,7 +482,7 @@ pub fn vector_topk_operator(
                 if (key as u32) >= crate::dict_overlay::EPHEMERAL_VECTOR_BASE
                     && !ephemeral.contains_key(&key)
                 {
-                    let Some(gv) = ctx.graph_view() else {
+                    let Some(gv) = ctx.one_graph_view() else {
                         return Ok(None);
                     };
                     match gv.decode_value_from_kind(
@@ -571,7 +571,7 @@ pub fn vector_topk_operator(
             // Overlay-lane subjects may be novelty-only (absent from the
             // persisted dict) — materialize via the novelty-aware view.
             let view = if overlay_present {
-                Some(ctx.graph_view().ok_or_else(|| {
+                Some(ctx.one_graph_view().ok_or_else(|| {
                     QueryError::Internal("graph view unavailable for overlay subjects".into())
                 })?)
             } else {

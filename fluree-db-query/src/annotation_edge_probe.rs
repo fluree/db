@@ -895,7 +895,7 @@ impl AnnotationEdgeProbeOperator {
         let mut edge_of_row: Vec<Option<usize>> = Vec::new();
         // One subject-dictionary view for the whole pass — decoding an
         // EncodedSid edge endpoint goes straight through it.
-        let view = ctx.graph_view();
+        let view = ctx.one_graph_view();
         while let Some(batch) = self.child.next_batch(ctx).await? {
             if batch.is_empty() {
                 continue;
@@ -1222,7 +1222,7 @@ impl HashAnnotationEdgeProbeOperator {
     /// The child drains first so an empty driving stream never pays for
     /// either sweep.
     async fn probe_all(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        let view = ctx.graph_view();
+        let view = ctx.one_graph_view();
         let view = view.as_ref();
         let dicts = view.map(crate::object_binding::TermDicts::of_view);
 
@@ -1695,7 +1695,7 @@ impl Operator for AnnotationEnumerateOperator {
         self.store = ctx.active_snapshot.content_store.clone();
         self.as_of_t = ctx.to_t;
         self.pred_ids = ctx
-            .graph_view()
+            .one_graph_view()
             .map(|view| {
                 view.store()
                     .p_sid_table()
@@ -1752,7 +1752,7 @@ impl Operator for AnnotationEnumerateOperator {
                 .map_err(|e| QueryError::execution(format!("annotation arena walk: {e}")))?;
             self.leaves = Some(entries.into_iter().map(|e| e.leaf_cid).collect());
         }
-        let view = ctx.graph_view();
+        let view = ctx.one_graph_view();
         let dicts: Dicts<'_> = view.as_ref().map(crate::object_binding::TermDicts::of_view);
         loop {
             if let Some(batch) = self.drain_chunk() {
