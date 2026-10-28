@@ -2436,6 +2436,13 @@ fn check_count_routing(
 /// graph), g2 tags the even ones `I` and g3 the odd ones, so the members'
 /// subject ranges interleave with no subject in common; q00..q04 tagged `J` in
 /// g2 and q05..q09 in g3 hold disjoint ranges.
+///
+/// A list reads two ways (#2159). SPARQL reads it as the RDF it denotes, an
+/// owner edge to the list's head cell: a member is not a value of its
+/// predicate, and a pattern on a predicate holding lists is read through the
+/// list view, which the union lanes leave to the general plan, stamping
+/// `fallback:list_view`. JSON-LD reads the members as values, and the union
+/// lanes count them, one fact per value and list position.
 #[tokio::test(flavor = "current_thread")]
 async fn object_count_over_one_graph_and_a_union() {
     let ledger_id = "it/object-count-graphs:main";
@@ -2547,23 +2554,26 @@ async fn object_count_over_one_graph_and_a_union() {
             n("4"),
             ObjectCount::Union(Some("merge")),
         ),
+        // SPARQL reads a list as the RDF it denotes (#2159): a member is not
+        // a value of its predicate, so a predicate holding lists is read
+        // through the list view, which the union lane does not answer.
         (
-            "D9 FROM g2 + g3, a list repeating the object: every item a fact",
+            "D9 FROM g2 + g3, a list repeating the object: not a value in SPARQL",
             count("", from23, "ex:q 5"),
-            n("3"),
-            ObjectCount::Union(Some("merge")),
+            n("1"),
+            ObjectCount::UnionDeclines("list_view", None),
         ),
         (
-            "D10 FROM g2 + g3, a list repeating the object (g2 only)",
+            "D10 FROM g2 + g3, a list repeating the object (g2 only): not a value in SPARQL",
             count("", from23, "ex:r 5"),
-            n("2"),
-            ObjectCount::Union(None),
+            n("0"),
+            ObjectCount::UnionDeclines("list_view", None),
         ),
         (
-            "D15 FROM g2 + g3, two lists repeating the object: every item a fact",
+            "D15 FROM g2 + g3, two lists repeating the object: not values in SPARQL",
             count("", from23, "ex:w 5"),
-            n("4"),
-            ObjectCount::Union(None),
+            n("0"),
+            ObjectCount::UnionDeclines("list_view", None),
         ),
         (
             "D11 FROM g2 + g3, a bare number with a decimal slice in one member",
@@ -2572,16 +2582,16 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(Some("rows")),
         ),
         (
-            "D13 FROM g2 + g3, a predicate only g2 holds, past g3's last leaf",
+            "D13 FROM g2 + g3, a predicate only g2 holds, past g3's last leaf, beside a list",
             count("", from23, "ex:zz 6"),
             n("1"),
-            ObjectCount::Union(Some("rows")),
+            ObjectCount::UnionDeclines("list_view", None),
         ),
         (
-            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf: one member's rows",
+            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf: not a value in SPARQL",
             count("", from23, "ex:zz 5"),
-            n("2"),
-            ObjectCount::Union(Some("rows")),
+            n("0"),
+            ObjectCount::UnionDeclines("list_view", None),
         ),
         (
             "D16 FROM g2 + g3, interleaved subject ranges, none in common: the merge",
@@ -2672,6 +2682,60 @@ async fn object_count_over_one_graph_and_a_union() {
         check_object_count_routing(&mut failures, label, &store, before, lane);
     }
 
+    // The list cases in JSON-LD, which reads a list's members as values of
+    // its predicate: over a union each item is a fact (one per value and list
+    // position), and the union lane counts them.
+    let from23_jsonld = json!([
+        {"@id": ledger_id, "graph": "urn:g2"},
+        {"@id": ledger_id, "graph": "urn:g3"}
+    ]);
+    let json_bound = |pred: &str, value: i64| {
+        json!({
+            "@context": {"ex": EX},
+            "from": from23_jsonld.clone(),
+            "select": ["(as (count ?s) ?n)"],
+            "where": [{"@id": "?s", pred: value}]
+        })
+    };
+    for (label, query, want, lane) in [
+        (
+            "J9 JSON-LD, FROM g2 + g3, a list repeating the object: every item a fact",
+            json_bound("ex:q", 5),
+            n("3"),
+            ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "J10 JSON-LD, FROM g2 + g3, a list repeating the object (g2 only)",
+            json_bound("ex:r", 5),
+            n("2"),
+            ObjectCount::Union(None),
+        ),
+        (
+            "J13 JSON-LD, FROM g2 + g3, a predicate only g2 holds, past g3's last leaf",
+            json_bound("ex:zz", 6),
+            n("1"),
+            ObjectCount::Union(Some("rows")),
+        ),
+        (
+            "J14 JSON-LD, FROM g2 + g3, a list repeating the object, past g3's last leaf",
+            json_bound("ex:zz", 5),
+            n("2"),
+            ObjectCount::Union(Some("rows")),
+        ),
+        (
+            "J15 JSON-LD, FROM g2 + g3, two lists repeating the object: every item a fact",
+            json_bound("ex:w", 5),
+            n("4"),
+            ObjectCount::Union(None),
+        ),
+    ] {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = connection_jsonld(&fluree, ledger_id, &query).await;
+        failures.eq(jsonld_rows(&result), want, label);
+        check_object_count_routing(&mut failures, label, &store, before, lane);
+    }
+
     // The grouped twin: `GROUP BY ?o` with `COUNT(?s)`, top k. Over a union a
     // group counts the facts holding that object in some member, each once
     // (one fact per value and list position), and two datatypes of one number
@@ -2708,10 +2772,10 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(None),
         ),
         (
-            "T4 FROM g2 + g3, list rows: every item a fact",
+            "T4 FROM g2 + g3, a list: its head cell in SPARQL",
             topk("", from23, "ex:q"),
-            rows(&[&["5", "3"], &["7", "1"]]),
-            ObjectCount::Union(None),
+            rows(&[&["5", "1"], &["BLANK", "1"]]),
+            ObjectCount::UnionDeclines("list_view", None),
         ),
         (
             "T5 FROM g2 + g3, decimal objects (arena handles)",
@@ -2735,6 +2799,35 @@ async fn object_count_over_one_graph_and_a_union() {
             Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
         }
         check_count_routing(&mut failures, label, &store, before, TOPK_SITES, lane);
+    }
+    {
+        // T4 in JSON-LD, which reads the list's members as values.
+        let label = "JT4 JSON-LD, FROM g2 + g3, list rows: every item a fact";
+        let query = json!({
+            "@context": {"ex": EX},
+            "from": from23_jsonld.clone(),
+            "select": ["?o", "(as (count ?s) ?n)"],
+            "where": [{"@id": "?s", "ex:q": "?o"}],
+            "groupBy": ["?o"],
+            "orderBy": ["(desc ?n)"],
+            "limit": 5
+        });
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = connection_jsonld(&fluree, ledger_id, &query).await;
+        failures.eq(
+            jsonld_rows(&result),
+            rows(&[&["5", "3"], &["7", "1"]]),
+            label,
+        );
+        check_count_routing(
+            &mut failures,
+            label,
+            &store,
+            before,
+            TOPK_SITES,
+            ObjectCount::Union(None),
+        );
     }
 
     // Under the kill switch the planner builds no count lane; the union site
