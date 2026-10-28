@@ -279,7 +279,7 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
             match got {
                 Ok(rows) if rows == want => {}
                 Ok(rows) => {
-                    failures.push(format!("{}: {lane}: {rows:?}, want {want:?}", run.label))
+                    failures.push(format!("{}: {lane}: {rows:?}, want {want:?}", run.label));
                 }
                 Err(e) => failures.push(format!("{}: {lane}: failed: {e}", run.label)),
             }
