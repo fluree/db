@@ -3102,6 +3102,40 @@ fn build_operator_tree_inner(
         }
     }
 
+    // The two count lanes below read stored rows, so neither answers a
+    // pattern SPARQL reads through its view of RDF lists (`crate::list_view`),
+    // and neither detector accepts one. Over a default graph of several
+    // graphs (or of none) the union site says why it stood down where the
+    // query is its shape apart from the view; the kill switch, where it is on,
+    // is the reason given. The one-graph sites stay silent, as main's do.
+    if list_view
+        && !planning.is_history()
+        && !trailing_values
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+    {
+        let stored = query.with_patterns(crate::list_view::without_list_view(&query.patterns));
+        let reason = if fast_paths_globally_disabled {
+            FastPathFallback::KillSwitch
+        } else {
+            FastPathFallback::ListView
+        };
+        if detect_predicate_group_by_object_count_topk(&stored).is_some() {
+            stamp_fast_path(
+                crate::fast_group_count_firsts::GROUP_BY_OBJECT_COUNT_TOPK_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+        }
+        if detect_predicate_object_count(&stored).is_some() {
+            stamp_fast_path(
+                crate::fast_group_count_firsts::PREDICATE_OBJECT_COUNT_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+        }
+    }
+
     // Fast-path: `?s <p> ?o GROUP BY ?o COUNT(?s)` top-k using leaflet FIRST headers.
     //
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
