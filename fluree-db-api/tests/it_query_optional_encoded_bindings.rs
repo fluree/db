@@ -2240,6 +2240,113 @@ async fn exists_semijoin_cache_over_one_graph_and_a_union() {
     failures.assert_none();
 }
 
+/// The EXISTS cache over a union where the EXISTS's predicate holds lists.
+/// SPARQL reads a list as the RDF it denotes (#2159), an owner edge to the
+/// list's head cell, so `EXISTS { ?x ex:tags ?t }` is read through the list
+/// view: the cache over several graphs stands down with `ListView` and the
+/// general plan answers. JSON-LD reads the members as values, and the cache
+/// answers. Either way a subject that owns a list has a tag, so the answers
+/// agree.
+///
+/// Tags: y1 owns a list in g2, y2 one in g3, w1 a plain tag in g2; z1 has
+/// none. Amounts: y1 and y2 in g2, w1 and z1 in g3.
+#[tokio::test(flavor = "current_thread")]
+async fn exists_semijoin_cache_over_a_union_reads_a_list_as_each_surface_does() {
+    let ledger_id = "it/exists-cache-lists:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        ex:x1 ex:amount 1.5 .
+        GRAPH <urn:g2> {
+            ex:y1 ex:amount 7.5 ; ex:tags ( "a" "b" ) .
+            ex:y2 ex:amount 1.5 .
+            ex:w1 ex:tags "c" .
+        }
+        GRAPH <urn:g3> {
+            ex:w1 ex:amount 2.5 .
+            ex:z1 ex:amount 9.5 .
+            ex:y2 ex:tags ( "d" ) .
+        }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let x: &'static [&'static str] = &["x"];
+    let has_tag = rows(&[&["w1"], &["y1"], &["y2"]]);
+    let no_tag = rows(&[&["z1"]]);
+    let mut failures = Failures::default();
+    for (label, not, want) in [
+        (
+            "L1 FROM g2 + g3, FILTER(EXISTS && ...) on a list predicate",
+            "",
+            &has_tag,
+        ),
+        (
+            "L2 FROM g2 + g3, FILTER(!EXISTS && ...) on a list predicate",
+            "!",
+            &no_tag,
+        ),
+    ] {
+        let query = format!(
+            "{PREFIXES}SELECT ?x FROM <urn:g2> FROM <urn:g3> WHERE {{ ?x ex:amount ?v \
+             FILTER({not}EXISTS {{ ?x ex:tags ?t }} && ?v > 0) }}"
+        );
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, x), want.clone(), label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        let stamped = exists_stamps(&store, before);
+        check_exists_routing(&mut failures, label, &stamped, ExistsLane::Neither);
+        failures.eq(
+            stamped.1,
+            vec!["fallback:list_view".to_string()],
+            &format!("{label}: `{EXISTS_UNION_SITE}` decline"),
+        );
+    }
+    for (label, exists, want) in [
+        (
+            "JL1 JSON-LD, FROM g2 + g3, a list's members are tags",
+            json!(["exists", {"@id": "?x", "ex:tags": "?t"}]),
+            &has_tag,
+        ),
+        (
+            "JL2 JSON-LD, FROM g2 + g3, !EXISTS",
+            json!(["not", ["exists", {"@id": "?x", "ex:tags": "?t"}]]),
+            &no_tag,
+        ),
+    ] {
+        let query = json!({
+            "@context": {"ex": EX},
+            "from": [
+                {"@id": ledger_id, "graph": "urn:g2"},
+                {"@id": ledger_id, "graph": "urn:g3"}
+            ],
+            "select": ["?x"],
+            "where": [
+                {"@id": "?x", "ex:amount": "?v"},
+                ["filter", ["and", exists, [">", "?v", 0]]]
+            ]
+        });
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = connection_jsonld(&fluree, ledger_id, &query).await;
+        failures.eq(jsonld_rows(&result), want.clone(), label);
+        check_exists_routing(
+            &mut failures,
+            label,
+            &exists_stamps(&store, before),
+            ExistsLane::Union,
+        );
+    }
+    failures.assert_none();
+}
+
 /// A `geof:distance` filter, which the planner rewrites into the geo index
 /// search when the scope reads one graph. Paris is in the default graph,
 /// London in g2, Brussels and Berlin in g3; London and Brussels lie within
