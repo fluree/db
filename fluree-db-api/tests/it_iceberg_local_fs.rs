@@ -1833,3 +1833,114 @@ async fn sparql_construct_over_a_graph_source_keeps_the_ordered_page() {
         .expect_err("DESCRIBE over a graph source is refused");
     assert!(err.to_string().contains("subquery"), "DESCRIBE: {err}");
 }
+
+/// The people table mapped twice over disjoint subject templates: persons
+/// carry a name, agents a score. So a person never has a score, and a class
+/// or constraint on persons fuses into the scan beside it (the templates prove
+/// the fusion drops nothing).
+const SPLIT_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+    <http://example.org/mapping#Agent> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/agent/{id}" ; rr:class ex:Agent ] ;
+        rr:predicateObjectMap [ rr:predicate ex:score ; rr:objectMap [ rr:column "score" ] ] .
+"#;
+
+/// A pattern written above an OPTIONAL is part of its left side. The rewrite
+/// fuses a class (or a constant-object constraint) into the scan written below
+/// the OPTIONAL; that fused scan must stay above it. Below, the OPTIONAL runs
+/// over an empty seed, binds `?s` to the agents it matches, and every person,
+/// none of whom has a score, is lost. On a lake the trigger is a null column
+/// under an OPTIONAL.
+#[tokio::test]
+async fn an_optional_keeps_the_class_written_above_it() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("split-people", &location, SPLIT_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let jsonld = |query: Value| {
+        let fluree = &fluree;
+        async move {
+            let mut query = query;
+            query["@context"] = json!({"ex": "http://example.org/"});
+            query["from"] = json!("split-people:main");
+            fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+        }
+    };
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+    let no_score = json!(["optional", {"@id": "?s", "ex:score": "?x"}]);
+
+    // The browse crawl: the class fuses into the injected wildcard.
+    let crawl = jsonld(json!({
+        "select": {"?s": ["*"]},
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score],
+    }))
+    .await;
+    assert_eq!(rows(&crawl), 5, "crawl: {crawl}");
+    assert!(
+        crawl
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["ex:name"].is_string()),
+        "each person keeps its name: {crawl}"
+    );
+
+    // A constant-object constraint folded onto the crawl wildcard (W4-1b).
+    let alice = jsonld(json!({
+        "select": {"?s": ["*"]},
+        "where": [{"@id": "?s", "ex:name": "alice"}, no_score],
+    }))
+    .await;
+    assert_eq!(rows(&alice), 1, "constraint crawl: {alice}");
+
+    // The class fused into a star written below the OPTIONAL.
+    let star = jsonld(json!({
+        "select": ["?s", "?n", "?x"],
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score, {"@id": "?s", "ex:name": "?n"}],
+    }))
+    .await;
+    assert_eq!(rows(&star), 5, "class into star: {star}");
+
+    // A flat wildcard, and its SPARQL twin: a type and a name per person.
+    let flat = jsonld(json!({
+        "select": ["?s", "?p", "?o"],
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score, {"@id": "?s", "?p": "?o"}],
+    }))
+    .await;
+    assert_eq!(rows(&flat), 10, "flat wildcard: {flat}");
+    let sparql = fluree
+        .query_from()
+        .sparql(
+            "PREFIX ex: <http://example.org/> SELECT ?s ?p ?o FROM <split-people:main> \
+             WHERE { ?s a ex:Person OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+        )
+        .execute_formatted()
+        .await
+        .expect("SPARQL");
+    assert_eq!(
+        rows(&sparql["results"]["bindings"]),
+        10,
+        "SPARQL wildcard: {sparql}"
+    );
+}
