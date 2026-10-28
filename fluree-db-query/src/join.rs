@@ -8,7 +8,6 @@ use crate::binary_scan::EmitMask;
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
-use crate::dataset_operator::UnionFact;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
@@ -24,8 +23,9 @@ use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, CountGroup, Operator,
-    OperatorState, RowFact,
+    OperatorState,
 };
+use crate::union_fact::{FactRef, UnionFactSet};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, TermView};
@@ -655,8 +655,8 @@ struct SubjectMatch<'m> {
 /// The batched probes over a default graph of several graphs of one ledger
 /// (`IndexScope::Union`): each member's leaves are probed under the context
 /// `DatasetOperator` would give it (its graph, novelty and `t`), and the
-/// matches become one row per fact of the union ([`UnionFact`], the key the
-/// general plan's dedup uses). `plans` holds one probe plan per member, in
+/// matches become one row per fact of the union ([`UnionFactSet`], the key
+/// the general plan's dedup uses). `plans` holds one probe plan per member, in
 /// `ctx.active_graphs()` order.
 struct UnionProbe {
     plans: Vec<ProbeLanePlan>,
@@ -682,7 +682,7 @@ struct UnionMatch {
     member: usize,
     /// The term the row binds, as the member's probe bound it: encoded where
     /// the index holds it encoded. The union's term view decodes it later,
-    /// and the fact is keyed on it through [`UnionFact::of`], which keys an
+    /// and the fact is keyed on it through [`UnionFactSet::insert`], which keys an
     /// arena literal (it carries its graph) by value.
     object: Binding,
     o_i: u32,
@@ -705,11 +705,13 @@ impl UnionMatch {
 
 /// The matches a union probe keeps, in member order: every match of a key
 /// only one member matched (a graph holds each fact once), and the first row
-/// of each fact of a key two or more members matched. `fact_of` names the
-/// fact a match is, through [`UnionFact::of`].
+/// of each fact of a key two or more members matched. `insert` puts the fact a
+/// match is into a set of facts of `bindings` bindings
+/// ([`UnionFactSet::insert`]).
 fn union_keep(
     matches: &[UnionMatch],
-    mut fact_of: impl FnMut(&UnionMatch) -> Result<UnionFact>,
+    bindings: usize,
+    mut insert: impl FnMut(&mut UnionFactSet, &UnionMatch) -> Result<bool>,
 ) -> Result<Vec<bool>> {
     let mut first_member: FxHashMap<u64, (usize, bool)> = FxHashMap::default();
     for m in matches {
@@ -718,11 +720,10 @@ fn union_keep(
             entry.1 = true;
         }
     }
-    let mut seen: hashbrown::HashSet<UnionFact, FxBuildHasher> =
-        hashbrown::HashSet::with_hasher(FxBuildHasher);
+    let mut seen = UnionFactSet::new(bindings);
     matches
         .iter()
-        .map(|m| Ok(!first_member[&m.key].1 || seen.insert(fact_of(m)?)))
+        .map(|m| Ok(!first_member[&m.key].1 || insert(&mut seen, m)?))
         .collect()
 }
 
@@ -2374,16 +2375,16 @@ impl NestedLoopJoinOperator {
             )?;
         }
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
-        let keep = union_keep(&matches, |m| {
-            UnionFact::of(
+        let keep = union_keep(&matches, 2, |set, m| {
+            Ok(set.insert(
                 [&Binding::encoded_sid(m.key), &m.object],
-                Some(&RowFact {
+                Some(FactRef {
                     object: None,
                     list_index: m.list_index(),
                 }),
                 dicts,
                 gv,
-            )
+            )?)
         })?;
         for (m, keep) in matches.iter().zip(keep) {
             let Some(accum) = s_id_to_accum.get(&m.key).filter(|_| keep) else {
@@ -3202,16 +3203,16 @@ impl NestedLoopJoinOperator {
             )?;
         }
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
-        let keep = union_keep(&matches, |m| {
-            UnionFact::of(
+        let keep = union_keep(&matches, 2, |set, m| {
+            Ok(set.insert(
                 [&m.object, &Binding::encoded_sid(objs[m.key as usize])],
-                Some(&RowFact {
+                Some(FactRef {
                     object: None,
                     list_index: m.list_index(),
                 }),
                 dicts,
                 gv,
-            )
+            )?)
         })?;
         Ok(matches
             .into_iter()
@@ -3265,16 +3266,16 @@ impl NestedLoopJoinOperator {
             }
         }
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
-        let keep = union_keep(&matches, |m| {
-            UnionFact::of(
+        let keep = union_keep(&matches, 1, |set, m| {
+            Ok(set.insert(
                 [&Binding::encoded_sid(m.key)],
-                Some(&RowFact {
-                    object: Some(m.object.clone()),
+                Some(FactRef {
+                    object: Some(&m.object),
                     list_index: m.list_index(),
                 }),
                 dicts,
                 gv,
-            )
+            )?)
         })?;
         Ok(matches
             .into_iter()

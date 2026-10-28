@@ -20,13 +20,10 @@
 //!
 //! See `docs/design/query-execution.md` for the pipeline overview.
 
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use fluree_db_core::{DatatypeConstraint, IndexType, ObjectBounds, Sid};
-use hashbrown::HashMap;
-use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::binary_history::BinaryHistoryScanOperator;
 use crate::binary_scan::{schema_from_pattern_with_emit, BinaryScanOperator, EmitMask};
@@ -34,13 +31,13 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
-use crate::group_aggregate::TryCollectVec;
 use crate::ir::triple::TriplePattern;
-use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm, TermDicts};
+use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState, RowFact};
 use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
+use crate::union_fact::{FactRef, UnionFactSet};
 use crate::var_registry::VarId;
 
 // =============================================================================
@@ -228,16 +225,16 @@ pub(crate) fn union_dedups_on_fact_identity(members: usize, mode: TemporalMode) 
 /// graph alone. This holds a persistent seen-set across `next_batch` calls
 /// (the operator streams one member's batch per call).
 ///
-/// Hashing mirrors [`DistinctOperator`](crate::distinct): bindings are
-/// normalized with [`EqualityNorm`] so a late-materialized
-/// `EncodedSid`/`EncodedLit` and its decoded `Sid`/`Lit` twin collapse to one
-/// row. `Binding`'s manual `Eq`/`Hash` exclude history metadata, so this is
-/// only armed in current mode (see [`DatasetOperator::open`]).
+/// The key is [`UnionFactSet`]'s: bindings are normalized with
+/// [`EqualityNorm`] so a late-materialized `EncodedSid`/`EncodedLit` and its
+/// decoded `Sid`/`Lit` twin collapse to one row. `Binding`'s manual
+/// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
+/// (see [`DatasetOperator::open`]).
 ///
 /// MEMORY CLIFF (documented like `whole_graph_facts`'s): unlike a
 /// single-graph scan, a `>= 2`-member default union is no longer
 /// bounded-memory streaming — the seen-set grows O(distinct emitted facts)
-/// with full normalized `Binding` signatures as keys, exactly like a
+/// (16 bytes per encoded term, a whole `Binding` per decoded one), like a
 /// user-requested `DISTINCT` (which is the price of §13.2 set semantics; a
 /// hash-only key was rejected because a collision would silently DROP a
 /// distinct row). Each RETAINED row charges one unit of fuel, so a fuel
@@ -245,59 +242,15 @@ pub(crate) fn union_dedups_on_fact_identity(members: usize, mode: TemporalMode) 
 /// it forgoes the per-member count-only shortcut (surfaced to EXPLAIN via
 /// `plan_details.default_union_set_merge`).
 struct BatchDeduper {
-    seen: HashMap<UnionFact, (), FxBuildHasher>,
+    /// Armed by the first batch, whose width every later batch must have.
+    seen: Option<UnionFactSet>,
     norm: Option<EqualityNorm>,
-}
-
-/// One fact of a default graph of several graphs: storage's identity, one
-/// fact per value and list position. It is a row's bindings, normalized so a
-/// late-materialized term and its decoded twin are one, plus the fact the
-/// row's scan says it matched ([`RowFact`]: a constant object's matched term,
-/// and the list position).
-///
-/// Every reader that collapses a union's rows keys on this, so they cannot
-/// disagree about what one fact is: [`BatchDeduper`] for the general plan,
-/// and the nested-loop join's union probes.
-#[derive(PartialEq, Eq, Hash)]
-pub(crate) struct UnionFact {
-    bindings: Vec<Binding>,
-    fact: Option<RowFact>,
-}
-
-impl UnionFact {
-    /// The fact a row with `bindings` matched, `fact` being what its scan
-    /// recorded, normalized through `dicts` and `gv` ([`EqualityNorm::parts`]).
-    pub(crate) fn of<'b>(
-        bindings: impl IntoIterator<Item = &'b Binding>,
-        fact: Option<&RowFact>,
-        dicts: Option<TermDicts<'_>>,
-        gv: Option<&fluree_db_binary_index::TermView>,
-    ) -> Result<Self> {
-        Ok(Self {
-            bindings: bindings
-                .into_iter()
-                .map(|b| normalize_for_key(b, dicts, gv))
-                .try_collect_vec()?,
-            fact: fact
-                .map(|f| -> Result<RowFact> {
-                    Ok(RowFact {
-                        object: f
-                            .object
-                            .as_ref()
-                            .map(|o| normalize_for_key(o, dicts, gv))
-                            .transpose()?,
-                        list_index: f.list_index,
-                    })
-                })
-                .transpose()?,
-        })
-    }
 }
 
 impl BatchDeduper {
     fn new(ctx: &ExecutionContext<'_>) -> Self {
         Self {
-            seen: HashMap::with_hasher(FxBuildHasher),
+            seen: None,
             norm: equality_norm(ctx),
         }
     }
@@ -311,37 +264,35 @@ impl BatchDeduper {
                 "a union member's row facts do not match its batch".to_string(),
             ));
         }
+        let num_cols = batch.schema().len();
+        let seen = self.seen.get_or_insert_with(|| UnionFactSet::new(num_cols));
+        if seen.bindings() != num_cols {
+            return Err(QueryError::Internal(
+                "a union member's batch has another width than its first".to_string(),
+            ));
+        }
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let fact = |row: usize| facts.map(|f| FactRef::from(&f[row]));
         // A ground (all-constant) pattern emits the empty solution mapping
         // with no columns: one solution per fact it matched.
-        if batch.schema().is_empty() {
+        if num_cols == 0 {
             let mut kept = 0;
             for row in 0..batch.len() {
-                let key = UnionFact::of([], facts.map(|f| &f[row]), dicts, gv)?;
-                if self.seen.insert(key, ()).is_none() {
+                if seen.insert([], fact(row), dicts, gv)? {
                     kept += 1;
                 }
             }
             return Ok(Batch::empty_schema_with_len(kept));
         }
-        let num_cols = batch.schema().len();
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
         for row_idx in 0..batch.len() {
-            let key = UnionFact::of(
+            let new = seen.insert(
                 (0..num_cols).map(|col| batch.get_by_col(row_idx, col)),
-                facts.map(|f| &f[row_idx]),
+                fact(row_idx),
                 dicts,
                 gv,
             )?;
-            let mut h = FxHasher::default();
-            key.hash(&mut h);
-            let hash = h.finish();
-            let entry = self
-                .seen
-                .raw_entry_mut()
-                .from_hash(hash, |seen| *seen == key);
-            if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
-                v.insert_hashed_nocheck(hash, key, ());
+            if new {
                 for (col_idx, col) in columns.iter_mut().enumerate() {
                     col.push(batch.get_by_col(row_idx, col_idx).clone());
                 }

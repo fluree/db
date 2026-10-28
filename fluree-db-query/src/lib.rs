@@ -115,6 +115,7 @@ pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
 pub mod union;
+pub(crate) mod union_fact;
 pub mod unwind;
 pub mod values;
 pub mod var_registry;
