@@ -29,11 +29,14 @@ pub enum ManifestContent {
 }
 
 impl ManifestContent {
-    /// Parse from Avro integer value.
+    /// Classify a manifest-list `content` value (field 517): `0` is data, `1`
+    /// is deletes. Any other value is one this reader cannot classify, and it
+    /// is read as deletes: the merge-on-read guards then refuse the snapshot
+    /// with their typed error, rather than plan an unknown manifest as data.
     pub fn from_avro(value: i32) -> Self {
         match value {
-            1 => Self::Deletes,
-            _ => Self::Data,
+            0 => Self::Data,
+            _ => Self::Deletes,
         }
     }
 }
@@ -270,11 +273,18 @@ fn parse_manifest_list_entry(value: &AvroValue) -> Result<ManifestListEntry> {
         }
     };
 
-    // Optional fields with defaults
-    let content = match get_field("content") {
+    // `content` decides whether the merge-on-read guards see this manifest,
+    // so it fails closed. Absent or null is the spec's default, 0 (a v1 list
+    // has no such field, and v1 has no delete files). A present value is read
+    // through a `["null", "int"]` union, and anything that is not an `int` is
+    // as unclassifiable as an unknown `int`: both read as deletes.
+    let content = match field_value(record, "content") {
+        None | Some(AvroValue::Null) => ManifestContent::Data,
         Some(AvroValue::Int(i)) => ManifestContent::from_avro(*i),
-        _ => ManifestContent::Data,
+        Some(_) => ManifestContent::Deletes,
     };
+
+    // Optional fields with defaults
 
     let sequence_number = match get_field("sequence_number") {
         Some(AvroValue::Long(l)) => *l,
@@ -338,7 +348,7 @@ fn parse_manifest_list_entry(value: &AvroValue) -> Result<ManifestListEntry> {
 
 /// A field's value with the `["null", T]` union an optional v1 field is written
 /// as unwrapped, so a present value reads the same in v1 and v2.
-fn counter_value<'a>(record: &'a [(String, AvroValue)], name: &str) -> Option<&'a AvroValue> {
+fn field_value<'a>(record: &'a [(String, AvroValue)], name: &str) -> Option<&'a AvroValue> {
     let value = record.iter().find(|(n, _)| n == name).map(|(_, v)| v)?;
     Some(match value {
         AvroValue::Union(_, inner) => inner.as_ref(),
@@ -349,7 +359,7 @@ fn counter_value<'a>(record: &'a [(String, AvroValue)], name: &str) -> Option<&'
 /// An `int` counter under the first of `names` the record carries. `None` when
 /// it is absent, null, or not an integer that fits.
 fn int_counter(record: &[(String, AvroValue)], names: &[&str]) -> Option<i32> {
-    let value = names.iter().find_map(|name| counter_value(record, name))?;
+    let value = names.iter().find_map(|name| field_value(record, name))?;
     match value {
         AvroValue::Int(i) => Some(*i),
         AvroValue::Long(l) => i32::try_from(*l).ok(),
@@ -359,7 +369,7 @@ fn int_counter(record: &[(String, AvroValue)], names: &[&str]) -> Option<i32> {
 
 /// A `long` counter. `None` when it is absent, null, or not an integer.
 fn long_counter(record: &[(String, AvroValue)], name: &str) -> Option<i64> {
-    match counter_value(record, name)? {
+    match field_value(record, name)? {
         AvroValue::Long(l) => Some(*l),
         AvroValue::Int(i) => Some(i64::from(*i)),
         _ => None,
@@ -614,6 +624,80 @@ mod tests {
     fn test_manifest_content_from_avro() {
         assert_eq!(ManifestContent::from_avro(0), ManifestContent::Data);
         assert_eq!(ManifestContent::from_avro(1), ManifestContent::Deletes);
-        assert_eq!(ManifestContent::from_avro(99), ManifestContent::Data); // Unknown defaults to Data
+        // A value this reader cannot classify fails closed, as deletes.
+        assert_eq!(ManifestContent::from_avro(2), ManifestContent::Deletes);
+        assert_eq!(ManifestContent::from_avro(99), ManifestContent::Deletes);
+        assert_eq!(ManifestContent::from_avro(-1), ManifestContent::Deletes);
+    }
+
+    /// One manifest-list record whose `content` field has the schema
+    /// `content_type` (`None`: the field is absent) and the value `content`.
+    fn manifest_list_with_content(content_type: Option<&str>, content: Option<AvroValue>) -> Bytes {
+        let content_field = content_type
+            .map(|t| format!(r#", {{"name": "content", "type": {t}}}"#))
+            .unwrap_or_default();
+        let schema_json = format!(
+            r#"{{"type": "record", "name": "manifest_file", "fields": [
+                {{"name": "manifest_path", "type": "string"}},
+                {{"name": "manifest_length", "type": "long"}},
+                {{"name": "partition_spec_id", "type": "int"}},
+                {{"name": "added_snapshot_id", "type": "long"}}
+                {content_field}
+            ]}}"#
+        );
+        let schema = Schema::parse_str(&schema_json).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        let mut record = Record::new(writer.schema()).unwrap();
+        record.put("manifest_path", "s3://bucket/t/metadata/m.avro");
+        record.put("manifest_length", 10i64);
+        record.put("partition_spec_id", 0i32);
+        record.put("added_snapshot_id", 1i64);
+        if let Some(content) = content {
+            record.put("content", content);
+        }
+        writer.append(record).unwrap();
+        Bytes::from(writer.into_inner().unwrap())
+    }
+
+    fn parsed_content(data: &Bytes) -> ManifestContent {
+        parse_manifest_list_with_deletes(data, true).unwrap()[0].content
+    }
+
+    #[test]
+    fn a_union_wrapped_content_is_read_and_an_unknown_one_fails_closed() {
+        let union = Some(r#"["null", "int"]"#);
+        // A delete manifest written through a `["null", "int"]` union is one.
+        let wrapped_delete = manifest_list_with_content(
+            union,
+            Some(AvroValue::Union(1, Box::new(AvroValue::Int(1)))),
+        );
+        assert_eq!(parsed_content(&wrapped_delete), ManifestContent::Deletes);
+        assert!(
+            parse_manifest_list(&wrapped_delete).unwrap().is_empty(),
+            "the default parse filters it out as a delete manifest"
+        );
+        let wrapped_data = manifest_list_with_content(
+            union,
+            Some(AvroValue::Union(1, Box::new(AvroValue::Int(0)))),
+        );
+        assert_eq!(parsed_content(&wrapped_data), ManifestContent::Data);
+
+        // Null or absent is the spec's default, data (v1 has no delete files).
+        let null =
+            manifest_list_with_content(union, Some(AvroValue::Union(0, Box::new(AvroValue::Null))));
+        assert_eq!(parsed_content(&null), ManifestContent::Data);
+        let absent = manifest_list_with_content(None, None);
+        assert_eq!(parsed_content(&absent), ManifestContent::Data);
+
+        // A value this reader cannot classify is deletes, plain or wrapped.
+        let unknown = manifest_list_with_content(Some(r#""int""#), Some(AvroValue::Int(2)));
+        assert_eq!(parsed_content(&unknown), ManifestContent::Deletes);
+        let unknown_wrapped = manifest_list_with_content(
+            union,
+            Some(AvroValue::Union(1, Box::new(AvroValue::Int(7)))),
+        );
+        assert_eq!(parsed_content(&unknown_wrapped), ManifestContent::Deletes);
+        let not_an_int = manifest_list_with_content(Some(r#""long""#), Some(AvroValue::Long(0)));
+        assert_eq!(parsed_content(&not_an_int), ManifestContent::Deletes);
     }
 }

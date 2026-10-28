@@ -631,6 +631,12 @@ mod mor_guard_tests {
     /// writes. The delete manifest itself does not exist: it must never be
     /// read.
     fn bq_manifest_list_with_a_delete_manifest() -> Bytes {
+        bq_manifest_list_with_a_second_manifest(1)
+    }
+
+    /// The BigQuery manifest list with a second manifest beside its data
+    /// manifest, whose `content` is `content`.
+    fn bq_manifest_list_with_a_second_manifest(content_of_second: i32) -> Bytes {
         use apache_avro::types::{Record, Value as AvroValue};
         let data = crate::manifest::parse_manifest_list(&Bytes::from_static(BQ_MANIFEST_LIST))
             .unwrap()
@@ -655,7 +661,10 @@ mod mor_guard_tests {
         .unwrap();
         let mut writer = apache_avro::Writer::new(&schema, Vec::new());
         let delete_path = data.manifest_path.replace(".avro", "-deletes.avro");
-        for (path, content) in [(&data.manifest_path, 0i32), (&delete_path, 1i32)] {
+        for (path, content) in [
+            (&data.manifest_path, 0i32),
+            (&delete_path, content_of_second),
+        ] {
             let mut record = Record::new(writer.schema()).unwrap();
             record.put("manifest_path", AvroValue::String(path.clone()));
             record.put("manifest_length", 100i64);
@@ -759,6 +768,22 @@ mod mor_guard_tests {
             storage.read_paths().iter().all(|p| p == &list_path),
             "no manifest is read: {:?}",
             storage.read_paths()
+        );
+    }
+
+    /// A manifest whose `content` this reader cannot classify (the spec
+    /// defines only 0 and 1) is refused like a delete manifest, with the same
+    /// typed error, rather than planned as data.
+    #[tokio::test]
+    async fn a_manifest_of_unknown_content_is_refused_like_a_delete_manifest() {
+        let (metadata, storage) = bq_table(bq_manifest_list_with_a_second_manifest(2));
+        let err = SendScanPlanner::new(&storage, &metadata, ScanConfig::new())
+            .plan_scan()
+            .await
+            .expect_err("an unclassifiable manifest must fail closed");
+        assert!(
+            matches!(err, IcebergError::MergeOnReadDeletes(_)),
+            "{err:?}"
         );
     }
 }
