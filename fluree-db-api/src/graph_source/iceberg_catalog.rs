@@ -502,10 +502,11 @@ pub struct StatsCompleteness {
     pub manifests_read: usize,
     /// Whether any column carried lower/upper bounds in the manifests read.
     pub had_column_bounds: bool,
-    /// Whether the snapshot carries **merge-on-read delete files**, as its
-    /// manifest list shows (read by the Stats tier, and by the Schema tier when
-    /// it fills counts from the list). When `true`, the `row_count` / value /
-    /// null counts are **upper bounds**:
+    /// Whether the snapshot carries **merge-on-read delete files**: on the Stats
+    /// tier, as its manifest list shows; on the Schema tier, as its summary's
+    /// delete counters or (when it fills counts from the list) its manifest
+    /// list show. The Schema tier reports these rather than refusing them. When
+    /// `true`, the `row_count` / value / null counts are **upper bounds**:
     /// they sum live data-file records without subtracting position/equality
     /// deletes, so they are not exact.
     #[serde(default)]
@@ -703,18 +704,22 @@ pub(crate) fn table_schema_from_metadata(
     })
 }
 
-/// Run the zero-I/O snapshot-summary MoR guard (audit F-AUD-1) that BOTH preview
-/// tiers share, BEFORE any summary-derived count is surfaced. The Schema tier
-/// fills `row_count` from `total-records` and the Stats tier aggregates over the
-/// live data files; neither subtracts merge-on-read deletes, so both over-count a
-/// MoR snapshot. Mirrors the two scan planners (which run the same zero-I/O
-/// summary guard), so the preview can no longer return silent over-counts the
-/// planners would refuse.
+/// Run the zero-I/O snapshot-summary MoR guard (audit F-AUD-1) for the Stats
+/// tier, BEFORE any summary-derived count is surfaced. The Stats tier aggregates
+/// over the live data files without subtracting merge-on-read deletes, so it
+/// over-counts a MoR snapshot. Mirrors the two scan planners (which run the same
+/// zero-I/O summary guard), so the Stats tier cannot return silent over-counts
+/// the planners would refuse.
+///
+/// The Schema tier does not run it: it is display-only, so a snapshot whose
+/// summary reports deletes previews with its counts flagged as upper bounds
+/// (`has_delete_files` and the warning), as one whose manifest list shows
+/// delete manifests does. See [`preview_summary_guard_for`].
 ///
 /// Returns the operator override flag (`FLUREE_ICEBERG_ALLOW_MOR_DELETES`) so the
 /// Stats-tier manifest-list backstop reuses it and the env is read exactly once.
 /// `table_display` is the W2 "qualified (location)" identifier. Extracted so the
-/// two-tier guard is unit-testable without a live catalog.
+/// guard is unit-testable without a live catalog.
 fn preview_summary_guard(metadata: &TableMetadata, table_display: &str) -> Result<bool> {
     match metadata.current_snapshot() {
         Some(snapshot) => {
@@ -729,6 +734,21 @@ fn preview_summary_guard(metadata: &TableMetadata, table_display: &str) -> Resul
         // No current snapshot ⇒ no counts to over-count; still surface the
         // override flag for the (delete-free) Stats manifest path.
         None => Ok(fluree_db_iceberg::mor_deletes_allowed()),
+    }
+}
+
+/// The summary guard as `tier` applies it: the Stats tier refuses a snapshot
+/// whose summary reports deletes (unless overridden); the Schema tier is
+/// display-only and never refuses, so it reads the override as off (it reports
+/// deletes as upper bounds whether or not reads are allowed to proceed).
+fn preview_summary_guard_for(
+    tier: StatsTier,
+    metadata: &TableMetadata,
+    table_display: &str,
+) -> Result<bool> {
+    match tier {
+        StatsTier::Stats => preview_summary_guard(metadata, table_display),
+        StatsTier::Schema => Ok(false),
     }
 }
 
@@ -793,10 +813,12 @@ async fn preview_iceberg_table_in(
     // (they pass the location) plus the friendlier qualified name.
     let table_display = format!("{} ({})", table.qualified(), metadata.location);
 
-    // D1 (audit F-AUD-1): run the summary MoR guard for EVERY tier before any
-    // summary-derived count is surfaced. Returns the override flag reused by the
-    // Stats-tier manifest backstop below.
-    let allow_mor = preview_summary_guard(metadata, &table_display)?;
+    // D1 (audit F-AUD-1): run the summary MoR guard before any summary-derived
+    // count is surfaced. The Stats tier refuses a snapshot whose summary reports
+    // deletes; the display-only Schema tier flags it as upper bounds instead
+    // (below). Returns the override flag reused by the Stats-tier manifest
+    // backstop.
+    let allow_mor = preview_summary_guard_for(tier, metadata, &table_display)?;
 
     let mut schema = table_schema_from_metadata(&table, metadata)?;
 
@@ -804,9 +826,10 @@ async fn preview_iceberg_table_in(
         StatsTier::Schema => {
             // Schema tier reads no manifests, but its `row_count` comes from
             // `total-records`, else the manifest list; both over-count a MoR
-            // snapshot. Under the override the guard proceeded, so caveat the count.
+            // snapshot. It is display-only, so it never refuses: deletes either
+            // signal reports make the counts upper bounds, flagged as such.
             let mut warnings = Vec::new();
-            let has_delete_files =
+            let list_deletes =
                 schema_counts_from_manifest_list(cache, &mut schema, metadata, || async {
                     build_preview_storage(&conn, load.credentials.as_ref())
                         .await
@@ -816,7 +839,8 @@ async fn preview_iceberg_table_in(
             let summary_deletes = metadata
                 .current_snapshot()
                 .is_some_and(fluree_db_iceberg::summary_indicates_deletes);
-            if schema_counts_are_upper_bounds(allow_mor, has_delete_files, summary_deletes) {
+            let has_delete_files = schema_counts_are_upper_bounds(list_deletes, summary_deletes);
+            if has_delete_files {
                 warnings.push(MOR_UPPER_BOUND_WARNING.to_string());
             }
             Ok(TablePreview {
@@ -969,16 +993,11 @@ where
     totals.has_delete_manifests()
 }
 
-/// Whether a Schema-tier preview must caveat its counts as upper bounds: the
-/// manifest list it filled them from shows delete manifests (the tier reports
-/// these rather than refusing them), or the summary reports deletes and the
-/// read proceeded under the override (without it the summary guard refused).
-fn schema_counts_are_upper_bounds(
-    allow_mor: bool,
-    list_deletes: bool,
-    summary_deletes: bool,
-) -> bool {
-    list_deletes || preview_counts_are_upper_bounds(allow_mor, false, summary_deletes)
+/// Whether a Schema-tier preview's counts are upper bounds: the manifest list
+/// it filled them from shows delete manifests, or the summary reports deletes.
+/// The tier reports either rather than refusing it, override or not.
+fn schema_counts_are_upper_bounds(list_deletes: bool, summary_deletes: bool) -> bool {
+    list_deletes || summary_deletes
 }
 
 /// Lift an [`IcebergError`](fluree_db_iceberg::IcebergError) raised at a
@@ -1923,13 +1942,21 @@ mod tests {
     }
 
     #[test]
-    fn preview_summary_guard_refuses_mor_deletes_for_both_tiers() {
-        // D1: the summary guard runs BEFORE the tier split, so a single refusal
-        // covers Schema AND Stats (the tier arms are unreachable once it errors).
+    fn preview_summary_guard_refuses_mor_deletes_on_the_stats_tier_only() {
+        // D1: the summary guard runs BEFORE any summary-derived count, and the
+        // Stats tier refuses on it. The display-only Schema tier does not: it
+        // reports the deletes as upper bounds (see
+        // `summary_reported_deletes_preview_as_upper_bounds_on_the_schema_tier_only`).
         // Guard active: FLUREE_ICEBERG_ALLOW_MOR_DELETES is unset in the test env.
         let metadata = metadata_with_summary_deletes();
-        let err = preview_summary_guard(&metadata, "DW.SALES (s3://bucket/dw/sales)")
-            .expect_err("summary-reported deletes must refuse");
+        let display = "DW.SALES (s3://bucket/dw/sales)";
+        assert!(
+            !preview_summary_guard_for(StatsTier::Schema, &metadata, display)
+                .expect("the Schema tier is not refused"),
+            "and reads the override as off"
+        );
+        let err = preview_summary_guard_for(StatsTier::Stats, &metadata, display)
+            .expect_err("summary-reported deletes must refuse the Stats tier");
         // W3: typed error → 409 Conflict, not a 400 config error.
         assert_eq!(
             err.status_code(),
@@ -2507,22 +2534,75 @@ mod tests {
         assert!(list_deletes, "flagged");
         assert_eq!(schema.row_count, Some(1000));
         assert_eq!(schema.data_file_count, Some(1));
-        for allow_mor in [false, true] {
-            assert!(
-                schema_counts_are_upper_bounds(allow_mor, list_deletes, false),
-                "caveated with allow_mor = {allow_mor}"
-            );
-        }
+        assert!(
+            schema_counts_are_upper_bounds(list_deletes, false),
+            "caveated"
+        );
     }
 
     #[test]
     fn schema_counts_are_upper_bounds_only_when_a_delete_signal_fired() {
         // Neither signal: exact.
-        assert!(!schema_counts_are_upper_bounds(false, false, false));
-        assert!(!schema_counts_are_upper_bounds(true, false, false));
-        // The list: always an upper bound (this tier does not refuse it).
-        assert!(schema_counts_are_upper_bounds(false, true, false));
-        // The summary: an upper bound once the override let the read proceed.
-        assert!(schema_counts_are_upper_bounds(true, false, true));
+        assert!(!schema_counts_are_upper_bounds(false, false));
+        // Either signal is an upper bound; this tier refuses neither.
+        assert!(schema_counts_are_upper_bounds(true, false));
+        assert!(schema_counts_are_upper_bounds(false, true));
+        assert!(schema_counts_are_upper_bounds(true, true));
+    }
+
+    /// The Schema tier is display-only: a snapshot whose summary reports
+    /// deletes previews (no refusal), its counts flagged as upper bounds, as a
+    /// delete-bearing manifest list's are. The Stats tier still refuses it with
+    /// the typed 409. Through a REST catalog that returns the metadata inline;
+    /// the summary has both totals, so neither tier reaches storage first.
+    #[tokio::test]
+    async fn summary_reported_deletes_preview_as_upper_bounds_on_the_schema_tier_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut metadata: serde_json::Value = serde_json::from_str(SAMPLE_METADATA).unwrap();
+        let current = metadata["current-snapshot-id"].clone();
+        let snapshot = metadata["snapshots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["snapshot-id"] == current)
+            .unwrap();
+        snapshot["summary"]["total-position-deletes"] = serde_json::json!("3");
+        let catalog = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&catalog)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/dw/tables/sales"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": "s3://bucket/dw/sales/metadata/v1.metadata.json",
+                "metadata": metadata,
+            })))
+            .mount(&catalog)
+            .await;
+        let conn = || IcebergConnectionConfig::rest(catalog.uri());
+        let table = || TableIdentifier::new("dw", "sales");
+
+        let preview = preview_iceberg_table(conn(), table(), StatsTier::Schema)
+            .await
+            .expect("the Schema tier previews a snapshot whose summary reports deletes");
+        assert!(preview.stats_completeness.has_delete_files, "flagged");
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w == MOR_UPPER_BOUND_WARNING),
+            "{:?}",
+            preview.warnings
+        );
+        assert_eq!(preview.schema.row_count, Some(1000), "the summary's count");
+
+        let err = preview_iceberg_table(conn(), table(), StatsTier::Stats)
+            .await
+            .expect_err("the Stats tier still refuses it");
+        assert_eq!(err.status_code(), 409, "{err}");
     }
 }
