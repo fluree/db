@@ -1741,6 +1741,24 @@ impl BinaryIndexStore {
             .filter(|&dims| dims != 0)
     }
 
+    /// Whether `(g_id, p_id)` has a vector arena, so its rows may hold vector
+    /// objects. Their `o_key` is not a value identity even within the
+    /// predicate (`OType::o_key_is_predicate_identifying`), so a consumer that
+    /// keys objects on `(o_type, o_key)` declines when this holds.
+    pub fn holds_vectors(&self, g_id: GraphId, p_id: u32) -> bool {
+        self.graph_indexes
+            .get(&g_id)
+            .is_some_and(|gi| gi.vectors.contains_key(&p_id))
+    }
+
+    /// Whether any predicate of `g_id` has a vector arena (see
+    /// [`Self::holds_vectors`]).
+    pub fn graph_holds_vectors(&self, g_id: GraphId) -> bool {
+        self.graph_indexes
+            .get(&g_id)
+            .is_some_and(|gi| !gi.vectors.is_empty())
+    }
+
     /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
     ///
     /// See [`crate::arena::vector::LazyVectorArena::snapshot`] — scan loops
