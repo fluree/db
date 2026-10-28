@@ -1250,13 +1250,20 @@ async fn sparql_update_writes_an_iri_in_an_unseen_namespace() {
     )
     .await
     .expect("direct insert");
+    // The update also inserts a fact, so it commits: a namespace its
+    // retraction registered would land with that commit.
     let t_before_delete = fluree.ledger(id).await.expect("ledger").t();
     let deleted = update(
-        r#"DELETE { ex:s ex:ref ?o } WHERE { ex:s ex:p "a" BIND(IRI("http://never.example/o") AS ?o) }"#,
+        r#"DELETE { ex:s ex:ref ?o } INSERT { ex:s ex:p "e" }
+           WHERE { ex:s ex:p "a" BIND(IRI("http://never.example/o") AS ?o) }"#,
     )
     .await
     .expect("delete of an IRI nothing holds");
-    assert_eq!(deleted, t_before_delete, "the delete retracts nothing");
+    assert_eq!(
+        deleted,
+        t_before_delete + 1,
+        "the update commits its insert"
+    );
 
     let ledger = fluree.ledger(id).await.expect("ledger");
     let rows = support::query_sparql_formatted(
