@@ -241,6 +241,15 @@ const CASES: &[(&str, &str, &str, &str, &[&str])] = &[
         "",
         &["s", "o", "t"],
     ),
+    // The second pattern reads every list by its terms, the first names
+    // them as it scans: a head cell joins only if both give a list one name.
+    (
+        "one list met twice",
+        "?s ?s2",
+        "{in} ?s ex:items ?o . ?s2 ex:items ?o",
+        "",
+        &["s", "s2"],
+    ),
     (
         "in each named graph",
         "?g ?s ?o",
