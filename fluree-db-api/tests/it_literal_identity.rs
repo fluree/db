@@ -1019,8 +1019,8 @@ async fn unseen_datatype_literal_from_an_expression_is_a_term() {
         (
             "STRDT over a stored value",
             format!(
-                r#"SELECT (DATATYPE(?x) AS ?d) (STR(?x) AS ?l)
-                   WHERE {{ ex:s1 ex:p ?v BIND(STRDT(?v, {t}) AS ?x) }}"#
+                r"SELECT (DATATYPE(?x) AS ?d) (STR(?x) AS ?l)
+                   WHERE {{ ex:s1 ex:p ?v BIND(STRDT(?v, {t}) AS ?x) }}"
             ),
             json!([[UNSEEN_DT, "a"]]),
         ),
@@ -1058,9 +1058,9 @@ async fn unseen_datatype_literal_from_an_expression_is_a_term() {
         (
             "DATATYPE of the literal, bound or not, joins as one term",
             format!(
-                r#"SELECT ?a WHERE {{ ex:s1 ex:p ?v BIND(DATATYPE(STRDT(?v, {t})) AS ?d)
+                r"SELECT ?a WHERE {{ ex:s1 ex:p ?v BIND(DATATYPE(STRDT(?v, {t})) AS ?d)
                      {{ SELECT ?d ?a WHERE {{ ex:s1 ex:p ?w BIND(STRDT(?w, {t}) AS ?y)
-                                             BIND(DATATYPE(?y) AS ?d) BIND(1 AS ?a) }} }} }}"#
+                                             BIND(DATATYPE(?y) AS ?d) BIND(1 AS ?a) }} }} }}"
             ),
             json!([[1]]),
         ),
@@ -1075,9 +1075,9 @@ async fn unseen_datatype_literal_from_an_expression_is_a_term() {
         (
             "DATATYPE of the literal, bound or not, prints one way",
             format!(
-                r#"PREFIX nw: <http://nowhere.example/>
+                r"PREFIX nw: <http://nowhere.example/>
                    SELECT ?bound ?unbound WHERE {{ ex:s1 ex:p ?v BIND(STRDT(?v, {t}) AS ?x)
-                     BIND(DATATYPE(?x) AS ?bound) BIND(DATATYPE(STRDT(?v, {t})) AS ?unbound) }}"#
+                     BIND(DATATYPE(?x) AS ?bound) BIND(DATATYPE(STRDT(?v, {t})) AS ?unbound) }}"
             ),
             json!([["nw:T", "nw:T"]]),
         ),
@@ -1348,14 +1348,14 @@ async fn an_unseen_datatype_literal_is_stored_under_its_namespace_code() {
         ),
         (
             "one stored term per predicate",
-            r#"SELECT ?p (COUNT(DISTINCT ?o) AS ?n)
-               WHERE { VALUES ?p { ex:p ex:q ex:r ex:t } ?s ?p ?o } GROUP BY ?p ORDER BY ?p"#,
+            r"SELECT ?p (COUNT(DISTINCT ?o) AS ?n)
+               WHERE { VALUES ?p { ex:p ex:q ex:r ex:t } ?s ?p ?o } GROUP BY ?p ORDER BY ?p",
             json!([["ex:p", 1], ["ex:q", 1], ["ex:r", 1], ["ex:t", 1]]),
         ),
         (
             "DATATYPE reads the IRI back",
-            r#"SELECT DISTINCT ?p (DATATYPE(?o) AS ?d)
-               WHERE { VALUES ?p { ex:p ex:q ex:r ex:t } ?s ?p ?o } ORDER BY ?p"#,
+            r"SELECT DISTINCT ?p (DATATYPE(?o) AS ?d)
+               WHERE { VALUES ?p { ex:p ex:q ex:r ex:t } ?s ?p ?o } ORDER BY ?p",
             json!([
                 ["ex:p", "http://nowhere.example/T"],
                 ["ex:q", "http://typed.example/U"],
