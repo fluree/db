@@ -829,18 +829,66 @@ fn triangles(ns: &[u8]) -> Rows {
 /// a fact two members both hold is one solution. A fact is identified with its
 /// list position, so a list's repeated value stays two rows in a union, as in
 /// one graph.
-pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
+///
+/// A list reads as JSON-LD reads it, its members values of the owning
+/// predicate; SPARQL reads it as the RDF it denotes (#2159), see
+/// [`sparql_list_view`].
+pub fn expected(shape: Shape, graphs: Graphs, state: State, surface: Surface) -> Rows {
+    let rows = expected_members(shape, graphs, state);
+    match surface {
+        Surface::JsonLd => rows,
+        Surface::Sparql => sparql_list_view(shape, graphs, rows),
+    }
+}
+
+/// SPARQL's reading of the fixture's one list, `L items ("v" "v")` in g2
+/// (#2159): an owner edge to the list's head cell and, per member, a cell's
+/// `rdf:first` and `rdf:rest`. So a scope holding g2 counts `items` once and
+/// two each of `rdf:first` and `rdf:rest`, where JSON-LD counts its two
+/// members as `items`. No other shape reads `items`, `rdf:first` or
+/// `rdf:rest`.
+fn sparql_list_view(shape: Shape, graphs: Graphs, mut rows: Rows) -> Rows {
+    const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
+    const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
+    if shape != Shape::PerPredicateCount {
+        return rows;
+    }
+    let mut cells = Vec::new();
+    for row in &mut rows {
+        // `[p, c]`, or `[graph, p, c]` per named graph.
+        let (graph, p, c) = match row.as_slice() {
+            [p, c] => (None, p.clone(), c.clone()),
+            [g, p, c] => (Some(g.clone()), p.clone(), c.clone()),
+            _ => continue,
+        };
+        if p != "items" {
+            continue;
+        }
+        assert_eq!(c, "2", "{graphs:?}: the fixture's one list has two members");
+        *row.last_mut().expect("count") = "1".to_string();
+        for pred in [RDF_FIRST, RDF_REST] {
+            let mut cell = graph.iter().cloned().collect::<Vec<_>>();
+            cell.extend([pred.to_string(), "2".to_string()]);
+            cells.push(cell);
+        }
+    }
+    rows.extend(cells);
+    rows.sort();
+    rows
+}
+
+fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
     // With the write at t 2 (Novelty, Indexed2), g2 holds k4, `s3 n 4` and all
     // of t2.
     let w = state != State::Indexed;
     match graphs {
         // The empty default graph holds no fact, so it adds no solution.
-        Graphs::G1G2WithEmptyG0 => expected(shape, Graphs::G1G2, state),
-        Graphs::G1WithEmptyG0 => expected(shape, Graphs::G1, state),
+        Graphs::G1G2WithEmptyG0 => expected_members(shape, Graphs::G1G2, state),
+        Graphs::G1WithEmptyG0 => expected_members(shape, Graphs::G1, state),
         Graphs::PerNamedGraph => {
             let mut out = Rows::new();
             for (iri, g) in [(G1, Graphs::G1), (G2, Graphs::G2)] {
-                for mut row in expected(shape, g, state) {
+                for mut row in expected_members(shape, g, state) {
                     row.insert(0, iri.to_string());
                     out.push(row);
                 }
@@ -1272,7 +1320,7 @@ pub async fn check(
     failures: &mut Vec<String>,
 ) -> Run {
     let run = run(fx, scope, shape, surface).await;
-    let want = expected(shape, scope.graphs(), scope.answer_state(fx.state));
+    let want = expected(shape, scope.graphs(), scope.answer_state(fx.state), surface);
     for (lane, got) in [
         ("fast paths on", &run.fast),
         ("fast paths off", &run.generic),
