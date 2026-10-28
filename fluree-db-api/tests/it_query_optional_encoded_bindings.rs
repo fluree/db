@@ -2006,6 +2006,83 @@ async fn cyclic_union_lane_reads_past_an_empty_member() {
     failures.assert_none();
 }
 
+/// A triangle whose closing edge is a list. `c ex:knows ( a )` in g3 is, in
+/// SPARQL (#2159), an owner edge from c to the list's head cell, whose
+/// `rdf:first` is a: there is no edge `c → a`, so over g2 and g3 no triangle
+/// closes. The block holds a list-view triple, which the cyclic join does not
+/// read, and its union site says so with `fallback:list_view`. JSON-LD reads
+/// the member as a value of `ex:knows`, so the triangle closes three ways
+/// round, and the union variant answers it.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
+    let ledger_id = "it/cyclic-lane-lists:main";
+    let trig = r"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g2> { ex:a ex:knows ex:b . ex:b ex:knows ex:c . }
+        GRAPH <urn:g3> { ex:c ex:knows ( ex:a ) . }
+    ";
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let mut failures = Failures::default();
+    for (label, prologue, ds) in [
+        ("FROM g2 + g3", "", "FROM <urn:g2> FROM <urn:g3>"),
+        ("the union default graph", UNION_PRAGMA, ""),
+    ] {
+        let query = format!(
+            "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
+             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
+        );
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["x", "y", "z"]), rows(&[]), label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        failures.eq(
+            stamps(&store, before, "cyclic_bgp_union"),
+            vec!["fallback:list_view".to_string()],
+            &format!("{label}: `cyclic_bgp_union` stamps"),
+        );
+        failures.eq(
+            stamps(&store, before, "cyclic_bgp"),
+            Vec::<String>::new(),
+            &format!("{label}: `cyclic_bgp` stamps"),
+        );
+    }
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "cyclic_bgp_union",
+        JsonLaneCase {
+            label: "JSON-LD, FROM g2 + g3: the list's member closes the triangle",
+            query: json!({
+                "@context": {"ex": EX},
+                "from": [
+                    {"@id": ledger_id, "graph": "urn:g2"},
+                    {"@id": ledger_id, "graph": "urn:g3"}
+                ],
+                "select": ["?x", "?y", "?z"],
+                "where": [
+                    {"@id": "?x", "ex:knows": "?y"},
+                    {"@id": "?y", "ex:knows": "?z"},
+                    {"@id": "?z", "ex:knows": "?x"}
+                ]
+            }),
+            want: rows(&[&["a", "b", "c"], &["b", "c", "a"], &["c", "a", "b"]]),
+            must_fire: true,
+        },
+        &mut failures,
+    )
+    .await;
+    failures.assert_none();
+}
+
 /// The cyclic join's union variant sits behind the fast-path kill switch, so
 /// the general plan stays its oracle: with the switch on, the variant stamps
 /// its own site `fallback:kill_switch` and the general plan answers. The
