@@ -532,8 +532,10 @@ fn merge_two<O: MergeOrder>(a: &mut Lane<'_>, b: &mut Lane<'_>, out: &mut Emitte
 /// `head`: walk the rows they both hold in lockstep while the two stay equal,
 /// `a` emitting each and `b` stepping past its copy, which would be dropped
 /// as a repeat. One key read per lane and one comparison per row pair.
-/// Returns the two new heads, or `None` when either batch is used up.
-#[inline]
+/// Returns the two new heads, or `None` when either batch is used up. Kept
+/// out of line: a stretch is one call however many rows it walks, and
+/// inlined it slows the two-input loop's step where members interleave.
+#[inline(never)]
 fn shared_stretch<O: MergeOrder>(
     a: &mut Lane<'_>,
     b: &mut Lane<'_>,
@@ -610,6 +612,9 @@ fn constant_shared_prefix(a: &Lane<'_>, b: &Lane<'_>) -> Option<usize> {
 fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
     let mut heads: SmallVec<[Key; LINEAR_MERGE_MAX_INPUTS]> =
         lanes.iter().map(Lane::head).collect();
+    // A slice once: indexing the `SmallVec` itself checks where its items
+    // live on every access, a branch per head per step.
+    let heads = heads.as_mut_slice();
     loop {
         // The smallest head (the earlier input on a tie) and the smallest of
         // the others.
