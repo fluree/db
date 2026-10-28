@@ -1245,6 +1245,14 @@ async fn lists_in(
     Ok(found)
 }
 
+/// `predicates` in a fixed order, so a read across them meets, and so names,
+/// their lists in the same order on every request.
+fn in_order(predicates: &HashSet<Sid>) -> impl Iterator<Item = &Sid> {
+    let mut sorted: Vec<&Sid> = predicates.iter().collect();
+    sorted.sort_unstable();
+    sorted.into_iter()
+}
+
 async fn read_lists_in(
     ctx: &ExecutionContext<'_>,
     graph: &PathGraph<'_>,
@@ -1266,8 +1274,7 @@ async fn read_lists_in(
             )]
         }
         (Want::Node(s), Want::Any) => match &view.predicates {
-            Some(predicates) => predicates
-                .iter()
+            Some(predicates) => in_order(predicates)
                 .map(|p| {
                     let at = RangeMatch::new()
                         .with_subject(s.clone())
@@ -1284,8 +1291,7 @@ async fn read_lists_in(
             vec![(IndexType::Psot, RangeMatch::new().with_predicate(p.clone()))]
         }
         (Want::Any, Want::Any) => match &view.predicates {
-            Some(predicates) => predicates
-                .iter()
+            Some(predicates) => in_order(predicates)
                 .map(|p| (IndexType::Psot, RangeMatch::new().with_predicate(p.clone())))
                 .collect(),
             None => vec![(IndexType::Spot, RangeMatch::new())],
