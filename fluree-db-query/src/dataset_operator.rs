@@ -106,6 +106,8 @@ pub struct ScanDatasetBuilder {
     schema: Arc<[VarId]>,
     /// Scan with [`BinaryScanOperator::hiding_list_members`].
     hide_list_members: bool,
+    /// Scan with [`BinaryScanOperator::listing_owners`] of this view.
+    list_owners: Option<Arc<crate::list_view::ListView>>,
 }
 
 impl ScanDatasetBuilder {
@@ -128,6 +130,7 @@ impl ScanDatasetBuilder {
             mode,
             schema,
             hide_list_members: false,
+            list_owners: None,
         }
     }
 
@@ -173,10 +176,10 @@ impl DatasetBuilder for ScanDatasetBuilder {
                     self.emit,
                     self.index_hint,
                 );
-                Ok(Box::new(if self.hide_list_members {
-                    scan.hiding_list_members()
-                } else {
-                    scan
+                Ok(Box::new(match &self.list_owners {
+                    Some(view) => scan.listing_owners(Arc::clone(view)),
+                    None if self.hide_list_members => scan.hiding_list_members(),
+                    None => scan,
                 }))
             }
         }
@@ -431,6 +434,26 @@ impl DatasetOperator {
         let mut builder =
             ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
         builder.hide_list_members = true;
+        let mut op = Self::new(Box::new(builder));
+        op.mode = mode;
+        op
+    }
+
+    /// [`Self::scan`] of `pattern` in `view`'s reading of lists: its stored
+    /// rows that are not list members, and each list's owner edge (see
+    /// [`BinaryScanOperator::listing_owners`]).
+    pub fn scan_listing_owners(
+        pattern: TriplePattern,
+        object_bounds: Option<ObjectBounds>,
+        emit: EmitMask,
+        index_hint: Option<IndexType>,
+        mode: TemporalMode,
+        view: Arc<crate::list_view::ListView>,
+    ) -> Self {
+        let mut builder =
+            ScanDatasetBuilder::new(pattern, object_bounds, Vec::new(), emit, index_hint, mode);
+        builder.hide_list_members = true;
+        builder.list_owners = Some(view);
         let mut op = Self::new(Box::new(builder));
         op.mode = mode;
         op

@@ -2679,7 +2679,12 @@ pub fn build_where_operators_seeded_with_needed(
     let needs_empty_seed = seed.is_none()
         && !matches!(
             patterns.first(),
-            Some(Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. })
+            Some(
+                Pattern::Triple(_)
+                    | Pattern::ListView(_)
+                    | Pattern::Values { .. }
+                    | Pattern::Bind { .. }
+            )
         );
 
     // Start with provided seed, else start with empty operator if needed
@@ -3564,6 +3569,33 @@ fn build_list_view_triple(
     hash_planner: &HashJoinPlanner,
 ) -> BoxedOperator {
     use crate::list_view::{HeldRows, ListAugmentOperator, ListTeeOperator};
+    // With no input, a pattern whose list triples are its lists' owner edges
+    // is one scan: it skips the members and emits each owner edge as it meets
+    // the list, so a LIMIT stops it like any scan.
+    if left.is_none()
+        && crate::list_view::owner_edges_answer(tp)
+        && tp
+            .o
+            .as_var()
+            .is_none_or(|o| !object_bounds.contains_key(&o))
+    {
+        let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
+        let emit = if planning.multi_default_graph {
+            EmitMask::ALL
+        } else {
+            emit
+        };
+        return Box::new(
+            crate::dataset_operator::DatasetOperator::scan_listing_owners(
+                tp.clone(),
+                None,
+                emit,
+                index_hint,
+                planning.mode(),
+                Arc::clone(view),
+            ),
+        );
+    }
     let (left, held) = match left {
         Some(left) => {
             let held = HeldRows::default();

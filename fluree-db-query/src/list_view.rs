@@ -433,6 +433,18 @@ fn rewrite_pattern(
     }
 }
 
+/// Whether `t`'s list triples are exactly the owner edges of the lists on its
+/// predicate, so that a scan listing owners (`BinaryScanOperator::
+/// listing_owners`) answers it in one pass: `?s <p> ?o` with two distinct
+/// variables, `<p>` neither `rdf:first` nor `rdf:rest` (whose list triples
+/// are cells), and no datatype constraint.
+pub(crate) fn owner_edges_answer(t: &TriplePattern) -> bool {
+    let (Ref::Var(s), Ref::Sid(p), Term::Var(o)) = (&t.s, &t.p, &t.o) else {
+        return false;
+    };
+    s != o && t.dtc.is_none() && !is_rdf_first(p) && !is_rdf_rest(p)
+}
+
 /// `patterns` with each list-view pattern its triple again, for a graph that
 /// holds no RDF lists, such as an R2RML graph source.
 pub fn without_list_view(patterns: &[Pattern]) -> Vec<Pattern> {
