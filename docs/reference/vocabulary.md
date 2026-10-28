@@ -369,6 +369,7 @@ These predicates define ledger-level configuration stored in the config graph. S
 |-----------|----------|-------------|
 | `f:shaclEnabled` | `https://ns.flur.ee/db#shaclEnabled` | Enable/disable SHACL validation (boolean) |
 | `f:shapesSource` | `https://ns.flur.ee/db#shapesSource` | Graph containing SHACL shapes (GraphRef) |
+| `f:classMembershipSource` | `https://ns.flur.ee/db#classMembershipSource` | Extra graph consulted for `sh:class` membership (GraphRef, repeatable) |
 | `f:validationMode` | `https://ns.flur.ee/db#validationMode` | `f:ValidationReject` or `f:ValidationWarn` |
 
 ### Reasoning fields

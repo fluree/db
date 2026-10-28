@@ -101,6 +101,9 @@ pub struct ShaclDefaults {
     pub enabled: Option<bool>,
     /// `f:shapesSource` — reference to graph containing SHACL shapes.
     pub shapes_source: Option<GraphSourceRef>,
+    /// `f:classMembershipSource` — extra graphs whose `rdf:type` triples count
+    /// for `sh:class`, beyond the focus node's graph and the shapes source.
+    pub class_membership_sources: Vec<GraphSourceRef>,
     /// `f:validationMode` — reject or warn on validation failure.
     pub validation_mode: Option<ValidationMode>,
     /// Override control for this setting group.
@@ -280,6 +283,7 @@ impl ShaclDefaults {
     pub fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.shapes_source.is_none()
+            && self.class_membership_sources.is_empty()
             && self.validation_mode.is_none()
             && self.override_control.is_default()
     }

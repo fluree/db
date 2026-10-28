@@ -3949,6 +3949,175 @@ async fn shacl_class_value_set_in_shapes_graph() {
     );
 }
 
+/// Shapes graph, catalog graph and config for the `f:classMembershipSource`
+/// tests: listings must reference an `ex:Commodity`, and the commodities are
+/// typed in their own catalog graph, which is neither the focus graph nor the
+/// shapes source.
+#[cfg(feature = "shacl")]
+fn catalog_membership_trig(ledger_id: &str, with_membership_source: bool) -> String {
+    let config_iri = config_graph_iri(ledger_id);
+    let membership_source = if with_membership_source {
+        r"
+            <urn:config:shacl> f:classMembershipSource <urn:config:catalog-ref> .
+            <urn:config:catalog-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:config:catalog-source> .
+            <urn:config:catalog-source> f:graphSelector <http://example.org/catalog> ."
+    } else {
+        ""
+    };
+    format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://example.org/> .
+
+        GRAPH <http://example.org/shapes> {{
+            ex:ListingShape rdf:type sh:NodeShape ;
+                            sh:targetClass ex:Listing ;
+                            sh:property ex:lshape_commodity .
+            ex:lshape_commodity sh:path ex:commodity ;
+                                sh:class ex:Commodity .
+        }}
+
+        GRAPH <http://example.org/catalog> {{
+            ex:coffee rdf:type ex:Commodity .
+        }}
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true .
+            <urn:config:shacl> f:shapesSource <urn:config:shapes-ref> .
+            <urn:config:shapes-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:shapes-source> .
+            <urn:config:shapes-source> f:graphSelector <http://example.org/shapes> .{membership_source}
+        }}
+    "
+    )
+}
+
+#[cfg(feature = "shacl")]
+fn listing_in_org_graph(id: &str, commodity: &str) -> String {
+    format!(
+        r"
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex: <http://example.org/> .
+        GRAPH <http://example.org/org-a> {{
+            ex:{id} rdf:type ex:Listing ;
+                    ex:commodity ex:{commodity} .
+        }}
+    "
+    )
+}
+
+#[cfg(feature = "shacl")]
+fn assert_shacl_violation(err: fluree_db_api::ApiError, why: &str) {
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "{why}: {err:?}"
+    );
+}
+
+/// Without `f:classMembershipSource`, membership is the focus graph plus the
+/// shapes source only, so a type asserted in a separate catalog graph doesn't
+/// count.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_class_ignores_other_graphs_without_membership_source() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-class-catalog-unlisted:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&catalog_membership_trig(ledger_id, false))
+        .execute()
+        .await
+        .expect("config + shapes + catalog write should succeed")
+        .ledger;
+
+    let err = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&listing_in_org_graph("listing-1", "coffee"))
+        .execute()
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "the catalog graph is not consulted unless configured");
+}
+
+/// `f:classMembershipSource` adds a graph to the `sh:class` membership lookup,
+/// so data in one named graph can reference members typed in a dedicated
+/// catalog graph while non-members are still rejected.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_class_membership_source_adds_a_catalog_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-class-catalog-listed:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&catalog_membership_trig(ledger_id, true))
+        .execute()
+        .await
+        .expect("config + shapes + catalog write should succeed")
+        .ledger;
+
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&listing_in_org_graph("listing-1", "coffee"))
+        .execute()
+        .await
+        .expect("a commodity typed in the configured catalog graph satisfies sh:class")
+        .ledger;
+
+    let err = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&listing_in_org_graph("listing-2", "tea"))
+        .execute()
+        .await
+        .unwrap_err();
+    assert_shacl_violation(
+        err,
+        "a value typed in no consulted graph must still be rejected",
+    );
+}
+
+/// An unknown `f:classMembershipSource` graph fails like an unknown
+/// `f:shapesSource` instead of being silently skipped.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_class_membership_source_rejects_unknown_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-class-catalog-missing:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let trig = catalog_membership_trig(ledger_id, true).replace(
+        "f:graphSelector <http://example.org/catalog>",
+        "f:graphSelector <http://example.org/nowhere>",
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config + shapes + catalog write should succeed")
+        .ledger;
+
+    let err = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&listing_in_org_graph("listing-1", "coffee"))
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}")
+            .contains("f:classMembershipSource graph 'http://example.org/nowhere' not found"),
+        "an unknown membership graph must be reported: {err:?}"
+    );
+}
+
 // =============================================================================
 // Test 15d: Per-graph SHACL enable/disable
 // =============================================================================

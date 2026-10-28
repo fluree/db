@@ -179,7 +179,7 @@ Not all fields in a setting group are overridable. Source pointers (where rules/
 | Subsystem | Overridable fields | Non-overridable (config-only) |
 |-----------|-------------------|-------------------------------|
 | `f:policyDefaults` | `f:defaultAllow`, `f:policyClass` | `f:policySource` |
-| `f:shaclDefaults` | `f:validationMode`, `f:shaclEnabled` | `f:shapesSource` |
+| `f:shaclDefaults` | `f:validationMode`, `f:shaclEnabled` | `f:shapesSource`, `f:classMembershipSource` |
 | `f:reasoningDefaults` | `f:reasoningModes` | `f:schemaSource` |
 | `f:datalogDefaults` | `f:datalogEnabled`, `f:allowQueryTimeRules` | `f:rulesSource` |
 

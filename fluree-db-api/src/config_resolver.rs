@@ -1267,6 +1267,11 @@ impl MergeableGroup for ShaclDefaults {
         ShaclDefaults {
             enabled: self.enabled.or(base.enabled),
             shapes_source: self.shapes_source.clone().or(base.shapes_source.clone()),
+            class_membership_sources: if self.class_membership_sources.is_empty() {
+                base.class_membership_sources.clone()
+            } else {
+                self.class_membership_sources.clone()
+            },
             validation_mode: self.validation_mode.or(base.validation_mode),
             override_control: base.override_control.effective_min(&self.override_control),
         }
@@ -1834,12 +1839,21 @@ async fn read_shacl_fields(
         config_iris::SHAPES_SOURCE,
     )
     .await?;
+    let class_membership_sources = read_graph_source_refs(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::CLASS_MEMBERSHIP_SOURCE,
+    )
+    .await?;
     let validation_mode = read_validation_mode(snapshot, overlay, to_t, group_sid).await?;
     let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
     Ok(ShaclDefaults {
         enabled,
         shapes_source,
+        class_membership_sources,
         validation_mode,
         override_control,
     })
@@ -2938,6 +2952,7 @@ mod tests {
             shacl: Some(ShaclDefaults {
                 enabled: Some(true),
                 shapes_source: None,
+                class_membership_sources: Vec::new(),
                 validation_mode: Some(ValidationMode::Reject),
                 override_control: control,
             }),
@@ -2970,6 +2985,7 @@ mod tests {
             shacl: Some(ShaclDefaults {
                 enabled: Some(true),
                 shapes_source: None,
+                class_membership_sources: Vec::new(),
                 validation_mode: Some(ValidationMode::Warn),
                 override_control: OverrideControl::None,
             }),
