@@ -2065,6 +2065,17 @@ impl NestedLoopJoinOperator {
     fn plan_union_probe(&self, ctx: &ExecutionContext<'_>) -> Result<Option<UnionProbe>> {
         use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::index_scope::IndexScope;
+        if self.hide_list_members {
+            // SPARQL reads this triple through its view of RDF lists, which no
+            // stored row is (`hiding_list_members` turned the probes off).
+            if let Some(IndexScope::Union(_)) = ctx.index_scope_policy_cleared() {
+                stamp_fast_path(
+                    NESTED_LOOP_BATCHED_UNION_SITE,
+                    FastPathOutcome::Fallback(FastPathFallback::ListView),
+                );
+            }
+            return Ok(None);
+        }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
         {
             return Ok(None);

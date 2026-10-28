@@ -164,6 +164,18 @@ async fn lane_f_union_probes_answer_by_fact() {
                         _ => (&[union_site], &["nested-loop-batched"]),
                     };
                     check_lane_f(&label(name), &run, &want, fire, not_fire, &mut failures);
+                    // The union probe names why it stood down on the list view.
+                    if list_view
+                        && !run.fell_back.iter().any(|(site, outcome)| {
+                            site == "nested-loop-batched-union" && outcome == "fallback:list_view"
+                        })
+                    {
+                        failures.push(format!(
+                            "{}: no `fallback:list_view` at the union site ({:?})",
+                            label(name),
+                            run.fell_back
+                        ));
+                    }
                 }
                 // Over one graph the one-graph operators answer: the batched
                 // probes for the subject and existence joins (the planner picks
