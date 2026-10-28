@@ -15,10 +15,10 @@
 #[path = "support/span_capture.rs"]
 mod span_capture;
 
-use fluree_db_api::dataset::GraphSelector;
+use fluree_db_api::dataset::GraphSel;
 use fluree_db_api::{
-    DatasetSpec, Fluree, FlureeBuilder, GraphDb, GraphSource, LedgerHandle, ReindexOptions,
-    TimeSpec,
+    DatasetSpec, Fluree, FlureeBuilder, GraphDb, GraphSource, LedgerHandle, LedgerRef,
+    ReindexOptions, TimeSpec,
 };
 use serde_json::{json, Value as JsonValue};
 use span_capture::{init_test_tracing, SpanStore};
@@ -343,10 +343,19 @@ async fn index_scope_of_every_dataset_scope() {
     check(&fluree, cases).await;
 }
 
+/// The source naming the graph `iri` of `ledger`.
+fn graph_of(ledger: &str, iri: &str) -> GraphSource {
+    GraphSource::ledger(
+        LedgerRef::parse(ledger)
+            .expect("ledger")
+            .with_graph(GraphSel::parse(iri).expect("graph")),
+    )
+}
+
 /// `FROM <L#g1> FROM <L#g2>`, read at `at` (`None`: the head).
 fn from_two_graphs(at: Option<i64>) -> DatasetSpec {
     let source = |iri: &str| {
-        let s = GraphSource::new(LEDGER).with_graph(GraphSelector::Iri(iri.into()));
+        let s = graph_of(LEDGER, iri);
         match at {
             Some(t) => s.with_time(TimeSpec::AtT(t)),
             None => s,
@@ -432,10 +441,8 @@ async fn from_several_graphs_shares_one_load_of_the_ledger() {
     );
     // One ledger spelled two ways (`it/index-scope` names the `main` branch).
     let spelled_twice = DatasetSpec::new()
-        .with_default(
-            GraphSource::new("it/index-scope").with_graph(GraphSelector::Iri("urn:g1".into())),
-        )
-        .with_default(GraphSource::new(LEDGER).with_graph(GraphSelector::Iri("urn:g2".into())));
+        .with_default(graph_of("it/index-scope", "urn:g1"))
+        .with_default(graph_of(LEDGER, "urn:g2"));
     expect(
         "without the ledger cache, one ledger spelled two ways",
         scope_of(&uncached, &spelled_twice).await,

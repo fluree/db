@@ -444,6 +444,11 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
         ApiError::CommitContention { .. } => SubmissionError::CommitContention {
             message: err.to_string(),
         },
+        ApiError::Transact(fluree_db_api::TransactError::IndexNotLoaded(_)) => {
+            SubmissionError::IndexNotLoaded {
+                message: err.to_string(),
+            }
+        }
         _ => SubmissionError::Execution {
             status: err.status_code(),
             message: err.to_string(),

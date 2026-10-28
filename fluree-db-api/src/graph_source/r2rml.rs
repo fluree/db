@@ -86,19 +86,12 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
     cpus.min(num_files.max(1)).clamp(1, 32)
 }
 
-/// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
-/// catalog client cache. A config *edit* (including a secret written inline)
-/// yields a new fingerprint and a freshly built client. Note this hashes the raw
-/// JSON only: a secret referenced by env var / secret store is stored as that
-/// reference, so rotating the underlying secret leaves the fingerprint unchanged
-/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
-/// fingerprint, is what bounds staleness in that case.
-/// The R2RML mapping reference carried by a mapped graph-source record, per
-/// source family. `None` for a non-mapped type, an unparseable config, or a
-/// record registered without a mapping.
-/// The Iceberg-only paths (snapshot pinning, incremental materialization,
-/// tracking) parse the record as `IcebergGsConfig`; a SQL record would fail
-/// that parse with a misleading message. Refuse it by name instead.
+/// The Iceberg-only paths (materialization, tracking, the collecting
+/// incremental scan) parse the record as `IcebergGsConfig`; a SQL or Delta
+/// record would fail that parse with a misleading message. Refuse it by name
+/// instead. A Delta source is pinned and read whole before reaching these: see
+/// [`FlureeR2rmlProvider::current_snapshot_id`] and
+/// [`FlureeR2rmlProvider::scan_for_materialize_stream`].
 fn require_iceberg_backed(
     record: &fluree_db_nameservice::GraphSourceRecord,
     graph_source_id: &str,
@@ -122,6 +115,9 @@ fn require_iceberg_backed(
     Ok(())
 }
 
+/// The R2RML mapping reference carried by a mapped graph-source record, per
+/// source family. `None` for a non-mapped type, an unparseable config, or a
+/// record registered without a mapping.
 pub(crate) fn mapping_source_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> Option<fluree_db_iceberg::config::MappingSource> {
@@ -209,6 +205,13 @@ pub(crate) fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> 
     Ok(())
 }
 
+/// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
+/// catalog client cache. A config *edit* (including a secret written inline)
+/// yields a new fingerprint and a freshly built client. Note this hashes the raw
+/// JSON only: a secret referenced by env var / secret store is stored as that
+/// reference, so rotating the underlying secret leaves the fingerprint unchanged
+/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
+/// fingerprint, is what bounds staleness in that case.
 fn config_fingerprint(config: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -358,16 +361,34 @@ fn int_pushdown_literal(
     }
 }
 
+/// How a graph source's rows are materialized. A delete convention or an
+/// ordering column makes a pass latest-by-key; neither, additive.
+#[derive(Debug, Default)]
+pub struct MaterializeOptions {
+    /// The rows that delete their subject.
+    pub delete: Option<DeleteConvention>,
+    /// The column that orders the rows of one key.
+    pub order_by: Option<String>,
+    /// Incremental passes read the source's change feed, in which a deleted
+    /// or updated row retracts what it held.
+    pub change_feed: bool,
+}
+
 /// One materialize scan: what to read, how it was chosen, and how stale the window is.
 ///
 /// A struct rather than a tuple because `window_age_ms` is easy to drop silently
 /// from a positional return, and dropping it reintroduces the watermark-staleness
 /// failure it exists to prevent.
 pub struct MaterializeScan {
-    /// The source's current snapshot — the new watermark to persist. `None` when
-    /// the table has no snapshots at all (nothing to materialize).
+    /// The source's current snapshot — the new watermark to persist, unless
+    /// [`Self::stopped_at`] is set, which then is. `None` when the table has no
+    /// snapshots at all (nothing to materialize). A pinned read reports its
+    /// pin, and a Delta read the table version it read.
     pub to_snapshot_id: Option<i64>,
-    /// Whether an added-files scan was used, rather than a full read.
+    /// Whether the pass read only what changed after its window start, rather
+    /// than the table whole: an Iceberg added-files scan, whose rows are all
+    /// additions, or a Delta change feed, whose rows also retract. Check
+    /// [`Self::change_feed`] before treating every row as an addition.
     pub incremental: bool,
     /// Wall-clock span of the window, from Iceberg snapshot timestamps: how far the
     /// stored watermark now lags the current snapshot. `None` on a first run (no
@@ -375,7 +396,8 @@ pub struct MaterializeScan {
     /// both of which mean "persist regardless".
     pub window_age_ms: Option<i64>,
     /// The highest source COMMIT SEQUENCE this pass covers, when the pass was cut
-    /// short by the row budget — and `None` when it covers the whole plan.
+    /// short by the row budget — and `None` when it covers the whole plan, which
+    /// a pinned read always does.
     ///
     /// That distinction is the point of the field, and inverting it is silent data
     /// loss. `Some(s)` means the target will hold only a PREFIX of the window, so
@@ -391,9 +413,27 @@ pub struct MaterializeScan {
     /// that carried it has been expired away — which is the state that forced the
     /// full read to begin with.
     pub to_sequence: Option<i64>,
+    /// Whether the batches are a change feed rather than table rows. Every row
+    /// then carries [`CHANGE_TYPE_COLUMN`] and [`COMMIT_VERSION_COLUMN`], and
+    /// either asserts its values or retracts them. Only a Delta source's change
+    /// data feed sets it.
+    pub change_feed: bool,
+    /// Where a change feed window cut by the per-pass row budget stopped: the
+    /// last version whose changes the stream carried. Set while the stream is
+    /// read, so it is read only after the stream ends. Once set it, not
+    /// `to_snapshot_id`, is the window's end — a version the table had, so the
+    /// watermark advances to it and the next pass reads the changes after it.
+    pub stopped_at: Option<Arc<std::sync::OnceLock<u64>>>,
     /// Column batches, streamed. See [`Self::stream`] usage notes on the method.
     pub stream: ColumnBatchStream,
 }
+
+/// The column a change feed row names its change in: `insert` and
+/// `update_postimage` assert the row, `delete` and `update_preimage` retract it.
+pub const CHANGE_TYPE_COLUMN: &str = "_change_type";
+
+/// The column a change feed row names the source version that made it in.
+pub const COMMIT_VERSION_COLUMN: &str = "_commit_version";
 
 /// Why a materialize poll reads added files only, or re-reads the whole table.
 ///
@@ -1479,7 +1519,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .lookup_graph_source(&id)
             .await
             .map(|record| record.filter(|record| !record.retracted))
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))
+            .map_err(|e| QueryError::Nameservice(e.to_string()))
     }
 
     /// The SQL source behind `graph_source_id`, or `None` when it is
@@ -1545,7 +1585,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             // A drop leaves the record as a tombstone.
             .filter(|record| !record.retracted)
             .ok_or_else(|| {
@@ -1793,12 +1833,20 @@ impl<'a> FlureeR2rmlProvider<'a> {
     }
 
     /// The source table's current snapshot id (the materialization "to" point),
-    /// or `None` if the table has no snapshots yet.
+    /// or `None` if the table has no snapshots yet. For a Delta source, the
+    /// table's latest version.
     pub async fn current_snapshot_id(
         &self,
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<Option<i64>> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .latest_version(self.fluree, table_name)
+                .await
+                .map(Some);
+        }
         let (_storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
@@ -1834,32 +1882,48 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok((metadata.current_snapshot().map(|s| s.snapshot_id), columns))
     }
 
-    /// The source graph source's materialization options from the persisted
-    /// `IcebergGsConfig`: the optional tombstone/delete convention and the
-    /// optional latest-by-key ordering column. Both `None` means additive,
-    /// scan-order materialization (legacy behavior).
+    /// The source graph source's materialization options from its persisted
+    /// config (`IcebergGsConfig` or `DeltaGsConfig`).
     pub async fn materialize_options(
         &self,
         graph_source_id: &str,
-    ) -> QueryResult<(Option<DeleteConvention>, Option<String>)> {
+    ) -> QueryResult<MaterializeOptions> {
         let record = self
             .fluree
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             // A drop leaves the record as a tombstone.
             .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
+        #[cfg(feature = "delta")]
+        if record.source_type == GraphSourceType::Delta {
+            let config =
+                fluree_db_delta::DeltaGsConfig::from_json(&record.config).map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to parse Delta graph source config for '{graph_source_id}': {e}"
+                    ))
+                })?;
+            return Ok(MaterializeOptions {
+                delete: config.delete,
+                order_by: config.order_by,
+                change_feed: true,
+            });
+        }
         require_iceberg_backed(&record, graph_source_id)?;
         let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
             ))
         })?;
-        Ok((config.delete, config.order_by))
+        Ok(MaterializeOptions {
+            delete: config.delete,
+            order_by: config.order_by,
+            change_feed: false,
+        })
     }
 
     /// Scan only the data files ADDED in the snapshot window
@@ -1954,14 +2018,27 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// **never** a fall-forward: the from-side fall-forward below is a
     /// deliberate freshness/correctness trade a sync-to-head consumer wants,
     /// but silently moving a caller's `to` pin would change what the caller
-    /// asked to read.
+    /// asked to read. For the same reason a pinned read is never cut by the
+    /// per-pass row budget: that budget paces the tracking worker's unpinned
+    /// passes, and a prefix of a pin is a state the caller did not ask for.
     ///
-    /// Returns `(to_snapshot_id, incremental, batches)`:
+    /// **Delta sources.** `to` names a table version (`None` the latest). With a
+    /// `from_snapshot_id`, the window is the table's change data feed after that
+    /// version, flagged by [`MaterializeScan::change_feed`] and cut at a commit
+    /// boundary by the row budget unless pinned. Without one, or when the feed
+    /// cannot serve the window (not enabled, schema changed, log cleaned), the
+    /// `to` version is read whole. `from_sequence` is an Iceberg cursor and is
+    /// ignored.
+    ///
+    /// Returns a [`MaterializeScan`]:
     /// - `to_snapshot_id` — the resolved snapshot id of this read (the new
     ///   watermark to persist), or `None` if the table has no snapshots yet
     ///   (nothing to materialize; only possible when the caller didn't pin).
     /// - `incremental` — whether an added-files-only scan was used (vs a full
     ///   read of the live table state).
+    /// - `to_sequence` — set only when an unpinned Iceberg pass was cut short.
+    /// - `change_feed` / `stopped_at` — a Delta change feed window, and the
+    ///   version the row budget cut it at.
     ///
     /// An incremental scan is used when `from_snapshot_id` is set **and** the
     /// window `(from, to]` is incremental-safe — only `append`/`replace`
@@ -2003,6 +2080,26 @@ impl<'a> FlureeR2rmlProvider<'a> {
         to_snapshot_id: Option<i64>,
         from_sequence: Option<i64>,
     ) -> QueryResult<MaterializeScan> {
+        // A pinned read is never cut, on every path and for every source. `0`
+        // is the disabled budget: neither Iceberg full-read cut takes a prefix
+        // under it, the incremental cap is skipped for a pin outright, and a
+        // Delta change feed reads its whole window.
+        let pinned = to_snapshot_id.is_some();
+        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
+
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .materialize_scan(
+                    self.fluree,
+                    table_name,
+                    projection,
+                    from_snapshot_id,
+                    to_snapshot_id,
+                    budget_rows,
+                )
+                .await;
+        }
         let (storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
@@ -2012,7 +2109,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
         } else {
             table_name
         };
-        let pinned = to_snapshot_id.is_some();
         let to_snapshot = match to_snapshot_id {
             // A caller's pin must resolve — typed error, never fall-forward
             // (see the doc comment).
@@ -2035,6 +2131,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 incremental: false,
                 window_age_ms: None,
                 to_sequence: None,
+                change_feed: false,
+                stopped_at: None,
                 stream: empty_batch_stream(),
             });
         };
@@ -2068,8 +2166,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
                  stopped for longer than retention."
             ),
         }
-
-        let budget_rows = self.pass_row_budget();
 
         // An UNPINNED incremental window is read in bounded steps.
         //
@@ -2378,8 +2474,34 @@ impl<'a> FlureeR2rmlProvider<'a> {
             incremental,
             window_age_ms,
             to_sequence,
+            change_feed: false,
+            stopped_at: None,
             stream,
         })
+    }
+
+    /// The rows a change feed source's table holds at `version`, narrowed by
+    /// `filters` where the reader can state them exactly; the caller still
+    /// tests every row. Latest-by-key materialization reads a key back this
+    /// way when a change feed retraction leaves its fate to the table. Only a
+    /// Delta source has a change feed.
+    pub async fn rows_at_version(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .rows_at(self.fluree, table_name, version, filters)
+                .await;
+        }
+        let _ = (table_name, version, filters);
+        Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' has no change data feed"
+        )))
     }
 }
 
@@ -2393,17 +2515,24 @@ impl std::fmt::Debug for FlureeR2rmlProvider<'_> {
 #[async_trait]
 impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     /// Check if a graph source has an R2RML mapping.
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        match self
+    ///
+    /// The probe receives GRAPH IRIs as a query wrote them. One that does not
+    /// parse as a graph-source id names no source, so it is `false` without a
+    /// lookup. A failed lookup of a well-formed id fails the query: reading it
+    /// as "no mapping" would query an R2RML / Iceberg / SQL source as an empty
+    /// native graph whenever the nameservice is unavailable.
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> QueryResult<bool> {
+        let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
+            return Ok(false);
+        };
+        let record = self
             .fluree
             .nameservice()
-            .lookup_graph_source(graph_source_id)
+            .lookup_graph_source(&id)
             .await
-        {
-            Ok(Some(record)) => !record.retracted && mapping_source_of(&record).is_some(),
-            Ok(None) => false,
-            Err(_) => false,
-        }
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
+        // A drop leaves the record as a tombstone.
+        Ok(record.is_some_and(|r| !r.retracted && mapping_source_of(&r).is_some()))
     }
 
     /// Get the compiled R2RML mapping for a graph source.
@@ -2420,7 +2549,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             // A drop leaves the record as a tombstone.
             .filter(|record| !record.retracted)
             .ok_or_else(|| {
@@ -3407,7 +3536,7 @@ impl FlureeR2rmlProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
             // A drop leaves the record as a tombstone.
             .filter(|record| !record.retracted)
             .ok_or_else(|| {

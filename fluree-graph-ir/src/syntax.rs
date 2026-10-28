@@ -129,6 +129,41 @@ pub fn write_iri<W: io::Write + ?Sized>(w: &mut W, iri: &str) -> io::Result<()> 
     escape_iri(iri, |seg| w.write_all(seg.as_bytes()))
 }
 
+/// Escape a blank-node label (without `_:`): as is when it is a
+/// `BLANK_NODE_LABEL`, else `x` and the lowercase hex of its UTF-8 bytes,
+/// which is one. Nothing reverses the escape on read, so a label that needed
+/// it reads back as a different label.
+pub fn escape_blank_label<E>(
+    label: &str,
+    mut put: impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    if is_blank_node_label(label) {
+        return put(label);
+    }
+    put("x")?;
+    for b in label.bytes() {
+        put(ascii(&[
+            LOWER_HEX[(b >> 4) as usize],
+            LOWER_HEX[(b & 0xF) as usize],
+        ]))?;
+    }
+    Ok(())
+}
+
+/// Append a blank-node label (no `_:`), escaped as [`escape_blank_label`] does.
+pub fn push_blank_label(out: &mut String, label: &str) {
+    infallible(escape_blank_label(label, |seg| {
+        out.push_str(seg);
+        Ok(())
+    }));
+}
+
+/// Write a blank-node label (no `_:`), escaped as [`escape_blank_label`] does.
+pub fn write_blank_label<W: io::Write + ?Sized>(w: &mut W, label: &str) -> io::Result<()> {
+    escape_blank_label(label, |seg| w.write_all(seg.as_bytes()))
+}
+
 /// Append `<iri>`.
 pub fn push_iri_ref(out: &mut String, iri: &str) {
     out.push('<');
@@ -378,6 +413,23 @@ mod tests {
         }
         for bad in ["", "-a", ".a", "a.", "a/b", "a:b"] {
             assert!(!is_blank_node_label(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn blank_labels_escape_only_when_invalid() {
+        let escaped = |label: &str| {
+            let mut out = String::new();
+            push_blank_label(&mut out, label);
+            out
+        };
+        assert_eq!(escaped("fdb-0a-0--bnpl0"), "fdb-0a-0--bnpl0");
+        assert_eq!(escaped("fdb-1-0-#bnpl0"), "x6664622d312d302d23626e706c30");
+        let mut written = Vec::new();
+        write_blank_label(&mut written, "a/b").unwrap();
+        assert_eq!(written, b"x612f62");
+        for label in ["fdb-1-0-#bnpl0", "a/b", "-a", "fdb-x:y"] {
+            assert!(is_blank_node_label(&escaped(label)), "{label:?}");
         }
     }
 

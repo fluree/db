@@ -540,6 +540,11 @@ pub struct Query {
     /// surface language's null semantics. SPARQL / JSON-LD leave the default
     /// `Unbound`; Cypher lowering sets `Poisoned`.
     pub unmatched_optional: crate::binding::UnmatchedOptional,
+    /// Answer triple patterns in SPARQL's view of RDF lists, where a list is
+    /// its owner edge and `rdf:first`/`rdf:rest` cells and its members are
+    /// not values of their predicate (see [`crate::list_view`]). SPARQL
+    /// lowering sets it; JSON-LD and Cypher keep Fluree's member view.
+    pub rdf_list_view: bool,
 }
 
 impl Query {
@@ -561,6 +566,7 @@ impl Query {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: crate::binding::UnmatchedOptional::Unbound,
+            rdf_list_view: false,
         }
     }
 
@@ -585,6 +591,7 @@ impl Query {
             union_default_graph: self.union_default_graph,
             cypher_vocab: self.cypher_vocab.clone(),
             unmatched_optional: self.unmatched_optional,
+            rdf_list_view: self.rdf_list_view,
         }
     }
 }

@@ -607,6 +607,56 @@ async fn annotation_under_a_default_graph_name_lands_in_the_default_graph() {
     }
 }
 
+/// A graph named through the ledger's address, `L#<g>`, is the graph `<g>`:
+/// an annotated edge written there lands in `<g>`, and its reifier anchor
+/// names `<g>`, the graph its edge is in, not the text `L#<g>`.
+#[tokio::test]
+async fn annotation_under_a_graph_named_through_the_address_anchors_to_that_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let edge = json!({"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme", "@annotation": {"ex:role": "Engineer"}}});
+    for (i, what) in ["the graph key", "a [\"graph\", …] item"]
+        .into_iter()
+        .enumerate()
+    {
+        let ledger_id = format!("it/scope-annotation-through-{i}:main");
+        let through = format!("{ledger_id}#{G}");
+        let doc = if i == 0 {
+            json!({"@context": ctx(), "graph": through, "insert": edge})
+        } else {
+            json!({"@context": ctx(), "insert": [["graph", through, edge]]})
+        };
+        let ledger = fluree
+            .update(genesis_ledger(&fluree, &ledger_id), &doc)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: an annotated edge under {through}: {e}"))
+            .ledger;
+        assert_eq!(
+            annotation_role(&fluree, &ledger, Some(G)).await.as_deref(),
+            Some("Engineer"),
+            "{what}: the annotation is with its edge in <{G}>"
+        );
+        assert_eq!(
+            annotation_role(&fluree, &ledger, None).await,
+            None,
+            "{what}: nothing in the default graph"
+        );
+        let g_id = ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(G)
+            .unwrap_or_else(|| panic!("{what}: <{G}> is registered"));
+        let annotations =
+            support::decode_annotations_for_subject(&ledger, g_id, "http://example.org/alice")
+                .await;
+        assert_eq!(annotations.len(), 1, "{what}: one annotation in <{G}>");
+        assert_eq!(
+            annotations[0].g,
+            ledger.snapshot.encode_iri(G),
+            "{what}: the reifier anchor names <{G}>"
+        );
+    }
+}
+
 /// A node-level `@graph` names the same graph in `where` as in `delete` and
 /// `insert`: the one document writes one name, `ex:g`, compact, and the
 /// update deletes what the insert wrote. (The `where` side used to take the
