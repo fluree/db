@@ -1126,13 +1126,15 @@ async fn update_where_bind_error_handling_runtime_type_mismatch() {
     );
 }
 
+/// `(iri ..)` of an absolute IRI in a namespace the ledger has never
+/// registered writes that IRI, as a direct insert of it does (#1765): the
+/// update stores the same term, and only the write registers the namespace.
+/// A string that is not an absolute IRI names nothing to write and is still
+/// refused.
 #[tokio::test]
-async fn update_where_bind_error_handling_invalid_iri() {
-    // IRI("bad:thing") produces a Binding::Iri at the expression level, but
-    // the transact layer rejects raw IRIs that can't be resolved to a SID
-    // for flake generation.
+async fn update_where_bind_iri_in_an_unseen_namespace() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/transact-update:error-invalid-iri");
+    let db0 = LedgerSnapshot::genesis("it/transact-update:unseen-iri");
     let ledger0 = LedgerState::new(db0, Novelty::new(0));
 
     let seeded = fluree
@@ -1140,43 +1142,176 @@ async fn update_where_bind_error_handling_invalid_iri() {
             ledger0,
             &json!({
                 "@context": ctx_ex(),
-                "insert": {
-                    "@graph": [
-                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
-                        {"id":"ex:error","ex:text":"Abcdefg"}
-                    ]
-                }
+                "insert": {"id": "ex:error", "ex:text": "Abcdefg"}
             }),
         )
         .await
-        .expect("seed error fns");
+        .expect("seed");
+    let bind_iri = |iri: &str| {
+        json!({
+            "@context": ctx_ex(),
+            "where": [
+                {"id": "?s", "ex:text": "?text"},
+                ["bind", "?o", format!("(iri \"{iri}\")")]
+            ],
+            "insert": {"id": "?s", "ex:ref": "?o"}
+        })
+    };
 
-    let run_err = fluree
-        .update(
-            seeded.ledger,
+    let refused = fluree
+        .update(seeded.ledger.clone(), &bind_iri("not an iri"))
+        .await
+        .expect_err("a string that is not an absolute IRI");
+    assert!(
+        refused.to_string().contains("cannot be used as object"),
+        "unexpected error: {refused}"
+    );
+
+    let updated = fluree
+        .update(seeded.ledger, &bind_iri("http://unseen.example/o"))
+        .await
+        .expect("(iri ..) in an unseen namespace");
+    let direct = fluree
+        .insert(
+            updated.ledger,
             &json!({
                 "@context": ctx_ex(),
-                "where": [
-                    {"id":"?s","ex:text":"?text"},
-                    ["bind", "?err", "(iri \"bad:thing\")"]
-                ],
-                "insert": {"id":"?s","ex:error":"?err"},
-                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+                "@id": "ex:direct",
+                "ex:ref": {"@id": "http://unseen.example/o"}
             }),
         )
-        .await;
+        .await
+        .expect("direct insert of the same IRI");
 
-    assert!(
-        run_err.is_err(),
-        "expected transact error for unresolvable IRI"
-    );
-    if let Err(err) = run_err {
-        assert!(
-            err.to_string().contains("Raw IRI")
-                || err.to_string().contains("cannot be used as object"),
-            "unexpected error: {err}"
-        );
+    let both = support::query_jsonld(
+        &fluree,
+        &direct.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:ref": {"@id": "http://unseen.example/o"}},
+            "orderBy": "?s"
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&direct.ledger.snapshot)
+    .expect("format");
+    assert_eq!(both, json!(["ex:direct", "ex:error"]));
+}
+
+/// SPARQL's twin: `IRI()` and `UUID()` in a namespace the ledger has never
+/// registered write as subject, predicate and object, each the term an
+/// `INSERT DATA` of the IRI stores (#1765). A DELETE of such an IRI matches
+/// nothing stored, and registers no namespace.
+#[tokio::test]
+async fn sparql_update_writes_an_iri_in_an_unseen_namespace() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/transact-update:sparql-unseen-iri";
+    fluree.create_ledger(id).await.expect("create ledger");
+    let update = |body: &str| {
+        let fluree = &fluree;
+        let body = format!("PREFIX ex: <http://example.org/ns/> {body}");
+        async move {
+            fluree
+                .graph(id)
+                .transact()
+                .sparql_update(&body)
+                .commit()
+                .await
+                .map(|r| r.receipt.t)
+        }
+    };
+    update(r#"INSERT DATA { ex:s ex:p "a" }"#)
+        .await
+        .expect("seed");
+    for (name, body) in [
+        (
+            "object",
+            r#"INSERT { ex:s ex:ref ?o } WHERE { ex:s ex:p ?m BIND(IRI("http://unseen.example/o") AS ?o) }"#,
+        ),
+        (
+            "subject",
+            r#"INSERT { ?s ex:p "b" } WHERE { ex:s ex:p ?m BIND(IRI("urn:unseen:s") AS ?s) }"#,
+        ),
+        (
+            "predicate",
+            r#"INSERT { ex:s ?p "c" } WHERE { ex:s ex:p "a" BIND(IRI("http://unseen.example/p") AS ?p) }"#,
+        ),
+        (
+            "UUID()",
+            r#"INSERT { ex:s ex:id ?u } WHERE { ex:s ex:p "a" BIND(UUID() AS ?u) }"#,
+        ),
+    ] {
+        update(body).await.unwrap_or_else(|e| panic!("{name}: {e}"));
     }
+    update(
+        r#"INSERT DATA { ex:direct ex:ref <http://unseen.example/o> . <urn:unseen:s> ex:q "d" }"#,
+    )
+    .await
+    .expect("direct insert");
+    let t_before_delete = fluree.ledger(id).await.expect("ledger").t();
+    let deleted = update(
+        r#"DELETE { ex:s ex:ref ?o } WHERE { ex:s ex:p "a" BIND(IRI("http://never.example/o") AS ?o) }"#,
+    )
+    .await
+    .expect("delete of an IRI nothing holds");
+    assert_eq!(deleted, t_before_delete, "the delete retracts nothing");
+
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s WHERE { ?s ex:ref <http://unseen.example/o> } ORDER BY ?s"#,
+    )
+    .await
+    .expect("object query");
+    assert_eq!(
+        rows,
+        json!([["ex:direct"], ["ex:s"]]),
+        "the IRI() object and the INSERT DATA object are one term"
+    );
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/ns/>
+           SELECT ?p ?o WHERE { <urn:unseen:s> ?p ?o } ORDER BY ?p"#,
+    )
+    .await
+    .expect("subject query");
+    assert_eq!(
+        rows,
+        json!([["ex:p", "b"], ["ex:q", "d"]]),
+        "the IRI() subject and the INSERT DATA subject are one term"
+    );
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:s <http://unseen.example/p> ?o }"#,
+    )
+    .await
+    .expect("predicate query");
+    assert_eq!(rows, json!([["c"]]), "the IRI() predicate");
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/ns/>
+           SELECT (isIRI(?u) AS ?iri) (STRSTARTS(STR(?u), "urn:uuid:") AS ?uuid)
+           WHERE { ex:s ex:id ?u }"#,
+    )
+    .await
+    .expect("UUID query");
+    assert_eq!(rows, json!([[true, true]]), "the UUID() object");
+    assert!(
+        !ledger
+            .snapshot
+            .namespaces()
+            .values()
+            .any(|prefix| prefix.contains("never.example")),
+        "the delete registers no namespace"
+    );
 }
 
 /// A `str-dt` datatype string that looks like a compact IRI with an undefined
