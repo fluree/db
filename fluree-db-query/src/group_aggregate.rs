@@ -485,7 +485,8 @@ pub(crate) fn binding_to_group_key_normalized(
     {
         return binding_to_group_key_owned(canonical.as_ref().unwrap_or(binding));
     }
-    if crate::object_binding::is_numbig_encoded(binding) {
+    // An arena handle keys by its decoded value (see `normalize_for_key_cow`).
+    if crate::object_binding::is_arena_encoded(binding) {
         if let Some(gv) = gv {
             let materialized = materialize_encoded(binding, Some(gv));
             if !matches!(materialized, Binding::EncodedLit { .. }) {
