@@ -57,10 +57,6 @@ use crate::index_scope::MemberSet;
 /// Inputs merged by a scan of their heads; above this, by a heap.
 const LINEAR_MERGE_MAX_INPUTS: usize = 4;
 
-/// Steps in a row that find no rows two members hold before the scan of a
-/// few inputs stops looking for them (see [`merge_linear`]).
-const SHARED_MISSES_MAX: u32 = 64;
-
 /// Why a merge cannot give the exact union, so the lane that asked must fall
 /// back to the general plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,7 +345,6 @@ impl MergedRangeCursor {
             last,
             record,
             rows: 0,
-            repeated: false,
         };
         match lanes.as_mut_slice() {
             [] => {}
@@ -442,9 +437,6 @@ struct Emitted<'a> {
     record: bool,
     /// The rows emitted this round.
     rows: usize,
-    /// A repeat of the fact emitted last was dropped: two inputs' heads were
-    /// equal.
-    repeated: bool,
 }
 
 impl Emitted<'_> {
@@ -459,8 +451,6 @@ impl Emitted<'_> {
             }
             self.rows += 1;
             *self.last = Some(fact);
-        } else {
-            self.repeated = true;
         }
     }
 
@@ -471,7 +461,6 @@ impl Emitted<'_> {
     fn run(&mut self, lane: &Lane<'_>, mut from: usize, to: usize, first: Key) {
         if from < to && *self.last == Some(first.identity()) {
             from += 1;
-            self.repeated = true;
         }
         if from < to {
             if self.record {
@@ -531,7 +520,7 @@ fn merge_two<O: MergeOrder>(a: &mut Lane<'_>, b: &mut Lane<'_>, out: &mut Emitte
                 None => return,
             },
             // Rows both members hold, the commonest where they overlap.
-            Ordering::Equal => match shared_stretch::<O>(a, b, head_a, None, out) {
+            Ordering::Equal => match shared_stretch::<O>(a, b, head_a, out) {
                 Some((next_a, next_b)) => (head_a, head_b) = (next_a, next_b),
                 None => return,
             },
@@ -539,22 +528,20 @@ fn merge_two<O: MergeOrder>(a: &mut Lane<'_>, b: &mut Lane<'_>, out: &mut Emitte
     }
 }
 
-/// `a` and `b` both hold the row at their heads, whose key is `head`: walk the
-/// rows they both hold in lockstep, while the two stay equal and sort before
-/// `bound` (the smallest of any other heads), `a` emitting each and `b`
-/// stepping past its copy, which would be dropped as a repeat. One key read
-/// per lane and one comparison per row pair. Returns the two new heads, or
-/// `None` when either batch is used up.
+/// Of two inputs, `a` and `b` both hold the row at their heads, whose key is
+/// `head`: walk the rows they both hold in lockstep while the two stay equal,
+/// `a` emitting each and `b` stepping past its copy, which would be dropped
+/// as a repeat. One key read per lane and one comparison per row pair.
+/// Returns the two new heads, or `None` when either batch is used up.
 #[inline]
 fn shared_stretch<O: MergeOrder>(
     a: &mut Lane<'_>,
     b: &mut Lane<'_>,
     head: Key,
-    bound: Option<&Key>,
     out: &mut Emitted<'_>,
 ) -> Option<(Key, Key)> {
     let from = a.pos;
-    if let Some(shared) = constant_shared_prefix::<O>(a, b, bound) {
+    if let Some(shared) = constant_shared_prefix(a, b) {
         a.pos += shared;
         b.pos += shared;
         out.run(a, from, a.pos, head);
@@ -567,7 +554,7 @@ fn shared_stretch<O: MergeOrder>(
             break None;
         }
         let (next_a, next_b) = (a.head(), b.head());
-        if next_a != next_b || bound.is_some_and(|t| O::cmp(&next_a, t) != Ordering::Less) {
+        if next_a != next_b {
             break Some((next_a, next_b));
         }
     };
@@ -576,17 +563,12 @@ fn shared_stretch<O: MergeOrder>(
 }
 
 /// [`shared_stretch`]'s walk on slices: how many rows from both heads (equal)
-/// are equal and, after the first, sort before `bound`, when both batches
-/// carry `p_id`, `o_type` and `o_i` as one constant they agree on (one
+/// are equal, when both batches carry `p_id`, `o_type` and `o_i` as one constant they agree on (one
 /// predicate's leaflets of one type, without list rows, the common case).
 /// Two rows then differ only in `s_id` and `o_key`, compared as slices.
 /// `None` when the columns are not of that shape.
 #[inline]
-fn constant_shared_prefix<O: MergeOrder>(
-    a: &Lane<'_>,
-    b: &Lane<'_>,
-    bound: Option<&Key>,
-) -> Option<usize> {
+fn constant_shared_prefix(a: &Lane<'_>, b: &Lane<'_>) -> Option<usize> {
     let (ab, bb) = (a.batch, b.batch);
     let same_const = matches!((&ab.p_id, &bb.p_id), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
         && matches!((&ab.o_type, &bb.o_type), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
@@ -603,14 +585,7 @@ fn constant_shared_prefix<O: MergeOrder>(
     else {
         return None;
     };
-    let mut span = (a.end - a.pos).min(b.end - b.pos);
-    if let Some(bound) = bound {
-        // The head always goes; the rows after it only while below `bound`.
-        let below = partition_point(a.pos + 1, a.end, |row| {
-            O::cmp(&Key::at(ab, row), bound) == Ordering::Less
-        });
-        span = span.min(below - a.pos);
-    }
+    let span = (a.end - a.pos).min(b.end - b.pos);
     let shared = a_s[a.pos..a.pos + span]
         .iter()
         .zip(&b_s[b.pos..b.pos + span])
@@ -624,43 +599,17 @@ fn constant_shared_prefix<O: MergeOrder>(
     Some(shared.max(1))
 }
 
-/// Two distinct elements of `slice`, mutably.
-fn two_mut<T>(slice: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
-    debug_assert_ne!(i, j);
-    if i < j {
-        let (left, right) = slice.split_at_mut(j);
-        (&mut left[i], &mut right[0])
-    } else {
-        let (left, right) = slice.split_at_mut(i);
-        (&mut right[0], &mut left[j])
-    }
-}
-
 /// The merge for a few inputs: the next input is found by scanning the
-/// heads. Looking for rows two members hold costs a comparison per step, and
-/// members that interleave without sharing rows (graphs whose subjects were
-/// minted apart) would pay it on every row. So the merge starts without it;
-/// the dedup drops any repeat that reaches it, and the first repeat dropped
-/// turns the lockstep walk of shared rows on, until [`SHARED_MISSES_MAX`]
-/// steps in a row find none.
+/// heads. A row two members hold is emitted by one and dropped as a repeat by
+/// the other, a run of one each. Unlike [`merge_two`], whose one three-way
+/// comparison finds equal heads for free, the scan would pay a comparison per
+/// step to find them, and the lockstep walk stops at the next other head:
+/// interleaved members never use it, and three that hold the same rows walk
+/// one row per stretch. Measured, the walk cost more than it saved here on
+/// every shape tried.
 fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
     let mut heads: SmallVec<[Key; LINEAR_MERGE_MAX_INPUTS]> =
         lanes.iter().map(Lane::head).collect();
-    while merge_linear_apart::<O>(lanes, &mut heads, out)
-        && merge_linear_shared::<O>(lanes, &mut heads, out)
-    {}
-}
-
-/// [`merge_linear`] while no two heads have proved equal: each step emits
-/// the smallest head's run below the smallest of the others, and a repeat is
-/// left to the dedup. Returns `true` at the first repeat dropped, `false`
-/// when a batch is used up.
-fn merge_linear_apart<O: MergeOrder>(
-    lanes: &mut [Lane<'_>],
-    heads: &mut [Key],
-    out: &mut Emitted<'_>,
-) -> bool {
-    out.repeated = false;
     loop {
         // The smallest head (the earlier input on a tie) and the smallest of
         // the others.
@@ -676,61 +625,7 @@ fn merge_linear_apart<O: MergeOrder>(
         }
         match advance::<O>(&mut lanes[min_at], heads[min_at], runner_up.as_ref(), out) {
             Some(next) => heads[min_at] = next,
-            None => return false,
-        }
-        if out.repeated {
-            return true;
-        }
-    }
-}
-
-/// [`merge_linear`] once two heads have proved equal: rows two members hold
-/// are walked in lockstep below the third head. Returns `true` after
-/// [`SHARED_MISSES_MAX`] steps in a row with no two heads equal, `false` when
-/// a batch is used up.
-fn merge_linear_shared<O: MergeOrder>(
-    lanes: &mut [Lane<'_>],
-    heads: &mut [Key],
-    out: &mut Emitted<'_>,
-) -> bool {
-    let mut misses = 0;
-    loop {
-        // The smallest head and the smallest of the others (the earlier lane
-        // on a tie).
-        let mut min_at = 0;
-        let mut second_at: Option<usize> = None;
-        for at in 1..heads.len() {
-            if O::cmp(&heads[at], &heads[min_at]) == Ordering::Less {
-                second_at = Some(min_at);
-                min_at = at;
-            } else if second_at.is_none_or(|s| O::cmp(&heads[at], &heads[s]) == Ordering::Less) {
-                second_at = Some(at);
-            }
-        }
-        let second_at = second_at.expect("two or more lanes");
-        if heads[min_at] == heads[second_at] {
-            // Rows two members hold: walk them in lockstep below the third
-            // head.
-            misses = 0;
-            let third = (0..heads.len())
-                .filter(|&at| at != min_at && at != second_at)
-                .map(|at| heads[at])
-                .min_by(|x, y| O::cmp(x, y));
-            let (a, b) = two_mut(lanes, min_at, second_at);
-            match shared_stretch::<O>(a, b, heads[min_at], third.as_ref(), out) {
-                Some((next_a, next_b)) => (heads[min_at], heads[second_at]) = (next_a, next_b),
-                None => return false,
-            }
-        } else {
-            let bound = heads[second_at];
-            match advance::<O>(&mut lanes[min_at], heads[min_at], Some(&bound), out) {
-                Some(next) => heads[min_at] = next,
-                None => return false,
-            }
-            misses += 1;
-            if misses == SHARED_MISSES_MAX {
-                return true;
-            }
+            None => return,
         }
     }
 }
@@ -1717,13 +1612,11 @@ mod tests {
     }
 
     /// Three and four members that interleave apart, then share rows, then
-    /// interleave apart for longer than the scan of a few inputs keeps
-    /// looking for shared rows, then share again, each in one leaflet: the
-    /// merge moves between its apart and shared walks within a round, and
-    /// every fact comes out once, counted alone as well.
+    /// interleave apart again, then share again, each in one leaflet: every
+    /// fact comes out once, in order, counted alone as well.
     #[test]
-    fn a_few_members_move_between_apart_and_shared_rows() {
-        let stretch = u64::from(SHARED_MISSES_MAX) * 3;
+    fn a_few_members_merge_apart_and_shared_rows() {
+        let stretch = 192;
         let row = |s: u64| -> Row { (s, 5, STR, s % 7, NO_LIST) };
         for k in [3u64, 4] {
             let mut members: Vec<Vec<Row>> = vec![Vec::new(); k as usize];
