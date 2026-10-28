@@ -301,3 +301,102 @@ async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Union rows stay encoded: an arena literal (a big number) leaves its member
+/// with the graph it was read from, so every consumer reads the value its own
+/// graph holds. Fixture F's trap on `vf` (no lists, so SPARQL reads it as
+/// values): `y0 vf` is 1.5 in g1 and 2.5 in g2, both the first big-number
+/// handle of their graph; `y1 vf 3.5` is in both (one fact of the union);
+/// `y10 vf 7.5` is in g2. Each consumer that decodes or keys a binding (scan
+/// output, ORDER BY, FILTER, DISTINCT, GROUP BY) answers by value under both
+/// union spellings, with fast paths on and off, on the index and again with
+/// novelty in one member (which then binds decoded beside the encoded other).
+#[tokio::test(flavor = "current_thread")]
+async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
+    use lane_f::{fact, Obj, G2, LEDGER};
+    let fx = lane_f::Fixture::build().await;
+    let numeric = "?s ex:vf ?o FILTER(isNumeric(?o))";
+    // (label, WHERE body, projected vars, rows on the index, rows added by the
+    // novelty write of `y0 vf 4.5` in g2)
+    let cases: Vec<(&str, String, &[&str], Vec<&str>, Vec<&str>)> = vec![
+        (
+            "scan",
+            "ex:y0 ex:vf ?o".into(),
+            &["o"],
+            vec!["1.5^^decimal", "2.5^^decimal"],
+            vec!["4.5^^decimal"],
+        ),
+        (
+            "ORDER BY, lowest",
+            format!("{{ SELECT ?s ?o WHERE {{ {numeric} }} ORDER BY ?o LIMIT 1 }}"),
+            &["s", "o"],
+            vec!["y0 1.5^^decimal"],
+            vec![],
+        ),
+        (
+            "ORDER BY, highest",
+            format!("{{ SELECT ?s ?o WHERE {{ {numeric} }} ORDER BY DESC(?o) LIMIT 1 }}"),
+            &["s", "o"],
+            vec!["y10 7.5^^decimal"],
+            vec![],
+        ),
+        (
+            "FILTER > 2",
+            "?s ex:vf ?o FILTER(isNumeric(?o) && ?o > 2)".into(),
+            &["s", "o"],
+            vec!["y0 2.5^^decimal", "y1 3.5^^decimal", "y10 7.5^^decimal"],
+            vec!["y0 4.5^^decimal"],
+        ),
+        (
+            "DISTINCT",
+            format!("{{ SELECT DISTINCT ?o WHERE {{ {numeric} }} }}"),
+            &["o"],
+            vec![
+                "1.5^^decimal",
+                "2.5^^decimal",
+                "3.5^^decimal",
+                "7.5^^decimal",
+            ],
+            vec!["4.5^^decimal"],
+        ),
+        (
+            "GROUP BY",
+            format!("{{ SELECT ?o (COUNT(*) AS ?n) WHERE {{ {numeric} }} GROUP BY ?o }}"),
+            &["o", "n"],
+            vec![
+                "1.5^^decimal 1^^integer",
+                "2.5^^decimal 1^^integer",
+                "3.5^^decimal 1^^integer",
+                "7.5^^decimal 1^^integer",
+            ],
+            vec!["4.5^^decimal 1^^integer"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for novelty in [false, true] {
+        if novelty {
+            fx.write(LEDGER, &[fact(G2, "y0", "vf", Obj::Dec("4.5"))])
+                .await;
+        }
+        let phase = if novelty { "novelty in g2" } else { "indexed" };
+        for (scope, prologue, dataset) in UNION_SCOPES {
+            for (label, body, vars, base, added) in &cases {
+                let mut want: Vec<String> = base.iter().map(|s| (*s).to_string()).collect();
+                if novelty {
+                    want.extend(added.iter().map(|s| (*s).to_string()));
+                    want.sort();
+                }
+                let run = lane_f::run_where(&fx, LEDGER, prologue, dataset, body, vars).await;
+                check_lane_f(
+                    &format!("{phase} / {scope} / {label}"),
+                    &run,
+                    &want,
+                    &[],
+                    &[],
+                    &mut failures,
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
