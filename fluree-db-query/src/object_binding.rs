@@ -4,7 +4,7 @@ use fluree_db_core::dict_novelty::{DictNovelty, StringDictNovelty, SubjectDictNo
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
+use fluree_db_core::{DatatypeConstraint, FlakeValue, GraphId, Sid, NO_ARENA_GRAPH};
 use fluree_vocab::xsd_names;
 use std::sync::{Arc, OnceLock};
 
@@ -75,6 +75,7 @@ pub(crate) fn inline_numeric_encoded_lit(
         lang_id: 0,
         i_val: encoded_i_val(o_i),
         t,
+        arena_g_id: NO_ARENA_GRAPH,
     })
 }
 
@@ -84,6 +85,10 @@ pub(crate) fn inline_numeric_encoded_lit(
 /// then flows onto ref-valued bindings (`EncodedSid` / blank-node `Sid`)
 /// alongside `t`, mirroring how literal-valued objects already carry the
 /// metadata. Callers outside history mode pass `None`.
+///
+/// `g_id` is the graph the row was read from: an arena-backed literal (a big
+/// number or a vector) carries it, since its handle names a value only in
+/// that graph's arena.
 pub(crate) fn late_materialized_object_binding(
     o_type: u16,
     o_key: u64,
@@ -91,6 +96,7 @@ pub(crate) fn late_materialized_object_binding(
     t: i64,
     o_i: u32,
     op: Option<bool>,
+    g_id: GraphId,
 ) -> Option<Binding> {
     let ot = OType::from_u16(o_type);
     match ot.decode_kind() {
@@ -134,6 +140,7 @@ pub(crate) fn late_materialized_object_binding(
                 lang_id,
                 i_val: encoded_i_val(o_i),
                 t,
+                arena_g_id: NO_ARENA_GRAPH,
             })
         }
         DecodeKind::JsonArena => Some(Binding::EncodedLit {
@@ -144,6 +151,7 @@ pub(crate) fn late_materialized_object_binding(
             lang_id: 0,
             i_val: encoded_i_val(o_i),
             t,
+            arena_g_id: NO_ARENA_GRAPH,
         }),
         DecodeKind::VectorArena => Some(Binding::EncodedLit {
             o_kind: ObjKind::VECTOR_ID.as_u8(),
@@ -153,6 +161,7 @@ pub(crate) fn late_materialized_object_binding(
             lang_id: 0,
             i_val: encoded_i_val(o_i),
             t,
+            arena_g_id: g_id,
         }),
         // The arena holds overflow integers and decimals alike, so `dt_id` is
         // a placeholder: decode, then resolve via
@@ -165,6 +174,7 @@ pub(crate) fn late_materialized_object_binding(
             lang_id: 0,
             i_val: encoded_i_val(o_i),
             t,
+            arena_g_id: g_id,
         }),
         // Inline integer/float values whose datatype has a reserved dict id:
         // keep them encoded so they hash/compare/clone as cheap ints through
@@ -186,6 +196,7 @@ pub(crate) fn late_materialized_object_binding(
                 lang_id: 0,
                 i_val: encoded_i_val(o_i),
                 t,
+                arena_g_id: NO_ARENA_GRAPH,
             })
         }
         _ => None,
@@ -339,6 +350,7 @@ pub(crate) fn encoded_equivalent(binding: &Binding, dicts: TermDicts<'_>) -> Opt
                 lang_id,
                 i_val: i32::MIN,
                 t: t.unwrap_or(0),
+                arena_g_id: NO_ARENA_GRAPH,
             })
         }
         _ => None,
@@ -987,6 +999,7 @@ mod tests {
             0,
             u32::MAX,
             None,
+            0,
         )
         .expect("xsd:date should stay encoded");
 
@@ -1012,6 +1025,7 @@ mod tests {
             0,
             u32::MAX,
             None,
+            0,
         )
         .expect("xsd:dateTime should stay encoded");
 
@@ -1039,7 +1053,7 @@ mod tests {
             (OType::lang_string(3), DatatypeDictId::LANG_STRING, 3),
         ] {
             let binding =
-                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None)
+                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None, 0)
                     .unwrap_or_else(|| panic!("{o_type:?} should stay encoded"));
             assert!(
                 matches!(
@@ -1075,7 +1089,7 @@ mod tests {
                 "{o_type:?} is expected to be a string-dictionary type"
             );
             assert!(
-                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None)
+                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None, 0)
                     .is_none(),
                 "{o_type:?} must not borrow another datatype's dictionary id"
             );
@@ -1091,7 +1105,7 @@ mod tests {
         use crate::binding::is_string_dict_term;
 
         for o_type in [OType::XSD_STRING, OType::FULLTEXT, OType::lang_string(1)] {
-            let b = late_materialized_object_binding(o_type.as_u16(), 1, 1, 0, u32::MAX, None)
+            let b = late_materialized_object_binding(o_type.as_u16(), 1, 1, 0, u32::MAX, None, 0)
                 .unwrap_or_else(|| panic!("{o_type:?} should stay encoded"));
             assert!(is_string_dict_term(&b), "encoded {o_type:?}");
         }
@@ -1106,9 +1120,16 @@ mod tests {
         }
         // Numerics are outside the lane on both sides — the join stays lenient
         // across their subtypes.
-        let n =
-            late_materialized_object_binding(OType::XSD_INTEGER.as_u16(), 1, 1, 0, u32::MAX, None)
-                .expect("xsd:integer stays encoded");
+        let n = late_materialized_object_binding(
+            OType::XSD_INTEGER.as_u16(),
+            1,
+            1,
+            0,
+            u32::MAX,
+            None,
+            0,
+        )
+        .expect("xsd:integer stays encoded");
         assert!(!is_string_dict_term(&n));
         assert!(!is_string_dict_term(&Binding::lit(
             FlakeValue::Long(1),

@@ -43,6 +43,7 @@ fn materialize_encoded_for_sort(
             lang_id,
             i_val,
             t,
+            arena_g_id,
         } => {
             // Experiment: if string IDs are lex-order-preserving, keep EncodedLit for
             // simple xsd:string values so ORDER BY can compare by raw o_key.
@@ -56,7 +57,7 @@ fn materialize_encoded_for_sort(
 
             // BinaryGraphView handles novelty watermark routing internally.
             let val = gv
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                 .ok()?;
             match val {
                 FlakeValue::Ref(sid) => Some(Binding::sid(sid)),

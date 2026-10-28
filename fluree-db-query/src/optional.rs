@@ -4709,6 +4709,7 @@ mod tests {
             lang_id: 0,
             i_val: i32::MIN,
             t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         };
         let free = Some(vec![b'u']);
         let positions = [

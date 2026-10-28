@@ -1200,6 +1200,7 @@ mod tests {
             lang_id: 0,
             i_val: i32::MIN,
             t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         };
         let double_of = |b: Binding| match b.as_lit() {
             Some((FlakeValue::Double(d), _)) => *d,

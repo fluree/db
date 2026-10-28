@@ -286,12 +286,13 @@ impl Bm25SearchOperator {
                     p_id,
                     dt_id,
                     lang_id,
+                    arena_g_id,
                     ..
                 }) => {
                     // Late materialization: decode only when BM25 needs the target string.
                     if let Some(gv) = ctx.graph_view() {
                         let val = gv
-                            .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                            .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                             .map_err(|e| {
                                 tracing::debug!(
                                     o_kind,

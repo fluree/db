@@ -1435,7 +1435,11 @@ impl<'a> ExecutionContext<'a> {
     /// Thin wrapper around [`BinaryGraphView::decode_value_from_kind`] which
     /// handles watermark routing automatically when `dict_novelty` is present.
     ///
+    /// `arena_g_id` is the binding's own: the graph an arena-backed literal's
+    /// handle indexes ([`BinaryGraphView::decode_value_from_kind`]).
+    ///
     /// Returns `None` if no binary store is attached.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_encoded_value(
         &self,
         o_kind: u8,
@@ -1443,6 +1447,7 @@ impl<'a> ExecutionContext<'a> {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: GraphId,
     ) -> Option<std::io::Result<fluree_db_core::FlakeValue>> {
         use fluree_db_core::ids::DatatypeDictId;
         use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -1464,7 +1469,7 @@ impl<'a> ExecutionContext<'a> {
             return Some(Ok(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64())));
         }
         let gv = self.graph_view()?;
-        Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id))
+        Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id))
     }
 
     /// Resolve a binding-level `lang_id` to its language tag, memoized per

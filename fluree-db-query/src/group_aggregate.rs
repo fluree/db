@@ -180,9 +180,10 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
             lang_id,
             i_val,
             t,
+            arena_g_id,
         } => {
             // BinaryGraphView handles novelty watermark routing internally.
-            match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id) {
+            match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id) {
                 Ok(fluree_db_core::FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
                     let dt_sid = store
@@ -1353,13 +1354,14 @@ fn extract_numeric_with_gv(
         p_id,
         dt_id,
         lang_id,
+        arena_g_id,
         ..
     } = binding
     {
         if *o_kind == ObjKind::NUM_BIG.as_u8() {
             let gv = gv?;
             let val = gv
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                 .ok()?;
             return crate::aggregate::flake_value_to_numeric(&val);
         }

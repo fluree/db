@@ -485,7 +485,14 @@ pub fn vector_topk_operator(
                     let Some(gv) = ctx.graph_view() else {
                         return Ok(None);
                     };
-                    match gv.decode_value_from_kind(ObjKind::VECTOR_ID.as_u8(), key, p_id, 0, 0) {
+                    match gv.decode_value_from_kind(
+                        ObjKind::VECTOR_ID.as_u8(),
+                        key,
+                        p_id,
+                        0,
+                        0,
+                        gv.g_id(),
+                    ) {
                         Ok(FlakeValue::Vector(v)) => {
                             ephemeral.insert(key, v.iter().copied().collect());
                         }

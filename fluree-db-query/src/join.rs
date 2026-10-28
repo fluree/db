@@ -531,6 +531,7 @@ pub(crate) fn substitute_binding(
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             } => {
                 // Decode the encoded literal (novelty-aware via BinaryGraphView).
@@ -541,7 +542,7 @@ pub(crate) fn substitute_binding(
                     return Ok(Substitution::Free);
                 };
                 let val = gv
-                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                     .map_err(|e| {
                         tracing::debug!(
                             o_kind,
@@ -3486,7 +3487,7 @@ fn build_probe_object_binding(
     t: i64,
 ) -> Result<Binding> {
     if let Some(binding) =
-        late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
+        late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None, ctx.binary_g_id)
     {
         return Ok(binding);
     }

@@ -424,10 +424,16 @@ impl Materializer {
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
-            } => flake_value_to_comparable(
-                &self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?,
-            ),
+            } => flake_value_to_comparable(&self.decode_lit(
+                *o_kind,
+                *o_key,
+                *p_id,
+                *dt_id,
+                *lang_id,
+                *arena_g_id,
+            )?),
 
             Binding::Grouped(_) => None,
 
@@ -468,9 +474,10 @@ impl Materializer {
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             } => Some(Arc::from(
-                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
                     .to_string(),
             )),
 
@@ -523,7 +530,8 @@ impl Materializer {
                 lang_id,
                 i_val,
                 t,
-            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)? {
+                arena_g_id,
+            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)? {
                 FlakeValue::Ref(sid) => Binding::sid(sid),
                 val => {
                     let dt_sid = self
@@ -626,9 +634,10 @@ impl Materializer {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: fluree_db_core::GraphId,
     ) -> Result<FlakeValue> {
         self.graph_view
-            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id)
             .map_err(|e| {
                 decode_error(
                     "decode literal",
