@@ -19,6 +19,15 @@
 //! the union variant sits behind, and every lane run must stamp
 //! `cyclic_bgp_union` `proceed`.
 //!
+//! Every pair stored twice here is a list. SPARQL reads a list as the RDF it
+//! denotes (#2159): an owner edge to the list's head cell, so a list item is
+//! not an edge of its predicate, and a block reading one through that view
+//! is not the cyclic join's. The SPARQL cases answer that view, by hand and
+//! with the lane off; the one-graph lane stands down without a stamp, as
+//! main's does, and the union variant with `fallback:list_view`. JSON-LD and
+//! Cypher read the items as values, so their cases keep the multiplicity the
+//! lane must not collapse, and must stamp `proceed`.
+//!
 //! Env and switch mutation live in ONE test fn (and this file is its own test
 //! binary) so parallel test threads can't race on process-global state.
 
@@ -161,9 +170,11 @@ async fn index(fluree: &Fluree, ledger_id: &str) -> LedgerHandle {
     fluree.ledger_cached(ledger_id).await.expect("reload")
 }
 
+const UNION_LEDGER: &str = "it/cyclic-multiplicity-union:main";
+
 async fn union_ledger(state: State) -> (Fluree, LedgerHandle) {
     let fluree = FlureeBuilder::memory().without_indexing().build_memory();
-    let ledger_id = "it/cyclic-multiplicity-union:main";
+    let ledger_id = UNION_LEDGER;
     fluree
         .create_ledger(ledger_id)
         .await
@@ -286,6 +297,8 @@ fn stamps(store: &SpanStore, site: &str) -> Vec<String> {
 #[derive(Clone, Copy)]
 enum Surface {
     Sparql,
+    /// The JSON-LD query in `query`; with `from`, through the connection.
+    JsonLd,
     Cypher,
 }
 
@@ -295,6 +308,32 @@ struct Case {
     query: String,
     vars: &'static [&'static str],
     want: Rows,
+    /// Whether the lane answers. Otherwise the query reads its lists through
+    /// SPARQL's view, and the lane stands down.
+    fires: bool,
+}
+
+/// A JSON-LD triangle (or square) over `preds`, each edge from the one
+/// variable to the next, as a query string.
+fn jsonld_cycle(preds: &[&str], from: Option<JsonValue>, opts: Option<JsonValue>) -> String {
+    let vars = ["?w", "?x", "?y", "?z"];
+    let vars = &vars[4 - preds.len()..];
+    let mut q = json!({
+        "@context": {"ex": EX},
+        "select": vars,
+        "where": preds
+            .iter()
+            .enumerate()
+            .map(|(i, p)| json!({"@id": vars[i], *p: vars[(i + 1) % vars.len()]}))
+            .collect::<Vec<_>>()
+    });
+    if let Some(from) = from {
+        q["from"] = from;
+    }
+    if let Some(opts) = opts {
+        q["opts"] = opts;
+    }
+    q.to_string()
 }
 
 fn cases() -> Vec<Case> {
@@ -315,7 +354,11 @@ fn cases() -> Vec<Case> {
     let cypher = |a: &str, b: &str, c: &str| {
         format!("MATCH (x)-[:`{EX}{a}`]->(y)-[:`{EX}{b}`]->(z)-[:`{EX}{c}`]->(x) RETURN x, y, z")
     };
+    let square = times(&[(&["w1", "x1", "y1", "z1"], 2)]);
     vec![
+        // SPARQL's list view: `m → n`, `a1 → a2`, `b2 → b3`, `c3 → c1` and
+        // `z1 → w1` are owner edges to a head cell, so no cycle through them
+        // closes.
         Case {
             label: "knows triangle, the pair in each rotation's position",
             surface: Surface::Sparql,
@@ -323,7 +366,12 @@ fn cases() -> Vec<Case> {
                 "{PREFIXES}SELECT ?x ?y ?z WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
             ),
             vars: &["x", "y", "z"],
-            want: knows.clone(),
+            want: times(&[
+                (&["k1", "k2", "k3"], 1),
+                (&["k2", "k3", "k1"], 1),
+                (&["k3", "k1", "k2"], 1),
+            ]),
+            fires: false,
         },
         Case {
             label: "p/q/r triangles, the pair on p, on q, on r",
@@ -332,7 +380,8 @@ fn cases() -> Vec<Case> {
                 "{PREFIXES}SELECT ?x ?y ?z WHERE {{ ?x ex:p ?y . ?y ex:q ?z . ?z ex:r ?x }}"
             ),
             vars: &["x", "y", "z"],
-            want: pqr.clone(),
+            want: times(&[(&["d1", "d2", "d3"], 1)]),
+            fires: false,
         },
         Case {
             label: "square, the pair on its last edge",
@@ -342,7 +391,32 @@ fn cases() -> Vec<Case> {
                  WHERE {{ ?w ex:e1 ?x . ?x ex:e2 ?y . ?y ex:e3 ?z . ?z ex:e4 ?w }}"
             ),
             vars: &["w", "x", "y", "z"],
-            want: times(&[(&["w1", "x1", "y1", "z1"], 2)]),
+            want: vec![],
+            fires: false,
+        },
+        Case {
+            label: "JSON-LD: knows triangle, the pair in each rotation's position",
+            surface: Surface::JsonLd,
+            query: jsonld_cycle(&["ex:knows", "ex:knows", "ex:knows"], None, None),
+            vars: &[],
+            want: knows.clone(),
+            fires: true,
+        },
+        Case {
+            label: "JSON-LD: p/q/r triangles, the pair on p, on q, on r",
+            surface: Surface::JsonLd,
+            query: jsonld_cycle(&["ex:p", "ex:q", "ex:r"], None, None),
+            vars: &[],
+            want: pqr.clone(),
+            fires: true,
+        },
+        Case {
+            label: "JSON-LD: square, the pair on its last edge",
+            surface: Surface::JsonLd,
+            query: jsonld_cycle(&["ex:e1", "ex:e2", "ex:e3", "ex:e4"], None, None),
+            vars: &[],
+            want: square,
+            fires: true,
         },
         Case {
             label: "Cypher: knows triangle",
@@ -350,6 +424,7 @@ fn cases() -> Vec<Case> {
             query: cypher("knows", "knows", "knows"),
             vars: &[],
             want: knows,
+            fires: true,
         },
         Case {
             label: "Cypher: p/q/r triangles",
@@ -357,6 +432,7 @@ fn cases() -> Vec<Case> {
             query: cypher("p", "q", "r"),
             vars: &[],
             want: pqr,
+            fires: true,
         },
     ]
 }
@@ -364,6 +440,31 @@ fn cases() -> Vec<Case> {
 async fn answer(fluree: &Fluree, handle: &LedgerHandle, case: &Case) -> Result<Rows, String> {
     let db = GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
     match case.surface {
+        Surface::JsonLd => {
+            let query: JsonValue = serde_json::from_str(&case.query).expect("JSON-LD query");
+            if query.get("from").is_none() {
+                return db
+                    .query(fluree)
+                    .jsonld(&query)
+                    .execute_formatted()
+                    .await
+                    .map(|json| jsonld_rows(&json))
+                    .map_err(|e| e.to_string());
+            }
+            let result = fluree
+                .query_connection(&query)
+                .await
+                .map_err(|e| e.to_string())?;
+            let ledger = fluree
+                .ledger(UNION_LEDGER)
+                .await
+                .map_err(|e| e.to_string())?;
+            result
+                .to_jsonld_async(ledger.as_graph_db_ref(0))
+                .await
+                .map(|json| jsonld_rows(&json))
+                .map_err(|e| e.to_string())
+        }
         Surface::Sparql => db
             .query(fluree)
             .sparql(&case.query)
@@ -387,8 +488,18 @@ async fn answer(fluree: &Fluree, handle: &LedgerHandle, case: &Case) -> Result<R
 
 /// The union cases: the triangle over g1 and g2, by `FROM` and as the union
 /// default graph (whose default graph adds only the novelty state's base
-/// edge, which closes no cycle).
+/// edge, which closes no cycle). In SPARQL, m's list in each graph is an
+/// owner edge to that graph's head cell, and u's list in g2 another; only g1's
+/// plain `u → v` is an edge to v.
 fn union_cases() -> Vec<Case> {
+    let list_view = times(&[
+        (&["u", "v", "w"], 1),
+        (&["v", "w", "u"], 1),
+        (&["w", "u", "v"], 1),
+        (&["x", "y", "z"], 1),
+        (&["y", "z", "x"], 1),
+        (&["z", "x", "y"], 1),
+    ]);
     let want = times(&[
         (&["m", "n", "o"], 2),
         (&["n", "o", "m"], 2),
@@ -406,20 +517,50 @@ fn union_cases() -> Vec<Case> {
              WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
         )
     };
+    let knows3 = ["ex:knows", "ex:knows", "ex:knows"];
     vec![
         Case {
             label: "union: FROM g1 FROM g2",
             surface: Surface::Sparql,
             query: tri("", "FROM <urn:g1> FROM <urn:g2>"),
             vars: &["x", "y", "z"],
-            want: want.clone(),
+            want: list_view.clone(),
+            fires: false,
         },
         Case {
             label: "union: the union default graph",
             surface: Surface::Sparql,
             query: tri("# PRAGMA union-default-graph: true\n", ""),
             vars: &["x", "y", "z"],
+            want: list_view,
+            fires: false,
+        },
+        Case {
+            label: "union: JSON-LD, FROM g1 + g2",
+            surface: Surface::JsonLd,
+            query: jsonld_cycle(
+                &knows3,
+                Some(json!([
+                    {"@id": UNION_LEDGER, "graph": "urn:g1"},
+                    {"@id": UNION_LEDGER, "graph": "urn:g2"}
+                ])),
+                None,
+            ),
+            vars: &[],
+            want: want.clone(),
+            fires: true,
+        },
+        Case {
+            label: "union: JSON-LD, the union default graph",
+            surface: Surface::JsonLd,
+            query: jsonld_cycle(
+                &knows3,
+                Some(json!(UNION_LEDGER)),
+                Some(json!({"unionDefaultGraph": true})),
+            ),
+            vars: &[],
             want,
+            fires: true,
         },
     ]
 }
@@ -446,9 +587,10 @@ async fn cyclic_join_keeps_the_multiplicity_of_a_pair_stored_twice() {
             let lane = answer(&fluree, &handle, &case).await;
             drop(guard);
             let ran = stamps(&store, "cyclic_bgp");
-            if ran != ["proceed"] {
+            let want_ran: &[&str] = if case.fires { &["proceed"] } else { &[] };
+            if ran != want_ran {
                 failures.push(format!(
-                    "{label}: `cyclic_bgp` stamps {ran:?}, want [proceed]"
+                    "{label}: `cyclic_bgp` stamps {ran:?}, want {want_ran:?}"
                 ));
             }
 
@@ -476,9 +618,14 @@ async fn cyclic_join_keeps_the_multiplicity_of_a_pair_stored_twice() {
             let lane = answer(&fluree, &handle, &case).await;
             drop(guard);
             let ran = stamps(&store, "cyclic_bgp_union");
-            if ran != ["proceed"] {
+            let want_ran: &[&str] = if case.fires {
+                &["proceed"]
+            } else {
+                &["fallback:list_view"]
+            };
+            if ran != want_ran {
                 failures.push(format!(
-                    "{label}: `cyclic_bgp_union` stamps {ran:?}, want [proceed]"
+                    "{label}: `cyclic_bgp_union` stamps {ran:?}, want {want_ran:?}"
                 ));
             }
 
