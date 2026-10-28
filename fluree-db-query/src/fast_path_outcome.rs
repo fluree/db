@@ -53,6 +53,11 @@ pub enum FastPathFallback {
     /// vector). Its encoded key is a handle per `(g_id, p_id)`, so equal keys in
     /// two members need not be equal values.
     ArenaType,
+    /// A lane over several graphs met a pattern SPARQL reads through its view
+    /// of RDF lists (`crate::list_view`): an owner edge to each list's first
+    /// cell and the cells' `rdf:first`/`rdf:rest`, which no stored row is. The
+    /// lane reads stored rows, so it does not answer for that view.
+    ListView,
     /// A lane merging several graphs in POST met list rows (`o_i` set). Two
     /// rows of one fact can be separated there, so dropping adjacent
     /// duplicates would not remove every one.
@@ -72,6 +77,7 @@ impl FastPathOutcome {
             FastPathOutcome::Fallback(FastPathFallback::Novelty) => "fallback:novelty",
             FastPathOutcome::Fallback(FastPathFallback::StoreMismatch) => "fallback:store_mismatch",
             FastPathOutcome::Fallback(FastPathFallback::ArenaType) => "fallback:arena_type",
+            FastPathOutcome::Fallback(FastPathFallback::ListView) => "fallback:list_view",
             FastPathOutcome::Fallback(FastPathFallback::ListRowsInPost) => {
                 "fallback:list_rows_in_post"
             }
