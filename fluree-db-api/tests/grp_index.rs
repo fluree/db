@@ -53,5 +53,7 @@ mod it_trigger_index_incremental;
 mod it_typed_literal_index;
 #[path = "it_vector_lengths.rs"]
 mod it_vector_lengths;
+#[path = "it_vector_term_identity.rs"]
+mod it_vector_term_identity;
 #[path = "it_xsd_double_special_values.rs"]
 mod it_xsd_double_special_values;
