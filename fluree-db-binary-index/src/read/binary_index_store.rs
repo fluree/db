@@ -3259,6 +3259,75 @@ pub struct BinaryGraphView {
     /// the life of the store and novelty window the view holds.
     subject_sids: SubjectMemo<Sid>,
     subject_iris: SubjectMemo<Arc<str>>,
+    /// Vectors already decoded through this view, one shared value per
+    /// distinct vector: the arena gives every stored fact its own handle, so
+    /// equal vectors under many handles decode to one allocation.
+    vectors: VectorMemo,
+}
+
+/// Per-view memo of decoded vectors keyed by value, bounded by clearing
+/// rather than evicting. A probe hashes and compares the arena's `f32`
+/// components in place, so a handle whose value was seen allocates nothing.
+struct VectorMemo(std::sync::Mutex<VectorMemoInner>);
+
+#[derive(Default)]
+struct VectorMemoInner {
+    /// Decoded values by the hash of their components ([`VectorMemo::hash`]).
+    by_hash: rustc_hash::FxHashMap<u64, Vec<Arc<[f64]>>>,
+    /// Components held, the bound the memo clears at.
+    components: usize,
+}
+
+impl VectorMemo {
+    const MAX_COMPONENTS: usize = 1 << 22;
+
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(VectorMemoInner::default()))
+    }
+
+    fn hash(components: &[f32]) -> u64 {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        h.write_usize(components.len());
+        for x in components {
+            h.write_u32(x.to_bits());
+        }
+        h.finish()
+    }
+
+    /// The shared value equal to `components` (widened exactly to `f64`),
+    /// allocating it on the first sight of that value.
+    fn get_or_insert(&self, components: &[f32]) -> Arc<[f64]> {
+        let same = |v: &[f64]| {
+            v.len() == components.len()
+                && v.iter()
+                    .zip(components)
+                    .all(|(a, b)| a.to_bits() == f64::from(*b).to_bits())
+        };
+        let hash = Self::hash(components);
+        let mut memo = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(found) = memo
+            .by_hash
+            .get(&hash)
+            .and_then(|bucket| bucket.iter().find(|v| same(v)))
+        {
+            return Arc::clone(found);
+        }
+        if memo.components >= Self::MAX_COMPONENTS {
+            memo.by_hash.clear();
+            memo.components = 0;
+        }
+        let value: Arc<[f64]> = components.iter().map(|&x| f64::from(x)).collect();
+        memo.components += components.len();
+        memo.by_hash
+            .entry(hash)
+            .or_default()
+            .push(Arc::clone(&value));
+        value
+    }
 }
 
 /// Per-view id-to-name memo, bounded by clearing rather than evicting.
@@ -3301,6 +3370,7 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
+            vectors: VectorMemo::new(),
         }
     }
 
@@ -3323,6 +3393,7 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
+            vectors: VectorMemo::new(),
         }
     }
 
@@ -3446,6 +3517,11 @@ impl BinaryGraphView {
                 }
             }
         }
+        if o_kind == ObjKind::VECTOR_ID.as_u8() {
+            if let Some(value) = self.shared_vector(p_id, o_key as u32)? {
+                return Ok(FlakeValue::Vector(value));
+            }
+        }
         // Charge a dict touch for dict-backed ObjKinds when novelty didn't satisfy.
         if o_kind == ObjKind::REF_ID.as_u8()
             || o_kind == ObjKind::LEX_ID.as_u8()
@@ -3552,6 +3628,25 @@ impl BinaryGraphView {
 
     pub fn store(&self) -> &BinaryIndexStore {
         &self.store
+    }
+
+    /// The vector at `handle` in `p_id`'s arena of this view's graph, shared
+    /// with every handle decoded through this view that holds an equal
+    /// vector: one allocation per distinct value, none for a handle that
+    /// repeats one. `None` for a handle the arena does not hold (such as a
+    /// novelty handle), which the store's decode reports.
+    pub fn shared_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<Arc<[f64]>>> {
+        let Some(arena) = self
+            .store
+            .graph_indexes
+            .get(&self.g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        Ok(arena
+            .lookup_vector(handle)?
+            .map(|slice| self.vectors.get_or_insert(slice.as_f32())))
     }
 
     pub fn clone_store(&self) -> Arc<BinaryIndexStore> {
