@@ -23,7 +23,7 @@ use crate::error::Result;
 use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
 use crate::exists::any_solution;
-use crate::ir::triple::Ref;
+use crate::ir::triple::{Ref, TriplePattern};
 use crate::ir::{Expression, FlakeValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
@@ -173,14 +173,32 @@ impl<'a> SubjectSource<'a> {
     }
 }
 
+/// `(subject_var, predicate, object_var)` of `?s <p> ?o`: a variable subject
+/// and object, a bound predicate, no datatype constraint.
+fn simple_exists_key(tp: &TriplePattern) -> Option<(VarId, Ref, VarId)> {
+    let Ref::Var(sv) = &tp.s else {
+        return None;
+    };
+    if !tp.p_bound() || tp.dtc.is_some() {
+        return None;
+    }
+    Some((*sv, tp.p.clone(), tp.o.as_var()?))
+}
+
 /// Collect `(subject_var, predicate, object_var)` for every hoistable
-/// `EXISTS { ?s <p> ?o }` in `expr`.
+/// `EXISTS { ?s <p> ?o }` in `expr`. `list_view` is set when such an EXISTS
+/// reads its triple through SPARQL's view of RDF lists (`crate::list_view`):
+/// its rows are then not the predicate's stored rows, and it is not hoisted.
 ///
 /// The object variable is carried out so the caller can reject the pattern
 /// when that variable is correlated; `Term::is_bound()` below is a plan-time
 /// syntactic test ("is not a variable") and says nothing about whether the
 /// variable is bound at runtime.
-fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref, VarId)>) {
+fn collect_simple_exists_keys(
+    expr: &Expression,
+    out: &mut Vec<(VarId, Ref, VarId)>,
+    list_view: &mut bool,
+) {
     match expr {
         Expression::Exists {
             patterns,
@@ -188,34 +206,20 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref, VarI
         } => {
             // Only handle EXISTS { ?s <p> ?o } (single triple) here; more complex
             // inner patterns keep the generic per-row seeded execution.
-            if patterns.len() != 1 {
-                return;
+            match patterns.as_slice() {
+                [Pattern::Triple(tp)] => out.extend(simple_exists_key(tp)),
+                [Pattern::ListView(lv)] => *list_view |= simple_exists_key(&lv.triple).is_some(),
+                _ => {}
             }
-            let Pattern::Triple(tp) = &patterns[0] else {
-                return;
-            };
-            let Ref::Var(sv) = &tp.s else {
-                return;
-            };
-            if !tp.p_bound() {
-                return;
-            }
-            let Some(ov) = tp.o.as_var() else {
-                return;
-            };
-            if tp.dtc.is_some() {
-                return;
-            }
-            out.push((*sv, tp.p.clone(), ov));
         }
         Expression::Call { func: _, args } => {
             for a in args {
-                collect_simple_exists_keys(a, out);
+                collect_simple_exists_keys(a, out, list_view);
             }
         }
         Expression::Map(entries) => {
             for (_, v) in entries {
-                collect_simple_exists_keys(v, out);
+                collect_simple_exists_keys(v, out, list_view);
             }
         }
         // Scoped iteration / member access: an EXISTS buried in a comprehension
@@ -246,8 +250,26 @@ fn build_exists_semijoin_cache(
     };
 
     let mut exists_nodes: Vec<(VarId, Ref, VarId)> = Vec::new();
-    collect_simple_exists_keys(expr, &mut exists_nodes);
+    let mut list_view = false;
+    collect_simple_exists_keys(expr, &mut exists_nodes, &mut list_view);
     if exists_nodes.is_empty() {
+        // An EXISTS of the cache's shape read through SPARQL's list view: the
+        // cache over several graphs (or none) says why it stood down; the
+        // one-graph cache stays silent, as it always has.
+        let reason = match &source {
+            _ if !list_view => None,
+            Ok(SubjectSource::One(_)) => None,
+            Err(FastPathFallback::KillSwitch) => Some(FastPathFallback::KillSwitch),
+            Ok(SubjectSource::Union(_) | SubjectSource::Empty) | Err(_) => {
+                Some(FastPathFallback::ListView)
+            }
+        };
+        if let Some(reason) = reason {
+            stamp_fast_path(
+                EXISTS_SEMIJOIN_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+        }
         return Ok(None);
     }
     let source = match source {
@@ -953,7 +975,7 @@ mod tests {
             negated: true,
         };
         let mut out = Vec::new();
-        collect_simple_exists_keys(&expr, &mut out);
+        collect_simple_exists_keys(&expr, &mut out, &mut false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, VarId(0));
         assert_eq!(out[0].2, VarId(7));
@@ -970,7 +992,7 @@ mod tests {
             negated: true,
         };
         let mut out = Vec::new();
-        collect_simple_exists_keys(&expr, &mut out);
+        collect_simple_exists_keys(&expr, &mut out, &mut false);
         assert!(out.is_empty());
     }
 
