@@ -33,6 +33,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -962,7 +963,7 @@ impl SqlBlockSource {
                         .map(|(_, b)| join_key(b, ctx))
                         .transpose()
                 })
-                .collect::<Result<_>>()?;
+                .try_collect_vec()?;
             if key.iter().all(Option::is_some) {
                 index
                     .entry(key.into_iter().map(Option::unwrap).collect())
@@ -1294,7 +1295,7 @@ impl SqlBlockSource {
                             .find(|(v, _)| v == jv)
                             .map(|(_, b)| join_key(b, ctx))
                     })
-                    .collect::<Result<_>>()?;
+                    .try_collect_vec()?;
                 if pkey.len() != join_vars.len() {
                     return Ok(());
                 }
@@ -1388,11 +1389,11 @@ fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> Result<GroupKeyOwned> {
         Some(iri) => Ok(GroupKeyOwned::MaterializedSid(0, iri.into())),
         None => {
             let gv = ctx.term_view();
-            binding_to_group_key_normalized(
+            Ok(binding_to_group_key_normalized(
                 b,
                 crate::object_binding::TermDicts::of(ctx),
                 gv.as_ref(),
-            )
+            )?)
         }
     }
 }

@@ -34,6 +34,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
+use crate::group_aggregate::TryCollectVec;
 use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm, TermDicts};
 use crate::operator::inline::{extend_schema, InlineOperator};
@@ -276,7 +277,7 @@ impl UnionFact {
             bindings: bindings
                 .into_iter()
                 .map(|b| normalize_for_key(b, dicts, gv))
-                .collect::<Result<_>>()?,
+                .try_collect_vec()?,
             fact: fact
                 .map(|f| -> Result<RowFact> {
                     Ok(RowFact {

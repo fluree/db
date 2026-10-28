@@ -19,6 +19,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::group_aggregate::TryCollectVec;
 use crate::ir::{AggregateFn, AggregateSpec};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -381,7 +382,7 @@ fn apply_aggregate(
             let decoded: Vec<Binding> = values
                 .iter()
                 .map(|b| crate::group_aggregate::materialize_encoded(b, gv))
-                .collect::<Result<_>>()?;
+                .try_collect_vec()?;
             // Decoding turns an encoded ref into `Binding::Sid`, which
             // GROUP_CONCAT still cannot read — expand those too.
             let decoded = match func {
@@ -423,7 +424,7 @@ fn apply_aggregate(
                             Ok(b.clone())
                         }
                     })
-                    .collect::<Result<_>>()?;
+                    .try_collect_vec()?;
                 return Ok(func.apply(&Binding::Grouped(decoded)));
             }
         }

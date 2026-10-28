@@ -111,7 +111,7 @@ fn compare_for_minmax(
     a: &Binding,
     b: &Binding,
     gv: Option<&TermView>,
-) -> crate::error::Result<std::cmp::Ordering> {
+) -> std::result::Result<std::cmp::Ordering, Undecodable> {
     let Some(gv) = gv else {
         if a.is_encoded() || b.is_encoded() {
             return Err(undecodable(if a.is_encoded() { a } else { b }, "no view"));
@@ -168,14 +168,48 @@ fn compare_for_minmax(
     Ok(crate::sort::compare_bindings(&am, &bm))
 }
 
-/// The error for an encoded binding that cannot be decoded: an id the view's
-/// dictionaries do not hold, or no view at all. An encoded binding exists only
-/// where a store produced it, so either is a broken invariant, refused rather
-/// than passed on encoded to a reader that would read it through some other
-/// view or key it by an id.
+/// An encoded binding that cannot be decoded: an id the view's dictionaries
+/// do not hold, or no view at all. An encoded binding exists only where a
+/// store produced it, so either is a broken invariant, refused rather than
+/// passed on encoded to a reader that would read it through some other view
+/// or key it by an id.
+///
+/// A pointer, so the per-row key and decode paths that can return it stay the
+/// size of their success value; it becomes a [`QueryError`] where an operator
+/// returns it.
+#[derive(Debug)]
+pub(crate) struct Undecodable(Box<String>);
+
+impl From<Undecodable> for QueryError {
+    #[cold]
+    fn from(e: Undecodable) -> Self {
+        QueryError::dictionary_lookup(*e.0)
+    }
+}
+
+/// `collect` into a `Vec` for an iterator of `Result`s, as a plain loop.
+///
+/// `collect::<Result<Vec<_>, _>>()` goes through an adapter
+/// (`GenericShunt`) that the compiler leaves out of line, a call per item on
+/// the per-row key paths that build keys this way.
+pub(crate) trait TryCollectVec<T, E>:
+    Iterator<Item = std::result::Result<T, E>> + Sized
+{
+    #[inline]
+    fn try_collect_vec(self) -> std::result::Result<Vec<T>, E> {
+        let mut out = Vec::with_capacity(self.size_hint().0);
+        for item in self {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+}
+
+impl<T, E, I: Iterator<Item = std::result::Result<T, E>>> TryCollectVec<T, E> for I {}
+
 #[cold]
-pub(crate) fn undecodable(binding: &Binding, why: impl std::fmt::Display) -> QueryError {
-    QueryError::dictionary_lookup(format!("cannot decode {binding:?}: {why}"))
+pub(crate) fn undecodable(binding: &Binding, why: impl std::fmt::Display) -> Undecodable {
+    Undecodable(Box::new(format!("cannot decode {binding:?}: {why}")))
 }
 
 /// `binding` decoded through `gv`: an encoded literal, subject or predicate
@@ -184,7 +218,7 @@ pub(crate) fn undecodable(binding: &Binding, why: impl std::fmt::Display) -> Que
 pub(crate) fn materialize_encoded(
     binding: &Binding,
     gv: Option<&TermView>,
-) -> crate::error::Result<Binding> {
+) -> std::result::Result<Binding, Undecodable> {
     let Some(gv) = gv else {
         if binding.is_encoded() {
             return Err(undecodable(binding, "no view to decode it through"));
@@ -497,7 +531,7 @@ pub(crate) fn binding_to_group_key_normalized(
     binding: &Binding,
     dicts: Option<crate::object_binding::TermDicts<'_>>,
     gv: Option<&TermView>,
-) -> Result<GroupKeyOwned> {
+) -> std::result::Result<GroupKeyOwned, Undecodable> {
     // An encoded subject id is its own canonical key.
     if let Binding::EncodedSid { s_id, .. } = binding {
         return Ok(GroupKeyOwned::Sid(*s_id));
@@ -707,7 +741,7 @@ impl CompositeGroupKey {
             bindings
                 .into_iter()
                 .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                .collect::<Result<_>>()?,
+                .try_collect_vec()?,
         ))
     }
 }
@@ -894,12 +928,13 @@ impl GroupAggregateOperator {
         dicts: Option<crate::object_binding::TermDicts<'_>>,
         gv: Option<&TermView>,
     ) -> Result<Vec<GroupKeyOwned>> {
-        cols.iter()
+        Ok(cols
+            .iter()
             .map(|&col_idx| {
                 let binding = batch.get_by_col(row_idx, col_idx);
                 binding_to_group_key_normalized(binding, dicts, gv)
             })
-            .collect()
+            .try_collect_vec()?)
     }
 
     /// Per-spec composed solutions for this row, empty when no aggregate needs
@@ -1110,8 +1145,11 @@ impl Operator for GroupAggregateOperator {
 
                             // COUNT(DISTINCT *) reads a whole solution, so
                             // compose it before the group state is borrowed.
-                            let row_keys =
-                                self.extract_row_keys(&batch, row_idx, dicts, norm_gv)?;
+                            let row_keys = if self.has_row_distinct {
+                                self.extract_row_keys(&batch, row_idx, dicts, norm_gv)?
+                            } else {
+                                Vec::new()
+                            };
 
                             // Update aggregate states for current group.
                             let gv_ref = self.graph_view.as_ref();
@@ -1198,7 +1236,11 @@ impl Operator for GroupAggregateOperator {
 
                         // COUNT(DISTINCT *) reads a whole solution, so compose
                         // it here too — before the group state is borrowed.
-                        let row_keys = self.extract_row_keys(&batch, row_idx, dicts, norm_gv)?;
+                        let row_keys = if self.has_row_distinct {
+                            self.extract_row_keys(&batch, row_idx, dicts, norm_gv)?
+                        } else {
+                            Vec::new()
+                        };
 
                         // One hash per row; the key is cloned out of the
                         // buffer only when it opens a new group. The closure

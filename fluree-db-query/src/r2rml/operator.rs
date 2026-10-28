@@ -35,6 +35,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::filter::filter_batch;
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -1739,7 +1740,7 @@ fn emit_produced_window(
                             .find(|(v, _)| v == jv)
                             .map(|(_, b)| binding_to_group_key_normalized(b, dicts, gv))
                     })
-                    .collect::<Result<_>>()?;
+                    .try_collect_vec()?;
                 if pkey.len() != join_vars.len() {
                     continue;
                 }

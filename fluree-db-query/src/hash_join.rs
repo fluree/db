@@ -553,6 +553,23 @@ enum JoinKeyClass {
     /// produces no output and is dropped. Collapsing this into `Wildcard` would fan a
     /// failed OPTIONAL out to every probe row instead of producing no match.
     Dead,
+    /// An encoded literal that cannot be decoded to its key: the join fails
+    /// closed ([`undecodable_key`] rebuilds the error off the hot path).
+    Undecodable,
+}
+
+/// The error for a binding [`join_key`] classed [`JoinKeyClass::Undecodable`].
+#[cold]
+#[inline(never)]
+fn undecodable_key(
+    binding: &Binding,
+    dicts: Option<TermDicts<'_>>,
+    gv: Option<&fluree_db_binary_index::TermView>,
+) -> QueryError {
+    match binding_to_group_key_normalized(binding, dicts, gv) {
+        Err(e) => e.into(),
+        Ok(_) => QueryError::Internal(format!("join key of {binding:?} decoded on retry")),
+    }
 }
 
 /// Classify a binding's join key, normalising refs to a `u64` s_id when a store is
@@ -565,8 +582,8 @@ fn join_key(
     binding: &Binding,
     dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::TermView>,
-) -> Result<JoinKeyClass> {
-    Ok(match binding {
+) -> JoinKeyClass {
+    match binding {
         Binding::EncodedSid { s_id, .. } => JoinKeyClass::Keyed(JoinKey::Ref(*s_id)),
         Binding::Unbound => JoinKeyClass::Wildcard,
         Binding::Poisoned => JoinKeyClass::Dead,
@@ -584,10 +601,11 @@ fn join_key(
         }
         // Normalize decoded literals to their encoded form so they key
         // identically to late-materialized scan output.
-        other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(
-            other, dicts, gv,
-        )?)),
-    })
+        other => match binding_to_group_key_normalized(other, dicts, gv) {
+            Ok(key) => JoinKeyClass::Keyed(JoinKey::Other(key)),
+            Err(_) => JoinKeyClass::Undecodable,
+        },
+    }
 }
 
 /// Inner hash join: build a table from `build` (the small side), probe with `probe`
@@ -732,12 +750,12 @@ impl HashJoinOperator {
                 let row_vals: Vec<Binding> = (0..ncols)
                     .map(|c| batch.get_by_col(row, c).clone())
                     .collect();
-                match join_key(
-                    batch.get_by_col(row, self.build_key_col),
-                    dicts,
-                    gv.as_ref(),
-                )? {
+                let build_key = batch.get_by_col(row, self.build_key_col);
+                match join_key(build_key, dicts, gv.as_ref()) {
                     JoinKeyClass::Keyed(key) => self.table.entry(key).or_default().push(row_vals),
+                    JoinKeyClass::Undecodable => {
+                        return Err(undecodable_key(build_key, dicts, gv.as_ref()));
+                    }
                     // Unbound join var: unconstrained, matches every probe row.
                     JoinKeyClass::Wildcard => self.wildcard_rows.push(row_vals),
                     // Poisoned join var: blocks matching — drop the row (no output).
@@ -859,10 +877,14 @@ impl Operator for HashJoinOperator {
 
                 // The probe scan always binds the join var, so a non-keyed probe row
                 // (unbound/poisoned) cannot match — skip it.
-                let JoinKeyClass::Keyed(key) =
-                    join_key(pb.get_by_col(row, self.probe_key_col), dicts, gv.as_ref())?
-                else {
-                    continue;
+                let key = match join_key(pb.get_by_col(row, self.probe_key_col), dicts, gv.as_ref())
+                {
+                    JoinKeyClass::Keyed(key) => key,
+                    JoinKeyClass::Undecodable => {
+                        let b = pb.get_by_col(row, self.probe_key_col);
+                        return Err(undecodable_key(b, dicts, gv.as_ref()));
+                    }
+                    JoinKeyClass::Wildcard | JoinKeyClass::Dead => continue,
                 };
                 if let Some(matches) = self.table.get(&key) {
                     for build_row in matches {
@@ -943,13 +965,13 @@ impl Operator for HashJoinOperator {
             match probe.next_batch(ctx).await? {
                 Some(batch) if !batch.is_empty() => {
                     for row in 0..batch.len() {
-                        let JoinKeyClass::Keyed(key) = join_key(
-                            batch.get_by_col(row, self.probe_key_col),
-                            dicts,
-                            gv.as_ref(),
-                        )?
-                        else {
-                            continue;
+                        let probe_key = batch.get_by_col(row, self.probe_key_col);
+                        let key = match join_key(probe_key, dicts, gv.as_ref()) {
+                            JoinKeyClass::Keyed(key) => key,
+                            JoinKeyClass::Undecodable => {
+                                return Err(undecodable_key(probe_key, dicts, gv.as_ref()));
+                            }
+                            JoinKeyClass::Wildcard | JoinKeyClass::Dead => continue,
                         };
                         // Each probe row matches its keyed build rows plus every
                         // wildcard (unbound-key) build row.
@@ -989,11 +1011,11 @@ mod tests {
         // Unbound => matches every probe row; Poisoned => blocks matching (drop).
         // Collapsing both to one class is the bug this guards against.
         assert!(matches!(
-            join_key(&Binding::Unbound, None, None).unwrap(),
+            join_key(&Binding::Unbound, None, None),
             JoinKeyClass::Wildcard
         ));
         assert!(matches!(
-            join_key(&Binding::Poisoned, None, None).unwrap(),
+            join_key(&Binding::Poisoned, None, None),
             JoinKeyClass::Dead
         ));
         assert!(matches!(
@@ -1001,8 +1023,7 @@ mod tests {
                 &Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::new(2, "long")),
                 None,
                 None
-            )
-            .unwrap(),
+            ),
             JoinKeyClass::Keyed(_)
         ));
     }

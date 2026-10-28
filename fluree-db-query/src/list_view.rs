@@ -839,7 +839,10 @@ impl ObjectWant {
 }
 
 fn decoded(ctx: &ExecutionContext<'_>, b: &Binding) -> Result<Binding> {
-    crate::group_aggregate::materialize_encoded(b, ctx.term_view().as_ref())
+    Ok(crate::group_aggregate::materialize_encoded(
+        b,
+        ctx.term_view().as_ref(),
+    )?)
 }
 
 fn iri_sid(ctx: &ExecutionContext<'_>, iri: &str) -> Want {

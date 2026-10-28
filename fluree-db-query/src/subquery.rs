@@ -24,6 +24,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{Pattern, SubqueryPattern};
 use crate::object_binding::{equality_norm, EqualityNorm};
@@ -708,12 +709,12 @@ impl SubqueryOperator {
                     unbound.push(col);
                 }
                 let (dicts, gv) = EqualityNorm::parts(&self.norm);
-                Ok(binding
+                binding
                     .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                    .transpose()?
-                    .unwrap_or(GroupKeyOwned::Absent))
+                    .transpose()
+                    .map(|key| key.unwrap_or(GroupKeyOwned::Absent))
             })
-            .collect::<Result<_>>()?;
+            .try_collect_vec()?;
         Ok(if unbound.is_empty() {
             self.materialized
                 .as_ref()
@@ -906,15 +907,14 @@ impl SubqueryOperator {
                 .join_keys
                 .iter()
                 .map(|v| {
-                    Ok(self
-                        .select_index
+                    self.select_index
                         .get(v)
                         .and_then(|&col| row.get(col))
                         .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                        .transpose()?
-                        .unwrap_or(GroupKeyOwned::Absent))
+                        .transpose()
+                        .map(|key| key.unwrap_or(GroupKeyOwned::Absent))
                 })
-                .collect::<Result<_>>()?;
+                .try_collect_vec()?;
             let indices = mat.index.entry(key).or_insert_with(|| {
                 index_bytes += 2
                     * (std::mem::size_of::<Vec<GroupKeyOwned>>()

@@ -694,7 +694,7 @@ pub(crate) fn normalize_for_key(
     binding: &Binding,
     dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::TermView>,
-) -> crate::error::Result<Binding> {
+) -> Result<Binding, crate::group_aggregate::Undecodable> {
     Ok(normalize_for_key_cow(binding, dicts, gv)?.into_owned())
 }
 
@@ -710,7 +710,7 @@ pub(crate) fn normalize_for_key_cow<'a>(
     binding: &'a Binding,
     dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::TermView>,
-) -> crate::error::Result<std::borrow::Cow<'a, Binding>> {
+) -> Result<std::borrow::Cow<'a, Binding>, crate::group_aggregate::Undecodable> {
     use std::borrow::Cow;
     // An encoded subject id is its own canonical key: the commonest key pays
     // nothing else.
@@ -931,7 +931,10 @@ impl ArenaCrossing {
             is_arena_encoded(&binding)
         };
         match &self.leave {
-            Some(gv) if decode => crate::group_aggregate::materialize_encoded(&binding, Some(gv)),
+            Some(gv) if decode => Ok(crate::group_aggregate::materialize_encoded(
+                &binding,
+                Some(gv),
+            )?),
             _ => Ok(binding),
         }
     }

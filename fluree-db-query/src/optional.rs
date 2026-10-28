@@ -30,6 +30,7 @@ use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
     object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
 };
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
@@ -1781,13 +1782,13 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect::<Result<_>>()?;
+                .try_collect_vec()?;
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect::<Result<_>>()?;
+                .try_collect_vec()?;
             if seen_seed.insert(seed_key) {
                 seed_rows.push(
                     seed_cols
@@ -1867,7 +1868,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
                     .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
-                    .collect::<Result<_>>()?;
+                    .try_collect_vec()?;
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
                     .map(|&c| batch.get_by_col(r, c).clone())

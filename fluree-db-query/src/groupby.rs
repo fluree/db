@@ -25,6 +25,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::group_aggregate::TryCollectVec;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -117,7 +118,8 @@ impl GroupByOperator {
                 let (dicts, gv) = EqualityNorm::parts(&self.norm);
                 normalize_for_key(&row[idx], dicts, gv)
             })
-            .collect()
+            .try_collect_vec()
+            .map_err(Into::into)
     }
 
     /// Transform accumulated groups into output rows.

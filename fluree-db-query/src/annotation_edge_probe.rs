@@ -681,7 +681,7 @@ pub(crate) fn row_obj_key(
     row: usize,
     pos: &EdgePos,
     view: Option<&fluree_db_binary_index::TermView>,
-) -> Result<GroupKeyOwned> {
+) -> std::result::Result<GroupKeyOwned, crate::group_aggregate::Undecodable> {
     let dicts = view.map(crate::object_binding::TermDicts::of_view);
     match pos {
         EdgePos::Const(sid) => {
@@ -1316,7 +1316,10 @@ impl HashAnnotationEdgeProbeOperator {
                 // per-row substitution it replaces: the edge must carry the
                 // SAME value there. Unbound positions are free — the edge
                 // binds them.
-                let row_key = |pos: &EdgePos| -> Result<Option<GroupKeyOwned>> {
+                let row_key = |pos: &EdgePos| -> std::result::Result<
+                    Option<GroupKeyOwned>,
+                    crate::group_aggregate::Undecodable,
+                > {
                     Ok(match pos {
                         EdgePos::Const(_) => None, // constrained by the scan pattern itself
                         EdgePos::Var(v) => match batch.get(row, *v) {
