@@ -114,60 +114,74 @@ fn check_lane_f(
 /// lanes answer and the union site stays off. The membership join keeps its
 /// keep/drop path under the union, and goes exact where a list position
 /// repeats a key.
+///
+/// On JSON-LD a list's members are values, so every shape runs through its
+/// lane. On SPARQL a predicate holding lists is read through the list view,
+/// a list both graphs hold is two lists (its cells are blank nodes local to
+/// each graph), and no batched lane joins that predicate.
 #[tokio::test(flavor = "current_thread")]
 async fn lane_f_union_probes_answer_by_fact() {
+    use lane_f::{Shape, Surface};
     let fx = lane_f::Fixture::build().await;
     let mut failures = Vec::new();
-    for (ledger, floor, lists) in [
-        (lane_f::LEDGER, lane_f::FLOOR, false),
-        (lane_f::LEDGER_LISTS, lane_f::FLOOR_LISTS, true),
-    ] {
-        let facts = lane_f::facts(lists);
-        let g1_facts: Vec<_> = facts
-            .iter()
-            .filter(|f| f.g == lane_f::G1)
-            .cloned()
-            .collect();
-        for &shape in lane_f::SHAPES {
-            let want = lane_f::expected(shape, &facts);
-            let label = |scope: &str| format!("{shape:?} / {scope} / lists {lists}");
-            match fx.sparql(floor, "", "", shape).await {
-                Ok(rows) if rows == want => {}
-                other => failures.push(format!(
-                    "{}: floor {other:?}, want {want:?}",
-                    label("floor")
-                )),
-            }
-            let union_site = shape.site();
-            for (name, prologue, dataset) in UNION_SCOPES {
-                let run = lane_f::run(&fx, ledger, prologue, dataset, shape).await;
+    for &surface in lane_f::SURFACES {
+        for (ledger, floor, lists) in [
+            (lane_f::LEDGER, lane_f::FLOOR, false),
+            (lane_f::LEDGER_LISTS, lane_f::FLOOR_LISTS, true),
+        ] {
+            let facts = lane_f::facts(lists);
+            let g1_facts: Vec<_> = facts
+                .iter()
+                .filter(|f| f.g == lane_f::G1)
+                .cloned()
+                .collect();
+            let floor_facts = lane_f::union_of(&facts);
+            for &shape in lane_f::SHAPES {
+                let label =
+                    |scope: &str| format!("{surface:?} / {shape:?} / {scope} / lists {lists}");
+                let want_floor = lane_f::expected_on(surface, shape, &floor_facts);
+                match fx.on(surface, floor, "", "", shape).await {
+                    Ok(rows) if rows == want_floor => {}
+                    other => failures.push(format!(
+                        "{}: floor {other:?}, want {want_floor:?}",
+                        label("floor")
+                    )),
+                }
+                let want = lane_f::expected_on(surface, shape, &facts);
+                let list_view = surface == Surface::Sparql && lane_f::probes_a_list(shape, &facts);
+                let union_site = shape.site();
+                for (name, prologue, dataset) in UNION_SCOPES {
+                    let run = lane_f::run_on(&fx, surface, ledger, prologue, dataset, shape).await;
+                    let (fire, not_fire): (&[&str], &[&str]) = match shape {
+                        _ if list_view => (&[], &[union_site, "nested-loop-batched"]),
+                        // A list position repeating a key sends keep/drop exact.
+                        Shape::Membership if lists => (&[], &["membership-join"]),
+                        Shape::Membership => (&["membership-join"], &[]),
+                        _ => (&[union_site], &["nested-loop-batched"]),
+                    };
+                    check_lane_f(&label(name), &run, &want, fire, not_fire, &mut failures);
+                }
+                // Over one graph the one-graph operators answer: the batched
+                // probes for the subject and existence joins (the planner picks
+                // another join for the object shape there), never the union's.
+                let want_g1 = lane_f::expected_on(surface, shape, &g1_facts);
+                let run = lane_f::run_on(&fx, surface, ledger, "", "FROM <urn:g1>", shape).await;
                 let (fire, not_fire): (&[&str], &[&str]) = match shape {
-                    // A list position repeating a key sends keep/drop exact.
-                    lane_f::Shape::Membership if lists => (&[], &["membership-join"]),
-                    lane_f::Shape::Membership => (&["membership-join"], &[]),
-                    _ => (&[union_site], &["nested-loop-batched"]),
+                    _ if list_view => (&[], &["nested-loop-batched", "nested-loop-batched-union"]),
+                    Shape::Membership if lists => (&[], &["membership-join"]),
+                    Shape::Membership => (&["membership-join"], &[]),
+                    Shape::Object => (&[], &["nested-loop-batched-union"]),
+                    _ => (&["nested-loop-batched"], &["nested-loop-batched-union"]),
                 };
-                check_lane_f(&label(name), &run, &want, fire, not_fire, &mut failures);
+                check_lane_f(
+                    &label("FROM g1"),
+                    &run,
+                    &want_g1,
+                    fire,
+                    not_fire,
+                    &mut failures,
+                );
             }
-            // Over one graph the one-graph operators answer: the batched
-            // probes for the subject and existence joins (the planner picks
-            // another join for the object shape there), never the union's.
-            let want_g1 = lane_f::expected(shape, &g1_facts);
-            let run = lane_f::run(&fx, ledger, "", "FROM <urn:g1>", shape).await;
-            let (fire, not_fire): (&[&str], &[&str]) = match shape {
-                lane_f::Shape::Membership if lists => (&[], &["membership-join"]),
-                lane_f::Shape::Membership => (&["membership-join"], &[]),
-                lane_f::Shape::Object => (&[], &["nested-loop-batched-union"]),
-                _ => (&["nested-loop-batched"], &["nested-loop-batched-union"]),
-            };
-            check_lane_f(
-                &label("FROM g1"),
-                &run,
-                &want_g1,
-                fire,
-                not_fire,
-                &mut failures,
-            );
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -178,7 +192,8 @@ async fn lane_f_union_probes_answer_by_fact() {
 /// leaves the union probe running. A member the index has no branch for,
 /// whose novelty holds the probed predicate, stands it down (`Novelty`);
 /// for now so does a member with a branch and such novelty. Every answer is
-/// the union's.
+/// the union's. JSON-LD, where the probed predicate's list members are
+/// values and the probe runs (on SPARQL the list view joins it).
 #[tokio::test(flavor = "current_thread")]
 async fn lane_f_union_probes_follow_each_members_novelty() {
     use lane_f::{fact, Obj, Shape, G2, LEDGER};
@@ -194,12 +209,13 @@ async fn lane_f_union_probes_follow_each_members_novelty() {
     };
     let (from, pragma) = (UNION_SCOPES[0], UNION_SCOPES[1]);
     let union = "nested-loop-batched-union";
+    let json = lane_f::Surface::JsonLd;
 
     // Novelty in g2 on another predicate: g2 holds nothing new for `v`.
     let other = vec![fact(G2, "z", "other", Obj::Int(1))];
     fx.write(LEDGER, &other).await;
     facts.extend(other);
-    let run = lane_f::run(&fx, LEDGER, from.1, from.2, Shape::Subject).await;
+    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
     let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
     check_lane_f("other predicate", &run, &want, &[union], &[], &mut failures);
 
@@ -208,10 +224,10 @@ async fn lane_f_union_probes_follow_each_members_novelty() {
     let default_graph = vec![fact("", "y2", "v", Obj::Str("d".into()))];
     fx.write(LEDGER, &default_graph).await;
     facts.extend(default_graph);
-    let run = lane_f::run(&fx, LEDGER, from.1, from.2, Shape::Subject).await;
+    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
     let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
     check_lane_f("novelty outside", &run, &want, &[union], &[], &mut failures);
-    let run = lane_f::run(&fx, LEDGER, pragma.1, pragma.2, Shape::Subject).await;
+    let run = lane_f::run_on(&fx, json, LEDGER, pragma.1, pragma.2, Shape::Subject).await;
     let want = lane_f::expected(Shape::Subject, &facts);
     check_lane_f(
         "branchless member",
@@ -236,7 +252,7 @@ async fn lane_f_union_probes_follow_each_members_novelty() {
     let g2 = vec![fact(G2, "y0", "v", Obj::Dec("4.5"))];
     fx.write(LEDGER, &g2).await;
     facts.extend(g2);
-    let run = lane_f::run(&fx, LEDGER, from.1, from.2, Shape::Subject).await;
+    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
     let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
     check_lane_f(
         "member with novelty",
