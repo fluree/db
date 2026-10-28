@@ -57,6 +57,10 @@ use crate::index_scope::MemberSet;
 /// Inputs merged by a scan of their heads; above this, by a heap.
 const LINEAR_MERGE_MAX_INPUTS: usize = 4;
 
+/// Steps in a row that find no rows two members hold before the scan of a
+/// few inputs stops looking for them (see [`merge_linear`]).
+const SHARED_MISSES_MAX: u32 = 64;
+
 /// Why a merge cannot give the exact union, so the lane that asked must fall
 /// back to the general plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +349,7 @@ impl MergedRangeCursor {
             last,
             record,
             rows: 0,
+            repeated: false,
         };
         match lanes.as_mut_slice() {
             [] => {}
@@ -437,6 +442,9 @@ struct Emitted<'a> {
     record: bool,
     /// The rows emitted this round.
     rows: usize,
+    /// A repeat of the fact emitted last was dropped: two inputs' heads were
+    /// equal.
+    repeated: bool,
 }
 
 impl Emitted<'_> {
@@ -451,6 +459,8 @@ impl Emitted<'_> {
             }
             self.rows += 1;
             *self.last = Some(fact);
+        } else {
+            self.repeated = true;
         }
     }
 
@@ -461,6 +471,7 @@ impl Emitted<'_> {
     fn run(&mut self, lane: &Lane<'_>, mut from: usize, to: usize, first: Key) {
         if from < to && *self.last == Some(first.identity()) {
             from += 1;
+            self.repeated = true;
         }
         if from < to {
             if self.record {
@@ -626,10 +637,63 @@ fn two_mut<T>(slice: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
 }
 
 /// The merge for a few inputs: the next input is found by scanning the
-/// heads.
+/// heads. Looking for rows two members hold costs a comparison per step, and
+/// members that interleave without sharing rows (graphs whose subjects were
+/// minted apart) would pay it on every row. So the merge starts without it;
+/// the dedup drops any repeat that reaches it, and the first repeat dropped
+/// turns the lockstep walk of shared rows on, until [`SHARED_MISSES_MAX`]
+/// steps in a row find none.
 fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
     let mut heads: SmallVec<[Key; LINEAR_MERGE_MAX_INPUTS]> =
         lanes.iter().map(Lane::head).collect();
+    while merge_linear_apart::<O>(lanes, &mut heads, out)
+        && merge_linear_shared::<O>(lanes, &mut heads, out)
+    {}
+}
+
+/// [`merge_linear`] while no two heads have proved equal: each step emits
+/// the smallest head's run below the smallest of the others, and a repeat is
+/// left to the dedup. Returns `true` at the first repeat dropped, `false`
+/// when a batch is used up.
+fn merge_linear_apart<O: MergeOrder>(
+    lanes: &mut [Lane<'_>],
+    heads: &mut [Key],
+    out: &mut Emitted<'_>,
+) -> bool {
+    out.repeated = false;
+    loop {
+        // The smallest head (the earlier input on a tie) and the smallest of
+        // the others.
+        let mut min_at = 0;
+        let mut runner_up: Option<Key> = None;
+        for at in 1..heads.len() {
+            if O::cmp(&heads[at], &heads[min_at]) == Ordering::Less {
+                runner_up = Some(heads[min_at]);
+                min_at = at;
+            } else if runner_up.is_none_or(|r| O::cmp(&heads[at], &r) == Ordering::Less) {
+                runner_up = Some(heads[at]);
+            }
+        }
+        match advance::<O>(&mut lanes[min_at], heads[min_at], runner_up.as_ref(), out) {
+            Some(next) => heads[min_at] = next,
+            None => return false,
+        }
+        if out.repeated {
+            return true;
+        }
+    }
+}
+
+/// [`merge_linear`] once two heads have proved equal: rows two members hold
+/// are walked in lockstep below the third head. Returns `true` after
+/// [`SHARED_MISSES_MAX`] steps in a row with no two heads equal, `false` when
+/// a batch is used up.
+fn merge_linear_shared<O: MergeOrder>(
+    lanes: &mut [Lane<'_>],
+    heads: &mut [Key],
+    out: &mut Emitted<'_>,
+) -> bool {
+    let mut misses = 0;
     loop {
         // The smallest head and the smallest of the others (the earlier lane
         // on a tie).
@@ -647,6 +711,7 @@ fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
         if heads[min_at] == heads[second_at] {
             // Rows two members hold: walk them in lockstep below the third
             // head.
+            misses = 0;
             let third = (0..heads.len())
                 .filter(|&at| at != min_at && at != second_at)
                 .map(|at| heads[at])
@@ -654,13 +719,17 @@ fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
             let (a, b) = two_mut(lanes, min_at, second_at);
             match shared_stretch::<O>(a, b, heads[min_at], third.as_ref(), out) {
                 Some((next_a, next_b)) => (heads[min_at], heads[second_at]) = (next_a, next_b),
-                None => return,
+                None => return false,
             }
         } else {
             let bound = heads[second_at];
             match advance::<O>(&mut lanes[min_at], heads[min_at], Some(&bound), out) {
                 Some(next) => heads[min_at] = next,
-                None => return,
+                None => return false,
+            }
+            misses += 1;
+            if misses == SHARED_MISSES_MAX {
+                return true;
             }
         }
     }
@@ -1647,6 +1716,62 @@ mod tests {
         }
     }
 
+    /// Three and four members that interleave apart, then share rows, then
+    /// interleave apart for longer than the scan of a few inputs keeps
+    /// looking for shared rows, then share again, each in one leaflet: the
+    /// merge moves between its apart and shared walks within a round, and
+    /// every fact comes out once, counted alone as well.
+    #[test]
+    fn a_few_members_move_between_apart_and_shared_rows() {
+        let stretch = u64::from(SHARED_MISSES_MAX) * 3;
+        let row = |s: u64| -> Row { (s, 5, STR, s % 7, NO_LIST) };
+        for k in [3u64, 4] {
+            let mut members: Vec<Vec<Row>> = vec![Vec::new(); k as usize];
+            let mut s = 0;
+            for phase in 0..4 {
+                for _ in 0..stretch {
+                    // Apart: each subject in one member, round robin. Shared:
+                    // two members, and every fourth subject all of them.
+                    let holders = match phase % 2 {
+                        0 => 1,
+                        _ if s % 4 == 0 => k,
+                        _ => 2,
+                    };
+                    for m in 0..holders {
+                        members[((s + m) % k) as usize].push(row(s));
+                    }
+                    s += 1;
+                }
+            }
+            for order in ORDERS {
+                let inputs = || {
+                    members
+                        .iter()
+                        .map(|rows| member(order, &[&rows[..]]))
+                        .collect()
+                };
+                let out = drain(&mut merge(order, inputs())).expect("no decline");
+                assert_is_the_union(order, &members, &out);
+                let (min, max) = full_range();
+                let mut counting = MergedRangeCursor::from_batches(
+                    order,
+                    inputs(),
+                    &min,
+                    &max,
+                    ColumnProjection {
+                        output: ColumnSet::EMPTY,
+                        internal: ColumnSet::EMPTY,
+                    },
+                );
+                let mut counted = 0;
+                while let Some(batch) = counting.next_batch().unwrap().unwrap() {
+                    counted += batch.row_count;
+                }
+                assert_eq!(counted, out.len(), "{order:?} k={k}: count only");
+            }
+        }
+    }
+
     /// Construction over a real (empty) store: a set that is not current
     /// declines `Novelty`; a current one whose members the index holds
     /// nothing for (a default graph with every fact in named graphs) merges
@@ -1739,6 +1864,15 @@ mod tests {
                     ],
                 ),
                 ("k3_interleaved", interleaved(3)),
+                ("k3_identical", vec![(0..ROWS / 3).map(r).collect(); 3]),
+                ("k3_sparse_shared", {
+                    // Interleaved, and the second member also holds every
+                    // 64th of the first's rows.
+                    let mut members = interleaved(3);
+                    members[1].extend((0..ROWS / 3).step_by(64).map(|i| r(i * 3)));
+                    members[1].sort_unstable();
+                    members
+                }),
                 ("k5_interleaved", interleaved(5)),
             ]
         };
