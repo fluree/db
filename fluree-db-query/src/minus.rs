@@ -230,7 +230,7 @@ impl MinusOperator {
         input_bindings: &mut Vec<Option<Binding>>,
         probe: &mut MinusKey,
         dicts: Option<TermDicts<'_>>,
-        gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+        gv: Option<&fluree_db_binary_index::TermView>,
     ) -> bool {
         if let [var] = self.shared_vars.as_slice() {
             let Some(binding) = input_batch.column(*var).map(|col| &col[row_idx]) else {

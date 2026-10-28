@@ -64,7 +64,7 @@ pub struct AggregateOperator {
     /// Graph view for materializing encoded bindings before value-folding
     /// aggregates (GROUP_CONCAT/MEDIAN/VARIANCE/STDDEV) — their matchers
     /// silently drop encoded values.
-    graph_view: Option<fluree_db_binary_index::BinaryGraphView>,
+    graph_view: Option<fluree_db_binary_index::TermView>,
 }
 
 impl AggregateOperator {
@@ -189,7 +189,7 @@ impl Operator for AggregateOperator {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
         if self.graph_view.is_none() {
-            self.graph_view = ctx.one_graph_view();
+            self.graph_view = ctx.term_view();
         }
         Ok(())
     }
@@ -358,7 +358,7 @@ impl Operator for AggregateOperator {
 fn apply_aggregate(
     func: &AggregateFn,
     binding: &Binding,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    gv: Option<&fluree_db_binary_index::TermView>,
     namespaces: Option<&HashMap<u16, String>>,
 ) -> Binding {
     let needs_decoded_values = matches!(

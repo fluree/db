@@ -46,7 +46,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_binary_index::TermView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use rustc_hash::{FxBuildHasher, FxHashSet};
@@ -107,11 +107,7 @@ enum AggState {
 /// EncodedSid/EncodedPid raw IDs don't have semantic ordering (s_id=100 for "zebra"
 /// would incorrectly compare > s_id=50 for "apple"). We must decode to get correct
 /// term ordering via namespace/name comparison.
-fn compare_for_minmax(
-    a: &Binding,
-    b: &Binding,
-    gv: Option<&BinaryGraphView>,
-) -> std::cmp::Ordering {
+fn compare_for_minmax(a: &Binding, b: &Binding, gv: Option<&TermView>) -> std::cmp::Ordering {
     let Some(gv) = gv else {
         return crate::sort::compare_bindings(a, b);
     };
@@ -159,13 +155,13 @@ fn compare_for_minmax(
     }
 
     // General path: materialize then use SPARQL ordering comparator.
-    // BinaryGraphView handles novelty watermark routing internally.
+    // TermView handles novelty watermark routing internally.
     let am = materialize_encoded(a, Some(gv));
     let bm = materialize_encoded(b, Some(gv));
     crate::sort::compare_bindings(&am, &bm)
 }
 
-pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView>) -> Binding {
+pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&TermView>) -> Binding {
     let Some(gv) = gv else {
         return binding.clone();
     };
@@ -182,7 +178,7 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
             t,
             arena_g_id,
         } => {
-            // BinaryGraphView handles novelty watermark routing internally.
+            // TermView handles novelty watermark routing internally.
             match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id) {
                 Ok(fluree_db_core::FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
@@ -260,7 +256,7 @@ impl AggState {
         &mut self,
         binding: &Binding,
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
+        gv: Option<&TermView>,
     ) {
         match self {
             AggState::Count { n } => {
@@ -473,7 +469,7 @@ impl Hash for MaterializedLitKey {
 pub(crate) fn binding_to_group_key_normalized(
     binding: &Binding,
     dicts: Option<crate::object_binding::TermDicts<'_>>,
-    gv: Option<&BinaryGraphView>,
+    gv: Option<&TermView>,
 ) -> GroupKeyOwned {
     // An encoded subject id is its own canonical key.
     if let Binding::EncodedSid { s_id, .. } = binding {
@@ -739,7 +735,7 @@ pub struct GroupAggregateOperator {
     /// Graph view for materializing encoded bindings (used for MIN/MAX semantic ordering).
     /// When novelty-aware (via `ExecutionContext::one_graph_view()`), watermark routing
     /// for novelty-only subject/string IDs is handled internally.
-    graph_view: Option<BinaryGraphView>,
+    graph_view: Option<TermView>,
     /// Normalization for group keys and `COUNT(DISTINCT)`, so the forms one
     /// term takes key as one (see [`binding_to_group_key_normalized`]).
     norm: Option<crate::object_binding::EqualityNorm>,
@@ -773,7 +769,7 @@ impl GroupAggregateOperator {
         child: BoxedOperator,
         group_vars: Vec<VarId>,
         agg_specs: Vec<StreamingAggSpec>,
-        graph_view: Option<BinaryGraphView>,
+        graph_view: Option<TermView>,
         partitioned: bool,
     ) -> Self {
         let child_schema = child.schema().to_vec();
@@ -852,7 +848,7 @@ impl GroupAggregateOperator {
         row_idx: usize,
         key: &mut CompositeGroupKey,
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
+        gv: Option<&TermView>,
     ) {
         key.0.clear();
         key.0.extend(self.group_key_indices.iter().map(|&col_idx| {
@@ -872,7 +868,7 @@ impl GroupAggregateOperator {
         row_idx: usize,
         cols: &[usize],
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
+        gv: Option<&TermView>,
     ) -> Vec<GroupKeyOwned> {
         cols.iter()
             .map(|&col_idx| {
@@ -889,7 +885,7 @@ impl GroupAggregateOperator {
         batch: &Batch,
         row_idx: usize,
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
+        gv: Option<&TermView>,
     ) -> Vec<Vec<GroupKeyOwned>> {
         if !self.has_row_distinct {
             return Vec::new();
@@ -954,7 +950,7 @@ impl Operator for GroupAggregateOperator {
         // If the execution context has a binary store, use it to materialize
         // encoded bindings for correct MIN/MAX comparison semantics.
         if self.graph_view.is_none() {
-            self.graph_view = ctx.one_graph_view();
+            self.graph_view = ctx.term_view();
         }
         self.norm = crate::object_binding::equality_norm(ctx);
         Ok(())
@@ -1344,7 +1340,7 @@ impl Operator for GroupAggregateOperator {
 /// arena would silently drop the values.
 fn extract_numeric_with_gv(
     binding: &Binding,
-    gv: Option<&BinaryGraphView>,
+    gv: Option<&TermView>,
 ) -> Option<crate::aggregate::NumericValue> {
     use fluree_db_core::ObjKind;
 

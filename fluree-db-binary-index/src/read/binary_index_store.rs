@@ -3345,6 +3345,11 @@ impl BinaryGraphView {
         &self.terms
     }
 
+    /// [`Self::terms`], by value.
+    pub fn into_terms(self) -> TermView {
+        self.terms
+    }
+
     /// Decode a value of this graph's rows from `(o_type, o_key)`, an arena
     /// handle through this graph's arena. Novelty-aware when `dict_novelty`
     /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through

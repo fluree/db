@@ -239,7 +239,7 @@ impl GraphOperator {
                 .resolve_predicate_iri(*p_id)
                 .map(Arc::from),
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
-                let gv = ctx.one_graph_view()?;
+                let gv = ctx.term_view()?;
                 match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
                     Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(&sid).map(Arc::from),
                     Binding::Lit {

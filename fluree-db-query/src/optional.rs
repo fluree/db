@@ -615,7 +615,7 @@ impl PatternOptionalBuilder {
         let mut pattern = self.pattern.clone();
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
-        let mut view: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
+        let mut view: Option<Option<fluree_db_binary_index::TermView>> = None;
         let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             if object_to_unify && instr.position == PatternPosition::Object {
@@ -629,7 +629,7 @@ impl PatternOptionalBuilder {
                     | Binding::EncodedLit { .. }
             );
             let view = if encoded {
-                view.get_or_insert_with(|| ctx.one_graph_view()).as_ref()
+                view.get_or_insert_with(|| ctx.term_view()).as_ref()
             } else {
                 None
             };
@@ -2225,7 +2225,7 @@ impl AnnotationValueOptionalBuilder {
     async fn sidecar_maps(
         &self,
         ctx: &ExecutionContext<'_>,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+        view: Option<&fluree_db_binary_index::TermView>,
     ) -> Result<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>> {
         crate::annotation_edge_probe::AnnotationSidecarMaps::shared(
             &self.r_subj,
@@ -2244,7 +2244,7 @@ impl AnnotationValueOptionalBuilder {
         pos: &crate::annotation_edge_probe::EdgePos,
         batch: &Batch,
         row: usize,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+        view: Option<&fluree_db_binary_index::TermView>,
     ) -> Result<Option<fluree_db_core::Sid>> {
         use crate::annotation_edge_probe::EdgePos;
         match pos {
@@ -2282,7 +2282,7 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
             return Ok(None);
         }
         let view = ctx.one_graph_view();
-        let view = view.as_ref();
+        let view = view.as_deref();
 
         // One pass over each reifies predicate (overlay-merged, policy-
         // filtered planned scans) — cached across required batches — then

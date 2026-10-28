@@ -1,5 +1,5 @@
 use crate::binding::Binding;
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::dict_novelty::{DictNovelty, StringDictNovelty, SubjectDictNovelty};
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
@@ -464,7 +464,7 @@ impl<'a> TermDicts<'a> {
     }
 
     /// The dictionaries a novelty-aware graph view resolves through.
-    pub(crate) fn of_view(view: &'a fluree_db_binary_index::BinaryGraphView) -> Self {
+    pub(crate) fn of_view(view: &'a fluree_db_binary_index::TermView) -> Self {
         Self::new(view.store(), view.dict_novelty().map(|dn| &**dn))
     }
 
@@ -632,7 +632,7 @@ pub(crate) struct EqualityNorm {
     novel_strings: bool,
     /// See [`TermDicts`]'s field of the same name.
     novel_predicate_subjects: NovelPredicateSubjects,
-    gv: Option<fluree_db_binary_index::BinaryGraphView>,
+    gv: Option<fluree_db_binary_index::TermView>,
 }
 
 impl EqualityNorm {
@@ -653,7 +653,7 @@ impl EqualityNorm {
         norm: &Option<Self>,
     ) -> (
         Option<TermDicts<'_>>,
-        Option<&fluree_db_binary_index::BinaryGraphView>,
+        Option<&fluree_db_binary_index::TermView>,
     ) {
         match norm {
             Some(n) => (Some(n.dicts()), n.gv.as_ref()),
@@ -685,7 +685,7 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
         novel_subjects,
         novel_strings,
         novel_predicate_subjects: NovelPredicateSubjects::default(),
-        gv: ctx.one_graph_view(),
+        gv: ctx.term_view(),
     })
 }
 
@@ -693,7 +693,7 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
 pub(crate) fn normalize_for_key(
     binding: &Binding,
     dicts: Option<TermDicts<'_>>,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    gv: Option<&fluree_db_binary_index::TermView>,
 ) -> Binding {
     normalize_for_key_cow(binding, dicts, gv).into_owned()
 }
@@ -705,7 +705,7 @@ pub(crate) fn normalize_for_key(
 pub(crate) fn normalize_for_key_cow<'a>(
     binding: &'a Binding,
     dicts: Option<TermDicts<'_>>,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    gv: Option<&fluree_db_binary_index::TermView>,
 ) -> std::borrow::Cow<'a, Binding> {
     use std::borrow::Cow;
     // An encoded subject id is its own canonical key: the commonest key pays
@@ -808,7 +808,7 @@ fn undecodable_arena_literal(a: &Binding, b: &Binding) -> crate::error::QueryErr
 fn encoded_against_decoded_subject(
     a: &Binding,
     b: &Binding,
-    gv: &fluree_db_binary_index::BinaryGraphView,
+    gv: &fluree_db_binary_index::TermView,
 ) -> Option<bool> {
     let (s_id, sid) = match (a, b) {
         (Binding::EncodedSid { s_id, .. }, Binding::Sid { sid, .. })
@@ -884,9 +884,9 @@ pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
 /// same single graph, where a handle means the same value on either side.
 pub(crate) struct ArenaCrossing {
     /// The outer graph: decodes the handles the seeding row carries in.
-    enter: Option<fluree_db_binary_index::BinaryGraphView>,
+    enter: Option<fluree_db_binary_index::TermView>,
     /// The scope's graph: decodes the handles its rows carry out.
-    leave: Option<fluree_db_binary_index::BinaryGraphView>,
+    leave: Option<fluree_db_binary_index::TermView>,
     /// Decode every encoded binding leaving, not only arena handles: the
     /// outer context spans several graphs, whose members decode as they scan.
     leave_all: bool,
@@ -912,8 +912,8 @@ impl ArenaCrossing {
             };
         }
         Self {
-            enter: outer.one_graph_view(),
-            leave: scope.one_graph_view(),
+            enter: outer.one_graph_view().map(BinaryGraphView::into_terms),
+            leave: scope.one_graph_view().map(BinaryGraphView::into_terms),
             leave_all: !outer.has_binary_store(),
         }
     }

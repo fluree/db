@@ -1496,7 +1496,7 @@ impl<'a> ExecutionContext<'a> {
         {
             return Some(Ok(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64())));
         }
-        let gv = self.one_graph_view()?;
+        let gv = self.term_view()?;
         Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id))
     }
 
@@ -1558,7 +1558,7 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Returns `None` if no binary store is attached.
     pub fn resolve_subject_iri(&self, s_id: u64) -> Option<std::io::Result<String>> {
-        let gv = self.one_graph_view()?;
+        let gv = self.term_view()?;
         Some(gv.resolve_subject_iri(s_id))
     }
 

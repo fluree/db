@@ -28,7 +28,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, TermView};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
@@ -55,7 +55,7 @@ struct GroupedCountDrain {
     output_columns: Vec<usize>,
     groups: hashbrown::HashMap<CompositeGroupKey, CountGroup, FxBuildHasher>,
     key: CompositeGroupKey,
-    graph_view: Option<BinaryGraphView>,
+    graph_view: Option<TermView>,
     counted_rows: u64,
 }
 
@@ -459,9 +459,9 @@ pub(crate) fn substitute_binding(
     pattern: &mut TriplePattern,
     position: PatternPosition,
     binding: &Binding,
-    gv: Option<&BinaryGraphView>,
+    gv: Option<&TermView>,
 ) -> Result<Substitution> {
-    let resolve_subject = |gv: &BinaryGraphView, s_id: u64| -> Result<Arc<str>> {
+    let resolve_subject = |gv: &TermView, s_id: u64| -> Result<Arc<str>> {
         let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
             tracing::debug!(s_id, error = %e, "failed to resolve encoded subject binding");
             QueryError::dictionary_lookup(format!(
@@ -471,7 +471,7 @@ pub(crate) fn substitute_binding(
         Ok(Arc::from(iri))
     };
     let resolve_predicate =
-        |gv: &BinaryGraphView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
+        |gv: &TermView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
 
     match position {
         PatternPosition::Subject | PatternPosition::Predicate => {
@@ -690,13 +690,7 @@ struct UnionMatch {
 }
 
 impl UnionMatch {
-    fn new(
-        key: u64,
-        member: usize,
-        encoded: &Binding,
-        view: Option<&BinaryGraphView>,
-        o_i: u32,
-    ) -> Self {
+    fn new(key: u64, member: usize, encoded: &Binding, view: Option<&TermView>, o_i: u32) -> Self {
         let object = crate::group_aggregate::materialize_encoded(encoded, view);
         let term = if is_arena_encoded(encoded) {
             object.clone()
@@ -1278,7 +1272,7 @@ impl NestedLoopJoinOperator {
         &self,
         left_batch: &Batch,
         left_row: usize,
-        view: Option<&BinaryGraphView>,
+        view: Option<&TermView>,
     ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.right_pattern.clone();
         for instr in &self.bind_instructions {
@@ -1563,7 +1557,7 @@ impl Operator for NestedLoopJoinOperator {
 
         // Built once for the whole next_batch call (avoids repeated Arc::clone
         // + construction per row).
-        let cached_view = ctx.one_graph_view();
+        let cached_view = ctx.term_view();
 
         // Process until we have output or exhaust input
         loop {
@@ -1833,7 +1827,7 @@ impl Operator for NestedLoopJoinOperator {
             output_columns,
             groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
-            graph_view: ctx.one_graph_view(),
+            graph_view: ctx.term_view(),
             counted_rows: 0,
         });
         let result: Result<u64> = async {
@@ -2371,7 +2365,7 @@ impl NestedLoopJoinOperator {
                         m.s_id,
                         member,
                         m.object,
-                        view.as_ref(),
+                        view.as_deref(),
                         m.o_i,
                     ));
                     Ok(())
@@ -3201,7 +3195,7 @@ impl NestedLoopJoinOperator {
                         obj_idx as u64,
                         member,
                         &Binding::encoded_sid(s_id),
-                        view.as_ref(),
+                        view.as_deref(),
                         o_i,
                     ));
                     Ok(())
@@ -3273,7 +3267,7 @@ impl NestedLoopJoinOperator {
                     m.subject_id,
                     member,
                     object,
-                    view.as_ref(),
+                    view.as_deref(),
                     m.o_i,
                 ));
             }

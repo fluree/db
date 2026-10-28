@@ -270,7 +270,7 @@ impl UnionFact {
         bindings: impl IntoIterator<Item = &'b Binding>,
         fact: Option<&RowFact>,
         dicts: Option<TermDicts<'_>>,
-        gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+        gv: Option<&fluree_db_binary_index::TermView>,
     ) -> Self {
         Self {
             bindings: bindings

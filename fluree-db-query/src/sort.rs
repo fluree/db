@@ -11,7 +11,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_binary_index::TermView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeConstraint, DatatypeDictId, FlakeValue, Sid};
@@ -31,7 +31,7 @@ const SORT_DEBUG_MIN_MS: u64 = 25;
 /// value semantics for literals) rather than raw ID ordering.
 fn materialize_encoded_for_sort(
     b: &Binding,
-    gv: &BinaryGraphView,
+    gv: &TermView,
     assume_lex_sorted_string_ids: bool,
 ) -> Option<Binding> {
     match b {
@@ -55,7 +55,7 @@ fn materialize_encoded_for_sort(
                 return None;
             }
 
-            // BinaryGraphView handles novelty watermark routing internally.
+            // TermView handles novelty watermark routing internally.
             let val = gv
                 .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                 .ok()?;
@@ -82,7 +82,7 @@ fn materialize_encoded_for_sort(
             }
         }
         Binding::EncodedSid { s_id, .. } => {
-            // BinaryGraphView::resolve_subject_sid handles novelty routing
+            // TermView::resolve_subject_sid handles novelty routing
             // and returns Sid directly (no IRI string + trie lookup).
             let sid = gv.resolve_subject_sid(*s_id).ok()?;
             Some(Binding::sid(sid))
@@ -103,7 +103,7 @@ fn materialize_encoded_for_sort(
 fn materialize_sort_keys_in_rows(
     rows: &mut [Vec<Binding>],
     sort_col_indices: &[usize],
-    gv: &BinaryGraphView,
+    gv: &TermView,
     assume_lex_sorted_string_ids: bool,
 ) {
     for row in rows.iter_mut() {
@@ -123,7 +123,7 @@ fn materialize_sort_keys_in_rows(
 fn materialize_sort_keys_in_row(
     row: &mut Vec<Binding>,
     sort_col_indices: &[usize],
-    gv: &BinaryGraphView,
+    gv: &TermView,
     assume_lex_sorted_string_ids: bool,
 ) {
     materialize_sort_keys_in_rows(
@@ -610,7 +610,7 @@ impl Operator for SortOperator {
         self.buffer = None;
         self.emit_idx = 0;
         self.assume_lex_sorted_string_ids = ctx
-            .one_graph_view()
+            .term_view()
             .map(|gv| gv.store().lex_sorted_string_ids())
             .unwrap_or(false);
         self.state = OperatorState::Open;
@@ -664,7 +664,7 @@ impl Operator for SortOperator {
                 let k = self.topk.unwrap_or(0);
 
                 // Build novelty-aware graph view once for the entire drain loop.
-                let cached_gv = ctx.one_graph_view();
+                let cached_gv = ctx.term_view();
 
                 loop {
                     ctx.check_cancelled()?;
@@ -738,7 +738,7 @@ impl Operator for SortOperator {
                         all_rows.len()
                     },
                     sort_columns = self.sort_col_indices.len(),
-                    materialize = ctx.one_graph_view().is_some(),
+                    materialize = ctx.term_view().is_some(),
                 );
                 let _sort_exec_guard = sort_execute_span.enter();
                 ctx.check_cancelled()?;

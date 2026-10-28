@@ -1602,10 +1602,8 @@ impl PropertyPathOperator {
         let decoded;
         let term = match term {
             Binding::EncodedLit { .. } => {
-                decoded = crate::group_aggregate::materialize_encoded(
-                    term,
-                    ctx.one_graph_view().as_ref(),
-                );
+                decoded =
+                    crate::group_aggregate::materialize_encoded(term, ctx.term_view().as_ref());
                 &decoded
             }
             other => other,
@@ -1692,24 +1690,23 @@ impl PropertyPathOperator {
                     // (only meaningful within this single ledger, which property paths
                     // already require) to its IRI through the novelty-aware graph view,
                     // then re-encode against the same graph — matching the
-                    // `IriMatch`/`Iri` arms above. Subject ids are the ledger's, so with
-                    // several graphs active (no graph view) the store's view across them
-                    // resolves it. An id that cannot be resolved is an error, not an
-                    // unbound endpoint.
+                    // `IriMatch`/`Iri` arms above. Subject ids are the store's, the same
+                    // in every graph, so a decoder with no graph resolves it whatever
+                    // graphs are active. An id that cannot be resolved is an error, not
+                    // an unbound endpoint.
                     Some(b @ Binding::EncodedSid { s_id, .. }) => {
                         let view = ctx
-                            .one_graph_view()
+                            .term_view()
                             .or_else(|| {
                                 binary_store.map(|store| {
-                                    store
-                                        .graph_with_novelty(
-                                            ctx.binary_g_id,
-                                            ctx.dict_novelty.clone(),
-                                        )
-                                        .with_namespace_codes_fallback(
-                                            ctx.namespace_codes_fallback.clone(),
-                                        )
-                                        .with_tracker(ctx.tracker.clone())
+                                    fluree_db_binary_index::TermView::new(
+                                        Arc::clone(store),
+                                        ctx.dict_novelty.clone(),
+                                    )
+                                    .with_namespace_codes_fallback(
+                                        ctx.namespace_codes_fallback.clone(),
+                                    )
+                                    .with_tracker(ctx.tracker.clone())
                                 })
                             })
                             .ok_or_else(|| {
