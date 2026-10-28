@@ -43,7 +43,7 @@ use crate::operator::{BoxedOperator, CountGroup, Operator, OperatorState, RowFac
 use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
 use crate::union_group_count::{
-    count_groups_over_union, GroupedPosition, UnionGroupCount, PARTITIONED_GROUP_BY_UNION_SITE,
+    count_groups_over_union, grouped_position, UnionGroupCount, PARTITIONED_GROUP_BY_UNION_SITE,
 };
 use crate::var_registry::VarId;
 
@@ -216,28 +216,26 @@ impl DatasetBuilder for ScanDatasetBuilder {
     /// A current-mode scan of `?s <p> ?o` (two variables, a bound predicate,
     /// no datatype constraint) with no object bounds or inline operators: each
     /// of its rows is one fact of `<p>`, binding both variables. It answers a
-    /// grouped count by `?s` or by `?o`.
+    /// grouped count by `?s` or by `?o`. A scan that hides list members (a
+    /// list-view triple's, `crate::list_view`) does not: its rows are not
+    /// every fact of `<p>`, and the list triples join outside it.
     fn union_group_count(
         &self,
         group_vars: &[VarId],
         bound_vars: &[VarId],
     ) -> Option<UnionGroupCount<'_>> {
-        if !self.mode.is_current() || self.object_bounds.is_some() || !self.inline_ops.is_empty() {
+        if !self.mode.is_current()
+            || self.object_bounds.is_some()
+            || !self.inline_ops.is_empty()
+            || self.hide_list_members
+        {
             return None;
         }
-        let (s, _, o) = crate::execute::operator_tree::validate_simple_triple(&self.pattern)?;
-        let position = match group_vars {
-            [v] if *v == s => GroupedPosition::Subject,
-            [v] if *v == o => GroupedPosition::Object,
-            _ => return None,
-        };
-        bound_vars
-            .iter()
-            .all(|v| *v == s || *v == o)
-            .then_some(UnionGroupCount {
-                pattern: &self.pattern,
-                position,
-            })
+        let position = grouped_position(&self.pattern, group_vars, bound_vars)?;
+        Some(UnionGroupCount {
+            pattern: &self.pattern,
+            position,
+        })
     }
 }
 
@@ -1065,6 +1063,7 @@ impl Operator for DatasetOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::union_group_count::GroupedPosition;
     use crate::var_registry::VarId;
 
     /// A scan builder offers a grouped count over a union of graphs only for
@@ -1113,8 +1112,11 @@ mod tests {
             var: other,
             expr: crate::ir::Expression::Var(o),
         };
-        let inline = builder(plain, None, vec![bind], TemporalMode::Current);
+        let inline = builder(plain.clone(), None, vec![bind], TemporalMode::Current);
         assert_eq!(position(&inline, &[o], &[]), None);
+        let mut hiding = builder(plain, None, Vec::new(), TemporalMode::Current);
+        hiding.hide_list_members = true;
+        assert_eq!(position(&hiding, &[o], &[]), None);
 
         // A constant object, a variable predicate, one variable twice.
         let constant = TriplePattern::new(Ref::Var(s), p.clone(), Term::Sid(Sid::new(100, "T1")));

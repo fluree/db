@@ -38,13 +38,15 @@ use crate::binding::Binding;
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::predicate_range_keys;
-use crate::fast_path_outcome::FastPathFallback;
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::index_scope::MemberSet;
 use crate::ir::triple::TriplePattern;
+use crate::ir::{AggregateFn, Pattern, Query};
 use crate::merged_cursor::MergedRangeCursor;
 use crate::object_binding::{equality_norm, materialized_object_binding, EqualityNorm};
 use crate::operator::CountGroup;
+use crate::var_registry::VarId;
 
 /// `fast-path outcome` site of the grouped count over a default graph of
 /// several graphs, or of none: the one-graph partitioned GROUP BY's site
@@ -56,6 +58,69 @@ pub const PARTITIONED_GROUP_BY_UNION_SITE: &str = "partitioned_group_by_union";
 pub enum GroupedPosition {
     Subject,
     Object,
+}
+
+/// The position of `pattern` (`?s <p> ?o`, two distinct variables, a bound
+/// predicate, no datatype constraint) a grouped count by `group_vars` groups
+/// by, when every variable in `bound_vars` (those a `COUNT(?v)` reads) is one
+/// the pattern binds in every row.
+pub(crate) fn grouped_position(
+    pattern: &TriplePattern,
+    group_vars: &[VarId],
+    bound_vars: &[VarId],
+) -> Option<GroupedPosition> {
+    let (s, _, o) = crate::execute::operator_tree::validate_simple_triple(pattern)?;
+    let position = match group_vars {
+        [v] if *v == s => GroupedPosition::Subject,
+        [v] if *v == o => GroupedPosition::Object,
+        _ => return None,
+    };
+    bound_vars
+        .iter()
+        .all(|v| *v == s || *v == o)
+        .then_some(position)
+}
+
+/// Stamp why the union lane stands down for `query` where SPARQL reads its
+/// one pattern through its view of RDF lists (`crate::list_view`): a grouped
+/// count of a list-view triple `?s <p> ?o` by `?s` or `?o`, every aggregate a
+/// row count. That triple's rows are its stored rows that are not list
+/// members plus the list triples, which no index range holds, so the planner
+/// wraps its scan and the lane is never asked. The kill switch, where it is
+/// on, is the reason given. For a plan over a default graph of several graphs
+/// or of none, where the lane would otherwise run.
+pub(crate) fn stamp_list_view_decline(query: &Query) {
+    let (Some(grouping), [Pattern::ListView(lv)], None) = (
+        query.grouping.as_ref(),
+        query.patterns.as_slice(),
+        query.post_values.as_ref(),
+    ) else {
+        return;
+    };
+    if grouping.aggregates().next().is_none() {
+        return;
+    }
+    let mut bound_vars = Vec::new();
+    for spec in grouping.aggregates() {
+        match spec.function {
+            AggregateFn::CountAll => {}
+            AggregateFn::Count(v) => bound_vars.push(v),
+            _ => return,
+        }
+    }
+    let group_vars: Vec<VarId> = grouping.group_by_vars().collect();
+    if grouped_position(&lv.triple, &group_vars, &bound_vars).is_none() {
+        return;
+    }
+    let reason = if crate::execute::fast_paths_disabled() {
+        FastPathFallback::KillSwitch
+    } else {
+        FastPathFallback::ListView
+    };
+    stamp_fast_path(
+        PARTITIONED_GROUP_BY_UNION_SITE,
+        FastPathOutcome::Fallback(reason),
+    );
 }
 
 /// A grouped count one scan builder's pattern answers: every row is one fact
