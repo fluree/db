@@ -194,6 +194,19 @@ struct GroupCase {
     want: Rows,
     fires: bool,
     decline: Option<&'static str>,
+    /// JSON-LD's answer where it differs from SPARQL's: over a list, SPARQL
+    /// sees the RDF list view (the owner edge to the list's first cell,
+    /// `crate::list_view`), which the planner answers outside the scan, and
+    /// JSON-LD sees the members as values.
+    jsonld_view: Option<JsonLdView>,
+}
+
+/// A [`GroupCase`]'s JSON-LD rows, whether the union lane answers them, and
+/// which outcome it declines with.
+struct JsonLdView {
+    want: Rows,
+    fires: bool,
+    decline: Option<&'static str>,
 }
 
 /// `case` over `graphs` (a `FROM` clause each; `L` names the ledger's own
@@ -254,27 +267,38 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
         .await;
         surfaces.push(("JSON-LD", run));
     }
-    for (_, run) in surfaces {
+    for (surface, run) in surfaces {
+        let (want, fires, decline) = match (&case.jsonld_view, surface) {
+            (Some(view), "JSON-LD") => (&view.want, view.fires, view.decline),
+            _ => (&case.want, case.fires, case.decline),
+        };
         for (lane, got) in [
             ("fast paths on", &run.fast),
             ("fast paths off", &run.generic),
         ] {
             match got {
-                Ok(rows) if *rows == case.want => {}
-                Ok(rows) => failures.push(format!(
-                    "{}: {lane}: {rows:?}, want {:?}",
-                    run.label, case.want
-                )),
+                Ok(rows) if rows == want => {}
+                Ok(rows) => {
+                    failures.push(format!("{}: {lane}: {rows:?}, want {want:?}", run.label))
+                }
                 Err(e) => failures.push(format!("{}: {lane}: failed: {e}", run.label)),
             }
         }
-        if case.fires {
+        if fires {
             assert_routing(&run, &[A_UNION], &[A_ONE], failures);
         } else {
             assert_routing(&run, &[], &[A_UNION, A_ONE], failures);
         }
-        if let Some(outcome) = case.decline {
-            a_declined(&run, outcome, failures);
+        match decline {
+            Some(outcome) => a_declined(&run, outcome, failures),
+            // The list view's decline is named only for the lane's shape.
+            None if run
+                .fell_back
+                .contains(&(A_UNION.to_string(), "fallback:list_view".to_string())) =>
+            {
+                failures.push(format!("{}: `fallback:list_view` off the shape", run.label));
+            }
+            None => {}
         }
     }
 }
@@ -285,6 +309,12 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
 /// leaves to the general plan: a predicate no member holds, a count of the
 /// grouped key itself, another aggregate beside the count, a FILTER, and big
 /// numbers (an arena handle per graph and predicate).
+///
+/// A list reads two ways. SPARQL sees the RDF list view: `?s ex:items ?v` is
+/// the owner edge to the list's first cell (`_:l0-0`), one row, planned as a
+/// list-view triple, so the union lane stands down with `ListView` where the
+/// query is its shape. JSON-LD sees the members as values, two facts by
+/// their list positions, and the lane answers them.
 #[tokio::test(flavor = "current_thread")]
 async fn lane_a_group_counts_over_from_graphs() {
     use multigraph::{rows, G1, G2};
@@ -310,6 +340,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["s1", "2"], &["s2", "1"], &["s3", "1"]]),
                 fires: true,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -329,6 +360,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 ]),
                 fires: true,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -343,6 +375,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["1", "1", "1"], &["2", "2", "2"], &["3", "1", "1"]]),
                 fires: true,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -363,6 +396,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["1", "1"], &["2", "2"], &["3", "1"]]),
                 fires: false,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -377,6 +411,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["2", "2"], &["3", "1"]]),
                 fires: true,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -392,9 +427,14 @@ async fn lane_a_group_counts_over_from_graphs() {
                 })),
                 columns: &["v", "k"],
                 typed: false,
-                want: rows(&[&["v", "2"]]),
-                fires: true,
-                decline: None,
+                want: rows(&[&["l0-0", "1"]]),
+                fires: false,
+                decline: Some("fallback:list_view"),
+                jsonld_view: Some(JsonLdView {
+                    want: rows(&[&["v", "2"]]),
+                    fires: true,
+                    decline: None,
+                }),
             },
         ),
         (
@@ -402,12 +442,22 @@ async fn lane_a_group_counts_over_from_graphs() {
             GroupCase {
                 label: "a list's repeated value, by subject",
                 sparql: "SELECT ?s (COUNT(*) AS ?k) {ds} WHERE { ?s ex:items ?v } GROUP BY ?s",
-                jsonld: None,
+                jsonld: Some(json!({
+                    "@context": ctx(),
+                    "select": ["?s", "(as (count ?v) ?k)"],
+                    "where": [{"@id": "?s", "ex:items": "?v"}],
+                    "groupBy": ["?s"]
+                })),
                 columns: &["s", "k"],
                 typed: false,
-                want: rows(&[&["L", "2"]]),
-                fires: true,
-                decline: None,
+                want: rows(&[&["L", "1"]]),
+                fires: false,
+                decline: Some("fallback:list_view"),
+                jsonld_view: Some(JsonLdView {
+                    want: rows(&[&["L", "2"]]),
+                    fires: true,
+                    decline: None,
+                }),
             },
         ),
         (
@@ -425,6 +475,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 ]),
                 fires: true,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -438,6 +489,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["7", "1"]]),
                 fires: true,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -451,6 +503,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[]),
                 fires: false,
                 decline: Some("fallback:gate_declined"),
+                jsonld_view: None,
             },
         ),
         (
@@ -465,6 +518,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["1", "1", "1"], &["2", "2", "2"], &["3", "1", "1"]]),
                 fires: false,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -474,12 +528,22 @@ async fn lane_a_group_counts_over_from_graphs() {
                 label: "COUNT(DISTINCT ?s) of a list's repeated value",
                 sparql: "SELECT ?v (COUNT(*) AS ?k) (COUNT(DISTINCT ?s) AS ?d) {ds} \
                          WHERE { ?s ex:items ?v } GROUP BY ?v",
-                jsonld: None,
+                jsonld: Some(json!({
+                    "@context": ctx(),
+                    "select": ["?v", "(as (count ?s) ?k)", "(as (count-distinct ?s) ?d)"],
+                    "where": [{"@id": "?s", "ex:items": "?v"}],
+                    "groupBy": ["?v"]
+                })),
                 columns: &["v", "k", "d"],
                 typed: false,
-                want: rows(&[&["v", "2", "1"]]),
+                want: rows(&[&["l0-0", "1", "1"]]),
                 fires: false,
                 decline: None,
+                jsonld_view: Some(JsonLdView {
+                    want: rows(&[&["v", "2", "1"]]),
+                    fires: false,
+                    decline: None,
+                }),
             },
         ),
         (
@@ -494,6 +558,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["2", "2"], &["3", "1"]]),
                 fires: false,
                 decline: None,
+                jsonld_view: None,
             },
         ),
         (
@@ -507,6 +572,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["1.5", "1"], &["2.5", "1"]]),
                 fires: false,
                 decline: Some("fallback:arena_type"),
+                jsonld_view: None,
             },
         ),
         (
@@ -520,6 +586,7 @@ async fn lane_a_group_counts_over_from_graphs() {
                 want: rows(&[&["b", "2"]]),
                 fires: false,
                 decline: Some("fallback:arena_type"),
+                jsonld_view: None,
             },
         ),
     ];
@@ -554,7 +621,12 @@ async fn lane_a_answers_to_the_kill_switch() {
         drop(guard);
         set_fast_paths_disabled(false);
         let label = format!("{} / {surface:?}", scope.name());
-        let want = multigraph::expected(Shape::GroupByObject, scope.graphs(), State::Indexed);
+        let want = multigraph::expected(
+            Shape::GroupByObject,
+            scope.graphs(),
+            State::Indexed,
+            surface,
+        );
         match got {
             Ok(rows) if rows == want => {}
             Ok(rows) => failures.push(format!("{label}: {rows:?}, want {want:?}")),
