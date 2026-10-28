@@ -937,19 +937,34 @@ impl GroupAggregateOperator {
 }
 
 /// `fast-path outcome` site the partitioned GROUP BY lane stamps when its
-/// key column holds a vector and those rows fold through the hashed groups.
+/// key column holds a key whose encoding is not one per value and those rows
+/// fold through the hashed groups (see [`folds_by_value`]).
 pub(crate) const PARTITIONED_GROUP_BY_SITE: &str = "partitioned GROUP BY";
 
-/// The reason the partitioned lane logs for that decline.
-const PARTITIONED_VECTOR_KEY_REASON: &str = "vector-key";
-
-/// Whether `binding` is a vector literal, encoded (an arena handle) or decoded.
+/// Why the partitioned lane folds a key by value instead of by run, if it
+/// does: the key is a vector (`"vector-key"`), or a big number while
+/// `legacy_numbig` holds (`"legacy-numbig-key"`). Both cover the encoded
+/// (arena handle) and decoded forms.
 #[inline]
-fn is_vector_term(binding: &Binding) -> bool {
-    match binding {
-        Binding::EncodedLit { o_kind, .. } => *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8(),
-        Binding::Lit { val, .. } => matches!(val, FlakeValue::Vector(_)),
-        _ => false,
+fn folds_by_value(binding: &Binding, legacy_numbig: bool) -> Option<&'static str> {
+    use fluree_db_core::ObjKind;
+    let (vector, big_number) = match binding {
+        Binding::EncodedLit { o_kind, .. } => (
+            *o_kind == ObjKind::VECTOR_ID.as_u8(),
+            *o_kind == ObjKind::NUM_BIG.as_u8(),
+        ),
+        Binding::Lit { val, .. } => (
+            matches!(val, FlakeValue::Vector(_)),
+            matches!(val, FlakeValue::Decimal(_) | FlakeValue::BigInt(_)),
+        ),
+        _ => return None,
+    };
+    if vector {
+        Some("vector-key")
+    } else if big_number && legacy_numbig {
+        Some("legacy-numbig-key")
+    } else {
+        None
     }
 }
 
@@ -1125,10 +1140,15 @@ impl Operator for GroupAggregateOperator {
                     let key_col = self.group_key_indices[0];
                     let mut current_key: Option<GroupKeyOwned> = None;
                     let mut current_state: Option<GroupState> = None;
-                    // Rows whose key is a vector fold into the hashed groups
-                    // (see below); this buffer keys them.
-                    let mut vector_key = CompositeGroupKey(Vec::with_capacity(1));
-                    let mut vector_keys_hashed = false;
+                    // Rows whose key's encoding is not one per value fold into
+                    // the hashed groups (see below); this buffer keys them.
+                    let mut value_key = CompositeGroupKey(Vec::with_capacity(1));
+                    let mut keys_hashed = false;
+                    // Decided once, so a decimal's encoded and decoded forms
+                    // take the same path.
+                    let legacy_numbig = crate::object_binding::EqualityNorm::parts(&self.norm)
+                        .1
+                        .is_some_and(|gv| gv.store().graph_numbig_has_duplicate_handles(gv.g_id()));
 
                     loop {
                         // Per-batch checkpoint (deadline + memory budget; see the
@@ -1149,19 +1169,21 @@ impl Operator for GroupAggregateOperator {
                         for row_idx in 0..batch.len() {
                             input_rows += 1;
                             let key_binding = batch.get_by_col(row_idx, key_col);
-                            // A vector key breaks this lane's premise: the
-                            // vector arena gives each stored fact its own
-                            // handle, so equal vectors are neither one encoded
-                            // key nor adjacent in the input's order. Those rows
-                            // fold into the hashed groups instead, keyed by
-                            // value. No other term equals a vector, so the two
-                            // sets of groups never overlap.
-                            if is_vector_term(key_binding) {
-                                if !vector_keys_hashed {
-                                    vector_keys_hashed = true;
+                            // This lane needs one encoded key per value, with
+                            // equal values adjacent. A vector breaks that (its
+                            // arena gives each stored fact its own handle), and
+                            // so does a decimal on a graph whose legacy NumBig
+                            // arena holds scale variants (`1.5`, `1.50`) under
+                            // separate handles. Those rows fold into the hashed
+                            // groups instead, keyed by value. No other term
+                            // equals one of them, so the two sets of groups
+                            // never overlap.
+                            if let Some(reason) = folds_by_value(key_binding, legacy_numbig) {
+                                if !keys_hashed {
+                                    keys_hashed = true;
                                     tracing::debug!(
-                                        reason = PARTITIONED_VECTOR_KEY_REASON,
-                                        "partitioned GROUP BY: vector keys fold by value"
+                                        reason,
+                                        "partitioned GROUP BY: keys fold by value"
                                     );
                                     crate::fast_path_outcome::stamp_fast_path(
                                         PARTITIONED_GROUP_BY_SITE,
@@ -1173,7 +1195,7 @@ impl Operator for GroupAggregateOperator {
                                 self.fill_group_key(
                                     &batch,
                                     row_idx,
-                                    &mut vector_key,
+                                    &mut value_key,
                                     dicts,
                                     norm_gv,
                                 );
@@ -1188,7 +1210,7 @@ impl Operator for GroupAggregateOperator {
                                     dicts,
                                     &batch,
                                     row_idx,
-                                    &vector_key,
+                                    &value_key,
                                     &row_keys,
                                 );
                                 if self.groups.len() > groups_before {
@@ -1980,5 +2002,88 @@ mod tests {
             key(f64::NEG_INFINITY.to_bits())
         );
         assert_ne!(key(f64::INFINITY.to_bits()), nan);
+    }
+
+    /// A legacy pre-normalization NumBig arena holds `1.5` under two handles.
+    /// The partitioned lane groups by run of the encoded key, so it would
+    /// count the value as two groups; on a graph with such an arena it folds
+    /// big numbers by value, wherever their rows fall in the input.
+    #[tokio::test]
+    async fn partitioned_group_by_folds_legacy_numbig_scale_variants_by_value() {
+        use crate::context::ExecutionContext;
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_binary_index::arena::numbig::read_numbig_arena_from_bytes;
+        use fluree_db_binary_index::BinaryIndexStore;
+        use fluree_db_core::o_type::OType;
+        use num_bigint::BigInt;
+
+        /// One decimal entry of an NBA1 buffer, as a pre-normalization build
+        /// wrote it: unscaled value and scale as given.
+        fn bigdec_entry(buf: &mut Vec<u8>, unscaled: i64, scale: i64) {
+            let unscaled_bytes = BigInt::from(unscaled).to_signed_bytes_le();
+            buf.push(1);
+            let repr_len = 4 + unscaled_bytes.len() + 8;
+            buf.extend_from_slice(&(repr_len as u32).to_le_bytes());
+            buf.extend_from_slice(&(unscaled_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&unscaled_bytes);
+            buf.extend_from_slice(&scale.to_le_bytes());
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"NBA1");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        bigdec_entry(&mut buf, 150, 2); // handle 0: 1.50
+        bigdec_entry(&mut buf, 15, 1); // handle 1: 1.5, the same value
+        bigdec_entry(&mut buf, 1999, 2); // handle 2: 19.99
+        let arena = read_numbig_arena_from_bytes(&buf).unwrap();
+        assert!(arena.has_duplicate_handles());
+
+        const P_ID: u32 = 7;
+        let mut store = BinaryIndexStore::empty(std::env::temp_dir());
+        store.set_numbig_arena_for_test(0, P_ID, arena);
+        let snapshot = make_test_snapshot();
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_binary_store(Arc::new(store), 0);
+
+        let big = |handle: u64| {
+            crate::object_binding::late_materialized_object_binding(
+                OType::NUM_BIG_OVERFLOW.as_u16(),
+                handle,
+                P_ID,
+                1,
+                u32::MAX,
+                None,
+            )
+            .unwrap()
+        };
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batch = Batch::new(schema, vec![vec![big(0), big(2), big(1)]]).unwrap();
+        let agg_specs = vec![StreamingAggSpec {
+            function: AggregateFn::CountAll,
+            input_col: None,
+            output_var: VarId(1),
+        }];
+        let mut op = GroupAggregateOperator::new(
+            Box::new(BatchSeedOperator::from_batch(batch)),
+            vec![VarId(0)],
+            agg_specs,
+            None,
+            true,
+        );
+        op.open(&ctx).await.unwrap();
+        let mut counts = Vec::new();
+        while let Some(out) = op.next_batch(&ctx).await.unwrap() {
+            for row in 0..out.len() {
+                match out.get_by_col(row, 1) {
+                    Binding::Lit {
+                        val: FlakeValue::Long(n),
+                        ..
+                    } => counts.push(*n),
+                    other => panic!("count: {other:?}"),
+                }
+            }
+        }
+        counts.sort_unstable();
+        assert_eq!(counts, [1, 2], "1.5 and 1.50 are one group");
     }
 }

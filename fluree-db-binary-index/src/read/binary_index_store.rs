@@ -2557,6 +2557,39 @@ impl BinaryIndexStore {
             .is_some_and(crate::arena::numbig::NumBigArena::is_decimal_only)
     }
 
+    /// Whether any NumBig arena of `g_id` holds one value under several
+    /// handles: a legacy pre-normalization arena, where `1.5` and `1.50` kept
+    /// a handle each. Its rows are then not one key per value even within a
+    /// predicate, so a consumer that relies on that declines.
+    pub fn graph_numbig_has_duplicate_handles(&self, g_id: GraphId) -> bool {
+        self.numbig_arenas(g_id)
+            .any(|(_, arena)| arena.has_duplicate_handles())
+    }
+
+    /// Install `arena` as `(g_id, p_id)`'s NumBig arena. For tests that need
+    /// an arena shape no current build writes, such as a legacy arena with
+    /// scale-variant duplicates.
+    #[doc(hidden)]
+    pub fn set_numbig_arena_for_test(
+        &mut self,
+        g_id: GraphId,
+        p_id: u32,
+        arena: crate::arena::numbig::NumBigArena,
+    ) {
+        self.graph_indexes
+            .entry(g_id)
+            .or_insert_with(|| GraphIndex {
+                orders: HashMap::new(),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            })
+            .numbig
+            .insert(p_id, arena);
+    }
+
     /// Memoizes `prove` per `(graph, predicate)`. An inconclusive (`None`)
     /// proof is not cached, so a transient read failure is retried later.
     pub fn memoized_decimal_only_proof(
