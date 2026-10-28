@@ -3309,6 +3309,9 @@ struct VectorMemoInner {
     by_hash: rustc_hash::FxHashMap<u64, Vec<Arc<[f64]>>>,
     /// Components held, the bound the memo clears at.
     components: usize,
+    /// Arena shards read so far, by `(p_id, shard index)`, so a lookup skips
+    /// the shared shard cache's probe.
+    shards: rustc_hash::FxHashMap<(u32, usize), Arc<crate::arena::vector::VectorShard>>,
 }
 
 impl VectorMemo {
@@ -3319,18 +3322,43 @@ impl VectorMemo {
     }
 
     fn hash(components: &[f32]) -> u64 {
-        use std::hash::Hasher;
-        let mut h = rustc_hash::FxHasher::default();
-        h.write_usize(components.len());
-        for x in components {
-            h.write_u32(x.to_bits());
-        }
-        h.finish()
+        fluree_db_core::value::vector_bits_hash(
+            std::iter::once(components.len() as u64)
+                .chain(components.iter().map(|x| u64::from(x.to_bits()))),
+        )
+    }
+
+    /// The shared value of `handle` in `p_id`'s `arena`, allocating it on the
+    /// first sight of that value. `None` for a handle the arena does not hold.
+    fn get(
+        &self,
+        p_id: u32,
+        arena: &crate::arena::vector::LazyVectorArena,
+        handle: u32,
+    ) -> io::Result<Option<Arc<[f64]>>> {
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
+        let mut memo = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shard = match memo.shards.get(&(p_id, shard_idx)) {
+            Some(shard) => Arc::clone(shard),
+            None => {
+                let shard = arena.shard(shard_idx)?;
+                memo.shards.insert((p_id, shard_idx), Arc::clone(&shard));
+                shard
+            }
+        };
+        Ok(shard
+            .get_f32(offset)
+            .map(|components| Self::get_or_insert(&mut memo, components)))
     }
 
     /// The shared value equal to `components` (widened exactly to `f64`),
     /// allocating it on the first sight of that value.
-    fn get_or_insert(&self, components: &[f32]) -> Arc<[f64]> {
+    fn get_or_insert(memo: &mut VectorMemoInner, components: &[f32]) -> Arc<[f64]> {
         let same = |v: &[f64]| {
             v.len() == components.len()
                 && v.iter()
@@ -3338,10 +3366,6 @@ impl VectorMemo {
                     .all(|(a, b)| a.to_bits() == f64::from(*b).to_bits())
         };
         let hash = Self::hash(components);
-        let mut memo = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(found) = memo
             .by_hash
             .get(&hash)
@@ -3677,9 +3701,7 @@ impl BinaryGraphView {
         else {
             return Ok(None);
         };
-        Ok(arena
-            .lookup_vector(handle)?
-            .map(|slice| self.vectors.get_or_insert(slice.as_f32())))
+        self.vectors.get(p_id, arena, handle)
     }
 
     pub fn clone_store(&self) -> Arc<BinaryIndexStore> {

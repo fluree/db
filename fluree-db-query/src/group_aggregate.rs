@@ -448,12 +448,13 @@ pub(crate) struct VectorKey(Arc<[f64]>);
 
 impl PartialEq for VectorKey {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .zip(other.0.iter())
-                .all(|(a, b)| a.to_bits() == b.to_bits())
+        Arc::ptr_eq(&self.0, &other.0)
+            || self.0.len() == other.0.len()
+                && self
+                    .0
+                    .iter()
+                    .zip(other.0.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
     }
 }
 
@@ -462,9 +463,7 @@ impl Eq for VectorKey {}
 impl Hash for VectorKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.len().hash(state);
-        for x in self.0.iter() {
-            x.to_bits().hash(state);
-        }
+        fluree_db_core::value::vector_bits_hash(self.0.iter().map(|x| x.to_bits())).hash(state);
     }
 }
 

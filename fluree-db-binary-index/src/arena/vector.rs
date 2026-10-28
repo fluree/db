@@ -675,6 +675,23 @@ impl LazyVectorArena {
         self.shard_sources.len()
     }
 
+    /// The shard index holding `handle` and the handle's offset within it,
+    /// without loading anything; `None` out of range. With [`Self::shard`],
+    /// for a caller that keeps shards across many lookups instead of paying
+    /// [`Self::lookup_vector`]'s cache probe per handle.
+    pub fn shard_of(&self, handle: u32) -> Option<(usize, u32)> {
+        if handle >= self.manifest.total_count || self.manifest.shard_capacity == 0 {
+            return None;
+        }
+        let cap = self.manifest.shard_capacity;
+        Some(((handle / cap) as usize, handle % cap))
+    }
+
+    /// Shard `shard_idx`, loaded through the cache.
+    pub fn shard(&self, shard_idx: usize) -> io::Result<Arc<VectorShard>> {
+        self.load_shard_cached(shard_idx)
+    }
+
     // ========================================================================
     // Internal shard loading — two flavors
     // ========================================================================

@@ -912,10 +912,13 @@ impl PartialEq for FlakeValue {
                 (FlakeValue::String(a), FlakeValue::String(b)) => a == b,
                 (FlakeValue::Json(a), FlakeValue::Json(b)) => a == b,
                 (FlakeValue::Vector(a), FlakeValue::Vector(b)) => {
-                    a.len() == b.len()
-                        && a.iter()
-                            .zip(b.iter())
-                            .all(|(x, y)| x.to_bits() == y.to_bits())
+                    // A decode shares one allocation per distinct value
+                    // (`BinaryGraphView`), so most equal pairs are one `Arc`.
+                    Arc::ptr_eq(a, b)
+                        || a.len() == b.len()
+                            && a.iter()
+                                .zip(b.iter())
+                                .all(|(x, y)| x.to_bits() == y.to_bits())
                 }
                 (FlakeValue::GeoPoint(a), FlakeValue::GeoPoint(b)) => a == b,
                 // Numeric and temporal types already handled above
@@ -993,6 +996,24 @@ fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
         scale.hash(state);
         digits.to_signed_bytes_le().hash(state);
     }
+}
+
+/// A vector's components folded into one well-mixed `u64`, for hash keys.
+///
+/// Hashing the components' bits through an add-and-multiply hasher (such as
+/// `FxHasher`) leaves the result's low bits independent of the data whenever
+/// the components' low bits are zero, which they are for every vector held as
+/// `f32` (widening fills the low 29 bits with zeros): a hash table then sees
+/// the same tag for every vector and compares a probe with most of its
+/// neighbors. Each step here folds the product's high bits back down.
+#[inline]
+pub fn vector_bits_hash(bits: impl IntoIterator<Item = u64>) -> u64 {
+    let mut acc: u64 = 0;
+    for b in bits {
+        acc = (acc ^ b).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        acc ^= acc >> 29;
+    }
+    acc
 }
 
 impl std::hash::Hash for FlakeValue {
@@ -1114,9 +1135,7 @@ impl std::hash::Hash for FlakeValue {
             FlakeValue::Vector(v) => {
                 self.type_discriminant().hash(state);
                 v.len().hash(state);
-                for f in v.iter() {
-                    f.to_bits().hash(state);
-                }
+                vector_bits_hash(v.iter().map(|f| f.to_bits())).hash(state);
             }
             FlakeValue::GeoPoint(bits) => {
                 self.type_discriminant().hash(state);

@@ -98,9 +98,7 @@ impl Hash for FlakeValueKey {
             FlakeValue::Time(t) => t.hash(state),
             FlakeValue::Json(s) => s.hash(state),
             FlakeValue::Vector(v) => {
-                for f in v.iter() {
-                    f.to_bits().hash(state);
-                }
+                fluree_db_core::value::vector_bits_hash(v.iter().map(|f| f.to_bits())).hash(state);
             }
             FlakeValue::Null => {}
             FlakeValue::GYear(v) => v.hash(state),
