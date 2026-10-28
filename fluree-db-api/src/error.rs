@@ -757,8 +757,14 @@ impl ApiError {
                 ..
             }) if delta_bytes >= max_bytes => 413,
             ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => 503,
-            // Permanent: datatype IDs are never released.
-            ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => 422,
+            // This process has not loaded the ledger's index: its state, not
+            // the request's, and it clears when the index loads.
+            ApiError::Transact(TE::IndexNotLoaded(_)) => 503,
+            // Well-formed, but a value breaks a constraint the ledger holds:
+            // no room for its new datatypes (datatype IDs are never
+            // released), or a vector the index cannot store beside the
+            // property's others. Permanent either way.
+            ApiError::Transact(TE::DatatypeLimitExceeded { .. } | TE::InvalidVector(_)) => 422,
             // The ledger config could not be read: a storage failure, whichever
             // lane read it. Nothing in the request is wrong, and it is not
             // capacity pressure, so not a 503.
@@ -895,6 +901,8 @@ impl ApiError {
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                // Typed as `ApiError::NameService` is: the backend's fault.
+                QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
                 _ => errors::INVALID_QUERY,
             },
@@ -921,6 +929,9 @@ impl ApiError {
                 errors::NOVELTY_AT_MAX
             }
             ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => errors::DATATYPE_LIMIT_EXCEEDED,
+            ApiError::Transact(TE::IndexNotLoaded(_)) => errors::INDEX_NOT_LOADED,
+            // The generic code, the one its flattened 422 carries.
+            ApiError::Transact(TE::InvalidVector(_)) => errors::INVALID_TRANSACTION,
             ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => {
                 errors::STORAGE_READ
             }
@@ -1019,6 +1030,9 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::NeedFetch(_)
         | QE::Policy(_)
         | QE::Internal(_) => 500,
+        // A nameservice lookup the query needed failed (a graph-source probe
+        // or lookup): a backend fault, as `ApiError::NameService` is.
+        QE::Nameservice(_) => 500,
         QE::Batch(_)
         | QE::R2rml(_)
         | QE::VariableNotFound(_)
@@ -1036,6 +1050,20 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::TimeRangeNotCovered { .. }
         | QE::Arithmetic(_)
         | QE::Comparison(_) => 400,
+    }
+}
+
+/// A reference that does not name a graph of the ledger a surface reads: a
+/// caller mistake, never an internal error. Another ledger's address is a 400
+/// that names the fix; a graph the ledger does not have is a 404.
+impl From<fluree_db_core::TargetError> for ApiError {
+    fn from(e: fluree_db_core::TargetError) -> Self {
+        match e {
+            fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
+            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
+                ApiError::invalid_query(cross.to_string())
+            }
+        }
     }
 }
 
@@ -1316,11 +1344,21 @@ mod tests {
                 DATATYPE_LIMIT_EXCEEDED,
             ),
             (
+                ApiError::Transact(TE::InvalidVector("x".into())),
+                422,
+                INVALID_TRANSACTION,
+            ),
+            (
                 ApiError::Connection(ConnectionError::InvalidConfig("x".into())),
                 500,
                 CONNECTION,
             ),
             (ApiError::Query(QE::Internal("x".into())), 500, INTERNAL),
+            (
+                ApiError::Query(QE::Nameservice("x".into())),
+                500,
+                NAMESERVICE,
+            ),
             (ApiError::Ledger(LE::InvalidData("x".into())), 500, INTERNAL),
             (
                 ApiError::NameService(NSE::Storage("x".into())),
@@ -1411,6 +1449,11 @@ mod tests {
                 ApiError::commit_contention(16, conflict()),
                 503,
                 COMMIT_CONTENTION,
+            ),
+            (
+                ApiError::Transact(TE::IndexNotLoaded("x".into())),
+                503,
+                INDEX_NOT_LOADED,
             ),
             (ApiError::IndexTimeout(1), 504, INDEX_TIMEOUT),
             (
@@ -1560,6 +1603,15 @@ mod tests {
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
             400
         );
+    }
+
+    /// A nameservice lookup that fails while a query runs is the backend's
+    /// fault: a 500 typed like `ApiError::NameService`, never the generic 400.
+    #[test]
+    fn a_failed_nameservice_lookup_in_a_query_is_500() {
+        let e = ApiError::Query(fluree_db_query::QueryError::Nameservice("down".into()));
+        assert_eq!(e.status_code(), 500);
+        assert_eq!(e.error_type(), fluree_vocab::errors::NAMESERVICE);
     }
 
     #[test]
