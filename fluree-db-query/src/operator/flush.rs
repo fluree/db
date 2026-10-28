@@ -1,12 +1,19 @@
 //! Window sizing for lanes that gather input and answer it with one probe.
 //!
-//! The batched nested-loop join, OPTIONAL seed coalescing, and the
-//! property-join driver each pull a window of input rows, answer the window
-//! with one batched probe or scan, then emit. A wide window amortizes the
+//! The batched nested-loop join, OPTIONAL seed coalescing, the property-join
+//! driver, and a correlated R2RML scan's child each pull a window of input
+//! rows, answer the window with one batched probe or scan, then emit. A wide window amortizes the
 //! probe; a narrow one lets an outer `LIMIT` stop after little work.
 //! [`FlushSchedule`] opens narrow when a lane asks for it and widens each
 //! later window geometrically back to the lane's cap, so a lane that keeps
 //! pulling pays for only a few extra flushes.
+
+use crate::binding::{Batch, Binding};
+use crate::context::ExecutionContext;
+use crate::error::Result;
+use crate::operator::BoxedOperator;
+use crate::var_registry::VarId;
+use std::sync::Arc;
 
 /// Minimum first window for probes whose setup should be amortized. Lanes
 /// bounded by their input subjects can start smaller with `ramped_from`.
@@ -78,6 +85,55 @@ impl FlushSchedule {
             _ => step,
         };
     }
+}
+
+/// Pull rows from `source` into one batch until it holds `window` rows or the
+/// source runs dry, starting with the rows an earlier window left in
+/// `pending`. All of a source's batches share one schema, so this is a
+/// column-wise append. With `exact`, the batch that crosses `window` is split
+/// and its rest kept in `pending`; otherwise it is taken whole. `None` only
+/// when the source is exhausted with zero rows.
+pub(crate) async fn pull_window(
+    source: &mut BoxedOperator,
+    pending: &mut Option<(Batch, usize)>,
+    window: usize,
+    exact: bool,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<Batch>> {
+    let mut schema: Option<Arc<[VarId]>> = None;
+    let mut columns: Vec<Vec<Binding>> = Vec::new();
+    let mut rows = 0usize;
+    while rows < window {
+        let (batch, start) = match pending.take() {
+            Some(pending) => pending,
+            None => match source.next_batch(ctx).await? {
+                Some(batch) => (batch, 0),
+                None => break,
+            },
+        };
+        let end = if exact {
+            batch.len().min(start + window - rows)
+        } else {
+            batch.len()
+        };
+        if schema.is_none() {
+            schema = Some(batch.schema_arc());
+            columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
+        }
+        for (c, col) in columns.iter_mut().enumerate() {
+            let column = batch.column_by_idx(c).expect("column index within schema");
+            col.extend_from_slice(&column[start..end]);
+        }
+        rows += end - start;
+        if end < batch.len() {
+            *pending = Some((batch, end));
+        }
+    }
+    let Some(schema) = schema.filter(|_| rows > 0) else {
+        return Ok(None);
+    };
+    // `from_parts` keeps the row count of a 0-column source.
+    Ok(Some(Batch::from_parts(schema, columns, rows)?))
 }
 
 #[cfg(test)]
