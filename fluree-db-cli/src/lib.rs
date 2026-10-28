@@ -5,6 +5,7 @@
 //! directly to build alternative interfaces (web UI, TUI, etc.) on top
 //! of the same command logic.
 
+pub mod account;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -648,9 +649,24 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         }
 
         Commands::Auth { action } => {
-            let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::auth::run(action, &fluree_dir).await
+            // `auth status` also reports the machine's fluree.ai sign-in,
+            // which needs no project.
+            match config::require_fluree_dir(config_path) {
+                Ok(fluree_dir) => commands::auth::run(action, Some(&fluree_dir)).await,
+                Err(error::CliError::NoFlureeDir)
+                    if matches!(action, cli::AuthAction::Status { remote: None }) =>
+                {
+                    commands::auth::run(action, None).await
+                }
+                Err(e) => Err(e),
+            }
         }
+
+        Commands::Login { url, no_browser } => {
+            commands::login::run_login(Some(url), !no_browser).await
+        }
+
+        Commands::Logout => commands::login::run_logout().await,
 
         Commands::Upstream { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;

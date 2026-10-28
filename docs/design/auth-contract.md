@@ -110,6 +110,49 @@ It is specifically intended to support implementations that:
 - Discovery endpoint absent (404 or connection error) → CLI assumes `token` type, prompts user to provide a token manually
 - `version` > 1 → CLI warns but attempts to parse known fields
 
+## Account services
+
+Some servers are not Fluree data APIs but **account services**: the place a person signs in to once per machine (for
+example fluree.ai), whose hosted services, usage and billing belong to the account. The CLI signs in to one with
+[`fluree login`](../cli/login.md) and stores the result in the machine's `account.toml` (global config directory), never in
+a project's remote config. `fluree remote add` refuses such a URL.
+
+An account service's discovery document carries an `account` object and **no top-level `api_base_url`** (that field always
+means a Fluree data API):
+
+```json
+{
+  "version": 1,
+  "service": "fluree.ai",
+  "account": {
+    "api_base_url": "https://fluree.ai/v1",
+    "dashboard_url": "https://fluree.ai",
+    "status_url": "https://fluree.ai/v1/fuel/status"
+  },
+  "auth": {
+    "type": "oidc_device",
+    "issuer": "https://fluree.ai",
+    "client_id": "fluree-cli",
+    "exchange_url": "https://fluree.ai/v1/oauth/exchange",
+    "scopes": ["openid"]
+  }
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `service` | No | Display name for the service |
+| `account.api_base_url` | Yes | Base of the account's own API (absolute URL, or absolute path resolved against the discovery origin) |
+| `account.dashboard_url` | No | Where a person manages the account (and disconnects machines) |
+| `account.status_url` | No | An endpoint describing the account for a Bearer token |
+
+The flow is the one above with two requirements: the issuer's `openid-configuration` must offer a
+`device_authorization_endpoint` (there is no PKCE fallback for accounts), and the exchange must return a `refresh_token`,
+which the CLI uses with `grant_type=refresh_token` whenever the access token is about to expire. The device request may
+carry a non-standard `device_name` form field (the machine's host name) for the approval page to show. Sign-out is
+`POST {account.api_base_url}/auth/disconnect` with the access token as Bearer; the server should revoke the machine's refresh
+credential.
+
 ## Token exchange
 
 ### `POST {exchange_url}`

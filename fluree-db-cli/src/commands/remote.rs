@@ -209,6 +209,13 @@ async fn run_add(
     // constructed relative to it (e.g. `{api_base_url}/query/<ledger...>`).
     let mut discovered_api_base_url: Option<String> = None;
     match discover_remote(&input_url).await {
+        Ok(Some(discovered)) if discovered.account.is_some() => {
+            return Err(CliError::Usage(format!(
+                "{input_url} is an account service, not a Fluree server, so it can't be a remote\n  \
+                 hint: sign in to it with `{}`",
+                super::login::login_command_for(&input_url)
+            )));
+        }
         Ok(Some(discovered)) => {
             if let Some(api_base_url) = discovered.api_base_url {
                 discovered_api_base_url = Some(api_base_url);
@@ -282,6 +289,20 @@ pub(crate) struct DiscoveredRemote {
     /// Oldest CLI release whose command surface matches what the stack's
     /// docs and UI teach (the optional `cli.min_version` discovery field).
     pub(crate) cli_min_version: Option<String>,
+    /// Present when the server is an account service (fluree.ai) rather than
+    /// a Fluree data API: such a server is signed in to with `fluree login`,
+    /// never added as a remote.
+    pub(crate) account: Option<DiscoveredAccount>,
+}
+
+/// The `account` object of an account service's discovery document.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DiscoveredAccount {
+    /// The `service` field, e.g. `fluree.ai`; a display name.
+    pub(crate) service: Option<String>,
+    /// Base of the account's own API (`…/v1`), where its model routes live.
+    pub(crate) api_base_url: String,
+    pub(crate) dashboard_url: Option<String>,
 }
 
 /// Warning to print when the running CLI predates the stack's advertised
@@ -339,6 +360,34 @@ pub(crate) async fn discover_remote(remote_url: &str) -> Result<Option<Discovere
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
 
     let mut out = DiscoveredRemote::default();
+
+    // An account service has an `account` object (and no Fluree data API).
+    if let Some(account) = body.get("account").and_then(|a| a.as_object()) {
+        let api_base_url = account
+            .get("api_base_url")
+            .and_then(|v| v.as_str())
+            .ok_or("account discovery missing 'account.api_base_url'")?;
+        let resolve = |u: &str| -> Result<String, String> {
+            let url = if u.starts_with('/') {
+                discovery_url.join(u).map_err(|e| e.to_string())?
+            } else {
+                reqwest::Url::parse(u).map_err(|e| e.to_string())?
+            };
+            Ok(url.to_string().trim_end_matches('/').to_string())
+        };
+        out.account = Some(DiscoveredAccount {
+            service: body
+                .get("service")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            api_base_url: resolve(api_base_url)?,
+            dashboard_url: account
+                .get("dashboard_url")
+                .and_then(|v| v.as_str())
+                .map(resolve)
+                .transpose()?,
+        });
+    }
 
     // api_base_url can be:
     // - absolute URL: https://data.example.com/v1/fluree
