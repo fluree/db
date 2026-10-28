@@ -195,6 +195,23 @@ pub fn facts(lists: bool) -> Vec<Fact> {
     f.push(fact(G2, "x7c", "r", iri("y7")));
     f.extend(list(G1, "x900", "r", &[iri("y9"), iri("y9")]));
     f.extend(list(G2, "x900", "r", &[iri("y9")]));
+    // The probed predicates again without their lists (`vf`, `rf`, `qf`):
+    // SPARQL reads a predicate holding lists through the list view, so the
+    // union probes run on SPARQL over these.
+    let twins: Vec<Fact> = f
+        .iter()
+        .filter(|x| x.i.is_none())
+        .filter_map(|x| {
+            let p = match x.p {
+                "v" => "vf",
+                "r" => "rf",
+                "q" => "qf",
+                _ => return None,
+            };
+            Some(Fact { p, ..x.clone() })
+        })
+        .collect();
+    f.extend(twins);
     f
 }
 
@@ -293,6 +310,12 @@ pub enum Shape {
     Exists,
     /// The keep/drop membership join: `?x ex:p ?y . ?y ex:q ?x`.
     Membership,
+    /// [`Shape::Subject`] over `ex:vf`, which holds no lists.
+    SubjectNoLists,
+    /// [`Shape::Object`] over `ex:rf`, which holds no lists.
+    ObjectNoLists,
+    /// [`Shape::Membership`] over `ex:qf`, which holds no lists.
+    MembershipNoLists,
 }
 
 pub const SHAPES: &[Shape] = &[
@@ -300,23 +323,37 @@ pub const SHAPES: &[Shape] = &[
     Shape::Object,
     Shape::Exists,
     Shape::Membership,
+    Shape::SubjectNoLists,
+    Shape::ObjectNoLists,
+    Shape::MembershipNoLists,
 ];
 
 impl Shape {
-    pub fn body(self) -> &'static str {
+    /// The join the shape is, whichever predicate it probes.
+    pub fn base(self) -> Shape {
         match self {
-            Shape::Subject => "?x ex:sel ?y . ?y ex:v ?o",
-            Shape::Object => "?y ex:tag ex:T . ?x ex:r ?y",
-            Shape::Exists => "?x ex:sel ?y . ?y ex:score 1",
-            Shape::Membership => "?x ex:p ?y . ?y ex:q ?x",
+            Shape::SubjectNoLists => Shape::Subject,
+            Shape::ObjectNoLists => Shape::Object,
+            Shape::MembershipNoLists => Shape::Membership,
+            other => other,
+        }
+    }
+
+    pub fn body(self) -> String {
+        let p = self.probed();
+        match self.base() {
+            Shape::Subject => format!("?x ex:sel ?y . ?y ex:{p} ?o"),
+            Shape::Object => format!("?y ex:tag ex:T . ?x ex:{p} ?y"),
+            Shape::Exists => "?x ex:sel ?y . ?y ex:score 1".to_string(),
+            _ => format!("?x ex:p ?y . ?y ex:{p} ?x"),
         }
     }
 
     pub fn vars(self) -> &'static [&'static str] {
-        match self {
+        match self.base() {
             Shape::Subject => &["y", "o"],
             Shape::Exists => &["y"],
-            Shape::Object | Shape::Membership => &["x", "y"],
+            _ => &["x", "y"],
         }
     }
 
@@ -327,26 +364,30 @@ impl Shape {
             Shape::Object => "r",
             Shape::Exists => "score",
             Shape::Membership => "q",
+            Shape::SubjectNoLists => "vf",
+            Shape::ObjectNoLists => "rf",
+            Shape::MembershipNoLists => "qf",
         }
     }
 
     /// The shape's `where` in JSON-LD.
     pub fn jsonld_where(self) -> JsonValue {
         let pat = |s: &str, p: &str, o: JsonValue| json!({"@id": s, format!("ex:{p}"): o});
-        match self {
-            Shape::Subject => json!([pat("?x", "sel", json!("?y")), pat("?y", "v", json!("?o"))]),
+        let p = self.probed();
+        match self.base() {
+            Shape::Subject => json!([pat("?x", "sel", json!("?y")), pat("?y", p, json!("?o"))]),
             Shape::Object => json!([
                 pat("?y", "tag", json!({"@id": "ex:T"})),
-                pat("?x", "r", json!("?y"))
+                pat("?x", p, json!("?y"))
             ]),
             Shape::Exists => json!([pat("?x", "sel", json!("?y")), pat("?y", "score", json!(1))]),
-            Shape::Membership => json!([pat("?x", "p", json!("?y")), pat("?y", "q", json!("?x"))]),
+            _ => json!([pat("?x", "p", json!("?y")), pat("?y", p, json!("?x"))]),
         }
     }
 
     /// The routing-stamp site that answers the shape's join.
     pub fn site(self) -> &'static str {
-        match self {
+        match self.base() {
             Shape::Membership => "membership-join",
             _ => "nested-loop-batched-union",
         }
@@ -368,18 +409,19 @@ pub fn expected(shape: Shape, facts: &[Fact]) -> Vec<String> {
     let u = union_of(facts);
     let with = |p: &'static str| u.iter().filter(move |f| f.p == p);
     let mut rows: Vec<String> = Vec::new();
-    match shape {
+    let probed = shape.probed();
+    match shape.base() {
         Shape::Subject => {
             for a in with("sel") {
                 let Obj::Iri(y) = &a.o else { continue };
-                for b in with("v").filter(|b| &b.s == y) {
+                for b in with(probed).filter(|b| &b.s == y) {
                     rows.push(format!("{y} {}", b.o.rendered()));
                 }
             }
         }
         Shape::Object => {
             for t in with("tag").filter(|t| t.o == iri("T")) {
-                for a in with("r").filter(|a| a.o == iri(t.s.clone())) {
+                for a in with(probed).filter(|a| a.o == iri(t.s.clone())) {
                     rows.push(format!("{} {}", a.s, t.s));
                 }
             }
@@ -392,10 +434,10 @@ pub fn expected(shape: Shape, facts: &[Fact]) -> Vec<String> {
                 }
             }
         }
-        Shape::Membership => {
+        _ => {
             for a in with("p") {
                 let Obj::Iri(y) = &a.o else { continue };
-                for _ in with("q").filter(|b| &b.s == y && b.o == iri(a.s.clone())) {
+                for _ in with(probed).filter(|b| &b.s == y && b.o == iri(a.s.clone())) {
                     rows.push(format!("{} {y}", a.s));
                 }
             }
@@ -458,7 +500,7 @@ impl Fixture {
         dataset: &str,
         shape: Shape,
     ) -> Result<Vec<String>, String> {
-        self.sparql_where(ledger, prologue, dataset, shape.body(), shape.vars())
+        self.sparql_where(ledger, prologue, dataset, &shape.body(), shape.vars())
             .await
     }
 

@@ -118,7 +118,8 @@ fn check_lane_f(
 /// On JSON-LD a list's members are values, so every shape runs through its
 /// lane. On SPARQL a predicate holding lists is read through the list view,
 /// a list both graphs hold is two lists (its cells are blank nodes local to
-/// each graph), and no batched lane joins that predicate.
+/// each graph), and no batched lane joins that predicate; its list-free twin
+/// on the same ledger is joined by the lane.
 #[tokio::test(flavor = "current_thread")]
 async fn lane_f_union_probes_answer_by_fact() {
     use lane_f::{Shape, Surface};
@@ -149,13 +150,16 @@ async fn lane_f_union_probes_answer_by_fact() {
                 }
                 let want = lane_f::expected_on(surface, shape, &facts);
                 let list_view = surface == Surface::Sparql && lane_f::probes_a_list(shape, &facts);
+                // The membership join's key repeats where its predicate's list
+                // holds one member twice (`y20 q (x20 x20)`).
+                let repeats = lists && lane_f::probes_a_list(shape, &facts);
                 let union_site = shape.site();
                 for (name, prologue, dataset) in UNION_SCOPES {
                     let run = lane_f::run_on(&fx, surface, ledger, prologue, dataset, shape).await;
-                    let (fire, not_fire): (&[&str], &[&str]) = match shape {
+                    let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
                         _ if list_view => (&[], &[union_site, "nested-loop-batched"]),
                         // A list position repeating a key sends keep/drop exact.
-                        Shape::Membership if lists => (&[], &["membership-join"]),
+                        Shape::Membership if repeats => (&[], &["membership-join"]),
                         Shape::Membership => (&["membership-join"], &[]),
                         _ => (&[union_site], &["nested-loop-batched"]),
                     };
@@ -166,9 +170,9 @@ async fn lane_f_union_probes_answer_by_fact() {
                 // another join for the object shape there), never the union's.
                 let want_g1 = lane_f::expected_on(surface, shape, &g1_facts);
                 let run = lane_f::run_on(&fx, surface, ledger, "", "FROM <urn:g1>", shape).await;
-                let (fire, not_fire): (&[&str], &[&str]) = match shape {
+                let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
                     _ if list_view => (&[], &["nested-loop-batched", "nested-loop-batched-union"]),
-                    Shape::Membership if lists => (&[], &["membership-join"]),
+                    Shape::Membership if repeats => (&[], &["membership-join"]),
                     Shape::Membership => (&["membership-join"], &[]),
                     Shape::Object => (&[], &["nested-loop-batched-union"]),
                     _ => (&["nested-loop-batched"], &["nested-loop-batched-union"]),
@@ -286,6 +290,7 @@ async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
     let mut failures = Vec::new();
     let body = lane_f::Shape::Subject.body();
     let in_g3 = format!("GRAPH <urn:g3> {{ {body} }}");
+    let body = body.as_str();
     for (name, dataset, body) in [
         ("default graph", "", body),
         ("FROM g3", "FROM <urn:g3>", body),
