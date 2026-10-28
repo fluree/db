@@ -1233,6 +1233,15 @@ mod e2e {
             v.dedup();
             v
         }
+        /// How many scans read `table`.
+        fn scans(&self, table: &str) -> usize {
+            self.scanned
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| *t == table)
+                .count()
+        }
     }
 
     #[async_trait]
@@ -1389,6 +1398,21 @@ mod e2e {
         MockCrawlProvider::new(mapping, tables)
     }
 
+    /// [`two_table_provider`]'s mapping over a small `people` table and a large
+    /// `orders` one, the shape of a lake with a 5-row and a 2M-row table.
+    fn small_and_large_provider() -> MockCrawlProvider {
+        let small = two_table_provider();
+        let ids: Vec<i64> = (1..=2_000).collect();
+        let labels: Vec<String> = ids.iter().map(|i| format!("O-{i}")).collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let mut tables = small.tables.clone();
+        tables.insert(
+            "orders".to_string(),
+            vec![id_str_batch("label", &ids, &labels)],
+        );
+        MockCrawlProvider::new((*small.mapping).clone(), tables)
+    }
+
     fn person_crawl(projection: JsonValue, limit: Option<u64>) -> JsonValue {
         let mut q = serde_json::Map::new();
         q.insert("@context".into(), json!({"v": "http://example.org/"}));
@@ -1447,6 +1471,59 @@ mod e2e {
             vec!["people".to_string()],
             "class fusion must prune the scan to the Person table only"
         );
+    }
+
+    // A crawl whose WHERE puts a property beside `@type` fuses the class into
+    // that property's star, which left the wildcard beside it resolving every
+    // map. When the star's subjects are few (a filter, a small class) the
+    // wildcard's LIMIT budget is never met and it read every row of the large
+    // table; live, a filtered crawl of a 5-row class beside a 2M-row one took
+    // over 20 s. An ORDER BY has no budget at all. Hinted to the class's maps,
+    // the wildcard reads only the class's table.
+    #[tokio::test]
+    async fn a_crawl_with_a_property_beside_its_class_scans_only_that_class() {
+        let person_name = json!({"@id": "?s", "@type": "v:Person", "v:name": "?n"});
+        for (label, clauses, expected) in [
+            (
+                "filter",
+                json!({"where": [person_name, ["filter", "(= ?n \"Alice\")"]], "limit": 5}),
+                vec!["person/1"],
+            ),
+            (
+                "order by",
+                json!({"where": person_name, "orderBy": [["desc", "?n"]], "limit": 5}),
+                vec!["person/2", "person/1"],
+            ),
+        ] {
+            let provider = small_and_large_provider();
+            let (_ledger, view) = genesis_view();
+            let mut crawl = json!({
+                "@context": {"v": "http://example.org/"},
+                "select": {"?s": ["*"]},
+            });
+            for (key, value) in clauses.as_object().expect("clauses") {
+                crawl[key] = value.clone();
+            }
+            let docs = run_crawl(&provider, &view, &crawl).await;
+            let got: Vec<&str> = docs
+                .iter()
+                .map(|d| d["@id"].as_str().expect("@id"))
+                .collect();
+            assert_eq!(got.len(), expected.len(), "{label}: {docs:?}");
+            for (id, want) in got.iter().zip(&expected) {
+                assert!(id.ends_with(want), "{label}: {got:?}");
+            }
+            assert_eq!(
+                provider.scans("orders"),
+                0,
+                "{label}: the wildcard must not read the large table"
+            );
+            assert_eq!(
+                provider.scans("people"),
+                2,
+                "{label}: one scan for the star, one for the wildcard"
+            );
+        }
     }
 
     // (d) A 2nd TriplesMap sharing the subject template but lacking the class

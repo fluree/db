@@ -150,9 +150,10 @@ pub(crate) fn optional_budget_enabled() -> bool {
 }
 
 /// D7 (Cluster E / E1): whether a variable-predicate R2RML "crawl wildcard" scan
-/// with NO pruning key (no bound subject, no `class_filter`, no `class_prune_hint`,
-/// no pinned `triples_map_iri`) — which resolves to EVERY TriplesMap, i.e. a
-/// full-source scan — is cost-estimated as [`crate::planner`]'s `FULL_SCAN` so
+/// with NO pruning key (no bound subject, no `class_filter`, no pinned
+/// `triples_map_iri`; a `class_prune_hint` narrows the maps but not the rows
+/// read, so it does not count) — a full-source scan — is cost-estimated as
+/// [`crate::planner`]'s `FULL_SCAN` so
 /// `reorder_patterns` places it LAST among the query's co-subject R2RML scans.
 /// That makes the wildcard the LIMIT-budgeted, correlated OUTER scan driven by the
 /// selective INNER scan (the property-scoped browse crawl `{?s <prop> ?v}` +
