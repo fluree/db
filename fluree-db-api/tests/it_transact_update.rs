@@ -2643,9 +2643,9 @@ async fn multi_operation_registers_only_the_graphs_it_keeps() {
 
 /// PR-1454 review: atomicity on mid-request failure. Op 1 stages
 /// successfully; op 2 — evaluating over op 1's data, proving it actually
-/// ran against the sequential state — fails at staging. The request must
-/// fail as a unit: an error response, `t` unchanged, and no trace of
-/// op 1's insert.
+/// ran against the sequential state — writes a value the ledger refuses.
+/// The request must fail as a unit: an error response, `t` unchanged, and
+/// no trace of op 1's insert.
 #[tokio::test]
 async fn multi_operation_request_failing_mid_request_leaves_no_trace() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -2658,21 +2658,26 @@ async fn multi_operation_request_failing_mid_request_leaves_no_trace() {
         .graph("multiop:atomicity")
         .transact()
         .sparql_update(
-            r#"PREFIX ex: <http://example.org/ns/>
-               INSERT DATA { ex:pre ex:p "pre-existing" }"#,
+            r#"PREFIX ex: <http://example.org/ns/> PREFIX f: <https://ns.flur.ee/db#>
+               INSERT DATA { ex:pre ex:p "pre-existing" ; ex:emb "[1.0, 2.0]"^^f:embeddingVector }"#,
         )
         .commit()
         .await
         .expect("seed commit");
     let t_before = seeded.receipt.t;
 
-    // Op 2's BIND(STRDT(?m, <bad:datatype>)) evaluates over op 1's staged
-    // fact and fails at staging time — after op 1 already staged cleanly.
+    // Op 2 matches op 1's staged fact and gives it a 3-element vector on a
+    // property that holds 2-element vectors. The ledger refuses that by
+    // contract (one vector length per property, a 422), so no later fix
+    // can turn the trigger into a write that succeeds, as fixes to STRDT
+    // and IRI() in an unseen namespace (#1765) did to the earlier ones. With
+    // no row from op 1, op 2 writes nothing and the request succeeds.
     let failing = r#"
         PREFIX ex: <http://example.org/ns/>
+        PREFIX f: <https://ns.flur.ee/db#>
         INSERT DATA { ex:mid ex:p "landed" } ;
-        INSERT { ?s ex:q ?bad }
-        WHERE { ?s ex:p ?m . FILTER(?m = "landed") BIND(STRDT(?m, <bad:datatype>) AS ?bad) }
+        INSERT { ?s ex:emb "[1.0, 2.0, 3.0]"^^f:embeddingVector }
+        WHERE { ?s ex:p ?m . FILTER(?m = "landed") }
     "#;
     let result = fluree
         .graph("multiop:atomicity")
@@ -2680,9 +2685,14 @@ async fn multi_operation_request_failing_mid_request_leaves_no_trace() {
         .sparql_update(failing)
         .commit()
         .await;
+    let err = result.expect_err("a mid-request failure must fail the whole request");
     assert!(
-        result.is_err(),
-        "a mid-request staging failure must fail the whole request"
+        matches!(
+            &err,
+            fluree_db_api::ApiError::Transact(fluree_db_api::TransactError::InvalidVector(msg))
+                if msg.contains("<http://example.org/ns/emb>") && msg.contains("expected 2, got 3")
+        ),
+        "op 2's vector is refused for its length: {err}"
     );
 
     let ledger = fluree.ledger("multiop:atomicity").await.expect("ledger");
