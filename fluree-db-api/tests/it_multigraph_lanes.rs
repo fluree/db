@@ -330,7 +330,8 @@ async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
     let numeric = "?s ex:vf ?o FILTER(isNumeric(?o))";
     // (label, WHERE body, projected vars, rows on the index, rows added by the
     // novelty write of `y0 vf 4.5` in g2)
-    let cases: Vec<(&str, String, &[&str], Vec<&str>, Vec<&str>)> = vec![
+    type Case<'a> = (&'a str, String, &'a [&'a str], Vec<&'a str>, Vec<&'a str>);
+    let cases: Vec<Case<'_>> = vec![
         (
             "scan",
             "ex:y0 ex:vf ?o".into(),
