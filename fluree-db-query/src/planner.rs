@@ -1169,19 +1169,22 @@ pub fn estimate_pattern(
 
         Pattern::R2rml(rp) => PatternEstimate::Source {
             // D7 (E1): a variable-predicate R2RML scan with NO pruning key (no
-            // bound subject, class, class-prune hint, or pinned TriplesMap)
-            // resolves to EVERY TriplesMap — a full-source scan. Estimating it as
+            // bound subject, class, or pinned TriplesMap) reads every row of
+            // every TriplesMap it resolves — a full-source scan. Estimating it as
             // `FULL_SCAN` (not the default property-scan cost, which ties it with a
             // selective co-subject scan and leaves reorder's emit order) places it
             // LAST among co-subject R2RML scans, so it becomes the LIMIT-budgeted
             // correlated OUTER driven by the selective inner scan — the property-
             // scoped browse crawl that otherwise ran the wildcard unbudgeted and
-            // DNF'd. Gated so OFF is byte-identical to the pre-fix estimate.
+            // DNF'd. A class-prune hint is no pruning key here: it narrows which
+            // maps resolve, not the rows read, and the rewrite sets it on exactly
+            // this wildcard (beside the star its class fused into), which must
+            // still run last. Gated so OFF is byte-identical to the pre-fix
+            // estimate.
             row_count: if crate::r2rml::property_var_budget_enabled()
                 && rp.predicate_var.is_some()
                 && rp.subject_constant.is_none()
                 && rp.class_filter.is_none()
-                && rp.class_prune_hint.is_none()
                 && rp.triples_map_iri.is_none()
             {
                 FULL_SCAN
@@ -4084,6 +4087,26 @@ mod tests {
         assert!(
             matches!(&ordered[1], Pattern::R2rml(rp) if rp.predicate_var.is_some()),
             "the full-source wildcard must be placed LAST (budgeted correlated outer): {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn r2rml_class_hinted_wildcard_still_reorders_last() {
+        // The rewrite hints a crawl wildcard to the class it fused into the
+        // co-subject star. The hint narrows which maps resolve, not the rows
+        // read, so the wildcard must still run last: the LIMIT-budgeted
+        // correlated outer, driven by the star.
+        use crate::ir::R2rmlPattern;
+        let s = VarId(0);
+        let mut star = R2rmlPattern::new("gs", s, Some(VarId(1))).with_predicate("http://ex/prop");
+        star.class_filter = Some("http://ex/C".to_string());
+        let mut wildcard = R2rmlPattern::new("gs", s, Some(VarId(3))).with_predicate_var(VarId(2));
+        wildcard.class_prune_hint = Some("http://ex/C".to_string());
+        let patterns = vec![Pattern::R2rml(wildcard), Pattern::R2rml(star)];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert!(
+            matches!(&ordered[1], Pattern::R2rml(rp) if rp.predicate_var.is_some()),
+            "the hinted wildcard must be placed LAST: {ordered:?}"
         );
     }
 

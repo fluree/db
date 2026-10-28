@@ -556,6 +556,27 @@ pub fn rewrite_patterns_for_r2rml(
             Some(to) if class_fused => to,
             _ => origin,
         };
+        // The class now constrains the star alone, so a wildcard on the same
+        // subject (a crawl's `?s ?p ?o`) would still resolve every TriplesMap:
+        // when the star's subjects are few, the wildcard's LIMIT budget is never
+        // met and it streams every other table looking for subjects their
+        // templates cannot produce. Its rows only survive by joining the star's
+        // subjects, so when every other map's template is disjoint from the
+        // class's, hint it to the class's maps (resolution only, as PR-3 (b')).
+        if class_fused {
+            if let (Some(m), Some(class)) = (mapping, base.class_filter.clone()) {
+                if wildcard_class_fusion_is_safe(m, &class) {
+                    for p in &mut result_patterns {
+                        if let Pattern::R2rml(rp) = p {
+                            if is_standalone_wildcard(rp, subject) && rp.class_prune_hint.is_none()
+                            {
+                                rp.class_prune_hint = Some(class.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // PR-F20: if no query-declared class fused/pinned this star, but its
         // subject is a provable RefObjectMap object (invariant A+B, precomputed),
         // constrain resolution to the FK parent's class via the same
@@ -3233,6 +3254,77 @@ mod tests {
             unreachable!()
         };
         assert!(rp.star_constraints.is_empty(), "{out:?}");
+    }
+
+    /// `?s a C ; name ?n . ?s ?p ?o`: the class fuses into the `name` star, so
+    /// the crawl wildcard beside it is hinted to C's maps. Unhinted it resolves
+    /// every map, and when the star's subjects are few its LIMIT budget is never
+    /// met: it streams every other table for subjects their templates cannot
+    /// produce. The hint only narrows resolution; the class is not emitted.
+    #[test]
+    fn a_class_fused_into_a_star_hints_the_wildcard_beside_it() {
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                triple(0, PRED, Term::Var(VarId(1))),
+                wildcard_triple(0, 2, 3),
+            ],
+            true,
+        );
+        let scans: Vec<&R2rmlPattern> = out
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect();
+        let star = scans
+            .iter()
+            .find(|rp| rp.predicate_filter.as_deref() == Some(PRED))
+            .expect("the name star");
+        assert_eq!(star.class_filter.as_deref(), Some(CLASS), "{out:?}");
+        let wildcard = scans
+            .iter()
+            .find(|rp| rp.predicate_var.is_some())
+            .expect("the wildcard");
+        assert_eq!(wildcard.class_prune_hint.as_deref(), Some(CLASS), "{out:?}");
+        assert!(wildcard.class_filter.is_none(), "{out:?}");
+    }
+
+    /// A second map sharing the class's subject template (a vertical partition)
+    /// supplies the same subjects' other triples, so the wildcard must still
+    /// resolve it: no hint.
+    #[test]
+    fn a_vertical_partition_keeps_the_wildcard_unhinted() {
+        let person = TriplesMap::new("#P", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let nick = TriplesMap::new("#N", "nicks")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(OTHER_PRED, "nick"));
+        let mapping = CompiledR2rmlMapping::new(vec![person, nick]);
+        let out = rewrite_patterns_for_r2rml(
+            &[
+                class_triple(0),
+                triple(0, PRED, Term::Var(VarId(1))),
+                wildcard_triple(0, 2, 3),
+            ],
+            "gs:main",
+            &LedgerSnapshot::genesis("test:main"),
+            Some(&mapping),
+            false,
+            true,
+        )
+        .patterns;
+        let wildcard = out
+            .iter()
+            .find_map(|p| match p {
+                Pattern::R2rml(rp) if rp.predicate_var.is_some() => Some(rp),
+                _ => None,
+            })
+            .expect("the wildcard");
+        assert!(wildcard.class_prune_hint.is_none(), "{out:?}");
     }
 
     /// PR-0/0a: a non-lowered sub-scope that would evaluate against the R2RML
