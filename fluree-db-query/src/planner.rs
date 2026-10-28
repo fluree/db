@@ -8,7 +8,7 @@
 //! `build_where_operators_seeded` in `execute/where_plan.rs`.
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{CompareOp, Function, Grouping, Pattern, SubqueryPattern};
+use crate::ir::{CompareOp, Function, Grouping, OrderRole, Pattern, SubqueryPattern};
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
 use std::collections::{HashMap, HashSet};
@@ -1881,7 +1881,10 @@ fn left_join_order_barriers(
     seed_bound_in_every_row: &HashSet<VarId>,
 ) -> Vec<Vec<usize>> {
     let mut barriers: Vec<Vec<usize>> = vec![Vec::new(); patterns.len()];
-    if !patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
+    if !patterns
+        .iter()
+        .any(|p| p.order_role() == OrderRole::LeftJoin)
+    {
         return barriers;
     }
     let vars: Vec<HashSet<VarId>> = patterns
@@ -1891,12 +1894,12 @@ fn left_join_order_barriers(
     let mut certain_before: HashSet<VarId> = seed_bound_in_every_row.clone();
     for (i, earlier) in patterns.iter().enumerate() {
         if !matches!(
-            earlier,
-            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_)
+            earlier.order_role(),
+            OrderRole::GroupFilter | OrderRole::GroupTest
         ) {
-            let earlier_is_optional = matches!(earlier, Pattern::Optional(_));
+            let earlier_is_optional = earlier.order_role() == OrderRole::LeftJoin;
             for (j, later) in patterns.iter().enumerate().skip(i + 1) {
-                if !earlier_is_optional && !matches!(later, Pattern::Optional(_)) {
+                if !earlier_is_optional && later.order_role() != OrderRole::LeftJoin {
                     continue;
                 }
                 if vars[i]
@@ -2072,8 +2075,8 @@ pub fn reorder_patterns_with_seed(
         // Hoisting negation ahead of that triple changes which mappings it can
         // remove.
         if matches!(
-            pattern,
-            Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_)
+            pattern.order_role(),
+            OrderRole::AntiJoin | OrderRole::GroupTest
         ) {
             // Require all variables produced by preceding patterns (order preservation)
             let mut required: HashSet<VarId> = patterns[..i]

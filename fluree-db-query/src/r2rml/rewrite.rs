@@ -312,7 +312,7 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::Exists(_)
             | Pattern::NotExists(_)
             | Pattern::Service(_) => {
-                if matches!(pattern, Pattern::Optional(_) | Pattern::Minus(_)) {
+                if pattern.order_role().is_positional() {
                     barrier_vars.push((i, pattern.referenced_vars().into_iter().collect()));
                 }
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
@@ -715,10 +715,7 @@ pub fn rewrite_patterns_for_r2rml(
     // An OPTIONAL or a MINUS is evaluated over what is written before it, so
     // restore written order around it: the grouped scans above were emitted
     // after the loop, below every positional pattern.
-    if patterns
-        .iter()
-        .any(|p| matches!(p, Pattern::Optional(_) | Pattern::Minus(_)))
-    {
+    if patterns.iter().any(|p| p.order_role().is_positional()) {
         assert_eq!(origins.len(), result_patterns.len());
         let mut ordered: Vec<(usize, Pattern)> = origins.into_iter().zip(result_patterns).collect();
         ordered.sort_by_key(|(origin, _)| *origin);
@@ -1105,8 +1102,8 @@ fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> 
 }
 
 /// Whether lifting a scan written at slot `from` up to slot `to` (`to < from`)
-/// carries it past a positional pattern (an OPTIONAL or a MINUS) that reads
-/// one of `vars`.
+/// carries it past a positional pattern (an OPTIONAL or a MINUS, see
+/// [`crate::ir::OrderRole::is_positional`]) that reads one of `vars`.
 ///
 /// Every fusion here merges scans written at different slots into one, and the
 /// written-order restore places the fused scan at a single slot. That slot must
