@@ -144,7 +144,7 @@ impl MembershipJoinOperator {
         })
     }
 
-    fn extract_key(&self, batch: &Batch, row_idx: usize) -> CompositeGroupKey {
+    fn extract_key(&self, batch: &Batch, row_idx: usize) -> Result<CompositeGroupKey> {
         CompositeGroupKey::normalized(
             self.key_vars
                 .iter()
@@ -171,7 +171,7 @@ impl MembershipJoinOperator {
         while let Some(batch) = inner.next_batch(ctx).await? {
             ctx.check_cancelled()?;
             for row_idx in 0..batch.len() {
-                duplicate_ground_rows |= !set.insert(self.extract_key(&batch, row_idx));
+                duplicate_ground_rows |= !set.insert(self.extract_key(&batch, row_idx)?);
             }
         }
         inner.close();
@@ -329,7 +329,7 @@ impl Operator for MembershipJoinOperator {
                     // does not cover.
                     if !self.exact_only {
                         self.probed_rows += 1;
-                        let key = self.extract_key(&input_batch, row_idx);
+                        let key = self.extract_key(&input_batch, row_idx)?;
                         let keep = self
                             .key_set
                             .as_ref()

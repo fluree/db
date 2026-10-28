@@ -246,7 +246,7 @@ impl Operator for AggregateOperator {
                                 input_binding,
                                 self.graph_view.as_ref(),
                                 Some(namespaces),
-                            )
+                            )?
                         }
                         None => {
                             // Pass through unchanged
@@ -278,7 +278,7 @@ impl Operator for AggregateOperator {
                                     Some(namespaces),
                                 )
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                         // COUNT(DISTINCT *): the number of distinct solutions in
                         // the group, composed across the user-visible columns.
                         None if self.row_distinct_cols[*agg_idx].is_some() => {
@@ -360,7 +360,7 @@ fn apply_aggregate(
     binding: &Binding,
     gv: Option<&fluree_db_binary_index::TermView>,
     namespaces: Option<&HashMap<u16, String>>,
-) -> Binding {
+) -> Result<Binding> {
     let needs_decoded_values = matches!(
         func,
         AggregateFn::GroupConcat { .. }
@@ -381,14 +381,14 @@ fn apply_aggregate(
             let decoded: Vec<Binding> = values
                 .iter()
                 .map(|b| crate::group_aggregate::materialize_encoded(b, gv))
-                .collect();
+                .collect::<Result<_>>()?;
             // Decoding turns an encoded ref into `Binding::Sid`, which
             // GROUP_CONCAT still cannot read — expand those too.
             let decoded = match func {
                 AggregateFn::GroupConcat { .. } => group_concat_expand_iris(&decoded, namespaces),
                 _ => decoded,
             };
-            return func.apply(&Binding::Grouped(decoded));
+            return Ok(func.apply(&Binding::Grouped(decoded)));
         }
     }
     // No graph view (memory ledgers): bindings arrive already decoded, but an
@@ -397,7 +397,7 @@ fn apply_aggregate(
         if let Binding::Grouped(values) = binding {
             if values.iter().any(is_iri_binding) {
                 let expanded = group_concat_expand_iris(values, namespaces);
-                return func.apply(&Binding::Grouped(expanded));
+                return Ok(func.apply(&Binding::Grouped(expanded)));
             }
         }
     }
@@ -420,15 +420,15 @@ fn apply_aggregate(
                         if is_numbig(b) {
                             crate::group_aggregate::materialize_encoded(b, gv)
                         } else {
-                            b.clone()
+                            Ok(b.clone())
                         }
                     })
-                    .collect();
-                return func.apply(&Binding::Grouped(decoded));
+                    .collect::<Result<_>>()?;
+                return Ok(func.apply(&Binding::Grouped(decoded)));
             }
         }
     }
-    func.apply(binding)
+    Ok(func.apply(binding))
 }
 
 impl AggregateFn {

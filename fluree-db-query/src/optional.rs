@@ -1781,13 +1781,13 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             if seen_seed.insert(seed_key) {
                 seed_rows.push(
                     seed_cols
@@ -1867,7 +1867,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
                     .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
-                    .collect();
+                    .collect::<Result<_>>()?;
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
                     .map(|&c| batch.get_by_col(r, c).clone())
@@ -2296,7 +2296,7 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
                 self.row_sid(&self.p_src, required_batch, row, view)?,
             );
             let o =
-                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view);
+                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view)?;
             let ((Some(s), Some(p)), false) = (
                 key,
                 matches!(o, crate::group_aggregate::GroupKeyOwned::Absent),

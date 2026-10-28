@@ -1596,14 +1596,13 @@ impl PropertyPathOperator {
 
     /// Whether a literal is a term of the path's graphs: the object of a
     /// triple the query can see. One read of the triples holding its value.
-    /// An encoded literal decodes through the graph view; with several graphs
-    /// active there is none, and the member scans have decoded it already.
+    /// An encoded literal decodes through the scope's term view.
     async fn literal_in_graph(&self, ctx: &ExecutionContext<'_>, term: &Binding) -> Result<bool> {
         let decoded;
         let term = match term {
             Binding::EncodedLit { .. } => {
                 decoded =
-                    crate::group_aggregate::materialize_encoded(term, ctx.term_view().as_ref());
+                    crate::group_aggregate::materialize_encoded(term, ctx.term_view().as_ref())?;
                 &decoded
             }
             other => other,

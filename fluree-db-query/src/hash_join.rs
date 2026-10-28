@@ -565,8 +565,8 @@ fn join_key(
     binding: &Binding,
     dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::TermView>,
-) -> JoinKeyClass {
-    match binding {
+) -> Result<JoinKeyClass> {
+    Ok(match binding {
         Binding::EncodedSid { s_id, .. } => JoinKeyClass::Keyed(JoinKey::Ref(*s_id)),
         Binding::Unbound => JoinKeyClass::Wildcard,
         Binding::Poisoned => JoinKeyClass::Dead,
@@ -586,8 +586,8 @@ fn join_key(
         // identically to late-materialized scan output.
         other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(
             other, dicts, gv,
-        ))),
-    }
+        )?)),
+    })
 }
 
 /// Inner hash join: build a table from `build` (the small side), probe with `probe`
@@ -736,7 +736,7 @@ impl HashJoinOperator {
                     batch.get_by_col(row, self.build_key_col),
                     dicts,
                     gv.as_ref(),
-                ) {
+                )? {
                     JoinKeyClass::Keyed(key) => self.table.entry(key).or_default().push(row_vals),
                     // Unbound join var: unconstrained, matches every probe row.
                     JoinKeyClass::Wildcard => self.wildcard_rows.push(row_vals),
@@ -860,7 +860,7 @@ impl Operator for HashJoinOperator {
                 // The probe scan always binds the join var, so a non-keyed probe row
                 // (unbound/poisoned) cannot match — skip it.
                 let JoinKeyClass::Keyed(key) =
-                    join_key(pb.get_by_col(row, self.probe_key_col), dicts, gv.as_ref())
+                    join_key(pb.get_by_col(row, self.probe_key_col), dicts, gv.as_ref())?
                 else {
                     continue;
                 };
@@ -947,7 +947,8 @@ impl Operator for HashJoinOperator {
                             batch.get_by_col(row, self.probe_key_col),
                             dicts,
                             gv.as_ref(),
-                        ) else {
+                        )?
+                        else {
                             continue;
                         };
                         // Each probe row matches its keyed build rows plus every
@@ -988,11 +989,11 @@ mod tests {
         // Unbound => matches every probe row; Poisoned => blocks matching (drop).
         // Collapsing both to one class is the bug this guards against.
         assert!(matches!(
-            join_key(&Binding::Unbound, None, None),
+            join_key(&Binding::Unbound, None, None).unwrap(),
             JoinKeyClass::Wildcard
         ));
         assert!(matches!(
-            join_key(&Binding::Poisoned, None, None),
+            join_key(&Binding::Poisoned, None, None).unwrap(),
             JoinKeyClass::Dead
         ));
         assert!(matches!(
@@ -1000,7 +1001,8 @@ mod tests {
                 &Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::new(2, "long")),
                 None,
                 None
-            ),
+            )
+            .unwrap(),
             JoinKeyClass::Keyed(_)
         ));
     }

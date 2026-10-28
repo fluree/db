@@ -729,9 +729,9 @@ impl R2rmlScanOperator {
         child_schema: &[VarId],
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
-    ) -> JoinPlan {
+    ) -> Result<JoinPlan> {
         if join_vars.is_empty() {
-            return JoinPlan::Cross;
+            return Ok(JoinPlan::Cross);
         }
         let dicts = crate::object_binding::TermDicts::of(ctx);
         let gv = ctx.term_view();
@@ -751,7 +751,7 @@ impl R2rmlScanOperator {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(binding_to_group_key_normalized(b, dicts, gv)));
+                    key.push(Some(binding_to_group_key_normalized(b, dicts, gv)?));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -768,11 +768,11 @@ impl R2rmlScanOperator {
                 partial_rows.push((row_idx, key));
             }
         }
-        JoinPlan::Hash {
+        Ok(JoinPlan::Hash {
             join_vars: join_vars.to_vec(),
             full_index,
             partial_rows,
-        }
+        })
     }
 
     /// Buffer one child batch and set up its streaming scan: resolve the matching
@@ -1364,7 +1364,7 @@ impl R2rmlScanOperator {
                 }
             }
 
-            let join = self.build_join_plan(&join_vars, &child_schema, &child_batch, ctx);
+            let join = self.build_join_plan(&join_vars, &child_schema, &child_batch, ctx)?;
 
             tms.push(TmStream {
                 tm_iri: triples_map.iri.clone(),
@@ -1739,7 +1739,7 @@ fn emit_produced_window(
                             .find(|(v, _)| v == jv)
                             .map(|(_, b)| binding_to_group_key_normalized(b, dicts, gv))
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 if pkey.len() != join_vars.len() {
                     continue;
                 }

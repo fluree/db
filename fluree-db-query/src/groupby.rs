@@ -110,7 +110,7 @@ impl GroupByOperator {
     }
 
     /// Extract group key from a row
-    fn extract_group_key(&self, row: &[Binding]) -> Vec<Binding> {
+    fn extract_group_key(&self, row: &[Binding]) -> Result<Vec<Binding>> {
         self.group_key_indices
             .iter()
             .map(|&idx| {
@@ -244,7 +244,7 @@ impl Operator for GroupByOperator {
                             .map(|col| batch.get_by_col(row_idx, col).clone())
                             .collect();
 
-                        let group_key = self.extract_group_key(&row);
+                        let group_key = self.extract_group_key(&row)?;
                         self.groups.entry(group_key).or_default().push(row);
                     }
                     process_rows_ms += (proc_start.elapsed().as_secs_f64() * 1000.0) as u64;
@@ -414,7 +414,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(30), xsd_long()),
         ];
 
-        let key = op.extract_group_key(&row);
+        let key = op.extract_group_key(&row).unwrap();
         assert_eq!(key.len(), 1);
         assert_eq!(
             key[0],

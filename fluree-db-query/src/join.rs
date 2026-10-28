@@ -71,13 +71,13 @@ impl GroupedCountDrain {
         };
         self.key.0.clear();
         let dicts = self.graph_view.as_ref().map(TermDicts::of_view);
-        self.key.0.extend(columns.iter().map(|&col| {
-            binding_to_group_key_normalized(
+        for &col in columns {
+            self.key.0.push(binding_to_group_key_normalized(
                 batch.get_by_col(row, col),
                 dicts,
                 self.graph_view.as_ref(),
-            )
-        }));
+            )?);
+        }
         let (_, group) = self
             .groups
             .raw_entry_mut()
@@ -690,20 +690,26 @@ struct UnionMatch {
 }
 
 impl UnionMatch {
-    fn new(key: u64, member: usize, encoded: &Binding, view: Option<&TermView>, o_i: u32) -> Self {
-        let object = crate::group_aggregate::materialize_encoded(encoded, view);
+    fn new(
+        key: u64,
+        member: usize,
+        encoded: &Binding,
+        view: Option<&TermView>,
+        o_i: u32,
+    ) -> Result<Self> {
+        let object = crate::group_aggregate::materialize_encoded(encoded, view)?;
         let term = if is_arena_encoded(encoded) {
             object.clone()
         } else {
             encoded.clone()
         };
-        Self {
+        Ok(Self {
             key,
             member,
             term,
             object,
             o_i,
-        }
+        })
     }
 
     fn list_index(&self) -> Option<u32> {
@@ -717,8 +723,8 @@ impl UnionMatch {
 /// fact a match is, through [`UnionFact::of`].
 fn union_keep(
     matches: &[UnionMatch],
-    mut fact_of: impl FnMut(&UnionMatch) -> UnionFact,
-) -> Vec<bool> {
+    mut fact_of: impl FnMut(&UnionMatch) -> Result<UnionFact>,
+) -> Result<Vec<bool>> {
     let mut first_member: FxHashMap<u64, (usize, bool)> = FxHashMap::default();
     for m in matches {
         let entry = first_member.entry(m.key).or_insert((m.member, false));
@@ -730,7 +736,7 @@ fn union_keep(
         hashbrown::HashSet::with_hasher(FxBuildHasher);
     matches
         .iter()
-        .map(|m| !first_member[&m.key].1 || seen.insert(fact_of(m)))
+        .map(|m| Ok(!first_member[&m.key].1 || seen.insert(fact_of(m)?)))
         .collect()
 }
 
@@ -2367,7 +2373,7 @@ impl NestedLoopJoinOperator {
                         m.object,
                         view.as_deref(),
                         m.o_i,
-                    ));
+                    )?);
                     Ok(())
                 },
             )?;
@@ -2383,7 +2389,7 @@ impl NestedLoopJoinOperator {
                 dicts,
                 None,
             )
-        });
+        })?;
         for (m, keep) in matches.iter().zip(keep) {
             let Some(accum) = s_id_to_accum.get(&m.key).filter(|_| keep) else {
                 continue;
@@ -3197,7 +3203,7 @@ impl NestedLoopJoinOperator {
                         &Binding::encoded_sid(s_id),
                         view.as_deref(),
                         o_i,
-                    ));
+                    )?);
                     Ok(())
                 },
             )?;
@@ -3213,7 +3219,7 @@ impl NestedLoopJoinOperator {
                 dicts,
                 None,
             )
-        });
+        })?;
         Ok(matches
             .into_iter()
             .zip(keep)
@@ -3269,7 +3275,7 @@ impl NestedLoopJoinOperator {
                     object,
                     view.as_deref(),
                     m.o_i,
-                ));
+                )?);
             }
         }
         let (dicts, _) = EqualityNorm::parts(&self.norm);
@@ -3283,7 +3289,7 @@ impl NestedLoopJoinOperator {
                 dicts,
                 None,
             )
-        });
+        })?;
         Ok(matches
             .into_iter()
             .zip(keep)

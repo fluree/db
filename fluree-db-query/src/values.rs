@@ -172,10 +172,10 @@ impl ValuesOperator {
 
     /// Build the value-row hash lane (see the field docs). Called once per
     /// open, on the first batch.
-    fn build_value_index(&mut self, ctx: &ExecutionContext<'_>) {
+    fn build_value_index(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         let has_overlap = self.overlap_positions.iter().any(Option::is_some);
         if !has_overlap || self.value_rows.len() < VALUES_HASH_MIN_ROWS {
-            return;
+            return Ok(());
         }
         let norm = crate::object_binding::equality_norm(ctx);
         let (dicts, gv) = crate::object_binding::EqualityNorm::parts(&norm);
@@ -192,12 +192,13 @@ impl ValuesOperator {
                     fallback.push(i);
                     continue 'rows;
                 }
-                keys.push(binding_to_group_key_normalized(b, dicts, gv));
+                keys.push(binding_to_group_key_normalized(b, dicts, gv)?);
             }
             index.entry(CompositeGroupKey(keys)).or_default().push(i);
         }
         self.fallback_value_rows = fallback;
         self.value_index = Some(index);
+        Ok(())
     }
 
     /// Merge an input row with a compatible value row
@@ -252,7 +253,7 @@ impl Operator for ValuesOperator {
         if ctx.scan_provenance_ledger.is_some() {
             self.stamp_value_rows(ctx);
         }
-        self.build_value_index(ctx);
+        self.build_value_index(ctx)?;
         Ok(())
     }
 
@@ -317,21 +318,25 @@ impl Operator for ValuesOperator {
             // this only ever removes provably-mismatching candidates. A
             // row whose own overlap bindings are unbound or fragile keys
             // nothing exactly — it scans the full set like before.
-            let bucket: Option<&Vec<usize>> = self.value_index.as_ref().and_then(|index| {
-                let mut keys = Vec::new();
+            let mut bucket: Option<&Vec<usize>> = None;
+            if let Some(index) = self.value_index.as_ref() {
+                let mut keys = Some(Vec::new());
                 for overlap_pos in self.overlap_positions.iter().flatten() {
                     let b = input_row[*overlap_pos];
                     if b.is_unbound_or_poisoned() || hash_fragile(b) {
-                        return None;
+                        keys = None;
+                        break;
                     }
-                    keys.push(binding_to_group_key_normalized(b, dicts, gv));
+                    if let Some(keys) = keys.as_mut() {
+                        keys.push(binding_to_group_key_normalized(b, dicts, gv)?);
+                    }
                 }
-                Some(
+                bucket = keys.map(|keys| {
                     index
                         .get(&CompositeGroupKey(keys))
-                        .unwrap_or(const { &Vec::new() }),
-                )
-            });
+                        .unwrap_or(const { &Vec::new() })
+                });
+            }
 
             let check_and_merge =
                 |value_row: &[Binding], columns: &mut Vec<Vec<Binding>>| -> Result<()> {

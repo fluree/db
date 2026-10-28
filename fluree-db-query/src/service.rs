@@ -250,7 +250,7 @@ impl ServiceOperator {
             .row_view(row_idx)
             .expect("row_idx must be valid for parent batch")
             .to_vec();
-        crossing.enter(&mut row);
+        crossing.enter(&mut row)?;
         let schema: Arc<[VarId]> = Arc::from(parent_batch.schema().to_vec().into_boxed_slice());
         let seed = match &cross_ledger {
             Some(_) => {
@@ -350,7 +350,7 @@ impl ServiceOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        merged_row.push(crossing.leave(binding));
+                        merged_row.push(crossing.leave(binding)?);
                     }
                 }
 

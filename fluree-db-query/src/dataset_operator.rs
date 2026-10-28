@@ -271,17 +271,25 @@ impl UnionFact {
         fact: Option<&RowFact>,
         dicts: Option<TermDicts<'_>>,
         gv: Option<&fluree_db_binary_index::TermView>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             bindings: bindings
                 .into_iter()
                 .map(|b| normalize_for_key(b, dicts, gv))
-                .collect(),
-            fact: fact.map(|f| RowFact {
-                object: f.object.as_ref().map(|o| normalize_for_key(o, dicts, gv)),
-                list_index: f.list_index,
-            }),
-        }
+                .collect::<Result<_>>()?,
+            fact: fact
+                .map(|f| -> Result<RowFact> {
+                    Ok(RowFact {
+                        object: f
+                            .object
+                            .as_ref()
+                            .map(|o| normalize_for_key(o, dicts, gv))
+                            .transpose()?,
+                        list_index: f.list_index,
+                    })
+                })
+                .transpose()?,
+        })
     }
 }
 
@@ -308,7 +316,7 @@ impl BatchDeduper {
         if batch.schema().is_empty() {
             let mut kept = 0;
             for row in 0..batch.len() {
-                let key = UnionFact::of([], facts.map(|f| &f[row]), dicts, gv);
+                let key = UnionFact::of([], facts.map(|f| &f[row]), dicts, gv)?;
                 if self.seen.insert(key, ()).is_none() {
                     kept += 1;
                 }
@@ -323,7 +331,7 @@ impl BatchDeduper {
                 facts.map(|f| &f[row_idx]),
                 dicts,
                 gv,
-            );
+            )?;
             let mut h = FxHasher::default();
             key.hash(&mut h);
             let hash = h.finish();

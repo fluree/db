@@ -316,7 +316,7 @@ fn resolve_obj_key_parts(
                 Binding::Unbound | Binding::Poisoned => Ok(None),
                 other => {
                     // Literal object: decode to (value, effective dt, lang).
-                    match crate::group_aggregate::materialize_encoded(other, view) {
+                    match crate::group_aggregate::materialize_encoded(other, view)? {
                         Binding::Lit { val, dtc, .. } => Ok(Some((
                             val,
                             dtc.datatype().clone(),
@@ -681,7 +681,7 @@ pub(crate) fn row_obj_key(
     row: usize,
     pos: &EdgePos,
     view: Option<&fluree_db_binary_index::TermView>,
-) -> GroupKeyOwned {
+) -> Result<GroupKeyOwned> {
     let dicts = view.map(crate::object_binding::TermDicts::of_view);
     match pos {
         EdgePos::Const(sid) => {
@@ -689,7 +689,7 @@ pub(crate) fn row_obj_key(
         }
         EdgePos::Var(v) => match batch.get(row, *v) {
             Some(b) => binding_to_group_key_normalized(b, dicts, view),
-            None => GroupKeyOwned::Absent,
+            None => Ok(GroupKeyOwned::Absent),
         },
     }
 }
@@ -808,12 +808,13 @@ async fn drain_object_keys(
                 Some(v) => batch
                     .get(r, v)
                     .map(|b| binding_to_group_key_normalized(b, dicts, view))
+                    .transpose()?
                     .unwrap_or(GroupKeyOwned::Absent),
                 // Constant object (typed relationship / fixed endpoint):
                 // the scan already filtered to it; record the constant.
                 None => match &triple.o {
                     Term::Sid(sid) => {
-                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), dicts, view)
+                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), dicts, view)?
                     }
                     _ => GroupKeyOwned::Absent,
                 },
@@ -1125,12 +1126,12 @@ impl HashAnnotationEdgeProbeOperator {
             for row in 0..batch.len() {
                 let (s_key, s_b) = match &self.s_pos {
                     EdgePos::Const(sid) => (
-                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), dicts, view),
+                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), dicts, view)?,
                         None,
                     ),
                     EdgePos::Var(v) => {
                         let b = batch.get(row, *v).cloned().unwrap_or(Binding::Unbound);
-                        (binding_to_group_key_normalized(&b, dicts, view), Some(b))
+                        (binding_to_group_key_normalized(&b, dicts, view)?, Some(b))
                     }
                 };
                 if matches!(s_key, GroupKeyOwned::Absent)
@@ -1144,7 +1145,7 @@ impl HashAnnotationEdgeProbeOperator {
                 let Some(p_sid) = resolve_pos_pred(&batch, row, &self.p_pos, view)? else {
                     continue;
                 };
-                let o_key = row_obj_key(&batch, row, &self.o_pos, view);
+                let o_key = row_obj_key(&batch, row, &self.o_pos, view)?;
                 if matches!(o_key, GroupKeyOwned::Absent) {
                     continue;
                 }
@@ -1246,12 +1247,12 @@ impl HashAnnotationEdgeProbeOperator {
                             &Binding::sid(sid.clone()),
                             dicts,
                             view,
-                        ));
+                        )?);
                     }
                     EdgePos::Var(v) => match batch.get(row, *v) {
                         None | Some(Binding::Unbound) => keep_all = true,
                         Some(b) => {
-                            driving.insert(binding_to_group_key_normalized(b, dicts, view));
+                            driving.insert(binding_to_group_key_normalized(b, dicts, view)?);
                         }
                     },
                 }
@@ -1315,16 +1316,16 @@ impl HashAnnotationEdgeProbeOperator {
                 // per-row substitution it replaces: the edge must carry the
                 // SAME value there. Unbound positions are free — the edge
                 // binds them.
-                let row_key = |pos: &EdgePos| -> Option<GroupKeyOwned> {
-                    match pos {
+                let row_key = |pos: &EdgePos| -> Result<Option<GroupKeyOwned>> {
+                    Ok(match pos {
                         EdgePos::Const(_) => None, // constrained by the scan pattern itself
                         EdgePos::Var(v) => match batch.get(row, *v) {
                             None | Some(Binding::Unbound) => None,
-                            Some(b) => Some(binding_to_group_key_normalized(b, dicts, view)),
+                            Some(b) => Some(binding_to_group_key_normalized(b, dicts, view)?),
                         },
-                    }
+                    })
                 };
-                let s_key = row_key(&self.s_pos);
+                let s_key = row_key(&self.s_pos)?;
                 // Predicate compares in Sid space (a normalized key would
                 // straddle the predicate/subject id spaces).
                 let p_bound_sid = match &self.p_pos {
@@ -1338,7 +1339,7 @@ impl HashAnnotationEdgeProbeOperator {
                         },
                     },
                 };
-                let o_key = row_key(&self.o_pos);
+                let o_key = row_key(&self.o_pos)?;
                 let row_edges: Vec<&SweptEdge> = match &s_key {
                     // Unbound driving subject: every swept edge is a candidate.
                     None => edges.values().flatten().collect(),
@@ -1966,7 +1967,10 @@ mod tests {
         let s = Sid::new(3, "s");
         let p1 = Sid::new(2, "p1");
         let p2 = Sid::new(2, "p2");
-        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
+        let ok = |s: &Sid| {
+            binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None)
+                .expect("a Sid keys")
+        };
         let o1 = ok(&Sid::new(3, "o1"));
         let o2 = ok(&Sid::new(3, "o2"));
         let maps = AnnotationSidecarMaps::from_slot_pairs(
@@ -1989,7 +1993,10 @@ mod tests {
         let (a1, a2) = (Sid::new(1, "a1"), Sid::new(1, "a2"));
         let s = Sid::new(3, "hub");
         let p = Sid::new(2, "TREATS");
-        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
+        let ok = |s: &Sid| {
+            binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None)
+                .expect("a Sid keys")
+        };
         let (o1, o2) = (ok(&Sid::new(3, "o1")), ok(&Sid::new(3, "o2")));
         let maps = AnnotationSidecarMaps::from_slot_pairs(
             vec![(a1.clone(), s.clone()), (a2.clone(), s.clone())],

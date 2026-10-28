@@ -615,7 +615,7 @@ impl SubqueryOperator {
                     self.materialized = Some(self.materialize(ctx).await?);
                 }
                 if self.probe.is_none() {
-                    self.probe = Some(self.start_probe());
+                    self.probe = Some(self.start_probe()?);
                 }
                 let mat = self.materialized.as_ref().unwrap();
                 let Some(idx) = self.probe.as_mut().unwrap().next(mat, ctx)? else {
@@ -623,7 +623,7 @@ impl SubqueryOperator {
                     self.parent_row += 1;
                     continue;
                 };
-                self.merge_row(parent, self.parent_row, |col| mat.rows[idx].get(col))
+                self.merge_row(parent, self.parent_row, |col| mat.rows[idx].get(col))?
             } else {
                 // Per-row correlations keep their pruning seed. An identity
                 // parent uses an independent empty seed and runs the body once.
@@ -661,7 +661,7 @@ impl SubqueryOperator {
                         .select
                         .get(col)
                         .and_then(|v| batch.get(row, *v))
-                })
+                })?
             };
             if let Some(row) = merged {
                 for (col, binding) in columns.iter_mut().zip(row) {
@@ -693,7 +693,7 @@ impl SubqueryOperator {
         ))
     }
 
-    fn start_probe(&self) -> MatchCursor {
+    fn start_probe(&self) -> Result<MatchCursor> {
         let parent = self.parent_batch.as_ref().unwrap();
         // Only actual Unbound values are wildcards. Poisoned also normalizes
         // to Absent but must retain the existing blocking semantics.
@@ -708,12 +708,13 @@ impl SubqueryOperator {
                     unbound.push(col);
                 }
                 let (dicts, gv) = EqualityNorm::parts(&self.norm);
-                binding
+                Ok(binding
                     .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                    .unwrap_or(GroupKeyOwned::Absent)
+                    .transpose()?
+                    .unwrap_or(GroupKeyOwned::Absent))
             })
-            .collect();
-        if unbound.is_empty() {
+            .collect::<Result<_>>()?;
+        Ok(if unbound.is_empty() {
             self.materialized
                 .as_ref()
                 .unwrap()
@@ -735,7 +736,7 @@ impl SubqueryOperator {
                 bucket: 0,
                 row: 0,
             }
-        }
+        })
     }
 
     fn merge_row<'a>(
@@ -743,7 +744,7 @@ impl SubqueryOperator {
         parent_batch: &Batch,
         row_idx: usize,
         subquery_row: impl Fn(usize) -> Option<&'a Binding>,
-    ) -> Option<Vec<Binding>> {
+    ) -> Result<Option<Vec<Binding>>> {
         // Family B — reconcile OPTIONAL/UNION-produced correlation vars.
         // These are correlation vars the subquery does not self-produce,
         // so they are not hash join keys; the subquery binds them
@@ -757,22 +758,22 @@ impl SubqueryOperator {
         // no-op.
         if !self.reconcile_vars.is_empty() {
             let (dicts, gv) = EqualityNorm::parts(&self.norm);
-            let incompatible = self.reconcile_vars.iter().any(|v| {
+            for v in &self.reconcile_vars {
                 let parent = parent_batch.get(row_idx, *v);
                 let sub = self.select_index.get(v).and_then(|&i| subquery_row(i));
-                match (parent, sub) {
+                let incompatible = match (parent, sub) {
                     (Some(p), Some(s))
                         if !matches!(p, Binding::Unbound | Binding::Poisoned)
                             && !matches!(s, Binding::Unbound | Binding::Poisoned) =>
                     {
-                        binding_to_group_key_normalized(p, dicts, gv)
-                            != binding_to_group_key_normalized(s, dicts, gv)
+                        binding_to_group_key_normalized(p, dicts, gv)?
+                            != binding_to_group_key_normalized(s, dicts, gv)?
                     }
                     _ => false,
+                };
+                if incompatible {
+                    return Ok(None);
                 }
-            });
-            if incompatible {
-                return None;
             }
         }
 
@@ -812,7 +813,7 @@ impl SubqueryOperator {
             merged_row.push(binding);
         }
 
-        Some(merged_row)
+        Ok(Some(merged_row))
     }
 
     /// Seed only the inputs admitted by the existing correlation rules.
@@ -905,13 +906,15 @@ impl SubqueryOperator {
                 .join_keys
                 .iter()
                 .map(|v| {
-                    self.select_index
+                    Ok(self
+                        .select_index
                         .get(v)
                         .and_then(|&col| row.get(col))
                         .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                        .unwrap_or(GroupKeyOwned::Absent)
+                        .transpose()?
+                        .unwrap_or(GroupKeyOwned::Absent))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             let indices = mat.index.entry(key).or_insert_with(|| {
                 index_bytes += 2
                     * (std::mem::size_of::<Vec<GroupKeyOwned>>()

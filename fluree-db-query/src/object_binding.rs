@@ -694,36 +694,34 @@ pub(crate) fn normalize_for_key(
     binding: &Binding,
     dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::TermView>,
-) -> Binding {
-    normalize_for_key_cow(binding, dicts, gv).into_owned()
+) -> crate::error::Result<Binding> {
+    Ok(normalize_for_key_cow(binding, dicts, gv)?.into_owned())
 }
 
 /// [`normalize_for_key`] without the clone: an already-encoded binding (the
 /// common case on the indexed scan path) is returned borrowed, so a hot
 /// equality surface such as `DISTINCT` can hash and probe a row without
 /// copying it and only materializes the key for rows it actually keeps.
+///
+/// Fails closed: an arena-backed literal is keyed by its value, so one that
+/// cannot be decoded (no view, or an id the view does not hold) is an error,
+/// never a key by its handle.
 pub(crate) fn normalize_for_key_cow<'a>(
     binding: &'a Binding,
     dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::TermView>,
-) -> std::borrow::Cow<'a, Binding> {
+) -> crate::error::Result<std::borrow::Cow<'a, Binding>> {
     use std::borrow::Cow;
     // An encoded subject id is its own canonical key: the commonest key pays
     // nothing else.
     if let Binding::EncodedSid { .. } = binding {
-        return Cow::Borrowed(binding);
+        return Ok(Cow::Borrowed(binding));
     }
-    // A key over an arena handle with no view to decode it would key by a
-    // graph-scoped handle; member scans of a union of graphs decode them.
-    debug_assert!(
-        gv.is_some() || !is_arena_encoded(binding),
-        "arena-backed literal keyed with no graph view: {binding:?}"
-    );
     if let Some(canonical) = dicts.and_then(|d| encoded_iri_canonical(binding, d)) {
-        return match canonical {
+        return Ok(match canonical {
             Some(b) => Cow::Owned(b),
             None => Cow::Borrowed(binding),
-        };
+        });
     }
     // Arena-backed literals (NUM_BIG, VECTOR) normalize by DECODING: handles
     // are scoped per (graph, predicate), and one predicate's arena can hold
@@ -732,18 +730,14 @@ pub(crate) fn normalize_for_key_cow<'a>(
     // rows (VALUES, BIND, novelty raw-merge). The decoded value compares and
     // hashes by value.
     if is_arena_encoded(binding) {
-        if let Some(gv) = gv {
-            let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
-            if !matches!(materialized, Binding::EncodedLit { .. }) {
-                return Cow::Owned(materialized);
-            }
-        }
-        return Cow::Borrowed(binding);
+        return Ok(Cow::Owned(crate::group_aggregate::materialize_encoded(
+            binding, gv,
+        )?));
     }
-    match dicts.and_then(|d| encoded_equivalent(binding, d)) {
+    Ok(match dicts.and_then(|d| encoded_equivalent(binding, d)) {
         Some(encoded) => Cow::Owned(encoded),
         None => Cow::Borrowed(binding),
-    }
+    })
 }
 
 /// Whether two bindings are one RDF term, across the forms one term takes:
@@ -784,7 +778,7 @@ pub(crate) fn same_term(
                 return Ok(same);
             }
             let (dicts, gv) = EqualityNorm::parts(norm);
-            normalize_for_key_cow(a, dicts, gv) == normalize_for_key_cow(b, dicts, gv)
+            normalize_for_key_cow(a, dicts, gv)? == normalize_for_key_cow(b, dicts, gv)?
         }
     })
 }
@@ -838,7 +832,7 @@ pub(crate) fn same_term_in(
         Some(same) => same,
         None => {
             let dicts = ctx.and_then(equality_dicts);
-            normalize_for_key_cow(a, dicts, None) == normalize_for_key_cow(b, dicts, None)
+            normalize_for_key_cow(a, dicts, None)? == normalize_for_key_cow(b, dicts, None)?
         }
     })
 }
@@ -918,18 +912,19 @@ impl ArenaCrossing {
 
     /// Decode, through the outer graph, the arena handles in a row that seeds
     /// the scope.
-    pub(crate) fn enter(&self, row: &mut [Binding]) {
+    pub(crate) fn enter(&self, row: &mut [Binding]) -> crate::error::Result<()> {
         let Some(gv) = self.enter.as_ref() else {
-            return;
+            return Ok(());
         };
         for binding in row.iter_mut().filter(|b| is_arena_encoded(b)) {
-            *binding = crate::group_aggregate::materialize_encoded(binding, Some(gv));
+            *binding = crate::group_aggregate::materialize_encoded(binding, Some(gv))?;
         }
+        Ok(())
     }
 
     /// `binding`, bound inside the scope, decoded through the scope's graph
     /// when it is an arena handle, or any encoded binding for a union.
-    pub(crate) fn leave(&self, binding: Binding) -> Binding {
+    pub(crate) fn leave(&self, binding: Binding) -> crate::error::Result<Binding> {
         let decode = if self.leave_all {
             binding.is_encoded()
         } else {
@@ -937,7 +932,7 @@ impl ArenaCrossing {
         };
         match &self.leave {
             Some(gv) if decode => crate::group_aggregate::materialize_encoded(&binding, Some(gv)),
-            _ => binding,
+            _ => Ok(binding),
         }
     }
 }
