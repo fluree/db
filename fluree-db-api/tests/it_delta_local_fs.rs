@@ -7,7 +7,12 @@
 
 #![cfg(all(feature = "delta", feature = "native"))]
 
-use fluree_db_api::{ApiError, DeltaCreateConfig, Fluree, FlureeBuilder, TimeSpec};
+use fluree_db_api::{
+    ApiError, DeltaCreateConfig, Fluree, FlureeBuilder, FlureeR2rmlProvider, TimeSpec,
+};
+use fluree_db_query::error::QueryError;
+use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
+use futures::TryStreamExt;
 use serde_json::{json, Value};
 
 /// Commit times Delta Spark recorded in the `in_commit_time` fixture's log:
@@ -61,10 +66,16 @@ fn fixtures() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fluree-db-delta/tests/fixtures")
 }
 
-/// Every test must install the same allowlist: the guard reads it once.
+/// Every test must install the same allowlist: the guard reads it once. The
+/// temp directory holds staged copies of fixtures whose history a test plays
+/// out commit by commit.
 fn allow_fixture_roots() {
     let root = fixtures().canonicalize().expect("fixtures dir");
-    std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", root);
+    let temp = std::env::temp_dir().canonicalize().expect("temp dir");
+    std::env::set_var(
+        "FLUREE_ICEBERG_LOCAL_ROOTS",
+        format!("{}:{}", root.display(), temp.display()),
+    );
 }
 
 async fn source(name: &str) -> (Fluree, String) {
@@ -432,20 +443,390 @@ async fn a_pinned_version_resolves_columns_against_its_own_schema() {
     assert_eq!(sorted_ints(&v3), Vec::<i64>::new(), "got: {v3}");
 }
 
-/// Materialization reads Iceberg manifests; a Delta source is refused by name
-/// rather than failing to parse as an Iceberg config.
+/// A Delta table is pinned and read for materialization as an Iceberg table
+/// is: its latest version is the pin, an earlier version reads as it was, and a
+/// version it never had is refused. One provider reads several versions of one
+/// table here, so no read may answer with a version an earlier call resolved.
 #[tokio::test]
-async fn materializing_a_delta_source_is_refused() {
-    let (fluree, alias) = source("delta-materialize").await;
-    let err = fluree
-        .materialize_r2rml_graph_source(&alias, "delta-twin:main", true)
+async fn a_delta_table_is_pinned_and_read_whole() {
+    let (fluree, alias) = source("delta-pinned-read").await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let table = "in_commit_time";
+
+    let latest = provider
+        .current_snapshot_id(&alias, table)
         .await
-        .expect_err("Delta materialization is not available")
-        .to_string();
-    assert!(
-        err.contains("materialization is not yet available for Delta graph sources"),
-        "{err}"
+        .expect("latest version");
+    assert_eq!(latest, Some(2));
+
+    // (pin, rows at that version): v0 = {1}, v1 = {1, 2}, v2 = {2}.
+    for (pin, rows) in [(Some(0), 1), (Some(1), 2), (Some(2), 1), (None, 1)] {
+        let scan = provider
+            .scan_for_materialize_stream(&alias, table, &[], None, pin, None)
+            .await
+            .unwrap_or_else(|e| panic!("read at {pin:?}: {e}"));
+        assert_eq!(scan.to_snapshot_id, Some(pin.unwrap_or(2)), "pin {pin:?}");
+        assert!(!scan.incremental);
+        assert_eq!(scan.to_sequence, None);
+        let batches: Vec<_> = scan.stream.try_collect().await.expect("stream");
+        let read: usize = batches.iter().map(|b| b.num_rows).sum();
+        assert_eq!(read, rows, "rows at pin {pin:?}");
+    }
+
+    // A window start is no reason to read less: the version is read whole.
+    let scan = provider
+        .scan_for_materialize_stream(&alias, table, &[], Some(0), Some(1), Some(1))
+        .await
+        .expect("read with a window start");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream");
+    assert_eq!(batches.iter().map(|b| b.num_rows).sum::<usize>(), 2);
+
+    match provider
+        .scan_for_materialize_stream(&alias, table, &[], None, Some(9), None)
+        .await
+    {
+        Ok(_) => panic!("a version the table never had must fail, not fall forward"),
+        Err(QueryError::SnapshotNotFound { snapshot_id: 9, .. }) => {}
+        Err(other) => panic!("expected SnapshotNotFound, got: {other}"),
+    }
+}
+
+const FEED_MAPPING: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#Row>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "TABLE" ] ;
+        rr:subjectMap [ rr:template "http://example.org/row/{id}" ; rr:class ex:Row ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ; rr:datatype xsd:integer ] ] .
+"#;
+
+const STATE_LEDGER: &str = "fluree_materialize_state:main";
+
+/// A copy of fixture `table` under a temp root whose commits after `through`
+/// are held back until [`Staged::release`].
+struct Staged {
+    root: tempfile::TempDir,
+    held: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+impl Staged {
+    fn new(table: &str, through: u64) -> Self {
+        allow_fixture_roots();
+        let root = tempfile::TempDir::new().expect("staging root");
+        let copy = root.path().join(table);
+        copy_dir(&fixtures().join(table), &copy);
+        let log = copy.join("_delta_log");
+        let hold = root.path().join("held");
+        std::fs::create_dir_all(&hold).expect("held dir");
+        let mut held = Vec::new();
+        for entry in std::fs::read_dir(&log).expect("log dir") {
+            let path = entry.expect("entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let Some(version) = name.get(..20).and_then(|v| v.parse::<u64>().ok()) else {
+                continue;
+            };
+            if version > through {
+                let parked = hold.join(&name);
+                std::fs::rename(&path, &parked).expect("hold back commit");
+                held.push((parked, path));
+            }
+        }
+        Self { root, held }
+    }
+
+    fn root(&self) -> String {
+        self.root
+            .path()
+            .canonicalize()
+            .expect("staging root")
+            .display()
+            .to_string()
+    }
+
+    fn release(&mut self) {
+        for (parked, path) in self.held.drain(..) {
+            std::fs::rename(&parked, &path).expect("release commit");
+        }
+    }
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+async fn feed_source(
+    fluree: &Fluree,
+    name: &str,
+    table: &str,
+    root: &str,
+    latest_by_key: bool,
+) -> String {
+    let mapping = FEED_MAPPING.replace("TABLE", table);
+    let mut config = DeltaCreateConfig::new(name, root, mapping);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    if latest_by_key {
+        config = config.with_order_by("amount");
+    }
+    fluree
+        .create_delta_graph_source(config)
+        .await
+        .expect("create delta graph source");
+    format!("{name}:main")
+}
+
+/// `(id, name, amount)` of every `ex:Row` in `target`, sorted.
+async fn rows_in(fluree: &Fluree, target: &str) -> Vec<(i64, String, i64)> {
+    let q = json!({
+        "select": ["?s", "?name", "?amount"],
+        "where": {
+            "@id": "?s",
+            "@type": "http://example.org/Row",
+            "http://example.org/name": "?name",
+            "http://example.org/amount": "?amount"
+        },
+    });
+    let out = fluree
+        .graph(target)
+        .query()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("query target");
+    let mut rows: Vec<(i64, String, i64)> = out
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            let id = r[0]
+                .as_str()
+                .expect("iri")
+                .trim_start_matches("http://example.org/row/");
+            (
+                id.parse().expect("id"),
+                r[1].as_str().expect("name").to_string(),
+                r[2].as_i64().expect("amount"),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn expected(rows: &[(i64, &str, i64)]) -> Vec<(i64, String, i64)> {
+    rows.iter()
+        .map(|(i, n, a)| (*i, (*n).to_string(), *a))
+        .collect()
+}
+
+/// Materialize until the watermark reaches `head`, as the tracking worker's
+/// polls would; returns whether each pass read incrementally.
+async fn poll_to(fluree: &Fluree, gs: &str, target: &str, table: &str, head: i64) -> Vec<bool> {
+    let mut passes = Vec::new();
+    for _ in 0..10 {
+        let result = fluree
+            .materialize_r2rml_graph_source(gs, target, false)
+            .await
+            .expect("materialize");
+        passes.push(result.incremental);
+        let watermark = fluree
+            .materialize_watermark(STATE_LEDGER, gs, target, table)
+            .await
+            .expect("watermark");
+        if watermark == Some(head) {
+            return passes;
+        }
+    }
+    panic!("the watermark never reached version {head}");
+}
+
+/// A Delta source materializes into a native ledger and follows its table
+/// through the change data feed: a first pass reads version 2 whole, and once
+/// the table has moved on, later passes read only what changed — an update,
+/// a delete, a MERGE and a deleted key inserted again — and leave the target
+/// equal to the table at version 5. Additive and latest-by-key alike.
+#[tokio::test]
+async fn a_delta_source_materializes_and_follows_its_change_feed() {
+    for latest_by_key in [false, true] {
+        let mut staged = Staged::new("change_feed", 2);
+        let fluree = FlureeBuilder::memory().build_memory();
+        let gs = feed_source(
+            &fluree,
+            "feed",
+            "change_feed",
+            &staged.root(),
+            latest_by_key,
+        )
+        .await;
+        let target = "feed_native:main";
+
+        let first = poll_to(&fluree, &gs, target, "change_feed", 2).await;
+        assert_eq!(first, [false], "a first pass reads the version whole");
+        assert_eq!(
+            rows_in(&fluree, target).await,
+            expected(&[(1, "a", 100), (2, "b", 201), (3, "c", 301), (5, "e", 500)])
+        );
+
+        staged.release();
+        let later = poll_to(&fluree, &gs, target, "change_feed", 5).await;
+        assert!(later.iter().all(|incremental| *incremental), "{later:?}");
+        assert_eq!(
+            rows_in(&fluree, target).await,
+            expected(&[
+                (2, "b", 201),
+                (3, "c", 301),
+                (4, "d2", 401),
+                (5, "e2", 501),
+                (6, "f", 600),
+                (7, "g", 700),
+            ]),
+            "latest_by_key={latest_by_key}"
+        );
+
+        // Nothing new: the next poll writes nothing.
+        let idle = fluree
+            .materialize_r2rml_graph_source(&gs, target, false)
+            .await
+            .expect("idle poll");
+        assert!(!idle.committed, "an unchanged table commits nothing");
+    }
+}
+
+/// A window the change feed cannot serve — here it starts before the table
+/// turned its feed on — is read whole instead, and the source keeps going.
+#[tokio::test]
+async fn a_window_the_feed_cannot_serve_is_read_whole() {
+    let mut staged = Staged::new("change_feed_late", 0);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = feed_source(&fluree, "late", "change_feed_late", &staged.root(), false).await;
+    let target = "late_native:main";
+    poll_to(&fluree, &gs, target, "change_feed_late", 0).await;
+
+    staged.release();
+    let passes = poll_to(&fluree, &gs, target, "change_feed_late", 3).await;
+    assert_eq!(passes, [false], "the window is read whole");
+    assert_eq!(
+        rows_in(&fluree, target).await,
+        expected(&[(1, "a", 100), (2, "b", 201)])
     );
+}
+
+/// Rows a materialize stream yields, and where it says it stopped.
+async fn drain(
+    stream: fluree_db_query::r2rml::ColumnBatchStream,
+    stopped_at: Option<std::sync::Arc<std::sync::OnceLock<u64>>>,
+) -> (usize, Option<u64>) {
+    let batches: Vec<_> = stream.try_collect().await.expect("rows");
+    let read = batches.iter().map(|b| b.num_rows).sum();
+    (read, stopped_at.and_then(|cut| cut.get().copied()))
+}
+
+/// The per-pass row budget reaches the feed: a window larger than it stops at
+/// a commit boundary and says where, the watermark lands there, and passes
+/// drain the backlog in bounded steps. A pinned read is never cut.
+///
+/// Sets `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` for the process. The other
+/// tests here tolerate it: a whole read is never cut, and they poll until the
+/// watermark reaches the head.
+#[tokio::test]
+async fn a_change_feed_backlog_drains_in_bounded_passes() {
+    std::env::set_var("FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS", "4");
+    let mut staged = Staged::new("change_feed", 0);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = feed_source(&fluree, "budget", "change_feed", &staged.root(), false).await;
+    let target = "budget_native:main";
+    poll_to(&fluree, &gs, target, "change_feed", 0).await;
+    staged.release();
+
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let scan = provider
+        .scan_for_materialize_stream(&gs, "change_feed", &[], Some(0), None, None)
+        .await
+        .expect("change window");
+    assert!(scan.change_feed && scan.incremental);
+    assert_eq!(scan.to_snapshot_id, Some(5));
+    assert_eq!(
+        drain(scan.stream, scan.stopped_at).await,
+        (4, Some(1)),
+        "version 1's four changes, then stop"
+    );
+    let pinned = provider
+        .scan_for_materialize_stream(&gs, "change_feed", &[], Some(0), Some(5), None)
+        .await
+        .expect("pinned change window");
+    assert_eq!(
+        drain(pinned.stream, pinned.stopped_at).await,
+        (11, None),
+        "a pinned read is never cut"
+    );
+
+    let passes = poll_to(&fluree, &gs, target, "change_feed", 5).await;
+    std::env::remove_var("FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS");
+    assert!(
+        passes.len() > 1,
+        "the backlog takes several passes: {passes:?}"
+    );
+    assert_eq!(
+        rows_in(&fluree, target).await,
+        expected(&[
+            (2, "b", 201),
+            (3, "c", 301),
+            (4, "d2", 401),
+            (5, "e2", 501),
+            (6, "f", 600),
+            (7, "g", 700),
+        ])
+    );
+}
+
+/// A version is read back by key: an `id` set narrows the read to those rows,
+/// with each key value read as the column's own type, so a key the version no
+/// longer holds comes back with nothing.
+#[tokio::test]
+async fn a_version_is_read_back_by_key() {
+    let staged = Staged::new("change_feed", 5);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = feed_source(&fluree, "readback", "change_feed", &staged.root(), true).await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let keys = ScanFilter {
+        column: "id".to_string(),
+        op: ScanCmpOp::In,
+        value: ScanValue::Set(
+            ["1", "4", "6"]
+                .map(|id| ScanValue::TemplateKey(id.to_string()))
+                .to_vec(),
+        ),
+    };
+    for (version, ids) in [(2, vec![1]), (5, vec![4, 6])] {
+        let batches: Vec<_> = provider
+            .rows_at_version(&gs, "change_feed", version, std::slice::from_ref(&keys))
+            .await
+            .expect("read back")
+            .try_collect()
+            .await
+            .expect("stream");
+        let mut read: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let column = b.column_by_name("id").expect("id column");
+                (0..b.num_rows).map(|row| column.get_i64(row).expect("id"))
+            })
+            .collect();
+        read.sort();
+        assert_eq!(read, ids, "version {version}");
+    }
 }
 
 /// Registration checks each table for the columns its maps project: a column

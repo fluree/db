@@ -104,6 +104,8 @@ pub struct ScanDatasetBuilder {
     index_hint: Option<IndexType>,
     mode: TemporalMode,
     schema: Arc<[VarId]>,
+    /// Scan with [`BinaryScanOperator::hiding_list_members`].
+    hide_list_members: bool,
 }
 
 impl ScanDatasetBuilder {
@@ -125,6 +127,7 @@ impl ScanDatasetBuilder {
             index_hint,
             mode,
             schema,
+            hide_list_members: false,
         }
     }
 
@@ -162,13 +165,20 @@ impl DatasetBuilder for ScanDatasetBuilder {
                     self.index_hint,
                 ),
             )),
-            TemporalMode::Current => Ok(Box::new(BinaryScanOperator::new_with_emit_and_index(
-                self.pattern.clone(),
-                self.object_bounds.clone(),
-                self.inline_ops.clone(),
-                self.emit,
-                self.index_hint,
-            ))),
+            TemporalMode::Current => {
+                let scan = BinaryScanOperator::new_with_emit_and_index(
+                    self.pattern.clone(),
+                    self.object_bounds.clone(),
+                    self.inline_ops.clone(),
+                    self.emit,
+                    self.index_hint,
+                );
+                Ok(Box::new(if self.hide_list_members {
+                    scan.hiding_list_members()
+                } else {
+                    scan
+                }))
+            }
         }
     }
 
@@ -452,6 +462,24 @@ impl DatasetOperator {
     ) -> Self {
         let builder =
             ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
+        let mut op = Self::new(Box::new(builder));
+        op.mode = mode;
+        op
+    }
+
+    /// [`Self::scan`] of `pattern`'s stored rows that are not list members
+    /// (see [`BinaryScanOperator::hiding_list_members`]).
+    pub fn scan_hiding_list_members(
+        pattern: TriplePattern,
+        object_bounds: Option<ObjectBounds>,
+        inline_ops: Vec<InlineOperator>,
+        emit: EmitMask,
+        index_hint: Option<IndexType>,
+        mode: TemporalMode,
+    ) -> Self {
+        let mut builder =
+            ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
+        builder.hide_list_members = true;
         let mut op = Self::new(Box::new(builder));
         op.mode = mode;
         op

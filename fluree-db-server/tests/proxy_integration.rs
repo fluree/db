@@ -3796,3 +3796,113 @@ async fn test_ns_record_etag_changes_without_a_commit() {
     assert_eq!(before["commit_t"], after["commit_t"], "no commit happened");
     assert_ne!(before["branches"], after["branches"], "branch count moved");
 }
+
+/// A proxy-storage peer resolves a ledger route's dataset against its path
+/// ledger's graph registry, as a peer on shared storage does: its queries load
+/// through the same cached handle the registry is read from. A graph IRI the
+/// ledger registered (`urn:g1`, which also reads as a ledger address) names
+/// that graph, and an address of another ledger is the 400 "Ledger mismatch"
+/// in both languages. Read with no registry, the peer took `other:main` for a
+/// graph of the path's ledger and answered 404 `GraphNotFound`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_ledger_route_resolves_the_dataset_in_its_registry() {
+    use fluree_db_api::ReindexOptions;
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "peerds:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    let upsert = client
+        .post(format!("{server_url}/v1/fluree/upsert/peerds:main"))
+        .header("content-type", "application/trig")
+        .body(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:d ex:name \"D\" .\n\
+             <urn:g1> { ex:g ex:name \"G\" . }\n",
+        )
+        .send()
+        .await
+        .expect("upsert");
+    assert_eq!(upsert.status(), reqwest::StatusCode::OK);
+    state
+        .fluree
+        .reindex("peerds:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    assert!(peer.config.is_proxy_storage_mode());
+    let peer_app = build_router(peer);
+    let post = |content_type: &'static str, body: String| {
+        let peer_app = peer_app.clone();
+        async move {
+            let resp = peer_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/fluree/query/peerds:main")
+                        .header("content-type", content_type)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+    };
+    let jsonld = |from: &str| {
+        serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": from,
+            "select": ["?n"],
+            "where": {"@id": "?s", "ex:name": "?n"}
+        })
+        .to_string()
+    };
+    let sparql = |from: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/> SELECT ?n FROM <{from}> WHERE {{ ?s ex:name ?n }}"
+        )
+    };
+
+    let (status, body) = post("application/json", jsonld("urn:g1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"G\"") && !body.contains("\"D\""), "{body}");
+    let (status, body) = post("application/sparql-query", sparql("urn:g1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"G\"") && !body.contains("\"D\""), "{body}");
+
+    for (content_type, body) in [
+        ("application/json", jsonld("other:main")),
+        ("application/sparql-query", sparql("other:main")),
+    ] {
+        let (status, text) = post(content_type, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{content_type}: {text}");
+        assert!(text.contains("Ledger mismatch"), "{content_type}: {text}");
+    }
+
+    server_handle.abort();
+}
