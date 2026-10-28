@@ -177,6 +177,9 @@ fn compare_for_minmax(
 /// A pointer, so the per-row key and decode paths that can return it stay the
 /// size of their success value; it becomes a [`QueryError`] where an operator
 /// returns it.
+// One thin pointer on purpose: `String` (24 B) or `Box<str>` (16 B) would
+// not fit beside the key in `Result<GroupKeyOwned, Undecodable>`.
+#[allow(clippy::box_collection)]
 #[derive(Debug)]
 pub(crate) struct Undecodable(Box<String>);
 
