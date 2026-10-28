@@ -1944,3 +1944,181 @@ async fn an_optional_keeps_the_class_written_above_it() {
         "SPARQL wildcard: {sparql}"
     );
 }
+
+/// A MINUS is positional like an OPTIONAL: what is written before it is its
+/// left side, so a scan the rewrite fuses or groups must not cross it. Every
+/// shape runs over `SPLIT_R2RML` and over a native twin holding the same
+/// triples, on SPARQL and JSON-LD, and must give the count Jena ARQ and
+/// Oxigraph both give. The fused shapes lifted the wildcard or the star above a
+/// MINUS that reads its variables; the scopes without an OPTIONAL were never
+/// restored to written order, so the grouped scans ran below the MINUS.
+#[tokio::test]
+async fn a_minus_keeps_the_scans_written_above_it() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("minus-people", &location, SPLIT_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let twin = fluree
+        .create_ledger("minus-twin:main")
+        .await
+        .expect("twin ledger");
+    let people = [
+        (1, "alice", "91.5"),
+        (2, "bob", "82.0"),
+        (3, "carol", "77.25"),
+        (4, "dave", "64.0"),
+        (5, "erin", "99.9"),
+    ];
+    let mut graph: Vec<Value> = Vec::new();
+    for (id, name, score) in people {
+        graph.push(json!({
+            "@id": format!("http://example.org/person/{id}"),
+            "@type": "http://example.org/Person",
+            "http://example.org/name": name,
+        }));
+        graph.push(json!({
+            "@id": format!("http://example.org/agent/{id}"),
+            "@type": "http://example.org/Agent",
+            "http://example.org/score": score,
+        }));
+    }
+    fluree
+        .insert(twin, &json!({ "@graph": graph }))
+        .await
+        .expect("seed native twin");
+
+    let score = json!(["optional", {"@id": "?s", "ex:score": "?x"}]);
+    let person = json!({"@id": "?s", "@type": "ex:Person"});
+    let alice = json!({"@id": "?s", "ex:name": "alice"});
+    let wildcard = json!({"@id": "?s", "?p": "?o"});
+    // (label, SPARQL query, JSON-LD select, JSON-LD where, rows per ARQ and Oxigraph)
+    let cases = [
+        (
+            "class into wildcard, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s ex:name ?o } OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([person, ["minus", {"@id": "?s", "ex:name": "?o"}], score, wildcard]),
+            0,
+        ),
+        (
+            "class into star, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s a ?n } OPTIONAL { ?s ex:score ?x } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["minus", {"@id": "?s", "@type": "?n"}], score, {"@id": "?s", "ex:name": "?n"}]),
+            0,
+        ),
+        (
+            "constraint into wildcard, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s ex:name \"alice\" . MINUS { ?s a ?o } OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([alice, ["minus", {"@id": "?s", "@type": "?o"}], score, wildcard]),
+            0,
+        ),
+        (
+            "class into wildcard, MINUS only",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s ex:name ?o } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([person, ["minus", {"@id": "?s", "ex:name": "?o"}], wildcard]),
+            0,
+        ),
+        (
+            "class into star, MINUS only",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s a ?n } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["minus", {"@id": "?s", "@type": "?n"}], {"@id": "?s", "ex:name": "?n"}]),
+            0,
+        ),
+        (
+            "constraint into wildcard, MINUS only",
+            "SELECT * WHERE { ?s ex:name \"alice\" . MINUS { ?s a ?o } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([alice, ["minus", {"@id": "?s", "@type": "?o"}], wildcard]),
+            0,
+        ),
+        // The review's P3 and P3b, verbatim. The class triple is written
+        // first, so `?s` is bound when the MINUS runs (Join(Minus(Extend(
+        // BGP(?s a Person), ?k), BGP(?s name "alice")), BGP(?s name ?n)),
+        // §18.2.2) and alice is removed: 4. With no OPTIONAL the scope was
+        // never restored to written order, so the graph source ran the class
+        // below the MINUS, which then removed nothing: 5.
+        (
+            "P3: class, BIND, then MINUS",
+            "SELECT ?s ?n WHERE { ?s a ex:Person . BIND(\"k\" AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["bind", "?k", ["expr", ["str", "k"]]], ["minus", alice], {"@id": "?s", "ex:name": "?n"}]),
+            4,
+        ),
+        (
+            "P3b: class, BIND, MINUS, then OPTIONAL",
+            "SELECT ?s ?n WHERE { ?s a ex:Person . BIND(\"k\" AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n OPTIONAL { ?s ex:score ?x } }",
+            json!(["?s", "?n"]),
+            json!([person, ["bind", "?k", ["expr", ["str", "k"]]], ["minus", alice], {"@id": "?s", "ex:name": "?n"}, score]),
+            4,
+        ),
+        // With the BIND written first, the MINUS's left side is the BIND alone,
+        // whose domain shares nothing with the MINUS, so it removes nothing and
+        // the triple written after it joins every person: 5.
+        (
+            "BIND first, then MINUS",
+            "SELECT * WHERE { BIND(1 AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n }",
+            json!(["?s", "?n", "?k"]),
+            json!([["bind", "?k", "(+ 0 1)"], ["minus", alice], {"@id": "?s", "ex:name": "?n"}]),
+            5,
+        ),
+    ];
+    let count = |v: &Value| {
+        v["results"]["bindings"]
+            .as_array()
+            .or_else(|| v.as_array())
+            .map_or(usize::MAX, Vec::len)
+    };
+    let mut wrong = Vec::new();
+    for (label, query, select, where_clause, expected) in &cases {
+        for from in ["minus-people:main", "minus-twin:main"] {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/> {}",
+                query.replacen(" WHERE", &format!(" FROM <{from}> WHERE"), 1)
+            );
+            let result = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} SPARQL on {from}: {e}"));
+            if count(&result) != *expected {
+                wrong.push(format!("{label} SPARQL on {from}: {} rows", count(&result)));
+            }
+            let jsonld = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": from,
+                "select": select,
+                "where": where_clause,
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&jsonld)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} JSON-LD on {from}: {e}"));
+            if count(&result) != *expected {
+                wrong.push(format!(
+                    "{label} JSON-LD on {from}: {} rows",
+                    count(&result)
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "rows differ from ARQ/Oxigraph:\n{}",
+        wrong.join("\n")
+    );
+}

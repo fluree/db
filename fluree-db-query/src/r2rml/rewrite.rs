@@ -247,8 +247,9 @@ pub fn rewrite_patterns_for_r2rml(
     let mut origins: Vec<usize> = Vec::with_capacity(patterns.len());
     let mut star_origin: HashMap<VarId, usize> = HashMap::new();
     let mut class_origin: HashMap<VarId, usize> = HashMap::new();
-    // Variables of each OPTIONAL seen so far, by input position.
-    let mut optional_vars: Vec<(usize, HashSet<VarId>)> = Vec::new();
+    // Variables of each positional pattern (OPTIONAL, MINUS) seen so far, by
+    // input position.
+    let mut barrier_vars: Vec<(usize, HashSet<VarId>)> = Vec::new();
 
     for (i, pattern) in patterns.iter().enumerate() {
         match pattern {
@@ -260,12 +261,13 @@ pub fn rewrite_patterns_for_r2rml(
                     // subject; a bound-subject pattern (subject_var = None) is
                     // never star/class eligible and falls to standalone emit.
                     if let Some(sv) = star_member_subject(&r2rml_pattern) {
-                        // Joining a star opened before an OPTIONAL moves this
-                        // member above it: sound only if the OPTIONAL does not
-                        // also reference its object variable (#1924).
+                        // Joining a star opened before an OPTIONAL or a MINUS
+                        // moves this member above it: sound only if that
+                        // pattern does not also reference its object variable
+                        // (#1924).
                         let crosses_optional = star_origin.get(&sv).is_some_and(|&opened| {
-                            lifts_past_optional(
-                                &optional_vars,
+                            lifts_past_barrier(
+                                &barrier_vars,
                                 opened,
                                 i,
                                 r2rml_pattern.object_var.iter().copied(),
@@ -310,8 +312,8 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::Exists(_)
             | Pattern::NotExists(_)
             | Pattern::Service(_) => {
-                if matches!(pattern, Pattern::Optional(_)) {
-                    optional_vars.push((i, pattern.referenced_vars().into_iter().collect()));
+                if matches!(pattern, Pattern::Optional(_) | Pattern::Minus(_)) {
+                    barrier_vars.push((i, pattern.referenced_vars().into_iter().collect()));
                 }
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
                     let r = rewrite_patterns_for_r2rml(
@@ -530,15 +532,15 @@ pub fn rewrite_patterns_for_r2rml(
             .collect();
 
         // A class written above the star rises with it only if the star can
-        // rise to the class's slot (see `lifts_past_optional`); a class written
+        // rise to the class's slot (see `lifts_past_barrier`); a class written
         // below binds nothing but the subject, so it always may.
         let class_slot = class_origin
             .get(&subject)
             .copied()
             .filter(|&at| at < origin);
         let may_fuse_class = class_slot.is_none_or(|to| {
-            !lifts_past_optional(
-                &optional_vars,
+            !lifts_past_barrier(
+                &barrier_vars,
                 to,
                 origin,
                 var_members.iter().flat_map(bound_besides_subject),
@@ -632,7 +634,7 @@ pub fn rewrite_patterns_for_r2rml(
                     &mut origins,
                     WrittenAt {
                         class: class_origin[&subject],
-                        optionals: &optional_vars,
+                        barriers: &barrier_vars,
                     },
                     subject,
                     class,
@@ -674,7 +676,7 @@ pub fn rewrite_patterns_for_r2rml(
     // kept iff the constraint column equals the constant). If the wildcard is gone
     // (defensive — fusion never removes it), re-emit the members standalone.
     // The constraints keep their written slot: the wildcard rises to it when
-    // written below, and when it cannot (see `lifts_past_optional`) they stay
+    // written below, and when it cannot (see `lifts_past_barrier`) they stay
     // standalone scans there.
     for (subject, const_members) in deferred_wildcard_constraints {
         let written = star_origin[&subject];
@@ -682,8 +684,8 @@ pub fn rewrite_patterns_for_r2rml(
             .iter()
             .position(|p| matches!(p, Pattern::R2rml(rp) if is_crawl_wildcard(rp, subject)));
         let cannot_rise = wildcard.is_some_and(|idx| match &result_patterns[idx] {
-            Pattern::R2rml(rp) => lifts_past_optional(
-                &optional_vars,
+            Pattern::R2rml(rp) => lifts_past_barrier(
+                &barrier_vars,
                 written,
                 origins[idx],
                 bound_besides_subject(rp),
@@ -710,9 +712,13 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
-    // An OPTIONAL is evaluated where it is written relative to the patterns it
-    // shares a variable with, so restore written order around it.
-    if patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
+    // An OPTIONAL or a MINUS is evaluated over what is written before it, so
+    // restore written order around it: the grouped scans above were emitted
+    // after the loop, below every positional pattern.
+    if patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Optional(_) | Pattern::Minus(_)))
+    {
         assert_eq!(origins.len(), result_patterns.len());
         let mut ordered: Vec<(usize, Pattern)> = origins.into_iter().zip(result_patterns).collect();
         ordered.sort_by_key(|(origin, _)| *origin);
@@ -1098,30 +1104,27 @@ fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> 
     })
 }
 
-/// The subject var of a regular-predicate R2RML pattern that can join a
-/// same-subject star: variable subject, constant predicate, no class/TM filter,
-/// and either a fresh object var (distinct from the subject) or a constant-object
-/// equality. `None` (not eligible) for bound-subject patterns. Constant-object
-/// members become existence constraints on the star; var-object members produce
-/// bindings.
 /// Whether lifting a scan written at slot `from` up to slot `to` (`to < from`)
-/// carries it past an OPTIONAL that reads one of `vars`.
+/// carries it past a positional pattern (an OPTIONAL or a MINUS) that reads
+/// one of `vars`.
 ///
 /// Every fusion here merges scans written at different slots into one, and the
-/// OPTIONAL reorder places the fused scan at a single slot. That slot must be
-/// the EARLIEST constituent's: a constraint written above an OPTIONAL is part
-/// of its left side, and sinking it below runs the OPTIONAL over an unconstrained
-/// seed, dropping every row the OPTIONAL does not match. So the later
-/// constituents rise, and each rise is sound only when no OPTIONAL in between
-/// reads a variable that constituent binds (#1924): the subject is shared, so
-/// pass the others.
-fn lifts_past_optional(
-    optional_vars: &[(usize, HashSet<VarId>)],
+/// written-order restore places the fused scan at a single slot. That slot must
+/// be the EARLIEST constituent's: a constraint written above an OPTIONAL or a
+/// MINUS is part of its left side, and sinking it below runs the OPTIONAL over
+/// an unconstrained seed (dropping every row it does not match) or the MINUS
+/// against too little (removing nothing). So the later constituents rise, and
+/// each rise is sound only when no positional pattern in between reads a
+/// variable that constituent binds (#1924): the subject is shared, so pass the
+/// others. Past a MINUS that does read one, the MINUS would need that variable
+/// to agree as well, and remove fewer rows.
+fn lifts_past_barrier(
+    barrier_vars: &[(usize, HashSet<VarId>)],
     to: usize,
     from: usize,
     mut vars: impl Iterator<Item = VarId>,
 ) -> bool {
-    let between: Vec<&HashSet<VarId>> = optional_vars
+    let between: Vec<&HashSet<VarId>> = barrier_vars
         .iter()
         .filter(|(at, _)| *at > to && *at < from)
         .map(|(_, read)| read)
@@ -1129,7 +1132,7 @@ fn lifts_past_optional(
     !between.is_empty() && vars.any(|v| between.iter().any(|read| read.contains(&v)))
 }
 
-/// Variables a scan binds besides its subject: what [`lifts_past_optional`]
+/// Variables a scan binds besides its subject: what [`lifts_past_barrier`]
 /// checks when a fusion raises the scan.
 fn bound_besides_subject(p: &R2rmlPattern) -> impl Iterator<Item = VarId> + '_ {
     p.produced_vars()
@@ -1137,6 +1140,12 @@ fn bound_besides_subject(p: &R2rmlPattern) -> impl Iterator<Item = VarId> + '_ {
         .filter(move |v| Some(*v) != p.subject_var)
 }
 
+/// The subject var of a regular-predicate R2RML pattern that can join a
+/// same-subject star: variable subject, constant predicate, no class/TM filter,
+/// and either a fresh object var (distinct from the subject) or a constant-object
+/// equality. `None` (not eligible) for bound-subject patterns. Constant-object
+/// members become existence constraints on the star; var-object members produce
+/// bindings.
 fn star_member_subject(p: &R2rmlPattern) -> Option<VarId> {
     let subject_var = p.subject_var?;
     let base_ok = p.predicate_filter.is_some()
@@ -1495,13 +1504,13 @@ fn is_standalone_type_var(rp: &R2rmlPattern, subject: VarId) -> bool {
         && rp.object_var.is_none()
 }
 
-/// Where a class pattern was written, and the OPTIONALs around it, for
-/// [`try_fuse_wildcard_class`] to place the fused wildcard.
+/// Where a class pattern was written, and the positional patterns around it,
+/// for [`try_fuse_wildcard_class`] to place the fused wildcard.
 struct WrittenAt<'a> {
     /// The class pattern's input slot.
     class: usize,
-    /// The variables of each OPTIONAL in the scope, by input slot.
-    optionals: &'a [(usize, HashSet<VarId>)],
+    /// The variables of each positional pattern in the scope, by input slot.
+    barriers: &'a [(usize, HashSet<VarId>)],
 }
 
 /// Outcome of [`try_fuse_wildcard_class`].
@@ -1598,7 +1607,7 @@ fn try_fuse_wildcard_class(
 
     // The fused wildcard takes the earliest slot among the class, the wildcard
     // and a merged type-var, and every later one must be able to rise to it
-    // (see `lifts_past_optional`); otherwise the class stays its own scan.
+    // (see `lifts_past_barrier`); otherwise the class stays its own scan.
     let constituents: Vec<usize> = patterns
         .iter()
         .enumerate()
@@ -1616,8 +1625,8 @@ fn try_fuse_wildcard_class(
         let Pattern::R2rml(rp) = &patterns[i] else {
             return false;
         };
-        lifts_past_optional(
-            written.optionals,
+        lifts_past_barrier(
+            written.barriers,
             slot,
             origins[i],
             bound_besides_subject(rp),
@@ -3254,6 +3263,77 @@ mod tests {
             unreachable!()
         };
         assert!(rp.star_constraints.is_empty(), "{out:?}");
+    }
+
+    /// Positions of the first R2RML scan matching `pred` and of the MINUS.
+    fn minus_slots(out: &[Pattern], pred: impl Fn(&R2rmlPattern) -> bool) -> (usize, usize) {
+        let scan = out
+            .iter()
+            .position(|p| matches!(p, Pattern::R2rml(rp) if pred(rp)))
+            .unwrap_or_else(|| panic!("no matching scan: {out:?}"));
+        let minus = out
+            .iter()
+            .position(|p| matches!(p, Pattern::Minus(_)))
+            .expect("the MINUS stays a scope");
+        (scan, minus)
+    }
+
+    /// A MINUS is positional like an OPTIONAL: what is written before it is
+    /// its left side. The class written above it fuses into the wildcard
+    /// below by lifting the wildcard, which is sound when the MINUS reads none
+    /// of the wildcard's variables, and refused when it does: the MINUS would
+    /// then need `?o` to agree as well, and remove fewer rows.
+    #[test]
+    fn a_fused_scan_rises_past_a_minus_only_when_the_minus_reads_none_of_it() {
+        for crawl_active in [false, true] {
+            let out = rewrite_scope(
+                &[
+                    class_triple(0),
+                    Pattern::Minus(vec![triple(0, SCORE_PRED, Term::Var(VarId(3)))]),
+                    wildcard_triple(0, 1, 2),
+                ],
+                crawl_active,
+            );
+            let (wildcard, minus) = minus_slots(&out, |rp| rp.predicate_var.is_some());
+            assert!(wildcard < minus, "crawl={crawl_active}: {out:?}");
+            let Pattern::R2rml(rp) = &out[wildcard] else {
+                unreachable!()
+            };
+            assert_eq!(rp.class_filter.as_deref(), Some(CLASS), "{out:?}");
+        }
+
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                Pattern::Minus(vec![triple(0, PRED, Term::Var(VarId(2)))]),
+                wildcard_triple(0, 1, 2),
+            ],
+            true,
+        );
+        let (class, minus) = minus_slots(&out, |rp| {
+            rp.class_filter.is_some() && rp.predicate_var.is_none()
+        });
+        assert!(class < minus, "the class stays above: {out:?}");
+        let (wildcard, _) = minus_slots(&out, |rp| rp.predicate_var.is_some());
+        assert!(wildcard > minus, "the wildcard stays below: {out:?}");
+    }
+
+    /// A scope with a MINUS and no OPTIONAL is restored to written order too:
+    /// the grouped scans are emitted after the loop, so without the restore the
+    /// class and the star written above the MINUS ran below it, and the MINUS
+    /// removed nothing.
+    #[test]
+    fn a_minus_only_scope_keeps_its_written_order() {
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                triple(0, PRED, Term::Var(VarId(1))),
+                Pattern::Minus(vec![triple(0, SCORE_PRED, Term::Var(VarId(3)))]),
+            ],
+            false,
+        );
+        let (star, minus) = minus_slots(&out, |rp| rp.predicate_filter.as_deref() == Some(PRED));
+        assert!(star < minus, "{out:?}");
     }
 
     /// `?s a C ; name ?n . ?s ?p ?o`: the class fuses into the `name` star, so
