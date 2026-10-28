@@ -52,13 +52,13 @@ GRAPH <urn:g1> { ex:s4 ex:items ( 5 6 ) . ex:s1 ex:items 7 . }
 
 /// A later write: a list for a subject that held only a plain value, a list
 /// on a new subject, and a predicate whose only rows are a list.
-const LATER: &str = r#"
+const LATER: &str = r"
 @prefix ex: <http://example.org/> .
 ex:s2 ex:items ( 10 ) .
 ex:s5 ex:items ( 8 8 ) .
 ex:s6 ex:fresh ( 11 12 ) .
 GRAPH <urn:g1> { ex:s7 ex:items ( 13 ) . }
-"#;
+";
 
 #[derive(Clone, Copy, Debug)]
 enum State {

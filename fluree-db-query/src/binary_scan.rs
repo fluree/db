@@ -1485,10 +1485,9 @@ impl BinaryScanOperator {
                 continue;
             }
             if hide_members && o_i != u32::MAX {
-                if self.list_owners.is_some() {
-                    let p = self.resolve_p_id(p_id);
-                    let g_id = self.g_id;
-                    let owners = self.list_owners.as_mut().expect("checked");
+                let p = self.list_owners.is_some().then(|| self.resolve_p_id(p_id));
+                let g_id = self.g_id;
+                if let (Some(p), Some(owners)) = (p, self.list_owners.as_mut()) {
                     if let Some(row) =
                         owners.edge_for_row(g_id, s_id, p_id, &p, &view, late_materialize)?
                     {
