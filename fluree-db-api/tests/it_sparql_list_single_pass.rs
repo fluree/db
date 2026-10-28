@@ -40,11 +40,12 @@ impl Drop for FastPathsBackOn {
 }
 
 /// The ledger's first write: `ex:items` mixes lists with plain values (s1
-/// holds both), `ex:tags` is a second list on s3, and the named graph holds a
-/// list of its own and a plain value of s1.
+/// holds both) and a stored blank node (s8's), `ex:tags` is a second list on
+/// s3, and the named graph holds a list of its own and a plain value of s1.
 const BASE: &str = r#"
 @prefix ex: <http://example.org/> .
 ex:s1 ex:items ( 1 2 ) , 9 .
+ex:s8 ex:items [ ex:a 1 ] .
 ex:s2 ex:items 3 .
 ex:s3 ex:items ( 4 ) ; ex:tags ( "x" "y" ) .
 GRAPH <urn:g1> { ex:s4 ex:items ( 5 6 ) . ex:s1 ex:items 7 . }
@@ -131,6 +132,43 @@ fn rows(json: &JsonValue, vars: &[&str]) -> (Vec<Vec<String>>, usize) {
         .collect();
     out.sort();
     (out, blanks.len())
+}
+
+/// A query's rows with every blank node's label kept (`_:label`), sorted.
+fn raw_rows(json: &JsonValue, vars: &[&str]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = json["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("SPARQL results: {json}"))
+        .iter()
+        .map(|b| {
+            vars.iter()
+                .map(|v| match b.get(*v) {
+                    Some(t) if t["type"] == "bnode" => {
+                        format!("_:{}", t["value"].as_str().unwrap_or(""))
+                    }
+                    Some(t) => t["value"].as_str().unwrap_or("").to_string(),
+                    None => "-".to_string(),
+                })
+                .collect()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+async fn answer_raw(
+    fluree: &Fluree,
+    view: &GraphDb,
+    query: &str,
+    vars: &[&str],
+) -> Vec<Vec<String>> {
+    let json = view
+        .query(fluree)
+        .sparql(&format!("{PREFIXES}{query}"))
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    raw_rows(&json, vars)
 }
 
 async fn answer(
@@ -291,6 +329,19 @@ async fn one_pass_answers_as_the_list_view_with_an_input() {
                             "{label} (fast paths off: {disabled}):\n  one pass   {got:?}\n  with input {want:?}"
                         ));
                     }
+                    // Labels are numbered in the order lists are met: a scan
+                    // in subject order meets them as the list read does, so
+                    // the labels are equal; grouping by the object reads in
+                    // object order, and only a consistent renaming holds.
+                    if !tail.contains("GROUP BY ?o") {
+                        let got = answer_raw(&fluree, &view, &one_pass, vars).await;
+                        let want = answer_raw(&fluree, &view, &with_input, vars).await;
+                        if got != want {
+                            failures.push(format!(
+                                "{label} (fast paths off: {disabled}): labels differ:\n  one pass   {got:?}\n  with input {want:?}"
+                            ));
+                        }
+                    }
                     compared += 1;
                 }
                 set_fast_paths_disabled(false);
@@ -378,10 +429,11 @@ async fn one_pass_answers_by_hand() {
         vec![s("s2"), "_:".to_string()],
         vec![s("s3"), "_:".to_string()],
         vec![s("s5"), "_:".to_string()],
+        vec![s("s8"), "_:".to_string()],
     ];
     want.sort();
     assert_eq!(got, want);
-    assert_eq!(blanks, 4, "one head cell per list");
+    assert_eq!(blanks, 5, "one head cell per list, and s8's stored node");
     let (n, _) = answer(
         &fluree,
         &view,
@@ -454,4 +506,227 @@ async fn a_limit_over_lists_reads_one_batch() {
         large_fuel * 2.0 <= all_fuel,
         "LIMIT 5 fuel {large_fuel} is not under half the full read's {all_fuel}"
     );
+}
+
+/// A cell's label in the list view: `l{list}-{position}`.
+fn is_cell(label: &str) -> bool {
+    label
+        .strip_prefix("_:l")
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(n, k)| {
+            !n.is_empty()
+                && !k.is_empty()
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && k.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// Cell labels in the one-pass reading, in every state (the flake path over
+/// novelty, the cursor path over the index): within one result a cell has
+/// one label wherever it appears, the owner edge's object and the cell's own
+/// rows alike; the same query gives the same labels every time; and the
+/// labels are the list view's own, apart from stored blank nodes and
+/// `BNODE()`'s.
+#[tokio::test]
+async fn cell_labels_are_one_name_per_cell_and_stable() {
+    let _serial = SERIAL.lock().await;
+    let mut failures = Vec::new();
+    let s = |n: &str| format!("http://example.org/{n}");
+    for state in [State::Novelty, State::Indexed, State::IndexedWithNovelty] {
+        let (fluree, view) = ledger(state).await;
+        // The owner edge joined to its first cell: each head names the list
+        // its owner holds.
+        let joined = answer_raw(
+            &fluree,
+            &view,
+            "SELECT ?s ?l ?x WHERE { ?s ex:items ?l . ?l rdf:first ?x }",
+            &["s", "l", "x"],
+        )
+        .await;
+        let firsts: Vec<(String, String)> = joined
+            .iter()
+            .map(|r| (r[0].clone(), r[2].clone()))
+            .collect();
+        let mut want = vec![
+            (s("s1"), "1".to_string()),
+            (s("s2"), "10".to_string()),
+            (s("s3"), "4".to_string()),
+            (s("s5"), "8".to_string()),
+        ];
+        want.sort();
+        if firsts != want || !joined.iter().all(|r| is_cell(&r[1])) {
+            failures.push(format!(
+                "{state:?}: owner edge joined to its first cell: {joined:?}"
+            ));
+        }
+        // One result holding each head twice: as an owner edge's object and as
+        // the subject of its `rdf:first`.
+        let union = "SELECT ?a ?b WHERE { { ?a ex:items ?b } UNION { ?a rdf:first ?b } }";
+        let rows = answer_raw(&fluree, &view, union, &["a", "b"]).await;
+        let heads: std::collections::BTreeSet<&String> = rows
+            .iter()
+            .filter(|r| !r[0].starts_with("_:"))
+            .map(|r| &r[1])
+            .filter(|b| is_cell(b))
+            .collect();
+        let first_subjects: std::collections::BTreeSet<&String> = rows
+            .iter()
+            .filter(|r| is_cell(&r[0]) && r[0].ends_with("-0"))
+            .map(|r| &r[0])
+            .collect();
+        // Every list's first cell is there, those on other predicates too.
+        if heads.len() != 4 || !heads.is_subset(&first_subjects) {
+            failures.push(format!(
+                "{state:?}: heads {heads:?} are not among the first cells {first_subjects:?}"
+            ));
+        }
+        // The same labels on every run (lists on two predicates, whose order
+        // is the only thing a run could vary).
+        for _ in 0..6 {
+            let again = answer_raw(&fluree, &view, union, &["a", "b"]).await;
+            if again != rows {
+                failures.push(format!(
+                    "{state:?}: labels changed between runs:\n  {rows:?}\n  {again:?}"
+                ));
+                break;
+            }
+        }
+        // Cells, the stored blank node and `BNODE()` keep apart.
+        let with_bnode = answer_raw(
+            &fluree,
+            &view,
+            "SELECT ?o (BNODE(\"n\") AS ?n) WHERE { ?s ex:items ?o }",
+            &["o", "n"],
+        )
+        .await;
+        let objects: Vec<&String> = with_bnode
+            .iter()
+            .map(|r| &r[0])
+            .filter(|o| o.starts_with("_:"))
+            .collect();
+        let stored: Vec<&&String> = objects.iter().filter(|o| !is_cell(o)).collect();
+        let minted: std::collections::BTreeSet<&String> =
+            with_bnode.iter().map(|r| &r[1]).collect();
+        if stored.len() != 1
+            || !stored[0].starts_with("_:fdb-")
+            || objects.iter().filter(|o| is_cell(o)).count() != 4
+            || minted.iter().any(|n| is_cell(n) || n.starts_with("_:fdb-"))
+            || objects.iter().any(|o| minted.contains(o))
+        {
+            failures.push(format!(
+                "{state:?}: labels share a namespace: {with_bnode:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A predicate whose leaflets mix stored values with lists, large enough that
+/// a scan listing its owners stops a leaflet when a batch fills and resumes
+/// it: the rows are those of the reading with an input, labels included, and
+/// a LIMIT takes the first rows of a batch.
+#[tokio::test]
+async fn a_large_mixed_predicate_answers_as_with_an_input() {
+    let _serial = SERIAL.lock().await;
+    for novelty in [false, true] {
+        let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+        let id = format!("it/sparql-list-single-pass-mixed-{novelty}:main");
+        fluree.create_ledger(&id).await.expect("create");
+        let handle = fluree.ledger_cached(&id).await.expect("cache");
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..6_000 {
+            ttl.push_str(&format!("ex:s{i} ex:m \"v{i}\" .\n"));
+            if i % 3 == 0 {
+                ttl.push_str(&format!("ex:s{i} ex:m ( \"x{}\" \"y\" ) .\n", i % 5));
+            }
+        }
+        fluree
+            .stage(&handle)
+            .insert_turtle(&ttl)
+            .execute()
+            .await
+            .expect("write");
+        fluree
+            .reindex(&id, ReindexOptions::default())
+            .await
+            .expect("reindex");
+        fluree.disconnect_ledger(&id).await;
+        if novelty {
+            let handle = fluree.ledger_cached(&id).await.expect("cache");
+            fluree
+                .stage(&handle)
+                .insert_turtle(
+                    "@prefix ex: <http://example.org/> .\nex:t0 ex:m ( \"z\" ) ; ex:m \"w\" .",
+                )
+                .execute()
+                .await
+                .expect("write");
+        }
+        let view = fluree.db(&id).await.expect("view");
+        let label = if novelty { "with novelty" } else { "indexed" };
+        for (body, vars) in [
+            ("?s ex:m ?o", &["s", "o"][..]),
+            ("?s ex:m ?o . ?o rdf:first ?x", &["s", "o", "x"][..]),
+        ] {
+            let one_pass = format!("SELECT * WHERE {{ {body} }}");
+            let with_input =
+                format!("SELECT * WHERE {{ VALUES ?z {{ 1 }} FILTER(?z = 1) {body} }}");
+            let got = answer_raw(&fluree, &view, &one_pass, vars).await;
+            let want = answer_raw(&fluree, &view, &with_input, vars).await;
+            assert_eq!(got.len(), want.len(), "{label} / {body}: row counts");
+            assert!(
+                got == want,
+                "{label} / {body}: rows differ from the reading with an input"
+            );
+        }
+        let count = answer(
+            &fluree,
+            &view,
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:m ?o }",
+            &["n"],
+        )
+        .await;
+        let lists = if novelty { 2_001 } else { 2_000 };
+        let stored = if novelty { 6_001 } else { 6_000 };
+        assert_eq!(
+            count.0,
+            vec![vec![(stored + lists).to_string()]],
+            "{label}: COUNT(*)"
+        );
+        let limited = answer_raw(
+            &fluree,
+            &view,
+            "SELECT ?s ?o WHERE { ?s ex:m ?o } LIMIT 1500",
+            &["s", "o"],
+        )
+        .await;
+        let full = answer_raw(
+            &fluree,
+            &view,
+            "SELECT ?s ?o WHERE { ?s ex:m ?o }",
+            &["s", "o"],
+        )
+        .await;
+        assert_eq!(limited.len(), 1_500, "{label}: LIMIT 1500");
+        assert!(
+            limited.iter().all(|r| full.binary_search(r).is_ok()),
+            "{label}: LIMIT rows are rows of the full answer"
+        );
+        // A LIMIT reads a batch's rows, not the leaflet's: it names only the
+        // owners the batch reaches.
+        if !novelty {
+            let (limit_fuel, _) =
+                fuel(&fluree, &view, "SELECT ?s ?o WHERE { ?s ex:m ?o } LIMIT 5").await;
+            let (full_fuel, _) = fuel(&fluree, &view, "SELECT ?s ?o WHERE { ?s ex:m ?o }").await;
+            assert!(
+                limit_fuel * 3.0 <= full_fuel,
+                "LIMIT 5 fuel {limit_fuel} is not well under the full read's {full_fuel}"
+            );
+        }
+    }
 }
