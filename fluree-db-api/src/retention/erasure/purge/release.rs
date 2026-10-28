@@ -28,7 +28,7 @@ pub(crate) fn released_branches(entry: &DroppedLedger) -> BTreeSet<String> {
 pub(super) enum Released {
     /// The holders released, and the files deleted.
     Done { ledgers: usize, deleted: usize },
-    /// An entry changed meanwhile, as when a restore began: plan again.
+    /// An entry is being restored, or changed meanwhile: plan again.
     Changed,
 }
 
@@ -58,12 +58,24 @@ impl Fluree {
 
     /// Release the indexes of the soft-dropped ledgers holding the original
     /// of a commit of `commits`: every branch's, and the ledger's
-    /// dictionaries. A ledger being restored or purged is left alone.
+    /// dictionaries. A ledger being purged is left alone. One being restored
+    /// holds the release back: a restore that finds its name taken leaves it
+    /// dropped, with an index no later pass would release.
     pub(super) async fn release_dropped(&self, commits: &[String]) -> Result<Released> {
         let runtime = self.erasure_runtime()?;
         let registry = self.publisher()?;
+        let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
+        let holding = self
+            .dropped_holding(&commits, |state| !matches!(state, DroppedState::Purging))
+            .await?;
+        if holding
+            .iter()
+            .any(|v| matches!(v.value.state, DroppedState::Restoring { .. }))
+        {
+            return Ok(Released::Changed);
+        }
         let (mut ledgers, mut deleted) = (0, 0);
-        for versioned in self.dropped_at_rest(commits).await? {
+        for versioned in holding {
             let entry = versioned.value;
             let mut next = entry.clone();
             let mut rebuild = released_branches(&entry);

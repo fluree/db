@@ -127,6 +127,7 @@ resumes where an interrupted one stopped.
    index loses the files its current index does not use, which an earlier index of the same name may
    have left, and one dropped before the purge loses all of its files. A soft-dropped ledger that
    holds an erased commit has its indexes deleted, and restoring it rebuilds them before it serves.
+   While one is being restored, the purge waits for the restore to finish or leave it dropped.
 2. **Grace.** The older indexes stay for 15 minutes (the index collector's minimum age), so queries
    reading them can finish. They are then released.
 3. **Scan.** Every holding branch's history, index, dictionaries and TTL schedules are checked for the

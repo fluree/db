@@ -1828,6 +1828,159 @@ async fn a_purge_releases_a_dropped_holders_index_and_a_restore_rebuilds_it() {
     );
 }
 
+/// Soft-drops `copy`, a copy of `id` whose index holds `a@secret`, publishes
+/// the value's erasure on `id`, and stops a restore of `copy` once it marked
+/// the entry, before it claimed the name.
+async fn restore_stopped_part_way(
+    fluree: &Fluree,
+    id: &str,
+    copy: &str,
+) -> fluree_db_core::InstanceId {
+    use fluree_db_nameservice::{BranchFence, DroppedLedger, DroppedState, Fence};
+
+    insert(
+        fluree,
+        id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy_id = fluree
+        .restore_ledger(copy, &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(fluree, &copy_id).await;
+    let instance = fluree
+        .drop_ledger(copy, fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(fluree, id).await;
+    assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
+
+    let store = fluree.publisher().unwrap();
+    let held = store.get_dropped(&instance).await.unwrap().unwrap();
+    let fences = held
+        .value
+        .branches
+        .iter()
+        .map(|r| BranchFence {
+            dropped: r.retracted,
+            ..BranchFence::for_record(r, Fence::generate())
+        })
+        .collect();
+    let restoring = DroppedLedger {
+        state: DroppedState::Restoring { fences },
+        ..held.value
+    };
+    store
+        .cas_dropped(&instance, Some(held.version), Some(&restoring))
+        .await
+        .unwrap();
+    instance
+}
+
+/// Purge passes over `id` until one purges: what they released and purged.
+async fn purge_until_purged(fluree: &Fluree, id: &str) -> (usize, usize) {
+    let (mut released, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree
+            .run_purge_pass(id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        released += report.released;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    (released, purged)
+}
+
+/// A purge waits while a soft-dropped holder is being restored. Past it, a
+/// restore that then found its name taken would leave the ledger dropped
+/// with its index from before the erasure, which no later pass releases.
+#[tokio::test]
+async fn a_purge_waits_for_a_restore_that_leaves_the_ledger_dropped() {
+    use fluree_db_nameservice::DroppedState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-restoring-origin").await;
+    let copy = "it/purge-restoring-copy";
+    let instance = restore_stopped_part_way(&fluree, &id, copy).await;
+    for _ in 0..3 {
+        let report = fluree
+            .run_purge_pass(&id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(report.waiting && report.purged == 0, "{report:?}");
+    }
+
+    // The name taken meanwhile: the restore leaves the ledger dropped.
+    ledger(&fluree, copy).await;
+    assert!(fluree.restore_dropped(instance.as_str()).await.is_err());
+    let entry = fluree
+        .publisher()
+        .unwrap()
+        .get_dropped(&instance)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(entry.value.state, DroppedState::Dropped));
+
+    assert_eq!(purge_until_purged(&fluree, &id).await, (1, 1));
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A purge that waited for a restore finishes once the restore does, the
+/// restored ledger a holder like any other.
+#[tokio::test]
+async fn a_purge_waits_for_a_restore_that_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-restored-origin").await;
+    let copy = "it/purge-restored-copy";
+    let instance = restore_stopped_part_way(&fluree, &id, copy).await;
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(report.waiting && report.purged == 0, "{report:?}");
+
+    fluree.restore_dropped(instance.as_str()).await.unwrap();
+    assert_eq!(purge_until_purged(&fluree, &id).await, (0, 1));
+    let copy = format!("{copy}:main");
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&fluree, &copy, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
 /// Under the write-ahead log, no file under the storage holds the erased
 /// value once a purge completes, the log's segments included.
 #[tokio::test]
