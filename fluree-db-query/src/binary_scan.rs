@@ -212,6 +212,9 @@ pub struct BinaryScanOperator {
     /// members the scan skips: the scan emits each one's owner edge itself
     /// ([`Self::listing_owners`]).
     list_owners: Option<ListOwners>,
+    /// A cursor batch a listing-owners scan stopped converting when its
+    /// output batch filled, and the row to resume at.
+    owner_resume: Option<(ColumnBatch, usize)>,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -751,6 +754,7 @@ impl BinaryScanOperator {
             include_system_facts: false,
             hide_list_members: false,
             list_owners: None,
+            owner_resume: None,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -1415,12 +1419,19 @@ impl BinaryScanOperator {
     }
 
     /// Convert a ColumnBatch into columnar Bindings.
+    /// Convert `batch`'s rows from `start` into `columns`, returning how many
+    /// rows were produced and, when the scan lists owners
+    /// ([`Self::listing_owners`]) and `budget` rows were produced before the
+    /// next owner edge, the row to resume at: a leaflet's list owners are
+    /// named only as far as a batch needs them.
     fn batch_to_bindings(
         &mut self,
         batch: &ColumnBatch,
+        start: usize,
+        budget: usize,
         columns: &mut [Vec<Binding>],
         ctx: Option<&ExecutionContext<'_>>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Option<usize>)> {
         let mut produced = 0;
         let ncols = self.schema.len();
         let base_len = self.base_schema_len();
@@ -1467,7 +1478,7 @@ impl BinaryScanOperator {
                 fluree_db_binary_index::ColumnData::Const(u32::MAX)
                     | fluree_db_binary_index::ColumnData::AbsentDefault
             );
-        for row in 0..batch.row_count {
+        for row in start..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
@@ -1485,6 +1496,11 @@ impl BinaryScanOperator {
                 continue;
             }
             if hide_members && o_i != u32::MAX {
+                // The batch is full: the rest of the leaflet waits for the
+                // next one, so its owners are named only if it is asked for.
+                if produced >= budget && self.list_owners.is_some() {
+                    return Ok((produced, Some(row)));
+                }
                 let p = self.list_owners.is_some().then(|| self.resolve_p_id(p_id));
                 let g_id = self.g_id;
                 if let (Some(p), Some(owners)) = (p, self.list_owners.as_mut()) {
@@ -1661,7 +1677,7 @@ impl BinaryScanOperator {
             produced += 1;
         }
 
-        Ok(produced)
+        Ok((produced, None))
     }
 }
 
@@ -2078,6 +2094,7 @@ impl Operator for BinaryScanOperator {
         self.g_id = ctx.binary_g_id;
         // Over a dataset spanning ledgers the list view is not applied, and a
         // member is a value of its predicate.
+        self.owner_resume = None;
         self.hide_list_members &= !ctx.is_multi_ledger();
         if !self.hide_list_members {
             self.list_owners = None;
@@ -3014,8 +3031,20 @@ impl Operator for BinaryScanOperator {
 
         let mut produced = 0usize;
 
+        // A leaflet a listing-owners scan stopped converting when its last
+        // batch filled (`batch_to_bindings`): finish it first.
+        if let Some((batch, start)) = self.owner_resume.take() {
+            ctx.check_cancelled()?;
+            let (n, resume) =
+                self.batch_to_bindings(&batch, start, batch_size, &mut columns, Some(ctx))?;
+            produced += n;
+            if let Some(row) = resume {
+                self.owner_resume = Some((batch, row));
+            }
+        }
+
         // Prefer binary cursor (indexed data), then drain any overlay-only fallback flakes.
-        while produced < batch_size {
+        while produced < batch_size && self.owner_resume.is_none() {
             let Some(cursor) = &mut self.cursor else {
                 break;
             };
@@ -3025,8 +3054,17 @@ impl Operator for BinaryScanOperator {
                 Ok(Some(batch)) => {
                     // Per-leaflet fuel charge happens inside cursor.next_batch.
                     ctx.check_cancelled()?;
-                    let n = self.batch_to_bindings(&batch, &mut columns, Some(ctx))?;
+                    let (n, resume) = self.batch_to_bindings(
+                        &batch,
+                        0,
+                        batch_size - produced,
+                        &mut columns,
+                        Some(ctx),
+                    )?;
                     produced += n;
+                    if let Some(row) = resume {
+                        self.owner_resume = Some((batch, row));
+                    }
                     ctx.check_cancelled()?;
                 }
                 Ok(None) => {
@@ -3070,7 +3108,7 @@ impl Operator for BinaryScanOperator {
             produced as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
         )?;
 
-        if produced < batch_size && self.range_iter.is_some() {
+        if produced < batch_size && self.owner_resume.is_none() && self.range_iter.is_some() {
             // Overlay/novelty rows are in-memory; charge per row at 1 micro-fuel.
             let n = self.flakes_to_bindings(&mut columns, ctx, batch_size - produced)?;
             for _ in 0..n {
@@ -3147,6 +3185,7 @@ impl Operator for BinaryScanOperator {
 
     fn close(&mut self) {
         self.cursor = None;
+        self.owner_resume = None;
         self.pending_cursors.clear();
         self.range_iter = None;
         self.store = None;
