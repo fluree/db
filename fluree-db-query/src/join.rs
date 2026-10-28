@@ -680,36 +680,22 @@ struct UnionMatch {
     /// (the object probe's `objs` index).
     key: u64,
     member: usize,
-    /// What the fact is keyed on: the encoded term, or for an arena-backed
-    /// one (NumBig, vector) its value, decoded with the member's own view.
-    term: Binding,
-    /// What the row binds, decoded: a scope of several graphs has no graph
-    /// view to decode an encoded binding later.
+    /// The term the row binds, as the member's probe bound it: encoded where
+    /// the index holds it encoded. The union's term view decodes it later,
+    /// and the fact is keyed on it through [`UnionFact::of`], which keys an
+    /// arena literal (it carries its graph) by value.
     object: Binding,
     o_i: u32,
 }
 
 impl UnionMatch {
-    fn new(
-        key: u64,
-        member: usize,
-        encoded: &Binding,
-        view: Option<&TermView>,
-        o_i: u32,
-    ) -> Result<Self> {
-        let object = crate::group_aggregate::materialize_encoded(encoded, view)?;
-        let term = if is_arena_encoded(encoded) {
-            object.clone()
-        } else {
-            encoded.clone()
-        };
-        Ok(Self {
+    fn new(key: u64, member: usize, object: &Binding, o_i: u32) -> Self {
+        Self {
             key,
             member,
-            term,
-            object,
+            object: object.clone(),
             o_i,
-        })
+        }
     }
 
     fn list_index(&self) -> Option<u32> {
@@ -2355,7 +2341,6 @@ impl NestedLoopJoinOperator {
                 ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
                 _ => None,
             };
-            let view = member_ctx.one_graph_view();
             self.scan_matches(
                 &member_ctx,
                 store,
@@ -2367,27 +2352,21 @@ impl NestedLoopJoinOperator {
                 &dict_overlay,
                 probe_ops.as_mut(),
                 &mut |m| {
-                    matches.push(UnionMatch::new(
-                        m.s_id,
-                        member,
-                        m.object,
-                        view.as_deref(),
-                        m.o_i,
-                    )?);
+                    matches.push(UnionMatch::new(m.s_id, member, m.object, m.o_i));
                     Ok(())
                 },
             )?;
         }
-        let (dicts, _) = EqualityNorm::parts(&self.norm);
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         let keep = union_keep(&matches, |m| {
             UnionFact::of(
-                [&Binding::encoded_sid(m.key), &m.term],
+                [&Binding::encoded_sid(m.key), &m.object],
                 Some(&RowFact {
                     object: None,
                     list_index: m.list_index(),
                 }),
                 dicts,
-                None,
+                gv,
             )
         })?;
         for (m, keep) in matches.iter().zip(keep) {
@@ -3185,7 +3164,6 @@ impl NestedLoopJoinOperator {
                 ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
                 _ => None,
             };
-            let view = member_ctx.one_graph_view();
             // Charged as the one-graph lane charges: per emitted row, by the
             // flush.
             for_each_object_probe_match(
@@ -3201,23 +3179,22 @@ impl NestedLoopJoinOperator {
                         obj_idx as u64,
                         member,
                         &Binding::encoded_sid(s_id),
-                        view.as_deref(),
                         o_i,
-                    )?);
+                    ));
                     Ok(())
                 },
             )?;
         }
-        let (dicts, _) = EqualityNorm::parts(&self.norm);
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         let keep = union_keep(&matches, |m| {
             UnionFact::of(
-                [&m.term, &Binding::encoded_sid(objs[m.key as usize])],
+                [&m.object, &Binding::encoded_sid(objs[m.key as usize])],
                 Some(&RowFact {
                     object: None,
                     list_index: m.list_index(),
                 }),
                 dicts,
-                None,
+                gv,
             )
         })?;
         Ok(matches
@@ -3251,7 +3228,6 @@ impl NestedLoopJoinOperator {
                 _ => None,
             };
             let dict_overlay = make_dict_overlay(&member_ctx, store);
-            let view = member_ctx.one_graph_view();
             let found = batched_subject_probe_binary(
                 &member_ctx,
                 store,
@@ -3269,25 +3245,19 @@ impl NestedLoopJoinOperator {
                 let object = m.object.as_ref().ok_or_else(|| {
                     QueryError::Internal("an object-emitting probe returned no object".into())
                 })?;
-                matches.push(UnionMatch::new(
-                    m.subject_id,
-                    member,
-                    object,
-                    view.as_deref(),
-                    m.o_i,
-                )?);
+                matches.push(UnionMatch::new(m.subject_id, member, object, m.o_i));
             }
         }
-        let (dicts, _) = EqualityNorm::parts(&self.norm);
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         let keep = union_keep(&matches, |m| {
             UnionFact::of(
                 [&Binding::encoded_sid(m.key)],
                 Some(&RowFact {
-                    object: Some(m.term.clone()),
+                    object: Some(m.object.clone()),
                     list_index: m.list_index(),
                 }),
                 dicts,
-                None,
+                gv,
             )
         })?;
         Ok(matches

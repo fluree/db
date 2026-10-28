@@ -368,10 +368,9 @@ impl GraphOperator {
         // narrows the inner scan. All other shapes rely on the merge-time
         // `{?g → graph}` join below.
         //
-        // The seeding row's arena handles (big numbers, vectors) name values
-        // in the outer graph, and the rows leaving carry handles into this
-        // graph's arenas: each is decoded through its own graph on the way.
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        // Bindings cross to and from this graph encoded (an arena literal
+        // carries its graph), unless one side cannot decode them.
+        let crossing = crate::object_binding::ScopeCrossing::between(ctx, &graph_ctx);
         let mut row: Vec<Binding> = parent_batch
             .row_view(row_idx)
             .expect("row_idx must be valid for batch")
@@ -565,18 +564,11 @@ impl GraphOperator {
             ));
         }
 
-        // The whole parent batch seeds the source undecoded: sound only
-        // because nothing crosses graphs here. This path runs without an
-        // explicit dataset: with none, the source scope inherits the outer
-        // graph id; under an implicit union default graph, the outer context
-        // has no graph view and the source is no member graph, so neither side
-        // has one. Either way the arena crossing is a no-op both ways.
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
-        debug_assert!(
-            crossing.is_noop(),
-            "batched R2RML GRAPH scope crosses graphs: {graph_iri}"
-        );
-        let seed = BatchSeedOperator::from_batch(parent_batch.clone());
+        // The parent batch seeds the source: encoded, unless the source scope
+        // cannot decode what the outer context binds (an outer union of
+        // graphs over a store the source scope does not read).
+        let crossing = crate::object_binding::ScopeCrossing::between(ctx, &graph_ctx);
+        let seed = BatchSeedOperator::from_batch(crossing.enter_batch(parent_batch)?);
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
             &rewrite_result.patterns,

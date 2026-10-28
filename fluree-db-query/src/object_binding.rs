@@ -1,5 +1,5 @@
 use crate::binding::Binding;
-use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::dict_novelty::{DictNovelty, StringDictNovelty, SubjectDictNovelty};
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
@@ -863,77 +863,74 @@ pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
     )
 }
 
-/// What an arena-backed literal needs to cross between a context and a scope
-/// that reads another graph (a GRAPH scope): a handle names its value only
-/// within the graph that bound it, so one crossing in either direction is
-/// decoded through that graph. Nothing is decoded when both sides read the
-/// same single graph, where a handle means the same value on either side.
-pub(crate) struct ArenaCrossing {
-    /// The outer graph: decodes the handles the seeding row carries in.
+/// What crosses between a context and a scope derived from it (a `GRAPH`
+/// scope, a `SERVICE` body) that the receiving side could not decode.
+///
+/// An encoded binding names a term of its store, and an arena literal carries
+/// the graph it was read from, so scopes over one store pass bindings on
+/// encoded, both ways. Only a side with no [`term_view`] gets them decoded,
+/// through the other side's view: a cross-ledger body, which runs with no
+/// store, on the way in; an outer default graph whose members are not
+/// certified to one store (they decode as they scan) on the way out.
+///
+/// [`term_view`]: crate::context::ExecutionContext::term_view
+pub(crate) struct ScopeCrossing {
+    /// Decodes what enters a scope that cannot decode it.
     enter: Option<fluree_db_binary_index::TermView>,
-    /// The scope's graph: decodes the handles its rows carry out.
+    /// Decodes what leaves for an outer context that cannot decode it.
     leave: Option<fluree_db_binary_index::TermView>,
-    /// Decode every encoded binding leaving, not only arena handles: the
-    /// outer context spans several graphs, whose members decode as they scan.
-    leave_all: bool,
 }
 
-impl ArenaCrossing {
-    /// The crossing between `outer` and a `scope` derived from it. An outer
-    /// context that spans several graphs (a union) has no graph to decode a
-    /// binding through, so everything encoded leaving the scope for it is
-    /// decoded.
+impl ScopeCrossing {
+    /// The crossing between `outer` and a `scope` derived from it.
     pub(crate) fn between(
         outer: &crate::context::ExecutionContext<'_>,
         scope: &crate::context::ExecutionContext<'_>,
     ) -> Self {
-        let same_graph = outer.has_binary_store()
-            && scope.has_binary_store()
-            && outer.binary_g_id == scope.binary_g_id;
-        if same_graph {
-            return Self {
-                enter: None,
-                leave: None,
-                leave_all: false,
-            };
-        }
-        Self {
-            enter: outer.one_graph_view().map(BinaryGraphView::into_terms),
-            leave: scope.one_graph_view().map(BinaryGraphView::into_terms),
-            leave_all: !outer.has_binary_store(),
-        }
+        let (outer_view, scope_view) = (outer.term_view(), scope.term_view());
+        let (enter, leave) = match (outer_view, scope_view) {
+            (Some(outer_view), None) => (Some(outer_view), None),
+            (None, Some(scope_view)) => (None, Some(scope_view)),
+            _ => (None, None),
+        };
+        Self { enter, leave }
     }
 
-    /// Nothing crosses that needs decoding: both sides read one single graph,
-    /// or neither has a graph to decode through.
-    pub(crate) fn is_noop(&self) -> bool {
-        self.enter.is_none() && self.leave.is_none()
-    }
-
-    /// Decode, through the outer graph, the arena handles in a row that seeds
-    /// the scope.
+    /// Decode the encoded bindings of a row that seeds the scope, when the
+    /// scope cannot decode them.
     pub(crate) fn enter(&self, row: &mut [Binding]) -> crate::error::Result<()> {
-        let Some(gv) = self.enter.as_ref() else {
+        let Some(view) = self.enter.as_ref() else {
             return Ok(());
         };
-        for binding in row.iter_mut().filter(|b| is_arena_encoded(b)) {
-            *binding = crate::group_aggregate::materialize_encoded(binding, Some(gv))?;
+        for binding in row.iter_mut().filter(|b| b.is_encoded()) {
+            *binding = crate::group_aggregate::materialize_encoded(binding, Some(view))?;
         }
         Ok(())
     }
 
-    /// `binding`, bound inside the scope, decoded through the scope's graph
-    /// when it is an arena handle, or any encoded binding for a union.
+    /// [`Self::enter`] for a whole seeding batch.
+    pub(crate) fn enter_batch(
+        &self,
+        batch: &crate::binding::Batch,
+    ) -> crate::error::Result<crate::binding::Batch> {
+        if self.enter.is_none() {
+            return Ok(batch.clone());
+        }
+        let (schema, mut columns, len) = batch.clone().into_parts();
+        for column in &mut columns {
+            self.enter(column)?;
+        }
+        crate::binding::Batch::from_parts(schema, columns, len)
+            .map_err(|e| crate::error::QueryError::Internal(e.to_string()))
+    }
+
+    /// `binding`, bound inside the scope, decoded when the outer context
+    /// cannot decode it.
     pub(crate) fn leave(&self, binding: Binding) -> crate::error::Result<Binding> {
-        let decode = if self.leave_all {
-            binding.is_encoded()
-        } else {
-            is_arena_encoded(&binding)
-        };
         match &self.leave {
-            Some(gv) if decode => Ok(crate::group_aggregate::materialize_encoded(
+            Some(view) if binding.is_encoded() => Ok(crate::group_aggregate::materialize_encoded(
                 &binding,
-                Some(gv),
+                Some(view),
             )?),
             _ => Ok(binding),
         }

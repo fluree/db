@@ -396,13 +396,15 @@ pub struct DatasetOperator {
 impl DatasetOperator {
     /// The context member `graph` runs under.
     ///
-    /// Members that are several graphs of one ledger keep the binary cursor,
-    /// but their rows leave for a scope of several graphs, which has no single
-    /// graph view to decode an encoded binding against (`ctx.one_graph_view()` is
-    /// `None`). A join substituting an undecodable `EncodedSid` would leave the
-    /// position unbound and pair every row with every other, and a NUM_BIG
-    /// handle decodes only against its own graph's arena. So such members
-    /// decode as they scan, where their own view is at hand.
+    /// Members that are several graphs of one ledger keep the binary cursor.
+    /// Their rows leave encoded when the scope can decode them: every member
+    /// reads this context's store and dictionary novelty (a certified
+    /// [`IndexScope::Union`](crate::index_scope::IndexScope::Union)), so an id
+    /// names one term in every member and the scope's
+    /// [`term_view`](ExecutionContext::term_view) decodes it; an arena literal
+    /// carries the graph it was read from. Otherwise (a history range, members
+    /// on another store or novelty) members decode as they scan, where their
+    /// own view is at hand.
     fn member_ctx<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -803,7 +805,12 @@ impl Operator for DatasetOperator {
                     None
                 };
 
-                self.decode_members = !multi_ledger && graphs.len() >= 2;
+                self.decode_members = !multi_ledger
+                    && graphs.len() >= 2
+                    && !matches!(
+                        ctx.index_scope_policy_cleared(),
+                        Some(crate::index_scope::IndexScope::Union(_))
+                    );
 
                 for graph in &graphs {
                     let mut inner = self.builder.build()?;
