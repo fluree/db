@@ -483,12 +483,12 @@ pub(crate) fn substitute_binding(
                 }
                 Binding::EncodedSid { s_id, .. } => match gv {
                     Some(gv) => Ref::Iri(resolve_subject(gv, *s_id)?),
-                    None => return Err(undecodable_substitution(binding)),
+                    None => return Ok(Substitution::Free),
                 },
                 Binding::EncodedPid { p_id } => {
                     match gv.and_then(|gv| resolve_predicate(gv, *p_id)) {
                         Some(iri) => Ref::Iri(iri),
-                        None => return Err(undecodable_substitution(binding)),
+                        None => return Ok(Substitution::Free),
                     }
                 }
                 Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
@@ -539,7 +539,7 @@ pub(crate) fn substitute_binding(
                 // lang_id) — dt_id is a DatatypeDictId, NOT an o_type. p_id is
                 // needed for NUM_BIG per-predicate arena lookup.
                 let Some(gv) = gv else {
-                    return Err(undecodable_substitution(binding));
+                    return Ok(Substitution::Free);
                 };
                 let val = gv
                     .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
@@ -598,12 +598,12 @@ pub(crate) fn substitute_binding(
             }
             Binding::EncodedSid { s_id, .. } => match gv {
                 Some(gv) => pattern.o = Term::Iri(resolve_subject(gv, *s_id)?),
-                None => return Err(undecodable_substitution(binding)),
+                None => return Ok(Substitution::Free),
             },
             Binding::EncodedPid { p_id } => match gv.and_then(|gv| resolve_predicate(gv, *p_id)) {
                 // An encoded predicate IRI as an object IRI.
                 Some(iri) => pattern.o = Term::Iri(iri),
-                None => return Err(undecodable_substitution(binding)),
+                None => return Ok(Substitution::Free),
             },
             Binding::Unbound | Binding::Poisoned => return Ok(Substitution::Free),
             Binding::Grouped(_) => return Err(grouped_in_substitution()),
@@ -621,15 +621,6 @@ pub(crate) fn substitute_binding(
         },
     }
     Ok(Substitution::Bound)
-}
-
-/// An encoded binding a correlated substitution cannot decode: no view, or an
-/// id the view does not hold. Leaving the position free would match every
-/// row, so the substitution refuses instead.
-#[cold]
-fn undecodable_substitution(binding: &Binding) -> QueryError {
-    crate::group_aggregate::undecodable(binding, "a correlated substitution cannot decode it")
-        .into()
 }
 
 /// A per-group list never leaves a grouping stage (the plan-time
