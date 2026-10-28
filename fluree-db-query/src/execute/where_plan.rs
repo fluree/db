@@ -3579,6 +3579,7 @@ fn build_list_view_triple(
             .as_var()
             .is_none_or(|o| !object_bounds.contains_key(&o))
     {
+        view.name_lists_by_id();
         let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
         let emit = if planning.multi_default_graph {
             EmitMask::ALL

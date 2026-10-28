@@ -786,7 +786,9 @@ impl BinaryScanOperator {
         self.list_owners = Some(ListOwners {
             view,
             seen: std::collections::HashSet::new(),
+            seen_ids: rustc_hash::FxHashSet::default(),
             last_s_id: None,
+            by_id: false,
         });
         self
     }
@@ -1488,7 +1490,7 @@ impl BinaryScanOperator {
                     let g_id = self.g_id;
                     let owners = self.list_owners.as_mut().expect("checked");
                     if let Some(row) =
-                        owners.edge_for_row(g_id, s_id, &p, &view, late_materialize)?
+                        owners.edge_for_row(g_id, s_id, p_id, &p, &view, late_materialize)?
                     {
                         self.push_owner_edge(columns, row);
                         produced += 1;
@@ -2080,6 +2082,9 @@ impl Operator for BinaryScanOperator {
         self.hide_list_members &= !ctx.is_multi_ledger();
         if !self.hide_list_members {
             self.list_owners = None;
+        }
+        if let (Some(owners), Some(store)) = (self.list_owners.as_mut(), self.store.as_ref()) {
+            owners.by_id = owners.view.names_by_id_in(store);
         }
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
@@ -4539,7 +4544,12 @@ pub(crate) fn value_to_otype_okey_simple(
 struct ListOwners {
     view: Arc<crate::list_view::ListView>,
     seen: std::collections::HashSet<Sid>,
+    /// The subjects met by id, when the scan names lists by id.
+    seen_ids: rustc_hash::FxHashSet<u64>,
     last_s_id: Option<u64>,
+    /// Whether the view names this scan's lists by the store's ids
+    /// (`ListView::scanned_head`), so a row's subject need not be resolved.
+    by_id: bool,
 }
 
 impl ListOwners {
@@ -4560,11 +4570,14 @@ impl ListOwners {
         Ok(Some((subject()?, head)))
     }
 
-    /// [`Self::edge`] for a cursor row of subject `s_id`.
+    /// [`Self::edge`] for a cursor row of subject `s_id` on predicate
+    /// `p_id` (`p`). Over persisted ids alone (`late_materialize`, no
+    /// novelty) a list is named by those ids, and its subject stays encoded.
     fn edge_for_row(
         &mut self,
         g_id: GraphId,
         s_id: u64,
+        p_id: u32,
         p: &Sid,
         view: &BinaryGraphView,
         late_materialize: bool,
@@ -4573,6 +4586,13 @@ impl ListOwners {
             return Ok(None);
         }
         self.last_s_id = Some(s_id);
+        if self.by_id && late_materialize {
+            if !self.seen_ids.insert(s_id) {
+                return Ok(None);
+            }
+            let head = self.view.scanned_head(g_id, s_id, p_id, p);
+            return Ok(Some((Binding::encoded_sid(s_id), head)));
+        }
         let sid = view
             .resolve_subject_sid(s_id)
             .map_err(|e| QueryError::from_io("resolve_subject_sid", e))?;

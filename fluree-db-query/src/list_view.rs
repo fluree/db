@@ -36,6 +36,7 @@ use fluree_db_core::{
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +60,22 @@ pub struct ListView {
     /// Whether each subject this request asked about may own a list, per
     /// graph and `t` ([`Self::may_meet`]).
     subjects: Mutex<HashMap<(GraphId, i64, Subject), bool>>,
+    /// The index store the view was built over, whose ids name a list a
+    /// scan meets ([`Self::scanned_head`]).
+    store: ViewStore,
+}
+
+/// [`ListView::store`]; not shown in debug output.
+struct ViewStore(Option<Arc<BinaryIndexStore>>);
+
+impl std::fmt::Debug for ViewStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ViewStore(..)"
+        } else {
+            "ViewStore(None)"
+        })
+    }
 }
 
 /// A subject [`ListView::may_meet`] is asked about.
@@ -72,7 +89,30 @@ enum Subject {
 #[derive(Debug, Default)]
 struct ListTable {
     ids: HashMap<Owner, usize>,
-    owners: Vec<Owner>,
+    /// Once a scan of this request may name lists by their index ids
+    /// ([`ListView::name_lists_by_id`]): list `n` by `(graph, s_id, p_id)`,
+    /// for each list named by id and each named by its terms that the index
+    /// holds, so a list has one name however it is met.
+    by_id: Option<FxHashMap<(GraphId, u64, u32), usize>>,
+    owners: Vec<TableEntry>,
+}
+
+/// A named list: its owner, or, for a list a scan named by ids, the ids,
+/// resolved to the owner when a cell of it is decoded.
+#[derive(Debug, Clone)]
+enum TableEntry {
+    Owner(Owner),
+    Ids(GraphId, u64, Sid),
+}
+
+/// The name of cell `k` of list `n`.
+fn cell_name(n: usize, k: usize) -> Sid {
+    use std::io::Write as _;
+    let mut buf = [0u8; 44];
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    write!(cursor, "l{n}-{k}").expect("a cell name fits");
+    let len = cursor.position() as usize;
+    Sid::new(BLANK_NODE, std::str::from_utf8(&buf[..len]).expect("ASCII"))
 }
 
 /// The graph, its `t`, and the subject and predicate a list read asks for.
@@ -111,6 +151,7 @@ impl ListView {
             lists: Mutex::new(ListTable::default()),
             reads: Mutex::new(HashMap::new()),
             subjects: Mutex::new(HashMap::new()),
+            store: ViewStore(store.cloned()),
         })))
     }
 
@@ -188,13 +229,81 @@ impl ListView {
         let n = match table.ids.get(owner) {
             Some(&n) => n,
             None => {
-                let n = table.owners.len();
-                table.owners.push(owner.clone());
+                // The same list, named by a scan from its ids.
+                let ids = table.by_id.as_ref().and_then(|_| self.owner_ids(owner));
+                let named = ids.and_then(|key| table.by_id.as_ref()?.get(&key).copied());
+                let n = named.unwrap_or(table.owners.len());
+                if named.is_none() {
+                    table.owners.push(TableEntry::Owner(owner.clone()));
+                    if let (Some(key), Some(by_id)) = (ids, table.by_id.as_mut()) {
+                        by_id.insert(key, n);
+                    }
+                }
                 table.ids.insert(owner.clone(), n);
                 n
             }
         };
-        Sid::new(BLANK_NODE, format!("l{n}-{k}"))
+        cell_name(n, k)
+    }
+
+    /// From now on, name lists by index ids too: called when the plan holds
+    /// a scan that names the lists it meets by ids ([`Self::scanned_head`]),
+    /// before any list is named, so every name a list gets is the same.
+    pub(crate) fn name_lists_by_id(&self) {
+        let mut table = self
+            .lists
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if table.by_id.is_none() {
+            table.by_id = Some(FxHashMap::default());
+        }
+    }
+
+    /// Whether a scan reading `store` names lists by its ids.
+    pub(crate) fn names_by_id_in(&self, store: &Arc<BinaryIndexStore>) -> bool {
+        self.store
+            .0
+            .as_ref()
+            .is_some_and(|own| Arc::ptr_eq(own, store))
+            && self
+                .lists
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .by_id
+                .is_some()
+    }
+
+    /// The head cell of the list of subject `s_id` on predicate `p_id` (`p`)
+    /// in `g_id`, named by the ids a scan of the view's store read, with no
+    /// lookup of the subject's term: a list met by a scan is named for the
+    /// price of a map entry. The subject is resolved only if the cell is
+    /// decoded.
+    pub(crate) fn scanned_head(&self, g_id: GraphId, s_id: u64, p_id: u32, p: &Sid) -> Sid {
+        let mut table = self
+            .lists
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = table.owners.len();
+        let by_id = table
+            .by_id
+            .as_mut()
+            .expect("a scan names lists by id only once the plan said so");
+        let n = *by_id.entry((g_id, s_id, p_id)).or_insert(next);
+        if n == next {
+            table.owners.push(TableEntry::Ids(g_id, s_id, p.clone()));
+        }
+        cell_name(n, 0)
+    }
+
+    /// `owner` as index ids, when the view's store holds its subject and
+    /// predicate.
+    fn owner_ids(&self, owner: &Owner) -> Option<(GraphId, u64, u32)> {
+        let store = self.store.0.as_ref()?;
+        let (g_id, s, p) = owner;
+        let s_id = store
+            .find_subject_id_by_parts(s.namespace_code, &s.name)
+            .ok()??;
+        Some((*g_id, s_id, store.sid_to_p_id(p)?))
     }
 
     /// The list and position `sid` names, when it is a cell this request
@@ -224,11 +333,22 @@ impl ListView {
         }
         let (n, k) = sid.name.strip_prefix('l')?.split_once('-')?;
         let (n, k): (usize, usize) = (n.parse().ok()?, k.parse().ok()?);
-        let table = self
+        let mut table = self
             .lists
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some((table.owners.get(n)?.clone(), k))
+        let owner = match table.owners.get(n)?.clone() {
+            TableEntry::Owner(owner) => owner,
+            TableEntry::Ids(g_id, s_id, p) => {
+                let store = self.store.0.as_ref()?;
+                let (ns, suffix) = store.resolve_subject_parts(s_id).ok()?;
+                let owner = (g_id, store.subject_sid_of_parts(ns, suffix).ok()?, p);
+                table.owners[n] = TableEntry::Owner(owner.clone());
+                table.ids.insert(owner.clone(), n);
+                owner
+            }
+        };
+        Some((owner, k))
     }
 }
 
