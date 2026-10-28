@@ -1132,6 +1132,23 @@ async fn unseen_datatype_literal_from_an_expression_is_a_term() {
             json!([["nw:T", "nw:T"]]),
             "{phase}: json-ld DATATYPE forms"
         );
+        let values_join = json!({
+            "select": ["?a"],
+            "where": [["values", ["?x", [{"@value": "a", "@type": UNSEEN_DT}]]],
+                      ["bind", "?d", "(datatype ?x)"],
+                      ["query", {"select": ["?d", "?a"],
+                                 "where": [["bind",
+                                            "?d", format!(r#"(datatype (strdt "a" "{UNSEEN_DT}"))"#),
+                                            "?a", "1"]]}]]
+        });
+        let got = query_jsonld_formatted(&fluree, &view, &values_join)
+            .await
+            .unwrap_or_else(|e| panic!("{phase}: json-ld VALUES join: {e}"));
+        assert_eq!(
+            got,
+            json!([[1]]),
+            "{phase}: json-ld DATATYPE of a VALUES literal joins (datatype (strdt ..))"
+        );
     }
 }
 
