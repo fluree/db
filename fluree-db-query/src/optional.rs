@@ -707,6 +707,7 @@ fn push_cache_key_component(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if position == PatternPosition::Object => {
             key.push(b'L');
@@ -715,6 +716,9 @@ fn push_cache_key_component(
             key.extend_from_slice(&p_id.to_le_bytes());
             key.extend_from_slice(&dt_id.to_le_bytes());
             key.extend_from_slice(&lang_id.to_le_bytes());
+            // An arena handle names its value only with its graph: two
+            // graphs' handle 0 are two values.
+            key.extend_from_slice(&arena_g_id.to_le_bytes());
             true
         }
         // A literal OBJECT is pushed down by value (plus a string term

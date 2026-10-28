@@ -355,6 +355,7 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
                 p_id: p1,
                 dt_id: dt1,
                 lang_id: l1,
+                arena_g_id: g1,
                 ..
             },
             Binding::EncodedLit {
@@ -363,13 +364,15 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
                 p_id: p2,
                 dt_id: dt2,
                 lang_id: l2,
+                arena_g_id: g2,
                 ..
             },
         ) => {
             // IMPORTANT:
             // - `i_val` is list-index metadata and must not affect value ordering.
-            // - `p_id` is only relevant for NUM_BIG (per-predicate arena); for other kinds
-            //   it must not affect ordering semantics.
+            // - An arena handle (NUM_BIG, VECTOR) is numbered per (graph,
+            //   predicate), so both break its ties; for other kinds they must
+            //   not affect ordering semantics.
             let base = k1
                 .cmp(k2)
                 .then(ok1.cmp(ok2))
@@ -378,8 +381,8 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
 
             if base != Ordering::Equal {
                 base
-            } else if *k1 == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
-                p1.cmp(p2)
+            } else if crate::binding::is_arena_kind(*k1) {
+                p1.cmp(p2).then(g1.cmp(g2))
             } else {
                 Ordering::Equal
             }

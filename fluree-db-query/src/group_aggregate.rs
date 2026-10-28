@@ -479,9 +479,10 @@ pub(crate) enum GroupKeyOwned {
     Lit {
         o_kind: u8,
         o_key: u64,
-        /// `p_id` is only required for NUM_BIG decoding (per-predicate arena).
-        /// For all other literal kinds, it must not affect grouping identity.
-        p_id_for_numbig: Option<u32>,
+        /// An arena handle's predicate and graph (NUM_BIG, VECTOR): the handle
+        /// names a value only with both. `None` for every other kind, whose
+        /// identity they must not affect.
+        arena: Option<(u32, fluree_db_core::GraphId)>,
         dt_id: u16,
         lang_id: u16,
     },
@@ -573,15 +574,12 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => GroupKeyOwned::Lit {
             o_kind: *o_kind,
             o_key: *o_key,
-            p_id_for_numbig: if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
-                Some(*p_id)
-            } else {
-                None
-            },
+            arena: crate::binding::is_arena_kind(*o_kind).then_some((*p_id, *arena_g_id)),
             dt_id: *dt_id,
             lang_id: *lang_id,
         },
