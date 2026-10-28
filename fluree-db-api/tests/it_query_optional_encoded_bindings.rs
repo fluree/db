@@ -2013,6 +2013,12 @@ async fn cyclic_union_lane_reads_past_an_empty_member() {
 /// read, and its union site says so with `fallback:list_view`. JSON-LD reads
 /// the member as a value of `ex:knows`, so the triangle closes three ways
 /// round, and the union variant answers it.
+///
+/// The second triangle closes over `ex:likes` (two plain edges, the most
+/// selective predicate) and the list's `ex:knows` (beside ten edges no
+/// triangle uses), so the block opens with a stored triple and no seed: it
+/// is the planner's list-view guard, not a seed, that keeps the lane from
+/// reading the list's member as an edge.
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
     let ledger_id = "it/cyclic-lane-lists:main";
@@ -2020,18 +2026,31 @@ async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
         @prefix ex: <http://example.org/> .
         GRAPH <urn:g2> { ex:a ex:knows ex:b . ex:b ex:knows ex:c . }
         GRAPH <urn:g3> { ex:c ex:knows ( ex:a ) . }
+        GRAPH <urn:g4> { ex:i ex:likes ex:j . ex:j ex:likes ex:k . }
+        GRAPH <urn:g5> {
+            ex:k ex:knows ( ex:i ) .
+            ex:n0 ex:knows ex:n1 . ex:n1 ex:knows ex:n2 . ex:n2 ex:knows ex:n3 .
+            ex:n3 ex:knows ex:n4 . ex:n4 ex:knows ex:n5 . ex:n5 ex:knows ex:n6 .
+            ex:n6 ex:knows ex:n7 . ex:n7 ex:knows ex:n8 . ex:n8 ex:knows ex:n9 .
+            ex:n9 ex:knows ex:n10 .
+        }
     ";
     let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
     let _switch = crate::support::FAST_PATH_SWITCH.read().await;
     let mut failures = Failures::default();
-    for (label, prologue, ds) in [
-        ("FROM g2 + g3", "", "FROM <urn:g2> FROM <urn:g3>"),
-        ("the union default graph", UNION_PRAGMA, ""),
+    let knows3 = "?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x";
+    let likes2 = "?x ex:likes ?y . ?y ex:likes ?z . ?z ex:knows ?x";
+    for (label, prologue, ds, bgp) in [
+        ("FROM g2 + g3", "", "FROM <urn:g2> FROM <urn:g3>", knows3),
+        ("the union default graph", UNION_PRAGMA, "", knows3),
+        (
+            "FROM g4 + g5, opening on a stored triple",
+            "",
+            "FROM <urn:g4> FROM <urn:g5>",
+            likes2,
+        ),
     ] {
-        let query = format!(
-            "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
-             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
-        );
+        let query = format!("{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} WHERE {{ {bgp} }}");
         let (store, _guard) = init_test_tracing();
         let before = store.all_events().len();
         match db(&handle)
@@ -2075,6 +2094,31 @@ async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
                 ]
             }),
             want: rows(&[&["a", "b", "c"], &["b", "c", "a"], &["c", "a", "b"]]),
+            must_fire: true,
+        },
+        &mut failures,
+    )
+    .await;
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "cyclic_bgp_union",
+        JsonLaneCase {
+            label: "JSON-LD, FROM g4 + g5: the list's member closes the triangle",
+            query: json!({
+                "@context": {"ex": EX},
+                "from": [
+                    {"@id": ledger_id, "graph": "urn:g4"},
+                    {"@id": ledger_id, "graph": "urn:g5"}
+                ],
+                "select": ["?x", "?y", "?z"],
+                "where": [
+                    {"@id": "?x", "ex:likes": "?y"},
+                    {"@id": "?y", "ex:likes": "?z"},
+                    {"@id": "?z", "ex:knows": "?x"}
+                ]
+            }),
+            want: rows(&[&["i", "j", "k"]]),
             must_fire: true,
         },
         &mut failures,
