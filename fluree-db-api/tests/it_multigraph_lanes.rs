@@ -81,6 +81,14 @@ const E_ONE_PLANNED: &str = "stats_count_by_predicate";
 /// the index declines it with `Novelty`; the one-graph lane answers one
 /// current graph; nothing answers a GRAPH scope (not the shape) or two
 /// ledgers.
+///
+/// Fixture A holds a list, so SPARQL reads `?s ?p ?o` through its view of
+/// RDF lists (#2159): the owner edge and the cells' `rdf:first`/`rdf:rest`
+/// in place of the members. The union lane counts stored rows, so over
+/// several graphs or none it stands down at plan time with `ListView`, in
+/// every state, and the general plan answers; the one-graph lane corrects
+/// its counts from the list census. JSON-LD reads the members as values,
+/// and the union lane answers it.
 async fn lane_e(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -100,6 +108,16 @@ async fn lane_e(state: State) {
             // member of any scope current.
             let current = state != State::Novelty && scope != Scope::TimeTravel;
             match scope.kind() {
+                Kind::Union | Kind::Empty if surface == Surface::Sparql => {
+                    assert_routing(&run, &[], &all, &mut failures);
+                    let list_view = (E_UNION.to_string(), "fallback:list_view".to_string());
+                    if !run.fell_back.contains(&list_view) {
+                        failures.push(format!(
+                            "{}: no ListView decline (fell back: {:?})",
+                            run.label, run.fell_back
+                        ));
+                    }
+                }
                 Kind::Union if current => {
                     assert_routing(&run, &[E_UNION], &[E_ONE, E_ONE_PLANNED], &mut failures);
                 }
