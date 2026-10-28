@@ -1284,6 +1284,44 @@ async fn update_where_bind_iri_expands_through_the_context() {
     .to_jsonld(&direct.ledger.snapshot)
     .expect("format");
     assert_eq!(both, json!(["ex:direct", "ex:error"]));
+
+    // With `strictCompactIri: false` the update takes the string verbatim,
+    // as the insert does, and both store the IRI `bad:thing`.
+    let mut lax = bind_iri("bad:thing");
+    lax["opts"] = json!({"strictCompactIri": false});
+    lax["insert"] = json!({"id": "?s", "ex:lax": "?o"});
+    let lax_update = fluree
+        .update(direct.ledger, &lax)
+        .await
+        .expect("strictCompactIri: false");
+    let lax_insert = fluree
+        .insert(
+            lax_update.ledger,
+            &json!({"@context": ctx_ex(), "@id": "ex:lax-direct", "ex:lax": {"@id": "bad:thing"},
+                    "opts": {"strictCompactIri": false}}),
+        )
+        .await
+        .expect("insert with strictCompactIri: false");
+    let lax_both = support::query_jsonld(
+        &fluree,
+        &lax_insert.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:lax": {"@id": "bad:thing"}},
+            "orderBy": "?s",
+            "opts": {"strictCompactIri": false}
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&lax_insert.ledger.snapshot)
+    .expect("format");
+    assert_eq!(
+        lax_both,
+        json!(["ex:error", "ex:lax-direct"]),
+        "strictCompactIri: false"
+    );
 }
 
 /// SPARQL's twin: `IRI()` and `UUID()` in a namespace the ledger has never
@@ -1355,8 +1393,8 @@ async fn sparql_update_writes_an_iri_in_an_unseen_namespace() {
     let rows = support::query_sparql_formatted(
         &fluree,
         &ledger,
-        r#"PREFIX ex: <http://example.org/ns/>
-           SELECT ?s WHERE { ?s ex:ref <http://unseen.example/o> } ORDER BY ?s"#,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s WHERE { ?s ex:ref <http://unseen.example/o> } ORDER BY ?s",
     )
     .await
     .expect("object query");
@@ -1368,8 +1406,8 @@ async fn sparql_update_writes_an_iri_in_an_unseen_namespace() {
     let rows = support::query_sparql_formatted(
         &fluree,
         &ledger,
-        r#"PREFIX ex: <http://example.org/ns/>
-           SELECT ?p ?o WHERE { <urn:unseen:s> ?p ?o } ORDER BY ?p"#,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?p ?o WHERE { <urn:unseen:s> ?p ?o } ORDER BY ?p",
     )
     .await
     .expect("subject query");
@@ -1381,8 +1419,8 @@ async fn sparql_update_writes_an_iri_in_an_unseen_namespace() {
     let rows = support::query_sparql_formatted(
         &fluree,
         &ledger,
-        r#"PREFIX ex: <http://example.org/ns/>
-           SELECT ?o WHERE { ex:s <http://unseen.example/p> ?o }"#,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:s <http://unseen.example/p> ?o }",
     )
     .await
     .expect("predicate query");

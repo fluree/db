@@ -252,6 +252,18 @@ async fn jsonld_bind_iri_expands_through_the_context() {
         .await
         .expect("a defined prefix");
     assert_eq!(expanded, json!(["http://example.org/ns/T"]));
+    let absolute = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &query("https://ns.example/T", json!({})),
+    )
+    .await
+    .expect("an absolute https IRI");
+    assert_eq!(
+        absolute,
+        json!(["https://ns.example/T"]),
+        "an absolute IRI is itself"
+    );
     assert_query_bind_error(
         &fluree,
         &ledger,

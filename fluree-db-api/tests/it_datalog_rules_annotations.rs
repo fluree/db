@@ -1004,6 +1004,10 @@ async fn filter_iri_operand_forms_across_spellings() {
             json!(["filter", ["=", "?p", "ex:knows"]]),
             0,
         ),
+        // An update writes the IRI `iri` builds, so a constant argument goes
+        // through the `@context` as an insert's `@id` does; unexpanded,
+        // `ex:knows` would be written as an IRI of its own under an `ex:`
+        // scheme. This case matched nothing before that rule.
         (
             "array iri() with a prefixed name, expanded as an @id is",
             json!(["filter", ["=", "?p", ["iri", "ex:knows"]]]),
