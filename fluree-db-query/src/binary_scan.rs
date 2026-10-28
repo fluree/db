@@ -36,7 +36,7 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
-use crate::operator::{Operator, OperatorState};
+use crate::operator::{Operator, OperatorState, RowFact};
 use crate::policy::QueryPolicyEnforcer;
 use crate::sid_iri;
 use crate::stats_cache::cached_stats_view_for_db;
@@ -194,8 +194,6 @@ pub struct BinaryScanOperator {
     /// Novelty-only predicate overrides keyed by ephemeral p_id, populated
     /// during overlay translation (ephemeral ids sit above the persisted range).
     p_sids_ephemeral: HashMap<u32, Sid>,
-    /// Cached s_id → Sid for amortized IRI resolution.
-    sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
     p_is_var: bool,
     /// Snapshot of `ExecutionContext::include_system_facts` taken at
@@ -204,6 +202,11 @@ pub struct BinaryScanOperator {
     /// `f:reifies*` skip in `flakes_to_bindings`) become no-ops so
     /// debug/inspection callers can see Fluree-system facts directly.
     include_system_facts: bool,
+    /// Skip rows that are members of a compactly stored RDF list — rows with
+    /// a list position. In SPARQL's view of lists (see
+    /// [`crate::list_view`]) a member is not a value of its predicate; the
+    /// list's owner edge and cells come from [`crate::list_view`] instead.
+    hide_list_members: bool,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -244,6 +247,10 @@ pub struct BinaryScanOperator {
     /// `mode == Current`, it is constructed by `ScanDatasetBuilder` directly
     /// and emits current-state bindings without the `op` channel.
     mode: crate::temporal_mode::TemporalMode,
+    /// The fact each row of the batch being built matched, when a union of
+    /// graphs that deduplicates on fact identity armed recording
+    /// ([`Operator::record_row_facts`]).
+    row_facts: Option<Vec<RowFact>>,
 }
 
 /// A filter that can be evaluated on encoded index columns (no term decoding).
@@ -743,9 +750,9 @@ impl BinaryScanOperator {
             pending_cursors: VecDeque::new(),
             p_sids: Vec::new().into(),
             p_sids_ephemeral: HashMap::new(),
-            sid_cache: HashMap::new(),
             p_is_var,
             include_system_facts: false,
+            hide_list_members: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -760,7 +767,20 @@ impl BinaryScanOperator {
             range_dt: None,
             unresolved_bound_subject_iri: None,
             mode,
+            row_facts: None,
         }
+    }
+
+    /// Skip list members (see [`Self::hide_list_members`]).
+    pub fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self
+    }
+
+    /// Whether the pattern's object is a constant literal, the one position
+    /// a constant can match several terms at.
+    fn object_is_constant_literal(&self) -> bool {
+        matches!(&self.pattern.o, Term::Value(v) if !matches!(v, FlakeValue::Ref(_)))
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -804,6 +824,9 @@ impl BinaryScanOperator {
         let base_len = self.base_schema_len();
         let num_vars = columns.len();
         let mut produced = 0;
+        // Read once: see `batch_to_bindings`.
+        let record_facts = self.row_facts.is_some();
+        let record_object = record_facts && self.object_is_constant_literal();
 
         while produced < batch_size {
             let Some(flake) = self.range_iter.as_mut().and_then(std::iter::Iterator::next) else {
@@ -828,6 +851,9 @@ impl BinaryScanOperator {
                 && !self.include_system_facts
                 && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
             {
+                continue;
+            }
+            if self.hide_list_members && flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
                 continue;
             }
 
@@ -929,6 +955,9 @@ impl BinaryScanOperator {
 
             for (col, binding) in columns.iter_mut().zip(bindings) {
                 col.push(binding);
+            }
+            if record_facts {
+                self.record_flake_fact(record_object, &flake);
             }
             produced += 1;
         }
@@ -1173,24 +1202,6 @@ impl BinaryScanOperator {
             .find_subject(sid.namespace_code, sid.name.as_ref())
     }
 
-    /// Resolve s_id → Sid with caching.
-    fn resolve_s_id(&mut self, s_id: u64) -> Result<Sid> {
-        if let Some(sid) = self.sid_cache.get(&s_id) {
-            return Ok(sid.clone());
-        }
-        let iri = self
-            .store()
-            .resolve_subject_iri(s_id)
-            .map_err(|e| QueryError::Internal(format!("resolve s_id={s_id}: {e}")))?;
-        let sid = self
-            .store()
-            .find_subject_sid(&iri)
-            .map_err(|e| QueryError::Internal(format!("find_subject_sid: {e}")))?
-            .unwrap_or_else(|| self.store().encode_iri(&iri));
-        self.sid_cache.insert(s_id, sid.clone());
-        Ok(sid)
-    }
-
     /// Resolve p_id → Sid (pre-computed, O(1)).
     #[inline]
     fn resolve_p_id(&self, p_id: u32) -> Sid {
@@ -1245,7 +1256,8 @@ impl BinaryScanOperator {
     /// e.g. `?x <p> ?x` or `?x ?x ?o`. These are equality constraints that must be applied
     /// even when emission pruning omits one of the positions.
     fn within_row_var_equality_ok(
-        &mut self,
+        &self,
+        view: &BinaryGraphView,
         s_id: u64,
         p_id: u32,
         o_type: u16,
@@ -1269,7 +1281,9 @@ impl BinaryScanOperator {
 
         // Comparisons involving predicate IDs require Sid materialization (different ID domains).
         if self.check_s_eq_p {
-            let s = self.resolve_s_id(s_id)?;
+            let s = view
+                .resolve_subject_sid(s_id)
+                .map_err(|e| QueryError::from_io("resolve_subject_sid", e))?;
             let p = self.resolve_p_id(p_id);
             if s != p {
                 return Ok(false);
@@ -1280,7 +1294,9 @@ impl BinaryScanOperator {
             if !(ot.is_iri_ref() || ot.is_blank_node()) {
                 return Ok(false);
             }
-            let o_sid = self.resolve_s_id(o_key)?;
+            let o_sid = view
+                .resolve_subject_sid(o_key)
+                .map_err(|e| QueryError::from_io("resolve_subject_sid", e))?;
             let p_sid = self.resolve_p_id(p_id);
             if o_sid != p_sid {
                 return Ok(false);
@@ -1420,6 +1436,18 @@ impl BinaryScanOperator {
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // Whether a union's dedup armed fact recording, read once per batch:
+        // a scan that is not a union member pays nothing per row.
+        let record_facts = self.row_facts.is_some();
+        let record_object = record_facts && self.object_is_constant_literal();
+        // Decided per batch: a leaflet holding no list rows loads its
+        // position column as the constant "none".
+        let hide_members = self.hide_list_members
+            && !matches!(
+                batch.o_i,
+                fluree_db_binary_index::ColumnData::Const(u32::MAX)
+                    | fluree_db_binary_index::ColumnData::AbsentDefault
+            );
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
@@ -1437,6 +1465,9 @@ impl BinaryScanOperator {
             if self.is_internal_predicate(p_id) {
                 continue;
             }
+            if hide_members && o_i != u32::MAX {
+                continue;
+            }
 
             // Encoded pre-filters: run before any decoding work.
             if !self
@@ -1447,7 +1478,7 @@ impl BinaryScanOperator {
                 continue;
             }
 
-            if !self.within_row_var_equality_ok(s_id, p_id, o_type, o_key)? {
+            if !self.within_row_var_equality_ok(&view, s_id, p_id, o_type, o_key)? {
                 continue;
             }
 
@@ -1598,10 +1629,82 @@ impl BinaryScanOperator {
             for (i, binding) in bindings.drain(..).enumerate() {
                 columns[i].push(binding);
             }
+            if record_facts {
+                self.record_index_row_fact(&view, record_object, o_type, o_key, p_id, o_i)?;
+            }
             produced += 1;
         }
 
         Ok(produced)
+    }
+}
+
+impl BinaryScanOperator {
+    /// Record the fact an index row matched: its list position, and the term
+    /// it matched when the pattern's object is a constant literal (a constant
+    /// can match terms of several datatypes). Out of line, so a scan that
+    /// records nothing carries none of it in its row loop.
+    #[inline(never)]
+    fn record_index_row_fact(
+        &mut self,
+        view: &BinaryGraphView,
+        record_object: bool,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+        o_i: u32,
+    ) -> Result<()> {
+        let object = if record_object {
+            let val = view
+                .decode_value(o_type, o_key, p_id)
+                .map_err(|e| QueryError::from_io("decode_value", e))?;
+            Some(materialized_object_binding(
+                self.store(),
+                o_type,
+                p_id,
+                val,
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
+        let list_index = (o_i != u32::MAX).then_some(o_i);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
+        Ok(())
+    }
+
+    /// [`Self::record_index_row_fact`] for a decoded flake.
+    #[inline(never)]
+    fn record_flake_fact(&mut self, record_object: bool, flake: &Flake) {
+        let object = record_object.then(|| flake_object_binding(flake));
+        let list_index = flake.m.as_ref().and_then(|m| m.i).map(|i| i as u32);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
+    }
+}
+
+/// A decoded flake's object as the scan binds it, without its `t`: the
+/// matched object of a recorded fact ([`RowFact`]).
+fn flake_object_binding(flake: &Flake) -> Binding {
+    match &flake.o {
+        FlakeValue::Ref(r) => Binding::sid(r.clone()),
+        v => {
+            let dtc = match flake.m.as_ref().and_then(|m| m.lang.as_ref()) {
+                Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang.as_str())),
+                None => DatatypeConstraint::Explicit(flake.dt.clone()),
+            };
+            Binding::Lit {
+                val: v.clone(),
+                dtc,
+                t: None,
+                op: None,
+                p_id: None,
+            }
+        }
     }
 }
 
@@ -2084,6 +2187,15 @@ impl Operator for BinaryScanOperator {
         &self.schema
     }
 
+    fn record_row_facts(&mut self) -> bool {
+        self.row_facts = Some(Vec::new());
+        true
+    }
+
+    fn take_row_facts(&mut self) -> Option<Vec<RowFact>> {
+        self.row_facts.as_mut().map(std::mem::take)
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         if !self.state.can_open() {
             if self.state.is_closed() {
@@ -2095,6 +2207,9 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // Over a dataset spanning ledgers the list view is not applied, and a
+        // member is a value of its predicate.
+        self.hide_list_members &= !ctx.is_multi_ledger();
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
         // hiding it would defeat the point of inspecting a history
@@ -3015,6 +3130,9 @@ impl Operator for BinaryScanOperator {
         let mut columns: Vec<Vec<Binding>> = (0..num_vars)
             .map(|_| Vec::with_capacity(batch_size))
             .collect();
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.clear();
+        }
 
         // Residency mode: handle a store's ContentStore + retry budget for
         // the drain/fetch/retry arm in the cursor loop below.
@@ -3107,7 +3225,8 @@ impl Operator for BinaryScanOperator {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
-        if !self.count_only_eligible() {
+        // Counting rows undecoded would count the list members it hides.
+        if !self.count_only_eligible() || self.hide_list_members {
             return Ok(None);
         }
 
@@ -3161,7 +3280,6 @@ impl Operator for BinaryScanOperator {
         self.pending_cursors.clear();
         self.range_iter = None;
         self.store = None;
-        self.sid_cache.clear();
         self.p_sids = Vec::new().into();
         self.p_sids_ephemeral.clear();
         self.unresolved_bound_subject_iri = None;

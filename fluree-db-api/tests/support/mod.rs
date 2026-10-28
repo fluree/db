@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod hooked_storage;
+pub mod recording_ns;
 pub mod span_capture;
 
 use fluree_db_api::{LedgerState, Novelty};
@@ -355,7 +356,9 @@ pub async fn seed_user_with_ssn(
 /// Rebuild and publish a binary index for the ledger's current commit head.
 ///
 /// Use this in regression tests that need to exercise the FIR6/binary-only
-/// reload path rather than the purely in-memory novelty path.
+/// reload path rather than the purely in-memory novelty path. The rebuild
+/// replaces an index already published at the same `t`, so a test that asks
+/// for a full rebuild reads one ([`publish_built_index`]).
 pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let record = fluree
         .nameservice()
@@ -371,12 +374,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
     )
     .await
     .expect("index rebuild should succeed");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
-        .await
-        .expect("publish index");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
 }
 
 /// Like `rebuild_and_publish_index`, but uses `build_index_for_record` which
@@ -397,12 +395,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
     )
     .await
     .expect("index build should succeed");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
-        .await
-        .expect("publish index");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
 }
 
 /// Build the index incrementally over the published one and publish it, with
@@ -430,12 +423,46 @@ pub async fn build_incrementally_and_publish_index(
     )
     .await
     .expect("incremental index build should succeed");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
+}
+
+/// Publish the index a test built, and fail closed if it didn't take.
+///
+/// `publish_index` declines, silently, an index whose `t` is not newer than
+/// the one already published. So a second build at one `t` (a full rebuild
+/// after an incremental build, a repeat rebuild, or a build that a background
+/// indexer beat to that `t`) left the test reading the index it meant to
+/// replace. This publishes the way `Fluree::reindex` does, replacing an index
+/// of the same `t`, so the test reads the build it asked for. A newer
+/// published index can't be replaced, and that panics: the test's reads would
+/// not see its build. Build the `Fluree` with `without_indexing()` so no
+/// background indexer publishes ahead of the test.
+pub async fn publish_built_index(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    index_t: i64,
+    root_id: &fluree_db_core::ContentId,
+) {
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal(ledger_id, index_t, root_id)
         .await
         .expect("publish index");
+    let published = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    assert_eq!(
+        published.index_head_id.as_ref(),
+        Some(root_id),
+        "{ledger_id}: the index built at t={index_t} was not published; the \
+         nameservice holds one at t={}. The test would read that index instead. \
+         Is a background indexer running? Build the Fluree `without_indexing()`.",
+        published.index_t
+    );
 }
 
 // =============================================================================
@@ -1069,4 +1096,66 @@ pub async fn run_collector_and_fork_drop_scenario(
     // And the worker still builds once the drop's window has closed.
     round(main_id.clone(), 7).await;
     assert_dicts_present(main_id.clone(), "after a build following the drop").await;
+}
+
+/// The RDF lists `subject predicate` holds in `ledger`'s default graph, each
+/// as its members' integer values, sorted. Read through the shared list
+/// reader, so a list reads the same whether it is stored as positioned
+/// members or as an explicit `rdf:first`/`rdf:rest` chain.
+#[allow(dead_code)]
+pub async fn stored_int_lists(
+    ledger: &LedgerState,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    stored_int_lists_in(ledger, 0, subject, predicate).await
+}
+
+/// [`stored_int_lists`] in graph `g_id`.
+#[allow(dead_code)]
+pub async fn stored_int_lists_in(
+    ledger: &LedgerState,
+    g_id: fluree_db_core::GraphId,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+    use fluree_db_core::FlakeValue;
+    let snapshot = &ledger.snapshot;
+    let (Some(s), Some(p)) = (snapshot.encode_iri(subject), snapshot.encode_iri(predicate)) else {
+        return Vec::new();
+    };
+    let db = ledger.as_graph_db_ref(g_id);
+    let values = db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s),
+                p: Some(p),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("range");
+    let read = fluree_db_core::rdf_list::read_lists(db, &values)
+        .await
+        .expect("read lists");
+    assert!(read.malformed == 0 && read.values.is_empty(), "{read:?}");
+    let mut lists: Vec<Vec<i64>> = read
+        .lists
+        .into_iter()
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|m| match m {
+                    FlakeValue::Long(n) => n,
+                    other => panic!("integer member expected, got {other:?}"),
+                })
+                .collect()
+        })
+        .collect();
+    lists.sort();
+    lists
 }

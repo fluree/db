@@ -5,8 +5,9 @@
 
 use crate::annotation_edge_probe::AnnotationSidecarCache;
 use crate::bm25::{Bm25IndexProvider, Bm25SearchProvider};
-use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet};
+use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet, MemberKind};
 use crate::error::QueryError;
+use crate::index_scope::{IndexMember, IndexScope, MemberSet, ScopeKind};
 use crate::policy::QueryPolicyEnforcer;
 use crate::r2rml::{R2rmlProvider, R2rmlTableProvider};
 use crate::remote_service::RemoteServiceExecutor;
@@ -298,6 +299,10 @@ pub struct ExecutionContext<'a> {
     /// evaluation to compact IRIs the way `db.labels()` does: strip the
     /// vocab prefix, otherwise return the full IRI.
     pub cypher_vocab: Option<Arc<str>>,
+    /// What `NOW()` and `TODAY()` return. `None` reads the wall clock on
+    /// every call. Rule bodies set it to the materialization's evaluation
+    /// time, so every rule in one run sees one clock.
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
     /// When true, an R2RML `RefObjectMap` object whose parent subject is a pure
     /// IRI template over the FK join columns is rendered directly from the child
     /// row's FK columns, skipping the parent-table scan and its referential
@@ -322,6 +327,13 @@ pub struct ExecutionContext<'a> {
     /// to `range_with_overlay()`.
     pub binary_store: Option<Arc<BinaryIndexStore>>,
     /// Graph ID for binary index scans (typically 0 for default graph).
+    ///
+    /// Under a default graph of several graphs this names one member only,
+    /// so reading it there reads that member alone. A lane takes its graph
+    /// from [`Self::index_scope`] instead; the remaining readers are listed by
+    /// this deprecation (allowed at the crate root until the field is made
+    /// private, #2075).
+    #[deprecated(note = "take the graph from `ExecutionContext::index_scope()` (#2075)")]
     pub binary_g_id: GraphId,
     /// Dictionary novelty layer for subject/string lookups in binary scans.
     ///
@@ -369,6 +381,10 @@ pub struct ExecutionContext<'a> {
     /// with its `ledger_id` in this set, it routes triple patterns through
     /// R2RML scan instead of native index scan.
     pub r2rml_graph_ids: std::collections::HashSet<Arc<str>>,
+    /// What the primary snapshot reads when there is no dataset, as the caller
+    /// that loaded it said (see [`MemberKind`]). A native primary's own id is
+    /// never looked up as a graph source.
+    pub primary_kind: MemberKind,
     /// Cached result of the multi-ledger check.
     ///
     /// `true` when the active query scope spans more than one distinct ledger ID.
@@ -527,6 +543,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -539,6 +556,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -588,6 +606,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store,
@@ -600,6 +619,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
@@ -653,6 +673,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store,
@@ -665,6 +686,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
@@ -707,6 +729,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -719,6 +742,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -760,6 +784,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -772,6 +797,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -815,6 +841,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -827,6 +854,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
@@ -1284,34 +1312,104 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// Whether this scope reads exactly one graph: no dataset, or a dataset
-    /// whose active graph is one graph (a named graph, or a default graph of
-    /// one). A default graph of several graphs, of one ledger or of several,
-    /// reads several; `FROM NAMED` alone, a default graph of none, reads
-    /// none. Defined once, by [`ActiveGraph::reads_one_graph`], which the
-    /// planner's [`PlanningContext::one_graph`] answers too.
+    /// How many graphs this scope's active graph reads ([`ScopeKind::of`]),
+    /// which the planner's [`PlanningContext::index_scope_kind`] answers too,
+    /// so a lane the planner admits is a lane the runtime admits.
     ///
-    /// [`PlanningContext::one_graph`]: crate::temporal_mode::PlanningContext::one_graph
-    ///
-    /// Every single-graph lane gates on this: the binary-index fast paths
-    /// (through `fast_path_store` and `allow_cursor_fast_path`), the batched
-    /// probe lanes, the cyclic-join lane, the EXISTS semijoin cache and the
-    /// partitioned GROUP BY. They read one graph's index, `binary_g_id`'s,
-    /// which a default graph of several graphs does not have; it sets
-    /// `binary_g_id` to one member, so a lane that ran there would read that
-    /// member alone.
-    pub fn reads_exactly_one_graph(&self) -> bool {
-        self.active_graph.reads_one_graph(self.dataset)
+    /// [`PlanningContext::index_scope_kind`]: crate::temporal_mode::PlanningContext::index_scope_kind
+    pub fn scope_kind(&self) -> ScopeKind {
+        ScopeKind::of(&self.active_graph, self.dataset)
     }
 
-    /// Whether this scope reads exactly one graph through its binary index:
-    /// [`ActiveGraph::reads_one_graph_index`] (a store attached,
-    /// [`Self::reads_exactly_one_graph`], and a dataset that does not span
-    /// ledgers), which the planner answers too. Individual call sites may
-    /// layer additional conditions (e.g. `to_t >= base_t`).
+    /// Whether this scope reads exactly one graph ([`ScopeKind::One`]): no
+    /// dataset, or a dataset whose active graph is one graph (a named graph,
+    /// or a default graph of one). A default graph of several graphs, of one
+    /// ledger or of several, reads several; `FROM NAMED` alone, a default
+    /// graph of none, reads none.
+    ///
+    /// The structural half of [`Self::index_scope`], for a single-graph lane
+    /// that needs no index (the partitioned GROUP BY) or that discharges the
+    /// view policy per predicate itself (the batched probe lanes). A lane that
+    /// reads the index takes its graph from [`Self::index_scope`] instead.
+    pub fn reads_exactly_one_graph(&self) -> bool {
+        self.scope_kind() == ScopeKind::One
+    }
+
+    /// Whether this scope reads exactly one graph through its binary index
+    /// ([`ScopeKind::reads_one_graph_index`]: one graph, a store attached, and
+    /// a dataset that does not span ledgers), which the planner answers too.
+    /// Individual call sites may layer additional conditions (e.g.
+    /// `to_t >= base_t`).
     pub fn has_binary_store(&self) -> bool {
-        self.active_graph
-            .reads_one_graph_index(self.dataset, self.binary_store.is_some())
+        self.scope_kind().reads_one_graph_index(
+            self.binary_store.is_some(),
+            self.dataset.is_some_and(DataSet::spans_multiple_ledgers),
+        )
+    }
+
+    /// What this scope reads through the ledger's binary index, or `None`
+    /// where no index lane may run: no store attached, a dataset that spans
+    /// ledgers, a history range, a view policy that filters, or a default
+    /// graph whose members are not all read through this context's store and
+    /// dictionary novelty.
+    ///
+    /// - [`IndexScope::One`]: the graph `binary_g_id` names, at this
+    ///   context's overlay and `t`, as every single-graph lane has read it.
+    /// - [`IndexScope::Union`]: each member of the default graph, at its own
+    ///   overlay and `t`.
+    /// - [`IndexScope::Empty`]: a default graph of none.
+    ///
+    /// A lane that reads the index gets its graph here and matches on the
+    /// result; a lane that reads one graph declines every arm but `One`.
+    pub fn index_scope(&self) -> Option<IndexScope<'_>> {
+        if !self.allow_unfiltered() {
+            return None;
+        }
+        self.index_scope_policy_cleared()
+    }
+
+    /// [`Self::index_scope`] with the view policy **already discharged by the
+    /// caller**: use only after the policy gate for every predicate the lane
+    /// reads returned `Allow` (`cursor_fast_path_for_predicate`,
+    /// `policy_lane_for_predicates`).
+    pub fn index_scope_policy_cleared(&self) -> Option<IndexScope<'_>> {
+        let store = self.binary_store.as_ref()?;
+        if self.is_history_range() {
+            return None;
+        }
+        match self.scope_kind() {
+            ScopeKind::One => {
+                if self.dataset.is_some_and(DataSet::spans_multiple_ledgers) {
+                    return None;
+                }
+                Some(IndexScope::One(IndexMember::new(
+                    store,
+                    self.binary_g_id,
+                    self.overlay(),
+                    self.to_t,
+                )))
+            }
+            // The members' ids are comparable only if every member reads this
+            // store's dictionaries and this dictionary novelty; a dataset
+            // shares them per ledger and time (`LedgerLoads`, fluree-db-api).
+            ScopeKind::Union => {
+                let dict_novelty = self.dict_novelty.as_ref()?;
+                let members = self
+                    .dataset?
+                    .default_graphs()
+                    .iter()
+                    .map(|g| {
+                        let provider = Self::binary_range_provider(g.snapshot)?;
+                        (Arc::ptr_eq(provider.store(), store)
+                            && Arc::ptr_eq(provider.dict_novelty(), dict_novelty))
+                        .then(|| IndexMember::new(store, g.g_id, g.overlay, g.to_t))
+                    })
+                    .collect::<Option<_>>()?;
+                MemberSet::new(store, members).map(IndexScope::Union)
+            }
+            ScopeKind::Empty => Some(IndexScope::Empty),
+            ScopeKind::None => None,
+        }
     }
 
     /// Return a `BinaryGraphView` for the current graph, combining the binary store
@@ -1444,42 +1542,89 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
-    /// `None` when a dataset scopes the named set (`FROM NAMED`), the IRI is
-    /// unregistered, or it names a reserved system graph. The ledger alias is
-    /// reserved for the default graph and never resolves here, even if a
-    /// registered graph shares the ledger's IRI.
-    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
-        if self.explicit_dataset().is_some() || self.names_default_graph(iri) {
-            return None;
+    /// Whether `iri` names a graph the caller loaded as a ledger graph: a
+    /// dataset member (or member alias) of kind [`MemberKind::Native`], or,
+    /// with no dataset, a native primary's default graph by its own address.
+    /// Such a graph is never asked about as a graph source.
+    pub fn graph_is_native(&self, iri: &str) -> bool {
+        match self.dataset {
+            Some(ds) => ds
+                .named_graph(iri)
+                .is_some_and(|graph| graph.kind == MemberKind::Native),
+            None => {
+                self.primary_kind == MemberKind::Native && self.single_db_names_default_graph(iri)
+            }
         }
-        self.active_snapshot
-            .graph_registry
-            .graph_id_for_iri(iri)
-            .filter(|g| *g >= FIRST_USER_GRAPH_ID)
     }
 
-    /// User-registered named graph IRIs of the active snapshot, for `GRAPH ?g`
-    /// discovery. Excludes the default, reserved system graphs, and any graph
-    /// registered under a name that addresses the default graph (see
-    /// [`Self::names_default_graph`]); empty when the query names a dataset.
+    /// What `GRAPH <iri>` names in this single-ledger view, through the table
+    /// every graph position of a ledger shares
+    /// ([`TargetLedger::graph_position`](fluree_db_core::TargetLedger::graph_position)):
+    /// the ledger's own address in any spelling is its default graph, `L#<g>`
+    /// the graph `<g>`, and any other IRI the graph registered by it. `None`
+    /// when the query names a dataset, whose members are the named graphs (a
+    /// union default graph names graphs as no dataset does).
+    fn single_db_graph_position<'i>(
+        &self,
+        iri: &'i str,
+    ) -> Option<fluree_db_core::GraphPosition<'i>> {
+        if self.explicit_dataset().is_some() {
+            return None;
+        }
+        Some(
+            fluree_db_core::TargetLedger::new(
+                &self.active_snapshot.ledger_id,
+                &self.active_snapshot.graph_registry,
+            )
+            .graph_position(iri),
+        )
+    }
+
+    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
+    /// `None` when the query names a dataset (`FROM` / `FROM NAMED`), the IRI
+    /// names no graph, or it names a reserved system graph or the default graph
+    /// (the ledger's own address, even if a registered graph shares the text).
+    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
+        match self.single_db_graph_position(iri)? {
+            fluree_db_core::GraphPosition::Registered { g_id, .. }
+                if g_id >= FIRST_USER_GRAPH_ID =>
+            {
+                Some(g_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
+    /// the ledger's own address, in any spelling.
+    pub fn single_db_names_default_graph(&self, iri: &str) -> bool {
+        matches!(
+            self.single_db_graph_position(iri),
+            Some(fluree_db_core::GraphPosition::Default)
+        )
+    }
+
+    /// User-registered named graphs of the active snapshot, for `GRAPH ?g`
+    /// discovery, each under the name that reads it back
+    /// ([`TargetLedger::enumeration_name`](fluree_db_core::TargetLedger::enumeration_name)):
+    /// its IRI, or `L#<iri>` for a graph registered under the ledger's own
+    /// address. Excludes the default and reserved system graphs, and a graph
+    /// no name reads back; empty when the query names a dataset.
     pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
         if self.explicit_dataset().is_some() {
             return Vec::new();
         }
-        self.active_snapshot
-            .graph_registry
+        let registry = &self.active_snapshot.graph_registry;
+        let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
+        registry
             .iter_entries()
-            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && !self.names_default_graph(iri))
-            .map(|(_, iri)| Arc::from(iri))
+            .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
+            .filter_map(|(g, iri)| {
+                target
+                    .enumeration_name(iri, g)
+                    .map(|name| Arc::from(name.as_ref()))
+            })
             .collect()
-    }
-
-    /// Whether `GRAPH <iri>` addresses the active ledger's default graph: the
-    /// ledger alias, or `urn:default`
-    /// ([`DEFAULT_GRAPH_IRI`](fluree_db_core::DEFAULT_GRAPH_IRI)).
-    pub fn names_default_graph(&self, iri: &str) -> bool {
-        iri == self.active_snapshot.ledger_id.as_str() || iri == fluree_db_core::DEFAULT_GRAPH_IRI
     }
 
     /// Create a new context with a specific named graph active
@@ -1517,6 +1662,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
@@ -1529,6 +1675,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
@@ -1581,6 +1728,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
@@ -1593,6 +1741,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
@@ -1641,6 +1790,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
             path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
@@ -1653,6 +1803,7 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
@@ -1694,11 +1845,16 @@ impl<'a> ExecutionContext<'a> {
     /// Cost: one `TypeId` comparison. Returns `None` when no range provider is
     /// attached (e.g. genesis / metadata-only snapshot).
     pub(crate) fn extract_binary_store(snapshot: &LedgerSnapshot) -> Option<Arc<BinaryIndexStore>> {
+        Self::binary_range_provider(snapshot).map(|brp| Arc::clone(brp.store()))
+    }
+
+    /// The snapshot's `RangeProvider` as a [`BinaryRangeProvider`]: the store
+    /// and dictionary novelty a per-graph context reads it through.
+    fn binary_range_provider(snapshot: &LedgerSnapshot) -> Option<&BinaryRangeProvider> {
         snapshot
             .range_provider
             .as_ref()
             .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
-            .map(|brp| Arc::clone(brp.store()))
     }
 
     /// Extract `DictNovelty` from a snapshot's `RangeProvider` via downcast.

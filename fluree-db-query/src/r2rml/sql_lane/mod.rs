@@ -292,6 +292,11 @@ pub(super) async fn resolve_block(
             }
         }
     }
+    // A graph the caller loaded as a ledger graph is never a source, so the
+    // lane declines it without a capability lookup.
+    if ctx.graph_is_native(iri) {
+        return Ok(None);
+    }
     let (Some(provider), Some(table_provider)) = (ctx.r2rml_provider, ctx.r2rml_table_provider)
     else {
         return Ok(None);

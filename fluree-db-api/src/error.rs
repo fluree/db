@@ -474,6 +474,12 @@ pub enum ApiError {
     #[error("Indexing is disabled - no background indexer configured")]
     IndexingDisabled,
 
+    /// Another open instance holds the file storage root: one in another
+    /// process, or a second one built in this process. `holder` is its
+    /// process id when known.
+    #[error("{}", storage_in_use_message(root, *holder))]
+    StorageInUse { root: String, holder: Option<u32> },
+
     /// Refresh did not reach the requested minimum `t` value.
     ///
     /// The nameservice was polled and any available commits were applied,
@@ -702,6 +708,8 @@ impl ApiError {
             | ApiError::ReindexConflict { .. }
             | ApiError::GraphSourceRetracted(_) => 409,
 
+            ApiError::StorageInUse { .. } => 423,
+
             // Read-after-write: the ledger has not caught up to the `t` the
             // caller asked for.
             ApiError::AwaitTNotReached { .. } => 408,
@@ -749,8 +757,14 @@ impl ApiError {
                 ..
             }) if delta_bytes >= max_bytes => 413,
             ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => 503,
-            // Permanent: datatype IDs are never released.
-            ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => 422,
+            // This process has not loaded the ledger's index: its state, not
+            // the request's, and it clears when the index loads.
+            ApiError::Transact(TE::IndexNotLoaded(_)) => 503,
+            // Well-formed, but a value breaks a constraint the ledger holds:
+            // no room for its new datatypes (datatype IDs are never
+            // released), or a vector the index cannot store beside the
+            // property's others. Permanent either way.
+            ApiError::Transact(TE::DatatypeLimitExceeded { .. } | TE::InvalidVector(_)) => 422,
             // The ledger config could not be read: a storage failure, whichever
             // lane read it. Nothing in the request is wrong, and it is not
             // capacity pressure, so not a 503.
@@ -823,6 +837,7 @@ impl ApiError {
                 // distinct codes.
                 413 => errors::PAYLOAD_TOO_LARGE,
                 422 => errors::INVALID_TRANSACTION,
+                423 => errors::STORAGE_IN_USE,
                 _ => errors::INTERNAL,
             },
 
@@ -854,6 +869,7 @@ impl ApiError {
 
             ApiError::IndexTimeout(_) => errors::INDEX_TIMEOUT,
             ApiError::IndexingDisabled => errors::INDEXING_DISABLED,
+            ApiError::StorageInUse { .. } => errors::STORAGE_IN_USE,
             ApiError::ReindexConflict { .. } => errors::REINDEX_CONFLICT,
             ApiError::Indexer(e) => {
                 use crate::wasm_compat::IndexerError;
@@ -885,6 +901,8 @@ impl ApiError {
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                // Typed as `ApiError::NameService` is: the backend's fault.
+                QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
                 _ => errors::INVALID_QUERY,
             },
@@ -911,6 +929,9 @@ impl ApiError {
                 errors::NOVELTY_AT_MAX
             }
             ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => errors::DATATYPE_LIMIT_EXCEEDED,
+            ApiError::Transact(TE::IndexNotLoaded(_)) => errors::INDEX_NOT_LOADED,
+            // The generic code, the one its flattened 422 carries.
+            ApiError::Transact(TE::InvalidVector(_)) => errors::INVALID_TRANSACTION,
             ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => {
                 errors::STORAGE_READ
             }
@@ -967,6 +988,23 @@ impl ApiError {
     }
 }
 
+fn storage_in_use_message(root: &str, holder: Option<u32>) -> String {
+    if holder == Some(std::process::id()) {
+        return format!(
+            "storage '{root}' is already open in this process; \
+             use that instance instead of opening the storage again"
+        );
+    }
+    let by = holder
+        .map(|pid| format!(" (pid {pid})"))
+        .unwrap_or_default();
+    format!(
+        "storage '{root}' is in use by another Fluree process{by}. Only one process \
+         can open a storage directory; to share it, run `fluree server` on it and \
+         send requests to the server"
+    )
+}
+
 /// The HTTP status for a query engine error, wherever it surfaces: wrapped in
 /// [`ApiError::Query`], or reported directly by a tracked query.
 ///
@@ -992,6 +1030,9 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::NeedFetch(_)
         | QE::Policy(_)
         | QE::Internal(_) => 500,
+        // A nameservice lookup the query needed failed (a graph-source probe
+        // or lookup): a backend fault, as `ApiError::NameService` is.
+        QE::Nameservice(_) => 500,
         QE::Batch(_)
         | QE::R2rml(_)
         | QE::VariableNotFound(_)
@@ -1009,6 +1050,20 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::TimeRangeNotCovered { .. }
         | QE::Arithmetic(_)
         | QE::Comparison(_) => 400,
+    }
+}
+
+/// A reference that does not name a graph of the ledger a surface reads: a
+/// caller mistake, never an internal error. Another ledger's address is a 400
+/// that names the fix; a graph the ledger does not have is a 404.
+impl From<fluree_db_core::TargetError> for ApiError {
+    fn from(e: fluree_db_core::TargetError) -> Self {
+        match e {
+            fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
+            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
+                ApiError::invalid_query(cross.to_string())
+            }
+        }
     }
 }
 
@@ -1044,7 +1099,7 @@ mod tests {
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
     /// count it here.
-    const VARIANTS: usize = 48
+    const VARIANTS: usize = 49
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
         + cfg!(feature = "iceberg") as usize;
@@ -1255,6 +1310,14 @@ mod tests {
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),
             (
+                ApiError::StorageInUse {
+                    root: "x".into(),
+                    holder: None,
+                },
+                423,
+                STORAGE_IN_USE,
+            ),
+            (
                 ApiError::ReindexConflict {
                     expected: 1,
                     found: 2,
@@ -1281,11 +1344,21 @@ mod tests {
                 DATATYPE_LIMIT_EXCEEDED,
             ),
             (
+                ApiError::Transact(TE::InvalidVector("x".into())),
+                422,
+                INVALID_TRANSACTION,
+            ),
+            (
                 ApiError::Connection(ConnectionError::InvalidConfig("x".into())),
                 500,
                 CONNECTION,
             ),
             (ApiError::Query(QE::Internal("x".into())), 500, INTERNAL),
+            (
+                ApiError::Query(QE::Nameservice("x".into())),
+                500,
+                NAMESERVICE,
+            ),
             (ApiError::Ledger(LE::InvalidData("x".into())), 500, INTERNAL),
             (
                 ApiError::NameService(NSE::Storage("x".into())),
@@ -1377,6 +1450,11 @@ mod tests {
                 503,
                 COMMIT_CONTENTION,
             ),
+            (
+                ApiError::Transact(TE::IndexNotLoaded("x".into())),
+                503,
+                INDEX_NOT_LOADED,
+            ),
             (ApiError::IndexTimeout(1), 504, INDEX_TIMEOUT),
             (
                 ApiError::Query(QE::MemoryBudgetExceeded {
@@ -1430,6 +1508,7 @@ mod tests {
                 | ApiError::Http { .. }
                 | ApiError::IndexTimeout(_)
                 | ApiError::IndexingDisabled
+                | ApiError::StorageInUse { .. }
                 | ApiError::AwaitTNotReached { .. }
                 | ApiError::CommitContention { .. }
                 | ApiError::ReindexConflict { .. }
@@ -1524,6 +1603,15 @@ mod tests {
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
             400
         );
+    }
+
+    /// A nameservice lookup that fails while a query runs is the backend's
+    /// fault: a 500 typed like `ApiError::NameService`, never the generic 400.
+    #[test]
+    fn a_failed_nameservice_lookup_in_a_query_is_500() {
+        let e = ApiError::Query(fluree_db_query::QueryError::Nameservice("down".into()));
+        assert_eq!(e.status_code(), 500);
+        assert_eq!(e.error_type(), fluree_vocab::errors::NAMESERVICE);
     }
 
     #[test]

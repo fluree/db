@@ -16,6 +16,9 @@
 //! kill-switch sites). This module and its call sites are the seam that grows
 //! into that; the tracing target is the interim surface.
 
+use crate::context::ExecutionContext;
+use crate::index_scope::IndexScope;
+
 /// Tracing target every fast-path outcome is emitted on. Subscribe to it (e.g.
 /// `RUST_LOG=fluree::fastpath=debug`) to observe fast-path routing.
 pub const FAST_PATH_TARGET: &str = "fluree::fastpath";
@@ -65,5 +68,32 @@ pub fn stamp_fast_path(site: &'static str, outcome: FastPathOutcome) {
         site,
         outcome = outcome.label(),
         "fast-path outcome",
+    );
+}
+
+/// Stamp what `ctx` reads through the binary index
+/// ([`ExecutionContext::index_scope`]) for the scope `site` opens: `scope` is
+/// `one`, `union`, `empty`, or `none` where no index lane may run; `members`
+/// counts the graphs it reads; `current` says whether the index alone answers
+/// for every one of them. Computed only when the event is enabled, so a
+/// per-row call site costs one interest check.
+#[inline]
+pub fn stamp_index_scope(site: &'static str, ctx: &ExecutionContext<'_>) {
+    if !tracing::enabled!(target: FAST_PATH_TARGET, tracing::Level::DEBUG) {
+        return;
+    }
+    let (scope, members, current) = match ctx.index_scope() {
+        Some(IndexScope::One(member)) => ("one", 1, member.index_is_current()),
+        Some(IndexScope::Union(set)) => ("union", set.members().len(), set.all_current()),
+        Some(IndexScope::Empty) => ("empty", 0, true),
+        None => ("none", 0, false),
+    };
+    tracing::debug!(
+        target: FAST_PATH_TARGET,
+        site,
+        scope,
+        members,
+        current,
+        "index scope",
     );
 }

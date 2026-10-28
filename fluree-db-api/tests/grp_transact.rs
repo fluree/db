@@ -11,12 +11,20 @@ mod it_concurrent_update_reconcile;
 mod it_cypher_txn;
 #[path = "it_default_graph_name.rs"]
 mod it_default_graph_name;
+#[path = "it_delete_point_reads.rs"]
+mod it_delete_point_reads;
 #[path = "it_delete_stored_facts.rs"]
 mod it_delete_stored_facts;
 #[path = "it_enforce_unique_upsert_indexed.rs"]
 mod it_enforce_unique_upsert_indexed;
+#[path = "it_export_lists.rs"]
+mod it_export_lists;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
+#[path = "it_list_identity.rs"]
+mod it_list_identity;
+#[path = "it_overflow_iri_delete_index.rs"]
+mod it_overflow_iri_delete_index;
 #[path = "it_raw_txn_parallel_upload.rs"]
 mod it_raw_txn_parallel_upload;
 #[path = "it_rdf_text_parity.rs"]
@@ -25,6 +33,8 @@ mod it_rdf_text_parity;
 mod it_reserved_graph_writes;
 #[path = "it_stable_blank_nodes.rs"]
 mod it_stable_blank_nodes;
+#[path = "it_temporal_storage_precision.rs"]
+mod it_temporal_storage_precision;
 #[path = "it_transact.rs"]
 mod it_transact;
 #[path = "it_transact_conditional.rs"]

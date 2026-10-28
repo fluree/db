@@ -111,7 +111,7 @@ PREFIX ex: <http://example.org/ns/>
 DESCRIBE ex:alice
 ```
 
-Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`).
+Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`), plus the outgoing triples of each blank node it points to, and of every cell of a [list](#rdf-lists) it points to.
 
 ## Basic Graph Patterns
 
@@ -274,6 +274,24 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 #### Not Yet Supported
 
 A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
+
+### RDF Lists
+
+A list — Turtle `( … )`, JSON-LD `{"@list": [...]}` — is, as RDF, its owner's edge to a head cell and a chain of cells, each with an `rdf:first` (the member) and an `rdf:rest` (the next cell, or `rdf:nil`). SPARQL sees that graph, however the list was written:
+
+```sparql
+# data: ex:s ex:items (ex:a ex:b ex:c) .
+
+SELECT ?x WHERE { ex:s ex:items/rdf:rest*/rdf:first ?x }  # ex:a, ex:b, ex:c
+SELECT ?x WHERE { ex:s ex:items/rdf:rest/rdf:first ?x }   # ex:b
+SELECT ?x ?y ?z WHERE { ex:s ex:items (?x ?y ?z) }        # one solution
+```
+
+- `ex:s ex:items ?o` binds `?o` to the head cell, a blank node, not to the members; `?s ?p ?o` and `COUNT(*)` count the owner edge and two triples per member.
+- A cell's blank node (`_:l0-0`, …) names it only within the result that returned it.
+- CONSTRUCT, DESCRIBE and a Graph Store `GET` write a list as `( … )` in Turtle and as `{"@list": [...]}` in JSON-LD, so a graph read and written back is unchanged.
+- JSON-LD queries keep Fluree's view, where the members are the values of their property: `{"@id": "ex:s", "ex:items": "?x"}` binds each member. For a list stored as its triples (see [Lists](#lists) in updates), a JSON-LD crawl shows the members, but a `where` clause binds the list's head.
+- A query over a dataset spanning several ledgers, and a history query, see the members as values.
 
 ## Query Modifiers
 
@@ -594,9 +612,14 @@ SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
 
 An unbound `GRAPH ?g` ranges over **named graphs only**, per SPARQL 1.1: it
 binds `?g` to each user-registered named graph and never to the default
-graph. The default graph remains explicitly addressable by the ledger alias
-(`GRAPH <mydb:main> { ... }`) when named directly or bound from another
-pattern — it just isn't enumerated.
+graph. The default graph remains explicitly addressable by the ledger's own
+address in any spelling (`GRAPH <mydb:main> { ... }`, `GRAPH <mydb> { ... }`)
+when named directly or bound from another pattern — it just isn't
+enumerated. `GRAPH <mydb:main#http://example.org/g>` addresses the graph
+`http://example.org/g`, and a graph an earlier version registered under the
+address is listed, and read, as
+`<mydb:main#mydb:main>` (see [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)).
 
 Only user-registered named graphs are exposed this way; the reserved system
 graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
@@ -865,20 +888,28 @@ For local Fluree ledger queries, use the `fluree:ledger:` scheme:
 |--------|-------------|----------------------|
 | `fluree:ledger:<name>` | Query ledger with default branch (main) | `<name>:main` |
 | `fluree:ledger:<name>:<branch>` | Query specific branch | `<name>:<branch>` |
+| `fluree:ledger:urn:fluree:<name>:<branch>` | The same, in the URN spelling | `<name>:<branch>` |
 
 Where:
 - `<name>` is the ledger name **without** the branch (e.g., `orders`, `acme/people`)
 - `<branch>` is the branch name (e.g., `main`, `dev`)
 - The full dataset ledger ID is always `<name>:<branch>` (e.g., `orders:main`, `acme/people:dev`)
 
-The endpoint is resolved by matching against the full `ledger_id` in the dataset.
+The endpoint must name a ledger that is **in the query's dataset** (a `FROM` or
+`FROM NAMED` member), or, for a query with no dataset clause, the ledger the
+query runs on. An endpoint naming any other ledger is refused with a 400
+("… not in this query's dataset; add it with FROM NAMED to query it"), and under
+`SERVICE SILENT` it contributes no rows. A SERVICE endpoint never loads a ledger
+on its own. The endpoint names a whole ledger, so it takes no time pin
+(`@t:…`) and no graph (`#…`): the member's time and graphs come from the
+dataset.
 
 **Examples:**
 
 ```sparql
-SERVICE <fluree:ledger:orders> { ... }         -- matches orders:main
-SERVICE <fluree:ledger:orders:main> { ... }    -- matches orders:main (explicit)
-SERVICE <fluree:ledger:orders:dev> { ... }     -- matches orders:dev
+SERVICE <fluree:ledger:orders> { ... }         # matches orders:main
+SERVICE <fluree:ledger:orders:main> { ... }    # matches orders:main (explicit)
+SERVICE <fluree:ledger:orders:dev> { ... }     # matches orders:dev
 ```
 
 ### SERVICE SILENT
@@ -897,7 +928,7 @@ WHERE {
 }
 ```
 
-If the `orders` ledger is not in the dataset or encounters an error, the query returns results with unbound `?order` values instead of failing.
+If the `orders` ledger is not in the dataset or encounters an error, the SERVICE block contributes no rows instead of failing the query.
 
 ### Variable Endpoints
 
@@ -1263,7 +1294,27 @@ SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 - **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**. A graph that doesn’t exist contributes nothing, so a lone `USING` of an unknown graph gives the `WHERE` an empty default graph.
 - **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs. With `USING NAMED` and no `USING`, the `WHERE`’s default graph is empty.
 
-The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
+Each `USING`, `USING NAMED` or `WITH` IRI resolves in the ledger being updated,
+the same way a query's `FROM` does: the ledger's own address (`mydb`,
+`mydb:main`, `urn:fluree:mydb:main`) names its default graph, `mydb:main#config`
+or its URN names the config graph, and a registered graph IRI names that graph.
+A graph the ledger does not have contributes nothing, so `WHERE` over it binds
+nothing and the update changes nothing (SPARQL 1.1 Update §3.1.3). That
+includes an IRI that also reads as another ledger's address (`urn:g1`,
+`other:main`). An address that can only name another ledger (`other`,
+`other@t:1`), or an address with a time pin, is refused with a 400.
+
+A `GRAPH <iri>` block in the `WHERE` or in a template, and an `INSERT DATA` /
+`DELETE DATA` quad, read the address the same way: `mydb:main` is the default
+graph, so `WITH <mydb:main>` and `GRAPH <mydb:main> { … }` read and write it and
+never create a named graph called `mydb:main`, and `mydb:main#<graph IRI>` is
+that graph. See [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)
+for the full table, and for a graph an earlier version registered under the
+address. The reserved graphs keep their own IRIs, such as
+`urn:fluree:mydb:main#config`, and `mydb:main#config` names the config graph
+in these positions too: it writes the config graph, and `mydb:main#txn-meta`
+is refused as a write target like any name of `#txn-meta`.
 
 `urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, names the default graph in every clause that reads a graph: `USING`, `USING NAMED`, `WITH`, and `GRAPH <urn:default>` in the `WHERE`. `WITH <urn:default>` also writes the default graph. The default graph is not a named graph, so a write that names one by it (a `GRAPH <urn:default>` template or `INSERT DATA` quad, `CREATE GRAPH`, or a `CLEAR`/`DROP`/`ADD`/`COPY`/`MOVE` operand) is refused with a `400`; leave out `GRAPH`, or write `DEFAULT` in graph management.
 
@@ -1281,7 +1332,8 @@ WHERE  { GRAPH ?g { ?s ex:status "old" } }
 
 `DELETE WHERE { GRAPH ?g { ... } }` works the same way.
 
-- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>`.
+- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>` or `GRAPH <<ledger>#config>`.
+- The template writes the graph `?g` names in the ledger (see [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)), which is the graph the `WHERE` read: a `?g` bound to the ledger's own address writes the default graph.
 - `?g` may name a graph that does not exist yet, for example one built with `BIND(IRI(...) AS ?g)`. The commit registers it.
 - A solution that leaves `?g` unbound writes nothing for that block. A `?g` bound to a literal or a blank node is an error, as is a `?g` that names `#txn-meta`.
 
@@ -1297,6 +1349,37 @@ INSERT DATA {
   _:newPerson ex:age 25 .
 }
 ```
+
+### Lists
+
+An update reads and writes lists as [RDF lists](#rdf-lists): a `( … )` in a template writes one, and a WHERE that binds a list's cells lets the templates change them.
+
+```sparql
+# data: ex:s ex:items (1 2 3) .
+
+# Replace a member
+DELETE { ?c rdf:first 2 } INSERT { ?c rdf:first 20 }
+WHERE  { ex:s ex:items/rdf:rest ?c . ?c rdf:first 2 }
+
+# Append
+DELETE { ?last rdf:rest rdf:nil } INSERT { ?last rdf:rest ( 4 ) }
+WHERE  { ex:s ex:items/rdf:rest* ?last . ?last rdf:rest rdf:nil }
+
+# Move the list to another subject
+DELETE { ex:s ex:items ?l } INSERT { ex:t ex:items ?l }
+WHERE  { ex:s ex:items ?l }
+```
+
+- `ex:s ex:items 2` is no triple of the list: `DELETE DATA { ex:s ex:items 2 }` leaves the member, and `INSERT DATA { ex:s ex:items 2 }` adds a value beside the list.
+- Deleting a list's edge from its owner leaves its cells, as it does for any RDF list, and `DELETE WHERE { ex:s ?p ?o }` deletes the edge alone. To delete a list with its cells:
+
+  ```sparql
+  DELETE { ex:s ex:items ?l . ?c ?p ?o }
+  WHERE  { ex:s ex:items ?l . ?l rdf:rest* ?c . ?c ?p ?o }
+  ```
+- After `ADD` or `COPY`, a list is in both graphs as the same list, with the same cells.
+- Under a policy, a change to a list's cells is judged as a change to its owner's property, however the list is stored.
+- A list whose cells something else names, or that carries other triples, is stored as its triples; it reads the same. So is a second list on one subject and property, and a list `ADD` or `COPY` leaves in two graphs.
 
 ### Typed Literals
 
@@ -1364,7 +1447,7 @@ single-valued setting) run once, on the request's result.
 
 Current restrictions / boundaries:
 
-- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
+- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs, and read a graph named through the ledger's address, `<ledger>#<g>`, as the graph `<g>`. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
 - **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
 - **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
 - **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
@@ -1412,6 +1495,7 @@ SELECT ?name WHERE { ?person ex:name ?name }
 |--------|-------|------------|----------------|--------|
 | `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
 | `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
+| `reasoning-time` | ISO 8601 datetime | queries | `reasoningTime` | — |
 | `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
 | `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
 | `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |

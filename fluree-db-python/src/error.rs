@@ -4,7 +4,7 @@
 //! builtin (`LookupError`, `ValueError`, ...), which `create_exception!` cannot.
 
 use crate::convert::iri;
-use fluree_db_api::{ApiError, TransactError};
+use fluree_db_api::{ApiError, ImportError, TransactError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 
@@ -41,6 +41,10 @@ pub(crate) fn api_error(e: ApiError) -> PyErr {
                 details.set_item("head_t", head_t)?;
                 "ConflictError"
             }
+            ApiError::StorageInUse { holder, .. } => {
+                details.set_item("pid", holder)?;
+                "DatabaseInUseError"
+            }
             // Every retry lost a race: still a conflict, so `transact` retries
             // it. A 503 would otherwise read as a plain `FlureeError`.
             ApiError::CommitContention { last, .. } => {
@@ -57,6 +61,16 @@ pub(crate) fn api_error(e: ApiError) -> PyErr {
         Ok::<_, PyErr>(raise_with(class, message, Some(status), &details))
     })
     .unwrap_or_else(|err| err)
+}
+
+/// A failed import as its Python exception. A value the ledger refuses is
+/// raised as a transaction refusing it would be; anything else is a
+/// `FlureeError`.
+pub(crate) fn import_error(e: ImportError) -> PyErr {
+    match e {
+        ImportError::Invalid(e) => api_error(ApiError::Transact(e)),
+        e => fluree_error(e.to_string()),
+    }
 }
 
 pub(crate) fn class_for_status(status: u16) -> &'static str {

@@ -201,6 +201,11 @@ name = "policy_http"
 harness = false
 required-features = ["native", "credential"]
 
+[[bench]]
+name = "dataset_http"
+harness = false
+required-features = ["native", "credential"]
+
 # Integration tests are grouped into grp_* harnesses so the crate links a
 # handful of test binaries instead of one per tests/*.rs file. `autotests =
 # false` above is what stops each file from also becoming its own binary;

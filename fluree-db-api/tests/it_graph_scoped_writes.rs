@@ -213,6 +213,39 @@ async fn default_graph_sync_keeps_blank_nodes_and_guards_empty() {
     assert_eq!(cleared.retracted, 3, "{cleared:?}");
     assert_eq!(count(&fluree, ledger_id, None).await, 0);
     assert_eq!(count(&fluree, ledger_id, Some(OTHER)).await, 1);
+
+    // An empty JSON-LD array is guarded and clears the same way.
+    sync(
+        &fluree,
+        ledger_id,
+        &GraphSel::Default,
+        GraphPayload::Rdf(&spec),
+        false,
+    )
+    .await
+    .expect("refill");
+    let empty = json!([]);
+    let err = sync(
+        &fluree,
+        ledger_id,
+        &GraphSel::Default,
+        GraphPayload::JsonLd(&empty),
+        false,
+    )
+    .await
+    .expect_err("[] without allowEmpty");
+    assert!(err.to_string().contains("allowEmpty"), "{err}");
+    let cleared = sync(
+        &fluree,
+        ledger_id,
+        &GraphSel::Default,
+        GraphPayload::JsonLd(&empty),
+        true,
+    )
+    .await
+    .expect("allowEmpty clears with []");
+    assert_eq!(cleared.retracted, 3, "{cleared:?}");
+    assert_eq!(count(&fluree, ledger_id, None).await, 0);
 }
 
 #[tokio::test]
@@ -275,16 +308,17 @@ async fn graph_insert_refusals() {
             .expect_err("nothing to add");
         assert!(err.to_string().contains("nothing to add"), "{err}");
     }
-    let empty_json = json!({ "@graph": [] });
-    let err = insert(
-        &fluree,
-        ledger_id,
-        named(),
-        GraphPayload::JsonLd(&empty_json),
-    )
-    .await
-    .expect_err("nothing to add");
-    assert!(err.to_string().contains("nothing to add"), "{err}");
+    for empty_json in [json!({ "@graph": [] }), json!([])] {
+        let err = insert(
+            &fluree,
+            ledger_id,
+            named(),
+            GraphPayload::JsonLd(&empty_json),
+        )
+        .await
+        .expect_err("nothing to add");
+        assert!(err.to_string().contains("nothing to add"), "{err}");
+    }
 
     let other_block = format!("{PREFIX}GRAPH <{OTHER}> {{ ex:a ex:p \"x\" . }}\n");
     let err = insert(&fluree, ledger_id, named(), GraphPayload::Rdf(&other_block))

@@ -2662,6 +2662,59 @@ async fn policy_defaults_apply() {
     );
 }
 
+/// `f:policyClass` written as an RDF list reads its members, whether the list
+/// is stored compactly (`( … )`) or as the `rdf:first`/`rdf:rest` triples it
+/// stands for — a chain head used to be read as one blank-node "class".
+#[tokio::test]
+async fn policy_class_list_reads_its_members_in_either_shape() {
+    for (name, list) in [
+        ("collection", "( ex:A ex:B )".to_string()),
+        (
+            "chain",
+            "_:c0 . _:c0 rdf:first ex:A ; rdf:rest _:c1 . _:c1 rdf:first ex:B ; rdf:rest rdf:nil"
+                .to_string(),
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/config-policy-class-{name}:main");
+        let ledger = genesis_ledger(&fluree, &ledger_id);
+        let config_iri = config_graph_iri(&ledger_id);
+        let trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex: <http://example.org/ns/> .
+
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:policyDefaults <urn:config:policy> .
+                <urn:config:policy> f:policyClass {list} .
+            }}
+        "
+        );
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&trig)
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{name}: config write: {e}"));
+
+        let view = fluree.db(&ledger_id).await.unwrap();
+        let config = view.ledger_config().expect("config should be attached");
+        let mut classes = config
+            .policy
+            .as_ref()
+            .and_then(|p| p.policy_class.clone())
+            .unwrap_or_default();
+        classes.sort();
+        assert_eq!(
+            classes,
+            ["http://example.org/ns/A", "http://example.org/ns/B"],
+            "{name}"
+        );
+    }
+}
+
 // =============================================================================
 // Test 5: reasoning defaults apply (RDFS subProperty)
 // =============================================================================
@@ -4177,6 +4230,82 @@ async fn shacl_per_graph_mode_applies_to_graph_variable_targets() {
     let err = stage(ledger, update("http://example.org/strict"))
         .await
         .expect_err("violation in a Reject-mode graph reached through ?g must fail");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "expected a SHACL violation: {err:?}"
+    );
+}
+
+/// Per-graph SHACL governance reaches a new graph written beside a new graph
+/// the transaction only deletes from. The commit does not register the
+/// second, so the first takes the id the second would have taken (it sorts
+/// first); the staged flakes must be routed to that id, or validation looks
+/// under another id and the Reject override, the only one enabled, never
+/// applies.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_per_graph_mode_reaches_a_new_graph_beside_one_only_deleted_from() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-pergraph-delete-only:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r#"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://example.org/> .
+
+        ex:PersonShape rdf:type sh:NodeShape ;
+                       sh:targetClass ex:Person ;
+                       sh:property ex:pshape_name .
+        ex:pshape_name sh:path ex:name ;
+                       sh:minCount 1 .
+        ex:alice ex:name "Alice" .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:graphOverrides <urn:config:strict-override> .
+            <urn:config:strict-override> rdf:type f:GraphConfig ;
+                                         f:targetGraph <http://example.org/strict> ;
+                                         f:shaclDefaults <urn:config:strict-shacl> .
+            <urn:config:strict-shacl> f:shaclEnabled true ;
+                                      f:validationMode f:ValidationReject .
+        }}
+    "#
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config + shape write should succeed")
+        .ledger;
+
+    let parsed = fluree_db_sparql::parse_sparql(
+        r"PREFIX ex: <http://example.org/>
+          DELETE { GRAPH <http://example.org/also> { ?s ex:name ?o } }
+          INSERT { GRAPH <http://example.org/strict> { ex:bob a ex:Person } }
+          WHERE { ?s ex:name ?o }",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &parsed.ast.expect("SPARQL AST"),
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL UPDATE");
+    let err = fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect_err("a nameless ex:Person in the Reject-mode graph must fail");
     assert!(
         matches!(
             err,

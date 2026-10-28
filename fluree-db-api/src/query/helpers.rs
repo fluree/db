@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use crate::view::QueryInput;
+use crate::view::{DataSetDb, QueryInput};
 use crate::{
-    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider, Result,
-    Tracker, TrackingOptions, VarRegistry,
+    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider,
+    QueryExecutionOptions, Result, Tracker, TrackingOptions, VarRegistry,
 };
 
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_query::ir::Query;
-use fluree_db_query::parse::parse_query;
+use fluree_db_query::parse::parse_query_in_dataset;
 
 use super::QueryResult;
 
@@ -32,6 +32,25 @@ pub(crate) fn parse_jsonld_query(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     strict_compact_iri: Option<bool>,
+) -> Result<(VarRegistry, Query)> {
+    parse_jsonld_query_for_dataset(
+        query_json,
+        snapshot,
+        default_context,
+        strict_compact_iri,
+        &DataSetDb::new(),
+    )
+}
+
+/// [`parse_jsonld_query`] for a query run against `dataset`: a
+/// `["graph", …]` name the dataset registers is kept as written, even when
+/// the body does not list it in `fromNamed`.
+pub(crate) fn parse_jsonld_query_for_dataset(
+    query_json: &JsonValue,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    strict_compact_iri: Option<bool>,
+    dataset: &DataSetDb,
 ) -> Result<(VarRegistry, Query)> {
     let has_context = query_json.get("@context").is_some() || query_json.get("context").is_some();
 
@@ -54,7 +73,14 @@ pub(crate) fn parse_jsonld_query(
     };
 
     let mut vars = VarRegistry::new();
-    let parsed = parse_query(query_ref, snapshot, &mut vars, strict_compact_iri)?;
+    let dataset_names = dataset.named.keys().map(ToString::to_string).collect();
+    let parsed = parse_query_in_dataset(
+        query_ref,
+        snapshot,
+        &mut vars,
+        strict_compact_iri,
+        &dataset_names,
+    )?;
     Ok((vars, parsed))
 }
 
@@ -446,6 +472,7 @@ pub(crate) fn build_query_result(
         // (`query_view_with_r2rml_options`) overrides this to true so the
         // sparql_json formatter CURIE-compacts graph-source IRIs (F9).
         from_graph_source: false,
+        advisories: Vec::new(),
     }
 }
 
@@ -733,23 +760,40 @@ pub(crate) fn parse_dataset_spec_as(
     Ok((spec, qc_opts))
 }
 
-/// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED).
+/// The dataset a JSON-LD connection query reads, and its connection options:
+/// [`parse_dataset_spec_as`] for the caller `options` carries, with each
+/// member read at the ledger time `options` fixes for it, if any
+/// ([`QueryExecutionOptions::ledger_times`]).
+pub(crate) fn connection_dataset_spec(
+    query_json: &JsonValue,
+    options: &QueryExecutionOptions,
+) -> Result<(DatasetSpec, GovernanceOptions)> {
+    let (mut spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok((spec, qc_opts))
+}
+
+/// The dataset a SPARQL connection query reads: [`extract_sparql_dataset_spec`],
+/// with each member read at the ledger time `options` fixes for it, if any.
+pub(crate) fn connection_sparql_dataset_spec(
+    ast: &fluree_db_sparql::SparqlAst,
+    options: &QueryExecutionOptions,
+) -> Result<DatasetSpec> {
+    let mut spec = extract_sparql_dataset_spec(ast)?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok(spec)
+}
+
+/// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED),
+/// its IRIs expanded against the prologue (prefixes applied, BASE resolved).
 pub(crate) fn extract_sparql_dataset_spec(
     ast: &fluree_db_sparql::SparqlAst,
 ) -> Result<DatasetSpec> {
-    let dataset_clause = match &ast.body {
-        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Update(_) => None,
-    };
-
-    match dataset_clause {
-        Some(clause) => DatasetSpec::from_sparql_clause(clause)
-            .map_err(|e| ApiError::invalid_query(e.to_string())),
-        None => Ok(DatasetSpec::default()),
-    }
+    DatasetSpec::from_sparql_ast(ast).map_err(|e| ApiError::invalid_query(e.to_string()))
 }
 
 #[cfg(test)]

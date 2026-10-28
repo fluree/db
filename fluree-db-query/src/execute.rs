@@ -54,6 +54,7 @@ pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block
 
 // Re-export operator tree builder and runner for custom execution pipelines
 pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
+pub use reasoning_prep::explain_derived_facts;
 pub use runner::{run_operator, run_operator_streaming};
 
 // Re-export pushdown utilities for tests
@@ -64,7 +65,7 @@ pub use pushdown::{
 
 pub use runner::{
     prepare_execution, prepare_execution_with_binary_store, prepare_execution_with_config,
-    PrepareConfig,
+    PrepareConfig, QueryRequest,
 };
 
 #[cfg(test)]
@@ -118,6 +119,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         let executable = ExecutableQuery::simple(query);
         let results = execute(db, &vars, &executable, ContextConfig::default())
@@ -150,6 +152,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(
@@ -182,6 +185,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(

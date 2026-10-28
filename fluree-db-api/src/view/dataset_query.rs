@@ -4,8 +4,8 @@
 
 use crate::query::helpers::{
     build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
-    parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, sparql_ast_has_dataset,
-    tracked_query_tracker, tracker_for_input_limits,
+    parse_jsonld_query_for_dataset, parse_sparql_to_ir, prepare_for_execution,
+    sparql_ast_has_dataset, tracked_query_tracker, tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
 use crate::{
@@ -92,8 +92,11 @@ impl Fluree {
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
                 match &input {
+                    // This view is the whole dataset, already read from the body.
                     QueryInput::JsonLd(_) => {
-                        return self.query_with_options(view, input, options).await;
+                        return self
+                            .query_with_options(view, input, options.on_the_datasets_view())
+                            .await;
                     }
                     QueryInput::Sparql(sparql) => {
                         // Reuse the entry method's AST when it threaded one
@@ -140,11 +143,12 @@ impl Fluree {
 
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )?,
             QueryInput::Sparql(sparql) => {
                 // For dataset view, SPARQL FROM/FROM NAMED are allowed
@@ -187,14 +191,17 @@ impl Fluree {
             .await?;
 
         // 5. Build result with max_t across all views
-        Ok(build_query_result(
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        ))
+        );
+        result.advisories = advisories;
+        Ok(result)
     }
 
     pub(crate) async fn query_dataset_with_r2rml_options(
@@ -212,6 +219,7 @@ impl Fluree {
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
                 match &input {
+                    // This view is the whole dataset, already read from the body.
                     QueryInput::JsonLd(_) => {
                         return self
                             .query_view_with_r2rml_options(
@@ -219,7 +227,7 @@ impl Fluree {
                                 input,
                                 r2rml_provider,
                                 r2rml_table_provider,
-                                options,
+                                options.on_the_datasets_view(),
                             )
                             .await;
                     }
@@ -261,11 +269,12 @@ impl Fluree {
 
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )?,
             QueryInput::Sparql(sparql) => parse_sparql_to_ir(
                 sparql,
@@ -304,14 +313,17 @@ impl Fluree {
             )
             .await?;
 
-        Ok(build_query_result(
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             dataset.result_t(),
             dataset.composite_overlay(),
             primary.binary_graph(),
-        ))
+        );
+        result.advisories = advisories;
+        Ok(result)
     }
 
     /// Execute a dataset query with tracking.
@@ -378,11 +390,12 @@ impl Fluree {
 
         // Parse (SPARQL reuses the entry method's AST when threaded — #1473)
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
             QueryInput::Sparql(sparql) => {
@@ -496,11 +509,12 @@ impl Fluree {
         })?;
 
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
             QueryInput::Sparql(sparql) => parse_sparql_to_ir(
@@ -750,6 +764,8 @@ impl Fluree {
         if !is_single_ledger_dataset {
             prepare_config = prepare_config.without_binary_scans();
         }
+        let prepare_config =
+            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
@@ -934,6 +950,8 @@ impl Fluree {
         if !is_single_ledger_dataset {
             prepare_config = prepare_config.without_binary_scans();
         }
+        let prepare_config =
+            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;

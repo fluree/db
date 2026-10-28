@@ -130,6 +130,7 @@ macro_rules! view_context_config {
             include_system_facts: $executable.query.include_system_facts,
             cypher_vocab: $executable.query.cypher_vocab.clone(),
             trust_fk_refs: $options.trust_fk_refs,
+            primary_kind: __db.member_kind(),
             ..Default::default()
         };
         // The same provider answers `f:queryVector` when the embedded HNSW
@@ -144,6 +145,7 @@ macro_rules! view_context_config {
 mod dataset;
 mod dataset_builder;
 mod dataset_query;
+mod explain;
 mod fluree_ext;
 pub(crate) mod query;
 mod query_builder;

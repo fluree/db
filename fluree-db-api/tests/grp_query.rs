@@ -35,6 +35,8 @@ mod it_query_fulltext;
 mod it_query_geo;
 #[path = "it_query_geo_search.rs"]
 mod it_query_geo_search;
+#[path = "it_query_graph_names.rs"]
+mod it_query_graph_names;
 #[path = "it_query_grouping.rs"]
 mod it_query_grouping;
 #[path = "it_query_jsonld.rs"]
@@ -73,3 +75,5 @@ mod it_query_wildcard_system_facts;
 mod it_reserved_graph_contract;
 #[path = "it_service_cross_ledger_iri.rs"]
 mod it_service_cross_ledger_iri;
+#[path = "it_union_fact_identity.rs"]
+mod it_union_fact_identity;

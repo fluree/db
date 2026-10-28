@@ -367,7 +367,25 @@ impl PropertyPathOperator {
                         )
                     };
                     let flakes = Self::read_graph_edges(ctx, graph, index, range_match).await?;
+                    let view = self.pattern.list_view.as_deref();
+                    // A list member is no edge of its predicate in the list
+                    // view; the list's owner edge and cells are, below.
+                    let hides_members = view.is_some_and(|v| v.may_hold_lists(pred));
+                    let mut steps = Vec::new();
+                    if let Some(view) = view {
+                        steps =
+                            crate::list_view::path_steps(ctx, graph, view, node, pred, use_post)
+                                .await?;
+                    }
+                    for n in steps {
+                        if seen.insert(n.clone()) {
+                            out.push(n);
+                        }
+                    }
                     for flake in flakes {
+                        if hides_members && crate::list_view::is_member(&flake) {
+                            continue;
+                        }
                         // POST yields the subject side; SPOT yields the ref object.
                         let next = if use_post {
                             Some(flake.s)
@@ -423,6 +441,10 @@ impl PropertyPathOperator {
     /// edges are removed here so the path neither traverses them nor reaches the
     /// nodes behind them, matching the per-flake semantics of the scan path.
     /// No-op for root / no policy (the filter short-circuits).
+    ///
+    /// Every edge read is charged to the query's fuel, as a row a range read
+    /// returns: traversal reads each reached node's edges, so this prices
+    /// the walk itself.
     async fn read_graph_edges(
         ctx: &ExecutionContext<'_>,
         graph: &PathGraph<'_>,
@@ -439,6 +461,9 @@ impl PropertyPathOperator {
             RangeOptions::new().with_to_t(graph.to_t),
         )
         .await?;
+        ctx.tracker.consume_fuel(
+            flakes.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+        )?;
         BinaryScanOperator::filter_flakes_by_enforcer(
             ctx,
             graph.policy_enforcer.as_ref(),
@@ -764,6 +789,13 @@ impl PropertyPathOperator {
                 }
             }
         }
+        if let Some(view) = self.pattern.list_view.as_deref() {
+            for cell in crate::list_view::cell_nodes(ctx, &graphs, view).await? {
+                if seen_nodes.insert(cell.clone()) {
+                    out.push(Binding::sid(cell));
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -826,11 +858,14 @@ impl PropertyPathOperator {
         let graphs = ctx.path_graphs()?;
         let mut adj: std::collections::HashMap<Sid, Vec<Sid>> = std::collections::HashMap::new();
         let mut nodes: HashSet<Sid> = HashSet::new();
-        let mut ingest = |flake: fluree_db_core::Flake| {
+        let mut edge = |s: Sid, o: Sid| {
+            nodes.insert(s.clone());
+            nodes.insert(o.clone());
+            adj.entry(s).or_default().push(o);
+        };
+        let ingest = |flake: fluree_db_core::Flake, edge: &mut dyn FnMut(Sid, Sid)| {
             if let FlakeValue::Ref(o) = flake.o {
-                nodes.insert(flake.s.clone());
-                nodes.insert(o.clone());
-                adj.entry(flake.s).or_default().push(o);
+                edge(flake.s, o);
             }
         };
         if self.pattern.wildcard {
@@ -841,10 +876,11 @@ impl PropertyPathOperator {
                 .await?;
             for flake in flakes {
                 if !is_reserved_edge_predicate(&flake.p) {
-                    ingest(flake);
+                    ingest(flake, &mut edge);
                 }
             }
         } else {
+            let view = self.pattern.list_view.as_deref();
             for pred in &self.pattern.predicates {
                 // Re-encode into each graph's dict — see `reencode_pred`.
                 let flakes = self
@@ -852,8 +888,16 @@ impl PropertyPathOperator {
                         RangeMatch::predicate(reencode_pred(ctx, db, pred))
                     })
                     .await?;
+                let hides_members = view.is_some_and(|v| v.may_hold_lists(pred));
                 for flake in flakes {
-                    ingest(flake);
+                    if !(hides_members && crate::list_view::is_member(&flake)) {
+                        ingest(flake, &mut edge);
+                    }
+                }
+                if let Some(view) = view {
+                    for (s, o) in crate::list_view::path_edges(ctx, &graphs, view, pred).await? {
+                        edge(s, o);
+                    }
                 }
             }
         }
@@ -1018,14 +1062,22 @@ impl PropertyPathOperator {
                     RangeMatch::predicate(reencode_pred(ctx, db, pred))
                 })
                 .await?;
-            for flake in flakes {
+            let mut edges: Vec<(Sid, Option<Sid>)> = flakes
+                .into_iter()
+                .map(|flake| match flake.o {
+                    FlakeValue::Ref(o) => (flake.s, Some(o)),
+                    _ => (flake.s, None),
+                })
+                .collect();
+            if let Some(view) = self.pattern.list_view.as_deref() {
+                let list_edges = crate::list_view::path_edges(ctx, &graphs, view, pred).await?;
+                edges.extend(list_edges.into_iter().map(|(s, o)| (s, Some(o))));
+            }
+            for (s, o) in edges {
                 let candidate = if self.pattern.first_inverse {
-                    match flake.o {
-                        FlakeValue::Ref(o) => Some(o),
-                        _ => None,
-                    }
+                    o
                 } else {
-                    Some(flake.s)
+                    Some(s)
                 };
                 if let Some(c) = candidate {
                     if seen.insert(c.clone()) {
@@ -1060,6 +1112,12 @@ impl PropertyPathOperator {
             for flake in flakes {
                 nodes.insert(flake.s);
                 if let FlakeValue::Ref(o) = flake.o {
+                    nodes.insert(o);
+                }
+            }
+            if let Some(view) = self.pattern.list_view.as_deref() {
+                for (s, o) in crate::list_view::path_edges(ctx, &graphs, view, pred).await? {
+                    nodes.insert(s);
                     nodes.insert(o);
                 }
             }
@@ -1166,7 +1224,13 @@ impl PropertyPathOperator {
     /// that exists only in novelty, or a path over more than one graph (the
     /// lane reads a single graph's index).
     fn id_lane(&self, ctx: &ExecutionContext<'_>) -> Result<Option<PathIdLane>> {
-        if self.pattern.is_composite() {
+        // Raw ids name no list cell, which nothing stores.
+        let walks_lists = self
+            .pattern
+            .list_view
+            .as_deref()
+            .is_some_and(|view| crate::list_view::walks_lists(&self.pattern, view));
+        if self.pattern.is_composite() || walks_lists {
             return Ok(None);
         }
         let Some(store) = ctx.binary_store.as_ref() else {
@@ -1835,6 +1899,10 @@ impl Operator for PropertyPathOperator {
                 self.state = OperatorState::Exhausted;
                 return Ok(None);
             }
+            // Each emitted row is charged, as a scan charges its rows.
+            ctx.tracker.consume_fuel(
+                batch_results.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+            )?;
 
             // A both-constant path (e.g. `:a0 (:p)* :a1`, pp36) binds no
             // variables, so `in_schema` is empty and `Batch::new` would infer
@@ -1924,6 +1992,9 @@ impl Operator for PropertyPathOperator {
             }
 
             if !all_rows.is_empty() {
+                ctx.tracker.consume_fuel(
+                    all_rows.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+                )?;
                 // Same empty-schema guard as unseeded mode (pp36): a
                 // both-constant path over a variable-free child produces rows
                 // with no columns; preserve the row count instead of letting

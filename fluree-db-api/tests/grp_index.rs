@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_custom_datatype_limit.rs"]
 mod it_custom_datatype_limit;
+#[path = "it_delete_survives_index_build.rs"]
+mod it_delete_survives_index_build;
 #[path = "it_disk_cache_locality.rs"]
 mod it_disk_cache_locality;
 #[path = "it_duration_index_roundtrip.rs"]
@@ -39,11 +41,15 @@ mod it_reindex_pre_build_perf;
 mod it_reindex_schema;
 #[path = "it_stats_sketch_format.rs"]
 mod it_stats_sketch_format;
+#[path = "it_store_load_failure.rs"]
+mod it_store_load_failure;
 #[path = "it_time_travel_indexing.rs"]
 mod it_time_travel_indexing;
 #[path = "it_trigger_index_incremental.rs"]
 mod it_trigger_index_incremental;
 #[path = "it_typed_literal_index.rs"]
 mod it_typed_literal_index;
+#[path = "it_vector_lengths.rs"]
+mod it_vector_lengths;
 #[path = "it_xsd_double_special_values.rs"]
 mod it_xsd_double_special_values;

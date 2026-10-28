@@ -95,6 +95,12 @@ pub(crate) struct SequentialStager {
     /// fact whose first and last ops differ may net to no change; see
     /// [`Self::finish`].
     first_ops: Vec<bool>,
+    /// The retraction each fact first staged as a retraction was staged
+    /// with, by `folded` index, kept once a later operation overwrote it.
+    /// That retraction was staged against the base, so it names the fact as
+    /// the base stores it; a later one may name it as an earlier operation
+    /// wrote it. See [`Self::drop_reversed_facts`].
+    first_retractions: HashMap<usize, fluree_db_core::Flake>,
     fold_index: HashMap<SequentialFactKey, usize>,
     /// Simulated sequential per-op graph-id assignment, so the merged view's
     /// routing matches the ids each op's staging (and each intermediate
@@ -128,15 +134,11 @@ pub(crate) struct SequentialStager {
     nested: bool,
 }
 
-/// Fact identity for the sequential fold (flake minus `t`/`op`).
-type SequentialFactKey = (
-    Option<Sid>,
-    Sid,
-    Sid,
-    FlakeValue,
-    Sid,
-    Option<fluree_db_core::FlakeMeta>,
-);
+/// Fact identity for the sequential fold: `(g, s, p)` and the object as
+/// storage tells it apart ([`fluree_db_transact::FactTerm`]). A delete that
+/// retracts the stored term and an insert that writes the same value with
+/// more detail than the index keeps are one fact, as they are to storage.
+type SequentialFactKey = (Option<Sid>, Sid, Sid, fluree_db_transact::FactTerm);
 
 impl SequentialStager {
     pub(crate) fn new(ledger: LedgerState) -> Self {
@@ -146,6 +148,7 @@ impl SequentialStager {
             final_t,
             folded: Vec::new(),
             first_ops: Vec::new(),
+            first_retractions: HashMap::new(),
             fold_index: HashMap::new(),
             sim_registry: ledger.snapshot.graph_registry.clone(),
             merged_graph_iris: Vec::new(),
@@ -262,6 +265,7 @@ impl SequentialStager {
 
         let (mut state_i, flakes_i) = result.view.into_parts();
         let staged_count = flakes_i.len();
+        let ids = fluree_db_transact::FactIdentity::new(&self.original);
         for flake in &flakes_i {
             let mut merged = flake.clone();
             merged.t = self.final_t;
@@ -269,13 +273,15 @@ impl SequentialStager {
                 merged.g.clone(),
                 merged.s.clone(),
                 merged.p.clone(),
-                merged.o.clone(),
-                merged.dt.clone(),
-                merged.m.clone(),
+                ids.of_flake(&merged),
             );
             match self.fold_index.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
-                    self.folded[*entry.get()] = merged;
+                    let i = *entry.get();
+                    let replaced = std::mem::replace(&mut self.folded[i], merged);
+                    if !self.first_ops[i] {
+                        self.first_retractions.entry(i).or_insert(replaced);
+                    }
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(self.folded.len());
@@ -310,30 +316,85 @@ impl SequentialStager {
     /// the fact, or retracted then re-asserted when it has it. Last-wins
     /// alone would commit the final op — a retraction of a fact the ledger
     /// never held, for `INSERT x ; DELETE x`. Only facts whose first and last
-    /// ops differ are looked up; the base decides because staging still
-    /// stages an assert of a fact already present, so a first-op assert does
-    /// not say what the base held. (A first-op retraction does: staging only
-    /// retracts a stored fact.)
+    /// ops differ are looked up for that; the base decides because staging
+    /// still stages an assert of a fact already present, so a first-op assert
+    /// does not say what the base held. (A first-op retraction does: staging
+    /// only retracts a stored fact.)
+    ///
+    /// The base is asked through [`CurrentFacts::all_named_by`], by the
+    /// identity the fold keyed the fact by. Every retraction that stays
+    /// retracts the fact as the base stores it, under every term the base
+    /// holds it by: an earlier operation may have written the value with
+    /// more detail than the index keeps, and novelty holds the subtypes of
+    /// one big integer apart until the next index build, so the fold's one
+    /// retraction can stand for several stored terms. A fact whose first op
+    /// retracted is that first retraction again, which staging read from the
+    /// base; a big integer's is also asked again, for its other terms.
+    ///
+    /// [`CurrentFacts::all_named_by`]: fluree_db_transact::CurrentFacts::all_named_by
     async fn drop_reversed_facts(&mut self) -> Result<()> {
-        let mut keep = vec![true; self.folded.len()];
-        for (i, flake) in self.folded.iter().enumerate() {
-            if flake.op == self.first_ops[i] {
-                continue;
+        for (i, first) in std::mem::take(&mut self.first_retractions) {
+            if !self.folded[i].op {
+                self.folded[i] = first;
             }
-            let key =
-                fluree_db_core::ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone());
-            let in_base = crate::rebase::current_asserted_for_key(&self.original, &key)
-                .await?
-                .iter()
-                .map(fluree_db_transact::StoredFact::flake)
-                .any(|f| f.o == flake.o && f.dt == flake.dt && f.m == flake.m);
-            keep[i] = flake.op != in_base;
         }
-        if keep.iter().all(|k| *k) {
+        let asked: Vec<usize> = (0..self.folded.len())
+            .filter(|&i| {
+                let f = &self.folded[i];
+                f.op != self.first_ops[i] || (!f.op && f.o.index_keys_by_value())
+            })
+            .collect();
+        if asked.is_empty() {
             return Ok(());
         }
-        let mut keep = keep.into_iter();
-        self.folded.retain(|_| keep.next().unwrap_or(true));
+        // A graph the base does not have holds nothing: no slot to ask.
+        let slots: Vec<(usize, fluree_db_transact::Slot)> = asked
+            .iter()
+            .filter_map(|&i| {
+                let f = &self.folded[i];
+                fluree_db_transact::Slot::in_ledger(&self.original, &f.g, &f.s, &f.p)
+                    .map(|slot| (i, slot))
+            })
+            .collect();
+        let items: Vec<(fluree_db_transact::Slot, &fluree_db_core::Flake)> = slots
+            .iter()
+            .map(|(i, slot)| (slot.clone(), &self.folded[*i]))
+            .collect();
+        let named = fluree_db_transact::CurrentFacts::new(&self.original)
+            .all_named_by(&items)
+            .await?;
+        let mut stored: HashMap<usize, Vec<fluree_db_transact::StoredFact>> = slots
+            .iter()
+            .zip(named)
+            .map(|((i, _), facts)| (*i, facts))
+            .collect();
+        let mut keep = vec![true; self.folded.len()];
+        let mut more = Vec::new();
+        for i in asked {
+            let held = stored.remove(&i).unwrap_or_default();
+            if self.folded[i].op {
+                // Retracted then re-asserted: a restatement when the base
+                // holds the fact.
+                keep[i] = held.is_empty();
+                continue;
+            }
+            let mut retractions = held
+                .into_iter()
+                .map(|fact| fact.retract(self.final_t).into_flake());
+            match retractions.next() {
+                Some(first) => {
+                    self.folded[i] = first;
+                    more.extend(retractions);
+                }
+                // Asserted then retracted, of a fact the base lacks.
+                None => keep[i] = false,
+            }
+        }
+        if keep.iter().any(|k| !k) {
+            let mut keep = keep.into_iter();
+            self.folded.retain(|_| keep.next().unwrap_or(true));
+        }
+        self.folded.extend(more);
         Ok(())
     }
 
@@ -4147,13 +4208,21 @@ impl crate::Fluree {
             tracing::debug_span!("turtle_parse_to_flakes", turtle_bytes = turtle.len());
         let parsed = {
             let _g = parse_span.enter();
-            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id);
-            fluree_graph_turtle::parse(turtle, &mut sink).map(|()| sink.into_flakes())
+            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id.clone());
+            fluree_graph_turtle::parse(turtle, &mut sink).map(|()| sink.into_flakes_and_lists())
         };
         let flakes = match parsed {
-            Ok(flakes) => {
+            Ok(parts) => {
                 stamp_fast_path(TURTLE_INSERT_SITE, FastPathOutcome::Proceed);
-                flakes.map_err(ApiError::from)?
+                let (mut flakes, lists) = parts.map_err(ApiError::from)?;
+                // An insert retracts nothing, so every list member the ledger
+                // holds survives it.
+                flakes.extend(
+                    fluree_db_transact::lists::store_lists(&ledger, lists, &txn_id, |_| false)
+                        .await
+                        .map_err(ApiError::from)?,
+                );
+                flakes
             }
             Err(turtle_err) => {
                 return self

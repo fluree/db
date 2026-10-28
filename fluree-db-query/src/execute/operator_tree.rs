@@ -43,6 +43,7 @@ use crate::fast_whole_graph_agg::{
 use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
+use crate::index_scope::ScopeKind;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{
     AggregateFn, AggregateSpec, Aggregation, Expression, Grouping, InputSemantics, PathModifier,
@@ -1716,7 +1717,23 @@ fn anchored_literal_regex_prefix(pattern: &str) -> Option<Arc<str>> {
 /// Detect if this is a stats fast-path query: `SELECT ?p (COUNT(?x) as ?c) WHERE { ?s ?p ?o } GROUP BY ?p`
 ///
 /// Returns `Some((predicate_var, count_output_var))` if the query matches the pattern.
-fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
+/// `query`'s one triple pattern, and whether SPARQL's view of RDF lists
+/// answers it (`crate::list_view`) — then the only list view in the query.
+fn single_triple(query: &Query) -> Option<(&TriplePattern, bool)> {
+    match query.patterns.as_slice() {
+        [Pattern::Triple(tp)] => Some((tp, false)),
+        [Pattern::ListView(lv)]
+            if !crate::list_view::modifiers_have_list_view(&query.grouping, &query.order_binds) =>
+        {
+            Some((&lv.triple, true))
+        }
+        _ => None,
+    }
+}
+
+/// The predicate and count variables of a per-predicate `COUNT` over
+/// `?s ?p ?o`, and whether the list view answers the pattern.
+fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId, bool)> {
     // Expression ORDER BY needs the generic pipeline's order-bind stage; this
     // fast path sorts on `query.ordering` directly (a synthetic, unbound sort
     // var would be silently dropped), so decline it.
@@ -1734,12 +1751,7 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
-    if query.patterns.len() != 1 {
-        return None;
-    }
-    let Pattern::Triple(tp) = &query.patterns[0] else {
-        return None;
-    };
+    let (tp, lists) = single_triple(query)?;
 
     // All three positions must be variables
     let Ref::Var(s_var) = &tp.s else {
@@ -1798,7 +1810,7 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
         "detected stats count-by-predicate fast-path"
     );
 
-    Some((*p_var, agg.output_var))
+    Some((*p_var, agg.output_var, lists))
 }
 
 fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> {
@@ -2070,16 +2082,13 @@ fn detect_count_distinct_position(query: &Query) -> Option<(DistinctPosition, Va
 /// Detect `SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }`, answered from the
 /// whole-permutation triple count. All three positions must be distinct
 /// variables — `{ ?x ?p ?x }` counts self-loops, not triples.
-fn detect_count_triples(query: &Query) -> Option<VarId> {
+/// The output variable of a `COUNT` over `?s ?p ?o`, and whether the list
+/// view answers the pattern.
+fn detect_count_triples(query: &Query) -> Option<(VarId, bool)> {
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
     // Pattern shape: exactly one triple with all vars.
-    if query.patterns.len() != 1 {
-        return None;
-    }
-    let Pattern::Triple(tp) = &query.patterns[0] else {
-        return None;
-    };
+    let (tp, lists) = single_triple(query)?;
     let Ref::Var(sv) = &tp.s else { return None };
     let Ref::Var(pv) = &tp.p else { return None };
     let Term::Var(ov) = &tp.o else { return None };
@@ -2097,7 +2106,7 @@ fn detect_count_triples(query: &Query) -> Option<VarId> {
         }
     }
 
-    Some(out_var)
+    Some((out_var, lists))
 }
 
 fn detect_transitive_path_plus_count_all(query: &Query) -> Option<(Ref, Ref, VarId)> {
@@ -2446,6 +2455,14 @@ fn build_operator_tree_inner(
     // below alike.
     let fast_paths_globally_disabled = fast_paths_disabled();
     let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+    // A pattern answered in SPARQL's view of RDF lists counts list triples
+    // that no stored row is (`crate::list_view`); every fast path reads the
+    // stored rows, members included, so none applies.
+    let list_view = crate::list_view::query_has_list_view(query);
+    // Lanes that correct for the list view's triples, when it answers the
+    // query's only pattern, run under the setting the view does not clear.
+    let enable_list_corrected_fast_paths = enable_fused_fast_paths;
+    let enable_fused_fast_paths = enable_fused_fast_paths && !list_view;
     // A trailing VALUES clause (`query.post_values`) joins after the WHERE
     // tree, below grouping. Every fast path reads `query.patterns` alone, so
     // one would answer as if the VALUES were absent (`COUNT(*) … VALUES ?a
@@ -2480,10 +2497,11 @@ fn build_operator_tree_inner(
     //
     // The fused paths also read one graph's index (`binary_g_id`'s), so they
     // are planned only for a default graph of exactly one graph
-    // (`planning.one_graph`, which implies `!multi_default_graph`): their
-    // runtime gates check the same definition, and a default graph of none
-    // (`FROM NAMED` alone) has no index to read either.
-    let enable_fused_fast_paths = enable_fused_fast_paths && planning.one_graph;
+    // (`ScopeKind::One`, which implies `!multi_default_graph`): their runtime
+    // gates check the same definition, and a default graph of none (`FROM
+    // NAMED` alone) has no index to read either.
+    let enable_fused_fast_paths =
+        enable_fused_fast_paths && planning.index_scope_kind == ScopeKind::One;
 
     // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
     // generic pipeline's dedicated post-grouping bind stage. No fast path runs
@@ -2918,10 +2936,16 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s ?p ?o }`
     // answered metadata-only by summing leaf row_count across a branch manifest.
-    if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_triples(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_triples_operator(out_var, Some(fallback))));
+    if enable_list_corrected_fast_paths {
+        if let Some((out_var, lists)) = detect_count_triples(query) {
+            if enable_fused_fast_paths || lists {
+                let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+                return Ok(Box::new(count_triples_operator(
+                    out_var,
+                    lists,
+                    Some(fallback),
+                )));
+            }
         }
     }
 
@@ -3083,7 +3107,7 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
-    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values && !list_view {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
@@ -3121,7 +3145,7 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
-    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values && !list_view {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
@@ -3180,7 +3204,9 @@ fn build_operator_tree_inner(
         && !trailing_values
         && stats.is_some()
     {
-        if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
+        if let Some((pred_var, count_var, lists)) =
+            detect_stats_count_by_predicate(query).filter(|(_, _, lists)| *lists || !list_view)
+        {
             // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
             // stamps the runtime Proceed/Fallback(GateDeclined) at open().
             stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
@@ -3208,6 +3234,7 @@ fn build_operator_tree_inner(
             let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
                 pred_var,
                 count_var,
+                lists,
                 Some(fallback),
             ));
 
@@ -3504,9 +3531,10 @@ pub(crate) fn apply_solution_modifiers(
     // scan arrives sorted by the key, but `DatasetOperator` drains the members
     // one after another, so one key's rows come in one run per member. The
     // operator also checks its scope at open, by the same definition
-    // (`planning.one_graph` here, `ExecutionContext::reads_exactly_one_graph`
+    // (`planning.index_scope_kind` here, `ExecutionContext::scope_kind`
     // there).
-    let partitioned = partitioned && !planning.is_history() && planning.one_graph;
+    let partitioned =
+        partitioned && !planning.is_history() && planning.index_scope_kind == ScopeKind::One;
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
     // tail treats both variants uniformly. Cloning is cheap — both vectors are
@@ -4505,6 +4533,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         }
     }
 
@@ -4707,6 +4736,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Grouping::assemble(
                 vec![p],
                 vec![AggregateSpec {
@@ -4726,7 +4756,7 @@ mod tests {
 
         // Bare-variable ORDER BY (no order binds): fast path applies.
         let plain = make(Vec::new(), vec![SortSpec::asc(c)]);
-        assert_eq!(detect_stats_count_by_predicate(&plain), Some((p, c)));
+        assert_eq!(detect_stats_count_by_predicate(&plain), Some((p, c, false)));
 
         // Expression ORDER BY (order binds present): must decline.
         let with_expr = make(
@@ -4786,6 +4816,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let spec =
@@ -4819,6 +4850,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(
@@ -4852,6 +4884,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let kept = bindable_sort_keys(
@@ -4971,6 +5004,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -4999,6 +5033,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),
@@ -5038,6 +5073,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -5115,6 +5151,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -5175,6 +5212,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -5227,6 +5265,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: None,
             ordering,
             order_binds: Vec::new(),

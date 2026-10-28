@@ -23,6 +23,19 @@ pub struct CountGroup {
     pub count: u64,
 }
 
+/// What one row of a triple pattern's scan needs beside its bindings to name
+/// the fact it matched. Storage's fact identity is one fact per value
+/// and list position. The bindings carry neither the term a constant object
+/// matched (a constant can match terms of several datatypes: `1` matches
+/// `1` and `1.0e0`) nor the list position, so two facts can bind one row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RowFact {
+    /// The matched object, when the pattern's object is a constant literal.
+    pub object: Option<Binding>,
+    /// The list position, when the fact is a list item.
+    pub list_index: Option<u32>,
+}
+
 /// Query execution operator
 ///
 /// Operators follow a lifecycle pattern for resource control:
@@ -167,6 +180,20 @@ pub trait Operator: Send + Sync {
     /// authoritative, so honoring it never changes results. Set **before**
     /// `open()`.
     fn set_distinct(&mut self, _vars: &[VarId]) {}
+
+    /// Record the fact each returned row matched ([`RowFact`]), for a union
+    /// of graphs that deduplicates on fact identity. Returns whether this
+    /// operator records them; a triple pattern's scan does. Set **before**
+    /// `open()`.
+    fn record_row_facts(&mut self) -> bool {
+        false
+    }
+
+    /// The facts of the rows of the batch `next_batch` last returned, in row
+    /// order, once [`Self::record_row_facts`] armed recording.
+    fn take_row_facts(&mut self) -> Option<Vec<RowFact>> {
+        None
+    }
 
     // ------------------------------------------------------------------
     // EXPLAIN introspection (never called on the hot path)
