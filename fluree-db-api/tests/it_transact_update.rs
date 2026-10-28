@@ -1200,6 +1200,92 @@ async fn update_where_bind_iri_in_an_unseen_namespace() {
     assert_eq!(both, json!(["ex:direct", "ex:error"]));
 }
 
+/// A constant `(iri ..)` is expanded as an insert's `@id` is (#1765):
+/// `"ex:thing"` with `ex` in the `@context` writes the expanded IRI, the term
+/// `{"@id": "ex:thing"}` stores, and `"bad:thing"` with no `bad` prefix is
+/// refused with the insert's "Unresolved compact IRI" error rather than
+/// written as the IRI `bad:thing`.
+#[tokio::test]
+async fn update_where_bind_iri_expands_through_the_context() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:iri-context");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {"id": "ex:error", "ex:text": "Abcdefg"}
+            }),
+        )
+        .await
+        .expect("seed");
+    let bind_iri = |iri: &str| {
+        json!({
+            "@context": ctx_ex(),
+            "where": [
+                {"id": "?s", "ex:text": "?text"},
+                ["bind", "?o", format!("(iri \"{iri}\")")]
+            ],
+            "insert": {"id": "?s", "ex:ref": "?o"}
+        })
+    };
+
+    for (what, refused) in [
+        (
+            "(iri \"bad:thing\")",
+            fluree
+                .update(seeded.ledger.clone(), &bind_iri("bad:thing"))
+                .await
+                .err(),
+        ),
+        (
+            "{\"@id\": \"bad:thing\"}",
+            fluree
+                .insert(
+                    seeded.ledger.clone(),
+                    &json!({"@context": ctx_ex(), "@id": "ex:direct", "ex:ref": {"@id": "bad:thing"}}),
+                )
+                .await
+                .err(),
+        ),
+    ] {
+        let err = refused.unwrap_or_else(|| panic!("{what} is refused"));
+        assert!(
+            err.to_string().contains("Unresolved compact IRI 'bad:thing'"),
+            "{what}: {err}"
+        );
+    }
+
+    let updated = fluree
+        .update(seeded.ledger, &bind_iri("ex:thing"))
+        .await
+        .expect("(iri \"ex:thing\")");
+    let direct = fluree
+        .insert(
+            updated.ledger,
+            &json!({"@context": ctx_ex(), "@id": "ex:direct", "ex:ref": {"@id": "ex:thing"}}),
+        )
+        .await
+        .expect("direct insert of the same IRI");
+    let both = support::query_jsonld(
+        &fluree,
+        &direct.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:ref": {"@id": "http://example.com/thing"}},
+            "orderBy": "?s"
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&direct.ledger.snapshot)
+    .expect("format");
+    assert_eq!(both, json!(["ex:direct", "ex:error"]));
+}
+
 /// SPARQL's twin: `IRI()` and `UUID()` in a namespace the ledger has never
 /// registered write as subject, predicate and object, each the term an
 /// `INSERT DATA` of the IRI stores (#1765). A DELETE of such an IRI matches

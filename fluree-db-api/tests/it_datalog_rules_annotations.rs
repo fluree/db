@@ -976,10 +976,9 @@ async fn filter_iri_operand_forms_across_spellings() {
     // string: a prefixed name resolves through the query's `@context`, a bare
     // absolute URL is an IRI, and a quoted value is a string. The array form
     // has no such syntax — every element is a JSON string — so a bare atom is
-    // always a string there, and `iri(…)` is the way to mean the IRI. Note
-    // `iri(…)` does NOT expand a prefix — its argument is used verbatim, and
-    // this surface has no BASE to resolve against — so the array form needs
-    // the full IRI.
+    // always a string there, and `iri(…)` is the way to mean the IRI. A
+    // constant `iri(…)` argument is expanded as an `@id` is, so a prefixed
+    // name the `@context` defines works there as the full IRI does.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = claims_ledger(&fluree, "rules/filter-forms").await;
 
@@ -1006,9 +1005,9 @@ async fn filter_iri_operand_forms_across_spellings() {
             0,
         ),
         (
-            "array iri() with a prefixed name (not expanded)",
+            "array iri() with a prefixed name, expanded as an @id is",
             json!(["filter", ["=", "?p", ["iri", "ex:knows"]]]),
-            0,
+            matching,
         ),
         (
             "array iri() with an absolute URL",

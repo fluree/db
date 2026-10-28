@@ -226,6 +226,82 @@ async fn jsonld_bind_error_unexpanded_xsd_datatype() {
     assert_eq!(verbatim, json!(["xsd:integer"]));
 }
 
+/// A constant `iri` argument is expanded as a JSON-LD `@id` is (#1765): a
+/// prefix the `@context` defines gives the expanded IRI, and an undefined
+/// one is the insert's "Unresolved compact IRI" error, unless
+/// `strictCompactIri` is off, which takes it verbatim as an insert does.
+#[tokio::test]
+async fn jsonld_bind_iri_expands_through_the_context() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "query/bind:iri-context";
+    let ledger = seed_people_filter_dataset(&fluree, ledger_id).await;
+
+    let query = |iri: &str, opts: serde_json::Value| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+            "where": [
+                {"@id": "ex:alice", "schema:name": "?name"},
+                ["bind", "?x", format!("(iri \"{iri}\")"), "?s", "(str ?x)"]
+            ],
+            "select": "?s",
+            "opts": opts
+        })
+    };
+
+    let expanded = support::query_jsonld_formatted(&fluree, &ledger, &query("ex:T", json!({})))
+        .await
+        .expect("a defined prefix");
+    assert_eq!(expanded, json!(["http://example.org/ns/T"]));
+    assert_query_bind_error(
+        &fluree,
+        &ledger,
+        query("bad:thing", json!({})),
+        "Unresolved compact IRI 'bad:thing'",
+    )
+    .await;
+    let verbatim = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &query("bad:thing", json!({"strictCompactIri": false})),
+    )
+    .await
+    .expect("strictCompactIri: false");
+    assert_eq!(verbatim, json!(["bad:thing"]));
+
+    // The array form of a filter, whose bare atoms are strings, expands the
+    // same two arguments: an `iri` argument and a `str-dt` datatype.
+    for (what, filter) in [
+        (
+            "iri",
+            json!([
+                "filter",
+                ["=", ["iri", "ex:T"], ["iri", "http://example.org/ns/T"]]
+            ]),
+        ),
+        (
+            "str-dt",
+            json!([
+                "filter",
+                [
+                    "=",
+                    ["datatype", ["str-dt", "?name", "ex:T"]],
+                    ["iri", "http://example.org/ns/T"]
+                ]
+            ]),
+        ),
+    ] {
+        let q = json!({
+            "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+            "where": [{"@id": "ex:alice", "schema:name": "?name"}, filter],
+            "select": "?name"
+        });
+        let rows = support::query_jsonld_formatted(&fluree, &ledger, &q)
+            .await
+            .unwrap_or_else(|e| panic!("array-form {what}: {e}"));
+        assert_eq!(rows, json!(["Alice"]), "array-form {what}");
+    }
+}
+
 /// `str-dt` builds its literal for a datatype in a namespace the ledger has
 /// never registered, as SPARQL's `STRDT` does for any IRI (#1765): an absolute
 /// `urn:` or `http://` IRI, a prefix the `@context` defines, and an IRI bound
