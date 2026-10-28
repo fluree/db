@@ -4261,6 +4261,33 @@ pub fn build_triple_operators(
         return Ok(Box::new(pj));
     }
 
+    // A list-view triple's rows are not its stored rows (`crate::list_view`),
+    // so the cyclic join, which reads stored rows, takes no block holding
+    // one. Over a default graph of several graphs (or of none) its union
+    // site says why it stood down where the block's triples are otherwise
+    // its shape; the kill switch, where it is on, is the reason given. A
+    // WHERE that opens with a list-view triple is planned on an empty seed,
+    // so `existing` is not asked here: a block holding one is never the
+    // lane's, whatever precedes it.
+    if object_bounds.is_empty()
+        && !ctx.list_views.is_empty()
+        && matches!(
+            ctx.planning.index_scope_kind,
+            crate::index_scope::ScopeKind::Union | crate::index_scope::ScopeKind::Empty
+        )
+        && analyze_cyclic_bgp(&triples_for_exec, ctx.stats).is_some()
+    {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        let reason = if super::fast_paths_disabled() {
+            FastPathFallback::KillSwitch
+        } else {
+            FastPathFallback::ListView
+        };
+        stamp_fast_path(
+            crate::cyclic_bgp::CYCLIC_BGP_UNION_SITE,
+            FastPathOutcome::Fallback(reason),
+        );
+    }
     if existing.is_none() && object_bounds.is_empty() && ctx.list_views.is_empty() {
         if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, ctx.stats) {
             let fallback = build_sequential_triple_chain(
