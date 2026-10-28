@@ -302,7 +302,10 @@ fn lookup_ref_objects(
         );
         return Ok(Vec::new());
     }
-    if let Some(store) = ctx.binary_store.as_ref() {
+    // The batched read takes one graph's refs (`binary_g_id`), so it runs
+    // only where the scope reads exactly that graph through the index; a
+    // default graph of several graphs reads through the range path below.
+    if let Some(store) = ctx.binary_store.as_ref().filter(|_| ctx.has_binary_store()) {
         if let Some(subject_s_id) = binding_subject_s_id(
             &Binding::Sid {
                 sid: subject.clone(),
