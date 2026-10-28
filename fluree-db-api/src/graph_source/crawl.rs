@@ -119,6 +119,10 @@ struct DetectedCrawl<'a> {
     /// triples to cover `offset + limit` subjects and grouping then skips the
     /// first `offset`.
     offset: usize,
+    /// The query's `orderBy` (or `order-by`) value, verbatim. It decides which
+    /// subjects a LIMIT/OFFSET page holds and in what order, so the flat query
+    /// must carry it (see [`build_flat_query`]).
+    order_by: Option<&'a JsonValue>,
     /// Which projection shape this crawl requests.
     projection: CrawlProjection,
 }
@@ -176,6 +180,7 @@ pub(crate) async fn expand_wildcard_crawl(
         context,
         limit,
         offset,
+        order_by,
         projection,
     }) = detect_wildcard_crawl(input)
     else {
@@ -198,6 +203,21 @@ pub(crate) async fn expand_wildcard_crawl(
                  entire class. Put the subject constraint in the WHERE clause instead — \
                  e.g. `{\"select\": [\"?p\", \"?o\"], \"where\": {\"@id\": \"<subject-iri>\", \
                  \"?p\": \"?o\"}}` for a single subject.",
+            ),
+        ));
+    }
+    // Same class as C1: `build_flat_query` carries no GROUP BY / HAVING, so a
+    // HAVING would be dropped and the crawl would answer subjects whose groups it
+    // rejects. Refuse rather than answer wrongly.
+    if ["groupBy", "group-by", "having"]
+        .iter()
+        .any(|key| input.get(*key).is_some_and(|v| !v.is_null()))
+    {
+        return Err(crate::ApiError::Query(
+            fluree_db_query::QueryError::r2rml_unsupported_pattern(
+                "`groupBy` / `having` on a virtual-dataset (graph-source) subgraph crawl \
+                 is not supported and would be silently dropped. Select the grouped \
+                 variables with a flat `select` instead.",
             ),
         ));
     }
@@ -242,14 +262,23 @@ pub(crate) async fn expand_wildcard_crawl(
     // does not early-terminate); the subject LIMIT/OFFSET are re-applied exactly
     // after grouping. The flat triple budget must cover `offset + limit` subjects
     // (the OFFSET is on grouped subjects, not flat triples), so paging forward
-    // fetches — and then skips — the earlier subjects.
+    // fetches — and then skips — the earlier subjects. An ORDER BY rides on the
+    // flat query (see `build_flat_query`), so the budget is cut from the ordered
+    // rows rather than from scan order.
     let flat_limit = limit.map(|n| {
         offset
             .saturating_add(n)
             .saturating_add(1)
             .saturating_mul(TRIPLES_PER_SUBJECT_BUDGET)
     });
-    let flat_query = build_flat_query(subject_var, where_clause, context, flat_limit, &projection);
+    let flat_query = build_flat_query(
+        subject_var,
+        where_clause,
+        context,
+        flat_limit,
+        order_by,
+        &projection,
+    );
 
     // This is a browse ("View Instances") crawl: render R2RML RefObjectMap objects
     // by templating the parent IRI from the child row's own FK columns instead of
@@ -393,13 +422,16 @@ pub(crate) async fn expand_wildcard_crawl(
     }
 
     // Assemble per-subject JSON-LD documents, honoring the crawl's subject
-    // OFFSET then LIMIT. Paging is BEST-EFFORT: subject order follows the scan's
-    // first-seen order, which is deterministic for a stable table but is not
-    // enforced across separately-executed requests (per-file reads run
-    // concurrently, and a table can compact/append between pages), so a page
-    // boundary can skip or repeat a subject when the underlying scan order
-    // shifts. Fine for shallow browse paging; a real pagination surface wants
-    // keyset/cursor paging instead of OFFSET.
+    // OFFSET then LIMIT. With an ORDER BY, first-seen order IS the solution
+    // order (the flat rows arrive sorted, subject last as the tie-break), so a
+    // page holds the subjects the ORDER BY puts there. Without one, paging is
+    // BEST-EFFORT: subject order follows the scan's first-seen order, which is
+    // deterministic for a stable table but is not enforced across
+    // separately-executed requests (per-file reads run concurrently, and a table
+    // can compact/append between pages), so a page boundary can skip or repeat a
+    // subject when the underlying scan order shifts. Fine for shallow browse
+    // paging; a real pagination surface wants keyset/cursor paging instead of
+    // OFFSET.
     let normalize = format_config.normalize_arrays;
     let take = limit.unwrap_or(usize::MAX);
     let mut docs: Vec<JsonValue> = Vec::new();
@@ -710,6 +742,10 @@ fn detect_wildcard_crawl_inner(
         .map(|n| n as usize)
         .unwrap_or(0);
     let context = obj.get("@context");
+    let order_by = obj
+        .get("orderBy")
+        .or_else(|| obj.get("order-by"))
+        .filter(|v| !v.is_null());
 
     if root_key.starts_with('?') {
         // Variable-subject crawl: the WHERE binds and filters `?s` — REQUIRED
@@ -720,6 +756,7 @@ fn detect_wildcard_crawl_inner(
             context,
             limit,
             offset,
+            order_by,
             projection,
         })
     } else if select_map_routing {
@@ -734,6 +771,7 @@ fn detect_wildcard_crawl_inner(
             context,
             limit,
             offset,
+            order_by,
             projection,
         })
     } else {
@@ -799,11 +837,20 @@ fn where_as_array(where_clause: &JsonValue) -> Vec<JsonValue> {
 /// - [`CrawlProjection::Predicates`]: one `?s <p_i> ?__crawl_o{i}` per predicate
 ///   with a DISTINCT object var (so they star-collapse into one scan), plus an
 ///   optional `?s a ?__crawl_type`.
+///
+/// An `order_by` is carried with the subject appended as the last key. The
+/// grouping assembles subjects in first-seen order and the triple LIMIT cuts
+/// the rows, so both must see the rows in solution order. The subject
+/// tie-break keeps each subject's rows contiguous within one sort key, so tied
+/// subjects cannot interleave and the triple budget still covers whole
+/// subjects. Without it, a sort key shared by many subjects (an unbound
+/// OPTIONAL, say) would let the top-k keep an arbitrary slice of their rows.
 fn build_flat_query(
     subject_var: &str,
     where_clause: &JsonValue,
     context: Option<&JsonValue>,
     flat_limit: Option<usize>,
+    order_by: Option<&JsonValue>,
     projection: &CrawlProjection,
 ) -> JsonValue {
     let mut where_patterns = where_as_array(where_clause);
@@ -852,6 +899,15 @@ fn build_flat_query(
     }
     query.insert("select".to_string(), JsonValue::Array(select));
     query.insert("where".to_string(), JsonValue::Array(where_patterns));
+    if let Some(order_by) = order_by {
+        // A top-level array is a list of terms; anything else is one term.
+        let mut terms = match order_by {
+            JsonValue::Array(terms) => terms.clone(),
+            term => vec![term.clone()],
+        };
+        terms.push(json!(subject_var));
+        query.insert("orderBy".to_string(), JsonValue::Array(terms));
+    }
     if let Some(n) = flat_limit {
         query.insert("limit".to_string(), json!(n));
     }
@@ -887,11 +943,13 @@ mod tests {
             context,
             limit,
             offset,
+            order_by,
             projection,
         } = detect_wildcard_crawl(&input).expect("wildcard crawl");
         assert!(matches!(root, CrawlRoot::Var("?s")));
         assert_eq!(limit, Some(3));
         assert_eq!(offset, 6);
+        assert!(order_by.is_none());
         assert!(context.is_some());
         assert_eq!(
             where_clause,
@@ -1009,6 +1067,7 @@ mod tests {
             &where_clause,
             Some(&context),
             Some(256),
+            None,
             &CrawlProjection::Wildcard,
         );
 
@@ -1023,12 +1082,52 @@ mod tests {
         assert_eq!(patterns.len(), 2);
         assert_eq!(patterns[0], where_clause);
         assert_eq!(patterns[1], json!({"@id": "?s", CRAWL_PRED: CRAWL_OBJ}));
+        assert!(flat.get("orderBy").is_none(), "no ORDER BY, no sort");
+    }
+
+    #[test]
+    fn flat_query_carries_order_by_with_subject_tie_break() {
+        let where_clause = json!({"@id": "?s", "v:score": "?sort"});
+        let flat = |order_by: JsonValue| {
+            build_flat_query(
+                "?s",
+                &where_clause,
+                None,
+                Some(64),
+                Some(&order_by),
+                &CrawlProjection::Wildcard,
+            )
+        };
+        // A list of terms keeps its terms, then the subject.
+        assert_eq!(
+            flat(json!([["desc", "?sort"], "?name"]))["orderBy"],
+            json!([["desc", "?sort"], "?name", "?s"])
+        );
+        // A single term becomes the first of two.
+        assert_eq!(
+            flat(json!("(desc ?sort)"))["orderBy"],
+            json!(["(desc ?sort)", "?s"])
+        );
+        let kebab = json!({
+            "select": {"?s": ["*"]},
+            "where": where_clause,
+            "order-by": "?sort",
+        });
+        let detected = detect_wildcard_crawl(&kebab).expect("crawl");
+        assert_eq!(detected.order_by, Some(&json!("?sort")));
     }
 
     #[test]
     fn flat_query_wraps_array_where() {
         let where_clause = json!([{"@id": "?s", "v:country": "?c"}]);
-        let flat = build_flat_query("?s", &where_clause, None, None, &CrawlProjection::Wildcard);
+        let flat = build_flat_query(
+            "?s",
+            &where_clause,
+            None,
+            None,
+            None,
+            &CrawlProjection::Wildcard,
+        );
         let patterns = flat["where"].as_array().expect("where array");
         // Original single pattern + the one injected wildcard scan.
         assert_eq!(patterns.len(), 2);
@@ -1040,7 +1139,14 @@ mod tests {
     #[test]
     fn flat_query_id_only_projects_subject_alone() {
         let where_clause = json!({"@id": "?s", "@type": "v:C"});
-        let flat = build_flat_query("?s", &where_clause, None, None, &CrawlProjection::IdOnly);
+        let flat = build_flat_query(
+            "?s",
+            &where_clause,
+            None,
+            None,
+            None,
+            &CrawlProjection::IdOnly,
+        );
         // Select is just the subject; no scan patterns injected beyond the WHERE.
         assert_eq!(flat["select"], json!(["?s"]));
         let patterns = flat["where"].as_array().expect("where array");
@@ -1056,7 +1162,7 @@ mod tests {
             want_type: true,
             want_id: false,
         };
-        let flat = build_flat_query("?s", &where_clause, None, None, &projection);
+        let flat = build_flat_query("?s", &where_clause, None, None, None, &projection);
         // Select: subject, one distinct object var per predicate, then type.
         assert_eq!(
             flat["select"],
