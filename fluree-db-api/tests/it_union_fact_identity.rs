@@ -4,11 +4,18 @@
 //! with a graph that adds nothing answers as the graph alone.
 //!
 //! The cases are the ones where a dedup keyed on the emitted row loses the
-//! fact: the term a constant object matched, and the list position. Each runs
-//! before the ledger is indexed (the scan reads decoded flakes) and after (it
-//! reads index rows), through SPARQL, with a JSON-LD twin.
+//! fact: the term a constant object matched (through SPARQL), and the list
+//! position (through JSON-LD, which reads a list's members as values; SPARQL
+//! reads the list as RDF, #2159). Each runs before the ledger is indexed (the
+//! scan reads decoded flakes) and after (it reads index rows), with fast
+//! paths on and off, and every mismatch of every run is reported together.
+//! The kill switch is process-wide: the runs with fast paths on hold the
+//! read side of `support::FAST_PATH_SWITCH`, so no test in this binary turns
+//! them off underneath, and the runs with them off hold the write side.
 
-use fluree_db_api::{Fluree, FlureeBuilder, GraphDb, ReindexOptions};
+use fluree_db_api::{
+    fast_paths_disabled, set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions,
+};
 use serde_json::{json, Value as JsonValue};
 
 const LEDGER: &str = "it/union-fact-identity:main";
@@ -82,7 +89,7 @@ fn want(rows: &[&str]) -> Vec<String> {
 }
 
 /// Every case of the probe table, plus the facts two members both hold.
-async fn check_sparql(fluree: &Fluree, state: &str) {
+async fn check_sparql(fluree: &Fluree, state: &str, failures: &mut Vec<String>) {
     let int = "integer";
     let one_a = format!("o=1^^{int};s=a");
     let one_b = format!("o=1^^{int};s=b");
@@ -119,37 +126,28 @@ async fn check_sparql(fluree: &Fluree, state: &str) {
             G1_G2,
             want(&[&one_a, "o=1.0E0^^double;s=a", &one_b]),
         ),
-        // A list that repeats 5: two facts, one per list position.
-        (
-            "SELECT ?s {ds} WHERE { ?s ex:q 5 }",
-            G1,
-            want(&["s=d", "s=d"]),
-        ),
-        (
-            "SELECT ?s {ds} WHERE { ?s ex:q 5 }",
-            G1_EMPTY,
-            want(&["s=d", "s=d"]),
-        ),
-        // g2's first item is g1's first item.
-        (
-            "SELECT ?s {ds} WHERE { ?s ex:q 5 }",
-            G1_G2,
-            want(&["s=d", "s=d"]),
-        ),
+        // SPARQL reads a list as the RDF it denotes (#2159): its members are
+        // not values of `ex:q`, and `?s ex:q ?o` binds the list's head cell.
+        // Each graph's list is a list of its own, so g1 and g2 give two
+        // heads. The list-position identity is the JSON-LD twin's
+        // ([`check_jsonld`]), which reads the members as values.
+        ("SELECT ?s {ds} WHERE { ?s ex:q 5 }", G1, want(&[])),
+        ("SELECT ?s {ds} WHERE { ?s ex:q 5 }", G1_EMPTY, want(&[])),
+        ("SELECT ?s {ds} WHERE { ?s ex:q 5 }", G1_G2, want(&[])),
         (
             "SELECT (COUNT(?s) AS ?c) {ds} WHERE { ?s ex:q 5 }",
             G1_EMPTY,
-            want(&["c=2^^integer"]),
+            want(&["c=0^^integer"]),
         ),
         (
             "SELECT ?s ?o {ds} WHERE { ?s ex:q ?o }",
             G1_EMPTY,
-            want(&["o=5^^integer;s=d", "o=5^^integer;s=d", "o=7^^integer;s=d"]),
+            want(&["o=l0-0;s=d"]),
         ),
         (
             "SELECT ?s ?o {ds} WHERE { ?s ex:q ?o }",
             G1_G2,
-            want(&["o=5^^integer;s=d", "o=5^^integer;s=d", "o=7^^integer;s=d"]),
+            want(&["o=l0-0;s=d", "o=l1-0;s=d"]),
         ),
         // A ground pattern: one empty solution per fact it matches.
         (
@@ -163,7 +161,6 @@ async fn check_sparql(fluree: &Fluree, state: &str) {
             want(&["c=2^^integer"]),
         ),
     ];
-    let mut failures = Vec::new();
     for (body, dataset, expected) in cases {
         let got = sparql_rows(fluree, body, dataset).await;
         if got != expected {
@@ -181,18 +178,19 @@ async fn check_sparql(fluree: &Fluree, state: &str) {
             }
         }
     }
-    assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// The JSON-LD twin of the list case, through the connection.
-async fn check_jsonld(fluree: &Fluree, state: &str) {
-    let count = |graphs: &[&str]| {
+/// The list cases in JSON-LD, which reads a list's members as values of its
+/// predicate, through the connection. The list repeats 5: two facts, one per
+/// list position, and g2's first item is g1's first item.
+async fn check_jsonld(fluree: &Fluree, state: &str, failures: &mut Vec<String>) {
+    let query = |graphs: &[&str], object: JsonValue, select: &[&str]| {
         let from: Vec<String> = graphs.iter().map(|g| format!("{LEDGER}#{g}")).collect();
         json!({
             "@context": {"ex": "http://example.org/"},
             "from": from,
-            "select": ["?s"],
-            "where": [{"@id": "?s", "ex:q": 5}]
+            "select": select,
+            "where": [{"@id": "?s", "ex:q": object}]
         })
     };
     for graphs in [
@@ -200,22 +198,73 @@ async fn check_jsonld(fluree: &Fluree, state: &str) {
         &["urn:g1", "urn:gEmpty"],
         &["urn:g1", "urn:g2"],
     ] {
-        let result = fluree
-            .query_connection(&count(graphs))
-            .await
-            .unwrap_or_else(|e| panic!("{graphs:?}: {e}"));
-        let ledger = fluree.ledger(LEDGER).await.expect("ledger");
-        let json: JsonValue = result
-            .to_jsonld_async(ledger.as_graph_db_ref(0))
-            .await
-            .expect("format");
-        let rows = json.as_array().map_or(0, Vec::len);
-        assert_eq!(rows, 2, "{state}: JSON-LD from {graphs:?}: {json}");
+        for (q, want) in [
+            (query(graphs, json!(5), &["?s"]), 2),
+            (query(graphs, json!("?o"), &["?s", "?o"]), 3),
+        ] {
+            let result = match fluree.query_connection(&q).await {
+                Ok(result) => result,
+                Err(e) => {
+                    failures.push(format!("{state}: JSON-LD {q} from {graphs:?}: {e}"));
+                    continue;
+                }
+            };
+            let ledger = fluree.ledger(LEDGER).await.expect("ledger");
+            let json: JsonValue = result
+                .to_jsonld_async(ledger.as_graph_db_ref(0))
+                .await
+                .expect("format");
+            let rows = json.as_array().map_or(0, Vec::len);
+            if rows != want {
+                failures.push(format!(
+                    "{state}: JSON-LD {q} from {graphs:?}: {rows} rows, want {want}: {json}"
+                ));
+            }
+        }
+    }
+}
+
+/// Every check in `state`, with fast paths on and then off.
+async fn check_state(fluree: &Fluree, state: &str, failures: &mut Vec<String>) {
+    {
+        let _on = crate::support::FAST_PATH_SWITCH.read().await;
+        assert!(!fast_paths_disabled(), "fast paths must be on");
+        let state = format!("{state}, fast paths on");
+        check_sparql(fluree, &state, failures).await;
+        check_jsonld(fluree, &state, failures).await;
+    }
+    let _off = crate::support::FAST_PATH_SWITCH.write().await;
+    let _restore = FastPathsOff::set();
+    let state = format!("{state}, fast paths off");
+    check_sparql(fluree, &state, failures).await;
+    check_jsonld(fluree, &state, failures).await;
+}
+
+/// The kill switch on, and off again however the holder exits.
+struct FastPathsOff;
+
+impl FastPathsOff {
+    fn set() -> Self {
+        set_fast_paths_disabled(true);
+        assert!(fast_paths_disabled(), "the kill switch must read as set");
+        Self
+    }
+}
+
+impl Drop for FastPathsOff {
+    fn drop(&mut self) {
+        set_fast_paths_disabled(false);
     }
 }
 
 #[tokio::test]
 async fn union_dedups_on_fact_identity() {
+    // The env var ORs into the switch and can't be cleared from here, so with
+    // it set the fast-paths-on runs would be generic ones.
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "FLUREE_DISABLE_QUERY_FAST_PATHS must be unset"
+    );
     let fluree = FlureeBuilder::memory().without_indexing().build_memory();
     fluree.create_ledger(LEDGER).await.expect("create ledger");
     let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
@@ -225,10 +274,10 @@ async fn union_dedups_on_fact_identity() {
         .execute()
         .await
         .expect("seed");
+    let mut failures = Vec::new();
 
     // Novelty only: the scans read decoded flakes.
-    check_sparql(&fluree, "novelty").await;
-    check_jsonld(&fluree, "novelty").await;
+    check_state(&fluree, "novelty", &mut failures).await;
 
     // Indexed: the scans read index rows.
     fluree
@@ -238,6 +287,7 @@ async fn union_dedups_on_fact_identity() {
     fluree.disconnect_ledger(LEDGER).await;
     let handle = fluree.ledger_cached(LEDGER).await.expect("reload");
     assert!(handle.snapshot().await.binary_store.is_some(), "indexed");
-    check_sparql(&fluree, "indexed").await;
-    check_jsonld(&fluree, "indexed").await;
+    check_state(&fluree, "indexed", &mut failures).await;
+
+    assert!(failures.is_empty(), "{failures:#?}");
 }
