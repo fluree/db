@@ -1024,7 +1024,10 @@ pub struct IcebergPreviewRequest {
     /// Stats tier: "schema" (Tier-A) or "stats" (Tier-A + Tier-B). Default "schema".
     /// Tier-A reads no manifest; when the snapshot summary omits the row and
     /// file totals it reads the snapshot's manifest list for them, once per
-    /// snapshot.
+    /// snapshot. On a merge-on-read snapshot (delete files in its summary or
+    /// its manifest list), "schema" answers 200 with the counts flagged as
+    /// upper bounds (`has_delete_files`, a warning) and "stats" answers 409
+    /// unless `FLUREE_ICEBERG_ALLOW_MOR_DELETES` is set.
     pub tier: Option<String>,
 }
 

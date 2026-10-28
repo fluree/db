@@ -361,10 +361,15 @@ pub enum StatsTier {
     /// Tier-A: schema only (columns/types/partition/sort/snapshot), from the
     /// inline REST `loadTable` metadata. Manifest-free: the one storage read is
     /// of the snapshot's manifest list, cached, and only when the snapshot
-    /// summary omits the row or data-file total.
+    /// summary omits the row or data-file total. Display-only, so it never
+    /// refuses a merge-on-read snapshot: delete files its summary or its
+    /// manifest list reports make its counts upper bounds, flagged by
+    /// `has_delete_files` and a warning.
     Schema,
     /// Tier-A + Tier-B: additionally aggregate per-column statistics from the
-    /// snapshot's manifest-list + manifest Avro files (never a data file).
+    /// snapshot's manifest-list + manifest Avro files (never a data file). A
+    /// merge-on-read snapshot is refused (409) unless
+    /// `FLUREE_ICEBERG_ALLOW_MOR_DELETES` is set.
     Stats,
 }
 
