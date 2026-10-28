@@ -10,7 +10,7 @@
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use std::sync::Arc;
@@ -90,7 +90,8 @@ impl FlushSchedule {
 /// Pull rows from `source` into one batch until it holds `window` rows or the
 /// source runs dry, starting with the rows an earlier window left in
 /// `pending`. All of a source's batches share one schema, so this is a
-/// column-wise append. With `exact`, the batch that crosses `window` is split
+/// column-wise append, and a batch whose schema differs from the first is an
+/// `Internal` error. With `exact`, the batch that crosses `window` is split
 /// and its rest kept in `pending`; otherwise it is taken whole. `None` only
 /// when the source is exhausted with zero rows.
 pub(crate) async fn pull_window(
@@ -116,9 +117,22 @@ pub(crate) async fn pull_window(
         } else {
             batch.len()
         };
-        if schema.is_none() {
-            schema = Some(batch.schema_arc());
-            columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
+        match &schema {
+            None => {
+                schema = Some(batch.schema_arc());
+                columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
+            }
+            // Columns are appended by index, so a batch in another variable
+            // order would mix columns silently; refuse it instead, as the SQL
+            // lane does.
+            Some(first) if batch.schema() != first.as_ref() => {
+                return Err(QueryError::Internal(format!(
+                    "a source changed its batch schema mid-stream: first {:?}, then {:?}",
+                    first.as_ref(),
+                    batch.schema()
+                )));
+            }
+            Some(_) => {}
         }
         for (c, col) in columns.iter_mut().enumerate() {
             let column = batch.column_by_idx(c).expect("column index within schema");
@@ -206,6 +220,39 @@ mod tests {
         let mut schedule = FlushSchedule::ramped_from(10, 100_000);
         schedule.advance_toward(usize::MAX, usize::MAX, 1);
         assert_eq!(schedule.size(), 80);
+    }
+
+    /// Columns are appended by index, so a second batch in another variable
+    /// order would land its values under the wrong variables.
+    #[tokio::test]
+    async fn a_window_refuses_a_batch_in_another_schema() {
+        use crate::seed::BatchReplayOperator;
+        use crate::var_registry::VarRegistry;
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let ab: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let ba: Arc<[VarId]> = Arc::from(vec![VarId(1), VarId(0)].into_boxed_slice());
+        let one_row = |schema: &Arc<[VarId]>| {
+            Batch::new(
+                Arc::clone(schema),
+                vec![
+                    vec![Binding::iri("http://ex/a")],
+                    vec![Binding::iri("http://ex/b")],
+                ],
+            )
+            .unwrap()
+        };
+        let mut source: BoxedOperator = Box::new(BatchReplayOperator::new(
+            Arc::clone(&ab),
+            vec![one_row(&ab), one_row(&ba)],
+        ));
+        source.open(&ctx).await.unwrap();
+        let err = pull_window(&mut source, &mut None, 10, false, &ctx)
+            .await
+            .expect_err("a second schema must not be appended by index");
+        assert!(matches!(err, QueryError::Internal(_)), "{err:?}");
     }
 
     #[test]
