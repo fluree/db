@@ -130,12 +130,14 @@ fn check_lane_route(
 }
 
 /// Run `shape` in every scope and surface over fixture A in `state`: both
-/// answers by hand, and the route `one_answered` and the sites say it took.
+/// answers by hand, and the route `one_answered` and the sites say it took,
+/// against the lane's `route`.
 async fn union_lane_routes(
     state: State,
     shape: Shape,
     sites: (&str, &str),
     one_answered: fn(&Run, &str) -> bool,
+    route: fn(Scope, State) -> LaneRoute,
 ) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -150,13 +152,7 @@ async fn union_lane_routes(
             }
             let run = check(&fx, scope, shape, surface, &mut failures).await;
             let answered = one_answered(&run, sites.0);
-            check_lane_route(
-                &run,
-                union_lane_route(scope, state),
-                answered,
-                sites,
-                &mut failures,
-            );
+            check_lane_route(&run, route(scope, state), answered, sites, &mut failures);
             runs += 1;
         }
     }
@@ -188,6 +184,7 @@ async fn lane_c_exists_cache_indexed() {
         Shape::ExistsInExpression,
         EXISTS_SITES,
         exists_cache_answered,
+        union_lane_route,
     )
     .await;
 }
@@ -199,6 +196,7 @@ async fn lane_c_exists_cache_with_novelty_in_g2() {
         Shape::ExistsInExpression,
         EXISTS_SITES,
         exists_cache_answered,
+        union_lane_route,
     )
     .await;
 }
@@ -210,6 +208,101 @@ async fn lane_c_exists_cache_read_below_its_index() {
         Shape::ExistsInExpression,
         EXISTS_SITES,
         exists_cache_answered,
+        union_lane_route,
+    )
+    .await;
+}
+
+// ============================================================================
+// Lane D: the bound-object count
+// ============================================================================
+
+const OBJECT_COUNT_SITES: (&str, &str) = ("predicate_object_count", "predicate_object_count_union");
+
+/// The one-graph count stamps `proceed` when it is planned and a decline at
+/// open when it does not answer: it answered when it proceeded and declined
+/// nothing.
+fn object_count_answered(run: &Run, site: &str) -> bool {
+    run.proceeded.iter().any(|s| s == site) && !run.fell_back.iter().any(|(s, _)| s == site)
+}
+
+/// The count's route: [`union_lane_route`], except inside `GRAPH`, where the
+/// count is no single triple pattern and neither lane is planned.
+fn object_count_route(scope: Scope, state: State) -> LaneRoute {
+    match scope {
+        Scope::GraphG2 | Scope::GraphVar => LaneRoute::Neither,
+        _ => union_lane_route(scope, state),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_object_count_indexed() {
+    union_lane_routes(
+        State::Indexed,
+        Shape::BoundObjectCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_object_count_with_novelty_in_g2() {
+    union_lane_routes(
+        State::Novelty,
+        Shape::BoundObjectCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_object_count_read_below_its_index() {
+    union_lane_routes(
+        State::Indexed2,
+        Shape::BoundObjectCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_numeric_count_indexed() {
+    union_lane_routes(
+        State::Indexed,
+        Shape::BoundNumericCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_numeric_count_with_novelty_in_g2() {
+    union_lane_routes(
+        State::Novelty,
+        Shape::BoundNumericCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_numeric_count_read_below_its_index() {
+    union_lane_routes(
+        State::Indexed2,
+        Shape::BoundNumericCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
     )
     .await;
 }

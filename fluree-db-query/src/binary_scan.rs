@@ -4374,10 +4374,11 @@ const NUMERIC_TAGS: [fluree_db_core::ValueTypeTag; 15] = {
     ]
 };
 
-/// Every slice an untyped `Long` or `Double` can be stored under, in `o_type`
-/// order: one per numeric datatype in `observed` (the predicate's observed
-/// datatypes; every integer and float datatype when `None`), keyed by that
-/// datatype's encoding of the value.
+/// Every slice an untyped number can be stored under, in `o_type` order: one per
+/// numeric datatype in `observed` (the predicate's observed datatypes; every
+/// integer and float datatype when `None`), keyed by that datatype's encoding of
+/// the value. The number is a `Long` or `Double` (a bare integer or double), or
+/// a `Decimal` or `BigInt` (a bare decimal, or an integer too large for `i64`).
 ///
 /// A bare number matches every numeric datatype holding an equal value, and
 /// the families encode differently (`i64` keys for integer types, `f64` keys
@@ -4410,6 +4411,13 @@ pub(crate) fn untyped_numeric_slices(
         FlakeValue::Double(d) if d.is_finite() => {
             let integral = d.fract() == 0.0 && *d >= -(2f64.powi(63)) && *d < 2f64.powi(63);
             (integral.then_some(*d as i64), Some(*d))
+        }
+        // A decimal or a big integer has an integer or float slice only where
+        // that type holds the value exactly: `numeric_cmp` compares exactly.
+        FlakeValue::Decimal(d) => (exact_i64(d), exact_f64(d)),
+        FlakeValue::BigInt(b) => {
+            let d = bigdecimal::BigDecimal::from((**b).clone());
+            (exact_i64(&d), exact_f64(&d))
         }
         _ => return None,
     };
@@ -4447,6 +4455,24 @@ pub(crate) fn untyped_numeric_slices(
     Some(slices)
 }
 
+/// `value` as an `i64`, when it is one exactly.
+fn exact_i64(value: &bigdecimal::BigDecimal) -> Option<i64> {
+    use num_traits::ToPrimitive;
+    if value.is_integer() {
+        value.to_i64()
+    } else {
+        None
+    }
+}
+
+/// `value` as an `f64`, when an `f64` holds it exactly.
+fn exact_f64(value: &bigdecimal::BigDecimal) -> Option<f64> {
+    use num_traits::ToPrimitive;
+    let f = value.to_f64().filter(|f| f.is_finite())?;
+    let back = bigdecimal::BigDecimal::try_from(f).ok()?;
+    (back.cmp(value) == std::cmp::Ordering::Equal).then_some(f)
+}
+
 /// The predicate's observed datatypes for [`untyped_numeric_slices`]; `None`
 /// when unknown. The observed set, never the `datatypes` counts: a no-op
 /// retraction can zero a tag's count while its rows remain (#1738).
@@ -4474,11 +4500,22 @@ fn numbig_slices(
     arena_is_current: bool,
 ) -> Vec<ObjectSlice> {
     // Arena integers lie outside `i64`, so only an integral double beyond it
-    // can equal one; the handle lookup covers decimals only.
+    // can equal one; for a double the handle lookup covers decimals only.
     let decimal = match value {
         FlakeValue::Long(n) => Some(bigdecimal::BigDecimal::from(*n)),
         FlakeValue::Double(d) if as_i64.is_some() || d.fract() != 0.0 => {
             bigdecimal::BigDecimal::try_from(*d).ok()
+        }
+        FlakeValue::Decimal(d) => Some((**d).clone()),
+        FlakeValue::BigInt(b) => Some(bigdecimal::BigDecimal::from((**b).clone())),
+        _ => None,
+    };
+    // A decimal or big integer beyond `i64` that is integral can also equal an
+    // arena integer, which the decimal lookup does not find.
+    let big_int = match value {
+        FlakeValue::BigInt(b) if as_i64.is_none() => Some((**b).clone()),
+        FlakeValue::Decimal(d) if as_i64.is_none() && d.is_integer() => {
+            num_bigint::ToBigInt::to_bigint(&**d)
         }
         _ => None,
     };
@@ -4486,12 +4523,26 @@ fn numbig_slices(
         return vec![(OType::NUM_BIG_OVERFLOW, None)];
     };
     let handles: Vec<u32> = match p_id {
-        Some(p_id) => store
-            .find_decimal_handles(g_id, p_id, &decimal)
-            .unwrap_or_default(),
+        Some(p_id) => {
+            let mut handles = store
+                .find_decimal_handles(g_id, p_id, &decimal)
+                .unwrap_or_default();
+            if let Some(big_int) = &big_int {
+                handles.extend(store.find_numbig_handle(
+                    g_id,
+                    p_id,
+                    &FlakeValue::BigInt(Box::new(big_int.clone())),
+                ));
+            }
+            handles
+        }
         None => store
             .numbig_arenas(g_id)
-            .flat_map(|(_, arena)| arena.find_bigdec_handles(&decimal))
+            .flat_map(|(_, arena)| {
+                let mut handles = arena.find_bigdec_handles(&decimal);
+                handles.extend(big_int.as_ref().and_then(|b| arena.find_bigint(b)));
+                handles
+            })
             .collect(),
     };
     handles
