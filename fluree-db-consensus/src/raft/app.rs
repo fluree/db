@@ -293,12 +293,9 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
         _log_index: u64,
         out: &mut Vec<Effect>,
     ) {
-        // A fenced write is the write it wraps, once the state machine has
+        // A wrapped write is the write it wraps, once the state machine has
         // admitted it.
-        let command = match command {
-            Command::Fenced { command, .. } => command.as_ref(),
-            command => command,
-        };
+        let command = command.admitted();
         if let Some(event) = event_for(command, response, state) {
             out.push(Effect::Event(event));
         }

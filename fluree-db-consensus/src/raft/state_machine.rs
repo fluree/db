@@ -29,6 +29,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
+mod erasure;
+pub use erasure::{
+    generation, holder_state, ActivateErasure, Activation, ActivationRefusal, ErasureCommand,
+    ErasureState, HolderState, Incarnation,
+};
+
 /// Postcard-friendly mirror of [`TrackingTally`].
 ///
 /// `TrackingTally` uses `#[serde(skip_serializing_if = "Option::is_none")]`
@@ -542,6 +548,10 @@ pub struct NameServiceState {
     pub dropped: HashMap<String, VersionedJson>,
     /// The fence and frozen flag of each branch created under a binding.
     pub fences: HashMap<RefKey, FenceState>,
+    /// Permanent erasure: generations, holds and activations. Appended
+    /// after every field above, so a snapshot taken before it still
+    /// decodes through [`NameServiceStateV2`].
+    pub erasure: ErasureState,
 }
 
 /// A name binding or dropped-ledger entry: its version, and the value as
@@ -636,6 +646,55 @@ impl From<NameServiceStateV1> for NameServiceState {
             bindings: HashMap::new(),
             dropped: HashMap::new(),
             fences: HashMap::new(),
+            erasure: ErasureState::default(),
+        }
+    }
+}
+
+/// [`NameServiceState`] as snapshotted before erasure state.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct NameServiceStateV2 {
+    refs: HashMap<RefKey, RefEntry>,
+    ledgers: HashMap<String, LedgerRecord>,
+    retracted: HashSet<RefKey>,
+    idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
+    queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    next_queue_id: u64,
+    recently_cleared: HashMap<RefKey, ClearMarker>,
+    evicted_idempotency_count: u64,
+    queue_config: QueueConfig,
+    status: HashMap<String, StoredStatus>,
+    config: HashMap<String, StoredConfig>,
+    graph_sources: HashMap<String, GraphSourceRecord>,
+    worker_eligible_voters: BTreeSet<NodeId>,
+    configured_voters: BTreeSet<NodeId>,
+    bindings: HashMap<String, VersionedJson>,
+    dropped: HashMap<String, VersionedJson>,
+    fences: HashMap<RefKey, FenceState>,
+}
+
+impl From<NameServiceStateV2> for NameServiceState {
+    fn from(v2: NameServiceStateV2) -> Self {
+        Self {
+            refs: v2.refs,
+            ledgers: v2.ledgers,
+            retracted: v2.retracted,
+            idempotency: v2.idempotency,
+            queues: v2.queues,
+            next_queue_id: v2.next_queue_id,
+            recently_cleared: v2.recently_cleared,
+            evicted_idempotency_count: v2.evicted_idempotency_count,
+            queue_config: v2.queue_config,
+            status: v2.status,
+            config: v2.config,
+            graph_sources: v2.graph_sources,
+            worker_eligible_voters: v2.worker_eligible_voters,
+            configured_voters: v2.configured_voters,
+            bindings: v2.bindings,
+            dropped: v2.dropped,
+            fences: v2.fences,
+            erasure: ErasureState::default(),
         }
     }
 }
@@ -863,6 +922,29 @@ pub enum Command {
     /// it and wrote nothing else is undone. (Appended: variants are
     /// positional in the log.)
     ThawBranch { key: RefKey, fence: u64 },
+    /// `command` staged on a view of the listed branches at these erasure
+    /// generations: applied only while each branch still holds its
+    /// generation. A write to a branch an erasure has reached must be
+    /// wrapped; see [`erasure`]. Outermost: it may wrap a
+    /// [`Self::Fenced`] write, not the other way round.
+    AtGeneration {
+        generations: Vec<(RefKey, u64)>,
+        command: Box<Command>,
+    },
+    /// Permanent erasure; see [`ErasureCommand`].
+    Erasure(ErasureCommand),
+}
+
+impl Command {
+    /// The write a wrapper carries, once the state machine has admitted it.
+    pub fn admitted(&self) -> &Command {
+        match self {
+            Command::AtGeneration { command, .. } | Command::Fenced { command, .. } => {
+                command.admitted()
+            }
+            command => command,
+        }
+    }
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1479,6 +1561,32 @@ pub enum Response {
     },
     /// [`Command::ResetGraphSourceIndex`] cleared the index pointer.
     GraphSourceIndexReset,
+    /// A write staged on a view of erasure generation `presented` (`None`:
+    /// presented none) of a branch now at `current`. Nothing applied; the
+    /// writer stages again on a current view.
+    ErasureGenerationMoved {
+        ledger_id: String,
+        current: u64,
+        presented: Option<u64>,
+    },
+    /// A head advance on a branch held while an erasure activation is
+    /// prepared. The queue entry stays at the front.
+    ErasureHeld {
+        ledger_id: String,
+        until_millis: u64,
+    },
+    /// [`ErasureCommand::Hold`] or [`ErasureCommand::Release`] applied.
+    ErasureHoldApplied,
+    /// [`ErasureCommand::Activate`] applied as activation `activation`.
+    ErasureActivated { activation: u64 },
+    /// [`ErasureCommand::Activate`] refused; nothing changed.
+    ErasureActivationRefused { refusal: ActivationRefusal },
+    /// [`ErasureCommand::Ready`] recorded.
+    ErasureReadyRecorded,
+    /// [`ErasureCommand::Ready`] named no activation.
+    ErasureActivationUnknown { activation: u64 },
+    /// [`ErasureCommand::Track`] applied.
+    ErasureTracking,
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1549,10 +1657,13 @@ impl NameServiceState {
     /// Restore state machine state from snapshot bytes produced by
     /// [`Self::to_snapshot`].
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        // Newest layout first: postcard ignores trailing bytes, so an
+        // older layout would decode a newer snapshot and drop its tail.
         match postcard::from_bytes(bytes) {
             Ok(state) => Ok(state),
-            Err(e) => postcard::from_bytes::<NameServiceStateV1>(bytes)
+            Err(e) => postcard::from_bytes::<NameServiceStateV2>(bytes)
                 .map(Self::from)
+                .or_else(|_| postcard::from_bytes::<NameServiceStateV1>(bytes).map(Self::from))
                 .map_err(|_| e.into()),
         }
     }
@@ -1563,6 +1674,26 @@ impl NameServiceState {
 /// this command, used as a deterministic alternative to wall-clock
 /// time for any state-machine bookkeeping that needs it.
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
+    let (command, generations) = match command {
+        Command::AtGeneration {
+            generations,
+            command,
+        } => (*command, Some(generations)),
+        command => (command, None),
+    };
+    if let Some(refused) = erasure::admit(state, &command, generations.as_deref()) {
+        return refused;
+    }
+    let adds_holders = erasure::adds_holders(&command);
+    let refs = state.refs.len();
+    let response = apply_fenced(state, command, log_index);
+    if state.erasure.tracking && (adds_holders || state.refs.len() > refs) {
+        state.erasure.holder_set += 1;
+    }
+    response
+}
+
+fn apply_fenced(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
     let (command, presented) = match command {
         Command::Fenced { fence, command } => (*command, Some(fence)),
         command => (command, None),
@@ -1732,8 +1863,9 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
                 _ => Response::NoOp,
             }
         }
+        Command::Erasure(command) => erasure::apply(state, command, log_index),
         // A wrapper nested in a wrapper covers no single branch write.
-        Command::Fenced { .. } => Response::FenceMismatch,
+        Command::Fenced { .. } | Command::AtGeneration { .. } => Response::FenceMismatch,
     }
 }
 
