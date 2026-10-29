@@ -101,6 +101,8 @@ impl Fluree {
                     return Ok(Released::Changed);
                 }
             }
+            #[cfg(test)]
+            super::hooks::hold(super::hooks::Hold::Marked, entry.name.as_str()).await;
             for prefix in self.index_prefixes(&entry)? {
                 for address in runtime.index.list_raw(&prefix).await? {
                     if runtime.index.delete_raw(&address).await? {

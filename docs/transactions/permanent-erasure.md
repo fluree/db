@@ -115,7 +115,9 @@ backup restores do not touch them.
 ## Purge
 
 After publication, the retention worker purges the erasure in the background, one pass at a time. A pass
-resumes where an interrupted one stopped.
+resumes where an interrupted one stopped. While a pass runs, creating a branch, restoring a ledger
+(from a soft drop or an archive), receiving erased history by a pull or push, and accepting or
+publishing an erasure wait for it, so the ledgers a pass purges stay those it found at its start.
 
 1. **Indexes.** Every branch that holds an erased commit has its index rewritten without the erased
    events. Usually only the leaves that hold them are rewritten. The branch is rebuilt from the

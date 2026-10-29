@@ -79,8 +79,9 @@ pub(crate) struct ErasureRuntime {
     in_flight: AtomicBool,
     /// A background purge pass is running.
     purge_in_flight: AtomicBool,
-    /// Held to accept or publish an erasure, and to create a branch: the
-    /// branches an erasure reaches are the branches as they are then.
+    /// Held to accept or publish an erasure, to create a branch, to restore a
+    /// ledger, and by a purge pass: the branches an erasure or a pass reaches
+    /// are the branches as they are then. Taken before `purging`.
     pub(crate) admission: tokio::sync::Mutex<()>,
     /// Held by a purge pass: one at a time. Shared with key rotation, whose
     /// rewrites a purge's deletions must not interleave with.

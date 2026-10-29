@@ -691,3 +691,198 @@ async fn a_sync_does_not_publish_a_file_a_release_took() {
         head
     );
 }
+
+/// The files under `root` holding `needle`.
+fn holding(root: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if std::fs::read(&path)
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle.as_bytes())
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// What `subject` has for `ex:email` on `ledger_id`.
+async fn emails(fluree: &Fluree, ledger_id: &str, subject: &str) -> crate::Result<Vec<JsonValue>> {
+    let results = fluree
+        .query_connection(&json!({
+            "from": ledger_id,
+            "select": "?o",
+            "where": {"@id": format!("http://example.org/{subject}"), "http://example.org/email": "?o"}
+        }))
+        .await?;
+    let ledger = fluree.ledger(ledger_id).await?;
+    Ok(results
+        .to_jsonld(&ledger.snapshot)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Purge passes over `id` until none has a job left to purge.
+async fn purge(fluree: &Fluree, id: &str) {
+    for _ in 0..5 {
+        let report = fluree
+            .run_purge_pass(id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        if report.requests.is_empty() {
+            return;
+        }
+    }
+    panic!("{id} was not purged");
+}
+
+/// Runs `during` once a pass over `id` reaches `at` for `name`, for at most
+/// two seconds, then lets the pass go on. Returns what `during` returned,
+/// if it finished.
+async fn while_held<T>(
+    fluree: &Fluree,
+    id: &str,
+    at: super::hooks::Hold,
+    name: &str,
+    during: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let (reached, proceed) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *super::hooks::HOLD.lock() = Some((at, name.to_string(), reached.clone(), proceed.clone()));
+    let held = async {
+        reached.notified().await;
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), during)
+            .await
+            .ok();
+        proceed.notify_one();
+        done
+    };
+    let (pass, done) = tokio::join!(fluree.run_purge_pass(id, std::time::Duration::ZERO), held);
+    *super::hooks::HOLD.lock() = None;
+    pass.unwrap();
+    done
+}
+
+/// A restore of a soft-dropped holder never runs within a purge pass: run
+/// once the release has marked the ledger and before it deleted the
+/// ledger's index files, the release would delete the index the restore
+/// rebuilt.
+#[tokio::test]
+async fn a_restore_of_a_dropped_holder_waits_for_a_purge_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/restore-race").await.unwrap();
+    let id = "t/restore-race:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@graph": [
+            {"@id": "http://example.org/alice", "http://example.org/email": "a@secret"},
+            {"@id": "http://example.org/bob", "http://example.org/email": "b@kept"}
+        ]}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("t/restore-race-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .reindex(&copy, ReindexOptions::default())
+        .await
+        .unwrap();
+    let instance = fluree
+        .drop_ledger("t/restore-race-copy", crate::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    erase(&fluree, id, email("alice", "a@secret")).await;
+
+    let restore = fluree.restore_dropped(instance.as_str());
+    let during = while_held(
+        &fluree,
+        id,
+        super::hooks::Hold::Marked,
+        "t/restore-race-copy",
+        restore,
+    )
+    .await;
+    if during.is_none() {
+        fluree.restore_dropped(instance.as_str()).await.unwrap();
+    }
+    purge(&fluree, id).await;
+    assert_eq!(
+        emails(&fluree, &copy, "bob").await.expect("the copy reads"),
+        vec![json!("b@kept")]
+    );
+    assert!(emails(&fluree, &copy, "alice").await.unwrap().is_empty());
+    assert_eq!(
+        holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// A branch is never made within a purge pass: made from a holder once the
+/// pass has planned and before it erased the holder's index, the branch
+/// would copy that index with the value, and no pass would look at it.
+#[tokio::test]
+async fn a_branch_of_a_holder_waits_for_a_purge_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/branch-race").await.unwrap();
+    let id = "t/branch-race:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@graph": [
+            {"@id": "http://example.org/alice", "http://example.org/email": "a@secret"},
+            {"@id": "http://example.org/bob", "http://example.org/email": "b@kept"}
+        ]}),
+    )
+    .await;
+    erase(&fluree, id, email("alice", "a@secret")).await;
+
+    let branch = fluree.create_branch("t/branch-race", "dev", None, None);
+    let during = while_held(
+        &fluree,
+        id,
+        super::hooks::Hold::Planned,
+        "t/branch-race",
+        branch,
+    )
+    .await;
+    if during.is_none() {
+        fluree
+            .create_branch("t/branch-race", "dev", None, None)
+            .await
+            .unwrap();
+    }
+    purge(&fluree, id).await;
+    let dev = "t/branch-race:dev";
+    assert!(emails(&fluree, dev, "alice").await.unwrap().is_empty());
+    assert_eq!(
+        emails(&fluree, dev, "bob").await.unwrap(),
+        vec![json!("b@kept")]
+    );
+    assert_eq!(
+        holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}

@@ -85,6 +85,10 @@ impl Fluree {
         release_after: Duration,
     ) -> Result<PurgeReport> {
         let runtime = self.erasure_runtime()?;
+        // The holders stay those the pass planned for: a branch made from
+        // one would copy an index not yet erased, and a restore would
+        // rebuild into folders the release deletes.
+        let _admission = runtime.admission.lock().await;
         let _purging = runtime.purging.lock().await;
         let name = LedgerId::parse(ledger)?.ledger_name();
         let jobs = self.purge_jobs(&name).await?;
@@ -109,6 +113,8 @@ impl Fluree {
         let clock = Instant::now();
         let plan = self.plan_purge(ledger).await?;
         report.timings.plan += clock.elapsed();
+        #[cfg(test)]
+        super::hooks::hold(super::hooks::Hold::Planned, name.as_str()).await;
         let stuck = self.unrebuildable_sources(&plan.rebuilt_sources).await?;
         let blocked = (!stuck.is_empty()).then_some(
             "full-text or vector indexes over a dropped ledger, or of a kind this build \

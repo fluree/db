@@ -375,8 +375,46 @@ pub(crate) mod release;
 mod run;
 mod scan;
 mod sources;
+
+/// Where a test holds a purge pass, for one ledger name.
 #[cfg(test)]
-mod tests;
+pub(crate) mod hooks {
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Hold {
+        /// Once the pass over the name has planned.
+        Planned,
+        /// Once the release marked the dropped ledger of the name, before
+        /// deleting its index files.
+        Marked,
+    }
+
+    /// Notified on reaching the hold; the pass then waits for the second.
+    #[allow(clippy::type_complexity)]
+    pub(crate) static HOLD: parking_lot::Mutex<
+        Option<(
+            Hold,
+            String,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    > = parking_lot::Mutex::new(None);
+
+    pub(crate) async fn hold(at: Hold, name: &str) {
+        let held = HOLD
+            .lock()
+            .clone()
+            .filter(|(hold, held, ..)| *hold == at && held == name);
+        if let Some((_, _, reached, proceed)) = held {
+            reached.notify_one();
+            proceed.notified().await;
+        }
+    }
+}
 
 pub use run::{PurgeReport, PurgeTimings};
 pub use scan::PurgeScan;
+
+#[cfg(test)]
+mod tests;
