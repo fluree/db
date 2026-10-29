@@ -269,6 +269,163 @@ pub async fn load_gazetteer(
     })
 }
 
+/// An ontology as RDF, for a reader that is sent the ontology itself: a
+/// file read as it is, or a ledger's default graph.
+pub async fn load_rdf(source: &Source, dirs: &FlureeDir) -> CliResult<fluree_graph_ir::Graph> {
+    use fluree_db_doc::reader::request::{parse_jsonld, parse_turtle};
+    let label = source.label();
+    let graph = match &source.kind {
+        SourceKind::File(path) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            if ext == "ttl" || ext == "nt" {
+                parse_turtle(&content)
+            } else {
+                parse_jsonld(&content)
+            }
+            .map_err(|e| CliError::Input(format!("{label}: {e}")))?
+        }
+        SourceKind::Ledger(alias) => {
+            let opened = Opened::open(source, dirs).await?;
+            if opened.graph_source {
+                return Err(CliError::Usage(format!(
+                    "--ontology {alias}: a graph source cannot be an ontology; export one to a file, or name a ledger"
+                )));
+            }
+            let mut bytes = Vec::new();
+            opened
+                .fluree
+                .export(&opened.alias)
+                .format(fluree_db_api::export::ExportFormat::NTriples)
+                .write_to(&mut bytes)
+                .await?;
+            parse_turtle(&String::from_utf8_lossy(&bytes))
+                .map_err(|e| CliError::Input(format!("{label}: {e}")))?
+        }
+    };
+    if graph.is_empty() {
+        return Err(CliError::Input(format!("--ontology {label}: no triples")));
+    }
+    Ok(graph)
+}
+
+/// What a catalog record carries: its names, a short description, and its
+/// types. Everything else about a subject stays behind, because the whole
+/// catalog goes into every window a reader reads.
+const RECORD_PREDICATES: &[&str] = &[
+    "skos:prefLabel",
+    "skos:altLabel",
+    "skos:hiddenLabel",
+    "skos:definition",
+    "rdfs:label",
+    "rdfs:comment",
+    "schema:name",
+    "schema:alternateName",
+    "schema:legalName",
+    "schema:description",
+];
+
+pub struct LoadedCatalog {
+    pub graph: fluree_graph_ir::Graph,
+    /// Records found per source, for the run's announcement.
+    pub counts: Vec<(String, usize)>,
+}
+
+/// The catalog a reader is sent: each source's records, scoped to its
+/// `#Class` when it has one.
+pub async fn load_catalog(sources: &[Source], dirs: &FlureeDir) -> CliResult<LoadedCatalog> {
+    use fluree_graph_ir::Term;
+    let mut graph = fluree_graph_ir::Graph::new();
+    let mut counts = Vec::new();
+    let rdf_type = format!("{}type", fluree_db_doc::vocab::RDF_NS);
+    for source in sources {
+        check_class_scope(source)?;
+        let opened = Opened::open(source, dirs).await?;
+        let anchor = |extra: (&str, &str)| {
+            let mut node = serde_json::json!({ "@id": "?s", extra.0: extra.1 });
+            if let Some(c) = &source.class {
+                node["@type"] = serde_json::json!(c);
+            }
+            node
+        };
+        let mut subjects = std::collections::BTreeSet::new();
+        for predicate in RECORD_PREDICATES {
+            let query = serde_json::json!({
+                "@context": fluree_db_doc::model::query_context(),
+                "where": [anchor((predicate, "?v"))],
+                "select": ["?s", "?v"]
+            });
+            for row in opened.rows(&query).await? {
+                let (Some(s), Some(v)) = (row_cell(&row, 0), row_cell(&row, 1)) else {
+                    continue;
+                };
+                if s.starts_with("_:") || v.trim().is_empty() {
+                    continue;
+                }
+                let s = expand_compact(&s);
+                graph.add_triple(
+                    Term::iri(&s),
+                    Term::iri(expand_compact(predicate)),
+                    Term::string(v.trim()),
+                );
+                subjects.insert(s);
+            }
+        }
+        let query = serde_json::json!({
+            "@context": fluree_db_doc::model::query_context(),
+            "where": [anchor(("@type", "?t"))],
+            "select": ["?s", "?t"]
+        });
+        for row in opened.rows(&query).await? {
+            let (Some(s), Some(t)) = (row_cell(&row, 0), row_cell(&row, 1)) else {
+                continue;
+            };
+            let s = expand_compact(&s);
+            if subjects.contains(&s) {
+                graph.add_triple(
+                    Term::iri(&s),
+                    Term::iri(&rdf_type),
+                    Term::iri(expand_compact(&t)),
+                );
+            }
+        }
+        counts.push((source.label(), subjects.len()));
+    }
+    graph.sort();
+    graph.dedupe();
+    Ok(LoadedCatalog { graph, counts })
+}
+
+fn row_cell(row: &Value, i: usize) -> Option<String> {
+    match row.get(i)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) => o
+            .get("@id")
+            .or_else(|| o.get("@value"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A compact IRI from a query row, with the prefixes the queries bind.
+fn expand_compact(iri: &str) -> String {
+    for (prefix, ns) in fluree_db_doc::model::PREFIXES {
+        if let Some(rest) = iri.strip_prefix(&format!("{prefix}:")) {
+            return format!("{ns}{rest}");
+        }
+    }
+    if let Some(rest) = iri.strip_prefix("doc:") {
+        return format!("{}{rest}", fluree_db_doc::vocab::DOC_NS);
+    }
+    iri.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

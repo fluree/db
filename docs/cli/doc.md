@@ -54,7 +54,9 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `1500`). |
 | `--max-chars <N>` | Split a single element longer than this many characters (default `4000`). |
 | `--max-crops <N>` | Most crops one document may send to the vision model (default `70`). A document asking for more is parsed with the deterministic tier only and flagged in the output; nothing is sent. |
-| `--ontology <LEDGER\|FILE>` | Ontology the language model extracts against: a ledger, or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Needs `[doc.llm]` or `doc.remote`. |
+| `--ontology <LEDGER\|FILE>` | Ontology extraction reads against: a ledger, or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Needs a language model (`[doc.llm]` or `doc.remote`) or a reader (`--model`). |
+| `--model <ID>` | The extraction model. An id a [`[doc.reader]`](#an-http-reader) lists in `models` reads each document whole with that reader; any other id names the language model `[doc.llm]` runs. Default: `doc.model`, else `[doc.llm] model`. |
+| `--cache <ontology\|catalog>` | For a reader: what it may keep for the next request that shares it, the ontology alone or the ontology and catalog. Config: `doc.reader.cache`. |
 | `--entities <LEDGER\|FILE[#CLASS]>` (alias `--catalog`) | Known entities (a catalog): a ledger, a graph source mapped over a table (`fluree iceberg\|sql\|delta map`), or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Found by `skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName` and `schema:alternateName`. Repeatable; `#Class` scopes to one type. A mention keeps the entity's IRI. Needs no model. |
 | `--relations <direct\|reified\|off>` | `direct` (default): reified nodes plus an edge per admitted predicate; `reified`: nodes only; `off`: entities alone. |
 | `--guidance <FILE>` | Project priorities placed in the extraction prompt. Config: `doc.extraction.guidance`. |
@@ -226,6 +228,32 @@ guidance = "prompts/guidance.md"        # priorities placed in the prompt
 ```
 
 All three slots speak the OpenAI wire shape, so OpenAI, Ollama, vLLM and LM Studio are configured the same way. Each slot can be overridden by environment variables `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
+
+### An HTTP reader
+
+Some extraction models read a whole document at once rather than a chunk at a time, and take their inputs as RDF. `[doc.reader]` names one:
+
+```toml
+[doc.reader]
+url = "https://reader.example/extract"   # the URL each request is POSTed to
+api_key = "$READER_API_KEY"
+# auth_header = "X-Api-Key"              # default: Authorization: Bearer <key>
+models = ["reader-small", "reader-large"]
+# cache = "catalog"                      # what it may keep between requests (--cache)
+
+[doc]
+# model = "reader-small"                 # what --model defaults to
+```
+
+Then `fluree doc ingest ./docs -l docs --ontology onto.ttl --catalog people --model reader-small` reads each document with it. Each request is one RDF dataset (TriG) whose named graphs give the inputs their roles, under `https://ns.flur.ee/extract#`: `document` (the document node with its full text as `nif:isString`, and the parsed structure's elements with their offsets), `ontology` (the `--ontology` source as it is), `instances` (the catalog: each `--catalog` record's types, labels and short description), and, when the text needs it, `request` (the windows it is read in). The model id goes in `X-Fluree-Model` and `--cache` in `X-Fluree-Cache`; the answer is asked for as JSON-LD.
+
+- **Long documents.** A request carries at most 48,000 characters, so a longer document is read in several, cut between elements, never inside one. A request whose text would not fit one window beside the ontology and catalog is read in up to 16 windows, cut between leaf elements.
+- **What is kept.** The reader's answer is a dataset: the document graph it was sent, echoed, and the reading in graphs of its own. The echo is dropped. The reading goes into the document's commit with its offsets moved back into the document's text, every node stamped `doc:sourceDocument`, and each reified `rdf:Statement` typed `doc:Relation` (and `doc:asserted` when the reading also states its triple with an IRI object). A re-ingest retracts it like any extraction, and every triple on a node the reader minted under the document's IRI (`<doc>/…`, `<doc>#…`).
+- **What is billed.** Each document line reports the tokens the reader billed (`X-Fluree-Serialized-Tokens`), prompt-cache reads and writes, and fuel when the endpoint meters it; the run's last lines total them, and say what the reader set aside or adapted in the ontology.
+- **Resends.** A request is resent only when the reader answers 503 with `Retry-After` (no capacity yet, such as a model still starting), after the wait it names, up to four attempts and five minutes of waiting, each wait shown as it starts. Nothing else is resent, because any other failure may follow a read that ran and was billed.
+- **Caching.** Answers are kept in the reading cache by request body, so a rerun that sends the same request (`--force` with nothing changed) is not read again; `--no-cache` reads afresh.
+
+Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE}` and `FLUREE_DOC_MODEL` override the file.
 
 ### Using a Fluree AI account
 

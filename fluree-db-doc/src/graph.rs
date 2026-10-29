@@ -213,7 +213,9 @@ fn expand_owned(predicate: &str) -> String {
 
 /// SPARQL UPDATE that retracts everything a previous extraction of this
 /// document wrote: every node stamped with it, the table cells those hold,
-/// and the document node itself. Re-extraction is retract-then-insert,
+/// and the document node itself. A stamped node a reader minted under the
+/// document's own IRI (`<doc>/…`, `<doc>#…`) is the pipeline's whole, in
+/// whatever terms the reader wrote it, so it goes with every predicate. Re-extraction is retract-then-insert,
 /// never a diff; the earlier extraction stays queryable at its commit.
 ///
 /// Cells are the one node the engine does not stamp: a cell is always one
@@ -244,13 +246,20 @@ pub fn retract_update(doc_iri: &str) -> String {
          DELETE {{ ?s ?p ?o }}\n\
          WHERE {{\n  \
            {{\n    \
-             {{ ?s doc:sourceDocument <{iri}> . ?s ?p ?o }}\n    \
-             UNION\n    \
-             {{ ?x doc:sourceDocument <{iri}> . ?x po:contains ?s . ?s a doc:TableCell . ?s ?p ?o }}\n    \
-             UNION\n    \
-             {{ VALUES ?s {{ <{iri}> }} ?s ?p ?o }}\n  \
+             {{\n      \
+               {{ ?s doc:sourceDocument <{iri}> . ?s ?p ?o }}\n      \
+               UNION\n      \
+               {{ ?x doc:sourceDocument <{iri}> . ?x po:contains ?s . ?s a doc:TableCell . ?s ?p ?o }}\n      \
+               UNION\n      \
+               {{ VALUES ?s {{ <{iri}> }} ?s ?p ?o }}\n    \
+             }}\n    \
+             FILTER ( {filter} )\n  \
            }}\n  \
-           FILTER ( {filter} )\n\
+           UNION\n  \
+           {{\n    \
+             ?s doc:sourceDocument <{iri}> . ?s ?p ?o\n    \
+             FILTER ( STRSTARTS(STR(?s), \"{iri}/\") || STRSTARTS(STR(?s), \"{iri}#\") )\n  \
+           }}\n\
          }}",
         ns = vocab::DOC_NS,
         po = vocab::PO_NS,
@@ -381,6 +390,10 @@ mod tests {
             update.contains("FILTER ("),
             "an unfiltered ?p takes foreign triples with it: {update}"
         );
+        // Unbounded only on nodes minted under the document's own IRI.
+        assert!(update.contains(
+            "FILTER ( STRSTARTS(STR(?s), \"urn:fluree:doc:memo.md/\") || STRSTARTS(STR(?s), \"urn:fluree:doc:memo.md#\") )"
+        ));
     }
 
     #[test]
