@@ -41,6 +41,25 @@ pub enum FastPathFallback {
     /// The operator's runtime gate declined (overlay novelty, time-travel,
     /// non-root policy, multi-ledger, or a shape the fast path can't answer).
     GateDeclined,
+    /// A lane over several graphs (`IndexScope::Union`) declined because the
+    /// index alone does not answer for some member: it carries novelty, or it
+    /// is read at a `t` below the index.
+    Novelty,
+    /// A lane over several graphs declined because its members are not all
+    /// read through one store and one dictionary novelty, so their ids are not
+    /// comparable.
+    StoreMismatch,
+    /// A lane over several graphs met an arena-backed `o_type` (NumBig,
+    /// vector). Its encoded key is a handle per `(g_id, p_id)`, so equal keys in
+    /// two members need not be equal values.
+    ArenaType,
+    /// A lane merging several graphs in POST met list rows (`o_i` set). Two
+    /// rows of one fact can be separated there, so dropping adjacent
+    /// duplicates would not remove every one.
+    ListRowsInPost,
+    /// A lane over several graphs met a member with no index branch for the
+    /// order it reads.
+    NoBranch,
 }
 
 impl FastPathOutcome {
@@ -50,6 +69,13 @@ impl FastPathOutcome {
             FastPathOutcome::Proceed => "proceed",
             FastPathOutcome::Fallback(FastPathFallback::KillSwitch) => "fallback:kill_switch",
             FastPathOutcome::Fallback(FastPathFallback::GateDeclined) => "fallback:gate_declined",
+            FastPathOutcome::Fallback(FastPathFallback::Novelty) => "fallback:novelty",
+            FastPathOutcome::Fallback(FastPathFallback::StoreMismatch) => "fallback:store_mismatch",
+            FastPathOutcome::Fallback(FastPathFallback::ArenaType) => "fallback:arena_type",
+            FastPathOutcome::Fallback(FastPathFallback::ListRowsInPost) => {
+                "fallback:list_rows_in_post"
+            }
+            FastPathOutcome::Fallback(FastPathFallback::NoBranch) => "fallback:no_branch",
         }
     }
 }
