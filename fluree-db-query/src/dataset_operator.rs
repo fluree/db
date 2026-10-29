@@ -993,7 +993,7 @@ impl Operator for DatasetOperator {
     }
 
     /// A default graph of several graphs of one ledger counts one pattern's
-    /// rows per group from its members' indexes (lane A, see
+    /// rows per group from its members' indexes (the grouped count,
     /// [`crate::union_group_count`]) when every member's index answers for
     /// it, instead of draining and deduplicating the members' decoded rows.
     /// A default graph of none answers no group. Each answer or decline

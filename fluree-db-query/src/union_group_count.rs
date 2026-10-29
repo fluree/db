@@ -1,5 +1,5 @@
 //! The grouped count of one triple pattern over a default graph of several
-//! graphs of one ledger (lane A).
+//! graphs of one ledger.
 //!
 //! `SELECT ?k (COUNT(*) AS ?c) WHERE { ?s <p> ?o } GROUP BY ?k`, with `?k`
 //! the subject or the object, over a default graph of two or more graphs.

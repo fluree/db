@@ -1,5 +1,5 @@
-//! Fixture F, for the nested-loop join's batched probes over a union of
-//! graphs (lane F): joins whose right side the subject, object and
+//! The union-probe fixture, for the nested-loop join's batched probes over
+//! a union of graphs: joins whose right side the subject, object and
 //! existence probes answer, and the keep/drop membership join, over facts
 //! two graphs both hold and facts only one does.
 //!
@@ -37,14 +37,14 @@ use std::fmt::Write as _;
 pub const EX: &str = "http://example.org/";
 pub const G1: &str = "urn:g1";
 pub const G2: &str = "urn:g2";
-/// Fixture F's g1 and g2.
-pub const LEDGER: &str = "it/lane-f:main";
-/// Fixture F with a list-position duplicate on the membership join's
+/// The union-probe fixture's g1 and g2.
+pub const LEDGER: &str = "it/union-probes:main";
+/// The union-probe fixture with a list-position duplicate on the membership join's
 /// predicate, which sends that join to its exact per-row path.
-pub const LEDGER_LISTS: &str = "it/lane-f-lists:main";
+pub const LEDGER_LISTS: &str = "it/union-probes-lists:main";
 /// Each ledger's union, once, in a default graph.
-pub const FLOOR: &str = "it/lane-f-floor:main";
-pub const FLOOR_LISTS: &str = "it/lane-f-floor-lists:main";
+pub const FLOOR: &str = "it/union-probes-floor:main";
+pub const FLOOR_LISTS: &str = "it/union-probes-floor-lists:main";
 
 /// Driving rows for the membership join: at least the planner's minimum
 /// (256), so it picks keep/drop over the nested loop.
@@ -128,7 +128,7 @@ fn iri(n: impl Into<String>) -> Obj {
     Obj::Iri(n.into())
 }
 
-/// Fixture F's facts; with `lists`, `y20 q` is the list `(x20 x20)` instead
+/// The union-probe fixture's facts; with `lists`, `y20 q` is the list `(x20 x20)` instead
 /// of the single fact `y20 q x20`.
 pub fn facts(lists: bool) -> Vec<Fact> {
     let mut f = Vec::new();
@@ -299,7 +299,7 @@ pub fn trig(facts: &[Fact]) -> String {
     out
 }
 
-/// A join the batched probes answer, over fixture F.
+/// A join the batched probes answer, over the union-probe fixture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
     /// The subject probe: `?x ex:sel ?y . ?y ex:v ?o`.
@@ -447,7 +447,7 @@ pub fn expected(shape: Shape, facts: &[Fact]) -> Vec<String> {
     rows
 }
 
-/// Fixture F's ledgers, indexed, on one in-memory connection with background
+/// The union-probe fixture's ledgers, indexed, on one in-memory connection with background
 /// indexing off.
 pub struct Fixture {
     pub fluree: Fluree,

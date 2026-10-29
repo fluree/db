@@ -14,7 +14,7 @@
 //! test binary using this module must be its own `[[test]]` target, and
 //! [`check`] holds a lock across each on/off pair.
 
-// Kept for: the lane tests (C, D, E, B, A) that build on this module; the
+// Kept for: the union lanes' tests that build on this module; the
 // fixture's own validation does not use every helper.
 #![allow(dead_code)]
 
@@ -635,24 +635,25 @@ impl Scope {
 /// The shapes the lanes answer, named by lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
-    /// C: `FILTER(EXISTS { ?x ex:label ?l } && ?v > 0)`, the EXISTS cache.
+    /// The EXISTS cache: `FILTER(EXISTS { ?x ex:label ?l } && ?v > 0)`, the EXISTS cache.
     ExistsInExpression,
-    /// D: `COUNT(?s)` over `?s ex:kind ex:T1`, the bound-object count.
+    /// The object count: `COUNT(?s)` over `?s ex:kind ex:T1`, the bound-object count.
     BoundObjectCount,
-    /// D′: `COUNT(?s)` over `?s ex:m 2`, a bound-object count whose constant
+    /// The object count again: `COUNT(?s)` over `?s ex:m 2`, a bound-object count whose constant
     /// matches facts of three numeric datatypes.
     BoundNumericCount,
-    /// E: `COUNT(?s)` per predicate over `?s ?p ?o`.
+    /// The per-predicate count: `COUNT(?s)` per predicate over `?s ?p ?o`.
     PerPredicateCount,
-    /// B: the `ex:knows` triangle, the cyclic join.
+    /// The cyclic join: the `ex:knows` triangle.
     Triangle,
-    /// A: `COUNT(*)` grouped by `?v` over `?s ex:n ?v`, the partitioned GROUP BY.
+    /// The grouped count: `COUNT(*)` grouped by `?v` over `?s ex:n ?v`, the partitioned GROUP BY.
     GroupByObject,
-    /// F: `?x ex:sel ?y . ?y ex:n ?v`, the nested-loop join's subject probe.
+    /// The union probes: `?x ex:sel ?y . ?y ex:n ?v`, the nested-loop join's
+    /// subject probe.
     /// Only the list fixtures hold `ex:sel` ([`ListCase`]), and it is checked
     /// against the general plan there, not by hand.
     SubjectProbe,
-    /// M2: `?s ex:label ?l FILTER(?l >= "s2")`, a string bound pushed into
+    /// The string bound: `?s ex:label ?l FILTER(?l >= "s2")`, a string bound pushed into
     /// the scan. Checked against the general plan on the list fixtures only.
     StringBound,
 }
@@ -681,14 +682,14 @@ struct Parts {
 impl Shape {
     pub fn name(self) -> &'static str {
         match self {
-            Shape::ExistsInExpression => "C exists in an expression",
-            Shape::BoundObjectCount => "D bound-object count",
-            Shape::BoundNumericCount => "D′ numeric bound-object count",
-            Shape::PerPredicateCount => "E per-predicate count",
-            Shape::Triangle => "B triangle",
-            Shape::GroupByObject => "A GROUP BY object",
-            Shape::SubjectProbe => "F subject probe",
-            Shape::StringBound => "M2 string bound",
+            Shape::ExistsInExpression => "exists in an expression",
+            Shape::BoundObjectCount => "bound-object count",
+            Shape::BoundNumericCount => "numeric bound-object count",
+            Shape::PerPredicateCount => "per-predicate count",
+            Shape::Triangle => "triangle",
+            Shape::GroupByObject => "GROUP BY object",
+            Shape::SubjectProbe => "subject probe",
+            Shape::StringBound => "string bound",
         }
     }
 

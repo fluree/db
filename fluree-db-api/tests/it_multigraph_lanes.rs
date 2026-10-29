@@ -5,10 +5,13 @@
 //! `support/multigraph.rs`, and the query's `index scope` stamp is the one the
 //! scope must get.
 //!
-//! Lane tests (C, D, E, B, A) belong in this binary: they run their shape
+//! Each union lane's tests (the EXISTS cache, the object count, the
+//! per-predicate count, the cyclic join, the grouped count) belong in this
+//! binary: they run their shape
 //! through `multigraph::check` and pin their sites with
-//! `multigraph::assert_routing`. Lane F (the nested-loop join's batched
-//! probes over a union) runs on fixture F (`support/lane_f.rs`), whose facts
+//! `multigraph::assert_routing`. The union probes (the nested-loop join's
+//! batched probes over a union) run on a fixture of their own
+//! (`support/union_probes.rs`), whose facts
 //! carry the fact-identity cases its probes must keep apart.
 
 #[path = "support/span_capture.rs"]
@@ -17,8 +20,8 @@ mod span_capture;
 #[path = "support/multigraph.rs"]
 mod multigraph;
 
-#[path = "support/lane_f.rs"]
-mod lane_f;
+#[path = "support/union_probes.rs"]
+mod union_probes;
 
 use multigraph::{
     assert_routing, check, Fixture, Graphs, Kind, ListCase, Rows, Run, Scope, Shape, State,
@@ -174,7 +177,7 @@ async fn union_lane_routes(
 }
 
 // ============================================================================
-// Lane C: the EXISTS semijoin cache
+// The EXISTS semijoin cache over a union
 // ============================================================================
 
 const EXISTS_SITES: (&str, &str) = ("exists_semijoin", "exists_semijoin_union");
@@ -186,7 +189,7 @@ fn exists_cache_answered(run: &Run, site: &str) -> bool {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_c_exists_cache_indexed() {
+async fn exists_cache_union_indexed() {
     union_lane_routes(
         State::Indexed,
         Shape::ExistsInExpression,
@@ -198,7 +201,7 @@ async fn lane_c_exists_cache_indexed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_c_exists_cache_with_novelty_in_g2() {
+async fn exists_cache_union_with_novelty_in_g2() {
     union_lane_routes(
         State::Novelty,
         Shape::ExistsInExpression,
@@ -210,7 +213,7 @@ async fn lane_c_exists_cache_with_novelty_in_g2() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_c_exists_cache_read_below_its_index() {
+async fn exists_cache_union_read_below_its_index() {
     union_lane_routes(
         State::Indexed2,
         Shape::ExistsInExpression,
@@ -222,7 +225,7 @@ async fn lane_c_exists_cache_read_below_its_index() {
 }
 
 // ============================================================================
-// Lane D: the bound-object count
+// The bound-object count over a union
 // ============================================================================
 
 const OBJECT_COUNT_SITES: (&str, &str) = ("predicate_object_count", "predicate_object_count_union");
@@ -244,7 +247,7 @@ fn object_count_route(scope: Scope, state: State) -> LaneRoute {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_d_object_count_indexed() {
+async fn object_count_union_indexed() {
     union_lane_routes(
         State::Indexed,
         Shape::BoundObjectCount,
@@ -256,7 +259,7 @@ async fn lane_d_object_count_indexed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_d_object_count_with_novelty_in_g2() {
+async fn object_count_union_with_novelty_in_g2() {
     union_lane_routes(
         State::Novelty,
         Shape::BoundObjectCount,
@@ -268,7 +271,7 @@ async fn lane_d_object_count_with_novelty_in_g2() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_d_object_count_read_below_its_index() {
+async fn object_count_union_read_below_its_index() {
     union_lane_routes(
         State::Indexed2,
         Shape::BoundObjectCount,
@@ -280,7 +283,7 @@ async fn lane_d_object_count_read_below_its_index() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_d_numeric_count_indexed() {
+async fn numeric_count_union_indexed() {
     union_lane_routes(
         State::Indexed,
         Shape::BoundNumericCount,
@@ -292,7 +295,7 @@ async fn lane_d_numeric_count_indexed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_d_numeric_count_with_novelty_in_g2() {
+async fn numeric_count_union_with_novelty_in_g2() {
     union_lane_routes(
         State::Novelty,
         Shape::BoundNumericCount,
@@ -304,7 +307,7 @@ async fn lane_d_numeric_count_with_novelty_in_g2() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_d_numeric_count_read_below_its_index() {
+async fn numeric_count_union_read_below_its_index() {
     union_lane_routes(
         State::Indexed2,
         Shape::BoundNumericCount,
@@ -316,19 +319,19 @@ async fn lane_d_numeric_count_read_below_its_index() {
 }
 
 // ============================================================================
-// Lane E: the per-predicate count over a default graph of several graphs
+// The per-predicate count over a default graph of several graphs
 // ============================================================================
 
-/// Lane E's site over several graphs or none; the one-graph lane's site as
+/// The per-predicate count's site over several graphs or none; the one-graph lane's site as
 /// it runs, and as it is planned. The planned site stamps at plan time
 /// whenever the one-graph lane is planned, also where its open() then
 /// declines (two ledgers, novelty), so only the run site says it answered;
 /// a union scope plans neither.
-const E_UNION: &str = "stats_count_by_predicate_union";
-const E_ONE: &str = "COUNT by predicate (directory)";
-const E_ONE_PLANNED: &str = "stats_count_by_predicate";
+const PER_PREDICATE_UNION: &str = "stats_count_by_predicate_union";
+const PER_PREDICATE_ONE: &str = "COUNT by predicate (directory)";
+const PER_PREDICATE_ONE_PLANNED: &str = "stats_count_by_predicate";
 
-/// Lane E's shape in every scope of fixture A in `state`: the answer by hand
+/// The per-predicate count's shape in every scope of fixture A in `state`: the answer by hand
 /// with fast paths on and off, and the routing. The union lane answers a
 /// current scope of several graphs, also one with a default graph the index
 /// holds no leaf for, and the empty one; a scope with novelty or read below
@@ -343,11 +346,15 @@ const E_ONE_PLANNED: &str = "stats_count_by_predicate";
 /// every state, and the general plan answers; the one-graph lane corrects
 /// its counts from the list census. JSON-LD reads the members as values,
 /// and the union lane answers it.
-async fn lane_e(state: State) {
+async fn per_predicate_count_union(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
     let mut runs = 0;
-    let all = [E_UNION, E_ONE, E_ONE_PLANNED];
+    let all = [
+        PER_PREDICATE_UNION,
+        PER_PREDICATE_ONE,
+        PER_PREDICATE_ONE_PLANNED,
+    ];
     for &scope in SCOPES {
         if !scope.applies(state) {
             continue;
@@ -364,7 +371,10 @@ async fn lane_e(state: State) {
             match scope.kind() {
                 Kind::Union | Kind::Empty if surface == Surface::Sparql => {
                     assert_routing(&run, &[], &all, &mut failures);
-                    let list_view = (E_UNION.to_string(), "fallback:list_view".to_string());
+                    let list_view = (
+                        PER_PREDICATE_UNION.to_string(),
+                        "fallback:list_view".to_string(),
+                    );
                     if !run.fell_back.contains(&list_view) {
                         failures.push(format!(
                             "{}: no ListView decline (fell back: {:?})",
@@ -373,11 +383,19 @@ async fn lane_e(state: State) {
                     }
                 }
                 Kind::Union if current => {
-                    assert_routing(&run, &[E_UNION], &[E_ONE, E_ONE_PLANNED], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[PER_PREDICATE_UNION],
+                        &[PER_PREDICATE_ONE, PER_PREDICATE_ONE_PLANNED],
+                        &mut failures,
+                    );
                 }
                 Kind::Union => {
                     assert_routing(&run, &[], &all, &mut failures);
-                    let novelty = (E_UNION.to_string(), "fallback:novelty".to_string());
+                    let novelty = (
+                        PER_PREDICATE_UNION.to_string(),
+                        "fallback:novelty".to_string(),
+                    );
                     if !run.fell_back.contains(&novelty) {
                         failures.push(format!(
                             "{}: no Novelty decline (fell back: {:?})",
@@ -386,14 +404,29 @@ async fn lane_e(state: State) {
                     }
                 }
                 Kind::Empty => {
-                    assert_routing(&run, &[E_UNION], &[E_ONE, E_ONE_PLANNED], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[PER_PREDICATE_UNION],
+                        &[PER_PREDICATE_ONE, PER_PREDICATE_ONE_PLANNED],
+                        &mut failures,
+                    );
                 }
                 // In a GRAPH scope the pattern is not the lane's shape.
                 Kind::One if current && matches!(scope.graphs(), Graphs::G0 | Graphs::G1) => {
-                    assert_routing(&run, &[E_ONE], &[E_UNION], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[PER_PREDICATE_ONE],
+                        &[PER_PREDICATE_UNION],
+                        &mut failures,
+                    );
                 }
                 Kind::One | Kind::None => {
-                    assert_routing(&run, &[], &[E_UNION, E_ONE], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[],
+                        &[PER_PREDICATE_UNION, PER_PREDICATE_ONE],
+                        &mut failures,
+                    );
                 }
             }
         }
@@ -408,18 +441,18 @@ async fn lane_e(state: State) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_e_indexed() {
-    lane_e(State::Indexed).await;
+async fn per_predicate_count_union_indexed() {
+    per_predicate_count_union(State::Indexed).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_e_with_novelty_in_g2() {
-    lane_e(State::Novelty).await;
+async fn per_predicate_count_union_with_novelty_in_g2() {
+    per_predicate_count_union(State::Novelty).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_e_read_below_its_index() {
-    lane_e(State::Indexed2).await;
+async fn per_predicate_count_union_read_below_its_index() {
+    per_predicate_count_union(State::Indexed2).await;
 }
 
 /// Big numbers in the per-predicate count over several graphs. A big number
@@ -537,7 +570,7 @@ async fn numbig_counts(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_e_keys_big_numbers_by_value() {
+async fn per_predicate_count_union_keys_big_numbers_by_value() {
     use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder, GraphDb, ReindexOptions};
     let fluree = FlureeBuilder::memory().without_indexing().build_memory();
     fluree
@@ -591,8 +624,10 @@ async fn lane_e_keys_big_numbers_by_value() {
             if generic != expected {
                 failures.push(format!("{label}: generic {generic:?}, want {expected:?}"));
             }
-            if union && !proceeded.iter().any(|s| s == E_UNION) {
-                failures.push(format!("{label}: {E_UNION} did not proceed: {proceeded:?}"));
+            if union && !proceeded.iter().any(|s| s == PER_PREDICATE_UNION) {
+                failures.push(format!(
+                    "{label}: {PER_PREDICATE_UNION} did not proceed: {proceeded:?}"
+                ));
             }
         }
     }
@@ -600,7 +635,7 @@ async fn lane_e_keys_big_numbers_by_value() {
 }
 
 // ---------------------------------------------------------------------------
-// Lane B: the cyclic join (`Shape::Triangle`).
+// The cyclic join over a union (`Shape::Triangle`).
 
 const CYCLIC: &str = "cyclic_bgp";
 const CYCLIC_UNION: &str = "cyclic_bgp_union";
@@ -665,33 +700,33 @@ async fn triangle_lanes_read_below_the_index() {
 }
 
 // ============================================================================
-// Lane A: the grouped count over a default graph of several graphs
+// The grouped count over a default graph of several graphs
 // ============================================================================
 
-/// Lane A's site over several graphs or none, and the one-graph partitioned
+/// The grouped count's site over several graphs or none, and the one-graph partitioned
 /// GROUP BY's site.
-const A_UNION: &str = "partitioned_group_by_union";
-const A_ONE: &str = "partitioned_group_by";
+const GROUPED_COUNT_UNION: &str = "partitioned_group_by_union";
+const GROUPED_COUNT_ONE: &str = "partitioned_group_by";
 
-/// Whether `run` stamped `outcome` at lane A's union site.
+/// Whether `run` stamped `outcome` at the grouped count's union site.
 fn a_declined(run: &Run, outcome: &str, failures: &mut Vec<String>) {
-    let decline = (A_UNION.to_string(), outcome.to_string());
+    let decline = (GROUPED_COUNT_UNION.to_string(), outcome.to_string());
     if !run.fell_back.contains(&decline) {
         failures.push(format!(
-            "{}: no `{outcome}` at {A_UNION} (fell back: {:?})",
+            "{}: no `{outcome}` at {GROUPED_COUNT_UNION} (fell back: {:?})",
             run.label, run.fell_back
         ));
     }
 }
 
-/// Lane A's shape (`COUNT(*)` in SPARQL, `COUNT(?s)` in JSON-LD) in every
+/// The grouped count's shape (`COUNT(*)` in SPARQL, `COUNT(?s)` in JSON-LD) in every
 /// scope of fixture A in `state`: the answer by hand with fast paths on and
 /// off, and the routing. The union lane answers a current scope of several
 /// graphs, one of them an empty default graph or not, and the scope of none;
 /// a scope with novelty or read below the index declines it with `Novelty`;
 /// the one-graph lane answers one graph; neither answers a GRAPH scope (not
 /// the shape) or two ledgers.
-async fn lane_a(state: State) {
+async fn grouped_count_union(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
     let mut runs = 0;
@@ -710,19 +745,44 @@ async fn lane_a(state: State) {
                 // A member the index holds nothing for (the empty default
                 // graph) contributes nothing; it is no reason to decline.
                 Kind::Union if current => {
-                    assert_routing(&run, &[A_UNION], &[A_ONE], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[GROUPED_COUNT_UNION],
+                        &[GROUPED_COUNT_ONE],
+                        &mut failures,
+                    );
                 }
                 Kind::Union => {
-                    assert_routing(&run, &[], &[A_UNION, A_ONE], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[],
+                        &[GROUPED_COUNT_UNION, GROUPED_COUNT_ONE],
+                        &mut failures,
+                    );
                     a_declined(&run, "fallback:novelty", &mut failures);
                 }
-                Kind::Empty => assert_routing(&run, &[A_UNION], &[A_ONE], &mut failures),
+                Kind::Empty => assert_routing(
+                    &run,
+                    &[GROUPED_COUNT_UNION],
+                    &[GROUPED_COUNT_ONE],
+                    &mut failures,
+                ),
                 // A GRAPH scope groups a pattern inside GRAPH: not the shape.
                 Kind::One if matches!(scope.graphs(), Graphs::G0 | Graphs::G1) => {
-                    assert_routing(&run, &[A_ONE], &[A_UNION], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[GROUPED_COUNT_ONE],
+                        &[GROUPED_COUNT_UNION],
+                        &mut failures,
+                    );
                 }
                 Kind::One | Kind::None => {
-                    assert_routing(&run, &[], &[A_UNION, A_ONE], &mut failures);
+                    assert_routing(
+                        &run,
+                        &[],
+                        &[GROUPED_COUNT_UNION, GROUPED_COUNT_ONE],
+                        &mut failures,
+                    );
                 }
             }
         }
@@ -737,18 +797,18 @@ async fn lane_a(state: State) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_a_indexed() {
-    lane_a(State::Indexed).await;
+async fn grouped_count_union_indexed() {
+    grouped_count_union(State::Indexed).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_a_with_novelty_in_g2() {
-    lane_a(State::Novelty).await;
+async fn grouped_count_union_with_novelty_in_g2() {
+    grouped_count_union(State::Novelty).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lane_a_read_below_its_index() {
-    lane_a(State::Indexed2).await;
+async fn grouped_count_union_read_below_its_index() {
+    grouped_count_union(State::Indexed2).await;
 }
 
 /// The SPARQL rows of `result`, each value with its datatype's local name
@@ -782,7 +842,7 @@ fn typed_rows(result: &serde_json::Value, vars: &[&str]) -> Rows {
     out
 }
 
-/// One of lane A's own queries over fixture A: its SPARQL (`{ds}` for the
+/// One of the grouped count's own queries over fixture A: its SPARQL (`{ds}` for the
 /// dataset clause) and, where it has one, its JSON-LD twin; the columns; the
 /// rows by hand; and whether the union lane answers it, or which outcome it
 /// declines with.
@@ -887,16 +947,22 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
             }
         }
         if fires {
-            assert_routing(&run, &[A_UNION], &[A_ONE], failures);
+            assert_routing(&run, &[GROUPED_COUNT_UNION], &[GROUPED_COUNT_ONE], failures);
         } else {
-            assert_routing(&run, &[], &[A_UNION, A_ONE], failures);
+            assert_routing(
+                &run,
+                &[],
+                &[GROUPED_COUNT_UNION, GROUPED_COUNT_ONE],
+                failures,
+            );
         }
         match decline {
             Some(outcome) => a_declined(&run, outcome, failures),
             // The list view's decline is named only for the lane's shape.
-            None if run
-                .fell_back
-                .contains(&(A_UNION.to_string(), "fallback:list_view".to_string())) =>
+            None if run.fell_back.contains(&(
+                GROUPED_COUNT_UNION.to_string(),
+                "fallback:list_view".to_string(),
+            )) =>
             {
                 failures.push(format!("{}: `fallback:list_view` off the shape", run.label));
             }
@@ -905,7 +971,7 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
     }
 }
 
-/// Lane A beyond the shape, over fixture A's `FROM` scopes: grouping by the
+/// The grouped count beyond the shape, over fixture A's `FROM` scopes: grouping by the
 /// subject, two counts, modifiers above the count, a list's repeated value,
 /// one value under three datatypes, a predicate one member holds; and what it
 /// leaves to the general plan: a predicate no member holds, a count of the
@@ -918,7 +984,7 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
 /// query is its shape. JSON-LD sees the members as values, two facts by
 /// their list positions, and the lane answers them.
 #[tokio::test(flavor = "current_thread")]
-async fn lane_a_group_counts_over_from_graphs() {
+async fn grouped_count_union_group_counts_over_from_graphs() {
     use multigraph::{rows, G1, G2};
     use serde_json::json;
     let fx = Fixture::build(State::Indexed).await;
@@ -1207,7 +1273,7 @@ async fn lane_a_group_counts_over_from_graphs() {
 /// Under the kill switch the union lane stands down with `KillSwitch`, and
 /// the general plan answers.
 #[tokio::test(flavor = "current_thread")]
-async fn lane_a_answers_to_the_kill_switch() {
+async fn grouped_count_union_answers_to_the_kill_switch() {
     use fluree_db_api::set_fast_paths_disabled;
     let fx = Fixture::build(State::Indexed).await;
     let mut failures = Vec::new();
@@ -1235,11 +1301,19 @@ async fn lane_a_answers_to_the_kill_switch() {
             Err(e) => failures.push(format!("{label}: failed: {e}")),
         }
         let outcomes = multigraph::outcomes(&store);
-        if !outcomes.contains(&(A_UNION.to_string(), "fallback:kill_switch".to_string())) {
+        if !outcomes.contains(&(
+            GROUPED_COUNT_UNION.to_string(),
+            "fallback:kill_switch".to_string(),
+        )) {
             failures.push(format!("{label}: no kill-switch decline: {outcomes:?}"));
         }
-        if outcomes.iter().any(|(s, o)| s == A_UNION && o == "proceed") {
-            failures.push(format!("{label}: {A_UNION} proceeded under the switch"));
+        if outcomes
+            .iter()
+            .any(|(s, o)| s == GROUPED_COUNT_UNION && o == "proceed")
+        {
+            failures.push(format!(
+                "{label}: {GROUPED_COUNT_UNION} proceeded under the switch"
+            ));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -1250,7 +1324,7 @@ async fn lane_a_answers_to_the_kill_switch() {
 /// object and by the subject, reaches the union lane and answers by hand;
 /// over the plain ledger's default graph alone the one-graph lane answers.
 #[tokio::test(flavor = "current_thread")]
-async fn lane_a_cypher_over_the_union_default_graph() {
+async fn grouped_count_union_cypher_over_the_union_default_graph() {
     use multigraph::{jsonld_rows, rows, EMPTY_G0_UNION_LEDGER, LEDGER, UNION_LEDGER};
     let fx = Fixture::build(State::Indexed).await;
     let kind = "`http://example.org/kind`";
@@ -1318,9 +1392,19 @@ async fn lane_a_cypher_over_the_union_default_graph() {
             }
         }
         if ledger != LEDGER {
-            assert_routing(&run, &[A_UNION], &[A_ONE], &mut failures);
+            assert_routing(
+                &run,
+                &[GROUPED_COUNT_UNION],
+                &[GROUPED_COUNT_ONE],
+                &mut failures,
+            );
         } else {
-            assert_routing(&run, &[A_ONE], &[A_UNION], &mut failures);
+            assert_routing(
+                &run,
+                &[GROUPED_COUNT_ONE],
+                &[GROUPED_COUNT_UNION],
+                &mut failures,
+            );
         }
     }
     assert!(
@@ -1342,9 +1426,9 @@ const UNION_SCOPES: &[(&str, &str, &str)] = &[
 
 /// `run`'s answers against `want`, and its routing: `must_fire` proceeded,
 /// `must_not_fire` did not.
-fn check_lane_f(
+fn check_union_probes(
     label: &str,
-    run: &lane_f::Run,
+    run: &union_probes::Run,
     want: &[String],
     must_fire: &[&str],
     must_not_fire: &[&str],
@@ -1375,7 +1459,7 @@ fn check_lane_f(
     }
 }
 
-/// Lane F over fixture F: under a union of g1 and g2, every shape answers as
+/// The union probes over their fixture: under a union of g1 and g2, every shape answers as
 /// the union's facts do and as the one-graph floor does, with fast paths on
 /// and off, and the union probe answers it; over g1 alone the one-graph
 /// lanes answer and the union site stays off. The membership join keeps its
@@ -1388,26 +1472,26 @@ fn check_lane_f(
 /// each graph), and no batched lane joins that predicate; its list-free twin
 /// on the same ledger is joined by the lane.
 #[tokio::test(flavor = "current_thread")]
-async fn lane_f_union_probes_answer_by_fact() {
-    use lane_f::{Shape, Surface};
-    let fx = lane_f::Fixture::build().await;
+async fn union_probes_answer_by_fact() {
+    use union_probes::{Shape, Surface};
+    let fx = union_probes::Fixture::build().await;
     let mut failures = Vec::new();
-    for &surface in lane_f::SURFACES {
+    for &surface in union_probes::SURFACES {
         for (ledger, floor, lists) in [
-            (lane_f::LEDGER, lane_f::FLOOR, false),
-            (lane_f::LEDGER_LISTS, lane_f::FLOOR_LISTS, true),
+            (union_probes::LEDGER, union_probes::FLOOR, false),
+            (union_probes::LEDGER_LISTS, union_probes::FLOOR_LISTS, true),
         ] {
-            let facts = lane_f::facts(lists);
+            let facts = union_probes::facts(lists);
             let g1_facts: Vec<_> = facts
                 .iter()
-                .filter(|f| f.g == lane_f::G1)
+                .filter(|f| f.g == union_probes::G1)
                 .cloned()
                 .collect();
-            let floor_facts = lane_f::union_of(&facts);
-            for &shape in lane_f::SHAPES {
+            let floor_facts = union_probes::union_of(&facts);
+            for &shape in union_probes::SHAPES {
                 let label =
                     |scope: &str| format!("{surface:?} / {shape:?} / {scope} / lists {lists}");
-                let want_floor = lane_f::expected_on(surface, shape, &floor_facts);
+                let want_floor = union_probes::expected_on(surface, shape, &floor_facts);
                 match fx.on(surface, floor, "", "", shape).await {
                     Ok(rows) if rows == want_floor => {}
                     other => failures.push(format!(
@@ -1415,14 +1499,16 @@ async fn lane_f_union_probes_answer_by_fact() {
                         label("floor")
                     )),
                 }
-                let want = lane_f::expected_on(surface, shape, &facts);
-                let list_view = surface == Surface::Sparql && lane_f::probes_a_list(shape, &facts);
+                let want = union_probes::expected_on(surface, shape, &facts);
+                let list_view =
+                    surface == Surface::Sparql && union_probes::probes_a_list(shape, &facts);
                 // The membership join's key repeats where its predicate's list
                 // holds one member twice (`y20 q (x20 x20)`).
-                let repeats = lists && lane_f::probes_a_list(shape, &facts);
+                let repeats = lists && union_probes::probes_a_list(shape, &facts);
                 let union_site = shape.site();
                 for (name, prologue, dataset) in UNION_SCOPES {
-                    let run = lane_f::run_on(&fx, surface, ledger, prologue, dataset, shape).await;
+                    let run =
+                        union_probes::run_on(&fx, surface, ledger, prologue, dataset, shape).await;
                     let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
                         _ if list_view => (&[], &[union_site, "nested-loop-batched"]),
                         // A list position repeating a key sends keep/drop exact.
@@ -1430,7 +1516,7 @@ async fn lane_f_union_probes_answer_by_fact() {
                         Shape::Membership => (&["membership-join"], &[]),
                         _ => (&[union_site], &["nested-loop-batched"]),
                     };
-                    check_lane_f(&label(name), &run, &want, fire, not_fire, &mut failures);
+                    check_union_probes(&label(name), &run, &want, fire, not_fire, &mut failures);
                     // The union probe names why it stood down on the list view.
                     if list_view
                         && !run.fell_back.iter().any(|(site, outcome)| {
@@ -1447,8 +1533,9 @@ async fn lane_f_union_probes_answer_by_fact() {
                 // Over one graph the one-graph operators answer: the batched
                 // probes for the subject and existence joins (the planner picks
                 // another join for the object shape there), never the union's.
-                let want_g1 = lane_f::expected_on(surface, shape, &g1_facts);
-                let run = lane_f::run_on(&fx, surface, ledger, "", "FROM <urn:g1>", shape).await;
+                let want_g1 = union_probes::expected_on(surface, shape, &g1_facts);
+                let run =
+                    union_probes::run_on(&fx, surface, ledger, "", "FROM <urn:g1>", shape).await;
                 let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
                     _ if list_view => (&[], &["nested-loop-batched", "nested-loop-batched-union"]),
                     Shape::Membership if repeats => (&[], &["membership-join"]),
@@ -1456,7 +1543,7 @@ async fn lane_f_union_probes_answer_by_fact() {
                     Shape::Object => (&[], &["nested-loop-batched-union"]),
                     _ => (&["nested-loop-batched"], &["nested-loop-batched-union"]),
                 };
-                check_lane_f(
+                check_union_probes(
                     &label("FROM g1"),
                     &run,
                     &want_g1,
@@ -1470,49 +1557,49 @@ async fn lane_f_union_probes_answer_by_fact() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Lane F follows each member's own novelty, per graph and per predicate
-/// (lane B's rule). Novelty outside the union, or on another predicate,
+/// The union probes follow each member's own novelty, per graph and per predicate
+/// (the cyclic join's rule). Novelty outside the union, or on another predicate,
 /// leaves the union probe running. A member the index has no branch for,
 /// whose novelty holds the probed predicate, stands it down (`Novelty`);
 /// for now so does a member with a branch and such novelty. Every answer is
 /// the union's. JSON-LD, where the probed predicate's list members are
 /// values and the probe runs (on SPARQL the list view joins it).
 #[tokio::test(flavor = "current_thread")]
-async fn lane_f_union_probes_follow_each_members_novelty() {
-    use lane_f::{fact, Obj, Shape, G2, LEDGER};
-    let fx = lane_f::Fixture::build().await;
-    let mut facts = lane_f::facts(false);
+async fn union_probes_follow_each_members_novelty() {
+    use union_probes::{fact, Obj, Shape, G2, LEDGER};
+    let fx = union_probes::Fixture::build().await;
+    let mut facts = union_probes::facts(false);
     let mut failures = Vec::new();
-    let in_g1_g2 = |facts: &[lane_f::Fact]| -> Vec<lane_f::Fact> {
+    let in_g1_g2 = |facts: &[union_probes::Fact]| -> Vec<union_probes::Fact> {
         facts
             .iter()
-            .filter(|f| f.g == lane_f::G1 || f.g == G2)
+            .filter(|f| f.g == union_probes::G1 || f.g == G2)
             .cloned()
             .collect()
     };
     let (from, pragma) = (UNION_SCOPES[0], UNION_SCOPES[1]);
     let union = "nested-loop-batched-union";
-    let json = lane_f::Surface::JsonLd;
+    let json = union_probes::Surface::JsonLd;
 
     // Novelty in g2 on another predicate: g2 holds nothing new for `v`.
     let other = vec![fact(G2, "z", "other", Obj::Int(1))];
     fx.write(LEDGER, &other).await;
     facts.extend(other);
-    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
-    let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
-    check_lane_f("other predicate", &run, &want, &[union], &[], &mut failures);
+    let run = union_probes::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
+    let want = union_probes::expected(Shape::Subject, &in_g1_g2(&facts));
+    check_union_probes("other predicate", &run, &want, &[union], &[], &mut failures);
 
     // Novelty for `v` in the default graph, which the index has no branch
     // for: outside `FROM g1 FROM g2`, a member of the union default graph.
     let default_graph = vec![fact("", "y2", "v", Obj::Str("d".into()))];
     fx.write(LEDGER, &default_graph).await;
     facts.extend(default_graph);
-    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
-    let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
-    check_lane_f("novelty outside", &run, &want, &[union], &[], &mut failures);
-    let run = lane_f::run_on(&fx, json, LEDGER, pragma.1, pragma.2, Shape::Subject).await;
-    let want = lane_f::expected(Shape::Subject, &facts);
-    check_lane_f(
+    let run = union_probes::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
+    let want = union_probes::expected(Shape::Subject, &in_g1_g2(&facts));
+    check_union_probes("novelty outside", &run, &want, &[union], &[], &mut failures);
+    let run = union_probes::run_on(&fx, json, LEDGER, pragma.1, pragma.2, Shape::Subject).await;
+    let want = union_probes::expected(Shape::Subject, &facts);
+    check_union_probes(
         "branchless member",
         &run,
         &want,
@@ -1535,9 +1622,9 @@ async fn lane_f_union_probes_follow_each_members_novelty() {
     let g2 = vec![fact(G2, "y0", "v", Obj::Dec("4.5"))];
     fx.write(LEDGER, &g2).await;
     facts.extend(g2);
-    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
-    let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
-    check_lane_f(
+    let run = union_probes::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
+    let want = union_probes::expected(Shape::Subject, &in_g1_g2(&facts));
+    check_union_probes(
         "member with novelty",
         &run,
         &want,
@@ -1550,14 +1637,14 @@ async fn lane_f_union_probes_follow_each_members_novelty() {
 }
 
 /// A one-graph join whose probed graph has no PSOT branch: the default graph
-/// (fixture F's facts are all in g1 and g2) and a named graph first written
+/// (the union-probe fixture's facts are all in g1 and g2) and a named graph first written
 /// after the index, each holding left rows in novelty only. The probed
 /// predicate has no novelty there, so the graph holds nothing for the probe:
 /// the join answers with no rows, rather than failing to find the branch.
 #[tokio::test(flavor = "current_thread")]
 async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
-    use lane_f::{fact, Obj, LEDGER};
-    let fx = lane_f::Fixture::build().await;
+    use union_probes::{fact, Obj, LEDGER};
+    let fx = union_probes::Fixture::build().await;
     fx.write(
         LEDGER,
         &[
@@ -1567,7 +1654,7 @@ async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
     )
     .await;
     let mut failures = Vec::new();
-    let body = lane_f::Shape::Subject.body();
+    let body = union_probes::Shape::Subject.body();
     let in_g3 = format!("GRAPH <urn:g3> {{ {body} }}");
     let body = body.as_str();
     for (name, dataset, body) in [
@@ -1575,15 +1662,15 @@ async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
         ("FROM g3", "FROM <urn:g3>", body),
         ("GRAPH g3", "", in_g3.as_str()),
     ] {
-        let run = lane_f::run_where(&fx, LEDGER, "", dataset, body, &["y", "o"]).await;
-        check_lane_f(name, &run, &[], &[], &[], &mut failures);
+        let run = union_probes::run_where(&fx, LEDGER, "", dataset, body, &["y", "o"]).await;
+        check_union_probes(name, &run, &[], &[], &[], &mut failures);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Union rows stay encoded: an arena literal (a big number) leaves its member
 /// with the graph it was read from, so every consumer reads the value its own
-/// graph holds. Fixture F's trap on `vf` (no lists, so SPARQL reads it as
+/// graph holds. The union-probe fixture's trap on `vf` (no lists, so SPARQL reads it as
 /// values): `y0 vf` is 1.5 in g1 and 2.5 in g2, both the first big-number
 /// handle of their graph; `y1 vf 3.5` is in both (one fact of the union);
 /// `y10 vf 7.5` is in g2. Each consumer that decodes or keys a binding (scan
@@ -1592,8 +1679,8 @@ async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
 /// novelty in one member (which then binds decoded beside the encoded other).
 #[tokio::test(flavor = "current_thread")]
 async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
-    use lane_f::{fact, Obj, G2, LEDGER};
-    let fx = lane_f::Fixture::build().await;
+    use union_probes::{fact, Obj, G2, LEDGER};
+    let fx = union_probes::Fixture::build().await;
     let numeric = "?s ex:vf ?o FILTER(isNumeric(?o))";
     // (label, WHERE body, projected vars, rows on the index, rows added by the
     // novelty write of `y0 vf 4.5` in g2)
@@ -1666,8 +1753,8 @@ async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
                     want.extend(added.iter().map(|s| (*s).to_string()));
                     want.sort();
                 }
-                let run = lane_f::run_where(&fx, LEDGER, prologue, dataset, body, vars).await;
-                check_lane_f(
+                let run = union_probes::run_where(&fx, LEDGER, prologue, dataset, body, vars).await;
+                check_union_probes(
                     &format!("{phase} / {scope} / {label}"),
                     &run,
                     &want,
@@ -1687,15 +1774,15 @@ async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
 // ============================================================================
 
 /// The shapes the list fixtures run, and the union site of the lane each
-/// exercises (M2's bound is pushed into each member's scan: it has no union
+/// exercises (the string bound is pushed into each member's scan: it has no union
 /// site, and is checked by its answer alone).
 const LIST_SHAPES: &[(Shape, Option<&str>)] = &[
     (Shape::ExistsInExpression, Some(EXISTS_SITES.1)),
     (Shape::BoundObjectCount, Some(OBJECT_COUNT_SITES.1)),
     (Shape::BoundNumericCount, Some(OBJECT_COUNT_SITES.1)),
-    (Shape::PerPredicateCount, Some(E_UNION)),
+    (Shape::PerPredicateCount, Some(PER_PREDICATE_UNION)),
     (Shape::Triangle, Some(CYCLIC_UNION)),
-    (Shape::GroupByObject, Some(A_UNION)),
+    (Shape::GroupByObject, Some(GROUPED_COUNT_UNION)),
     (Shape::SubjectProbe, Some("nested-loop-batched-union")),
     (Shape::StringBound, None),
 ];
