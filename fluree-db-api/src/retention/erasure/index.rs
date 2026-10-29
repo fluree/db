@@ -12,8 +12,8 @@
 //! its last listing is [`REFRESH`] old, and a publication is reported only
 //! after that.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,33 @@ pub(crate) struct ErasureIndex {
     /// The digests of erased commits' transaction documents.
     txns: parking_lot::RwLock<HashSet<String>>,
     entries: parking_lot::RwLock<HashMap<String, Arc<Entry>>>,
+    /// Reads of commits and transaction documents under way, by the epoch
+    /// they started in, so [`Self::drain`] can wait out those begun before
+    /// it.
+    reads: parking_lot::Mutex<BTreeMap<u64, usize>>,
+    epoch: AtomicU64,
+    read_done: tokio::sync::Notify,
+}
+
+/// A read of a commit or transaction document under way; see
+/// [`ErasureIndex::drain`].
+pub(crate) struct Reading<'a> {
+    index: &'a ErasureIndex,
+    epoch: u64,
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        let mut reads = self.index.reads.lock();
+        if let Some(count) = reads.get_mut(&self.epoch) {
+            *count -= 1;
+            if *count == 0 {
+                reads.remove(&self.epoch);
+            }
+        }
+        drop(reads);
+        self.index.read_done.notify_waiters();
+    }
 }
 
 impl std::fmt::Debug for ErasureIndex {
@@ -210,6 +237,36 @@ impl ErasureIndex {
             any: AtomicBool::new(false),
             txns: parking_lot::RwLock::new(HashSet::new()),
             entries: parking_lot::RwLock::new(HashMap::new()),
+            reads: parking_lot::Mutex::new(BTreeMap::new()),
+            epoch: AtomicU64::new(0),
+            read_done: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn reading(&self) -> Reading<'_> {
+        let mut reads = self.reads.lock();
+        let epoch = self.epoch.load(Ordering::Acquire);
+        *reads.entry(epoch).or_default() += 1;
+        Reading { index: self, epoch }
+    }
+
+    /// Wait until every read of a commit or transaction document begun
+    /// before this call has finished. A read decides whether its address is
+    /// erased as it starts, so one begun before the maps were listed again
+    /// may still return an original.
+    pub(crate) async fn drain(&self) {
+        let before = {
+            let _reads = self.reads.lock();
+            self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+        };
+        loop {
+            let done = self.read_done.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            if self.reads.lock().range(..before).next().is_none() {
+                return;
+            }
+            done.await;
         }
     }
 
@@ -743,6 +800,13 @@ impl ErasureStorage {
         }
     }
 
+    /// Counts a read of `address` under way if it is a commit or a
+    /// transaction document, which an erasure can replace.
+    fn reading(&self, address: &str) -> Option<Reading<'_>> {
+        (commit_digest(address).is_some() || txn_digest(address).is_some())
+            .then(|| self.index.reading())
+    }
+
     /// Whether a sync read of `address` must go the async way, through
     /// [`Self::substitute`].
     fn defer_sync(&self, address: &str) -> bool {
@@ -753,6 +817,7 @@ impl ErasureStorage {
 #[async_trait]
 impl StorageRead for ErasureStorage {
     async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
+        let _reading = self.reading(address);
         match self.substitute(address).await {
             Some(r) => r.map(|b| b.to_vec()),
             None => self.inner.read_bytes(address).await,
@@ -764,6 +829,7 @@ impl StorageRead for ErasureStorage {
         address: &str,
         hint: ReadHint,
     ) -> fluree_db_core::Result<Vec<u8>> {
+        let _reading = self.reading(address);
         match self.substitute(address).await {
             Some(r) => r.map(|b| b.to_vec()),
             None => self.inner.read_bytes_hint(address, hint).await,
@@ -775,6 +841,7 @@ impl StorageRead for ErasureStorage {
         address: &str,
         range: std::ops::Range<u64>,
     ) -> fluree_db_core::Result<Vec<u8>> {
+        let _reading = self.reading(address);
         match self.substitute(address).await {
             Some(r) => r.map(|b| {
                 let end = (range.end as usize).min(b.len());
@@ -957,6 +1024,133 @@ mod tests {
             steps: vec![step(&format!("r{n}"))],
             replaced_at: Vec::new(),
         }
+    }
+
+    /// An installation waits out reads of commits begun before it, which
+    /// may still return an original, and not those begun after it.
+    #[tokio::test]
+    async fn a_drain_waits_out_reads_begun_before_it() {
+        let storage: Arc<dyn Storage> = Arc::new(fluree_db_core::MemoryStorage::new());
+        let index = Arc::new(ErasureIndex::new(storage, Arc::new(Verifier::default())));
+        let before = index.reading();
+        let drain = tokio::spawn({
+            let index = Arc::clone(&index);
+            async move { index.drain().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain.is_finished(), "a read begun before is under way");
+        let after = index.reading();
+        drop(before);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("only the read begun before held it")
+            .unwrap();
+        drop(after);
+    }
+
+    /// Memory storage whose commit reads wait until `release`.
+    #[derive(Debug)]
+    struct GatedReads {
+        inner: fluree_db_core::MemoryStorage,
+        release: tokio::sync::Notify,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl StorageRead for GatedReads {
+        async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
+            if commit_digest(address).is_some() {
+                let released = self.release.notified();
+                self.started.notify_one();
+                released.await;
+            }
+            self.inner.read_bytes(address).await
+        }
+        async fn exists(&self, address: &str) -> fluree_db_core::Result<bool> {
+            self.inner.exists(address).await
+        }
+        async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl StorageWrite for GatedReads {
+        async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.write_bytes(address, bytes).await
+        }
+        async fn delete(&self, address: &str) -> fluree_db_core::Result<()> {
+            self.inner.delete(address).await
+        }
+    }
+
+    #[async_trait]
+    impl ContentAddressedWrite for GatedReads {
+        async fn content_write_bytes_with_hash(
+            &self,
+            kind: ContentKind,
+            namespace: &StorageNamespace,
+            content_hash_hex: &str,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<ContentWriteResult> {
+            self.inner
+                .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
+                .await
+        }
+    }
+
+    impl StorageMethod for GatedReads {
+        fn storage_method(&self) -> &str {
+            self.inner.storage_method()
+        }
+    }
+
+    /// A commit read through the erasure storage is one a drain waits out.
+    #[tokio::test]
+    async fn a_commit_read_under_way_holds_a_drain() {
+        let gated = Arc::new(GatedReads {
+            inner: fluree_db_core::MemoryStorage::new(),
+            release: tokio::sync::Notify::new(),
+            started: tokio::sync::Notify::new(),
+        });
+        let address = "fluree:memory://l/main/commit/abc.fcv2";
+        gated.inner.write_bytes(address, b"original").await.unwrap();
+        let index = Arc::new(ErasureIndex::new(
+            gated.clone() as Arc<dyn Storage>,
+            Arc::new(Verifier::default()),
+        ));
+        let storage = Arc::new(ErasureStorage::new(
+            gated.clone() as Arc<dyn Storage>,
+            Arc::clone(&index),
+            None,
+        ));
+        let started = gated.started.notified();
+        let read = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            async move { storage.read_bytes(address).await }
+        });
+        started.await;
+        let drain = tokio::spawn({
+            let index = Arc::clone(&index);
+            async move { index.drain().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain.is_finished(), "the commit read is under way");
+        gated.release.notify_one();
+        assert_eq!(read.await.unwrap().unwrap(), b"original");
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("the read finished")
+            .unwrap();
     }
 
     #[tokio::test]

@@ -48,6 +48,7 @@ use crate::raft::integration::{
 };
 use crate::raft::liveness_monitor::{LivenessConfig, LivenessMonitor};
 use crate::raft::queued_transactor::QueuedTransactor;
+use crate::raft::state_machine::RefKey;
 use crate::{CachingCommitter, SubmittingCommitter};
 use fluree_db_api::{Fluree, IndexConfig};
 use fluree_db_core::ContentId;
@@ -311,9 +312,8 @@ impl EmbeddedRaftNode {
 
 /// The per-node release loop: frees envelope blobs the state machine
 /// has finished with, then drains what is still buffered at shutdown.
-/// Installs an erasure activation into this node's engine: each holder's
-/// cached state goes and the erasure maps are listed again, so what loads
-/// next reads with the activation.
+/// Installs an erasure activation into this node's engine; see
+/// [`Fluree::install_erasures`].
 struct EngineInstall(Arc<Fluree>);
 
 #[async_trait::async_trait]
@@ -323,9 +323,8 @@ impl crate::raft::erasure::ErasureInstall for EngineInstall {
         _number: u64,
         activation: &crate::raft::state_machine::Activation,
     ) -> Result<(), String> {
-        for holder in &activation.holders {
-            self.0.refresh_ledger(&holder.ledger_id()).await;
-        }
+        let holders: Vec<String> = activation.holders.iter().map(RefKey::ledger_id).collect();
+        self.0.install_erasures(&holders).await;
         Ok(())
     }
 }
