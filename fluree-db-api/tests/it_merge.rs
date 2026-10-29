@@ -1383,7 +1383,12 @@ async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
         cached.snapshot.graph_registry.iri_for_graph_id(1),
         Some("urn:fluree:mydb:feature#txn-meta")
     );
-    assert_eq!(resolved_default_allow(&fluree, "mydb:main").await, None);
+    // Main's config still reads under the branch's labels: any ledger's
+    // config graph IRI is the config graph.
+    assert_eq!(
+        resolved_default_allow(&fluree, "mydb:main").await,
+        Some(false)
+    );
     fluree
 }
 
@@ -1439,8 +1444,10 @@ async fn reindex_repairs_adopted_branch_registry_in_cached_reads() {
     );
 }
 
+/// An incremental cycle over an index carrying a branch's labels writes the
+/// ledger's own, and the next cycle seeds from it.
 #[tokio::test]
-async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
+async fn adopted_branch_index_is_relabelled_by_the_next_cycle() {
     use fluree_db_binary_index::format::index_root::IndexRoot;
     use fluree_db_indexer::run_index::resolve::resolver::SharedResolverState;
 
@@ -1474,28 +1481,15 @@ async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
         )
         .unwrap();
         assert_eq!(root.ledger_id, "mydb:main");
-        if cycle == 1 {
-            assert_eq!(
-                root.graph_iris[0], "urn:fluree:mydb:feature#txn-meta",
-                "first incremental cycle preserves the adopted labels"
-            );
-            let error = SharedResolverState::from_index_root(&root)
-                .err()
-                .expect("the next incremental cycle cannot seed from this root");
-            assert!(
-                error
-                    .to_string()
-                    .contains("graph_iris[0] must be txn-meta IRI"),
-                "{error}"
-            );
-        } else {
-            assert_eq!(
-                root.graph_iris[0], "urn:fluree:mydb:main#txn-meta",
-                "second cycle falls back to a full rebuild"
-            );
-            assert_eq!(root.graph_iris[1], "urn:fluree:mydb:main#config");
-            assert!(SharedResolverState::from_index_root(&root).is_ok());
-        }
+        assert_eq!(
+            root.graph_iris[0], "urn:fluree:mydb:main#txn-meta",
+            "cycle {cycle}"
+        );
+        assert_eq!(
+            root.graph_iris[1], "urn:fluree:mydb:main#config",
+            "cycle {cycle}"
+        );
+        assert!(SharedResolverState::from_index_root(&root, "mydb:main").is_ok());
         crate::support::publish_built_index(&fluree, "mydb:main", result.index_t, &result.root_id)
             .await;
     }

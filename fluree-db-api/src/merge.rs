@@ -563,7 +563,10 @@ impl crate::Fluree {
         // lands on the target in between fails the merge rather than slipping
         // past the validation.
         if let (Some(base), Some(diff)) = (base, diff) {
-            if let Some(outcome) = self.validate_fast_forward(base, source_store, diff).await? {
+            if let Some(outcome) = self
+                .validate_fast_forward(base, source_branch, source_store, diff)
+                .await?
+            {
                 outcome.into_result()?;
             }
         }
@@ -683,6 +686,7 @@ impl crate::Fluree {
         let (view, outcome) = self
             .stage_merge(
                 target_state,
+                source_branch,
                 source_flakes,
                 &conflicts,
                 &strategy,

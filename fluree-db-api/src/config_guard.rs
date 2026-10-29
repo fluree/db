@@ -221,13 +221,11 @@ pub(crate) async fn validate_staged_config(
     Ok(retention)
 }
 
-/// The branch (and the graph's role, `config` or `txn-meta`) when `iri` is
-/// one of this ledger's system graphs on a branch other than `ledger_id`'s:
-/// `urn:fluree:<name>:<branch>#config` or `…#txn-meta`. A branch's system
-/// graphs are named for the branch, so on another branch they are ordinary
-/// graphs, never its configuration or commit metadata. The IRI is read by the
-/// address grammar's own lexer and parser, and the role by the one keyword
-/// table.
+/// The branch (and the graph's role, `config` or `txn-meta`) when `iri`
+/// names one of this ledger's system graphs for a branch other than
+/// `ledger_id`'s: `urn:fluree:<name>:<branch>#config` or `…#txn-meta`. The
+/// IRI is read by the address grammar's own lexer and parser, and the role by
+/// the one keyword table.
 pub(crate) fn other_branch_system_graph<'i>(
     iri: &'i str,
     ledger_id: &str,

@@ -611,7 +611,10 @@ mod inner {
                     if iri == txn_meta_iri {
                         return Err(TransactError::ReservedGraphTarget { graph_iri: iri });
                     }
-                    if iri == config_iri {
+                    // Any ledger's config graph IRI is this ledger's config
+                    // graph (`names_config_graph`).
+                    if iri == config_iri || fluree_db_core::graph_registry::names_config_graph(&iri)
+                    {
                         return Err(TransactError::ConfigGraphImportUnsupported { graph_iri: iri });
                     }
 
