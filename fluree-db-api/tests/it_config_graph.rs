@@ -8556,3 +8556,140 @@ async fn a_write_to_another_ledgers_config_graph_iri_writes_the_config_graph() {
         );
     }
 }
+
+/// A ledger `name` whose main's config sets reasoning `setting`, written
+/// before its branch `dev` is made.
+async fn reasoning_ledger(fluree: &fluree_db_api::Fluree, name: &str, setting: &str) {
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             ex:seed ex:p 1 .
+             GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
+               f:reasoningDefaults <urn:config:r> . <urn:config:r> {setting} . }}",
+            config_graph_iri(&format!("{name}:main"))
+        ))
+        .execute()
+        .await
+        .expect("main's config");
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+}
+
+/// `ledger_id` sets reasoning `setting` in its own config graph.
+async fn set_reasoning(fluree: &fluree_db_api::Fluree, ledger_id: &str, setting: &str) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{}> {{ <urn:config:r> {setting} . }}",
+            config_graph_iri(ledger_id)
+        ))
+        .commit()
+        .await
+        .expect("a reasoning setting");
+}
+
+/// `ledger_id`'s reasoning config.
+async fn reasoning_of(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> Option<fluree_db_core::ledger_config::ReasoningDefaults> {
+    fluree
+        .db(ledger_id)
+        .await
+        .unwrap()
+        .ledger_config()
+        .and_then(|c| c.reasoning.clone())
+}
+
+/// A setting a branch and its parent both changed since the fork, each in
+/// its own config graph IRI, is one setting: a merge from the parent (and
+/// its preview) and a rebase onto it resolve the conflict by the strategy.
+#[tokio::test]
+async fn a_setting_both_branches_changed_follows_the_strategy() {
+    use fluree_db_api::ConflictStrategy;
+    for (strategy, kept) in [
+        (ConflictStrategy::TakeSource, 300),
+        (ConflictStrategy::TakeBranch, 200),
+    ] {
+        for rebase in [false, true] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let name = format!("it-config-both-{kept}-{rebase}");
+            reasoning_ledger(&fluree, &name, "f:reasoningMaxFacts 100").await;
+            let dev = format!("{name}:dev");
+            set_reasoning(&fluree, &dev, "f:reasoningMaxFacts 200").await;
+            set_reasoning(&fluree, &format!("{name}:main"), "f:reasoningMaxFacts 300").await;
+            if rebase {
+                fluree
+                    .rebase_branch(&name, "dev", strategy)
+                    .await
+                    .expect("rebase");
+            } else {
+                let preview = fluree
+                    .merge_preview_with(
+                        &name,
+                        "main",
+                        Some("dev"),
+                        fluree_db_api::MergePreviewOpts {
+                            conflict_strategy: strategy,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(preview.mergeable, "{strategy:?}: the preview accepts");
+                fluree
+                    .merge_branch(&name, "main", Some("dev"), strategy)
+                    .await
+                    .expect("merge");
+            }
+            assert_eq!(
+                reasoning_of(&fluree, &dev).await.and_then(|r| r.max_facts),
+                Some(kept),
+                "{strategy:?}, rebase {rebase}"
+            );
+        }
+    }
+}
+
+/// Reverting a branch's commits that changed a setting under two config
+/// graph IRIs (its parent's, merged in, then its own) puts the setting back:
+/// the undo is one change to one setting, not a retraction under one IRI and
+/// an assertion under the other at one `t`, where the retraction would win.
+#[tokio::test]
+async fn a_revert_across_two_config_graph_iris_restores_the_setting() {
+    use fluree_db_api::{CommitRef, ConflictStrategy};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-revert-two-iris";
+    reasoning_ledger(&fluree, name, "f:reasoningModes \"rdfs\"").await;
+    let dev = format!("{name}:dev");
+    set_reasoning(
+        &fluree,
+        &format!("{name}:main"),
+        "f:reasoningModes \"owl2rl\"",
+    )
+    .await;
+    fluree
+        .merge_branch(name, "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .expect("main merges into dev");
+    let merged = fluree.ledger(&dev).await.unwrap().t();
+    set_reasoning(&fluree, &dev, "f:reasoningModes \"rdfs\"").await;
+    let own = fluree.ledger(&dev).await.unwrap().t();
+
+    fluree
+        .revert_commits(
+            name,
+            "dev",
+            vec![CommitRef::T(merged), CommitRef::T(own)],
+            ConflictStrategy::Abort,
+        )
+        .await
+        .expect("revert");
+    assert_eq!(
+        reasoning_of(&fluree, &dev).await.and_then(|r| r.modes),
+        Some(vec!["rdfs".to_string()])
+    );
+}

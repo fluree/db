@@ -434,9 +434,13 @@ impl crate::Fluree {
         source_store: &impl fluree_db_core::ContentStore,
         diff: &fluree_db_core::BranchDiff,
     ) -> Result<Option<BranchOpValidation>> {
-        let (data, _keys) =
-            crate::merge::collect_commit_data(source_store, &diff.source.commits, &diff.source.own)
-                .await?;
+        let (data, _keys) = crate::merge::collect_commit_data(
+            source_store,
+            &diff.source.commits,
+            &diff.source.own,
+            &mut crate::commit_data::ConfigGraphs::for_target(&base.state),
+        )
+        .await?;
         if !base.governed && !carries_config_settings(&base.state, &data) {
             return Ok(None);
         }

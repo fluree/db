@@ -4,7 +4,9 @@
 //! merges (the target's head is on the source's first-parent line) and
 //! general merges with conflict resolution strategies.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold, NetChange, OwnChanges};
+use crate::commit_data::{
+    collect_from_commits, CollectedCommitData, ConfigGraphs, Fold, NetChange, OwnChanges,
+};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
@@ -608,11 +610,28 @@ impl crate::Fluree {
             ));
         }
 
-        // Fold the source's commits, and collect the keys its own changes
-        // touched, in one pass. The target's keys need their own read.
-        let (source_data, source_delta) =
-            collect_commit_data(source_store, &diff.source.commits, &diff.source.own).await?;
         let target_delta = delta_keys_of(&target_store, &diff.target.own).await?;
+
+        // Acquire target state under the write lock when a manager is
+        // available, serializing with regular transactions on the target
+        // branch. Without a manager (embedded use, no shared cache), fall
+        // back to a fresh storage load — there's nothing to protect.
+        let (write_guard, target_state) = self
+            .lock_or_load(&target_id, target_store, target_record.clone())
+            .await?;
+
+        // Fold the source's commits, and collect the keys its own changes
+        // touched, in one pass, both sides naming the config graph as the
+        // target does.
+        let mut config = ConfigGraphs::for_target(&target_state);
+        let (source_data, source_delta) = collect_commit_data(
+            source_store,
+            &diff.source.commits,
+            &diff.source.own,
+            &mut config,
+        )
+        .await?;
+        let target_delta = config.keys(target_delta);
 
         // Find conflicts: intersection of source and target delta sets.
         let conflicts: Vec<ConflictKey> =
@@ -629,14 +648,6 @@ impl crate::Fluree {
                 resolved_target,
             )));
         }
-
-        // Acquire target state under the write lock when a manager is
-        // available, serializing with regular transactions on the target
-        // branch. Without a manager (embedded use, no shared cache), fall
-        // back to a fresh storage load — there's nothing to protect.
-        let (write_guard, target_state) = self
-            .lock_or_load(&target_id, target_store, target_record.clone())
-            .await?;
 
         let CollectedCommitData {
             net: NetChange {
@@ -849,15 +860,19 @@ impl crate::Fluree {
 /// carry the source's own changes. A merge on the line keeps only the flakes
 /// that are its resolution; see [`OwnChanges`]. The fold runs oldest-first
 /// so that earlier commits win on namespace and graph delta key collisions.
+/// The flakes and keys name the config graph as `config` does.
 pub(crate) async fn collect_commit_data(
     store: &impl ContentStore,
     cids: &[ContentId],
     own: &[ContentId],
+    config: &mut ConfigGraphs,
 ) -> Result<(CollectedCommitData, FxHashSet<ConflictKey>)> {
     let mut changes = OwnChanges::new(own);
     let mut commits = Vec::with_capacity(cids.len());
     for cid in cids {
         let mut commit = load_commit_by_id(store, cid).await?;
+        config.adopt(&commit.namespace_delta);
+        config.flakes(&mut commit.flakes);
         changes.retain_changes(cid, &mut commit.flakes);
         commits.push(commit);
     }
