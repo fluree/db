@@ -27,7 +27,7 @@ use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryGraphView, ColumnProjection};
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::ObjKind;
-use fluree_db_core::{PropertyStatData, StatsView};
+use fluree_db_core::{GraphId, PropertyStatData, StatsView};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -404,7 +404,7 @@ impl EncObj {
     /// `Sid`, built by the same `materialized_object_binding` the fallback
     /// scan uses for these rows. The decode runs once per row that
     /// *survives* the join, not per row scanned.
-    fn to_binding(self, view: Option<&BinaryGraphView>) -> Result<Binding> {
+    fn to_binding(self, emit: &Emit) -> Result<Binding> {
         if let Some(binding) = late_materialized_object_binding(
             self.o_type,
             self.o_key,
@@ -412,12 +412,11 @@ impl EncObj {
             0,
             u32::MAX,
             None,
-            // The relation scans read one graph, the emit view's.
-            view.map_or(fluree_db_core::NO_ARENA_GRAPH, BinaryGraphView::g_id),
+            emit.arena_graph,
         ) {
             return Ok(binding);
         }
-        let Some(view) = view else {
+        let Some(view) = emit.view.as_ref() else {
             return Err(QueryError::Internal(
                 "cyclic bgp emit: string-dict object binding requires a graph view".into(),
             ));
@@ -439,37 +438,6 @@ impl EncObj {
             None,
         ))
     }
-
-    /// The decoded `Binding` an eager scan builds for this object, which is
-    /// what a member of a default graph of several graphs emits: the value
-    /// through `view`, then [`materialized_object_binding`].
-    fn decoded_binding(self, view: &BinaryGraphView) -> Result<Binding> {
-        let val = view
-            .decode_value(self.o_type, self.o_key, self.p_id)
-            .map_err(|e| {
-                QueryError::dictionary_lookup(format!(
-                    "cyclic bgp emit decode: o_type={}, o_key={}, p_id={}: {e}",
-                    self.o_type, self.o_key, self.p_id
-                ))
-            })?;
-        Ok(materialized_object_binding(
-            view.store(),
-            self.o_type,
-            self.p_id,
-            val,
-            None,
-            None,
-        ))
-    }
-}
-
-/// The decoded `Binding` an eager scan builds for a subject: its `Sid`
-/// through `view`, which memoizes it, so a vertex that closes many cycles is
-/// looked up once per open.
-fn decoded_subject(view: &BinaryGraphView, s_id: u64) -> Result<Binding> {
-    view.resolve_subject_sid(s_id)
-        .map(Binding::sid)
-        .map_err(|e| QueryError::from_io("resolve_subject_sid", e))
 }
 
 /// Whether `o_type`'s `o_key` is a handle into a per-graph, per-predicate
@@ -537,18 +505,27 @@ impl<'c, 'a> MemberRead<'c, 'a> {
     }
 }
 
-/// How the lane's rows leave it.
-enum Emit {
-    /// One graph: the encoded bindings that graph's scan emits. The view
-    /// decodes the string-dictionary objects that have no encoded form
-    /// (EncodedObject mode only).
-    Encoded(Option<BinaryGraphView>),
-    /// A default graph of several graphs: the decoded bindings
-    /// `DatasetOperator`'s members emit there, since that scope has no graph
-    /// view to decode an encoded id against downstream. The view reads only
-    /// the ledger-wide dictionaries (subjects, strings): the arena types it
-    /// could not decode are declined while loading.
-    Decoded(BinaryGraphView),
+/// How the lane's rows leave it: encoded, as a scan of its scope emits them,
+/// over one graph or several (a union's term view decodes them later).
+struct Emit {
+    /// Decodes the string-dictionary objects that have no encoded form
+    /// (EncodedObject mode only). Strings are ledger-wide, so any member's
+    /// view serves a union.
+    view: Option<BinaryGraphView>,
+    /// The graph an arena handle (a big number, a vector) is numbered in:
+    /// the one graph's, and none over several graphs, which decline arena
+    /// objects while loading; one that reached emit would fail to decode
+    /// rather than read another member's arena.
+    arena_graph: GraphId,
+}
+
+impl Emit {
+    fn none() -> Self {
+        Self {
+            view: None,
+            arena_graph: fluree_db_core::NO_ARENA_GRAPH,
+        }
+    }
 }
 
 /// Relation index over subject-grouped `(subject, object)` edge rows.
@@ -739,8 +716,8 @@ pub(crate) struct CyclicBgpOperator {
     /// How many graphs the lane reads: 1, or a union's members; 0 before open
     /// and over a default graph of none.
     graphs: usize,
-    /// How rows leave the lane. Set when the fast path opens; `Encoded(None)`
-    /// in one-graph RefOnly mode and on the fallback path.
+    /// How rows leave the lane. Set when the fast path opens; no view in
+    /// RefOnly mode and on the fallback path.
     emit: Emit,
     /// The first reason the lane stood down, stamped on the union site.
     decline: OnceLock<FastPathFallback>,
@@ -812,7 +789,7 @@ impl CyclicBgpOperator {
             raw_relation_rows: 0,
             pruned_relation_rows: 0,
             graphs: 0,
-            emit: Emit::Encoded(None),
+            emit: Emit::none(),
             decline: OnceLock::new(),
         }
     }
@@ -1367,6 +1344,7 @@ impl CyclicBgpOperator {
         let scope = ctx.index_scope();
         if let Some(IndexScope::One(member)) = scope {
             self.graphs = 1;
+            self.emit.arena_graph = member.g_id();
             let mut reads = [MemberRead::new(ctx, member)];
             let fast = self.open_reads(ctx, &mut reads)?;
             return Ok((
@@ -1466,14 +1444,9 @@ impl CyclicBgpOperator {
         }
 
         self.graphs = reads.len();
-        // Subjects and strings are ledger-wide, so one view serves every
-        // member; the member's graph only names the view.
-        self.emit = Emit::Decoded(
-            set.store()
-                .graph_with_novelty(reads[0].member.g_id(), reads[0].ctx.dict_novelty.clone())
-                .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
-                .with_tracker(ctx.tracker.clone()),
-        );
+        // The rows leave encoded, as `DatasetOperator`'s members emit them:
+        // the union's term view decodes them downstream.
+        self.emit.arena_graph = fluree_db_core::NO_ARENA_GRAPH;
         let fast = self.open_reads(ctx, &mut reads)?;
         let reason = self
             .decline
@@ -1492,19 +1465,18 @@ impl CyclicBgpOperator {
         match self.join_mode {
             CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx, reads),
             CyclicJoinMode::EncodedObject => {
-                if let Emit::Encoded(view) = &mut self.emit {
-                    // Emit-side decoder for string-dictionary objects: same
-                    // view construction as `ExecutionContext::one_graph_view`,
-                    // against the one graph the relation scans below read.
-                    let member = &reads[0].member;
-                    *view = Some(
-                        member
-                            .store()
-                            .graph_with_novelty(member.g_id(), ctx.dict_novelty.clone())
-                            .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
-                            .with_tracker(ctx.tracker.clone()),
-                    );
-                }
+                // Emit-side decoder for string-dictionary objects: same view
+                // construction as `ExecutionContext::one_graph_view`, against
+                // the first graph the relation scans below read (strings are
+                // ledger-wide).
+                let member = &reads[0].member;
+                self.emit.view = Some(
+                    member
+                        .store()
+                        .graph_with_novelty(member.g_id(), ctx.dict_novelty.clone())
+                        .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                        .with_tracker(ctx.tracker.clone()),
+                );
                 self.open_encoded_fast_path(ctx, reads)
             }
         }
@@ -2697,15 +2669,9 @@ impl CyclicBgpOperator {
                 let s_id = value
                     .ref_s_id()
                     .expect("subject-positioned cyclic vars only bind refs");
-                match &self.emit {
-                    Emit::Encoded(_) => Binding::encoded_sid(s_id),
-                    Emit::Decoded(view) => decoded_subject(view, s_id)?,
-                }
+                Binding::encoded_sid(s_id)
             } else {
-                match &self.emit {
-                    Emit::Encoded(view) => value.to_binding(view.as_ref())?,
-                    Emit::Decoded(view) => value.decoded_binding(view)?,
-                }
+                value.to_binding(&self.emit)?
             };
             cols[out_idx].push(binding);
         }
@@ -2844,10 +2810,7 @@ impl CyclicBgpOperator {
     ) -> Result<()> {
         for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
             let s_id = assignment[var_idx];
-            cols[out_idx].push(match &self.emit {
-                Emit::Encoded(_) => Binding::encoded_sid(s_id),
-                Emit::Decoded(view) => decoded_subject(view, s_id)?,
-            });
+            cols[out_idx].push(Binding::encoded_sid(s_id));
         }
         Ok(())
     }
@@ -3101,7 +3064,7 @@ impl Operator for CyclicBgpOperator {
         self.pending.clear();
         self.square_wedge = None;
         self.probed_edges = 0;
-        self.emit = Emit::Encoded(None);
+        self.emit = Emit::none();
         self.state = OperatorState::Closed;
     }
 }
@@ -3163,7 +3126,7 @@ mod tests {
         assert!(matches!(object.id, EncIdentity::Lit { o_key: 42, .. }));
         assert!(matches!(
             object
-                .to_binding(None)
+                .to_binding(&Emit::none())
                 .expect("reserved string-dict o_types need no view"),
             Binding::EncodedLit { o_key: 42, .. }
         ));
@@ -3193,7 +3156,7 @@ mod tests {
         assert!(matches!(object.id, EncIdentity::Lit { o_key: 12_345, .. }));
         assert!(matches!(
             object
-                .to_binding(None)
+                .to_binding(&Emit::none())
                 .expect("encoded temporal o_types need no view"),
             Binding::EncodedLit { o_key: 12_345, .. }
         ));
@@ -3243,8 +3206,8 @@ mod tests {
         assert_ne!(any_uri, encode(OType::XSD_ANY_URI, 43).unwrap());
 
         // Emit needs the store: there is no encoded binding to rebuild.
-        assert!(any_uri.to_binding(None).is_err());
-        assert!(customer.to_binding(None).is_err());
+        assert!(any_uri.to_binding(&Emit::none()).is_err());
+        assert!(customer.to_binding(&Emit::none()).is_err());
     }
 
     /// `EncIdentity::Lit` keys on `o_type` where `Binding::eq` on `EncodedLit`
