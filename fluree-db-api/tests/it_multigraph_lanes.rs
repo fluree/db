@@ -1,5 +1,5 @@
 //! Fixture A for the lanes that read several graphs of one ledger, checked
-//! before any lane leans on it. In every scope of design §5's table and every
+//! before any lane leans on it. In every scope of the scope table and every
 //! fixture state, the answer to each of the six shapes, with fast paths off
 //! (the general plan) and on, equals the answer written by hand in
 //! `support/multigraph.rs`, and the query's `index scope` stamp is the one the
@@ -84,7 +84,7 @@ enum LaneRoute {
     Neither,
 }
 
-/// The route of a union lane in `scope` and `state` (design §5's table), by
+/// The route of a union lane in `scope` and `state` (the scope table), by
 /// what the index scope makes of the scope's default graph. The union sites
 /// take a default graph of several graphs of one ledger, an empty member
 /// among them, and of none; novelty and a read below the index decline them.

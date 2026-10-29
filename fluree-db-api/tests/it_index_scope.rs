@@ -166,7 +166,7 @@ fn sparql(body: &str) -> String {
     format!("{PREFIXES}{body}")
 }
 
-/// Every scope of design §5's table, through the surface that reaches it.
+/// Every scope of the multigraph scope table, through the surface that reaches it.
 #[tokio::test(flavor = "current_thread")]
 async fn index_scope_of_every_dataset_scope() {
     let _turn = take_turn().await;

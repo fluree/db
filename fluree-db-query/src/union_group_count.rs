@@ -10,7 +10,7 @@
 //!
 //! Here the members' index ranges for `<p>` are merged instead
 //! ([`MergedRangeCursor`]): PSOT to group by the subject, POST by the object.
-//! The merge holds each fact once (AJ-66: one fact per value and list
+//! The merge holds each fact once (storage's fact identity: one fact per value and list
 //! position), the rows the general plan's union deduplication keeps, and it
 //! is sorted by the key, so a group is one run of equal encoded keys. Runs
 //! are counted on integer keys alone. Each run's key is then decoded once,

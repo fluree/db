@@ -1,5 +1,5 @@
 //! Fixture A, its scopes and its answers, for the lanes that read several
-//! graphs of one ledger (design: round4/MULTIGRAPH-LANES-DESIGN.md §5).
+//! graphs of one ledger.
 //!
 //! A lane test picks a [`Shape`], runs it under every [`Scope`] with
 //! [`check`], and gets back what ran: the answer with fast paths on and with
@@ -377,7 +377,7 @@ impl Fixture {
 }
 
 // ============================================================================
-// Scopes (design §5's table)
+// Scopes
 // ============================================================================
 
 /// The query surface.
@@ -387,7 +387,7 @@ pub enum Surface {
     JsonLd,
 }
 
-/// Every scope of design §5's table, and the union scopes over a default graph
+/// Every scope of the scope table, and the union scopes over a default graph
 /// the index holds no leaf for. A scope says what the query's default graph
 /// is, the `index scope` stamp it must get, and which answer it reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -433,7 +433,7 @@ pub enum Scope {
     FromEmptyG0G1,
 }
 
-/// The scopes every lane runs: design §5's order, then the empty default
+/// The scopes every lane runs: the scope table's order, then the empty default
 /// graph's.
 pub const SCOPES: &[Scope] = &[
     Scope::FromG1G2,
@@ -629,10 +629,10 @@ impl Scope {
 }
 
 // ============================================================================
-// Shapes (design §4) and their spellings
+// Shapes and their spellings
 // ============================================================================
 
-/// The five shapes the lanes answer (design §4), named by lane.
+/// The shapes the lanes answer, named by lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
     /// C: `FILTER(EXISTS { ?x ex:label ?l } && ?v > 0)`, the EXISTS cache.
@@ -976,7 +976,7 @@ fn triangles(ns: &[u8]) -> Rows {
 /// The answer to `shape` over `graphs` of the fixture in `state`, written by
 /// hand from [`FIXTURE_A`], [`FIXTURE_OTHER`] and [`WRITE_TO_G2`].
 ///
-/// A default graph of two or more graphs is the union of their facts (AJ-66):
+/// A default graph of two or more graphs is the union of their facts (storage's fact identity, #2109):
 /// a fact two members both hold is one solution. A fact is identified with its
 /// list position, so a list's repeated value stays two rows in a union, as in
 /// one graph.
@@ -1090,7 +1090,7 @@ fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
                 rows(&[&[&n.to_string()]])
             }
             // Facts `?s ex:m v` with v numerically 2, any datatype. Over a
-            // union a fact two members both hold counts once (AJ-66); q1's
+            // union a fact two members both hold counts once (storage's fact identity); q1's
             // integer and double are two facts.
             Shape::BoundNumericCount => {
                 let n = match graphs {
@@ -1139,7 +1139,7 @@ fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
                     ],
                     // `s2 n 2`, `k1 kind`, `b big 2.5`, t3 and `q2 m 2` once
                     // each (both members hold them); L's two list items stay
-                    // two facts, and so do q1's `m 2` and `m 2.0e0` (AJ-66);
+                    // two facts, and so do q1's `m 2` and `m 2.0e0` (storage's fact identity);
                     // the write's t2 edges are g1's.
                     Graphs::G1G2 if w => &[
                         ("n", 5),
