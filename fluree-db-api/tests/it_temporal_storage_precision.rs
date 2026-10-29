@@ -427,6 +427,16 @@ fn holds(op: &str, ord: std::cmp::Ordering) -> bool {
     }
 }
 
+/// Whether `op` holds between a plain string and a temporal value it orders
+/// `ord` against. Ordering reads the string as the temporal it spells, but a
+/// plain string is never `=` a temporal: SPARQL has no `=` for an
+/// `xsd:string` and an `xsd:dateTime` or `xsd:time`, so `RDFterm-equal` is a
+/// type error and the FILTER is false. So `<=` and `>=` can both hold where
+/// `=` doesn't.
+fn holds_for_a_string(op: &str, ord: std::cmp::Ordering) -> bool {
+    op != "=" && holds(op, ord)
+}
+
 /// The operator `op` reads as with its operands swapped.
 fn mirrored(op: &str) -> &str {
     match op {
@@ -442,7 +452,8 @@ const OPS: [&str; 5] = ["<", "<=", "=", ">=", ">"];
 
 /// A `dateTime` or `time` constant past the microsecond is held to it like
 /// every value, for ordering as well as equality, so a stored value is
-/// exactly one of `<`, `=` and `>` it. The value is written as `DT_NS` and
+/// exactly one of `<`, `=` and `>` it (a plain-string constant orders but is
+/// never `=` it, [`holds_for_a_string`]). The value is written as `DT_NS` and
 /// `TIME_NS`, and `>=` that same constant finds it, which is how a client
 /// pages from a timestamp it wrote. On SPARQL as a typed literal, a cast, a
 /// constant on the left, and one bound first through `BIND` or `VALUES`,
@@ -489,7 +500,12 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
                     "where": [{"@id": "ex:s", "ex:d": "?d"}, ["filter", [op, "?d", rhs]]]
                 })
             };
-            jsonld.push((format!("JSON-LD ?d {op} \"{c}\""), filter(json!(c)), want));
+            // A JSON-LD filter's bare string is a plain string.
+            jsonld.push((
+                format!("JSON-LD ?d {op} \"{c}\""),
+                filter(json!(c)),
+                holds_for_a_string(op, ord),
+            ));
             let mut by_values = filter(json!("?c"));
             by_values["values"] = json!(["?c", [{"@value": c, "@type": "xsd:dateTime"}]]);
             jsonld.push((format!("JSON-LD values ?d {op} {c}"), by_values, want));
@@ -515,7 +531,7 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
                 "select": ["?t"],
                 "where": [{"@id": "ex:s", "ex:t": "?t"}, ["filter", [op, "?t", TIME_ABOVE]]]
             }),
-            want,
+            holds_for_a_string(op, Equal),
         ));
     }
     sparql.push((
@@ -602,9 +618,10 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
 /// A plain string that reads as a `dateTime` is ordered against a temporal
 /// value as the value it reads as, held to the microsecond: a stored
 /// `"…1234565Z"` and a constant `"…1234569Z"^^xsd:dateTime` both read as
-/// `…123456Z`, so exactly one of `<`, `=` and `>` holds, `=`, either way
-/// round, as for a string equal to the constant at every digit. In process,
-/// reloaded and indexed.
+/// `…123456Z`, so `<=` and `>=` hold and `<` and `>` don't, either way
+/// round, as for a string equal to the constant at every digit. `=` doesn't
+/// hold: a plain string is never `=` a temporal ([`holds_for_a_string`]). In
+/// process, reloaded and indexed.
 #[tokio::test]
 async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -612,7 +629,7 @@ async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
     let c = "\"2020-01-01T00:00:00.1234569Z\"^^xsd:dateTime";
     let mut checks: Vec<(String, String, bool)> = Vec::new();
     for op in OPS {
-        let want = holds(op, std::cmp::Ordering::Equal);
+        let want = holds_for_a_string(op, std::cmp::Ordering::Equal);
         let mirror = mirrored(op);
         checks.push((
             format!("?v {op} c"),
