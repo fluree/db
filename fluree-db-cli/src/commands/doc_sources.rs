@@ -1,10 +1,11 @@
-//! Where `--model` and `--entities` come from.
+//! Where `--ontology` and `--entities` come from.
 //!
-//! A source is a ledger in the local store or an RDF file. A file is loaded
+//! A source is a ledger in the local store, a graph source mapped over a
+//! table (`fluree iceberg|sql|delta map`), or an RDF file. A file is loaded
 //! into a scratch in-memory ledger, so every source is queried the same
-//! way with the database's own parsers and no second RDF stack. Ledger
-//! names and file paths are told apart by extension: `.ttl`, `.nt`,
-//! `.jsonld` and `.json` are files.
+//! way with the database's own parsers and no second RDF stack. Names and
+//! file paths are told apart by extension: `.ttl`, `.nt`, `.jsonld` and
+//! `.json` are files.
 
 use crate::context;
 use crate::error::{CliError, CliResult};
@@ -74,6 +75,9 @@ fn is_rdf_file(spec: &str) -> bool {
 pub struct Opened {
     fluree: Fluree,
     alias: String,
+    /// Queried through the graph-source path, which maps the table's rows
+    /// to triples as it reads them; a ledger or file has flakes to read.
+    graph_source: bool,
 }
 
 impl Opened {
@@ -82,14 +86,19 @@ impl Opened {
             SourceKind::Ledger(alias) => {
                 let fluree = context::build_fluree(dirs).await?;
                 let ledger_id = context::to_ledger_id(alias)?;
-                if !fluree.ledger_exists(&ledger_id).await? {
+                let graph_source = if fluree.ledger_exists(&ledger_id).await? {
+                    false
+                } else if is_graph_source(&fluree, &ledger_id).await? {
+                    true
+                } else {
                     return Err(CliError::NotFound(format!(
-                        "{alias}: no such ledger (a file source needs a .ttl, .nt, .jsonld or .json extension)"
+                        "{alias}: no such ledger or graph source (a file source needs a .ttl, .nt, .jsonld or .json extension)"
                     )));
-                }
+                };
                 Ok(Self {
                     fluree,
                     alias: alias.clone(),
+                    graph_source,
                 })
             }
             SourceKind::File(path) => {
@@ -114,17 +123,45 @@ impl Opened {
                     })?;
                     g.transact().insert(&json).commit().await?;
                 }
-                Ok(Self { fluree, alias })
+                Ok(Self {
+                    fluree,
+                    alias,
+                    graph_source: false,
+                })
             }
         }
     }
 
     pub async fn rows(&self, query: &Value) -> CliResult<Vec<Value>> {
+        if self.graph_source {
+            let json = self
+                .fluree
+                .graph(&self.alias)
+                .query()
+                .jsonld(query)
+                .execute_formatted()
+                .await?;
+            return Ok(json.as_array().cloned().unwrap_or_default());
+        }
         let view = self.fluree.db_with_default_context(&self.alias).await?;
         let result = self.fluree.query(&view, query).await?;
         let json = result.to_jsonld(&view.snapshot)?;
         Ok(json.as_array().cloned().unwrap_or_default())
     }
+}
+
+/// A graph source this build can read. Without the `iceberg` feature the
+/// table readers are not compiled in, so a mapped source reads as missing
+/// rather than failing on its first query.
+async fn is_graph_source(fluree: &Fluree, id: &str) -> CliResult<bool> {
+    if !cfg!(feature = "iceberg") {
+        return Ok(false);
+    }
+    Ok(fluree
+        .nameservice()
+        .lookup_graph_source(id)
+        .await?
+        .is_some_and(|r| !r.retracted))
 }
 
 pub async fn load_model(source: &Source, dirs: &FlureeDir) -> CliResult<Model> {
@@ -139,7 +176,7 @@ pub async fn load_model(source: &Source, dirs: &FlureeDir) -> CliResult<Model> {
     let model = builder.build();
     if model.is_empty() {
         return Err(CliError::Input(format!(
-            "--model {}: no classes or properties found (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty, or anything with rdfs:subClassOf / rdfs:domain / schema:domainIncludes)",
+            "--ontology {}: no classes or properties found (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty, or anything with rdfs:subClassOf / rdfs:domain / schema:domainIncludes)",
             source.label()
         )));
     }
@@ -206,6 +243,7 @@ pub async fn load_gazetteer(
         let opened = Opened {
             fluree: fluree.clone(),
             alias: alias.to_string(),
+            graph_source: false,
         };
         for (query, predicate) in Gazetteer::queries(Some(fluree_db_doc::vocab::ENTITY)) {
             builder.add_rows(&opened.rows(&query).await?, predicate);

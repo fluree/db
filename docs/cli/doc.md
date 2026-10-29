@@ -8,7 +8,7 @@ Turn a folder of documents into a searchable graph, and search it.
 - **retrieval chunks** cut along that structure, each citing the elements it was built from and carrying its section path;
 - an **embedding** per chunk, when an embedding endpoint is configured;
 - a **document node** recording the file, its content hash, the parser revision and the embedding model;
-- with `--entities` and `--model`, **mentions** of known entities under their own IRIs, **relations** the text states (reified with evidence and verdict, and as edges when the ontology admits them), and any **new entities** the language model found.
+- with `--entities` and `--ontology`, **mentions** of known entities under their own IRIs, **relations** the text states (reified with evidence and verdict, and as edges when the ontology admits them), and any **new entities** the language model found.
 
 It then creates or syncs a BM25 full-text index over the chunks. `fluree doc search` joins each hit back to its chunk text, section path and source file.
 
@@ -54,8 +54,8 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `1500`). |
 | `--max-chars <N>` | Split a single element longer than this many characters (default `4000`). |
 | `--max-crops <N>` | Most crops one document may send to the vision model (default `70`). A document asking for more is parsed with the deterministic tier only and flagged in the output; nothing is sent. |
-| `--model <LEDGER\|FILE>` | Ontology the language model extracts against: a ledger, or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Needs `[doc.llm]` or `doc.remote`. |
-| `--entities <LEDGER\|FILE[#CLASS]>` | Known entities, found by `skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName` and `schema:alternateName`. Repeatable; `#Class` scopes to one type. A mention keeps the entity's IRI. Needs no model. |
+| `--ontology <LEDGER\|FILE>` | Ontology the language model extracts against: a ledger, or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Needs `[doc.llm]` or `doc.remote`. |
+| `--entities <LEDGER\|FILE[#CLASS]>` (alias `--catalog`) | Known entities (a catalog): a ledger, a graph source mapped over a table (`fluree iceberg\|sql\|delta map`), or a `.ttl` / `.nt` / `.jsonld` / `.json` file. Found by `skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName` and `schema:alternateName`. Repeatable; `#Class` scopes to one type. A mention keeps the entity's IRI. Needs no model. |
 | `--relations <direct\|reified\|off>` | `direct` (default): reified nodes plus an edge per admitted predicate; `reified`: nodes only; `off`: entities alone. |
 | `--guidance <FILE>` | Project priorities placed in the extraction prompt. Config: `doc.extraction.guidance`. |
 | `--system-prompt <FILE>` | Replaces the extraction system prompt; keep the `{model}` and `{guidance}` slots. Config: `doc.extraction.system_prompt`. |
@@ -63,7 +63,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--concurrency <N>` | Chunks sent to the language model at once (default `4`). Config: `doc.extraction.concurrency`. |
 | `--drop-off-model` | Drop new entities whose class is not in the ontology instead of keeping them flagged `doc:offModel`. Config: `doc.extraction.drop_off_model`. |
 | `--lang <CODE>` | Language for stemming in the entity scan (default `en`). |
-| `--no-extract` | Skip extraction even when `--model` or `--entities` is given. |
+| `--no-extract` | Skip extraction even when `--ontology` or `--entities` is given. |
 | `--dry-run` | Parse, chunk and embed, then report what would be written. Nothing is written. |
 | `--out-dir <DIR>` | Also write each document's transaction as JSON-LD into this directory. |
 
@@ -75,7 +75,7 @@ For each document, in path order:
 2. **Parse**, served from the parse cache when the same bytes were parsed with the same settings before. PDF structure is inferred from glyph geometry; the other formats declare their structure. Pages the deterministic pass cannot read (scans, pixel-only regions, tables whose structure it doubts) are sent to the configured vision model as crops, and the readings are spliced back in under the engine's arbitration rules.
 3. **Chunk** along the structure graph. A chunk closes once it reaches `--min-chars`, or at a heading once it is at least half full. Table cells carry their row and column headers.
 4. **Embed** each chunk's text, prefixed with its section path, against `[doc.embedding]`.
-5. **Extract**, when `--entities` or `--model` is given. Each chunk is scanned for every label of every known entity (longest whole-word match, case-folded, plus Snowball stems), and each match becomes a mention under the entity's IRI. With `--model`, the language model is then asked about the chunk with the ontology as its system prompt and the entities found as known names. Its entities are resolved to known IRIs where a label matches and minted otherwise; an entity whose excerpt is not in the chunk is dropped; a new entity typed outside the ontology is kept flagged `doc:offModel` (or dropped with `--drop-off-model`); each relation's predicate is judged against the ontology as `valid`, `repaired` (an unambiguous label, local name or class-to-property fix) or `rejected`, and written reified with that verdict, a relation whose object names no entity carrying it as a literal. In `direct` mode an admitted relation with an entity object is also written as an edge. Answers are cached per chunk and asked for several chunks at once; a chunk whose call fails keeps its gazetteer mentions, and the document is not stamped as extracted so the next run retries it.
+5. **Extract**, when `--entities` or `--ontology` is given. Each chunk is scanned for every label of every known entity (longest whole-word match, case-folded, plus Snowball stems), and each match becomes a mention under the entity's IRI. With `--ontology`, the language model is then asked about the chunk with the ontology as its system prompt and the entities found as known names. Its entities are resolved to known IRIs where a label matches and minted otherwise; an entity whose excerpt is not in the chunk is dropped; a new entity typed outside the ontology is kept flagged `doc:offModel` (or dropped with `--drop-off-model`); each relation's predicate is judged against the ontology as `valid`, `repaired` (an unambiguous label, local name or class-to-property fix) or `rejected`, and written reified with that verdict, a relation whose object names no entity carrying it as a literal. In `direct` mode an admitted relation with an entity object is also written as an edge. Answers are cached per chunk and asked for several chunks at once; a chunk whose call fails keeps its gazetteer mentions, and the document is not stamped as extracted so the next run retries it.
 6. **Retract the previous extraction** of the same document IRI, if any, then insert the structure graph, the chunks, the document node and the extraction as one commit. The earlier extraction remains queryable at its commit. Entity nodes are shared across documents and not retracted; an edge the earlier extraction asserted is dropped only when no remaining relation supports it.
 
 After the documents, the ledger's binary index is brought up to the new head, so later invocations read it rather than replaying the commits just written (a CLI process never runs the background indexer that a server would). Then the full-text index `<ledger>-text` is created or synced. Embeddings need no index step — they are committed with the chunks and scored at search time.
@@ -100,7 +100,7 @@ fluree doc ingest ./contracts -l contracts --entities counterparties.ttl
 # Add an ontology and a language model: new entities and relations, gated by the ontology
 fluree config set doc.llm.url http://localhost:11434/v1
 fluree config set doc.llm.model qwen3
-fluree doc ingest ./contracts -l contracts --entities counterparties.ttl --model ./contracts-ontology.ttl
+fluree doc ingest ./contracts -l contracts --entities counterparties.ttl --ontology ./contracts-ontology.ttl
 ```
 
 Output:
@@ -212,7 +212,7 @@ model = "gpt-5-mini"
 api_key = "$OPENAI_API_KEY"
 # api = "chat"                          # `chat` (default) or `responses`
 
-[doc.llm]                               # entity and relation extraction (--model)
+[doc.llm]                               # entity and relation extraction (--ontology)
 url = "https://api.openai.com/v1"
 model = "gpt-5-mini"
 api_key = "$OPENAI_API_KEY"

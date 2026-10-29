@@ -4082,13 +4082,14 @@ pub struct DocIngestArgs {
     /// Ontology the language model extracts against: a ledger, or a
     /// `.ttl` / `.jsonld` file. Needs `[doc.llm]` (or a Fluree AI account)
     #[arg(long, value_name = "LEDGER|FILE")]
-    pub model: Option<String>,
+    pub ontology: Option<String>,
 
-    /// Known entities to find by their labels (`skos:prefLabel`, `skos:altLabel`,
-    /// `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a ledger or a
-    /// `.ttl` / `.jsonld` file, optionally scoped to one class with `#Class`.
-    /// Repeatable. A mention keeps the entity's own IRI
-    #[arg(long, value_name = "LEDGER|FILE[#CLASS]", action = clap::ArgAction::Append)]
+    /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
+    /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
+    /// ledger, a graph source mapped over a table (`fluree iceberg|sql|delta
+    /// map`), or a `.ttl` / `.jsonld` file, optionally scoped to one class
+    /// with `#Class`. Repeatable. A mention keeps the entity's own IRI
+    #[arg(long, visible_alias = "catalog", value_name = "LEDGER|FILE[#CLASS]", action = clap::ArgAction::Append)]
     pub entities: Vec<String>,
 
     /// What becomes of the relations the language model reports: `direct`
@@ -4126,7 +4127,7 @@ pub struct DocIngestArgs {
     #[arg(long, default_value = "en", value_name = "CODE")]
     pub lang: String,
 
-    /// Skip entity and relation extraction even when `--model` or `--entities` is given
+    /// Skip entity and relation extraction even when `--ontology` or `--entities` is given
     #[arg(long)]
     pub no_extract: bool,
 
