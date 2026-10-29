@@ -57,7 +57,10 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
-use crate::stats_query::stats_count_by_predicate_operator;
+use crate::stats_query::{
+    count_by_predicate_union_operator, stats_count_by_predicate_operator,
+    STATS_COUNT_BY_PREDICATE_UNION_SITE,
+};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
@@ -3268,20 +3271,56 @@ fn build_operator_tree_inner(
     // both keeps the probe to plausibly-indexed ledgers AND is the re-entry
     // guard — the fallback below recurses with `stats = None`, so a false here on
     // that recursion stops this fast path re-wrapping itself. The operator's
-    // open()-time gate (`fast_path_store`) is the real guard, declining to the
-    // generic fallback under overlay novelty, time-travel, a non-root policy, or
-    // multi-ledger.
+    // open()-time gate (a scope of one graph whose index is current) is the
+    // real guard, declining to the generic fallback under overlay novelty,
+    // time-travel, a non-root policy, or multi-ledger.
+    //
+    // Over a default graph of several graphs, or of none, the count reads the
+    // union of the members (`count_by_predicate_union_operator`), which stamps
+    // only its own site and only at open(), so a site that proceeded is one
+    // that answered. It answers to the kill switch by stamping that site; the
+    // one-graph operator keeps its plan-time switch unchanged.
+    let union_scope = matches!(
+        planning.index_scope_kind,
+        ScopeKind::Union | ScopeKind::Empty
+    );
+    if fast_paths_globally_disabled
+        && union_scope
+        && !planning.is_history()
+        && !trailing_values
+        && stats.is_some()
+        && detect_stats_count_by_predicate(query).is_some()
+    {
+        stamp_fast_path(
+            STATS_COUNT_BY_PREDICATE_UNION_SITE,
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
+        );
+    }
     if !planning.is_history()
         && !fast_paths_globally_disabled
         && !trailing_values
         && stats.is_some()
     {
-        if let Some((pred_var, count_var, lists)) =
-            detect_stats_count_by_predicate(query).filter(|(_, _, lists)| *lists || !list_view)
-        {
+        // The count over several graphs reads stored rows, and does not
+        // answer for SPARQL's view of RDF lists: it stands down for the
+        // general plan, saying so. Over one graph, the list census corrects
+        // the stored counts where the view answers the query's one pattern.
+        let detected = match detect_stats_count_by_predicate(query) {
+            Some(_) if union_scope && list_view => {
+                stamp_fast_path(
+                    STATS_COUNT_BY_PREDICATE_UNION_SITE,
+                    FastPathOutcome::Fallback(FastPathFallback::ListView),
+                );
+                None
+            }
+            detected => detected.filter(|(_, _, lists)| *lists || !list_view),
+        };
+        if let Some((pred_var, count_var, lists)) = detected {
             // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
             // stamps the runtime Proceed/Fallback(GateDeclined) at open().
-            stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
+            if !union_scope {
+                stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
+            }
             // Build the fallback: the same query as a generic GROUP BY,
             // producing the operator's internal `[pred, count]` schema (output
             // forced to those two vars; ORDER BY / LIMIT / OFFSET stripped,
@@ -3303,12 +3342,20 @@ fn build_operator_tree_inner(
                 planning,
             )?;
 
-            let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
-                pred_var,
-                count_var,
-                lists,
-                Some(fallback),
-            ));
+            let mut operator: BoxedOperator = if union_scope {
+                Box::new(count_by_predicate_union_operator(
+                    pred_var,
+                    count_var,
+                    Some(fallback),
+                ))
+            } else {
+                Box::new(stats_count_by_predicate_operator(
+                    pred_var,
+                    count_var,
+                    lists,
+                    Some(fallback),
+                ))
+            };
 
             // ORDER BY (on predicate or count)
             if !query.ordering.is_empty() {
