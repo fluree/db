@@ -1884,74 +1884,466 @@ async fn cyclic_lane_reads_one_graph() {
     failures.assert_none();
 }
 
-/// EXISTS inside an expression (the semijoin cache, admitted by
-/// `fast_path_store`, built from `binary_g_id`'s graph). Labels: x1 in the
-/// default graph, y1 in g2.
+/// The two sites of the EXISTS semijoin cache, and whether each must run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ExistsLane {
+    /// `exists_semijoin`: one graph, its subject set read from that graph.
+    One,
+    /// `exists_semijoin_union`: a default graph of several graphs, the union
+    /// of the members' subject sets; or of none, the empty set.
+    Union,
+    /// Neither site runs.
+    Neither,
+}
+
+/// Turns the process-wide kill switch back off when dropped, panic included.
+struct FastPathSwitchRestore;
+impl Drop for FastPathSwitchRestore {
+    fn drop(&mut self) {
+        fluree_db_api::set_fast_paths_disabled(false);
+    }
+}
+
+const EXISTS_ONE_SITE: &str = "exists_semijoin";
+const EXISTS_UNION_SITE: &str = "exists_semijoin_union";
+
+/// One case of the EXISTS cache: the query, its columns, the answer, and the
+/// site that must run (the other must not).
+type ExistsCase = (
+    &'static str,
+    String,
+    &'static [&'static str],
+    Rows,
+    ExistsLane,
+);
+
+/// The outcomes each EXISTS cache site stamped since `before`.
+fn exists_stamps(store: &SpanStore, before: usize) -> (Vec<String>, Vec<String>) {
+    (
+        stamps(store, before, EXISTS_ONE_SITE),
+        stamps(store, before, EXISTS_UNION_SITE),
+    )
+}
+
+/// Check the answer, and that exactly the expected site proceeded.
+fn check_exists_routing(
+    failures: &mut Failures,
+    label: &str,
+    (one, union): &(Vec<String>, Vec<String>),
+    lane: ExistsLane,
+) {
+    let ran = |s: &Vec<String>| s.iter().any(|o| o == "proceed");
+    failures.eq(
+        ran(one),
+        lane == ExistsLane::One,
+        &format!("{label}: `{EXISTS_ONE_SITE}` ran ({one:?})"),
+    );
+    failures.eq(
+        ran(union),
+        lane == ExistsLane::Union,
+        &format!("{label}: `{EXISTS_UNION_SITE}` ran ({union:?})"),
+    );
+}
+
+/// EXISTS inside an expression: the semijoin cache, built at the FILTER's (or
+/// HAVING's) `open`. One graph reads its subject set from that graph; a
+/// default graph of several graphs of one ledger from the union of the
+/// members' sets; a default graph of none from nothing.
+///
+/// Labels: x1 in the default graph; y1 in g2 and, identically, in g3; w1 in
+/// g2, while w1's amount is in g3, so only a union of both graphs' sets
+/// answers for it.
 #[tokio::test(flavor = "current_thread")]
-async fn exists_semijoin_cache_reads_one_graph() {
+async fn exists_semijoin_cache_over_one_graph_and_a_union() {
+    let ledger_id = "it/exists-cache-graphs:main";
     let trig = r#"
         @prefix ex: <http://example.org/> .
         ex:x1 ex:amount 1.5 ; ex:label "x one" .
         ex:x2 ex:amount 9.5 .
-        GRAPH <urn:g2> { ex:y1 ex:amount 7.5 ; ex:label "y one" . ex:y2 ex:amount 1.5 . }
-        GRAPH <urn:g3> { ex:z1 ex:amount 9.5 . }
+        GRAPH <urn:g2> {
+            ex:y1 ex:amount 7.5 ; ex:label "y one" .
+            ex:y2 ex:amount 1.5 .
+            ex:w1 ex:label "w one" .
+        }
+        GRAPH <urn:g3> {
+            ex:z1 ex:amount 9.5 .
+            ex:w1 ex:amount 2.5 .
+            ex:y1 ex:label "y one" .
+        }
     "#;
-    let (fluree, handle) = indexed_trig_ledger("it/exists-cache-graphs:main", trig).await;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    // The union site answers to the kill switch: no test may flip it mid-case.
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
     let filter = |prologue: &str, ds: &str, not: &str| {
         format!(
             "{prologue}{PREFIXES}SELECT ?x {ds} WHERE {{ ?x ex:amount ?v \
              FILTER({not}EXISTS {{ ?x ex:label ?l }} && ?v > 0) }}"
         )
     };
+    let from_named_g2 = |not: &str| {
+        format!(
+            "{PREFIXES}SELECT ?x FROM NAMED <urn:g2> WHERE {{ \
+             GRAPH <urn:g2> {{ ?x ex:amount ?v }} \
+             FILTER({not}EXISTS {{ ?x ex:label ?l }} && ?v > 0) }}"
+        )
+    };
     let x: &'static [&'static str] = &["x"];
-    let cases: Vec<LaneCase> = vec![
+    let cases: Vec<ExistsCase> = vec![
         (
             "one graph: FROM g2 alone",
             filter("", "FROM <urn:g2>", ""),
             x,
             rows(&[&["y1"]]),
-            true,
+            ExistsLane::One,
         ),
         (
-            "E1 union, FILTER(EXISTS && ...)",
+            "one graph: FROM g3 alone (w1's label is in g2)",
+            filter("", "FROM <urn:g3>", ""),
+            x,
+            rows(&[]),
+            ExistsLane::One,
+        ),
+        (
+            "one graph: the default graph",
+            filter("", "", ""),
+            x,
+            rows(&[&["x1"]]),
+            ExistsLane::One,
+        ),
+        (
+            "E1 union default graph, FILTER(EXISTS && ...)",
             filter(UNION_PRAGMA, "", ""),
             x,
-            rows(&[&["x1"], &["y1"]]),
-            false,
+            rows(&[&["w1"], &["x1"], &["y1"]]),
+            ExistsLane::Union,
         ),
         (
-            "E3 union, FILTER(!EXISTS && ...)",
+            "E3 union default graph, FILTER(!EXISTS && ...)",
             filter(UNION_PRAGMA, "", "!"),
             x,
             rows(&[&["x2"], &["y2"], &["z1"]]),
-            false,
+            ExistsLane::Union,
         ),
         (
             "E4 FROM g3 + g2",
             filter("", "FROM <urn:g3> FROM <urn:g2>", ""),
             x,
-            rows(&[&["y1"]]),
-            false,
+            rows(&[&["w1"], &["y1"]]),
+            ExistsLane::Union,
         ),
         (
-            "E2 union, BIND(EXISTS)",
+            "E5 FROM g2 + g3, FILTER(!EXISTS && ...)",
+            filter("", "FROM <urn:g2> FROM <urn:g3>", "!"),
+            x,
+            rows(&[&["y2"], &["z1"]]),
+            ExistsLane::Union,
+        ),
+        (
+            "E6 FROM default + g2 + g3",
+            filter(
+                "",
+                &format!("FROM <{ledger_id}> FROM <urn:g2> FROM <urn:g3>"),
+                "",
+            ),
+            x,
+            rows(&[&["w1"], &["x1"], &["y1"]]),
+            ExistsLane::Union,
+        ),
+        (
+            "E7 HAVING(EXISTS), FROM g2 + g3",
+            format!(
+                "{PREFIXES}SELECT ?x FROM <urn:g2> FROM <urn:g3> WHERE {{ ?x ex:amount ?v }} \
+                 GROUP BY ?x HAVING(EXISTS {{ ?x ex:label ?l }} && COUNT(?v) > 0)"
+            ),
+            x,
+            rows(&[&["w1"], &["y1"]]),
+            ExistsLane::Union,
+        ),
+        (
+            "E8 FROM NAMED g2 alone: EXISTS over an empty default graph",
+            from_named_g2(""),
+            x,
+            rows(&[]),
+            ExistsLane::Union,
+        ),
+        (
+            "E9 FROM NAMED g2 alone: !EXISTS over an empty default graph",
+            from_named_g2("!"),
+            x,
+            rows(&[&["y1"], &["y2"]]),
+            ExistsLane::Union,
+        ),
+        (
+            "E2 union default graph, BIND(EXISTS): no cache",
             format!(
                 "{UNION_PRAGMA}{PREFIXES}SELECT ?x ?b WHERE {{ ?x ex:amount ?v \
                  BIND(EXISTS {{ ?x ex:label ?l }} AS ?b) }}"
             ),
             &["x", "b"],
             rows(&[
+                &["w1", "true"],
                 &["x1", "true"],
                 &["x2", "false"],
                 &["y1", "true"],
                 &["y2", "false"],
                 &["z1", "false"],
             ]),
-            false,
+            ExistsLane::Neither,
         ),
     ];
     let mut failures = Failures::default();
-    check_lane_cases(&fluree, &handle, "exists_semijoin", cases, &mut failures).await;
+    for (label, query, vars, want, lane) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await;
+        match result {
+            Ok(json) => failures.eq(sparql_rows(&json, vars), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        check_exists_routing(&mut failures, label, &exists_stamps(&store, before), lane);
+    }
+
+    // The JSON-LD twins: `exists` inside a filter expression.
+    let exists_filter = |from: JsonValue, opts: Option<JsonValue>| {
+        let mut q = json!({
+            "@context": {"ex": EX},
+            "from": from,
+            "select": ["?x"],
+            "where": [
+                {"@id": "?x", "ex:amount": "?v"},
+                ["filter", ["and", ["exists", {"@id": "?x", "ex:label": "?l"}], [">", "?v", 0]]]
+            ]
+        });
+        if let Some(opts) = opts {
+            q["opts"] = opts;
+        }
+        q
+    };
+    let json_cases = [
+        (
+            "J1 JSON-LD, one graph: g2",
+            exists_filter(json!({"@id": ledger_id, "graph": "urn:g2"}), None),
+            rows(&[&["y1"]]),
+            ExistsLane::One,
+        ),
+        (
+            "J2 JSON-LD, FROM g2 + g3",
+            exists_filter(
+                json!([
+                    {"@id": ledger_id, "graph": "urn:g2"},
+                    {"@id": ledger_id, "graph": "urn:g3"}
+                ]),
+                None,
+            ),
+            rows(&[&["w1"], &["y1"]]),
+            ExistsLane::Union,
+        ),
+        (
+            "J3 JSON-LD, opts.unionDefaultGraph",
+            exists_filter(json!(ledger_id), Some(json!({"unionDefaultGraph": true}))),
+            rows(&[&["w1"], &["x1"], &["y1"]]),
+            ExistsLane::Union,
+        ),
+    ];
+    for (label, query, want, lane) in json_cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = connection_jsonld(&fluree, ledger_id, &query).await;
+        failures.eq(jsonld_rows(&result), want, label);
+        check_exists_routing(&mut failures, label, &exists_stamps(&store, before), lane);
+    }
+
+    // Under the kill switch the union lane stands down and says so; the
+    // one-graph cache never answered to it, and still doesn't.
+    drop(_switch);
+    {
+        let _switch = crate::support::FAST_PATH_SWITCH.write().await;
+        let _restore = FastPathSwitchRestore;
+        fluree_db_api::set_fast_paths_disabled(true);
+        for (label, query, want, lane) in [
+            (
+                "K1 FROM g3 + g2 under the kill switch",
+                filter("", "FROM <urn:g3> FROM <urn:g2>", ""),
+                rows(&[&["w1"], &["y1"]]),
+                ExistsLane::Neither,
+            ),
+            (
+                "K2 FROM g2 alone under the kill switch",
+                filter("", "FROM <urn:g2>", ""),
+                rows(&[&["y1"]]),
+                ExistsLane::One,
+            ),
+        ] {
+            let (store, _guard) = init_test_tracing();
+            let before = store.all_events().len();
+            let json = db(&handle)
+                .await
+                .query(&fluree)
+                .sparql(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            failures.eq(sparql_rows(&json, x), want, label);
+            let stamped = exists_stamps(&store, before);
+            check_exists_routing(&mut failures, label, &stamped, lane);
+            if lane == ExistsLane::Neither {
+                failures.eq(
+                    stamped.1,
+                    vec!["fallback:kill_switch".to_string()],
+                    &format!("{label}: `{EXISTS_UNION_SITE}` decline"),
+                );
+            }
+        }
+    }
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+
+    // Novelty in one member: the union lane declines, and says why. The
+    // answer still counts v1, which only novelty holds.
+    fluree
+        .stage(&handle)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               GRAPH <urn:g2> { ex:v1 ex:amount 3.5 ; ex:label "v one" . }"#,
+        )
+        .execute()
+        .await
+        .expect("write to g2 after the index");
+    {
+        let label = "N1 FROM g3 + g2, novelty in g2";
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let json = db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&filter("", "FROM <urn:g3> FROM <urn:g2>", ""))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        failures.eq(
+            sparql_rows(&json, x),
+            rows(&[&["v1"], &["w1"], &["y1"]]),
+            label,
+        );
+        let stamped = exists_stamps(&store, before);
+        check_exists_routing(&mut failures, label, &stamped, ExistsLane::Neither);
+        failures.eq(
+            stamped.1,
+            vec!["fallback:novelty".to_string()],
+            &format!("{label}: `{EXISTS_UNION_SITE}` decline"),
+        );
+    }
+    failures.assert_none();
+}
+
+/// The EXISTS cache over a union where the EXISTS's predicate holds lists.
+/// SPARQL reads a list as the RDF it denotes (#2159), an owner edge to the
+/// list's head cell, so `EXISTS { ?x ex:tags ?t }` is read through the list
+/// view: the cache over several graphs stands down with `ListView` and the
+/// general plan answers. JSON-LD reads the members as values, and the cache
+/// answers. Either way a subject that owns a list has a tag, so the answers
+/// agree.
+///
+/// Tags: y1 owns a list in g2, y2 one in g3, w1 a plain tag in g2; z1 has
+/// none. Amounts: y1 and y2 in g2, w1 and z1 in g3.
+#[tokio::test(flavor = "current_thread")]
+async fn exists_semijoin_cache_over_a_union_reads_a_list_as_each_surface_does() {
+    let ledger_id = "it/exists-cache-lists:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        ex:x1 ex:amount 1.5 .
+        GRAPH <urn:g2> {
+            ex:y1 ex:amount 7.5 ; ex:tags ( "a" "b" ) .
+            ex:y2 ex:amount 1.5 .
+            ex:w1 ex:tags "c" .
+        }
+        GRAPH <urn:g3> {
+            ex:w1 ex:amount 2.5 .
+            ex:z1 ex:amount 9.5 .
+            ex:y2 ex:tags ( "d" ) .
+        }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let x: &'static [&'static str] = &["x"];
+    let has_tag = rows(&[&["w1"], &["y1"], &["y2"]]);
+    let no_tag = rows(&[&["z1"]]);
+    let mut failures = Failures::default();
+    for (label, not, want) in [
+        (
+            "L1 FROM g2 + g3, FILTER(EXISTS && ...) on a list predicate",
+            "",
+            &has_tag,
+        ),
+        (
+            "L2 FROM g2 + g3, FILTER(!EXISTS && ...) on a list predicate",
+            "!",
+            &no_tag,
+        ),
+    ] {
+        let query = format!(
+            "{PREFIXES}SELECT ?x FROM <urn:g2> FROM <urn:g3> WHERE {{ ?x ex:amount ?v \
+             FILTER({not}EXISTS {{ ?x ex:tags ?t }} && ?v > 0) }}"
+        );
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, x), want.clone(), label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        let stamped = exists_stamps(&store, before);
+        check_exists_routing(&mut failures, label, &stamped, ExistsLane::Neither);
+        failures.eq(
+            stamped.1,
+            vec!["fallback:list_view".to_string()],
+            &format!("{label}: `{EXISTS_UNION_SITE}` decline"),
+        );
+    }
+    for (label, exists, want) in [
+        (
+            "JL1 JSON-LD, FROM g2 + g3, a list's members are tags",
+            json!(["exists", {"@id": "?x", "ex:tags": "?t"}]),
+            &has_tag,
+        ),
+        (
+            "JL2 JSON-LD, FROM g2 + g3, !EXISTS",
+            json!(["not", ["exists", {"@id": "?x", "ex:tags": "?t"}]]),
+            &no_tag,
+        ),
+    ] {
+        let query = json!({
+            "@context": {"ex": EX},
+            "from": [
+                {"@id": ledger_id, "graph": "urn:g2"},
+                {"@id": ledger_id, "graph": "urn:g3"}
+            ],
+            "select": ["?x"],
+            "where": [
+                {"@id": "?x", "ex:amount": "?v"},
+                ["filter", ["and", exists, [">", "?v", 0]]]
+            ]
+        });
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = connection_jsonld(&fluree, ledger_id, &query).await;
+        failures.eq(jsonld_rows(&result), want.clone(), label);
+        check_exists_routing(
+            &mut failures,
+            label,
+            &exists_stamps(&store, before),
+            ExistsLane::Union,
+        );
+    }
     failures.assert_none();
 }
 
