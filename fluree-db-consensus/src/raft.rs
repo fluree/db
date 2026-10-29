@@ -98,6 +98,7 @@
 pub mod app;
 pub mod commit_worker;
 pub mod embedded;
+pub mod erasure;
 pub mod eviction_scheduler;
 pub mod integration;
 pub mod liveness_monitor;

@@ -140,6 +140,7 @@ pub struct EmbeddedRaftNode {
     worker_supervisor: CancellableTaskHandle,
     leader_watcher: CancellableTaskHandle,
     release_task: Option<(JoinHandle<()>, CancellationToken)>,
+    erasure_installer: (JoinHandle<()>, CancellationToken),
 }
 
 impl EmbeddedRaftNode {
@@ -209,10 +210,21 @@ impl EmbeddedRaftNode {
         }
         fluree.set_content_hash_readers_confirmed(false);
         // Historical reads confirm this replica's removal journal is
-        // current.
+        // current, and that it has installed the erasures it has applied.
         fluree.set_retention_replicas(Arc::new(
             crate::raft::nameservice::read_index::RaftReplicaSync(Arc::clone(&nameservice)),
         ));
+        let erasure_installer = {
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(crate::raft::erasure::run_installer(
+                Arc::clone(&integration.erasure),
+                integration.shared_state.clone(),
+                Arc::new(EngineInstall(Arc::clone(&fluree))),
+                Arc::clone(&nameservice),
+                cancel.clone(),
+            ));
+            (task, cancel)
+        };
         let commits: Arc<dyn CommitPublisher> = Arc::clone(&nameservice) as _;
         // Same Arc upcast again so a follower-owned worker can ferry a
         // deterministic poison to the leader rather than spin on
@@ -226,6 +238,7 @@ impl EmbeddedRaftNode {
                 commits,
                 poison,
                 staged_receipts: Arc::clone(&integration.staged_receipts),
+                erasure: Some(Arc::clone(&integration.erasure)),
             },
             StagingContext {
                 fluree: Arc::clone(&fluree),
@@ -260,6 +273,7 @@ impl EmbeddedRaftNode {
             worker_supervisor,
             leader_watcher,
             release_task,
+            erasure_installer,
         }
     }
 
@@ -272,6 +286,9 @@ impl EmbeddedRaftNode {
         // Then the leader tasks. Resolves only after each in-flight one
         // has been abort-and-awaited, not merely signalled.
         self.leader_watcher.shutdown().await;
+        let (installer, cancel) = self.erasure_installer;
+        cancel.cancel();
+        let _ = installer.await;
         // Then the core, so no further apply can push releases into the
         // channel the drain below is about to close. Bounded: a wedged
         // core must not hold the drain hostage.
@@ -294,6 +311,25 @@ impl EmbeddedRaftNode {
 
 /// The per-node release loop: frees envelope blobs the state machine
 /// has finished with, then drains what is still buffered at shutdown.
+/// Installs an erasure activation into this node's engine: each holder's
+/// cached state goes and the erasure maps are listed again, so what loads
+/// next reads with the activation.
+struct EngineInstall(Arc<Fluree>);
+
+#[async_trait::async_trait]
+impl crate::raft::erasure::ErasureInstall for EngineInstall {
+    async fn install(
+        &self,
+        _number: u64,
+        activation: &crate::raft::state_machine::Activation,
+    ) -> Result<(), String> {
+        for holder in &activation.holders {
+            self.0.refresh_ledger(&holder.ledger_id()).await;
+        }
+        Ok(())
+    }
+}
+
 fn spawn_release_task(
     fluree: Arc<Fluree>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, ContentId)>,

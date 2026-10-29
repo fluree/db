@@ -106,6 +106,10 @@ pub struct RaftNameService {
     /// `ForwardToLeader`). When unset, `publish_commit` behaves as it
     /// did before distributed workers — assumes leader-only callers.
     forwarding: Option<ForwardingConfig>,
+    /// What this node has installed of the erasure activations; its
+    /// records report each branch at the generation installed here.
+    /// Unset, they report the replicated generation.
+    erasure: Option<Arc<crate::raft::erasure::ErasureNode>>,
 }
 
 /// Per-node forwarding configuration for [`RaftNameService`]. Held as
@@ -134,7 +138,41 @@ impl RaftNameService {
             raft,
             staged_receipts: None,
             forwarding: None,
+            erasure: None,
         }
+    }
+
+    /// Report records at the erasure generation `node` has installed.
+    pub fn with_erasure_node(mut self, node: Arc<crate::raft::erasure::ErasureNode>) -> Self {
+        self.erasure = Some(node);
+        self
+    }
+
+    /// Wait up to `timeout` until this node has installed every erasure
+    /// activation it has applied that reaches `ledger_id`.
+    pub async fn wait_erasures_installed(
+        &self,
+        ledger_id: &str,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<(), String> {
+        let Some(node) = &self.erasure else {
+            return Ok(());
+        };
+        let key = ref_key_of(ledger_id).map_err(|e| e.to_string())?;
+        if node.wait_installed(&self.state, &key, timeout).await {
+            Ok(())
+        } else {
+            Err(format!(
+                "this node has not yet installed an erasure activated on {ledger_id}"
+            ))
+        }
+    }
+
+    /// Every activation numbered below this is installed on this node.
+    fn installed_through(&self) -> u64 {
+        self.erasure
+            .as_ref()
+            .map_or(u64::MAX, |node| node.installed_through())
     }
 
     /// Wire the [`StagedReceiptMap`] this nameservice peeks for
@@ -276,6 +314,7 @@ fn record_from_state(
     state: &NameServiceState,
     ledger_name: &str,
     branch: &str,
+    installed_through: u64,
 ) -> Option<NsRecord> {
     let ledger = state.ledgers.get(ledger_name)?;
     if !ledger.branches.iter().any(|b| b == branch) {
@@ -304,7 +343,8 @@ fn record_from_state(
         record.branches = entry.branches;
     }
     record.retracted = state.retracted.contains(&ref_key);
-    record.erasure_generation = crate::raft::state_machine::generation(state, &ref_key);
+    record.erasure_generation =
+        crate::raft::state_machine::view_generation(state, &ref_key, installed_through);
     if let Some(f) = state.fences.get(&ref_key) {
         record.fence = Some(Fence::from_u64(f.fence));
         record.frozen = f.frozen;
@@ -322,8 +362,9 @@ fn resolved_from_state(
     state: &NameServiceState,
     ledger_name: &str,
     branch: &str,
+    installed_through: u64,
 ) -> Result<Option<NsRecord>> {
-    let Some(record) = record_from_state(state, ledger_name, branch) else {
+    let Some(record) = record_from_state(state, ledger_name, branch, installed_through) else {
         return Ok(None);
     };
     let binding: Option<NameBinding> = match state.bindings.get(ledger_name) {
@@ -411,7 +452,9 @@ fn check_erasure_response(response: &SmResponse) -> Result<()> {
 fn stored_fence(state: &NameServiceState, key: &RefKey) -> Option<(Option<Fence>, bool)> {
     match state.fences.get(key) {
         Some(f) => Some((Some(Fence::from_u64(f.fence)), f.frozen)),
-        None => record_from_state(state, &key.ledger_name, &key.branch).map(|_| (None, false)),
+        None => {
+            record_from_state(state, &key.ledger_name, &key.branch, u64::MAX).map(|_| (None, false))
+        }
     }
 }
 
@@ -438,7 +481,7 @@ impl NameServiceLookup for RaftNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let state = self.state.read().await;
-        resolved_from_state(&state, &name, &branch)
+        resolved_from_state(&state, &name, &branch, self.installed_through())
     }
 
     /// One lock, two field reads. Mirrors `get_ref`: retracted branches are
@@ -472,7 +515,9 @@ impl NameServiceLookup for RaftNameService {
         let mut records = Vec::new();
         for (ledger_name, ledger) in &state.ledgers {
             for branch in &ledger.branches {
-                if let Some(record) = resolved_from_state(&state, ledger_name, branch)? {
+                if let Some(record) =
+                    resolved_from_state(&state, ledger_name, branch, self.installed_through())?
+                {
                     records.push(record);
                 }
             }
@@ -1159,6 +1204,84 @@ async fn handle_apply_queue_poison(
     }
 }
 
+/// Path under [`erasure_ready_router`]'s root for a member's erasure
+/// readiness report, which a follower posts to the leader.
+pub const ERASURE_READY_PATH: &str = "/erasure_ready";
+
+/// A member's erasure readiness report on its way to the leader; see
+/// [`ErasureCommand::Ready`](super::state_machine::ErasureCommand::Ready).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ErasureReady {
+    pub through: u64,
+    pub node: NodeId,
+    pub incarnation: super::state_machine::Incarnation,
+}
+
+/// Errors the leader returns for an [`ErasureReady`] report.
+#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum ApplyErasureReadyError {
+    #[error("not the leader; current leader: {leader:?}")]
+    NotLeader { leader: Option<NodeId> },
+    #[error("raft propose failed: {0}")]
+    RaftPropose(String),
+}
+
+impl FromRaftWriteError for ApplyErasureReadyError {
+    fn not_leader(leader: Option<NodeId>) -> Self {
+        Self::NotLeader { leader }
+    }
+    fn raft_propose(msg: String) -> Self {
+        Self::RaftPropose(msg)
+    }
+}
+
+/// Axum router for [`ERASURE_READY_PATH`], mounted beside
+/// [`apply_queue_poison_router`] with the same trust posture. The report
+/// is as small as a poison, so it takes the same body cap.
+pub fn erasure_ready_router(
+    ns: Arc<RaftNameService>,
+    network_config: &crate::raft::network::NetworkConfig,
+) -> Router {
+    Router::new()
+        .route(
+            ERASURE_READY_PATH,
+            post(handle_erasure_ready).layer(DefaultBodyLimit::max(
+                network_config.apply_queue_poison_max_body_bytes,
+            )),
+        )
+        .with_state(ns)
+}
+
+async fn handle_erasure_ready(
+    State(ns): State<Arc<RaftNameService>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let args: ErasureReady = match postcard::from_bytes(&body) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error on ErasureReady: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let outcome = ns.propose_erasure_ready(args).await;
+    match postcard::to_allocvec(&outcome) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("postcard encode error on erasure_ready response: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Translate openraft's structured `client_write` failure into one
 /// of the cross-node RPC error enums. Both
 /// [`ApplyStagedCommitError`] and [`ApplyQueuePoisonError`] carry
@@ -1666,6 +1789,82 @@ impl QueuePoisonPublisher for RaftNameService {
 }
 
 impl RaftNameService {
+    /// Report that `node`, in run `incarnation`, has installed every
+    /// erasure activation numbered below `through`: proposed here on the
+    /// leader, posted to the leader elsewhere.
+    pub async fn report_erasure_ready(
+        &self,
+        through: u64,
+        node: NodeId,
+        incarnation: super::state_machine::Incarnation,
+    ) -> std::result::Result<(), String> {
+        let args = ErasureReady {
+            through,
+            node,
+            incarnation,
+        };
+        if let Some(forwarding) = &self.forwarding {
+            if !self.is_local_leader(forwarding.id).await {
+                return self.erasure_ready_via_leader(&args, forwarding).await;
+            }
+        }
+        self.propose_erasure_ready(args)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Propose an [`ErasureReady`] report on this node, the leader.
+    pub async fn propose_erasure_ready(
+        &self,
+        args: ErasureReady,
+    ) -> std::result::Result<(), ApplyErasureReadyError> {
+        let ErasureReady {
+            through,
+            node,
+            incarnation,
+        } = args;
+        self.raft
+            .client_write(SmCommand::Erasure(
+                super::state_machine::ErasureCommand::Ready {
+                    through,
+                    node,
+                    incarnation,
+                },
+            ))
+            .await
+            .map_err(map_propose_error)?;
+        Ok(())
+    }
+
+    async fn erasure_ready_via_leader(
+        &self,
+        args: &ErasureReady,
+        forwarding: &ForwardingConfig,
+    ) -> std::result::Result<(), String> {
+        let leader_url = self
+            .lookup_leader_raft_url()
+            .await
+            .ok_or_else(|| "no leader currently elected".to_string())?;
+        let target = format!("{}{}", leader_url.trim_end_matches('/'), ERASURE_READY_PATH);
+        let body = postcard::to_allocvec(args).map_err(|e| format!("encode ErasureReady: {e}"))?;
+        let resp = forwarding
+            .http_client
+            .post(&target)
+            .header(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)
+            .body(body)
+            .timeout(forwarding.request_timeout)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("erasure_ready returned HTTP {}", resp.status()));
+        }
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let outcome: std::result::Result<(), ApplyErasureReadyError> =
+            postcard::from_bytes(&bytes).map_err(|e| format!("decode erasure_ready: {e}"))?;
+        outcome.map_err(|e| e.to_string())
+    }
+
     /// Submit a lifecycle command through Raft and surface the
     /// response. Maps `ForwardToLeader` to a storage error so callers
     /// (typically the HTTP route layer) can redirect — silently
@@ -1816,7 +2015,12 @@ impl BranchRecordStore for RaftNameService {
     async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let state = self.state.read().await;
-        Ok(record_from_state(&state, &name, &branch))
+        Ok(record_from_state(
+            &state,
+            &name,
+            &branch,
+            self.installed_through(),
+        ))
     }
 
     async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
@@ -1825,10 +2029,9 @@ impl BranchRecordStore for RaftNameService {
             .ledgers
             .iter()
             .flat_map(|(name, ledger)| {
-                ledger
-                    .branches
-                    .iter()
-                    .filter_map(|branch| record_from_state(&state, name, branch))
+                ledger.branches.iter().filter_map(|branch| {
+                    record_from_state(&state, name, branch, self.installed_through())
+                })
             })
             .collect())
     }
@@ -3691,5 +3894,68 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["a/db:feat".to_string(), "a/db:main".to_string()]);
+    }
+
+    /// A node reports a branch an erasure reached at the generation it has
+    /// installed, and holds its history reads until it installs, so a
+    /// write from its views is refused and nothing reads with the erasure
+    /// missing.
+    #[tokio::test]
+    async fn records_report_the_generation_this_node_installed() {
+        use crate::raft::erasure::ErasureNode;
+        use crate::raft::state_machine::{holder_state, ActivateErasure, ErasureCommand};
+        use fluree_db_nameservice::BranchRecordStore;
+
+        let state = fresh_state();
+        apply_cmd(&state, Command::Erasure(ErasureCommand::Track), 1).await;
+        apply_cmd(
+            &state,
+            Command::CreateLedger(NewLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                created_at_millis: 0,
+            }),
+            2,
+        )
+        .await;
+        let key = RefKey::new("test/db", "main");
+        let (holder, holder_set) = {
+            let s = state.read().await;
+            (holder_state(&s, &key), s.erasure.holder_set)
+        };
+        apply_cmd(
+            &state,
+            Command::Erasure(ErasureCommand::Activate(ActivateErasure {
+                manifest: "m".into(),
+                holder_set,
+                holders: vec![holder],
+                applied_at_millis: 0,
+            })),
+            3,
+        )
+        .await;
+
+        let node = Arc::new(ErasureNode::new(1, 7));
+        let ns = RaftNameService::new(view(&state), stub_raft().await)
+            .with_erasure_node(Arc::clone(&node));
+        // An unbound record, so read it raw rather than resolved.
+        let record = ns.raw_record("test/db:main").await.unwrap().unwrap();
+        assert_eq!(record.erasure_generation, 0, "not installed here yet");
+        let refused = ns
+            .wait_erasures_installed("test/db:main", std::time::Duration::from_millis(50))
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(ns
+            .wait_erasures_installed("other/db:main", std::time::Duration::from_millis(50))
+            .await
+            .is_ok());
+
+        node.mark_installed(1);
+        let record = ns.raw_record("test/db:main").await.unwrap().unwrap();
+        assert_eq!(record.erasure_generation, 1);
+        assert!(ns
+            .wait_erasures_installed("test/db:main", std::time::Duration::from_millis(50))
+            .await
+            .is_ok());
     }
 }

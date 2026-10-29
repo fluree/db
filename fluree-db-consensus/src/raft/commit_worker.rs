@@ -160,6 +160,10 @@ pub struct PublishingChannel {
     pub commits: Arc<dyn CommitPublisher>,
     pub poison: Arc<dyn QueuePoisonPublisher>,
     pub staged_receipts: Arc<StagedReceiptMap>,
+    /// What this node has installed of the erasure activations, which a
+    /// write staged from the replicated records presents. Unset, it
+    /// presents the replicated generation.
+    pub erasure: Option<Arc<crate::raft::erasure::ErasureNode>>,
 }
 
 /// Handles a [`Worker`] uses to stage a commit locally.
@@ -235,15 +239,25 @@ impl Worker {
         }
     }
 
-    /// What a write from the branch's replicated record presents.
+    /// What a write from the branch's replicated record presents, at the
+    /// erasure generation installed here.
     async fn branch_basis(&self) -> WriteBasis {
+        let installed_through = self
+            .publishing
+            .erasure
+            .as_ref()
+            .map_or(u64::MAX, |node| node.installed_through());
         let state = self.shared_state.read().await;
         WriteBasis {
             fence: state
                 .fences
                 .get(&self.ref_key)
                 .map(|f| fluree_db_nameservice::Fence::from_u64(f.fence)),
-            erasure_generation: crate::raft::state_machine::generation(&state, &self.ref_key),
+            erasure_generation: crate::raft::state_machine::view_generation(
+                &state,
+                &self.ref_key,
+                installed_through,
+            ),
         }
     }
 
@@ -2105,6 +2119,7 @@ mod tests {
                 commits: Arc::clone(&publisher) as _,
                 poison: Arc::new(NoPoison),
                 staged_receipts: Arc::new(StagedReceiptMap::default()),
+                erasure: None,
             },
             StagingContext {
                 fluree: Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory()),

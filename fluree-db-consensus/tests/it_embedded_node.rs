@@ -605,12 +605,22 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
         "{:?}",
         activated.data
     );
-    let after = ns
-        .lookup("erased/db:main")
-        .await
-        .expect("lookup")
-        .expect("registered");
-    assert_eq!(after.erasure_generation, 1);
+    // The node installs the activation, then reports that it has.
+    eventually("the node to install the activation", async || {
+        ns.lookup("erased/db:main")
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.erasure_generation == 1)
+    })
+    .await;
+    eventually("the node's readiness report", async || {
+        let state = integration.shared_state.read().await;
+        state.erasure.installed.get(&9).is_some_and(|installed| {
+            installed.through == 1 && installed.incarnation == integration.erasure.incarnation()
+        })
+    })
+    .await;
 
     let index = fluree_db_core::ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"stale");
     let stale = ns

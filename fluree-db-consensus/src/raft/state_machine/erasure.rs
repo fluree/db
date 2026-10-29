@@ -35,6 +35,16 @@ pub struct ErasureState {
     /// Activations by number.
     pub activations: BTreeMap<u64, Activation>,
     pub next_activation: u64,
+    /// What each member reported installed: every activation numbered
+    /// below `through`, by the run it reported from.
+    pub installed: BTreeMap<NodeId, Installed>,
+}
+
+/// A member's [`ErasureCommand::Ready`] report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Installed {
+    pub through: u64,
+    pub incarnation: Incarnation,
 }
 
 /// An applied [`ErasureCommand::Activate`].
@@ -45,9 +55,6 @@ pub struct Activation {
     pub holders: Vec<RefKey>,
     pub log_index: u64,
     pub applied_at_millis: u64,
-    /// Members that reported it installed, with the incarnation each
-    /// reported under.
-    pub ready: BTreeMap<NodeId, Incarnation>,
 }
 
 /// Which run of a member a report comes from: its process, and its local
@@ -97,9 +104,10 @@ pub enum ErasureCommand {
     Release { holders: Vec<RefKey> },
     /// Activate a prepared erasure: see [`ActivateErasure`].
     Activate(ActivateErasure),
-    /// `node` installed activation `activation`.
+    /// `node`, in the run `incarnation` names, installed every activation
+    /// numbered below `through`. Activations install in order.
     Ready {
-        activation: u64,
+        through: u64,
         node: NodeId,
         incarnation: Incarnation,
     },
@@ -123,6 +131,19 @@ pub enum ActivationRefusal {
 /// A branch's erasure generation.
 pub fn generation(state: &NameServiceState, key: &RefKey) -> u64 {
     state.erasure.generations.get(key).copied().unwrap_or(0)
+}
+
+/// `key`'s generation as a node that has installed every activation
+/// numbered below `installed_through` reads it: the replicated generation,
+/// less each activation reaching it the node has not installed.
+pub fn view_generation(state: &NameServiceState, key: &RefKey, installed_through: u64) -> u64 {
+    let pending = state
+        .erasure
+        .activations
+        .range(installed_through..)
+        .filter(|(_, a)| a.holders.contains(key))
+        .count() as u64;
+    generation(state, key).saturating_sub(pending)
 }
 
 /// `key` as an activation would find it now.
@@ -280,16 +301,24 @@ pub(super) fn apply(
         }
         ErasureCommand::Activate(args) => activate(state, args, log_index),
         ErasureCommand::Ready {
-            activation,
+            through,
             node,
             incarnation,
-        } => match state.erasure.activations.get_mut(&activation) {
-            Some(record) => {
-                record.ready.insert(node, incarnation);
-                Response::ErasureReadyRecorded
+        } => {
+            if through > state.erasure.next_activation {
+                return Response::ErasureActivationUnknown {
+                    activation: through - 1,
+                };
             }
-            None => Response::ErasureActivationUnknown { activation },
-        },
+            state.erasure.installed.insert(
+                node,
+                Installed {
+                    through,
+                    incarnation,
+                },
+            );
+            Response::ErasureReadyRecorded
+        }
         ErasureCommand::Track => {
             state.erasure.tracking = true;
             Response::ErasureTracking
@@ -328,7 +357,6 @@ fn activate(state: &mut NameServiceState, args: ActivateErasure, log_index: u64)
             holders,
             log_index,
             applied_at_millis: args.applied_at_millis,
-            ready: BTreeMap::new(),
         },
     );
     Response::ErasureActivated { activation }
@@ -774,16 +802,16 @@ mod tests {
         );
     }
 
-    /// A member's report is kept under the incarnation it came from; a
-    /// later run reports again and replaces it.
+    /// A member's report is kept under the run it came from; a later run
+    /// reports again and replaces it, even when it has installed less.
     #[test]
     fn ready_reports_are_kept_per_member_run() {
         let mut state = ledger_with_queued_request();
-        let ready = |state: &mut NameServiceState, activation, process| {
+        let ready = |state: &mut NameServiceState, through, process| {
             apply(
                 state,
                 Command::Erasure(ErasureCommand::Ready {
-                    activation,
+                    through,
                     node: 2,
                     incarnation: Incarnation {
                         process,
@@ -794,17 +822,20 @@ mod tests {
             )
         };
         assert_eq!(
-            ready(&mut state, 0, 1),
+            ready(&mut state, 1, 1),
             Response::ErasureActivationUnknown { activation: 0 }
         );
         activate(&mut state, &[main_key()]);
-        assert_eq!(ready(&mut state, 0, 1), Response::ErasureReadyRecorded);
+        assert_eq!(ready(&mut state, 1, 1), Response::ErasureReadyRecorded);
         assert_eq!(ready(&mut state, 0, 2), Response::ErasureReadyRecorded);
         assert_eq!(
-            state.erasure.activations[&0].ready[&2],
-            Incarnation {
-                process: 2,
-                storage: 1
+            state.erasure.installed[&2],
+            Installed {
+                through: 0,
+                incarnation: Incarnation {
+                    process: 2,
+                    storage: 1
+                }
             }
         );
     }

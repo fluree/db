@@ -195,4 +195,14 @@ impl fluree_db_api::retention::replicas::ReplicaSync for RaftReplicaSync {
     async fn await_replicas(&self, timeout: Duration) -> Vec<String> {
         self.0.await_replicas(timeout).await
     }
+
+    async fn erasures_installed(&self, ledger_id: &str) -> Result<(), String> {
+        self.0
+            .wait_erasures_installed(ledger_id, INSTALL_WAIT)
+            .await
+    }
 }
+
+/// How long a history read waits for this node to install an erasure
+/// activation it has applied before refusing the read.
+const INSTALL_WAIT: Duration = Duration::from_secs(5);

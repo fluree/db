@@ -30,6 +30,14 @@ pub trait ReplicaSync: Send + Sync {
     /// Wait up to `timeout` for every other replica to apply what this
     /// node has applied; the replicas that did not.
     async fn await_replicas(&self, timeout: Duration) -> Vec<String>;
+
+    /// Wait, briefly, until this node has installed every erasure
+    /// activation it has applied that reaches `ledger_id`: until then its
+    /// cached state and erasure map may still read what was erased.
+    async fn erasures_installed(&self, ledger_id: &str) -> std::result::Result<(), String> {
+        let _ = ledger_id;
+        Ok(())
+    }
 }
 
 impl Fluree {
@@ -51,6 +59,9 @@ impl Fluree {
                 "this replica cannot confirm it holds {ledger_id}'s current removal journal \
                  ({e}); retry, or read as of the current head"
             ))
+        })?;
+        replicas.erasures_installed(ledger_id).await.map_err(|e| {
+            ApiError::ReplicaNotCurrent(format!("{e}; retry, or read as of the current head"))
         })?;
         Ok(true)
     }

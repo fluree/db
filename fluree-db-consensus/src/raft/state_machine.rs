@@ -31,8 +31,8 @@ use thiserror::Error;
 
 mod erasure;
 pub use erasure::{
-    generation, holder_state, ActivateErasure, Activation, ActivationRefusal, ErasureCommand,
-    ErasureState, HolderState, Incarnation,
+    generation, holder_state, view_generation, ActivateErasure, Activation, ActivationRefusal,
+    ErasureCommand, ErasureState, HolderState, Incarnation, Installed,
 };
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -1583,7 +1583,7 @@ pub enum Response {
     ErasureActivationRefused { refusal: ActivationRefusal },
     /// [`ErasureCommand::Ready`] recorded.
     ErasureReadyRecorded,
-    /// [`ErasureCommand::Ready`] named no activation.
+    /// [`ErasureCommand::Ready`] claimed an activation not applied yet.
     ErasureActivationUnknown { activation: u64 },
     /// [`ErasureCommand::Track`] applied.
     ErasureTracking,
