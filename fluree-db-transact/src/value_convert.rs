@@ -60,6 +60,13 @@ pub(crate) enum LiteralCheck {
     /// Store it as text under its declared datatype ([`lenient_value`]).
     /// Bulk import only, the one lenient write path: it loads RDF text from
     /// elsewhere, which often carries ill-typed literals, in one pass.
+    #[cfg_attr(
+        not(feature = "import"),
+        expect(
+            dead_code,
+            reason = "bulk import, its only user, needs the `import` feature"
+        )
+    )]
     Lenient,
 }
 
