@@ -296,6 +296,28 @@ mod tests {
     }
 
     #[test]
+    fn every_fact_is_found_where_its_key_was_written() {
+        let mut set = UnionFactSet::new(2);
+        let facts: Vec<[Binding; 2]> = (0..100u64)
+            .map(|i| {
+                let s = Binding::EncodedSid {
+                    s_id: i,
+                    t: None,
+                    op: None,
+                };
+                [s, lit(i % 7)]
+            })
+            .collect();
+        for [s, o] in &facts {
+            assert!(set.insert([s, o], Some(fact(None)), None, None).unwrap());
+        }
+        for [s, o] in &facts {
+            assert!(!set.insert([s, o], Some(fact(None)), None, None).unwrap());
+        }
+        assert_eq!(set.len(), 100);
+    }
+
+    #[test]
     fn decoded_terms_compare_as_bindings() {
         let mut set = UnionFactSet::new(1);
         let a = Binding::lit(FlakeValue::Long(5), Sid::new(2, "long"));
