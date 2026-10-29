@@ -113,6 +113,11 @@ fn apply_joins(tables: &mut [Table], joins: &[Join]) {
 pub fn from_snowflake(yaml: &str) -> Result<Model, SemanticError> {
     let doc: Value =
         serde_saphyr::from_str(yaml).map_err(|e| SemanticError::Yaml(e.to_string()))?;
+    snowflake(&doc)
+}
+
+/// A semantic view already parsed.
+pub fn snowflake(doc: &Value) -> Result<Model, SemanticError> {
     let Some(table_values) = doc.get("tables").and_then(Value::as_array) else {
         return Err(SemanticError::Shape(
             "no `tables:` list: not a semantic view or semantic model".into(),

@@ -1,6 +1,8 @@
 //! Ontologies from what people already have: table and column names, a CSV
 //! header, a workbook, SQL DDL, a warehouse's semantic layer (a Snowflake
-//! semantic view, a Databricks Genie space).
+//! semantic view, a Databricks Genie space, a dbt project's semantic models
+//! and model properties, an Apache Ossie semantic model). An Ossie ontology,
+//! already conceptual, is written straight to RDF ([`ossie::ontology`]).
 //!
 //! Every source is read into one [`Model`] of tables and columns, and one
 //! emitter turns that into an ontology, so the rules are the same whatever
@@ -20,6 +22,8 @@
 //! - primary keys, metrics, filters and SQL are left out: they describe
 //!   tables, not things.
 
+pub mod dbt;
+pub mod ossie;
 pub mod semantic;
 pub mod sql;
 pub mod tabular;
@@ -29,6 +33,15 @@ use crate::vocab::*;
 use crate::words::name_words;
 use fluree_graph_ir::{Datatype, Term};
 use std::collections::{BTreeMap, HashMap};
+
+/// A YAML or JSON document (semantic layers come as either), as JSON values.
+pub fn parse_document(text: &str) -> Result<serde_json::Value, String> {
+    if crate::read::RdfFormat::sniff(text) == crate::read::RdfFormat::JsonLd {
+        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))
+    } else {
+        serde_saphyr::from_str(text).map_err(|e| format!("invalid YAML: {e}"))
+    }
+}
 
 /// A table, from any source.
 #[derive(Clone, Debug, Default)]

@@ -21,14 +21,16 @@ fluree ontology <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `check` | Report what the extraction model will and won't read of an ontology (and catalog) |
-| `from` | Write an ontology in the shape the extraction model reads well: from tables (CSV, a workbook, SQL DDL), or from RDF, optionally sliced |
+| `from` | Write an ontology in the shape the extraction model reads well: from tables (CSV, a workbook, SQL DDL), a semantic layer (Snowflake, Genie, dbt, Apache Ossie), or RDF, optionally sliced |
 
 Ontologies are read as Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-`
 reads stdin, and `--input-format turtle|jsonld` says which when the extension
 doesn't. TriG is not read yet: pass the ontology as Turtle, or a saved request
 as JSON-LD. `from` also reads tables (`.csv`/`.tsv`, `.xlsx`, `.sql`) and
-semantic layers (a Snowflake semantic view as `.yaml`, a Databricks Genie
-export as `.json`).
+semantic layers: a Snowflake semantic view (`.yaml`), a Databricks Genie
+export (`.json`), a dbt project (its `.yml` files or its directory) and an
+Apache Ossie semantic model or ontology (`.yaml`, `.json`). YAML and JSON
+are told apart by what they hold.
 
 For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
@@ -251,6 +253,43 @@ Unity Catalog's table and column comments. Pass them with `--comments` as JSON,
 `{"table": {"": "table comment", "column": "column comment"}}` (one query on
 `information_schema` gives them). SQL snippets and instructions are left out.
 
+A **dbt project** gives two kinds of YAML, and `from` reads both, from one file
+or from the project's directory (every `.yml`/`.yaml` under it, `target/` and
+`dbt_packages/` passed over):
+
+- **semantic models** (MetricFlow): a semantic model is a class; its primary
+  entity is its key; a foreign entity is a relation to the semantic model whose
+  primary entity has that name (`customer` relates to the model keyed by
+  `customer`); dimensions are properties (a `time` dimension a date, or a
+  date-time below a day's granularity); a measure that aggregates a column
+  (`sum`, `average`, `min`, `max`, `median`, `percentile`) is a decimal
+  property, while counts, metrics and saved queries are left out;
+- **model properties** (`schema.yml`): column descriptions are copied, an
+  `accepted_values` test makes a column enumerated, a `relationships` test or
+  `foreign_key` constraint makes it a foreign key, and a `primary_key`
+  constraint, or `unique` with `not_null` on `id`, makes it the key. A
+  semantic model built on a model (`model: ref('stg_orders')`) takes that
+  model's descriptions and accepted values, and stands for it.
+
+An **Apache Ossie** document (0.2, `.yaml` or `.json`) is read by its layer:
+
+- a **semantic model** (`datasets`, `relationships`) converts like a Snowflake
+  semantic view: fields' `description`, `datatype` and `ai_context` synonyms
+  are copied, relationships are foreign keys from their `from` fields to the
+  `to` dataset, and metrics are left out;
+- an **ontology** (`ontology:` a list of concepts) is already conceptual, and
+  is written as RDF directly, **keeping the IRIs it gives** (`iri: schema:Airport`,
+  expanded with its `prefixes`). An `EntityType` concept is a class (with its
+  `extends` as parents); a binary relationship is a property from the concept
+  that declares it to its role's concept, or to the datatype a `ValueType`
+  resolves to, described by its `description` or else its verbalization
+  (`'{Flight} uses {Aircraft}'` becomes "A flight uses an aircraft."); a unary
+  relationship (`'{Flight} was diverted'`) is a boolean property; one with
+  three or more roles is a class with a property per role; and a value type
+  whose `requires` lists its values (`Code == 'A' OR Code == 'B'`) is a class
+  with a catalog record per value. `derived_by`, other `requires` and
+  `identify_by` are logic, not what documents say, and are left out.
+
 A foreign key named for a code or number (`HIRE_CODE` into `PRODUCTS`) takes
 its target's label ("product"), since the name says what it is, not what role
 it plays. A key used by several tables is one relation, described for them
@@ -265,7 +304,7 @@ Snowflake's; statements none of them can parse are skipped and counted.
 | `--enum-max <N>` | Most distinct values an enumerated column may have, for CSV and workbooks (default: 12; 0 never enumerates) |
 | `--catalog-out <FILE>` | Write enumerated columns' records here instead of with the ontology |
 | `--comments <FILE>` | Unity Catalog comments for a Genie export (JSON) |
-| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake` or `genie`, when the extension doesn't say |
+| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake`, `genie`, `dbt` or `ossie`, when the extension or contents don't say |
 | `--format <FORMAT>` | `turtle` (default) or `jsonld` |
 | `-o, --output <FILE>` | Write to this file instead of stdout |
 
@@ -275,6 +314,8 @@ fluree ontology from accounts.csv -o ontology.ttl
 fluree ontology from crm.xlsx --catalog-out kinds.ttl -o ontology.ttl
 fluree ontology from sales_view.yaml --base https://example.com/sales/ > ontology.ttl
 fluree ontology from genie_space.json --comments uc_comments.json > ontology.ttl
+fluree ontology from ./my_dbt_project --base https://example.com/shop/ > ontology.ttl
+fluree ontology from flights.ossie.yaml > ontology.ttl
 ```
 
 From this DDL:
