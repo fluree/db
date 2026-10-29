@@ -341,6 +341,7 @@ pub(crate) async fn discover_remote(remote_url: &str) -> Result<Option<Discovere
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .user_agent(crate::USER_AGENT)
         .build()
         .map_err(|e| e.to_string())?;
 

@@ -21,6 +21,7 @@ pub(crate) fn login_command_for(url: &str) -> String {
 fn http_client() -> CliResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .user_agent(crate::USER_AGENT)
         .build()
         .map_err(|e| CliError::Remote(format!("failed to build HTTP client: {e}")))
 }
@@ -151,7 +152,11 @@ pub async fn run_logout() -> CliResult<()> {
     let server = sign_out_on_server(&http, &mut stored).await;
     account::remove()?;
     match server {
-        Ok(()) => println!("Signed out of {}", describe(&stored)),
+        Ok(SignOut::Done) => println!("Signed out of {}", describe(&stored)),
+        Ok(SignOut::AlreadyRevoked) => println!(
+            "Signed out of {} (the server had already signed this machine out)",
+            describe(&stored)
+        ),
         Err(e) => {
             println!("Signed out locally");
             eprintln!(
@@ -164,11 +169,25 @@ pub async fn run_logout() -> CliResult<()> {
     Ok(())
 }
 
+enum SignOut {
+    Done,
+    /// The credential was already dead on the server (an earlier logout, or
+    /// disconnected from the dashboard): nothing left to revoke.
+    AlreadyRevoked,
+}
+
 /// Revoke the machine's credential on the server: `POST {api}/auth/disconnect`
 /// with the access token (refreshed first if it has expired).
-async fn sign_out_on_server(http: &reqwest::Client, stored: &mut StoredAccount) -> CliResult<()> {
+async fn sign_out_on_server(
+    http: &reqwest::Client,
+    stored: &mut StoredAccount,
+) -> CliResult<SignOut> {
     if !account::token_seconds_left(&stored.access_token).is_some_and(|s| s > 0) {
-        account::refresh(http, stored).await?;
+        match account::refresh(http, stored).await {
+            Ok(()) => {}
+            Err(e) if account::is_revoked(&e) => return Ok(SignOut::AlreadyRevoked),
+            Err(e) => return Err(e),
+        }
     }
     let url = format!("{}/auth/disconnect", stored.api_base_url);
     let resp = http
@@ -177,14 +196,21 @@ async fn sign_out_on_server(http: &reqwest::Client, stored: &mut StoredAccount) 
         .send()
         .await
         .map_err(|e| CliError::Remote(e.to_string()))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(CliError::Remote(format!(
-            "{url} answered {}",
-            resp.status()
-        )))
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(SignOut::Done);
     }
+    // fluree.ai answers 400 `invalid_state` for a deployment that is
+    // already disconnected.
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let code = body
+        .pointer("/error/error")
+        .or_else(|| body.get("error"))
+        .and_then(|v| v.as_str());
+    if status == reqwest::StatusCode::BAD_REQUEST && code == Some("invalid_state") {
+        return Ok(SignOut::AlreadyRevoked);
+    }
+    Err(CliError::Remote(format!("{url} answered {status}")))
 }
 
 /// `owner@acme.test (Acme) on fluree.ai`, with whatever parts are known.

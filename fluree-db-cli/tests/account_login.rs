@@ -21,6 +21,8 @@ struct Seen {
     exchanges: u32,
     refreshes: u32,
     disconnects: Vec<String>,
+    /// Signed out server-side already (e.g. from the dashboard).
+    revoked: bool,
 }
 
 #[derive(Clone)]
@@ -47,8 +49,20 @@ fn oauth_error(code: &str) -> (axum::http::StatusCode, Json<Value>) {
     )
 }
 
-async fn discovery(State(f): State<Fake>) -> Json<Value> {
-    Json(json!({
+/// Fronts like fluree.ai's WAF refuse requests without a User-Agent; insist
+/// on the CLI's own.
+async fn discovery(
+    State(f): State<Fake>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !ua.starts_with("fluree/") {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    Ok(Json(json!({
         "version": 1,
         "service": "fluree.ai",
         "account": {
@@ -62,7 +76,7 @@ async fn discovery(State(f): State<Fake>) -> Json<Value> {
             "exchange_url": format!("{}/v1/oauth/exchange", f.base),
             "scopes": ["openid"],
         },
-    }))
+    })))
 }
 
 async fn openid(State(f): State<Fake>) -> Json<Value> {
@@ -132,14 +146,27 @@ async fn exchange(State(f): State<Fake>, Json(body): Json<Value>) -> axum::respo
     }
 }
 
-async fn disconnect(State(f): State<Fake>, headers: axum::http::HeaderMap) -> Json<Value> {
+async fn disconnect(
+    State(f): State<Fake>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    f.seen.lock().unwrap().disconnects.push(auth);
-    Json(json!({ "status": "disconnected" }))
+    let mut seen = f.seen.lock().unwrap();
+    if seen.revoked {
+        // fluree.ai's answer for a deployment that is already disconnected.
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "Deployment is already disconnected", "status": 400, "error": "invalid_state" } })),
+        )
+            .into_response();
+    }
+    seen.disconnects.push(auth);
+    Json(json!({ "status": "disconnected" })).into_response()
 }
 
 async fn start_fake() -> Fake {
@@ -297,4 +324,25 @@ async fn a_refresh_renews_an_expired_access_token() {
         stored.account.as_ref().and_then(|a| a.email.as_deref()),
         Some("owner@acme.test")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_after_the_server_already_signed_the_machine_out() {
+    let fake = start_fake().await;
+    let home = tempfile::tempdir().unwrap();
+    fluree(home.path(), &["login", "--url", &fake.base, "--no-browser"])
+        .await
+        .success();
+
+    // Disconnected from the dashboard in the meantime.
+    fake.seen.lock().unwrap().revoked = true;
+
+    fluree(home.path(), &["logout"])
+        .await
+        .success()
+        .stdout(predicate::str::contains(
+            "the server had already signed this machine out",
+        ))
+        .stderr(predicate::str::contains("did not confirm").not());
+    assert!(!home.path().join("account.toml").exists());
 }

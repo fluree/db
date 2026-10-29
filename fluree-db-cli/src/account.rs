@@ -24,6 +24,16 @@ pub const DEFAULT_ACCOUNT_URL: &str = "https://fluree.ai";
 /// Refresh when less than this much of the access token is left.
 const REFRESH_MARGIN_SECS: i64 = 60;
 
+/// How a refresh refused with `invalid_grant` begins: the server revoked
+/// this machine's sign-in (logout, or disconnected from the dashboard).
+const SIGN_IN_REVOKED: &str = "your sign-in is no longer valid";
+
+/// Whether `err` (from [`refresh`]) means the server revoked the sign-in,
+/// as opposed to a network or server failure.
+pub fn is_revoked(err: &CliError) -> bool {
+    matches!(err, CliError::Remote(msg) if msg.starts_with(SIGN_IN_REVOKED))
+}
+
 /// What `fluree login` stores.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredAccount {
@@ -204,9 +214,14 @@ pub async fn refresh(http: &reqwest::Client, account: &mut StoredAccount) -> Cli
             .or_else(|| body.get("error"))
             .and_then(|v| v.as_str())
             .unwrap_or("refresh rejected");
+        if body.get("error").and_then(|v| v.as_str()) == Some("invalid_grant") {
+            return Err(CliError::Remote(format!(
+                "{SIGN_IN_REVOKED} ({desc})\n  hint: fluree login{}",
+                login_url_flag(&account.url)
+            )));
+        }
         return Err(CliError::Remote(format!(
-            "your sign-in is no longer valid ({desc})\n  hint: fluree login{}",
-            login_url_flag(&account.url)
+            "token refresh failed ({status}): {desc}"
         )));
     }
     let access_token = body

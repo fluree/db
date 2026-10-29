@@ -5,6 +5,10 @@
 //! directly to build alternative interfaces (web UI, TUI, etc.) on top
 //! of the same command logic.
 
+/// `User-Agent` for the CLI's own HTTP calls. Some fronts (the AWS WAF
+/// common rule set among them) refuse requests that carry none.
+pub const USER_AGENT: &str = concat!("fluree/", env!("CARGO_PKG_VERSION"));
+
 pub mod account;
 pub mod cli;
 pub mod commands;

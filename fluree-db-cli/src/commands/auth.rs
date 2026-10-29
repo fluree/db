@@ -434,6 +434,7 @@ async fn run_oidc_login(config: &mut fluree_db_nameservice_sync::RemoteConfig) -
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .user_agent(crate::USER_AGENT)
         .build()
         .map_err(|e| CliError::Remote(format!("failed to build HTTP client: {e}")))?;
 
