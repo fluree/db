@@ -81,9 +81,15 @@ pub struct Opened {
 }
 
 impl Opened {
-    pub async fn open(source: &Source, dirs: &FlureeDir) -> CliResult<Self> {
+    /// `dirs` is the project a ledger source lives in; a file needs none.
+    pub async fn open(source: &Source, dirs: Option<&FlureeDir>) -> CliResult<Self> {
         match &source.kind {
             SourceKind::Ledger(alias) => {
+                let Some(dirs) = dirs else {
+                    return Err(CliError::Config(format!(
+                        "{alias}: a ledger source needs a project (fluree init), or name a .ttl, .nt, .jsonld or .json file"
+                    )));
+                };
                 let fluree = context::build_fluree(dirs).await?;
                 let ledger_id = context::to_ledger_id(alias)?;
                 let graph_source = if fluree.ledger_exists(&ledger_id).await? {
@@ -165,7 +171,7 @@ async fn is_graph_source(fluree: &Fluree, id: &str) -> CliResult<bool> {
 }
 
 pub async fn load_model(source: &Source, dirs: &FlureeDir) -> CliResult<Model> {
-    let opened = Opened::open(source, dirs).await?;
+    let opened = Opened::open(source, Some(dirs)).await?;
     let mut builder = ModelBuilder::default();
     for query in Model::class_queries() {
         builder.add_class_rows(&opened.rows(&query).await?);
@@ -229,7 +235,7 @@ pub async fn load_gazetteer(
     let mut counts = Vec::new();
     for source in sources {
         check_class_scope(source)?;
-        let opened = Opened::open(source, dirs).await?;
+        let opened = Opened::open(source, Some(dirs)).await?;
         let mut n = 0;
         for (query, predicate) in Gazetteer::queries(source.class.as_deref()) {
             let rows = opened.rows(&query).await?;
@@ -271,7 +277,10 @@ pub async fn load_gazetteer(
 
 /// An ontology as RDF, for a reader that is sent the ontology itself: a
 /// file read as it is, or a ledger's default graph.
-pub async fn load_rdf(source: &Source, dirs: &FlureeDir) -> CliResult<fluree_graph_ir::Graph> {
+pub async fn load_rdf(
+    source: &Source,
+    dirs: Option<&FlureeDir>,
+) -> CliResult<fluree_graph_ir::Graph> {
     use fluree_db_doc::reader::request::{parse_jsonld, parse_turtle};
     let label = source.label();
     let graph = match &source.kind {
@@ -338,7 +347,10 @@ pub struct LoadedCatalog {
 
 /// The catalog a reader is sent: each source's records, scoped to its
 /// `#Class` when it has one.
-pub async fn load_catalog(sources: &[Source], dirs: &FlureeDir) -> CliResult<LoadedCatalog> {
+pub async fn load_catalog(
+    sources: &[Source],
+    dirs: Option<&FlureeDir>,
+) -> CliResult<LoadedCatalog> {
     use fluree_graph_ir::Term;
     let mut graph = fluree_graph_ir::Graph::new();
     let mut counts = Vec::new();

@@ -52,7 +52,7 @@ pub async fn setup(
     catalog: &[String],
     cache_flag: Option<&str>,
     doc_cache: Option<DocCache>,
-    dirs: &FlureeDir,
+    dirs: Option<&FlureeDir>,
 ) -> CliResult<ReaderSetup> {
     let Some(spec) = ontology else {
         return Err(CliError::Usage(format!(

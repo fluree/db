@@ -7011,7 +7011,9 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
         .stderr(predicate::str::contains(
             "catalog    ont/entities.ttl: 1 record(s)",
         ))
-        .stdout(predicate::str::contains("1 mention(s) of 0 entities (0 new)"))
+        .stdout(predicate::str::contains(
+            "1 mention(s) of 0 entities (0 new)",
+        ))
         .stdout(predicate::str::contains("1 relation(s), 1,032 tokens"))
         .stdout(predicate::str::contains("reading: 1 call(s), 1,032 tokens"))
         .stdout(predicate::str::contains(
@@ -7115,5 +7117,92 @@ fn doc_ingest_model_without_a_reader_or_llm_says_what_is_missing() {
         .failure()
         .stderr(predicate::str::contains(
             "--cache is for a model a [doc.reader] serves",
+        ));
+}
+
+/// `doc read` needs no project: the reader comes from the environment, the
+/// reading goes to stdout and what it was billed to stderr.
+#[test]
+fn doc_read_prints_one_files_reading_without_a_project() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    // A global directory, with no project: it holds the reading cache.
+    std::fs::create_dir_all(tmp.path().join("home")).unwrap();
+    let read = |extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", tmp.path().join("home"))
+            .env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--catalog", "ont/entities.ttl", "--model", "stub-reader"])
+            .args(extra);
+        cmd
+    };
+
+    let out = read(&[]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("read memo.md with stub-reader via http://"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("1 mention(s), 0 entities, 1 relation(s); 1 call(s), 1,032 tokens"),
+        "{stderr}"
+    );
+    let reading: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let nodes = reading["@graph"].as_array().unwrap();
+    assert!(nodes
+        .iter()
+        .any(|n| n["@type"][0] == "https://ns.flur.ee/doc#Mention"));
+    assert!(nodes
+        .iter()
+        .all(|n| n["https://ns.flur.ee/doc#sourceDocument"][0]["@id"] == "urn:fluree:doc:memo.md"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // The same request again is answered from the cache.
+    read(&["--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "@prefix doc: <https://ns.flur.ee/doc#>",
+        ))
+        .stderr(predicate::str::contains("(1 from cache)"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    read(&["--format", "trig", "--no-cache"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<urn:fluree:doc:memo.md/reading> {",
+        ))
+        .stdout(predicate::str::contains("<urn:fluree:doc:memo.md> {"));
+}
+
+#[test]
+fn doc_read_names_what_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let cmd = |args: &[&str]| {
+        let mut c = fluree_cmd(&tmp);
+        c.env("FLUREE_HOME", tmp.path().join("home"))
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(args);
+        c
+    };
+    cmd(&[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("name the extraction model"));
+    cmd(&["--model", "nobody"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model nobody: no [doc.reader] lists it",
         ));
 }

@@ -25,6 +25,7 @@ Everything runs in-process against local storage: the ledger written is always a
 | `ingest` | Parse documents into a ledger and build the indexes over them |
 | `search` | Search a ledger's chunks by meaning (vector) or by words (full-text) |
 | `parse` | Parse one document and print its DoCO graph, without writing to a ledger |
+| `read` | Read one document with an extraction model and print the reading, without writing to a ledger |
 
 ## fluree doc ingest
 
@@ -196,6 +197,40 @@ fluree doc parse memo.docx --doc-iri https://example.org/doc/memo -o memo.jsonld
 ```
 
 The output is the engine's own JSON-LD, insertable as it is: `fluree insert docs -f memo.jsonld` writes the structure graph alone, without chunks, embeddings or a document node.
+
+## fluree doc read
+
+Parses one file as `parse` does, reads it with the [HTTP reader](#an-http-reader) that serves `--model`, and prints the reading: mentions linked to catalog records, entities, and claims, each anchored to the text's offsets, in the same shape `ingest` would commit. No ledger is written or needed. The reader comes from the project's `[doc.reader]` when there is a project, else the global config's, else `FLUREE_DOC_READER_*`; files as ontology and catalog need no project, a ledger does.
+
+### Usage
+
+```bash
+fluree doc read <FILE> --ontology <FILE|LEDGER> [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--ontology <FILE\|LEDGER>` | Ontology to read against. Required. |
+| `--entities <FILE\|LEDGER[#CLASS]>` (alias `--catalog`) | Known entities to link mentions to: a file, a ledger, or a graph source mapped over a table. Repeatable; `#Class` scopes to one type. |
+| `--model <ID>` | The extraction model, one a `[doc.reader]` lists in `models`. Default: `doc.model`. |
+| `--cache <ontology\|catalog>` | What the reader may keep for the next request that shares it. Config: `doc.reader.cache`. |
+| `--format <FORMAT>` | `jsonld` (default): the reading. `turtle`: the reading as Turtle. `trig`: the structure graph in `<doc>` and the reading in `<doc>/reading`. |
+| `-o, --output <FILE>` | Write to this file instead of stdout. |
+| `--base-iri <IRI>`, `--doc-iri <IRI>` | The document IRI, as for `parse`. |
+| `--no-escalate`, `--max-crops <N>` | Vision-model escalation during the parse, as for `parse`. |
+| `--no-cache` | Neither read nor write the parse and reading caches. |
+
+The reading goes to stdout. Stderr says what was read with which model, then the counts, the calls made (and how many the cache answered), what the reader billed, and what it set aside or adapted in the ontology.
+
+### Examples
+
+```bash
+fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small > invoice.jsonld
+fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
+fluree doc read call.vtt --ontology onto.ttl --format trig -o call.trig
+```
 
 ## Configuration
 

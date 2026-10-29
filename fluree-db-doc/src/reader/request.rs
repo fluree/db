@@ -269,6 +269,11 @@ impl Structure {
         candidates.into_iter().rev().find(|&c| !splits(c))
     }
 
+    /// The structure graph as the parser wrote it.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     /// The innermost element holding characters `[begin, end)` of the
     /// document's text, for a mention's `doc:sourceElement`.
     pub fn element_at(&self, begin: usize, end: usize) -> Option<&str> {

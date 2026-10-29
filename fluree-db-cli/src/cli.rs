@@ -4021,6 +4021,24 @@ pub enum DocAction {
     #[command(verbatim_doc_comment)]
     Parse(DocParseArgs),
 
+    /// Read one document with an extraction model and print the reading,
+    /// without writing to a ledger
+    ///
+    /// Parses the file as `fluree doc parse` does, sends its text and
+    /// structure with the ontology and catalog to the HTTP reader that
+    /// serves `--model` (`[doc.reader]`), and prints what it read: mentions
+    /// linked to catalog records, entities, and claims, each anchored to the
+    /// text's offsets. Needs no project; where there is one (or a global
+    /// config), its `[doc]` settings and caches are used. What the read was
+    /// billed goes to stderr.
+    ///
+    /// Examples:
+    ///   fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small
+    ///   fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
+    ///   fluree doc read call.vtt --ontology onto.ttl -o call.trig --format trig
+    #[command(verbatim_doc_comment)]
+    Read(DocReadArgs),
+
     /// Search a ledger's chunks by meaning (vector) or by words (full-text)
     ///
     /// Examples:
@@ -4187,6 +4205,70 @@ pub struct DocParseArgs {
     /// Neither read nor write the parse and reading caches
     #[arg(long)]
     pub no_cache: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DocReadArgs {
+    /// The document to read
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Ontology to read against: a `.ttl` / `.nt` / `.jsonld` / `.json`
+    /// file, or a ledger in the project
+    #[arg(long, value_name = "FILE|LEDGER")]
+    pub ontology: String,
+
+    /// Known entities, a catalog, to link mentions to: a file, a ledger,
+    /// or a graph source mapped over a table, optionally scoped to one
+    /// class with `#Class`. Repeatable
+    #[arg(long, visible_alias = "catalog", value_name = "FILE|LEDGER[#CLASS]", action = clap::ArgAction::Append)]
+    pub entities: Vec<String>,
+
+    /// The extraction model, one a `[doc.reader]` serves. Default: `doc.model`
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+
+    /// What the reader may keep for the next request sharing it: `ontology`,
+    /// or `catalog`. Config: `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog")]
+    pub cache: Option<String>,
+
+    /// `jsonld` prints the reading; `turtle` the same as Turtle; `trig` the
+    /// structure graph and the reading, each in a named graph
+    #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
+    pub format: DocReadFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// IRI prefix the file name is appended to, forming the document IRI,
+    /// as `doc ingest` does
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// The document IRI in full, in place of `--base-iri` and the file name
+    #[arg(long, value_name = "IRI", conflicts_with = "base_iri")]
+    pub doc_iri: Option<String>,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Most crops the document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocReadFormat {
+    Jsonld,
+    Turtle,
+    Trig,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

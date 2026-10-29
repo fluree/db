@@ -10,11 +10,12 @@
 //! and joins each hit back to the chunk's text, section path and source
 //! document, so a result is a citation and not just a score.
 //!
-//! `parse` prints the structure graph `ingest` would write for one file.
+//! `parse` prints the structure graph `ingest` would write for one file, and
+//! `read` what an HTTP reader reads in it.
 
 use crate::cli::{
-    DocAction, DocIngestArgs, DocParseArgs, DocParseFormat, DocRelationMode, DocSearchArgs,
-    DocSearchMode,
+    DocAction, DocIngestArgs, DocParseArgs, DocParseFormat, DocReadArgs, DocReadFormat,
+    DocRelationMode, DocSearchArgs, DocSearchMode,
 };
 use crate::commands::doc_reader::{self, ReaderSetup};
 use crate::commands::doc_sources::{self, Source};
@@ -40,6 +41,7 @@ pub async fn run(action: DocAction, dirs: &FlureeDir) -> CliResult<()> {
         DocAction::Ingest(args) => run_ingest(args, dirs).await,
         DocAction::Search(args) => run_search(args, dirs).await,
         DocAction::Parse(args) => run_parse(args, Some(dirs)).await,
+        DocAction::Read(args) => run_read(args, Some(dirs)).await,
     }
 }
 
@@ -251,7 +253,7 @@ async fn setup_extraction(
             &args.entities,
             args.cache.as_deref(),
             cache,
-            dirs,
+            Some(dirs),
         )
         .await?;
         return Ok(Some(Extraction {
@@ -1371,6 +1373,157 @@ pub async fn run_parse(args: DocParseArgs, dirs: Option<&FlureeDir>) -> CliResul
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             // A reader that stopped early (`| head`) is not an error.
+            match stdout
+                .write_all(out.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                r => r?,
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// read
+// ---------------------------------------------------------------------------
+
+/// One file read by an HTTP reader, its reading to stdout. Writes no ledger,
+/// so it needs no project: `dirs` supplies `[doc]` config, the caches, and
+/// the ledgers an ontology or catalog may name.
+pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<()> {
+    let path = &args.file;
+    if !path.is_file() {
+        return Err(CliError::Input(format!("{}: no such file", path.display())));
+    }
+    if fluree_db_doc::SourceKind::from_path(path).is_none() {
+        return Err(CliError::Usage(format!(
+            "{}: not a document `fluree doc` reads ({})",
+            path.display(),
+            fluree_db_doc::parse::SUPPORTED_EXTENSIONS
+        )));
+    }
+    let config = match dirs {
+        Some(dirs) => resolve_config(dirs).await?,
+        None => DocConfig::default().with_env(),
+    };
+    let Some(model) = args.model.clone().or_else(|| config.model.clone()) else {
+        return Err(CliError::Usage(
+            "name the extraction model: --model <ID> (one a [doc.reader] lists in `models`), or set doc.model".into(),
+        ));
+    };
+    let Some(endpoint) = config.reader.as_ref().filter(|r| r.serves(&model)) else {
+        return Err(CliError::Config(format!(
+            "--model {model}: no [doc.reader] lists it in `models` (fluree config set doc.reader.url …)"
+        )));
+    };
+    // Sources that are files need no project; a ledger does.
+    let cache = dirs
+        .filter(|_| !args.no_cache)
+        .map(|d| DocCache::new(cache_root(d)));
+    let setup = doc_reader::setup(
+        &model,
+        endpoint,
+        Some(&args.ontology),
+        &args.entities,
+        args.cache.as_deref(),
+        cache.clone(),
+        dirs,
+    )
+    .await?;
+    let vlm = match (args.no_escalate, config.crop_reader()) {
+        (false, Some(endpoint)) => Some(Arc::new(VlmReader::new(
+            endpoint.clone(),
+            cache.clone(),
+            args.max_crops,
+        )?)),
+        _ => None,
+    };
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let doc_iri = args
+        .doc_iri
+        .clone()
+        .unwrap_or_else(|| fluree_db_doc::ingest::document_iri(&args.base_iri, &file_name));
+    eprintln!(
+        "{} read {file_name} with {model} via {}",
+        "→".dimmed(),
+        setup.client.url()
+    );
+
+    let (p, iri) = (path.clone(), doc_iri.clone());
+    let format = args.format;
+    let (read, structure) = tokio::task::spawn_blocking(move || -> CliResult<_> {
+        let (meta, parsed) =
+            fluree_db_doc::parse_file(&p, &file_name, &iri, cache.as_ref(), vlm.as_ref())?;
+        let doc = fluree_db_doc::PreparedDocument {
+            meta,
+            doc_iri: iri,
+            parsed,
+            chunks: Vec::new(),
+        };
+        for note in &doc.parsed.notes {
+            eprintln!("{} {note}", "!".yellow());
+        }
+        let read = doc_reader::read_document(&setup, &doc, None)?;
+        let structure = match format {
+            DocReadFormat::Trig => Some(
+                fluree_db_doc::reader::request::parse_jsonld(&doc.parsed.doco)
+                    .map_err(|e| CliError::Input(format!("structure graph: {e}")))?,
+            ),
+            _ => None,
+        };
+        Ok((read, structure))
+    })
+    .await
+    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))??;
+
+    let mut out = match (format, &structure) {
+        (DocReadFormat::Jsonld, _) => serde_json::to_string_pretty(&json!({
+            "@context": vocab::context(),
+            "@graph": read.nodes,
+        }))?,
+        (DocReadFormat::Turtle, _) => fluree_db_doc::reader::reading::turtle(&read.nodes)?,
+        (DocReadFormat::Trig, Some(structure)) => {
+            fluree_db_doc::reader::reading::trig(&doc_iri, structure, &read.nodes)?
+        }
+        (DocReadFormat::Trig, None) => unreachable!("the structure graph is kept for trig"),
+    };
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+
+    let usage = doc_reader::usage_note(&read.usage);
+    eprintln!(
+        "{} {} mention(s), {} entit{}, {} relation(s); {} call(s){}{}",
+        "✓".green(),
+        read.mentions,
+        read.entities,
+        if read.entities == 1 { "y" } else { "ies" },
+        read.relations,
+        read.calls,
+        if read.cached > 0 {
+            format!(" ({} from cache)", read.cached)
+        } else {
+            String::new()
+        },
+        if usage.is_empty() {
+            String::new()
+        } else {
+            format!(", {usage}")
+        }
+    );
+    for note in &read.ontology_notes {
+        eprintln!("  {} ontology {note}", "·".dimmed());
+    }
+    match &args.output {
+        Some(target) => std::fs::write(target, out)?,
+        None => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
             match stdout
                 .write_all(out.as_bytes())
                 .and_then(|()| stdout.flush())
