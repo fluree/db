@@ -1,0 +1,22 @@
+[package]
+name = "fluree-db-ontology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ontology and catalog tools for document extraction: check what an extraction model reads, slice and convert vocabularies"
+
+[dependencies]
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
+fluree-graph-format = { path = "../fluree-graph-format" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+
+[lints]
+workspace = true
