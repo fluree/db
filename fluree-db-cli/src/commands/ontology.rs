@@ -11,7 +11,7 @@
 
 use crate::cli::{
     CatalogAction, CatalogFromArgs, OntologyAction, OntologyCheckArgs, OntologyFromArgs,
-    OntologyInputFormat, OntologyOutputFormat,
+    OntologyFromFormat, OntologyInputFormat, OntologyOutputFormat,
 };
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
@@ -304,11 +304,19 @@ enum Source {
     Csv,
     Workbook,
     Sql,
+    Snowflake,
+    Genie,
 }
 
-fn source(path: &Path, flag: Option<OntologyInputFormat>) -> Source {
-    if flag.is_some() {
-        return Source::Rdf;
+fn source(path: &Path, flag: Option<OntologyFromFormat>) -> Source {
+    match flag {
+        Some(OntologyFromFormat::Turtle | OntologyFromFormat::Jsonld) => return Source::Rdf,
+        Some(OntologyFromFormat::Csv) => return Source::Csv,
+        Some(OntologyFromFormat::Xlsx) => return Source::Workbook,
+        Some(OntologyFromFormat::Sql) => return Source::Sql,
+        Some(OntologyFromFormat::Snowflake) => return Source::Snowflake,
+        Some(OntologyFromFormat::Genie) => return Source::Genie,
+        None => {}
     }
     let ext = path
         .extension()
@@ -318,6 +326,15 @@ fn source(path: &Path, flag: Option<OntologyInputFormat>) -> Source {
         Some("csv" | "tsv") => Source::Csv,
         Some("xlsx" | "xlsm") => Source::Workbook,
         Some("sql" | "ddl") => Source::Sql,
+        Some("yaml" | "yml") => Source::Snowflake,
+        // a Genie export is JSON too; anything else JSON is JSON-LD
+        Some("json") => match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        {
+            Some(v) if convert::semantic::is_genie(&v) => Source::Genie,
+            _ => Source::Rdf,
+        },
         _ => Source::Rdf,
     }
 }
@@ -334,9 +351,15 @@ fn default_base(path: &Path) -> String {
     format!("https://example.com/{}/", convert::slug(&file_stem(path)))
 }
 
-/// A prefix for the minted namespace: the file name's letters, else `ex`.
-fn base_prefix(path: &Path) -> String {
-    let letters: String = file_stem(path)
+/// A prefix for the minted namespace: its last path segment's letters
+/// (`shop` for `https://example.com/shop/`), else `ex`.
+fn base_prefix(base: &str) -> String {
+    let segment = base
+        .trim_end_matches(['/', '#'])
+        .rsplit(['/', '#', ':'])
+        .next()
+        .unwrap_or_default();
+    let letters: String = segment
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect::<String>()
@@ -411,10 +434,36 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
             }
             model
         }
+        Source::Snowflake => {
+            let text = read_text(&args.file)?;
+            if text.lines().any(|l| l.starts_with("semantic_models:")) {
+                return Err(CliError::Input(format!(
+                    "{}: dbt semantic models aren't read yet (a Snowflake semantic view is)",
+                    args.file.display()
+                )));
+            }
+            convert::semantic::from_snowflake(&text)
+                .map_err(|e| CliError::Input(format!("{}: {e}", args.file.display())))?
+        }
+        Source::Genie => {
+            let json = |path: &Path| -> CliResult<serde_json::Value> {
+                serde_json::from_str(&read_text(path)?)
+                    .map_err(|e| CliError::Input(format!("{}: invalid JSON: {e}", path.display())))
+            };
+            let export = json(&args.file)?;
+            let comments = args.comments.as_deref().map(json).transpose()?;
+            if comments.is_none() {
+                notes.push(
+                    "a Genie export has no descriptions; pass Unity Catalog's comments with --comments".into(),
+                );
+            }
+            convert::semantic::from_genie(&export, comments.as_ref())
+                .map_err(|e| CliError::Input(format!("{}: {e}", args.file.display())))?
+        }
         _ => tabular::model(&read_sheets(&args.file)?, args.enum_max),
     };
     let out = convert::emit(&model, &EmitOptions { base: base.clone() });
-    let declared = vec![(base_prefix(&args.file), base.clone())];
+    let declared = vec![(base_prefix(&base), base.clone())];
     let format = output_format(args.format);
     match &args.catalog_out {
         Some(path) => {
@@ -487,7 +536,12 @@ fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
     if kind != Source::Rdf {
         return run_from_tables(args, kind);
     }
-    let (parsed, _) = parse_file(&args.file, args.input_format)?;
+    let rdf_format = match args.input_format {
+        Some(OntologyFromFormat::Turtle) => Some(OntologyInputFormat::Turtle),
+        Some(OntologyFromFormat::Jsonld) => Some(OntologyInputFormat::Jsonld),
+        _ => None,
+    };
+    let (parsed, _) = parse_file(&args.file, rdf_format)?;
     let out = write::rewrite(&parsed, &args.seed, args.depth)
         .map_err(|e| CliError::Usage(e.to_string()))?;
     let prefixes = write::used_prefixes(&out.quads, &parsed.prefixes);
@@ -589,7 +643,7 @@ fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
         base: base.clone(),
     };
     let out = catalog::from_sheet(sheet, &options).map_err(|e| CliError::Usage(e.to_string()))?;
-    declared.push((base_prefix(&args.file), base.clone()));
+    declared.push((base_prefix(&base), base.clone()));
     emit(
         &out.quads,
         &write::used_prefixes(&out.quads, &declared),

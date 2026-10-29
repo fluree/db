@@ -224,14 +224,14 @@ fn trig_and_unknown_formats_are_refused_plainly() {
         "request.trig",
         "<urn:g> { <urn:a> <urn:b> <urn:c> . }",
     );
-    write(&tmp, "view.yaml", "tables: []");
+    write(&tmp, "model.toml", "[tables]");
     fluree_cmd(&tmp)
         .args(["ontology", "check", "request.trig"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("TriG isn't read yet"));
     fluree_cmd(&tmp)
-        .args(["ontology", "from", "view.yaml"])
+        .args(["ontology", "from", "model.toml"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("not an RDF file"));
@@ -413,4 +413,139 @@ fn catalog_from_rows() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("no column \"title\""));
+}
+
+/// A Snowflake semantic view as a data team writes one for Cortex Analyst.
+const SEMANTIC_VIEW: &str = r"
+name: bike_shop
+description: Sales for a chain of bike shops.
+tables:
+  - name: CUSTOMERS
+    synonyms: [riders, clients]
+    description: People and clubs who buy from the shops.
+    primary_key: {columns: [CUSTOMER_ID]}
+    dimensions:
+      - name: CUSTOMER_ID
+        data_type: TEXT
+      - name: FULL_NAME
+        description: The customer's name.
+        data_type: VARCHAR(200)
+      - name: SEGMENT
+        description: Kind of customer.
+        data_type: TEXT
+        sample_values: [Commuter, Racer, Club]
+        is_enum: true
+  - name: ORDERS
+    description: Sales, one row per order.
+    primary_key: {columns: [ORDER_ID]}
+    dimensions:
+      - name: ORDER_ID
+        data_type: NUMBER(38,0)
+      - name: CUSTOMER_ID
+        data_type: TEXT
+    facts:
+      - name: TOTAL
+        description: Order total in pounds.
+        data_type: NUMBER(10,2)
+relationships:
+  - name: orders_to_customers
+    left_table: ORDERS
+    right_table: CUSTOMERS
+    relationship_columns: [{left_column: CUSTOMER_ID, right_column: CUSTOMER_ID}]
+metrics:
+  - name: REVENUE
+    expr: SUM(ORDERS.TOTAL)
+verified_queries:
+  - name: top riders
+    sql: SELECT 1
+";
+
+#[test]
+fn from_a_snowflake_semantic_view() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp, "shop.yaml", SEMANTIC_VIEW);
+    fluree_cmd(&tmp)
+        .args(["ontology", "from", "shop.yaml", "--base", "https://example.com/shop/", "-o", "shop.ttl"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "3 classes, 4 properties; 1 enumerated column made a class, with 3 catalog records; 2 primary key columns left out",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("shop.ttl")).unwrap();
+    assert!(
+        ttl.contains("rdfs:comment \"People and clubs who buy from the shops. Also called: riders, clients.\""),
+        "{ttl}"
+    );
+    // the relationship is a relation labelled for its column
+    assert!(ttl.contains("shop:customer a rdf:Property"), "{ttl}");
+    assert!(ttl.contains("rdfs:range shop:Customer"), "{ttl}");
+    assert!(
+        !ttl.contains("REVENUE") && !ttl.contains("revenue"),
+        "metrics are left out: {ttl}"
+    );
+    let (report, code) = check_json(&tmp, &["shop.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+
+    write(&tmp, "dbt.yml", "semantic_models:\n  - name: orders\n");
+    fluree_cmd(&tmp)
+        .args(["ontology", "from", "dbt.yml"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "dbt semantic models aren't read yet",
+        ));
+}
+
+#[test]
+fn from_a_genie_export_with_comments() {
+    let tmp = TempDir::new().unwrap();
+    let space = serde_json::json!({
+        "data_sources": {"tables": [
+            {"identifier": "main.shop.customers",
+             "column_configs": [{"column_name": "id"}, {"column_name": "full_name"}]},
+            {"identifier": "main.shop.orders",
+             "column_configs": [{"column_name": "order_id"}, {"column_name": "customer_ref"}]}
+        ]},
+        "instructions": {"join_specs": [{
+            "left": {"identifier": "main.shop.orders", "alias": "o"},
+            "right": {"identifier": "main.shop.customers", "alias": "c"},
+            "sql": ["`o`.`customer_ref` = `c`.`id`"]
+        }]}
+    });
+    write(
+        &tmp,
+        "space.json",
+        &serde_json::json!({"serialized_space": space.to_string()}).to_string(),
+    );
+    write(
+        &tmp,
+        "comments.json",
+        r#"{"customers": {"": "People who buy from the shops.", "full_name": "Their name."}}"#,
+    );
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "space.json",
+            "--comments",
+            "comments.json",
+            "--base",
+            "https://example.com/shop/",
+            "-o",
+            "shop.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("2 classes, 2 properties"));
+    let ttl = std::fs::read_to_string(tmp.path().join("shop.ttl")).unwrap();
+    assert!(
+        ttl.contains("rdfs:comment \"People who buy from the shops.\""),
+        "{ttl}"
+    );
+    assert!(
+        ttl.contains("shop:customerRef a rdf:Property")
+            || ttl.contains("shop:customer a rdf:Property"),
+        "{ttl}"
+    );
+    assert!(ttl.contains("rdfs:range shop:Customer"), "{ttl}");
 }

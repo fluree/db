@@ -92,10 +92,10 @@ A-100,Daxin Scientific Supply Co.,Daxin; DSS,Lab supplies,Taipei
 
 it writes
 
-(with `crm:` declared in `ontology.ttl`, and `accounts:` named for the file)
+(with `crm:` declared in `ontology.ttl`; `account:` is named for the `--base` namespace)
 
 ```turtle
-accounts:a-100 a crm:Organization ;
+account:a-100 a crm:Organization ;
     skos:altLabel "DSS", "Daxin" ;
     skos:definition "industry: Lab supplies; city: Taipei" ;
     skos:hiddenLabel "A-100" ;

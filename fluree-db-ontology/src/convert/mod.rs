@@ -1,5 +1,6 @@
 //! Ontologies from what people already have: table and column names, a CSV
-//! header, a workbook, SQL DDL.
+//! header, a workbook, SQL DDL, a warehouse's semantic layer (a Snowflake
+//! semantic view, a Databricks Genie space).
 //!
 //! Every source is read into one [`Model`] of tables and columns, and one
 //! emitter turns that into an ontology, so the rules are the same whatever
@@ -19,6 +20,7 @@
 //! - primary keys, metrics, filters and SQL are left out: they describe
 //!   tables, not things.
 
+pub mod semantic;
 pub mod sql;
 pub mod tabular;
 
@@ -91,13 +93,23 @@ pub fn class_label(name: &str) -> String {
 }
 
 /// A column's property label: its name in words, without a key suffix
-/// (`employer_id` → "employer"). `None` when nothing is left.
+/// (`employer_id` → "employer"). `None` when nothing is left, or when a
+/// foreign key is named for a code or number (`hire_code`): the relation
+/// then takes the referenced class's label.
 pub fn property_label(name: &str, foreign_key: bool) -> Option<String> {
     let words = name_words(name)?;
     if !foreign_key {
         return Some(words);
     }
-    let trimmed = ["id", "key", "fk", "code", "ref", "no", "num"]
+    // `hire code` is the product's code, not a role: a key named for a code
+    // or number has no label of its own, and takes its target's
+    if ["code", "no", "num", "number"]
+        .iter()
+        .any(|suffix| words.ends_with(&format!(" {suffix}")) || words == *suffix)
+    {
+        return None;
+    }
+    let trimmed = ["id", "key", "fk", "ref"]
         .iter()
         .find_map(|suffix| words.strip_suffix(&format!(" {suffix}")))
         .unwrap_or(&words);
@@ -207,16 +219,68 @@ pub fn comment(description: Option<&str>, synonyms: &[String]) -> Option<String>
     (!text.is_empty()).then_some(text)
 }
 
-/// A property's label, comment, domains and range, merged across tables.
-type PropertyParts = (String, Option<String>, Vec<String>, Option<String>);
+/// "a" or "an", by the word's first letter.
+fn article(word: &str) -> &'static str {
+    if word.starts_with(['a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U']) {
+        "an"
+    } else {
+        "a"
+    }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut c = word.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
+/// A property, merged across the tables that share it.
+struct PropertyParts {
+    label: String,
+    comment: Option<String>,
+    domains: Vec<String>,
+    /// The domains' class labels, for a description written for them all.
+    domain_labels: Vec<String>,
+    range: Option<String>,
+    /// For a relation with no description of its own: the class it points
+    /// at, so one can be written once every table using it is known.
+    target_label: Option<String>,
+}
+
+impl PropertyParts {
+    /// The description: the source's, else one written for a relation.
+    fn description(&self) -> Option<String> {
+        if self.comment.is_some() {
+            return self.comment.clone();
+        }
+        let target = self.target_label.as_deref()?;
+        let tables = match self.domain_labels.as_slice() {
+            [] => return None,
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+        };
+        let (of, to) = (article(&tables), article(target));
+        Some(if self.label == target {
+            format!("The {target} of {of} {tables}.")
+        } else if self.domain_labels.len() == 1 {
+            format!(
+                "{} {tables}'s {}: {to} {target}.",
+                capitalized(of),
+                self.label
+            )
+        } else {
+            format!("The {} of {of} {tables}: {to} {target}.", self.label)
+        })
+    }
+}
 
 struct Emitter<'a> {
     base: &'a str,
     out: Converted,
     /// IRIs already minted, by local name, so two terms never share one.
     used: HashMap<String, String>,
-    /// Properties by IRI: (label, comment, domains, range), merged across
-    /// tables that share a column.
+    /// Properties by IRI, merged across tables that share a column.
     properties: BTreeMap<String, PropertyParts>,
 }
 
@@ -249,24 +313,31 @@ impl Emitter<'_> {
         self.out.classes += 1;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn property(
         &mut self,
         key: &str,
         label: &str,
         comment: Option<String>,
-        domain: &str,
+        (domain, domain_label): (&str, &str),
         range: Option<String>,
+        target_label: Option<&str>,
     ) {
         let iri = self.mint(&camel(label), key);
-        let entry = self
-            .properties
-            .entry(iri)
-            .or_insert_with(|| (label.to_string(), None, Vec::new(), range.clone()));
-        if entry.1.is_none() {
-            entry.1 = comment;
+        let entry = self.properties.entry(iri).or_insert_with(|| PropertyParts {
+            label: label.to_string(),
+            comment: None,
+            domains: Vec::new(),
+            domain_labels: Vec::new(),
+            range: range.clone(),
+            target_label: target_label.map(str::to_string),
+        });
+        if entry.comment.is_none() {
+            entry.comment = comment;
         }
-        if !entry.2.iter().any(|d| d == domain) {
-            entry.2.push(domain.to_string());
+        if !entry.domains.iter().any(|d| d == domain) {
+            entry.domains.push(domain.to_string());
+            entry.domain_labels.push(domain_label.to_string());
         }
     }
 }
@@ -309,20 +380,14 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
             if let Some((range, target_label)) = target {
                 let label =
                     property_label(&column.name, true).unwrap_or_else(|| target_label.clone());
-                let text =
-                    comment(column.description.as_deref(), &column.synonyms).unwrap_or_else(|| {
-                        if label == target_label {
-                            format!("The {target_label} of a {table_label}.")
-                        } else {
-                            format!("A {table_label}'s {label}: a {target_label}.")
-                        }
-                    });
+                let text = comment(column.description.as_deref(), &column.synonyms);
                 e.property(
                     &format!("fk:{label}:{range}"),
                     &label,
-                    Some(text),
-                    &domain,
+                    text,
+                    (&domain, &table_label),
                     Some(range),
+                    Some(&target_label),
                 );
             } else if !column.values.is_empty() {
                 let label =
@@ -355,12 +420,16 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                     &format!("enum-property:{key}"),
                     &label,
                     text,
-                    &domain,
+                    (&domain, &table_label),
                     Some(class_iri),
+                    None,
                 );
             } else {
                 let fk = column.references.is_some();
-                let Some(label) = property_label(&column.name, fk) else {
+                // a code-named key to a table the input doesn't have keeps its words
+                let Some(label) = property_label(&column.name, fk)
+                    .or_else(|| property_label(&column.name, false))
+                else {
                     continue;
                 };
                 let text = comment(column.description.as_deref(), &column.synonyms);
@@ -371,12 +440,19 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                     .filter(|_| !fk)
                     .map(|dt| format!("{XSD}{dt}"));
                 let key = format!("value:{label}:{}", range.as_deref().unwrap_or("-"));
-                e.property(&key, &label, text, &domain, range);
+                e.property(&key, &label, text, (&domain, &table_label), range, None);
             }
         }
     }
     let properties = std::mem::take(&mut e.properties);
-    for (iri, (label, text, domains, range)) in properties {
+    for (iri, parts) in properties {
+        let text = parts.description();
+        let PropertyParts {
+            label,
+            domains,
+            range,
+            ..
+        } = parts;
         e.triple(&iri, RDF_TYPE, Term::iri(RDF_PROPERTY));
         e.triple(&iri, RDFS_LABEL, Term::string(&label));
         if let Some(c) = text {

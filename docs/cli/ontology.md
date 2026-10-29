@@ -26,7 +26,9 @@ fluree ontology <COMMAND>
 Ontologies are read as Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-`
 reads stdin, and `--input-format turtle|jsonld` says which when the extension
 doesn't. TriG is not read yet: pass the ontology as Turtle, or a saved request
-as JSON-LD. `from` also reads tables: `.csv`/`.tsv`, `.xlsx` and `.sql`.
+as JSON-LD. `from` also reads tables (`.csv`/`.tsv`, `.xlsx`, `.sql`) and
+semantic layers (a Snowflake semantic view as `.yaml`, a Databricks Genie
+export as `.json`).
 
 For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
@@ -189,7 +191,7 @@ Finding codes: `no-ontology`, `no-class`, `no-label`, `catalog-blank-node`,
 ## fluree ontology from
 
 ```bash
-fluree ontology from <FILE> [--base <IRI>] [--enum-max <N>] [--catalog-out <FILE>] [--format turtle|jsonld] [-o <FILE>]
+fluree ontology from <FILE> [--base <IRI>] [--enum-max <N>] [--catalog-out <FILE>] [--comments <FILE>] [--format turtle|jsonld] [-o <FILE>]
 fluree ontology from <FILE.ttl|.jsonld> [--seed <CLASSES>] [--depth <N>] [--format turtle|jsonld] [-o <FILE>]
 ```
 
@@ -197,7 +199,7 @@ The ontology goes to stdout, or to the file `-o` names; a summary of what was
 made goes to stderr. Run `fluree ontology check` on the result to see what the
 extraction model will read of it.
 
-### From tables
+### From tables and semantic layers
 
 A CSV file (`.csv`, `.tsv`: one table, named for the file), a workbook
 (`.xlsx`: a table per sheet, the first row its header) or SQL DDL (`.sql`:
@@ -233,6 +235,27 @@ five rows). Column datatypes come from the DDL, or from the values (integers,
 decimals, ISO dates and date-times, booleans; a number with a leading zero is a
 code and stays text).
 
+A **Snowflake semantic view** (or Cortex Analyst semantic model) as YAML
+(`.yaml`, `.yml`) is a data dictionary, and converts the same way: tables'
+descriptions and synonyms are copied ("Also called: riders, clients."),
+dimensions, time dimensions and facts become properties typed from their
+`data_type`, a dimension with `is_enum: true` and `sample_values` is
+enumerated, and each relationship is a foreign key from its left column to the
+right table (`CUSTOMER_ID` in `orders_to_customers` becomes the relation
+"customer"). Metrics, filters and verified queries describe queries, not
+things, and are left out.
+
+A **Databricks Genie space** export (`.json`, the `serialized_space` its API
+returns) gives tables, columns and join specs, but no descriptions: those are
+Unity Catalog's table and column comments. Pass them with `--comments` as JSON,
+`{"table": {"": "table comment", "column": "column comment"}}` (one query on
+`information_schema` gives them). SQL snippets and instructions are left out.
+
+A foreign key named for a code or number (`HIRE_CODE` into `PRODUCTS`) takes
+its target's label ("product"), since the name says what it is, not what role
+it plays. A key used by several tables is one relation, described for them
+all ("The account of a contact, booking or quote.").
+
 The DDL is parsed with a generic SQL dialect, then PostgreSQL's, MySQL's and
 Snowflake's; statements none of them can parse are skipped and counted.
 
@@ -241,6 +264,8 @@ Snowflake's; statements none of them can parse are skipped and counted.
 | `--base <IRI>` | Namespace for minted IRIs (default: `https://example.com/<file name>/`) |
 | `--enum-max <N>` | Most distinct values an enumerated column may have, for CSV and workbooks (default: 12; 0 never enumerates) |
 | `--catalog-out <FILE>` | Write enumerated columns' records here instead of with the ontology |
+| `--comments <FILE>` | Unity Catalog comments for a Genie export (JSON) |
+| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake` or `genie`, when the extension doesn't say |
 | `--format <FORMAT>` | `turtle` (default) or `jsonld` |
 | `-o, --output <FILE>` | Write to this file instead of stdout |
 
@@ -248,6 +273,8 @@ Snowflake's; statements none of them can parse are skipped and counted.
 fluree ontology from schema.sql --base https://example.com/crm/ > ontology.ttl
 fluree ontology from accounts.csv -o ontology.ttl
 fluree ontology from crm.xlsx --catalog-out kinds.ttl -o ontology.ttl
+fluree ontology from sales_view.yaml --base https://example.com/sales/ > ontology.ttl
+fluree ontology from genie_space.json --comments uc_comments.json > ontology.ttl
 ```
 
 From this DDL:

@@ -85,7 +85,14 @@ fn unquote(text: &str) -> String {
 
 /// An XSD datatype for a SQL type.
 fn xsd(data_type: &DataType) -> Option<&'static str> {
-    let text = data_type.to_string().to_ascii_uppercase();
+    xsd_for(&data_type.to_string())
+}
+
+/// An XSD datatype's local name for a SQL type name (`VARCHAR(200)`,
+/// `TIMESTAMP_NTZ`, `NUMBER(38,0)`), as warehouses and semantic layers write
+/// them.
+pub fn xsd_for(type_name: &str) -> Option<&'static str> {
+    let text = type_name.trim().to_ascii_uppercase();
     let base = text.split(['(', ' ']).next().unwrap_or_default();
     Some(match base {
         "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" | "SERIAL"
