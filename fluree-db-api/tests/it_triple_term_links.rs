@@ -2399,7 +2399,12 @@ async fn link_reads_refuse_an_index_built_before_links() {
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal_fenced(ledger_id, fence, index_t, &cid)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            fluree_db_nameservice::WriteBasis::fenced(fence),
+            index_t,
+            &cid,
+        )
         .await
         .expect("publish root");
 

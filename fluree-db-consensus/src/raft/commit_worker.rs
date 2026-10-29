@@ -29,6 +29,7 @@
 //!   travel verbatim; redaction is future work.
 
 use async_trait::async_trait;
+use fluree_db_nameservice::WriteBasis;
 
 use crate::local::build_policy_context;
 use crate::raft::ownership::owner;
@@ -217,6 +218,35 @@ impl Worker {
             .map(|f| (fluree_db_nameservice::Fence::from_u64(f.fence), f.frozen))
     }
 
+    /// Whether an erasure activation being prepared holds the branch's
+    /// head, so that a stage now would only be refused.
+    async fn held(&self) -> bool {
+        let state = self.shared_state.read().await;
+        state
+            .erasure
+            .holds
+            .get(&self.ref_key)
+            .is_some_and(|&until| crate::raft::current_millis() < until)
+    }
+
+    async fn wait_out_hold(&self) {
+        while self.held().await {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// What a write from the branch's replicated record presents.
+    async fn branch_basis(&self) -> WriteBasis {
+        let state = self.shared_state.read().await;
+        WriteBasis {
+            fence: state
+                .fences
+                .get(&self.ref_key)
+                .map(|f| fluree_db_nameservice::Fence::from_u64(f.fence)),
+            erasure_generation: crate::raft::state_machine::generation(&state, &self.ref_key),
+        }
+    }
+
     fn new(
         ref_key: RefKey,
         shared_state: SharedState,
@@ -331,6 +361,7 @@ impl Worker {
                         "staged on a lagging view; refreshing and re-staging"
                     );
                     tokio::time::sleep(RAFT_BACKOFF).await;
+                    self.wait_out_hold().await;
                     let ledger_id = self.ref_key.ledger_id();
                     if let Err(refresh_err) = self
                         .staging
@@ -372,10 +403,11 @@ impl Worker {
         };
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
-        // A stage on a cached state presents that state's fence, so one
-        // built on another activation's state, cached from before a drop
-        // and recreate this node has not yet reconciled, is refused.
-        let staged_fence = install.as_ref().and_then(|i| i.new_state.fence());
+        // A stage on a cached state presents that state's fence and erasure
+        // generation, so one built on another activation's state, cached
+        // from before a drop and recreate this node has not yet reconciled,
+        // or from before an erasure, is refused.
+        let staged_basis = install.as_ref().map(|i| i.new_state.write_basis());
 
         // Stash the typed receipt through `StashGuard` so an abort
         // mid-publish (ownership flap during the propose await)
@@ -396,7 +428,7 @@ impl Worker {
             receipt,
         );
         match self
-            .publish_head_advance(commit_id.clone(), commit_t, staged_fence)
+            .publish_head_advance(commit_id.clone(), commit_t, staged_basis)
             .await
         {
             Ok(()) => {
@@ -1244,24 +1276,25 @@ impl Worker {
         })
     }
 
-    /// Publish the head, presenting `staged_fence`, the fence of the state
-    /// the commit was staged on, or the branch's current fence for work
-    /// staged from the nameservice's records rather than a cached state.
+    /// Publish the head, presenting `staged_basis`, that of the state the
+    /// commit was staged on, or the branch's current one for work staged
+    /// from the nameservice's records rather than a cached state.
     async fn publish_head_advance(
         &self,
         commit_id: ContentId,
         commit_t: i64,
-        staged_fence: Option<fluree_db_nameservice::Fence>,
+        staged_basis: Option<WriteBasis>,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
-        let fence = match staged_fence {
-            Some(fence) => Some(fence),
-            None => self.branch_fence().await.map(|(fence, _)| fence),
+        let basis = match staged_basis {
+            Some(basis) => basis,
+            None => self.branch_basis().await,
         };
+        let fence = basis.fence;
         match self
             .publishing
             .commits
-            .publish_commit_fenced(&full_ledger_id, fence, commit_t, &commit_id)
+            .publish_commit_fenced(&full_ledger_id, basis, commit_t, &commit_id)
             .await
         {
             Ok(()) => Ok(()),
@@ -1366,6 +1399,10 @@ impl Worker {
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
+            }
+            if self.held().await {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
             }
             let queue_id = entry.queue_id;
             // Wrap `process_entry` in `catch_unwind` so a panic
@@ -2011,10 +2048,11 @@ mod tests {
         async fn publish_commit_fenced(
             &self,
             ledger_id: &str,
-            fence: Option<fluree_db_nameservice::Fence>,
+            basis: WriteBasis,
             _commit_t: i64,
             _commit_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
+            let fence = basis.fence;
             self.presented.lock().unwrap().push(fence);
             if fence.is_some() && fence == self.live {
                 Ok(())
@@ -2085,7 +2123,11 @@ mod tests {
         let (worker, publisher) = fenced_worker(2, false);
 
         let stale = worker
-            .publish_head_advance(cid(1), 5, Some(Fence::from_u64(1)))
+            .publish_head_advance(
+                cid(1),
+                5,
+                Some(WriteBasis::fenced(Some(Fence::from_u64(1)))),
+            )
             .await;
         assert!(matches!(stale, Err(WorkerError::Lagged(_))), "{stale:?}");
         assert_eq!(
@@ -2104,7 +2146,13 @@ mod tests {
     async fn a_commit_to_a_frozen_branch_is_poisoned() {
         let (worker, _) = fenced_worker(2, true);
         let frozen = worker
-            .publish_head_advance(cid(1), 5, Some(fluree_db_nameservice::Fence::from_u64(2)))
+            .publish_head_advance(
+                cid(1),
+                5,
+                Some(WriteBasis::fenced(Some(
+                    fluree_db_nameservice::Fence::from_u64(2),
+                ))),
+            )
             .await;
         assert!(
             matches!(&frozen, Err(WorkerError::Stage(reason)) if matches!(**reason, PoisonReason::LedgerNotFound { .. })),

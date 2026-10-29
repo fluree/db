@@ -202,6 +202,7 @@ fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRe
         storage_root: record.storage_root,
         fence: None,
         frozen: false,
+        erasure_generation: 0,
     }
 }
 

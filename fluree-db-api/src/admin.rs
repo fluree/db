@@ -2842,7 +2842,7 @@ impl crate::Fluree {
         self.publisher()?
             .publish_index_allow_equal_fenced(
                 &ledger_id,
-                record.fence,
+                record.write_basis(),
                 index_result.index_t,
                 &index_result.root_id,
             )

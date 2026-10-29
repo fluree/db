@@ -1,3 +1,4 @@
+use fluree_db_nameservice::WriteBasis;
 use std::sync::Arc;
 
 use crate::ledger_view::{CommitRef, LedgerView};
@@ -362,8 +363,14 @@ impl Fluree {
                         "failed to copy index to branch; branch will replay from genesis"
                     );
                 } else {
+                    // A name reused after an erasure reached an earlier branch
+                    // under it keeps that branch's erasure generation.
+                    let basis = match publisher.lookup(new_id.as_ref()).await? {
+                        Some(record) => record.write_basis(),
+                        None => WriteBasis::fenced(new_fence),
+                    };
                     self.index_publisher()?
-                        .publish_index_fenced(&new_id, new_fence, source_record.index_t, index_cid)
+                        .publish_index_fenced(&new_id, basis, source_record.index_t, index_cid)
                         .await?;
                 }
             }

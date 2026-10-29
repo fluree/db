@@ -241,7 +241,12 @@ impl PeerSyncTask {
                 t: record.commit_t,
             };
             match ns
-                .fast_forward_commit_fenced(&record.ledger_id, fence, &commit_head, 3)
+                .fast_forward_commit_fenced(
+                    &record.ledger_id,
+                    fluree_db_nameservice::WriteBasis::fenced(fence),
+                    &commit_head,
+                    3,
+                )
                 .await
             {
                 Ok(CasResult::Updated) => {}
@@ -274,7 +279,7 @@ impl PeerSyncTask {
                     let force_result = ns
                         .compare_and_set_ref_fenced(
                             &record.ledger_id,
-                            fence,
+                            fluree_db_nameservice::WriteBasis::fenced(fence),
                             RefKind::CommitHead,
                             actual.as_ref(),
                             &commit_head,
@@ -331,7 +336,7 @@ impl PeerSyncTask {
             let index_result = ns
                 .compare_and_set_ref_fenced(
                     &record.ledger_id,
-                    fence,
+                    fluree_db_nameservice::WriteBasis::fenced(fence),
                     RefKind::IndexHead,
                     current.as_ref(),
                     &index_head,

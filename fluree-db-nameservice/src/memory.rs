@@ -8,6 +8,7 @@ use crate::binding::{
     BranchRecordStore, DroppedLedger, Fence, FenceOutcome, LedgerRegistry, NameBinding,
     RegistryCas, Versioned,
 };
+use crate::WriteBasis;
 use crate::{
     check_cas_expectation, ref_values_match, AdminPublisher, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -335,9 +336,10 @@ impl crate::BranchLifecycle for MemoryNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: crate::NsRecordSnapshot,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -359,10 +361,11 @@ impl CommitPublisher for MemoryNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -395,10 +398,11 @@ impl IndexPublisher for MemoryNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -427,10 +431,11 @@ impl AdminPublisher for MemoryNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;
@@ -494,11 +499,12 @@ impl RefPublisher for MemoryNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        let fence = basis.fence;
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();
         check_fence(&records, &key, fence)?;

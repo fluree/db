@@ -9,6 +9,7 @@ use crate::binding::{
     LedgerRegistry, NameBinding, RegistryCas, Versioned,
 };
 use crate::lifecycle::{self, BranchDrop, LifecycleStore};
+use crate::WriteBasis;
 use crate::{NameServiceError, NsRecord, Result};
 use async_trait::async_trait;
 use fluree_db_core::{InstanceId, LedgerId, LedgerName, StorageRoot};
@@ -1235,7 +1236,7 @@ pub async fn a_mirrored_index_head_reads_and_swaps_as_one<
     let swapped = store
         .compare_and_set_ref_fenced(
             "mydb:main",
-            copy.fence,
+            copy.write_basis(),
             RefKind::IndexHead,
             Some(&read),
             &next,
@@ -1294,7 +1295,7 @@ async fn advance_commit<S: crate::NameServicePublisher>(
         store
             .compare_and_set_ref_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::CommitHead,
                 current.as_ref(),
                 &next
@@ -1332,7 +1333,9 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         t,
     };
     assert_refused(
-        store.publish_commit_fenced(id, fence, 99, &commit).await,
+        store
+            .publish_commit_fenced(id, WriteBasis::fenced(fence), 99, &commit)
+            .await,
         "publish_commit",
         missing,
     );
@@ -1341,7 +1344,7 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         store
             .compare_and_set_ref_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::CommitHead,
                 current.as_ref(),
                 &next(99),
@@ -1352,19 +1355,21 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
     );
     assert_refused(
         store
-            .fast_forward_commit_fenced(id, fence, &next(99), 3)
+            .fast_forward_commit_fenced(id, WriteBasis::fenced(fence), &next(99), 3)
             .await,
         "fast_forward_commit",
         missing,
     );
     assert_refused(
-        store.publish_index_fenced(id, fence, 99, &index).await,
+        store
+            .publish_index_fenced(id, WriteBasis::fenced(fence), 99, &index)
+            .await,
         "publish_index",
         missing,
     );
     assert_refused(
         store
-            .publish_index_allow_equal_fenced(id, fence, 99, &index)
+            .publish_index_allow_equal_fenced(id, WriteBasis::fenced(fence), 99, &index)
             .await,
         "publish_index_allow_equal",
         missing,
@@ -1374,7 +1379,7 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         store
             .compare_and_set_ref_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::IndexHead,
                 current.as_ref(),
                 &crate::RefValue {
@@ -1390,7 +1395,7 @@ async fn assert_writes_refused<S: crate::NameServicePublisher>(
         store
             .reset_head_fenced(
                 id,
-                fence,
+                WriteBasis::fenced(fence),
                 crate::NsRecordSnapshot {
                     commit_head_id: None,
                     commit_t: 0,
@@ -1448,7 +1453,7 @@ pub async fn writes_present_the_branch_fence<S: crate::NameServicePublisher>(sto
         store
             .compare_and_set_ref_fenced(
                 "mydb:main",
-                fence,
+                WriteBasis::fenced(fence),
                 crate::RefKind::CommitHead,
                 head.as_ref(),
                 &c2
@@ -1458,11 +1463,21 @@ pub async fn writes_present_the_branch_fence<S: crate::NameServicePublisher>(sto
         crate::CasResult::Updated
     );
     store
-        .publish_index_fenced("mydb:main", fence, 2, &cid(IndexRoot, "i2"))
+        .publish_index_fenced(
+            "mydb:main",
+            WriteBasis::fenced(fence),
+            2,
+            &cid(IndexRoot, "i2"),
+        )
         .await
         .unwrap();
     store
-        .publish_index_allow_equal_fenced("mydb:main", fence, 2, &cid(IndexRoot, "i2b"))
+        .publish_index_allow_equal_fenced(
+            "mydb:main",
+            WriteBasis::fenced(fence),
+            2,
+            &cid(IndexRoot, "i2b"),
+        )
         .await
         .unwrap();
     let record = store.lookup("mydb:main").await.unwrap().unwrap();
@@ -1481,7 +1496,7 @@ pub async fn writes_present_the_branch_fence<S: crate::NameServicePublisher>(sto
     store
         .reset_head_fenced(
             "mydb:main",
-            fence,
+            WriteBasis::fenced(fence),
             crate::NsRecordSnapshot::from_record(&record),
         )
         .await
@@ -1516,7 +1531,7 @@ pub async fn stale_writers_are_refused_across_drop_and_restore<S: crate::NameSer
         .unwrap();
     assert_fenced(
         store
-            .publish_commit_fenced("mydb:main", old.fence, 5, &cid(Commit, "late"))
+            .publish_commit_fenced("mydb:main", old.write_basis(), 5, &cid(Commit, "late"))
             .await,
         "publish after drop",
     );
@@ -1810,7 +1825,12 @@ pub async fn a_frozen_branchs_index_head_clears<S: crate::NameServicePublisher>(
         .unwrap();
     for (ledger, fence) in [("mydb:main", main.fence), ("mydb:dev", dev.fence)] {
         store
-            .publish_index_allow_equal_fenced(ledger, fence, 3, &cid(IndexRoot, ledger))
+            .publish_index_allow_equal_fenced(
+                ledger,
+                WriteBasis::fenced(fence),
+                3,
+                &cid(IndexRoot, ledger),
+            )
             .await
             .unwrap();
     }

@@ -2443,7 +2443,8 @@ impl UpdatePlan {
 /// storage root, so another ledger under the name, or, where both carry one,
 /// another fence, so the same ledger dropped and restored. Heads of two
 /// activations are not comparable. A side that carries neither is taken to
-/// match.
+/// match. Another erasure generation counts too: the history the cached
+/// state was loaded with has since been erased, and its writes are refused.
 fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
     let Some(cached) = cached else {
         return false;
@@ -2453,7 +2454,7 @@ fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
         (Some(a), Some(b)) if a != b
     );
     let fences = matches!((cached.fence, record.fence), (Some(a), Some(b)) if a != b);
-    roots || fences
+    roots || fences || cached.erasure_generation != record.erasure_generation
 }
 
 /// Input for notify: ledger ID + optional fresh NsRecord
@@ -3004,6 +3005,7 @@ mod tests {
             storage_root: None,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
         }
     }
 

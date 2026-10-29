@@ -393,7 +393,7 @@ async fn a_commit_a_branch_reads_from_its_parents_folder_stays() {
         .unwrap()
         .reset_head_fenced(
             "garbage:main",
-            before.fence,
+            before.write_basis(),
             fluree_db_nameservice::NsRecordSnapshot::from_record(&before),
         )
         .await

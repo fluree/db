@@ -43,6 +43,8 @@ pub(super) struct StagedCommit {
     pub commit_id: ContentId,
     pub commit_t: i64,
     pub receipt: AppliedReceipt,
+    /// Last, so a leader a release behind reads the rest and ignores it.
+    pub erasure_generation: u64,
 }
 
 /// Skip-free mirror of
@@ -77,6 +79,7 @@ impl From<InMemoryArgs> for StagedCommit {
             commit_id: args.commit_id,
             commit_t: args.commit_t,
             receipt: args.receipt.into(),
+            erasure_generation: args.erasure_generation,
         }
     }
 }
@@ -89,6 +92,7 @@ impl From<StagedCommit> for InMemoryArgs {
             commit_id: args.commit_id,
             commit_t: args.commit_t,
             receipt: args.receipt.into(),
+            erasure_generation: args.erasure_generation,
         }
     }
 }

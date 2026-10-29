@@ -141,7 +141,7 @@ where
     rebuild_from_store(commit_store, tracker, ledger_id, record, config)
         .await
         .map(|result| IndexResult {
-            fence: record.fence,
+            basis: record.write_basis(),
             ..result
         })
 }

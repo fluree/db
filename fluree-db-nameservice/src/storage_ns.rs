@@ -23,6 +23,7 @@ use crate::binding::{
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{merge_heads, ns_context, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION};
+use crate::WriteBasis;
 use crate::{
     deserialize_json, serialize_json, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -973,9 +974,10 @@ where
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: crate::NsRecordSnapshot,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
@@ -1011,10 +1013,11 @@ where
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
@@ -1083,10 +1086,11 @@ where
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let key = self.index_key(&ledger_name, &branch);
@@ -1131,10 +1135,11 @@ where
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let index_key = self.index_key(&ledger_name, &branch);
@@ -1212,11 +1217,12 @@ where
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
 
         match kind {
@@ -2472,7 +2478,7 @@ mod tests {
             .unwrap();
 
         let index = ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"index");
-        ns.publish_index_fenced("mydb:main", record.fence, 5, &index)
+        ns.publish_index_fenced("mydb:main", record.write_basis(), 5, &index)
             .await
             .unwrap();
         let after = ns.lookup("mydb:main").await.unwrap().unwrap();

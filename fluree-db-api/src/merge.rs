@@ -52,9 +52,9 @@ pub struct StagedMerge {
     pub target_id: LedgerId,
     /// Where the target branch's artifacts live.
     pub target_namespace: StorageNamespace,
-    /// The fence the target's record carried when the merge was prepared,
+    /// What the target's record presented when the merge was prepared,
     /// which the head publish presents.
-    pub target_fence: Option<fluree_db_nameservice::Fence>,
+    pub target_basis: fluree_db_nameservice::WriteBasis,
     /// Fully-qualified source id (`"<ledger>:<source>"`).
     pub source_id: LedgerId,
     /// `true` when the target's head is on the source's first-parent
@@ -160,7 +160,7 @@ impl crate::Fluree {
             let source_id = staged.source_id.clone();
             let target_id = staged.target_id.clone();
             let target_snapshot = staged.rollback_snapshot.clone();
-            let target_fence = staged.target_fence;
+            let target_basis = staged.target_basis;
             let published_head = staged.new_head_id.clone();
 
             match self.apply_merge(staged).await {
@@ -195,7 +195,7 @@ impl crate::Fluree {
                     );
                     if let Err(rollback_err) = self
                         .branch_admin()?
-                        .reset_head_fenced(&target_id, target_fence, target_snapshot)
+                        .reset_head_fenced(&target_id, target_basis, target_snapshot)
                         .await
                     {
                         tracing::error!(
@@ -373,7 +373,7 @@ impl crate::Fluree {
             .await?
         };
         Ok(StagedMerge {
-            target_fence: target_record.fence,
+            target_basis: target_record.write_basis(),
             ..staged
         })
     }
@@ -387,7 +387,7 @@ impl crate::Fluree {
             source,
             target_id,
             target_namespace,
-            target_fence,
+            target_basis,
             fast_forward,
             conflict_count,
             strategy,
@@ -460,7 +460,7 @@ impl crate::Fluree {
                     .publisher()?
                     .compare_and_set_ref_fenced(
                         &target_id,
-                        target_fence,
+                        target_basis,
                         RefKind::CommitHead,
                         Some(&expected),
                         &new_ref,
@@ -593,7 +593,7 @@ impl crate::Fluree {
             source: source_branch.to_string(),
             target_id,
             target_namespace,
-            target_fence: None,
+            target_basis: fluree_db_nameservice::WriteBasis::default(),
             source_ledger_id: source_record.ledger_id.clone(),
             source_id,
             fast_forward: true,
@@ -774,7 +774,7 @@ impl crate::Fluree {
             source: source_branch.to_string(),
             target_id,
             target_namespace,
-            target_fence: None,
+            target_basis: fluree_db_nameservice::WriteBasis::default(),
             source_ledger_id: source_record.ledger_id.clone(),
             source_id,
             fast_forward: false,

@@ -184,7 +184,7 @@ impl Fluree {
             self.publisher()?
                 .publish_index_allow_equal_fenced(
                     record.ledger_id.as_str(),
-                    record.fence,
+                    record.write_basis(),
                     built.index_t,
                     &built.root_id,
                 )

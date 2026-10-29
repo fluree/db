@@ -181,6 +181,15 @@ impl LedgerView {
         self.ns_record.as_ref().and_then(|r| r.fence)
     }
 
+    /// What this view's writes present; see
+    /// [`LedgerState::write_basis`](fluree_db_ledger::LedgerState::write_basis).
+    pub fn write_basis(&self) -> fluree_db_nameservice::WriteBasis {
+        self.ns_record
+            .as_ref()
+            .map(fluree_db_nameservice::NsRecord::write_basis)
+            .unwrap_or_default()
+    }
+
     /// Where this branch's artifacts live; see
     /// [`LedgerState::storage_namespace`](fluree_db_ledger::LedgerState::storage_namespace).
     pub fn storage_namespace(&self) -> fluree_db_core::StorageNamespace {

@@ -65,6 +65,7 @@ use axum::routing::post;
 use axum::Router;
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_core::{ContentId, InstanceId, LedgerId};
+use fluree_db_nameservice::WriteBasis;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
@@ -303,6 +304,7 @@ fn record_from_state(
         record.branches = entry.branches;
     }
     record.retracted = state.retracted.contains(&ref_key);
+    record.erasure_generation = crate::raft::state_machine::generation(state, &ref_key);
     if let Some(f) = state.fences.get(&ref_key) {
         record.fence = Some(Fence::from_u64(f.fence));
         record.frozen = f.frozen;
@@ -356,6 +358,51 @@ fn check_fence_response(response: &SmResponse, ledger_id: &str) -> Result<()> {
             Err(NameServiceError::fenced(ledger_id))
         }
         _ => Ok(()),
+    }
+}
+
+/// `command`, made from a view of `key` at erasure `generation`; see
+/// [`SmCommand::AtGeneration`]. A view no erasure has reached presents
+/// none, as every write did before erasure generations.
+fn at_generation(command: SmCommand, key: RefKey, generation: u64) -> SmCommand {
+    if generation == 0 {
+        return command;
+    }
+    SmCommand::AtGeneration {
+        generations: vec![(key, generation)],
+        command: Box::new(command),
+    }
+}
+
+/// Why a write the state machine refused for its erasure generation must
+/// be made again from a fresh view, if it did.
+fn erasure_refusal(response: &SmResponse) -> Option<String> {
+    match response {
+        SmResponse::ErasureGenerationMoved {
+            ledger_id,
+            current,
+            presented,
+        } => Some(format!(
+            "{ledger_id} was written from a view at erasure generation {}; the branch is at \
+             {current}",
+            presented.unwrap_or(0)
+        )),
+        SmResponse::ErasureHeld {
+            ledger_id,
+            until_millis,
+        } => Some(format!(
+            "{ledger_id} is held for an erasure activation until {until_millis}"
+        )),
+        _ => None,
+    }
+}
+
+/// A write refused for its erasure generation as an error: the writer
+/// loads the branch again and makes it again.
+fn check_erasure_response(response: &SmResponse) -> Result<()> {
+    match erasure_refusal(response) {
+        Some(reason) => Err(NameServiceError::apply_lagged(reason)),
+        None => Ok(()),
     }
 }
 
@@ -439,18 +486,21 @@ impl IndexPublisher for RaftNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let cmd = fenced_command(
             ledger_id,
             build_advance_index_command(ledger_id, index_t, index_id)?,
             fence,
         )?;
+        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
                 check_fence_response(&resp.data, ledger_id)?;
+                check_erasure_response(&resp.data)?;
                 map_advance_index_response(resp.data)
             }
             // A stepped-down leader's straggling publish call. The
@@ -480,18 +530,21 @@ impl AdminPublisher for RaftNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let cmd = fenced_command(
             ledger_id,
             build_rewrite_index_command(ledger_id, index_t, index_id)?,
             fence,
         )?;
+        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
                 check_fence_response(&resp.data, ledger_id)?;
+                check_erasure_response(&resp.data)?;
                 map_advance_index_response(resp.data)
             }
             // Unlike `publish_index`, no swallow here: this trait's
@@ -688,6 +741,8 @@ pub struct StagedCommit {
     /// Typed staging receipt to stash on the leader so the waiter
     /// resolves with full per-op detail.
     pub receipt: AppliedReceipt,
+    /// Erasure generation of the view the commit was staged on.
+    pub erasure_generation: u64,
 }
 
 pub mod read_index;
@@ -725,6 +780,11 @@ pub enum ApplyStagedCommitResponse {
         /// `t` the staged commit carried.
         proposed_t: i64,
     },
+    /// The entry is still at the queue front, but the commit was staged
+    /// on a view an erasure activation has since replaced, or the
+    /// branch is held while one is prepared. The caller loads the
+    /// branch again and re-stages. Appended, as `Lagged` was.
+    ErasureMoved { reason: String },
 }
 
 /// Errors returned by [`RaftNameService::apply_staged_commit`]. Sent
@@ -828,6 +888,7 @@ impl RaftNameService {
             commit_id,
             commit_t,
             receipt,
+            erasure_generation,
         } = args;
 
         let (tally, flake_count) = match &receipt {
@@ -837,16 +898,20 @@ impl RaftNameService {
             ),
             _ => (None, 0),
         };
-        let cmd = SmCommand::ApplyHead(StagedHead {
-            ledger_id: ref_key.ledger_name.clone(),
-            branch: ref_key.branch.clone(),
-            queue_id,
-            commit_id: commit_id.clone(),
-            commit_t,
-            applied_at_millis: crate::raft::current_millis(),
-            tally,
-            flake_count,
-        });
+        let cmd = at_generation(
+            SmCommand::ApplyHead(StagedHead {
+                ledger_id: ref_key.ledger_name.clone(),
+                branch: ref_key.branch.clone(),
+                queue_id,
+                commit_id: commit_id.clone(),
+                commit_t,
+                applied_at_millis: crate::raft::current_millis(),
+                tally,
+                flake_count,
+            }),
+            ref_key.clone(),
+            erasure_generation,
+        );
 
         let _guard = match self.staged_receipts.as_ref() {
             Some(stash) => match StashGuard::try_stash(stash, queue_id, ref_key.clone(), receipt) {
@@ -880,6 +945,11 @@ impl RaftNameService {
             SmResponse::QueueDesync { .. } => Ok(ApplyStagedCommitResponse::Stale {
                 current_front_queue_id: self.current_front_queue_id(&ref_key).await,
             }),
+            response if erasure_refusal(&response).is_some() => {
+                Ok(ApplyStagedCommitResponse::ErasureMoved {
+                    reason: erasure_refusal(&response).unwrap_or_default(),
+                })
+            }
             SmResponse::LedgerNotFound { ledger_id } => {
                 Err(ApplyStagedCommitError::LedgerNotFound(ledger_id))
             }
@@ -1194,6 +1264,9 @@ fn classify_apply_staged_commit_outcome(
             "queue_id {queue_id} still at front, but proposed commit_t {proposed_t} would not \
              advance current head (t={current_t}); local view lags the replicated head"
         ))),
+        Ok(ApplyStagedCommitResponse::ErasureMoved { reason }) => {
+            Err(NameServiceError::apply_lagged(reason))
+        }
         Err(ApplyStagedCommitError::LedgerNotFound(id)) => Err(NameServiceError::not_found(id)),
         Err(ApplyStagedCommitError::LedgerRetracted(id)) => Err(NameServiceError::Retracted(id)),
         Err(ApplyStagedCommitError::InvariantViolated(msg)) => {
@@ -1224,10 +1297,11 @@ impl CommitPublisher for RaftNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         // The head applies through the branch's queue, which a drop
         // clears, so the fence is checked here rather than in the state
         // machine; see `state_machine::fenced_branch`.
@@ -1246,15 +1320,18 @@ impl CommitPublisher for RaftNameService {
         // endpoint instead of attempting a local propose (which would
         // just bounce back as ForwardToLeader). Without forwarding,
         // the legacy leader-only contract applies.
+        let generation = basis.erasure_generation;
         if let Some(forwarding) = &self.forwarding {
             if !self.is_local_leader(forwarding.id).await {
                 return self
-                    .publish_commit_via_leader(ledger_id, commit_t, commit_id, forwarding)
+                    .publish_commit_via_leader(
+                        ledger_id, generation, commit_t, commit_id, forwarding,
+                    )
                     .await;
             }
         }
 
-        self.publish_commit_locally(ledger_id, commit_t, commit_id)
+        self.publish_commit_locally(ledger_id, generation, commit_t, commit_id)
             .await
     }
 
@@ -1281,6 +1358,7 @@ impl RaftNameService {
     async fn publish_commit_locally(
         &self,
         ledger_id: &str,
+        erasure_generation: u64,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -1294,9 +1372,13 @@ impl RaftNameService {
                 self.staged_receipts.as_deref(),
             )?
         };
+        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, erasure_generation);
 
         match self.raft.client_write(cmd).await {
-            Ok(resp) => map_apply_head_response(resp.data),
+            Ok(resp) => {
+                check_erasure_response(&resp.data)?;
+                map_apply_head_response(resp.data)
+            }
             // Stepped-down leader: the new leader's worker will
             // observe the same queue entry and re-stage. We must
             // surface this as an error (unlike `publish_index`) so
@@ -1347,6 +1429,7 @@ impl RaftNameService {
     async fn publish_commit_via_leader(
         &self,
         ledger_id: &str,
+        erasure_generation: u64,
         commit_t: i64,
         commit_id: &ContentId,
         forwarding: &ForwardingConfig,
@@ -1388,6 +1471,7 @@ impl RaftNameService {
             commit_id: commit_id.clone(),
             commit_t,
             receipt,
+            erasure_generation,
         };
 
         let leader_url = self.lookup_leader_raft_url().await.ok_or_else(|| {
@@ -1844,16 +1928,19 @@ impl BranchLifecycle for RaftNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
+        let fence = basis.fence;
         let cmd = fenced_command(
             ledger_id,
             build_reset_head_command(ledger_id, snapshot)?,
             fence,
         )?;
+        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
+        check_erasure_response(&response)?;
         map_reset_head_response(response)
     }
 }
@@ -1900,11 +1987,12 @@ impl RefPublisher for RaftNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let cmd = fenced_command(
             ledger_id,
@@ -1918,8 +2006,10 @@ impl RefPublisher for RaftNameService {
             }),
             fence,
         )?;
+        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
+        check_erasure_response(&response)?;
         match response {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),
             SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
@@ -2735,6 +2825,7 @@ mod tests {
             commit_id: cid(1),
             commit_t: 17,
             receipt,
+            erasure_generation: 3,
         }
     }
 
@@ -3110,8 +3201,10 @@ mod tests {
             commit_id,
             commit_t,
             receipt,
+            erasure_generation,
         } = round_tripped;
         assert_eq!(ref_key, args.ref_key);
+        assert_eq!(erasure_generation, args.erasure_generation);
         assert_eq!(queue_id, args.queue_id);
         assert_eq!(commit_id, args.commit_id);
         assert_eq!(commit_t, args.commit_t);
@@ -3309,7 +3402,7 @@ mod tests {
         let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         let fence = Some(fluree_db_nameservice::Fence::generate());
         assert!(ns
-            .publish_index_fenced("test/db:main", fence, 1, &cid(1))
+            .publish_index_fenced("test/db:main", WriteBasis::fenced(fence), 1, &cid(1))
             .await
             .is_ok());
     }
@@ -3319,7 +3412,7 @@ mod tests {
         let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         let fence = Some(fluree_db_nameservice::Fence::generate());
         let err = ns
-            .publish_index_allow_equal_fenced("test/db:main", fence, 1, &cid(1))
+            .publish_index_allow_equal_fenced("test/db:main", WriteBasis::fenced(fence), 1, &cid(1))
             .await
             .expect_err("not-leader admin publish must not report success");
         assert!(

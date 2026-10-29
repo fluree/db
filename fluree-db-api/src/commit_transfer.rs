@@ -33,6 +33,7 @@ use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::lifecycle::PendingLedger;
+use fluree_db_nameservice::WriteBasis;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::{
     drop_forged_commit_flakes, generate_commit_flakes, is_forged_commit_flake,
@@ -883,7 +884,7 @@ impl Fluree {
             .publisher()?
             .compare_and_set_ref_fenced(
                 &ledger,
-                final_state.fence(),
+                final_state.write_basis(),
                 RefKind::CommitHead,
                 Some(&pre_push_head),
                 &new_ref,
@@ -2291,10 +2292,10 @@ impl Fluree {
         head_t: i64,
     ) -> Result<()> {
         self.admit_content_id(head_commit_id)?;
-        let fence = handle.snapshot().await.fence();
+        let basis = handle.snapshot().await.write_basis();
         self.set_ref(
             handle.id(),
-            fence,
+            basis,
             RefKind::CommitHead,
             head_commit_id,
             head_t,
@@ -2314,8 +2315,8 @@ impl Fluree {
         index_t: i64,
     ) -> Result<()> {
         self.admit_content_id(index_id)?;
-        let fence = handle.snapshot().await.fence();
-        self.set_ref(handle.id(), fence, RefKind::IndexHead, index_id, index_t)
+        let basis = handle.snapshot().await.write_basis();
+        self.set_ref(handle.id(), basis, RefKind::IndexHead, index_id, index_t)
             .await
     }
 
@@ -2324,7 +2325,7 @@ impl Fluree {
     async fn set_ref(
         &self,
         ledger_id: &str,
-        fence: Option<fluree_db_nameservice::Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         id: &ContentId,
         t: i64,
@@ -2336,7 +2337,7 @@ impl Fluree {
         let current_ref = self.publisher()?.get_ref(ledger_id, kind).await?;
         match self
             .publisher()?
-            .compare_and_set_ref_fenced(ledger_id, fence, kind, current_ref.as_ref(), &new_ref)
+            .compare_and_set_ref_fenced(ledger_id, basis, kind, current_ref.as_ref(), &new_ref)
             .await?
         {
             CasResult::Updated => Ok(()),
@@ -2770,7 +2771,7 @@ impl Fluree {
 
         self.set_ref(
             new_ledger_id,
-            record.fence,
+            record.write_basis(),
             RefKind::CommitHead,
             &commit_cid,
             commit_t,
@@ -2831,7 +2832,7 @@ impl Fluree {
 
             self.set_ref(
                 new_ledger_id,
-                record.fence,
+                record.write_basis(),
                 RefKind::IndexHead,
                 &head_index_cid,
                 index_t,
@@ -3007,7 +3008,7 @@ impl Fluree {
             .publisher()?
             .compare_and_set_ref_fenced(
                 base_state.ledger_id(),
-                base_state.fence(),
+                base_state.write_basis(),
                 RefKind::CommitHead,
                 Some(&current_ref),
                 &new_ref,

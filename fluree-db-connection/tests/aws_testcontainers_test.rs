@@ -237,11 +237,11 @@ async fn localstack_s3_and_dynamodb_smoke() {
 
     // Publish index head
     let index_id = test_index_id("index:1");
-    let fence =
-        fluree_db_nameservice::testing::current_fence(aws.nameservice_arc().as_ref(), alias)
+    let basis =
+        fluree_db_nameservice::testing::current_basis(aws.nameservice_arc().as_ref(), alias)
             .await
             .unwrap();
-    aws.publish_index(alias, fence, 1, &index_id)
+    aws.publish_index(alias, basis, 1, &index_id)
         .await
         .expect("publish_index should succeed");
 

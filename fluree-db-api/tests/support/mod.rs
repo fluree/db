@@ -405,7 +405,12 @@ pub async fn publish_built_index(
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal_fenced(ledger_id, fence, index_t, root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            fluree_db_nameservice::WriteBasis::fenced(fence),
+            index_t,
+            root_id,
+        )
         .await
         .expect("publish index");
     let published = fluree

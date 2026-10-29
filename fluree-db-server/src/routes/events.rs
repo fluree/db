@@ -766,6 +766,7 @@ mod tests {
             storage_root: None,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
         };
         let id = ledger_event_id("test:main", &record);
         assert_eq!(id, "ledger:test:main:42:40");

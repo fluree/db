@@ -141,14 +141,15 @@ async fn push_ref_inner(
     })?;
 
     // Remote writers carry no fence yet, so the push presents the branch's
-    // current one: `expected` alone guards it against a concurrent writer.
-    let fence = ns
+    // current basis: `expected` alone guards it against a concurrent writer.
+    let basis = ns
         .lookup(alias)
         .await
         .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
-        .and_then(|record| record.fence);
+        .map(|record| record.write_basis())
+        .unwrap_or_default();
     let result = ns
-        .compare_and_set_ref_fenced(alias, fence, kind, body.expected.as_ref(), &body.new)
+        .compare_and_set_ref_fenced(alias, basis, kind, body.expected.as_ref(), &body.new)
         .await
         .map_err(|e| ServerError::internal(format!("CAS operation failed: {e}")))?;
 

@@ -104,10 +104,10 @@ pub struct IndexResult {
     /// `None` when the build went through the plain non-tracking API. An
     /// already-current build reports `Some(0.0)` if tracking was enabled.
     pub fuel: Option<f64>,
-    /// The fence of the branch record the build started from, which the
-    /// publication of this root presents: a branch dropped or replaced
-    /// during the build refuses it.
-    pub fence: Option<fluree_db_nameservice::Fence>,
+    /// What the publication of this root presents, from the branch record
+    /// the build started from: a branch dropped or replaced during the
+    /// build, or reached by an erasure, refuses it.
+    pub basis: fluree_db_nameservice::WriteBasis,
 }
 
 /// Statistics from index building
@@ -214,7 +214,7 @@ pub async fn build_index_for_record_with_tracker(
                     ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
                     stats: IndexStats::default(),
                     fuel,
-                    fence: None,
+                    basis: fluree_db_nameservice::WriteBasis::default(),
                 });
             }
         }
@@ -285,7 +285,7 @@ pub async fn build_index_for_record_with_tracker(
     .instrument(span)
     .await
     .map(|result| IndexResult {
-        fence: record.fence,
+        basis: record.write_basis(),
         ..result
     })
 }
@@ -507,7 +507,7 @@ pub async fn publish_index_result(
     publisher
         .publish_index_fenced(
             &result.ledger_id,
-            result.fence,
+            result.basis,
             result.index_t,
             &result.root_id,
         )
@@ -549,7 +549,7 @@ mod publish_barrier_tests {
         async fn publish_index_fenced(
             &self,
             _ledger_id: &str,
-            _fence: Option<fluree_db_nameservice::Fence>,
+            _basis: fluree_db_nameservice::WriteBasis,
             _index_t: i64,
             _index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
@@ -585,7 +585,7 @@ mod publish_barrier_tests {
             ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
             stats: IndexStats::default(),
             fuel: None,
-            fence: None,
+            basis: fluree_db_nameservice::WriteBasis::default(),
         };
         publish_index_result(&store, &publisher, &result)
             .await

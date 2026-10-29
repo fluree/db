@@ -3146,7 +3146,7 @@ where
                 Ok(()) => nameservice
                     .publish_index_fenced(
                         &ledger_addr,
-                        result.fence,
+                        result.basis,
                         result.index_t,
                         &result.root_id,
                     )
@@ -3265,7 +3265,7 @@ where
         )))
     })?;
     nameservice
-        .publish_index_fenced(&ledger_addr, result.fence, result.index_t, &result.root_id)
+        .publish_index_fenced(&ledger_addr, result.basis, result.index_t, &result.root_id)
         .await
         .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
 

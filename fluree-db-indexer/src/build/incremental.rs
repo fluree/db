@@ -879,7 +879,7 @@ pub async fn erase_index_events(
             total_bytes: root_bytes.len(),
         },
         fuel: None,
-        fence: None,
+        basis: fluree_db_nameservice::WriteBasis::default(),
     })
 }
 
@@ -1025,7 +1025,7 @@ async fn incremental_index_with(
             ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
             stats: IndexStats::default(),
             fuel: None,
-            fence: None,
+            basis: fluree_db_nameservice::WriteBasis::default(),
         });
     }
 
@@ -4327,7 +4327,7 @@ async fn incremental_index_with(
         },
         // Outer entry point fills fuel from the tracker tally.
         fuel: None,
-        fence: None,
+        basis: fluree_db_nameservice::WriteBasis::default(),
     })
 }
 

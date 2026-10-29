@@ -68,6 +68,30 @@ impl std::str::FromStr for Fence {
     }
 }
 
+/// What a write presents of the branch state it was made from: the fence of
+/// the branch it loaded, and that view's erasure generation. A writer takes
+/// both from the record it loaded ([`NsRecord::write_basis`]).
+///
+/// Erasure generations are a cluster's: activating a permanent erasure
+/// advances the generation of every branch holding the erased data, and a
+/// write made from a view before it is refused. Other backends keep none and
+/// ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteBasis {
+    pub fence: Option<Fence>,
+    pub erasure_generation: u64,
+}
+
+impl WriteBasis {
+    /// A write presenting `fence`, from a view no erasure has reached.
+    pub fn fenced(fence: Option<Fence>) -> Self {
+        Self {
+            fence,
+            erasure_generation: 0,
+        }
+    }
+}
+
 /// Hex, not a JSON number: 64-bit values do not survive JavaScript clients.
 impl Serialize for Fence {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {

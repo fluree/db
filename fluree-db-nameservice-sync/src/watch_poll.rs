@@ -219,6 +219,7 @@ mod tests {
             storage_root: None,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
         }
     }
 

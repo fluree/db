@@ -102,6 +102,7 @@ impl NsRecordResponse {
             storage_root: self.storage_root,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
         })
     }
 }

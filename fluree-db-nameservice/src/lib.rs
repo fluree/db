@@ -45,7 +45,7 @@ pub use binding::{
     check_write_fence, fence_admits, lookup_resolved, new_instance_id, read_all_resolved,
     read_resolved, resolve_record, BindingState, BranchFence, BranchRecordStore, DroppedLedger,
     DroppedState, ExtraFields, Fence, FenceOutcome, LedgerRegistry, NameBinding, RegistryCas,
-    Versioned,
+    Versioned, WriteBasis,
 };
 pub use branched_store::{
     branched_content_store_for_id, branched_content_store_for_record,
@@ -226,9 +226,18 @@ pub struct NsRecord {
     /// Set by a drop: the branch accepts no more writes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub frozen: bool,
+
+    /// The branch's erasure generation, as this node has installed it; see
+    /// [`WriteBasis`]. Always 0 outside a cluster.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub erasure_generation: u64,
 }
 
 pub(crate) fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
@@ -252,6 +261,15 @@ impl NsRecord {
             storage_root: None,
             fence: None,
             frozen: false,
+            erasure_generation: 0,
+        }
+    }
+
+    /// What a write made from this record presents.
+    pub fn write_basis(&self) -> WriteBasis {
+        WriteBasis {
+            fence: self.fence,
+            erasure_generation: self.erasure_generation,
         }
     }
 
@@ -583,7 +601,7 @@ pub trait BranchLifecycle: Debug + Send + Sync {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()>;
 
@@ -660,7 +678,7 @@ pub trait CommitPublisher: Debug + Send + Sync {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()>;
@@ -698,7 +716,7 @@ pub trait IndexPublisher: Debug + Send + Sync {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
@@ -775,7 +793,7 @@ pub trait AdminPublisher: Publisher {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
@@ -1133,7 +1151,7 @@ pub trait RefPublisher: RefLookup {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
@@ -1155,7 +1173,7 @@ pub trait RefPublisher: RefLookup {
     async fn fast_forward_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         new: &RefValue,
         max_retries: usize,
     ) -> Result<CasResult> {
@@ -1172,7 +1190,7 @@ pub trait RefPublisher: RefLookup {
             match self
                 .compare_and_set_ref_fenced(
                     ledger_id,
-                    fence,
+                    basis,
                     RefKind::CommitHead,
                     current.as_ref(),
                     new,
@@ -1675,10 +1693,10 @@ where
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: NsRecordSnapshot,
     ) -> Result<()> {
-        (**self).reset_head_fenced(ledger_id, fence, snapshot).await
+        (**self).reset_head_fenced(ledger_id, basis, snapshot).await
     }
 
     async fn pending_commit_cids(
@@ -1702,12 +1720,12 @@ where
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_commit_fenced(ledger_id, fence, commit_t, commit_id)
+            .publish_commit_fenced(ledger_id, basis, commit_t, commit_id)
             .await
     }
 
@@ -1724,12 +1742,12 @@ where
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_index_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_fenced(ledger_id, basis, index_t, index_id)
             .await
     }
 }
@@ -1742,12 +1760,12 @@ where
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
         (**self)
-            .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
+            .publish_index_allow_equal_fenced(ledger_id, basis, index_t, index_id)
             .await
     }
 
@@ -1764,13 +1782,13 @@ where
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
         (**self)
-            .compare_and_set_ref_fenced(ledger_id, fence, kind, expected, new)
+            .compare_and_set_ref_fenced(ledger_id, basis, kind, expected, new)
             .await
     }
 }

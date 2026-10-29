@@ -491,7 +491,7 @@ impl Fluree {
         let cas = publisher
             .compare_and_set_ref_fenced(
                 &txn.ledger_id,
-                head.fence(),
+                head.write_basis(),
                 RefKind::CommitHead,
                 Some(&txn.base_head),
                 &new_head,

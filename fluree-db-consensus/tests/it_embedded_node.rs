@@ -542,3 +542,87 @@ async fn a_fast_forward_merge_lands_through_consensus() {
 
     node.shutdown().await;
 }
+
+/// An erasure activation replaces the view a branch's writes are made from.
+/// A publication from the view before it is refused, and the committer's
+/// next transaction, staged on the branch as it is now, lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_land() {
+    use fluree_db_consensus::raft::state_machine::{
+        holder_state, ActivateErasure, Command, ErasureCommand, RefKey, Response,
+    };
+    use fluree_db_nameservice::{IndexPublisher, NameServiceError};
+
+    let (integration, fluree, node, _dirs) = stand_up(9, |config| config).await;
+    fluree.create_ledger("erased/db").await.expect("create");
+    node.committer
+        .transact(bulk_request_round("erased/db:main", 3, 0))
+        .await
+        .expect("first transaction");
+    let ns = integration.nameservice();
+    let before = ns
+        .lookup("erased/db:main")
+        .await
+        .expect("lookup")
+        .expect("registered");
+    assert_eq!(before.erasure_generation, 0);
+
+    let key = RefKey::new("erased/db", "main");
+    integration
+        .raft
+        .client_write(Command::Erasure(ErasureCommand::Track))
+        .await
+        .expect("track");
+    let (holder, holder_set) = {
+        let state = integration.shared_state.read().await;
+        (holder_state(&state, &key), state.erasure.holder_set)
+    };
+    let activated = integration
+        .raft
+        .client_write(Command::Erasure(ErasureCommand::Activate(
+            ActivateErasure {
+                manifest: "prepared".into(),
+                holder_set,
+                holders: vec![holder],
+                applied_at_millis: 0,
+            },
+        )))
+        .await
+        .expect("activate");
+    assert!(
+        matches!(activated.data, Response::ErasureActivated { .. }),
+        "{:?}",
+        activated.data
+    );
+    let after = ns
+        .lookup("erased/db:main")
+        .await
+        .expect("lookup")
+        .expect("registered");
+    assert_eq!(after.erasure_generation, 1);
+
+    let index = fluree_db_core::ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"stale");
+    let stale = ns
+        .publish_index_fenced(
+            "erased/db:main",
+            before.write_basis(),
+            before.commit_t,
+            &index,
+        )
+        .await;
+    assert!(
+        matches!(stale, Err(NameServiceError::ApplyLagged(_))),
+        "{stale:?}"
+    );
+
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(30),
+        node.committer
+            .transact(bulk_request_round("erased/db:main", 3, 1)),
+    )
+    .await
+    .expect("a transaction after the activation lands in time")
+    .expect("a transaction after the activation lands");
+    assert!(receipt.commit.t > before.commit_t);
+    node.shutdown().await;
+}

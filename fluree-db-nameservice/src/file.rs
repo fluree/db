@@ -34,6 +34,7 @@ use crate::migration::{
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{merge_heads, ns_context, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION};
+use crate::WriteBasis;
 use crate::{
     check_cas_expectation, deserialize_json, ref_values_match, serialize_json, AdminPublisher,
     CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
@@ -975,9 +976,10 @@ impl crate::BranchLifecycle for FileNameService {
     async fn reset_head_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         snapshot: crate::NsRecordSnapshot,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
@@ -1104,10 +1106,11 @@ impl CommitPublisher for FileNameService {
     async fn publish_commit_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
         let cid_str = commit_id.to_string();
@@ -1186,10 +1189,11 @@ impl IndexPublisher for FileNameService {
     async fn publish_index_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let address = Self::index_address(&ledger_name, &branch);
@@ -1236,10 +1240,11 @@ impl AdminPublisher for FileNameService {
     async fn publish_index_allow_equal_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        let fence = basis.fence;
         self.with_index_repair(ledger_id, fence, || async move {
             let (ledger_name, branch) = split_ledger_id(ledger_id)?;
             let address = Self::index_address(&ledger_name, &branch);
@@ -1599,11 +1604,12 @@ impl RefPublisher for FileNameService {
     async fn compare_and_set_ref_fenced(
         &self,
         ledger_id: &str,
-        fence: Option<Fence>,
+        basis: WriteBasis,
         kind: RefKind,
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        let fence = basis.fence;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let expected_clone = expected.cloned();
         let new_clone = new.clone();
@@ -2110,7 +2116,7 @@ mod tests {
         assert_eq!(
             ns.compare_and_set_ref_fenced(
                 "mydb:main",
-                record.fence,
+                record.write_basis(),
                 crate::RefKind::CommitHead,
                 current.as_ref(),
                 &head
@@ -2410,7 +2416,7 @@ mod tests {
         .unwrap();
 
         let index = ContentId::new(ContentKind::IndexRoot, b"index");
-        ns.publish_index_fenced("mydb:main", record.fence, 5, &index)
+        ns.publish_index_fenced("mydb:main", record.write_basis(), 5, &index)
             .await
             .unwrap();
         let after = ns.lookup("mydb:main").await.unwrap().unwrap();
