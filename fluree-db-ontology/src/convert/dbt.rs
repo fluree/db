@@ -16,14 +16,24 @@
 //! A **model's properties** give its columns' descriptions and tests:
 //! `accepted_values` makes a column enumerated, `relationships` (or a
 //! `foreign_key` constraint) makes it a foreign key, and a `primary_key`
-//! constraint, or `unique` with `not_null` on `id`, makes it the key. A
-//! semantic model built on a model (`model: ref('orders')`) takes the
-//! model's descriptions for columns it shares.
+//! constraint, or `unique` with `not_null` on `id`, makes it the key.
+//!
+//! A semantic model built on a model (`model: ref('orders')`) stands for it:
+//! it takes the model's descriptions and accepted values for the columns it
+//! uses, and the model is not repeated. Of the model's other columns, those
+//! that carry structure the semantic model lacks (a relation, from a
+//! `relationships` test or `foreign_key` constraint, or accepted values) are
+//! kept; the rest (audit columns, surrogate keys, columns only an
+//! expression uses) are left out and counted. A semantic model's choice of
+//! dimensions is made for metrics, so a relation it didn't need is still
+//! something documents talk about; but a mart's every documented column
+//! would bring back the breadth that costs an extraction model accuracy.
+//! References to a replaced model resolve to the semantic model.
 
 use super::sql::xsd_for;
 use super::{class_label, Column, Model, Table};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn text(v: &Value, key: &str) -> Option<String> {
     v.get(key)
@@ -64,8 +74,35 @@ pub fn is_dbt(doc: &Value) -> bool {
     doc.get("semantic_models").is_some() || doc.get("models").is_some()
 }
 
+/// The names a semantic model uses: its entities, dimensions and measures,
+/// and every identifier in their expressions (lowercased).
+fn used_names(sm: &Value) -> HashSet<String> {
+    let mut used = HashSet::new();
+    for group in ["entities", "dimensions", "measures"] {
+        for item in list(sm, group) {
+            if let Some(name) = text(item, "name") {
+                used.insert(name.to_lowercase());
+            }
+            if let Some(expr) = text(item, "expr") {
+                used.extend(
+                    expr.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_lowercase),
+                );
+            }
+        }
+    }
+    used
+}
+
 /// The model for one or more dbt YAML documents (a project's files).
 pub fn model(docs: &[Value]) -> Model {
+    read(docs).0
+}
+
+/// The model, and how many columns of models that semantic models stand for
+/// were left out.
+pub fn read(docs: &[Value]) -> (Model, usize) {
     let mut tables: Vec<Table> = Vec::new();
     // model properties first: semantic models take their descriptions
     for doc in docs {
@@ -160,15 +197,22 @@ pub fn model(docs: &[Value]) -> Model {
             }
         }
     }
+    // the models as their properties describe them, before semantic models
+    // take their place
+    let model_tables = tables.clone();
+    let mut replaced: HashMap<String, String> = HashMap::new();
+    let mut carried: HashSet<(String, String)> = HashSet::new();
+    let mut left_out = 0;
     for doc in docs {
         for sm in list(doc, "semantic_models") {
             let Some(name) = text(sm, "name") else {
                 continue;
             };
             let base = text(sm, "model").map(|m| ref_name(&m));
-            let described: HashMap<String, Column> = base
+            let base_table = base
                 .as_ref()
-                .and_then(|b| tables.iter().find(|t| t.name.eq_ignore_ascii_case(b)))
+                .and_then(|b| model_tables.iter().find(|t| t.name.eq_ignore_ascii_case(b)));
+            let described: HashMap<String, Column> = base_table
                 .map(|t| {
                     t.columns
                         .iter()
@@ -176,10 +220,7 @@ pub fn model(docs: &[Value]) -> Model {
                         .collect()
                 })
                 .unwrap_or_default();
-            let model_description = base
-                .as_ref()
-                .and_then(|b| tables.iter().find(|t| t.name.eq_ignore_ascii_case(b)))
-                .and_then(|t| t.description.clone());
+            let model_description = base_table.and_then(|t| t.description.clone());
             let mut table = Table {
                 name: name.clone(),
                 description: text(sm, "description").or(model_description),
@@ -273,14 +314,59 @@ pub fn model(docs: &[Value]) -> Model {
                     ..Column::default()
                 });
             }
-            // the semantic model stands for its base model, which is not repeated
-            if let Some(b) = &base {
-                tables.retain(|t| !t.name.eq_ignore_ascii_case(b));
+            // the semantic model stands for its base model, which is not
+            // repeated; the base model's relations and enumerations it didn't
+            // use come along
+            if let Some(bt) = base_table {
+                let used = used_names(sm);
+                for c in &bt.columns {
+                    let n = c.name.to_lowercase();
+                    if used.contains(&n)
+                        || bt.primary_key.iter().any(|k| k.eq_ignore_ascii_case(&n))
+                    {
+                        continue;
+                    }
+                    if c.references.is_some() || !c.values.is_empty() {
+                        carried.insert((name.to_lowercase(), n));
+                        table.columns.push(c.clone());
+                    } else {
+                        left_out += 1;
+                    }
+                }
+                replaced.insert(bt.name.to_lowercase(), name.clone());
+                tables.retain(|t| !t.name.eq_ignore_ascii_case(&bt.name));
             }
             tables.push(table);
         }
     }
-    Model { tables }
+    // a reference to a model a semantic model replaced is a reference to the
+    // semantic model
+    for c in tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
+        if let Some(to) = c
+            .references
+            .as_ref()
+            .and_then(|r| replaced.get(&r.to_lowercase()))
+        {
+            c.references = Some(to.clone());
+        }
+    }
+    // a carried key that a foreign entity already makes the relation is dropped
+    for t in &mut tables {
+        let table = t.name.to_lowercase();
+        let entity_targets: HashSet<String> = t
+            .columns
+            .iter()
+            .filter(|c| !carried.contains(&(table.clone(), c.name.to_lowercase())))
+            .filter_map(|c| c.references.as_ref().map(|r| r.to_lowercase()))
+            .collect();
+        t.columns.retain(|c| {
+            !carried.contains(&(table.clone(), c.name.to_lowercase()))
+                || c.references
+                    .as_ref()
+                    .is_none_or(|r| !entity_targets.contains(&r.to_lowercase()))
+        });
+    }
+    (Model { tables }, left_out)
 }
 
 #[cfg(test)]
@@ -314,6 +400,7 @@ models:
           - relationships:
               to: ref('stores')
               field: id
+      - name: _loaded_at
 semantic_models:
   - name: orders
     model: ref('stg_orders')
@@ -390,6 +477,71 @@ semantic_models:
             c(customers, "segment").values,
             ["commuter", "racer", "club"]
         );
+        // the base model's relation comes along; its plumbing doesn't
+        assert_eq!(c(orders, "store_id").references.as_deref(), Some("stores"));
+        assert!(orders.columns.iter().all(|c| c.name != "_loaded_at"));
+    }
+
+    #[test]
+    fn references_follow_the_semantic_model_and_entities_win() {
+        let doc: Value = serde_saphyr::from_str(
+            r"
+models:
+  - name: dim_customers
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+  - name: fct_orders
+    columns:
+      - name: customer_id
+        data_tests:
+          - relationships: {to: ref('dim_customers'), field: customer_id}
+      - name: amount_cents
+      - name: is_gift
+      - name: _loaded_at
+  - name: returns
+    columns:
+      - name: order_id
+        data_tests:
+          - relationships: {to: ref('fct_orders'), field: order_id}
+semantic_models:
+  - name: customers
+    model: ref('dim_customers')
+    entities:
+      - {name: customer, type: primary, expr: customer_id}
+  - name: orders
+    model: ref('fct_orders')
+    entities:
+      - {name: order, type: primary, expr: order_id}
+      - {name: customer, type: foreign}
+    measures:
+      - {name: gift_revenue, agg: sum, expr: case when is_gift then amount_cents / 100 end}
+",
+        )
+        .unwrap();
+        let (m, left_out) = read(&[doc]);
+        let t = |n: &str| m.tables.iter().find(|t| t.name == n).unwrap();
+        // returns' key to fct_orders now names the semantic model standing for it
+        assert_eq!(
+            t("returns").columns[0].references.as_deref(),
+            Some("orders")
+        );
+        // the base model's customer_id is the foreign entity's relation, not a second one
+        let orders = t("orders");
+        assert_eq!(
+            orders
+                .columns
+                .iter()
+                .filter(|c| c.references.as_deref() == Some("customers"))
+                .count(),
+            1
+        );
+        // columns only the measure's expression uses aren't repeated; plumbing is left out, counted
+        assert!(orders
+            .columns
+            .iter()
+            .all(|c| !matches!(c.name.as_str(), "is_gift" | "amount_cents" | "_loaded_at")));
+        assert_eq!(left_out, 1);
     }
 
     #[test]

@@ -532,9 +532,14 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
             } else {
                 vec![read_document(&args.file)?]
             };
-            let model = convert::dbt::model(&docs);
+            let (model, left_out) = convert::dbt::read(&docs);
             if model.tables.is_empty() {
                 return Err(failed(&"no dbt semantic models or model properties"));
+            }
+            if left_out > 0 {
+                notes.push(format!(
+                    "{left_out} column(s) of models that semantic models stand for were left out (no relation or accepted values, and no semantic model uses them)"
+                ));
             }
             tables(model)
         }

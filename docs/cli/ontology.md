@@ -267,9 +267,17 @@ or from the project's directory (every `.yml`/`.yaml` under it, `target/` and
 - **model properties** (`schema.yml`): column descriptions are copied, an
   `accepted_values` test makes a column enumerated, a `relationships` test or
   `foreign_key` constraint makes it a foreign key, and a `primary_key`
-  constraint, or `unique` with `not_null` on `id`, makes it the key. A
-  semantic model built on a model (`model: ref('stg_orders')`) takes that
-  model's descriptions and accepted values, and stands for it.
+  constraint, or `unique` with `not_null` on `id`, makes it the key.
+
+A semantic model built on a model (`model: ref('fct_orders')`) stands for it:
+it takes the model's descriptions and accepted values for the columns it uses,
+and the model isn't repeated. Of the model's other columns, the ones that carry
+a relation (a `relationships` test or `foreign_key` constraint) or accepted
+values are kept, since a relation a metric didn't need is still something
+documents talk about; the rest (audit columns, surrogate keys, columns only a
+measure's expression uses) are left out, and the summary says how many. A
+`relationships` test that names a replaced model (`ref('fct_orders')`) points
+at the semantic model standing for it.
 
 An **Apache Ossie** document (0.2, `.yaml` or `.json`) is read by its layer:
 
