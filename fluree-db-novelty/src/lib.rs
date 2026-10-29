@@ -594,7 +594,41 @@ fn flake_has_lossy_index_term(flake: &Flake) -> bool {
     flake.op && flake.o.index_key_loses_detail(&flake.dt)
 }
 
+/// What the flakes [`Novelty::apply_commit`] keeps change beyond their
+/// segments.
+#[derive(Default)]
+struct KeptEffects {
+    /// Kept `f:reifies*` flakes, so the attachment overlay observer sees
+    /// exactly the flakes that landed in novelty. The reserved-predicate test
+    /// is a single SID compare — negligible even on ledgers that never use
+    /// annotations.
+    accepted_reifies: Vec<Flake>,
+    /// Asserting OR retracting a hierarchy edge changes the RDFS schema —
+    /// invalidate the shared hierarchy cache.
+    schema_touched: bool,
+    /// Any SHACL-vocabulary flake invalidates the compiled-shapes cache.
+    shacl_touched: bool,
+}
+
+impl KeptEffects {
+    #[inline]
+    fn note(&mut self, flake: &Flake) {
+        if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
+            self.accepted_reifies.push(flake.clone());
+        }
+        self.schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
+        self.shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(flake);
+    }
+}
+
 impl Novelty {
+    /// Record what a kept `flake` changes on novelty itself: its list
+    /// position and whether its index term loses detail.
+    fn note_kept(&mut self, flake: &Flake) {
+        self.note_list_meta(flake);
+        self.has_lossy_index_terms |= flake_has_lossy_index_term(flake);
+    }
+
     /// Record `flake`'s list position in [`Self::has_list_meta`] and
     /// [`Self::list_predicates`].
     fn note_list_meta(&mut self, flake: &Flake) {
@@ -949,32 +983,49 @@ impl Novelty {
         // asserted across commits. Retractions are always accepted — they cancel
         // existing assertions. `fact_state` reflects PRIOR-commit state here (it
         // is updated only after this loop).
+        //
+        // An assertion this commit also retracts is kept: the pair holds the
+        // assertion (`fluree_db_core::same_t`), and dropping it would leave the
+        // retraction alone. That is what `bulk_apply_commits` keeps too. Such
+        // assertions are held until the commit's retractions are known, so a
+        // commit with none pays nothing for it.
         let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
         let mut deduped = 0u64;
-        // Capture post-dedup `f:reifies*` flakes so the attachment overlay
-        // observer sees exactly the flakes that landed in novelty. The
-        // reserved-predicate test is a single SID compare — negligible even on
-        // ledgers that never use annotations.
-        let mut accepted_reifies: Vec<Flake> = Vec::new();
-        let mut schema_touched = false;
-        let mut shacl_touched = false;
+        let mut restated: Vec<(Flake, GraphId)> = Vec::new();
+        let mut effects = KeptEffects::default();
         for (flake, g_id) in routed {
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
-                deduped += 1;
+                restated.push((flake, g_id));
                 continue;
             }
-            if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
-                accepted_reifies.push(flake.clone());
-            }
-            // Asserting OR retracting a hierarchy edge changes the RDFS
-            // schema — invalidate the shared hierarchy cache. Likewise any
-            // SHACL-vocabulary flake invalidates the compiled-shapes cache.
-            schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
-            shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
-            self.note_list_meta(&flake);
-            self.has_lossy_index_terms |= flake_has_lossy_index_term(&flake);
+            effects.note(&flake);
+            self.note_kept(&flake);
             per_graph.entry(g_id).or_default().push(flake);
         }
+        if !restated.is_empty() {
+            let retracted_here: HashSet<(GraphId, &Flake)> = per_graph
+                .iter()
+                .flat_map(|(&g_id, batch)| batch.iter().filter(|f| !f.op).map(move |f| (g_id, f)))
+                .collect();
+            let kept: Vec<bool> = restated
+                .iter()
+                .map(|(flake, g_id)| retracted_here.contains(&(*g_id, flake)))
+                .collect();
+            for ((flake, g_id), kept) in restated.into_iter().zip(kept) {
+                if kept {
+                    effects.note(&flake);
+                    self.note_kept(&flake);
+                    per_graph.entry(g_id).or_default().push(flake);
+                } else {
+                    deduped += 1;
+                }
+            }
+        }
+        let KeptEffects {
+            accepted_reifies,
+            schema_touched,
+            shacl_touched,
+        } = effects;
         if schema_touched {
             self.schema_epoch += 1;
         }
@@ -984,7 +1035,7 @@ impl Novelty {
 
         // Record every kept flake (assert + retract) into the current-state
         // index. `record` resolves lifecycle order-independently (highest-t
-        // wins, same-t retract wins), so batch order doesn't matter. After the
+        // wins, same-t assert wins), so batch order doesn't matter. After the
         // keep loop, so within-batch dedup decisions saw only prior state.
         for (&g_id, batch) in &per_graph {
             for flake in batch {
@@ -2604,14 +2655,14 @@ mod tests {
         assert_eq!(n.config_write_t, 8, "bulk config load advances marker");
     }
 
-    /// A same-`t` assert+retract of one identity must resolve to ABSENT in
-    /// `fact_state` (retract wins, matching overlay lifecycle resolution), so a
-    /// later re-assert is KEPT, not silently deduped. Stage-level cancellation
-    /// normally prevents such a pair from a live commit, but `bulk_apply_commits`
-    /// (cold load) replays raw persisted flakes, so `fact_state` must not depend
-    /// on that invariant — otherwise the re-assert would be dropped (data loss).
+    /// A same-`t` assert+retract of one identity holds the assertion in
+    /// `fact_state` (`fluree_db_core::same_t`), as overlay lifecycle resolution
+    /// and every index build do. `bulk_apply_commits` (cold load) replays raw
+    /// persisted flakes, and commits written before the staging fix hold such
+    /// pairs, so the state must not depend on staging having cancelled them: a
+    /// later re-assert is a no-op, and a later retract removes the fact.
     #[test]
-    fn same_t_assert_retract_keeps_later_reassert() {
+    fn same_t_assert_retract_holds_the_assertion() {
         let rg = no_graphs();
         let mut n = Novelty::new(0);
 
@@ -2622,16 +2673,50 @@ mod tests {
         ];
         n.bulk_apply_commits(vec![(commit, 1)], &rg).unwrap();
         let before = n.len();
+        assert!(n.fact_state.is_asserted(0, &make_flake(7, 1, 1, 1, true)));
 
-        // Re-assert the same identity at a later t: the fact was absent (same-t
-        // retract won), so this must be kept rather than deduped.
+        // The pair left the fact asserted, so a re-assert is a no-op.
         n.apply_commit(vec![make_flake(7, 1, 1, 2, true)], 2, &rg)
             .unwrap();
-        assert_eq!(
-            n.len(),
-            before + 1,
-            "re-assert after a same-t assert/retract must be kept, not deduped"
-        );
+        assert_eq!(n.len(), before, "re-assert of an asserted fact is deduped");
+
+        // A retract removes it, so the re-assert after that is kept.
+        n.apply_commit(vec![make_flake(7, 1, 1, 3, false)], 3, &rg)
+            .unwrap();
+        n.apply_commit(vec![make_flake(7, 1, 1, 4, true)], 4, &rg)
+            .unwrap();
+        assert_eq!(n.len(), before + 2);
+    }
+
+    /// `apply_commit` keeps an assertion its own commit also retracts, even
+    /// when novelty already holds the fact asserted: the pair holds the
+    /// assertion, and `bulk_apply_commits` keeps both ops as well. Dropping
+    /// it (as the plain re-assert rule would) leaves the retraction alone.
+    #[test]
+    fn apply_commit_keeps_an_assertion_its_commit_retracts() {
+        let rg = no_graphs();
+        let first = || vec![make_flake(7, 1, 1, 1, true)];
+        let pair = || vec![make_flake(7, 1, 1, 2, false), make_flake(7, 1, 1, 2, true)];
+
+        let mut per_commit = Novelty::new(0);
+        per_commit.apply_commit(first(), 1, &rg).unwrap();
+        per_commit.apply_commit(pair(), 2, &rg).unwrap();
+
+        let mut bulk = Novelty::new(0);
+        bulk.bulk_apply_commits(vec![(first(), 1), (pair(), 2)], &rg)
+            .unwrap();
+
+        assert_eq!(per_commit.len(), 3, "assert@1, retract@2, assert@2");
+        assert_eq!(bulk.len(), per_commit.len());
+        let probe = make_flake(7, 1, 1, 9, true);
+        assert!(per_commit.fact_state.is_asserted(0, &probe));
+        assert!(bulk.fact_state.is_asserted(0, &probe));
+
+        // A plain re-assert with no retraction in its commit is still deduped.
+        per_commit
+            .apply_commit(vec![make_flake(7, 1, 1, 3, true)], 3, &rg)
+            .unwrap();
+        assert_eq!(per_commit.len(), 3);
     }
 
     /// Cold/bulk load must produce a K=1-per-graph (already-compacted) shape, so

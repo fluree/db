@@ -1315,17 +1315,13 @@ mod tests {
     /// The target the slow-lookup logs, and the clock's `enabled!` check, use.
     const DICT_READER_TARGET: &str = "fluree_db_binary_index::dict::reader";
 
-    /// Runs `f` under `subscriber` as this thread's default, with callsite
-    /// interest rebuilt so a cached interest from another test can't decide
-    /// whether the clock runs.
+    /// Runs `f` under `subscriber` as this thread's default, so a cached
+    /// interest from another test can't decide whether the clock runs.
     fn with_subscriber<S, R>(subscriber: S, f: impl FnOnce() -> R) -> R
     where
         S: tracing::Subscriber + Send + Sync + 'static,
     {
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        })
+        fluree_test_support::with_scoped_default(subscriber, f)
     }
 
     fn reader_at(level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {

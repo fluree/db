@@ -449,20 +449,11 @@ fn collect_overlay_only<O: OverlayProvider + ?Sized>(
 /// applies; callers that merge base rows with a raw overlay walk themselves
 /// use it to get identical results to [`range_with_overlay`].
 ///
-/// At equal `t` a retraction beats an assert, so an assert and a retract of
-/// the same fact at one `t` resolve to absent. That matches
-/// `fluree_db_binary_index::read::types::resolve_overlay_ops`, which the
-/// cursor path uses, and the per-commit apply path. The transaction
-/// accumulator dedups within a commit so the tie is not reachable through a
-/// single transaction, but the segment-aware overlay assembly merges runs
-/// across segments — the rule is here so every path lands on the same answer
-/// rather than on whichever flake sorted last.
-///
-/// The merge and revert fold used to produce these pairs as well, by
-/// concatenating a source range's flakes into a single commit at a single
-/// `t`. It nets per fact now, so new commits carry no such pair, but merge
-/// commits written by the older code still do. The tie-break is what keeps
-/// those readable.
+/// An assert and a retract of the same fact at one `t` resolve to present:
+/// the one rule every lane applies ([`crate::same_t`]), so this path, the
+/// cursor's `resolve_overlay_ops`, novelty's fact state and every index build
+/// give the same answer. Commits written before the staging fix can hold
+/// such pairs.
 pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<Flake> {
     flakes.sort_by(index.comparator());
     remove_stale_flakes(flakes)
@@ -489,10 +480,9 @@ pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<F
 /// correct — it never leaned on `Ord` in the first place — so the hashed
 /// fact key stays, and the #1273 collapse it prevents is unrelated to #1711.
 ///
-/// The winner is chosen explicitly rather than by taking the first hit of a
-/// reverse scan, so the equal-`t` tie resolves to the retraction (see
-/// [`resolve_current_flakes`]) instead of to whichever op the comparator
-/// happened to sort last.
+/// The winner is chosen explicitly ([`crate::same_t::supersedes`]) rather than
+/// by taking the first hit of a reverse scan, so the answer does not depend
+/// on the input's order.
 fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
     use std::collections::HashMap;
 
@@ -521,8 +511,7 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
             }
             Some(&cur_idx) => {
                 let cur = &flakes[cur_idx];
-                // Newest op wins; at equal `t` the retraction does.
-                if f.t > cur.t || (f.t == cur.t && !f.op && cur.op) {
+                if crate::same_t::supersedes((f.t, f.op), (cur.t, cur.op)) {
                     winner.insert(key, idx);
                 }
             }
@@ -600,31 +589,25 @@ mod tests {
     }
 
     /// An assert and a retract of the same fact at the SAME `t` resolve to
-    /// absent. The comparator orders `op` ascending, so a reverse scan that
-    /// took its first hit picked the assert and the fact survived — which
-    /// disagreed with `resolve_overlay_ops` on the cursor path, and so with
-    /// this function's own documented promise of "identical results to
-    /// `range_with_overlay`".
+    /// present ([`crate::same_t`]), as `resolve_overlay_ops` on the cursor
+    /// path and every index build resolve them, whatever the input's order.
     #[test]
-    fn resolve_current_flakes_retraction_wins_at_equal_t() {
-        let out = resolve_current_flakes(
+    fn resolve_current_flakes_assertion_holds_at_equal_t() {
+        for flakes in [
             vec![
                 fact("a", "x", 2, true, None),
                 fact("a", "x", 2, false, None),
             ],
-            IndexType::Spot,
-        );
-        assert!(out.is_empty(), "same-t assert+retract resolves to absent");
-
-        // Order of the input must not change the answer.
-        let out = resolve_current_flakes(
             vec![
                 fact("a", "x", 2, false, None),
                 fact("a", "x", 2, true, None),
             ],
-            IndexType::Spot,
-        );
-        assert!(out.is_empty());
+        ] {
+            let out = resolve_current_flakes(flakes, IndexType::Spot);
+            assert_eq!(out.len(), 1, "same-t assert+retract resolves to present");
+            assert!(out[0].op);
+            assert_eq!(out[0].t, 2);
+        }
     }
 
     /// Metadata siblings: the comparators order `t` before `m`, so a

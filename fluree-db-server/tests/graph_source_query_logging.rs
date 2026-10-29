@@ -162,7 +162,7 @@ async fn a_graph_source_query_reports_no_missing_ledger_and_a_missing_name_still
 
     let failures = Failures::default();
     let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(failures.clone()));
+        fluree_test_support::scoped_default(tracing_subscriber::registry().with(failures.clone()));
 
     let (status, text) = send(
         &state,
@@ -239,7 +239,7 @@ async fn a_ledger_that_fails_to_load_is_not_reported_missing() {
 
     let failures = Failures::default();
     let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(failures.clone()));
+        fluree_test_support::scoped_default(tracing_subscriber::registry().with(failures.clone()));
 
     for (route, request) in requests("broken:main") {
         let (status, text) = send(&state, request).await;
