@@ -912,8 +912,13 @@ mod tests {
         assert_eq!(restored.erasure, ErasureState::default());
 
         activate(&mut state, &[main_key()]);
-        let restored = NameServiceState::from_snapshot(&state.to_snapshot().unwrap()).unwrap();
+        let bytes = state.to_snapshot().unwrap();
+        let restored = NameServiceState::from_snapshot(&bytes).unwrap();
         assert_eq!(restored, state);
         assert_eq!(generation(&restored, &main_key()), 1);
+
+        // A damaged one is refused, not restored as the older layout
+        // without its erasure state.
+        assert!(NameServiceState::from_snapshot(&bytes[..bytes.len() - 1]).is_err());
     }
 }

@@ -1659,12 +1659,21 @@ impl NameServiceState {
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
         // Newest layout first: postcard ignores trailing bytes, so an
         // older layout would decode a newer snapshot and drop its tail.
+        // For the same reason an older layout is taken only when it is the
+        // whole snapshot: a damaged newer one must not restore without
+        // its tail.
+        fn whole<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
+            match postcard::take_from_bytes(bytes) {
+                Ok((value, [])) => Some(value),
+                _ => None,
+            }
+        }
         match postcard::from_bytes(bytes) {
             Ok(state) => Ok(state),
-            Err(e) => postcard::from_bytes::<NameServiceStateV2>(bytes)
+            Err(e) => whole::<NameServiceStateV2>(bytes)
                 .map(Self::from)
-                .or_else(|_| postcard::from_bytes::<NameServiceStateV1>(bytes).map(Self::from))
-                .map_err(|_| e.into()),
+                .or_else(|| whole::<NameServiceStateV1>(bytes).map(Self::from))
+                .ok_or(e.into()),
         }
     }
 }
