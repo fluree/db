@@ -1,7 +1,7 @@
-//! Fixture A for the lanes that read several graphs of one ledger, checked
-//! before any lane leans on it. In every scope of the scope table and every
-//! fixture state, the answer to each of the six shapes, with fast paths off
-//! (the general plan) and on, equals the answer written by hand in
+//! The multigraph fixture for the lanes that read several graphs of one ledger,
+//! checked before any lane leans on it. In every scope of the scope table and
+//! every fixture state, the answer to each of the six shapes, with fast paths
+//! off (the general plan) and on, equals the answer written by hand in
 //! `support/multigraph.rs`, and the query's `index scope` stamp is the one the
 //! scope must get.
 //!
@@ -28,7 +28,7 @@ use multigraph::{
     Surface, G1, G2, SCOPES, SHAPES,
 };
 
-/// Every shape, scope and surface over fixture A in `state`.
+/// Every shape, scope and surface over the multigraph fixture in `state`.
 async fn every_scope_answers_by_hand(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -56,17 +56,17 @@ async fn every_scope_answers_by_hand(state: State) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn fixture_a_indexed() {
+async fn multigraph_fixture_indexed() {
     every_scope_answers_by_hand(State::Indexed).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn fixture_a_with_novelty_in_g2() {
+async fn multigraph_fixture_with_novelty_in_g2() {
     every_scope_answers_by_hand(State::Novelty).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn fixture_a_read_below_its_index() {
+async fn multigraph_fixture_read_below_its_index() {
     every_scope_answers_by_hand(State::Indexed2).await;
 }
 
@@ -140,9 +140,9 @@ fn check_lane_route(
     }
 }
 
-/// Run `shape` in every scope and surface over fixture A in `state`: both
-/// answers by hand, and the route `one_answered` and the sites say it took,
-/// against the lane's `route`.
+/// Run `shape` in every scope and surface over the multigraph fixture in
+/// `state`: both answers by hand, and the route `one_answered` and the sites
+/// say it took, against the lane's `route`.
 async fn union_lane_routes(
     state: State,
     shape: Shape,
@@ -322,30 +322,30 @@ async fn numeric_count_union_read_below_its_index() {
 // The per-predicate count over a default graph of several graphs
 // ============================================================================
 
-/// The per-predicate count's site over several graphs or none; the one-graph lane's site as
-/// it runs, and as it is planned. The planned site stamps at plan time
-/// whenever the one-graph lane is planned, also where its open() then
-/// declines (two ledgers, novelty), so only the run site says it answered;
-/// a union scope plans neither.
+/// The per-predicate count's site over several graphs or none; the one-graph
+/// lane's site as it runs, and as it is planned. The planned site stamps at
+/// plan time whenever the one-graph lane is planned, also where its open() then
+/// declines (two ledgers, novelty), so only the run site says it answered; a
+/// union scope plans neither.
 const PER_PREDICATE_UNION: &str = "stats_count_by_predicate_union";
 const PER_PREDICATE_ONE: &str = "COUNT by predicate (directory)";
 const PER_PREDICATE_ONE_PLANNED: &str = "stats_count_by_predicate";
 
-/// The per-predicate count's shape in every scope of fixture A in `state`: the answer by hand
-/// with fast paths on and off, and the routing. The union lane answers a
-/// current scope of several graphs, also one with a default graph the index
-/// holds no leaf for, and the empty one; a scope with novelty or read below
-/// the index declines it with `Novelty`; the one-graph lane answers one
-/// current graph; nothing answers a GRAPH scope (not the shape) or two
-/// ledgers.
+/// The per-predicate count's shape in every scope of the multigraph fixture in
+/// `state`: the answer by hand with fast paths on and off, and the routing. The
+/// union lane answers a current scope of several graphs, also one with a
+/// default graph the index holds no leaf for, and the empty one; a scope with
+/// novelty or read below the index declines it with `Novelty`; the one-graph
+/// lane answers one current graph; nothing answers a GRAPH scope (not the
+/// shape) or two ledgers.
 ///
-/// Fixture A holds a list, so SPARQL reads `?s ?p ?o` through its view of
-/// RDF lists (#2159): the owner edge and the cells' `rdf:first`/`rdf:rest`
-/// in place of the members. The union lane counts stored rows, so over
-/// several graphs or none it stands down at plan time with `ListView`, in
-/// every state, and the general plan answers; the one-graph lane corrects
-/// its counts from the list census. JSON-LD reads the members as values,
-/// and the union lane answers it.
+/// The multigraph fixture holds a list, so SPARQL reads `?s ?p ?o` through its
+/// view of RDF lists (#2159): the owner edge and the cells'
+/// `rdf:first`/`rdf:rest` in place of the members. The union lane counts stored
+/// rows, so over several graphs or none it stands down at plan time with
+/// `ListView`, in every state, and the general plan answers; the one-graph lane
+/// corrects its counts from the list census. JSON-LD reads the members as
+/// values, and the union lane answers it.
 async fn per_predicate_count_union(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -640,13 +640,13 @@ async fn per_predicate_count_union_keys_big_numbers_by_value() {
 const CYCLIC: &str = "cyclic_bgp";
 const CYCLIC_UNION: &str = "cyclic_bgp_union";
 
-/// The triangle in every scope and surface of fixture A in `state`, answered
-/// by hand and by the general plan, and routed by scope: the union variant
-/// answers a default graph of several graphs (an empty default graph among
-/// them included: a member that holds nothing adds no edges), and of none;
-/// the one-graph lane answers one graph; neither runs inside `GRAPH` (its
-/// inner plan is seeded, and the planner builds the cyclic operator only for
-/// an unseeded pattern list) or over two ledgers.
+/// The triangle in every scope and surface of the multigraph fixture in
+/// `state`, answered by hand and by the general plan, and routed by scope: the
+/// union variant answers a default graph of several graphs (an empty default
+/// graph among them included: a member that holds nothing adds no edges), and
+/// of none; the one-graph lane answers one graph; neither runs inside `GRAPH`
+/// (its inner plan is seeded, and the planner builds the cyclic operator only
+/// for an unseeded pattern list) or over two ledgers.
 async fn triangle_routes_by_scope(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -703,8 +703,8 @@ async fn triangle_lanes_read_below_the_index() {
 // The grouped count over a default graph of several graphs
 // ============================================================================
 
-/// The grouped count's site over several graphs or none, and the one-graph partitioned
-/// GROUP BY's site.
+/// The grouped count's site over several graphs or none, and the one-graph
+/// partitioned GROUP BY's site.
 const GROUPED_COUNT_UNION: &str = "partitioned_group_by_union";
 const GROUPED_COUNT_ONE: &str = "partitioned_group_by";
 
@@ -719,13 +719,13 @@ fn a_declined(run: &Run, outcome: &str, failures: &mut Vec<String>) {
     }
 }
 
-/// The grouped count's shape (`COUNT(*)` in SPARQL, `COUNT(?s)` in JSON-LD) in every
-/// scope of fixture A in `state`: the answer by hand with fast paths on and
-/// off, and the routing. The union lane answers a current scope of several
-/// graphs, one of them an empty default graph or not, and the scope of none;
-/// a scope with novelty or read below the index declines it with `Novelty`;
-/// the one-graph lane answers one graph; neither answers a GRAPH scope (not
-/// the shape) or two ledgers.
+/// The grouped count's shape (`COUNT(*)` in SPARQL, `COUNT(?s)` in JSON-LD) in
+/// every scope of the multigraph fixture in `state`: the answer by hand with
+/// fast paths on and off, and the routing. The union lane answers a current
+/// scope of several graphs, one of them an empty default graph or not, and the
+/// scope of none; a scope with novelty or read below the index declines it with
+/// `Novelty`; the one-graph lane answers one graph; neither answers a GRAPH
+/// scope (not the shape) or two ledgers.
 async fn grouped_count_union(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -842,10 +842,10 @@ fn typed_rows(result: &serde_json::Value, vars: &[&str]) -> Rows {
     out
 }
 
-/// One of the grouped count's own queries over fixture A: its SPARQL (`{ds}` for the
-/// dataset clause) and, where it has one, its JSON-LD twin; the columns; the
-/// rows by hand; and whether the union lane answers it, or which outcome it
-/// declines with.
+/// One of the grouped count's own queries over the multigraph fixture: its
+/// SPARQL (`{ds}` for the dataset clause) and, where it has one, its JSON-LD
+/// twin; the columns; the rows by hand; and whether the union lane answers it,
+/// or which outcome it declines with.
 struct GroupCase {
     label: &'static str,
     sparql: &'static str,
@@ -971,12 +971,12 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
     }
 }
 
-/// The grouped count beyond the shape, over fixture A's `FROM` scopes: grouping by the
-/// subject, two counts, modifiers above the count, a list's repeated value,
-/// one value under three datatypes, a predicate one member holds; and what it
-/// leaves to the general plan: a predicate no member holds, a count of the
-/// grouped key itself, another aggregate beside the count, a FILTER, and big
-/// numbers (an arena handle per graph and predicate).
+/// The grouped count beyond the shape, over the multigraph fixture's `FROM`
+/// scopes: grouping by the subject, two counts, modifiers above the count, a
+/// list's repeated value, one value under three datatypes, a predicate one
+/// member holds; and what it leaves to the general plan: a predicate no member
+/// holds, a count of the grouped key itself, another aggregate beside the
+/// count, a FILTER, and big numbers (an arena handle per graph and predicate).
 ///
 /// A list reads two ways. SPARQL sees the RDF list view: `?s ex:items ?v` is
 /// the owner edge to the list's first cell (`_:l0-0`), one row, planned as a
@@ -1319,9 +1319,9 @@ async fn grouped_count_union_answers_to_the_kill_switch() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Cypher over fixture A's ledger whose default graph is the union of its
-/// graphs (`f:unionDefaultGraph`): a count per related node, grouped by the
-/// object and by the subject, reaches the union lane and answers by hand;
+/// Cypher over the multigraph fixture's ledger whose default graph is the union
+/// of its graphs (`f:unionDefaultGraph`): a count per related node, grouped by
+/// the object and by the subject, reaches the union lane and answers by hand;
 /// over the plain ledger's default graph alone the one-graph lane answers.
 #[tokio::test(flavor = "current_thread")]
 async fn grouped_count_union_cypher_over_the_union_default_graph() {
@@ -1459,12 +1459,12 @@ fn check_union_probes(
     }
 }
 
-/// The union probes over their fixture: under a union of g1 and g2, every shape answers as
-/// the union's facts do and as the one-graph floor does, with fast paths on
-/// and off, and the union probe answers it; over g1 alone the one-graph
-/// lanes answer and the union site stays off. The membership join keeps its
-/// keep/drop path under the union, and goes exact where a list position
-/// repeats a key.
+/// The union probes over their fixture: under a union of g1 and g2, every shape
+/// answers as the union's facts do and as the one-graph floor does, with fast
+/// paths on and off, and the union probe answers it; over g1 alone the
+/// one-graph lanes answer and the union site stays off. The membership join
+/// keeps its keep/drop path under the union, and goes exact where a list
+/// position repeats a key.
 ///
 /// On JSON-LD a list's members are values, so every shape runs through its
 /// lane. On SPARQL a predicate holding lists is read through the list view,
@@ -1511,7 +1511,8 @@ async fn union_probes_answer_by_fact() {
                         union_probes::run_on(&fx, surface, ledger, prologue, dataset, shape).await;
                     let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
                         _ if list_view => (&[], &[union_site, "nested-loop-batched"]),
-                        // A list position repeating a key sends keep/drop exact.
+                        // A list position repeating a key sends keep/drop
+                        // exact.
                         Shape::Membership if repeats => (&[], &["membership-join"]),
                         Shape::Membership => (&["membership-join"], &[]),
                         _ => (&[union_site], &["nested-loop-batched"]),
@@ -1557,13 +1558,13 @@ async fn union_probes_answer_by_fact() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The union probes follow each member's own novelty, per graph and per predicate
-/// (the cyclic join's rule). Novelty outside the union, or on another predicate,
-/// leaves the union probe running. A member the index has no branch for,
-/// whose novelty holds the probed predicate, stands it down (`Novelty`);
-/// for now so does a member with a branch and such novelty. Every answer is
-/// the union's. JSON-LD, where the probed predicate's list members are
-/// values and the probe runs (on SPARQL the list view joins it).
+/// The union probes follow each member's own novelty, per graph and per
+/// predicate (the cyclic join's rule). Novelty outside the union, or on another
+/// predicate, leaves the union probe running. A member the index has no branch
+/// for, whose novelty holds the probed predicate, stands it down (`Novelty`);
+/// for now so does a member with a branch and such novelty. Every answer is the
+/// union's. JSON-LD, where the probed predicate's list members are values and
+/// the probe runs (on SPARQL the list view joins it).
 #[tokio::test(flavor = "current_thread")]
 async fn union_probes_follow_each_members_novelty() {
     use union_probes::{fact, Obj, Shape, G2, LEDGER};
@@ -1637,10 +1638,11 @@ async fn union_probes_follow_each_members_novelty() {
 }
 
 /// A one-graph join whose probed graph has no PSOT branch: the default graph
-/// (the union-probe fixture's facts are all in g1 and g2) and a named graph first written
-/// after the index, each holding left rows in novelty only. The probed
-/// predicate has no novelty there, so the graph holds nothing for the probe:
-/// the join answers with no rows, rather than failing to find the branch.
+/// (the union-probe fixture's facts are all in g1 and g2) and a named graph
+/// first written after the index, each holding left rows in novelty only. The
+/// probed predicate has no novelty there, so the graph holds nothing for the
+/// probe: the join answers with no rows, rather than failing to find the
+/// branch.
 #[tokio::test(flavor = "current_thread")]
 async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
     use union_probes::{fact, Obj, LEDGER};
@@ -1670,13 +1672,14 @@ async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
 
 /// Union rows stay encoded: an arena literal (a big number) leaves its member
 /// with the graph it was read from, so every consumer reads the value its own
-/// graph holds. The union-probe fixture's trap on `vf` (no lists, so SPARQL reads it as
-/// values): `y0 vf` is 1.5 in g1 and 2.5 in g2, both the first big-number
-/// handle of their graph; `y1 vf 3.5` is in both (one fact of the union);
-/// `y10 vf 7.5` is in g2. Each consumer that decodes or keys a binding (scan
-/// output, ORDER BY, FILTER, DISTINCT, GROUP BY) answers by value under both
-/// union spellings, with fast paths on and off, on the index and again with
-/// novelty in one member (which then binds decoded beside the encoded other).
+/// graph holds. The union-probe fixture's trap on `vf` (no lists, so SPARQL
+/// reads it as values): `y0 vf` is 1.5 in g1 and 2.5 in g2, both the first
+/// big-number handle of their graph; `y1 vf 3.5` is in both (one fact of the
+/// union); `y10 vf 7.5` is in g2. Each consumer that decodes or keys a binding
+/// (scan output, ORDER BY, FILTER, DISTINCT, GROUP BY) answers by value under
+/// both union spellings, with fast paths on and off, on the index and again
+/// with novelty in one member (which then binds decoded beside the encoded
+/// other).
 #[tokio::test(flavor = "current_thread")]
 async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
     use union_probes::{fact, Obj, G2, LEDGER};
@@ -1774,8 +1777,8 @@ async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
 // ============================================================================
 
 /// The shapes the list fixtures run, and the union site of the lane each
-/// exercises (the string bound is pushed into each member's scan: it has no union
-/// site, and is checked by its answer alone).
+/// exercises (the string bound is pushed into each member's scan: it has no
+/// union site, and is checked by its answer alone).
 const LIST_SHAPES: &[(Shape, Option<&str>)] = &[
     (Shape::ExistsInExpression, Some(EXISTS_SITES.1)),
     (Shape::BoundObjectCount, Some(OBJECT_COUNT_SITES.1)),

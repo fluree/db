@@ -1,5 +1,5 @@
-//! Fixture A, its scopes and its answers, for the lanes that read several
-//! graphs of one ledger.
+//! The multigraph fixture, its scopes and its answers, for the lanes that read
+//! several graphs of one ledger.
 //!
 //! A lane test picks a [`Shape`], runs it under every [`Scope`] with
 //! [`check`], and gets back what ran: the answer with fast paths on and with
@@ -25,22 +25,25 @@ use serde_json::{json, Value as JsonValue};
 use std::sync::OnceLock;
 
 pub const EX: &str = "http://example.org/";
-/// Fixture A: graphs g0 (the default graph), `urn:g1` and `urn:g2`.
+/// The multigraph fixture: graphs g0 (the default graph), `urn:g1` and
+/// `urn:g2`.
 pub const LEDGER: &str = "it/mg-lanes:main";
-/// Fixture A again, with `f:unionDefaultGraph` set in its config graph.
+/// The multigraph fixture again, with `f:unionDefaultGraph` set in its config
+/// graph.
 pub const UNION_LEDGER: &str = "it/mg-lanes-union:main";
 /// A second ledger, for a default graph that spans ledgers.
 pub const OTHER_LEDGER: &str = "it/mg-lanes-other:main";
-/// [`FIXTURE_A_EMPTY_G0`]: fixture A with an empty default graph.
+/// [`MULTIGRAPH_EMPTY_G0`]: the multigraph fixture with an empty default graph.
 pub const EMPTY_G0_LEDGER: &str = "it/mg-lanes-empty-g0:main";
-/// [`FIXTURE_A_EMPTY_G0`] again, with `f:unionDefaultGraph` set.
+/// [`MULTIGRAPH_EMPTY_G0`] again, with `f:unionDefaultGraph` set.
 pub const EMPTY_G0_UNION_LEDGER: &str = "it/mg-lanes-empty-g0-union:main";
 pub const G1: &str = "urn:g1";
 pub const G2: &str = "urn:g2";
 
-/// The parts of fixture A that [`FIXTURE_A`] and [`FIXTURE_A_EMPTY_G0`] share:
-/// its prefixes and its named graphs (what they hold is under [`FIXTURE_A`]).
-macro_rules! fixture_a {
+/// The parts of the multigraph fixture that [`MULTIGRAPH_FIXTURE`] and
+/// [`MULTIGRAPH_EMPTY_G0`] share: its prefixes and its named graphs (what they
+/// hold is under [`MULTIGRAPH_FIXTURE`]).
+macro_rules! multigraph_fixture {
     (prefixes) => {
         "
 @prefix ex: <http://example.org/> .
@@ -78,7 +81,7 @@ GRAPH <urn:g2> {
     };
 }
 
-/// Fixture A, written at t 1.
+/// The multigraph fixture, written at t 1.
 ///
 /// - an identical triple in g1 and g2: `s2 n 2`, `k1 kind T1`, `b big 2.5`
 ///   and triangle t3;
@@ -96,22 +99,23 @@ GRAPH <urn:g2> {
 ///   `2` (`xsd:integer`), `2.0e0` (`xsd:double`) and `"2"^^xsd:short`. `q1`
 ///   holds `2` in g1 and `2.0e0` in g2 (two facts), `q2` holds `2` in both
 ///   (one fact).
-pub const FIXTURE_A: &str = concat!(
-    fixture_a!(prefixes),
+pub const MULTIGRAPH_FIXTURE: &str = concat!(
+    multigraph_fixture!(prefixes),
     r#"
 ex:a1 ex:n 1 ; ex:label "a1" .
 ex:a2 ex:n 0 ; ex:label "a2" .
 ex:k0 ex:kind ex:T1 .
 ex:b ex:big 1.5 .
 "#,
-    fixture_a!(named)
+    multigraph_fixture!(named)
 );
 
-/// Fixture A's named graphs g1 and g2 alone: a ledger whose default graph
-/// holds no facts, so its index has no leaf for it in any order. Every
-/// union over it answers as g1 and g2 do; the empty member contributes
+/// The multigraph fixture's named graphs g1 and g2 alone: a ledger whose
+/// default graph holds no facts, so its index has no leaf for it in any order.
+/// Every union over it answers as g1 and g2 do; the empty member contributes
 /// nothing, and is no reason for a lane to decline.
-pub const FIXTURE_A_EMPTY_G0: &str = concat!(fixture_a!(prefixes), fixture_a!(named));
+pub const MULTIGRAPH_EMPTY_G0: &str =
+    concat!(multigraph_fixture!(prefixes), multigraph_fixture!(named));
 
 /// The second ledger's default graph.
 pub const FIXTURE_OTHER: &str = r#"
@@ -147,7 +151,7 @@ fn union_config(ledger: &str) -> String {
 /// The state the fixture's ledgers are in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Fixture A at t 1, indexed, no novelty.
+    /// The multigraph fixture at t 1, indexed, no novelty.
     Indexed,
     /// [`WRITE_TO_G2`] committed at t 2 and not indexed: novelty in g2.
     Novelty,
@@ -156,10 +160,10 @@ pub enum State {
     Indexed2,
 }
 
-/// Fixture A (twice: plain and with `f:unionDefaultGraph`), the same pair
-/// with an empty default graph, and the second ledger, on one in-memory
-/// connection with background indexing off, so only explicit index builds
-/// change what is indexed.
+/// The multigraph fixture (twice: plain and with `f:unionDefaultGraph`), the
+/// same pair with an empty default graph, and the second ledger, on one
+/// in-memory connection with background indexing off, so only explicit index
+/// builds change what is indexed.
 pub struct Fixture {
     pub fluree: Fluree,
     pub state: State,
@@ -169,15 +173,20 @@ impl Fixture {
     pub async fn build(state: State) -> Self {
         let fluree = FlureeBuilder::memory().without_indexing().build_memory();
         let config = union_config(UNION_LEDGER);
-        seed(&fluree, LEDGER, FIXTURE_A).await;
-        seed(&fluree, UNION_LEDGER, &format!("{FIXTURE_A}\n{config}")).await;
+        seed(&fluree, LEDGER, MULTIGRAPH_FIXTURE).await;
+        seed(
+            &fluree,
+            UNION_LEDGER,
+            &format!("{MULTIGRAPH_FIXTURE}\n{config}"),
+        )
+        .await;
         seed(&fluree, OTHER_LEDGER, FIXTURE_OTHER).await;
         let config = union_config(EMPTY_G0_UNION_LEDGER);
-        seed(&fluree, EMPTY_G0_LEDGER, FIXTURE_A_EMPTY_G0).await;
+        seed(&fluree, EMPTY_G0_LEDGER, MULTIGRAPH_EMPTY_G0).await;
         seed(
             &fluree,
             EMPTY_G0_UNION_LEDGER,
-            &format!("{FIXTURE_A_EMPTY_G0}\n{config}"),
+            &format!("{MULTIGRAPH_EMPTY_G0}\n{config}"),
         )
         .await;
         if state != State::Indexed {
@@ -266,8 +275,9 @@ async fn index(fluree: &Fluree, ledger: &str) {
 // The list fixtures (#2159)
 // ============================================================================
 
-/// Fixture A's list, `L items ("v" "v")` in g2, as the TriG writes it.
-const FIXTURE_A_LIST: &str = "  ex:L ex:items ( \"v\" \"v\" ) .\n";
+/// The multigraph fixture's list, `L items ("v" "v")` in g2, as the TriG writes
+/// it.
+const MULTIGRAPH_LIST: &str = "  ex:L ex:items ( \"v\" \"v\" ) .\n";
 
 /// Edges for [`Shape::SubjectProbe`]: `ex:sel` to subjects with an `n`, one
 /// edge in both members.
@@ -276,9 +286,9 @@ GRAPH <urn:g1> { ex:s1 ex:sel ex:s2 . ex:a9 ex:sel ex:s3 . }
 GRAPH <urn:g2> { ex:s1 ex:sel ex:s2 . ex:s2 ex:sel ex:s1 . }
 ";
 
-/// Lists on every lane's predicate, and on fixture A's list predicate, in
-/// `graph`: each lane's shape can meet a list member. Written to g1 and g2
-/// they are one list fact in both members.
+/// Lists on every lane's predicate, and on the multigraph fixture's list
+/// predicate, in `graph`: each lane's shape can meet a list member. Written to
+/// g1 and g2 they are one list fact in both members.
 fn lists_in(graph: &str) -> String {
     format!(
         r#"
@@ -294,8 +304,8 @@ GRAPH <{graph}> {{
     )
 }
 
-/// Fixture A's list in g1 too, so g1 and g2 hold one list fact.
-const FIXTURE_A_LIST_IN_G1: &str = r#"
+/// The multigraph fixture's list in g1 too, so g1 and g2 hold one list fact.
+const MULTIGRAPH_LIST_IN_G1: &str = r#"
 GRAPH <urn:g1> { ex:L ex:items ( "v" "v" ) . }
 "#;
 
@@ -307,34 +317,38 @@ GRAPH <urn:g1> { ex:L ex:items ( "v" "v" ) . }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListCase {
     /// Lists on every lane's predicate in g1 and in g2, as one list fact in
-    /// both, and fixture A's list in both; indexed.
+    /// both, and the multigraph fixture's list in both; indexed.
     TwoMembers,
-    /// Fixture A with no list, indexed; then fixture A's list and the lanes'
+    /// The multigraph fixture with no list, indexed; then the fixture's list
+    /// and the lanes'
     /// lists are written to g2 and not indexed.
     NoveltyOnly,
 }
 
 impl Fixture {
-    /// The ledgers of [`Fixture::build`] for `case`: fixture A with
-    /// [`SEL_EDGES`] and the case's lists. The fixture's state is `Indexed`
-    /// for [`ListCase::TwoMembers`] and `Novelty` for
+    /// The ledgers of [`Fixture::build`] for `case`: the multigraph fixture
+    /// with [`SEL_EDGES`] and the case's lists. The fixture's state is
+    /// `Indexed` for [`ListCase::TwoMembers`] and `Novelty` for
     /// [`ListCase::NoveltyOnly`].
     pub async fn build_lists(case: ListCase) -> Self {
         let fluree = FlureeBuilder::memory().without_indexing().build_memory();
         let (a, empty_g0) = match case {
             ListCase::TwoMembers => {
-                let lists = format!("{FIXTURE_A_LIST_IN_G1}{}{}", lists_in(G1), lists_in(G2));
+                let lists = format!("{MULTIGRAPH_LIST_IN_G1}{}{}", lists_in(G1), lists_in(G2));
                 (
-                    format!("{FIXTURE_A}{SEL_EDGES}{lists}"),
-                    format!("{FIXTURE_A_EMPTY_G0}{SEL_EDGES}{lists}"),
+                    format!("{MULTIGRAPH_FIXTURE}{SEL_EDGES}{lists}"),
+                    format!("{MULTIGRAPH_EMPTY_G0}{SEL_EDGES}{lists}"),
                 )
             }
             ListCase::NoveltyOnly => {
                 let strip = |trig: &str| {
-                    assert!(trig.contains(FIXTURE_A_LIST), "fixture A's list moved");
-                    format!("{}{SEL_EDGES}", trig.replace(FIXTURE_A_LIST, ""))
+                    assert!(
+                        trig.contains(MULTIGRAPH_LIST),
+                        "the multigraph fixture's list moved"
+                    );
+                    format!("{}{SEL_EDGES}", trig.replace(MULTIGRAPH_LIST, ""))
                 };
-                (strip(FIXTURE_A), strip(FIXTURE_A_EMPTY_G0))
+                (strip(MULTIGRAPH_FIXTURE), strip(MULTIGRAPH_EMPTY_G0))
             }
         };
         seed(&fluree, LEDGER, &a).await;
@@ -353,8 +367,8 @@ impl Fixture {
             ListCase::TwoMembers => State::Indexed,
             ListCase::NoveltyOnly => {
                 let write = format!(
-                    "{}GRAPH <{G2}> {{\n{FIXTURE_A_LIST}}}\n{}",
-                    fixture_a!(prefixes),
+                    "{}GRAPH <{G2}> {{\n{MULTIGRAPH_LIST}}}\n{}",
+                    multigraph_fixture!(prefixes),
                     lists_in(G2)
                 );
                 for ledger in [LEDGER, UNION_LEDGER, EMPTY_G0_LEDGER, EMPTY_G0_UNION_LEDGER] {
@@ -635,26 +649,30 @@ impl Scope {
 /// The shapes the lanes answer, named by lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
-    /// The EXISTS cache: `FILTER(EXISTS { ?x ex:label ?l } && ?v > 0)`, the EXISTS cache.
+    /// The EXISTS cache: `FILTER(EXISTS { ?x ex:label ?l } && ?v > 0)`, the
+    /// EXISTS cache.
     ExistsInExpression,
-    /// The object count: `COUNT(?s)` over `?s ex:kind ex:T1`, the bound-object count.
+    /// The object count: `COUNT(?s)` over `?s ex:kind ex:T1`, the bound-object
+    /// count.
     BoundObjectCount,
-    /// The object count again: `COUNT(?s)` over `?s ex:m 2`, a bound-object count whose constant
-    /// matches facts of three numeric datatypes.
+    /// The object count again: `COUNT(?s)` over `?s ex:m 2`, a bound-object
+    /// count whose constant matches facts of three numeric datatypes.
     BoundNumericCount,
     /// The per-predicate count: `COUNT(?s)` per predicate over `?s ?p ?o`.
     PerPredicateCount,
     /// The cyclic join: the `ex:knows` triangle.
     Triangle,
-    /// The grouped count: `COUNT(*)` grouped by `?v` over `?s ex:n ?v`, the partitioned GROUP BY.
+    /// The grouped count: `COUNT(*)` grouped by `?v` over `?s ex:n ?v`, the
+    /// partitioned GROUP BY.
     GroupByObject,
     /// The union probes: `?x ex:sel ?y . ?y ex:n ?v`, the nested-loop join's
     /// subject probe.
     /// Only the list fixtures hold `ex:sel` ([`ListCase`]), and it is checked
     /// against the general plan there, not by hand.
     SubjectProbe,
-    /// The string bound: `?s ex:label ?l FILTER(?l >= "s2")`, a string bound pushed into
-    /// the scan. Checked against the general plan on the list fixtures only.
+    /// The string bound: `?s ex:label ?l FILTER(?l >= "s2")`, a string bound
+    /// pushed into the scan. Checked against the general plan on the list
+    /// fixtures only.
     StringBound,
 }
 
@@ -975,12 +993,12 @@ fn triangles(ns: &[u8]) -> Rows {
 }
 
 /// The answer to `shape` over `graphs` of the fixture in `state`, written by
-/// hand from [`FIXTURE_A`], [`FIXTURE_OTHER`] and [`WRITE_TO_G2`].
+/// hand from [`MULTIGRAPH_FIXTURE`], [`FIXTURE_OTHER`] and [`WRITE_TO_G2`].
 ///
-/// A default graph of two or more graphs is the union of their facts (storage's fact identity, #2109):
-/// a fact two members both hold is one solution. A fact is identified with its
-/// list position, so a list's repeated value stays two rows in a union, as in
-/// one graph.
+/// A default graph of two or more graphs is the union of their facts (storage's
+/// fact identity, #2109): a fact two members both hold is one solution. A fact
+/// is identified with its list position, so a list's repeated value stays two
+/// rows in a union, as in one graph.
 ///
 /// A list reads as JSON-LD reads it, its members values of the owning
 /// predicate; SPARQL reads it as the RDF it denotes (#2159), see
@@ -1091,8 +1109,8 @@ fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
                 rows(&[&[&n.to_string()]])
             }
             // Facts `?s ex:m v` with v numerically 2, any datatype. Over a
-            // union a fact two members both hold counts once (storage's fact identity); q1's
-            // integer and double are two facts.
+            // union a fact two members both hold counts once (storage's fact
+            // identity); q1's integer and double are two facts.
             Shape::BoundNumericCount => {
                 let n = match graphs {
                     Graphs::G0 | Graphs::G0Other | Graphs::Empty => 0,
@@ -1140,8 +1158,8 @@ fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
                     ],
                     // `s2 n 2`, `k1 kind`, `b big 2.5`, t3 and `q2 m 2` once
                     // each (both members hold them); L's two list items stay
-                    // two facts, and so do q1's `m 2` and `m 2.0e0` (storage's fact identity);
-                    // the write's t2 edges are g1's.
+                    // two facts, and so do q1's `m 2` and `m 2.0e0` (storage's
+                    // fact identity); the write's t2 edges are g1's.
                     Graphs::G1G2 if w => &[
                         ("n", 5),
                         ("label", 2),
