@@ -1224,6 +1224,8 @@ When comparing incomparable types (e.g., a number and a string):
 - `!=` yields `true` — values of different types are not equal
 - `<`, `<=`, `>`, `>=` raise an error — ordering between incompatible types is undefined
 
+A string constant is an `xsd:string` term. `(= ?o "a")` is `false` for `"a"@en`, and for a literal of another datatype (`"a"^^ex:T`) both `=` and `!=` raise an error, which drops the row. To compare the text whatever its tag or datatype, use `(= (str ?o) "a")`. An `@fulltext` or `@json` value is its own datatype the same way, while the string functions (`contains`, `regex`, `strStarts`, `subStr`, …) read it as text. (This differs from a bare string as a constant object in `where`, which matches the text under any tag; see [Datatypes](../concepts/datatypes.md).)
+
 ### Logical Functions
 
 - `(and ...)` - Logical AND

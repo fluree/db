@@ -195,6 +195,19 @@ impl Expression {
                             return Ok(Some(ComparableValue::Float(d as f32)));
                         }
                     }
+                    // A stored `@fulltext` literal decodes to a bare string as
+                    // well, so `=` and `<` read it as an `xsd:string` here and
+                    // as `f:fullText` on the Lit path. Re-tag it the same way;
+                    // the string builtins still read it as text
+                    // (`value::reads_as_text`).
+                    if *dt_id == DatatypeDictId::FULL_TEXT.as_u16() {
+                        return Ok(Some(ComparableValue::TypedLiteral {
+                            val,
+                            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                                Arc::from(fluree_vocab::fluree::FULL_TEXT),
+                            )),
+                        }));
+                    }
                     // A stored language-tagged literal decodes to a bare string
                     // (`FlakeValue::String` cannot carry the tag), so `=`/`!=`/
                     // `IN` were tag-blind exactly on the production-typical

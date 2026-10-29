@@ -371,7 +371,10 @@ impl BinaryHistoryScanOperator {
         };
         let object_matches = |f: &Flake| {
             flake_matches_range_eq(f, &object_match)
-                && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
+                && self
+                    .object_bounds
+                    .as_ref()
+                    .is_none_or(|b| b.matches(&f.o, &f.dt))
         };
         flakes.retain(|f| object_matches(f));
 

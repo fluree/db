@@ -1440,6 +1440,10 @@ impl BinaryScanOperator {
         // a scan that is not a union member pays nothing per row.
         let record_facts = self.row_facts.is_some();
         let record_object = record_facts && self.object_is_constant_literal();
+        // Prepared once per batch: a string bound ordered against temporal
+        // rows is parsed once per temporal kind, not per row.
+        let object_bounds = self.object_bounds.clone();
+        let object_bounds = object_bounds.as_ref().map(ObjectBounds::prepare);
         // Decided per batch: a leaflet holding no list rows loads its
         // position column as the constant "none".
         let hide_members = self.hide_list_members
@@ -1537,13 +1541,13 @@ impl BinaryScanOperator {
                 }
             }
 
-            if let Some(bounds) = &self.object_bounds {
+            if let Some(bounds) = &object_bounds {
                 let Some(val) = decoded_o.as_ref() else {
                     return Err(QueryError::Internal(
                         "object bounds require object decoding".to_string(),
                     ));
                 };
-                if !bounds.matches(val) {
+                if !bounds.matches_encoded(val, OType::from_u16(o_type)) {
                     continue;
                 }
             }
@@ -2011,7 +2015,8 @@ impl BinaryScanOperator {
 
         // Apply object bounds (post-filter) when present.
         if let Some(bounds) = self.object_bounds.as_ref() {
-            flakes.retain(|f| bounds.matches(&f.o));
+            let bounds = bounds.prepare();
+            flakes.retain(|f| bounds.matches(&f.o, &f.dt));
         }
 
         self.range_iter = Some(flakes.into_iter());
@@ -2617,6 +2622,7 @@ impl Operator for BinaryScanOperator {
         let mut range_min_okey: Option<u64> = None;
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
+        let mut bound_slices = false;
         if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
             if let Some(bounds) = self.object_bounds.as_ref() {
                 let supports_range = |ot: OType| -> bool {
@@ -2663,6 +2669,16 @@ impl Operator for BinaryScanOperator {
                     range_o_type = Some(o_type);
                     // Also set the filter o_type so directory-level pre-skip can eliminate non-matching leaflets.
                     filter.o_type = Some(o_type);
+                    // `<`, `<=`, `>` and `>=` also order an `xsd:string` row
+                    // against a temporal bound, reading it as a value of that
+                    // type, so seek that slice too, unranged (string ids are
+                    // not in date order). `=` never equates the two, so its
+                    // seek stays on the temporal slice.
+                    if bounds.temporal_string_ordering {
+                        object_slices =
+                            vec![(OType::from_u16(o_type), None), (OType::XSD_STRING, None)];
+                        bound_slices = true;
+                    }
                 }
 
                 // Integer EQUALITY bounds (`FILTER(?v = 4112)`, the id-lookup
@@ -2695,6 +2711,53 @@ impl Operator for BinaryScanOperator {
                         }
                     }
                 }
+
+                // A string bound admits only `xsd:string` objects (plus, when
+                // it orders against temporals, the temporal types its strings
+                // parse as), so seek those slices rather than read every type
+                // the predicate holds: tagged and otherwise-typed strings sort
+                // into other o_types. An equality seeks its one string id, as
+                // `?s <p> "a"` does. A bound already narrowed above (a date
+                // on the other side) keeps that narrowing.
+                let narrowed =
+                    range_o_type.is_some() || range_min_okey.is_some() || range_max_okey.is_some();
+                if let Some(otypes) = bounds.string_bound_otypes().filter(|_| !narrowed) {
+                    stamp_string_bound_seek();
+                    let point = match (&bounds.lower, &bounds.upper) {
+                        (
+                            Some((lo @ FlakeValue::String(_), true)),
+                            Some((hi @ FlakeValue::String(_), true)),
+                        ) if lo == hi && otypes == [OType::XSD_STRING] => Some(lo),
+                        _ => None,
+                    };
+                    let encoded = point.map(|s| {
+                        value_to_otype_okey(
+                            s,
+                            &Sid::xsd_string(),
+                            None,
+                            store_ref,
+                            ctx.dict_novelty.as_ref(),
+                            None,
+                        )
+                    });
+                    match encoded {
+                        Some(Ok((ot, key))) => {
+                            filter.o_type = Some(ot.as_u16());
+                            filter.o_key = Some(key);
+                        }
+                        // Absent from the base dictionary; only novelty can hold it.
+                        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
+                        }
+                        _ => match otypes.as_slice() {
+                            [ot] => filter.o_type = Some(ot.as_u16()),
+                            _ => {
+                                object_slices = otypes.into_iter().map(|ot| (ot, None)).collect();
+                                bound_slices = true;
+                            }
+                        },
+                    }
+                }
             }
         }
 
@@ -2713,7 +2776,7 @@ impl Operator for BinaryScanOperator {
         // A bare number spanning several numeric datatypes seeks each slice
         // with its own cursor, drained in turn.
         let slice_filters = object_slice_filters(order, filter, &object_slices);
-        if !object_slices.is_empty() {
+        if !object_slices.is_empty() && !bound_slices {
             stamp_bare_number_seek(slice_filters.len() > 1);
         }
         let open_cursor = |filter: BinaryFilter| {
@@ -2728,6 +2791,14 @@ impl Operator for BinaryScanOperator {
                 .with_tracker(ctx.tracker.clone());
                 return (cursor, None);
             }
+            // The temporal key range bounds the temporal slice only, not an
+            // `xsd:string` slice sought beside it.
+            let in_range = filter.o_type.is_none() || filter.o_type == range_o_type;
+            let (range_min_okey, range_max_okey) = if in_range {
+                (range_min_okey, range_max_okey)
+            } else {
+                (None, None)
+            };
             let min_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(0)),
                 o_key: filter.o_key.or(range_min_okey).unwrap_or(0),
@@ -3078,7 +3149,10 @@ impl Operator for BinaryScanOperator {
                                     .and_then(|m| m.lang.as_deref())
                                     .is_some_and(|l| l.eq_ignore_ascii_case(lang))
                             })
-                            && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
+                            && self
+                                .object_bounds
+                                .as_ref()
+                                .is_none_or(|b| b.matches(&f.o, &f.dt))
                     })
                     .cloned()
                     .collect();
@@ -4346,6 +4420,15 @@ fn stamp_bare_number_seek(seeks: bool) {
             FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
         },
     );
+}
+
+/// Routing stamp: a scan under a string object bound seeks the `o_type`
+/// slices the bound admits (see `ObjectBounds::string_bound_otypes`).
+const STRING_BOUND_SEEK_SITE: &str = "string_bound_seek";
+
+fn stamp_string_bound_seek() {
+    use crate::fast_path_outcome::{stamp_fast_path, FastPathOutcome};
+    stamp_fast_path(STRING_BOUND_SEEK_SITE, FastPathOutcome::Proceed);
 }
 
 /// One seek of a bare-number scan: the rows of `o_type` keyed `o_key`, or with

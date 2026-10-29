@@ -218,12 +218,11 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-not-eq",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-simple",
     // D5 datatype-aware `=`/`!=` (rdf_term_equal) greened eq-2-1/eq-2-2 (numeric
-    // promotion + foreign-datatype distinctness) and open-eq-04. eq-4 remains:
-    // its foreign literal arrives as a late-materialized EncodedLit (scan+filter
-    // path), whose datatype-aware carry is on the binary-index hot path
-    // (bench-sensitive, D5b class); the join-materialized Lit path is already
-    // fixed — the same "zzz"^^:myType is correctly distinct in eq-2-1 — PR-X2.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-4",
+    // promotion + foreign-datatype distinctness) and open-eq-04. eq-4
+    // (`FILTER(?v = "zzz")`) greened once a pushed string bound became the
+    // xsd:string term: the filter is pushed into the scan as object bounds and
+    // dropped, and the bounds compared the lexical value alone, so they kept
+    // "zzz"^^:myType.
     // eq-dateTime: temporal `=` — a plain string vs xsd:dateTime and timezone-
     // instant handling; needs temporal value semantics beyond the filter lattice
     // — PR-X2 (temporal, deferred).

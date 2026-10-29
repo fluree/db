@@ -501,6 +501,11 @@ pub struct RangeConstraint {
     pub lower: Option<(RangeValue, bool)>,
     /// Upper bound: (value, inclusive)
     pub upper: Option<(RangeValue, bool)>,
+    /// Whether an `=` contributed to the bounds. `=` never equates a string
+    /// with a temporal, where `<` and `>` order one by parsing it, so only
+    /// bounds without one may compare across the two
+    /// ([`ObjectBounds::temporal_string_ordering`]).
+    pub from_equality: bool,
 }
 
 /// A value that can be used in range constraints
@@ -511,6 +516,9 @@ pub enum RangeValue {
     Long(i64),
     Double(f64),
     Decimal(Box<bigdecimal::BigDecimal>),
+    /// The `xsd:string` term with this lexical form: a plain string constant
+    /// (SPARQL `"a"` or `"a"^^xsd:string`, a JSON-LD or Cypher string). It
+    /// bounds `xsd:string` objects only ([`ObjectBounds`]).
     String(String),
     /// Temporal value for range pushdown (NOT used for xsd:duration — it has no total order)
     Temporal(fluree_db_core::value::FlakeValue),
@@ -523,6 +531,7 @@ impl RangeConstraint {
             var,
             lower: None,
             upper: None,
+            from_equality: false,
         }
     }
 
@@ -593,6 +602,7 @@ impl RangeConstraint {
 
         self.lower = lower;
         self.upper = upper;
+        self.from_equality |= other.from_equality;
         true
     }
 
@@ -823,6 +833,7 @@ fn create_constraint(
             // Equality: lower = upper = val, both inclusive
             constraint.lower = Some((val.clone(), true));
             constraint.upper = Some((val, true));
+            constraint.from_equality = true;
         }
         CompareOp::Lt => {
             // ?var < val: upper bound exclusive
@@ -874,7 +885,10 @@ impl RangeConstraint {
             return None;
         }
 
-        let mut bounds = ObjectBounds::new();
+        let mut bounds = ObjectBounds {
+            temporal_string_ordering: !self.from_equality,
+            ..ObjectBounds::new()
+        };
 
         if let Some((val, inclusive)) = &self.lower {
             bounds = bounds.with_lower(val.to_flake_value(), *inclusive);
@@ -4509,6 +4523,24 @@ mod tests {
             c.upper,
             Some((RangeValue::String("active".to_string()), true))
         );
+        assert!(c.from_equality);
+    }
+
+    /// `=` and `>= && <=` push the same two bounds, but only the ranges may
+    /// order a string against a temporal, so the bounds record which it was.
+    #[test]
+    fn test_object_bounds_record_equality() {
+        let a = || Expression::Const(FlakeValue::String("a".to_string()));
+        let eq = Expression::eq(Expression::Var(VarId(0)), a());
+        let closed = Expression::and(vec![
+            Expression::ge(Expression::Var(VarId(0)), a()),
+            Expression::le(Expression::Var(VarId(0)), a()),
+        ]);
+        let eq_and_range = Expression::and(vec![eq.clone(), closed.clone()]);
+        for (expr, ordering) in [(eq, false), (closed, true), (eq_and_range, false)] {
+            let bounds = extract_object_bounds_for_var(&expr, VarId(0)).expect("pushed");
+            assert_eq!(bounds.temporal_string_ordering, ordering, "{expr:?}");
+        }
     }
 
     #[test]
@@ -4689,14 +4721,14 @@ mod tests {
         );
 
         let bounds = extract_object_bounds_for_var(&expr, VarId(0)).expect("bounds");
-        assert!(bounds.matches(&FlakeValue::Double(0.005)));
-        assert!(bounds.matches(&FlakeValue::Long(0)));
-        assert!(bounds.matches(&decimal_value("0.0099")));
-        assert!(!bounds.matches(&FlakeValue::Double(0.01)));
-        assert!(!bounds.matches(&decimal_value("0.01")));
-        assert!(!bounds.matches(&FlakeValue::Long(7)));
-        assert!(!bounds.matches(&FlakeValue::Double(497.2607)));
-        assert!(!bounds.matches(&FlakeValue::Double(-0.5)));
+        assert!(bounds.matches_number(&FlakeValue::Double(0.005)));
+        assert!(bounds.matches_number(&FlakeValue::Long(0)));
+        assert!(bounds.matches_number(&decimal_value("0.0099")));
+        assert!(!bounds.matches_number(&FlakeValue::Double(0.01)));
+        assert!(!bounds.matches_number(&decimal_value("0.01")));
+        assert!(!bounds.matches_number(&FlakeValue::Long(7)));
+        assert!(!bounds.matches_number(&FlakeValue::Double(497.2607)));
+        assert!(!bounds.matches_number(&FlakeValue::Double(-0.5)));
     }
 
     #[test]
@@ -4835,8 +4867,8 @@ mod tests {
         let b = bounds.get(&VarId(0)).expect("bounds for ?v");
         assert!(b.lower.is_some(), "lower bound pushed");
         assert!(b.upper.is_some(), "upper bound pushed");
-        assert!(b.matches(&FlakeValue::Double(0.005)));
-        assert!(!b.matches(&FlakeValue::Double(0.01)));
+        assert!(b.matches_number(&FlakeValue::Double(0.005)));
+        assert!(!b.matches_number(&FlakeValue::Double(0.01)));
     }
 
     #[test]
@@ -4994,18 +5026,18 @@ mod tests {
         let bounds = c1.to_object_bounds().expect("should have bounds");
         assert!(!bounds.is_empty());
         // Verify it filters correctly
-        assert!(!bounds.matches(&FlakeValue::Long(18))); // exclusive
-        assert!(bounds.matches(&FlakeValue::Long(19)));
+        assert!(!bounds.matches_number(&FlakeValue::Long(18))); // exclusive
+        assert!(bounds.matches_number(&FlakeValue::Long(19)));
 
         // Two-sided bounds
         let c2 = RangeConstraint::new(VarId(0))
             .with_lower(RangeValue::Long(18), false)
             .with_upper(RangeValue::Long(65), true);
         let bounds = c2.to_object_bounds().expect("should have bounds");
-        assert!(!bounds.matches(&FlakeValue::Long(18))); // exclusive lower
-        assert!(bounds.matches(&FlakeValue::Long(19)));
-        assert!(bounds.matches(&FlakeValue::Long(65))); // inclusive upper
-        assert!(!bounds.matches(&FlakeValue::Long(66)));
+        assert!(!bounds.matches_number(&FlakeValue::Long(18))); // exclusive lower
+        assert!(bounds.matches_number(&FlakeValue::Long(19)));
+        assert!(bounds.matches_number(&FlakeValue::Long(65))); // inclusive upper
+        assert!(!bounds.matches_number(&FlakeValue::Long(66)));
     }
 
     #[test]
@@ -5028,9 +5060,9 @@ mod tests {
             extract_object_bounds_for_var(&filter, VarId(0)).expect("should extract bounds");
 
         // Should filter 18 out (exclusive) but include 19
-        assert!(!bounds.matches(&FlakeValue::Long(18)));
-        assert!(bounds.matches(&FlakeValue::Long(19)));
-        assert!(bounds.matches(&FlakeValue::Long(100)));
+        assert!(!bounds.matches_number(&FlakeValue::Long(18)));
+        assert!(bounds.matches_number(&FlakeValue::Long(19)));
+        assert!(bounds.matches_number(&FlakeValue::Long(100)));
     }
 
     #[test]
@@ -5050,10 +5082,10 @@ mod tests {
         let bounds =
             extract_object_bounds_for_var(&filter, VarId(0)).expect("should extract bounds");
 
-        assert!(!bounds.matches(&FlakeValue::Long(18)));
-        assert!(bounds.matches(&FlakeValue::Long(19)));
-        assert!(bounds.matches(&FlakeValue::Long(64)));
-        assert!(!bounds.matches(&FlakeValue::Long(65)));
+        assert!(!bounds.matches_number(&FlakeValue::Long(18)));
+        assert!(bounds.matches_number(&FlakeValue::Long(19)));
+        assert!(bounds.matches_number(&FlakeValue::Long(64)));
+        assert!(!bounds.matches_number(&FlakeValue::Long(65)));
     }
 
     #[test]
@@ -5332,12 +5364,12 @@ mod tests {
 
         let bounds = extract_object_bounds_for_var(&expr, VarId(0)).expect("should extract bounds");
 
-        assert!(!bounds.matches(&FlakeValue::Long(10))); // exclusive lower
-        assert!(bounds.matches(&FlakeValue::Long(11)));
-        assert!(bounds.matches(&FlakeValue::Long(19)));
-        assert!(!bounds.matches(&FlakeValue::Long(20))); // exclusive upper
-        assert!(!bounds.matches(&FlakeValue::Long(5))); // below range
-        assert!(!bounds.matches(&FlakeValue::Long(25))); // above range
+        assert!(!bounds.matches_number(&FlakeValue::Long(10))); // exclusive lower
+        assert!(bounds.matches_number(&FlakeValue::Long(11)));
+        assert!(bounds.matches_number(&FlakeValue::Long(19)));
+        assert!(!bounds.matches_number(&FlakeValue::Long(20))); // exclusive upper
+        assert!(!bounds.matches_number(&FlakeValue::Long(5))); // below range
+        assert!(!bounds.matches_number(&FlakeValue::Long(25))); // above range
     }
 
     // =========================================================================
