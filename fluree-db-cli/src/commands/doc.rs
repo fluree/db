@@ -770,6 +770,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 reader: Some(reader),
                 ..
             }) => {
+                doc_reader::renew(reader).await?;
                 let reader = reader.clone();
                 let out_dir = args.out_dir.clone();
                 let (doc, read) = tokio::task::spawn_blocking(move || {

@@ -133,7 +133,9 @@ pub struct Answer {
 pub struct ReaderClient {
     agent: ureq::Agent,
     url: String,
-    credential: Option<Credential>,
+    /// Replaceable, for a credential that is renewed during a run (an
+    /// account sign-in's hourly token).
+    credential: std::sync::RwLock<Option<Credential>>,
 }
 
 impl std::fmt::Debug for ReaderClient {
@@ -164,12 +166,17 @@ impl ReaderClient {
         Self {
             agent,
             url: url.to_string(),
-            credential,
+            credential: std::sync::RwLock::new(credential),
         }
     }
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Replace the credential the next calls send.
+    pub fn set_credential(&self, credential: Option<Credential>) {
+        *self.credential.write().expect("credential lock") = credential;
     }
 
     /// Read one request dataset (TriG) with `model`. `on_wait` hears about
@@ -193,7 +200,8 @@ impl ReaderClient {
             if let Some(c) = cache {
                 req = req.header("X-Fluree-Cache", c);
             }
-            req = match &self.credential {
+            let credential = self.credential.read().expect("credential lock").clone();
+            req = match &credential {
                 Some(Credential::Bearer(t)) => req.header("Authorization", &format!("Bearer {t}")),
                 Some(Credential::Header { name, value }) => {
                     req.header(name.as_str(), value.as_str())
@@ -369,6 +377,7 @@ mod tests {
             auth_header: Some("X-Api-Key".into()),
             models: vec!["m".into()],
             cache: None,
+            account: false,
         }
     }
 

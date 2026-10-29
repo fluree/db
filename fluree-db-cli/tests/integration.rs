@@ -7248,3 +7248,63 @@ fn doc_read_names_what_is_missing() {
             "--model nobody: no [doc.reader] lists it",
         ));
 }
+
+/// A JWT whose `exp` is far off, so the sign-in is used without a refresh.
+fn long_lived_jwt() -> String {
+    use base64::Engine;
+    let enc = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    };
+    format!(
+        "{}.{}.sig",
+        enc(serde_json::json!({"alg": "none"})),
+        enc(serde_json::json!({"exp": 4_102_444_800_i64, "sub": "acct"}))
+    )
+}
+
+/// `account = true`: the reader is the signed-in account's own, reached at
+/// `<api base>/grounding` with the sign-in's token; not signed in, it says so.
+#[test]
+fn doc_read_through_the_signed_in_account() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    let base = url.trim_end_matches("/extract").to_string();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let read = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", &home)
+            .env("FLUREE_DOC_READER_ACCOUNT", "true")
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--model", "stub-reader", "--no-cache"]);
+        cmd
+    };
+
+    read().assert().failure().stderr(predicate::str::contains(
+        "isn't signed in: run `fluree login`",
+    ));
+    assert!(seen.lock().unwrap().is_empty());
+
+    let token = long_lived_jwt();
+    std::fs::write(
+        home.join("account.toml"),
+        format!(
+            "url = \"{base}\"\napi_base_url = \"{base}/v1\"\nexchange_url = \"{base}/v1/oauth/token\"\naccess_token = \"{token}\"\nrefresh_token = \"flk_test\"\n"
+        ),
+    )
+    .unwrap();
+    read()
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!("via {base}/v1/grounding")));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let head = &seen[0].0;
+    assert!(head.starts_with("post /v1/grounding "), "{head}");
+    assert!(
+        head.contains(&format!("authorization: bearer {}", token.to_lowercase())),
+        "{head}"
+    );
+}

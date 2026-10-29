@@ -288,7 +288,15 @@ Then `fluree doc ingest ./docs -l docs --ontology onto.ttl --catalog people --mo
 - **Resends.** A request is resent only when the reader answers 503 with `Retry-After` (no capacity yet, such as a model still starting), after the wait it names, up to four attempts and five minutes of waiting, each wait shown as it starts. Nothing else is resent, because any other failure may follow a read that ran and was billed.
 - **Caching.** Answers are kept in the reading cache by request body, so a rerun that sends the same request (`--force` with nothing changed) is not read again; `--no-cache` reads afresh.
 
-Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE}` and `FLUREE_DOC_MODEL` override the file.
+A reader the signed-in account serves needs no key: with `account = true` the credential is this machine's [`fluree login`](login.md), renewed as it runs, and `url` defaults to the account's own reader at `<api base>/grounding`:
+
+```toml
+[doc.reader]
+account = true
+models = ["reader-small"]
+```
+
+Environment variables `FLUREE_DOC_READER_{URL,API_KEY,AUTH_HEADER,MODELS,CACHE,ACCOUNT}` and `FLUREE_DOC_MODEL` override the file.
 
 ### Using a Fluree AI account
 
