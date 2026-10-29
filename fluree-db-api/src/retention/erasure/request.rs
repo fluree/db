@@ -213,6 +213,7 @@ impl Fluree {
             published_ms: None,
             added: Vec::new(),
             purge: None,
+            as_written: None,
         };
         let recorded = job.clone();
         registry::update(ns, ledger_id.as_str(), |current| {
@@ -677,6 +678,7 @@ mod tests {
             published_ms: None,
             added: Vec::new(),
             purge: None,
+            as_written: None,
         }
     }
 
@@ -709,8 +711,17 @@ mod tests {
     /// were.
     #[test]
     fn a_job_in_a_later_release_stage_is_kept_as_written() {
+        let mut proving = job(1, ErasureStage::Proving);
+        proving.commits.push(super::super::CommitErasure {
+            commit: "c".into(),
+            t: 1,
+            slots: vec![0],
+            ledger_id: "l:main".into(),
+            branches: vec!["l:main".into()],
+            proved: None,
+        });
         let registration = registry::Registration {
-            erasures: vec![job(1, ErasureStage::Proving)],
+            erasures: vec![proving],
             ..Default::default()
         };
         let mut written = serde_json::to_value(&registration).unwrap();
@@ -721,6 +732,19 @@ mod tests {
         assert_eq!(held.stage, ErasureStage::Other("queued".into()));
         assert!(!held.pending() && !held.purge_pending() && !held.finished());
         assert_eq!(serde_json::to_value(&read).unwrap(), written);
+
+        // Fields of that release, at the top and nested, are kept with it.
+        written["erasures"][0]["remoteTask"] = serde_json::json!({"worker": "w1", "lease": 5});
+        written["erasures"][0]["commits"][0]["remoteSlot"] = 3.into();
+        let read: registry::Registration = serde_json::from_value(written.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&read).unwrap(), written);
+
+        // Changed here, it is written as this release knows it.
+        let mut changed = read.clone();
+        changed.erasures[0].retries = 7;
+        let rewritten = serde_json::to_value(&changed).unwrap();
+        assert_eq!(rewritten["erasures"][0]["retries"], 7);
+        assert!(rewritten["erasures"][0].get("remoteTask").is_none());
 
         for (stage, name) in [
             (ErasureStage::Proving, "proving"),

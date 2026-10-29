@@ -296,6 +296,62 @@ pub struct ErasureJob {
     pub added: Vec<crate::retention::removal::OccurrenceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge: Option<PurgeProgress>,
+    /// A job in a later release's stage as stored, with the fields this
+    /// release does not know: a registration writes it back so.
+    #[serde(skip)]
+    pub(crate) as_written: Option<std::sync::Arc<AsWritten>>,
+}
+
+/// A job's stored form, and how this release read it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AsWritten {
+    stored: serde_json::Value,
+    read: serde_json::Value,
+}
+
+/// A registration's jobs, each in a later release's stage kept as stored
+/// unless this release changed it.
+pub(crate) mod jobs_as_written {
+    use serde::de::Error as _;
+    use serde::ser::{Error as _, SerializeSeq};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{AsWritten, ErasureJob, ErasureStage};
+
+    pub(crate) fn serialize<S: Serializer>(
+        jobs: &[ErasureJob],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(jobs.len()))?;
+        for job in jobs {
+            match &job.as_written {
+                Some(written)
+                    if serde_json::to_value(job).map_err(S::Error::custom)? == written.read =>
+                {
+                    seq.serialize_element(&written.stored)?;
+                }
+                _ => seq.serialize_element(job)?,
+            }
+        }
+        seq.end()
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<ErasureJob>, D::Error> {
+        Vec::<serde_json::Value>::deserialize(deserializer)?
+            .into_iter()
+            .map(|stored| {
+                let mut job: ErasureJob =
+                    serde_json::from_value(stored.clone()).map_err(D::Error::custom)?;
+                if matches!(job.stage, ErasureStage::Other(_)) {
+                    let read = serde_json::to_value(&job).map_err(D::Error::custom)?;
+                    job.as_written = Some(std::sync::Arc::new(AsWritten { stored, read }));
+                }
+                Ok(job)
+            })
+            .collect()
+    }
 }
 
 impl ErasureJob {

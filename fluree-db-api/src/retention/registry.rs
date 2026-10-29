@@ -66,7 +66,11 @@ pub struct Registration {
     pub checkpointed: u64,
     /// Permanent-erasure requests made on this branch, and their progress.
     #[cfg(feature = "native")]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "super::erasure::jobs_as_written"
+    )]
     pub erasures: Vec<super::erasure::ErasureJob>,
 }
 

@@ -394,3 +394,53 @@ async fn a_panicking_background_step_is_retried() {
     let job = fluree.job(id, &receipt.request_id).await.unwrap();
     assert_eq!(proved, job.commits.len(), "{job:?}");
 }
+
+/// A job in a later release's stage keeps that release's fields, at the
+/// top and nested, through the work this release does on the registration
+/// around it: a pass, and another request's job.
+#[tokio::test]
+async fn a_later_release_job_keeps_its_fields_through_this_releases_work() {
+    use crate::retention::registry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/later-stage").await.unwrap();
+    let id = "t/later-stage:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@graph": [
+            {"@id": "http://example.org/alice", "http://example.org/email": "a@secret"},
+            {"@id": "http://example.org/bob", "http://example.org/email": "b@secret"}
+        ]}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    let ns = fluree.publisher().unwrap();
+    let (_, read) = registry::read(ns, id).await.unwrap();
+    let mut stored = serde_json::to_value(read.unwrap()).unwrap();
+    let job = &mut stored["erasures"][0];
+    job["stage"] = "remoteQueued".into();
+    job["remoteTask"] = json!({"worker": "w1", "lease": 5});
+    job["commits"][0]["remoteSlot"] = 3.into();
+    let later = job.clone();
+    let registration: registry::Registration = serde_json::from_value(stored).unwrap();
+    registry::update(ns, id, |_| Some(registration.clone()))
+        .await
+        .unwrap();
+
+    fluree.run_erasure_pass(id).await.unwrap();
+    fluree
+        .erase_occurrences(id, email("bob", "b@secret"), None)
+        .await
+        .unwrap();
+    fluree.run_erasure_pass(id).await.unwrap();
+
+    let config = ns.get_config(id).await.unwrap().unwrap();
+    let jobs = config.payload.unwrap().extra["retention"]["erasures"].clone();
+    assert_eq!(jobs.as_array().map(Vec::len), Some(2), "{jobs}");
+    assert!(jobs.as_array().unwrap().contains(&later), "{jobs}");
+}
