@@ -225,6 +225,7 @@ impl crate::Fluree {
             branch_store,
             plan,
             conflict_keys,
+            mut config,
             ..
         } = self
             .build_revert_context(ledger_name, branch, selection)
@@ -277,7 +278,9 @@ impl crate::Fluree {
             if opts.include_validation && !opts.conflict_strategy.aborts_on(conflicts.count) {
                 let mut commits = Vec::with_capacity(plan.ordered_commits.len());
                 for commit_id in plan.ordered_commits.iter().rev() {
-                    commits.push(load_commit_by_id(&branch_store, commit_id).await?);
+                    let mut commit = load_commit_by_id(&branch_store, commit_id).await?;
+                    config.flakes(&mut commit.flakes);
+                    commits.push(commit);
                 }
                 let CollectedCommitData {
                     flakes: inverted,
