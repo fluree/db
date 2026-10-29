@@ -9,7 +9,7 @@
 //! staged on ([`Command::AtGeneration`]); one from an older view is refused,
 //! so nothing staged before an activation lands after it.
 
-use super::{Command, NameServiceState, RefKey, Response};
+use super::{BodyKind, Command, NameServiceState, RefKey, Response};
 use crate::raft::NodeId;
 use fluree_db_api::ContentId;
 use fluree_db_core::ledger_id::split_ledger_id;
@@ -239,8 +239,9 @@ pub(super) fn admit(
 }
 
 /// Whether applying `command` can add a branch that holds data. A head
-/// advance that creates a branch's first head also does; [`super::apply`]
-/// catches that by the new ref entry.
+/// advance can too, by creating a branch's first head or bringing it
+/// another branch's history; [`super::apply`] catches the first by the new
+/// ref entry and the second through [`importing`].
 pub(super) fn adds_holders(command: &Command) -> bool {
     match command {
         Command::CreateLedger(_)
@@ -276,6 +277,33 @@ pub(super) fn adds_holders(command: &Command) -> bool {
             adds_holders(command)
         }
     }
+}
+
+/// The branch `command` advances with history from elsewhere, as a merge,
+/// rebase or push does, and its head before: an existing branch that did
+/// not hold the erased data can after.
+pub(super) fn importing(
+    state: &NameServiceState,
+    command: &Command,
+) -> Option<(RefKey, Option<ContentId>)> {
+    let args = match command {
+        Command::ApplyHead(args) => args,
+        Command::Fenced { command, .. } => match command.as_ref() {
+            Command::ApplyHead(args) => args,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let key = RefKey::new(&args.ledger_id, &args.branch);
+    let front = state.queues.get(&key)?.front()?;
+    let imports = matches!(
+        front.body_kind,
+        BodyKind::Merge | BodyKind::Rebase | BodyKind::Pushed
+    );
+    (front.queue_id == args.queue_id && imports).then(|| {
+        let head = state.refs.get(&key).map(|r| r.head.clone());
+        (key, head)
+    })
 }
 
 pub(super) fn apply(
@@ -396,6 +424,10 @@ mod tests {
     }
 
     fn enqueue(state: &mut NameServiceState, seed: u8) -> u64 {
+        enqueue_kind(state, seed, BodyKind::JsonLdInsert)
+    }
+
+    fn enqueue_kind(state: &mut NameServiceState, seed: u8, body_kind: BodyKind) -> u64 {
         match apply(
             state,
             Command::EnqueueCommand(QueueSubmission {
@@ -404,7 +436,7 @@ mod tests {
                 idempotency: None,
                 request_cid: cid(seed),
                 body_cid: cid(seed),
-                body_kind: BodyKind::JsonLdInsert,
+                body_kind,
                 applied_at_millis: 1_000,
             }),
             2,
@@ -680,6 +712,62 @@ mod tests {
             14,
         );
         assert!(state.erasure.holder_set > created);
+    }
+
+    /// A merge, rebase or push can bring an existing branch the erased data
+    /// from a holder, so an activation whose holders were found before it
+    /// lands is refused. A transaction brings nothing.
+    #[test]
+    fn a_head_brought_from_another_branch_changes_the_holder_set() {
+        let mut state = ledger_with_queued_request();
+        advance(&mut state, None, 1, 1, 6_000, 11);
+        apply(
+            &mut state,
+            Command::CreateBranch(NewBranch {
+                ledger_id: "test/db".into(),
+                branch: "dev".into(),
+                source_branch: "main".into(),
+                at_commit: None,
+                applied_at_millis: 6_000,
+            }),
+            12,
+        );
+        let dev = RefKey::new("test/db", "dev");
+        let activate_after = |state: &mut NameServiceState, seed: u8, kind| {
+            let holders = vec![holder_state(state, &dev)];
+            let holder_set = state.erasure.holder_set;
+            enqueue_kind(state, seed, kind);
+            let moved = advance(state, None, seed, i64::from(seed), 6_000, 13);
+            assert!(matches!(moved, Response::HeadApplied { .. }), "{moved:?}");
+            apply(
+                state,
+                Command::Erasure(ErasureCommand::Activate(ActivateErasure {
+                    manifest: "m".into(),
+                    holder_set,
+                    holders,
+                    applied_at_millis: 6_000,
+                })),
+                14,
+            )
+        };
+        for (seed, kind) in [
+            (2, BodyKind::Merge),
+            (3, BodyKind::Rebase),
+            (4, BodyKind::Pushed),
+        ] {
+            let response = activate_after(&mut state, seed, kind);
+            assert!(
+                matches!(
+                    response,
+                    Response::ErasureActivationRefused {
+                        refusal: ActivationRefusal::HolderSetChanged { .. }
+                    }
+                ),
+                "{kind:?}: {response:?}"
+            );
+        }
+        let response = activate_after(&mut state, 5, BodyKind::JsonLdInsert);
+        assert_eq!(response, Response::ErasureActivated { activation: 0 });
     }
 
     /// A hold keeps the head where the preparation saw it; it lapses on the

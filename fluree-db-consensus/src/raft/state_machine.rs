@@ -1694,9 +1694,12 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         return refused;
     }
     let adds_holders = erasure::adds_holders(&command);
+    let importing = erasure::importing(state, &command);
     let refs = state.refs.len();
     let response = apply_fenced(state, command, log_index);
-    if state.erasure.tracking && (adds_holders || state.refs.len() > refs) {
+    let imported = importing
+        .is_some_and(|(key, before)| state.refs.get(&key).map(|r| &r.head) != before.as_ref());
+    if state.erasure.tracking && (adds_holders || imported || state.refs.len() > refs) {
         state.erasure.holder_set += 1;
     }
     response
