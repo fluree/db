@@ -170,6 +170,10 @@ pub struct GraphRegistry {
     /// Other ledgers' config graph IRIs the commits carry, each the config
     /// graph here ([`names_config_graph`]); also in `iri_to_id`.
     aliases: Vec<Arc<str>>,
+    /// A config graph IRI the index root holds as an ordinary graph, its
+    /// rows under that graph's id: a root built before any ledger's config
+    /// graph IRI named the config graph.
+    config_in_user_slot: Option<Arc<str>>,
     /// Next available GraphId for assignment (always >= FIRST_USER_GRAPH_ID).
     next_id: GraphId,
 }
@@ -185,6 +189,7 @@ impl Default for GraphRegistry {
             // slot 0 = default graph, slot 1 = txn-meta (empty), slot 2 = config (empty)
             id_to_iri: vec![None, None, None],
             aliases: Vec::new(),
+            config_in_user_slot: None,
             next_id: FIRST_USER_GRAPH_ID,
         }
     }
@@ -206,6 +211,7 @@ impl GraphRegistry {
             iri_to_id,
             id_to_iri: vec![None, Some(txn_meta), Some(config)],
             aliases: Vec::new(),
+            config_in_user_slot: None,
             next_id: FIRST_USER_GRAPH_ID,
         }
     }
@@ -227,7 +233,9 @@ impl GraphRegistry {
     ///
     /// A root from before config graphs were read across ledgers may list
     /// another ledger's config graph as a user graph. It is the config graph
-    /// here, and its user slot stays empty: the next index build rebuilds.
+    /// here, and its user slot stays empty; the rows the index holds under
+    /// that slot are not read as config, so config reads refuse until the
+    /// index is rebuilt ([`Self::config_in_user_slot`]).
     ///
     /// # Errors
     ///
@@ -246,6 +254,7 @@ impl GraphRegistry {
         let mut id_to_iri: Vec<Option<Arc<str>>> = Vec::with_capacity(iris.len() + 1);
         id_to_iri.push(None); // slot 0 = default graph
         let mut aliases = Vec::new();
+        let mut config_in_user_slot = None;
 
         for (root_idx, iri_str) in iris.iter().enumerate() {
             let g_id = (root_idx as GraphId) + 1; // root index 0 → g_id 1
@@ -262,6 +271,7 @@ impl GraphRegistry {
             }
             if g_id >= FIRST_USER_GRAPH_ID && names_config_graph(&arc) {
                 iri_to_id.insert(arc.clone(), CONFIG_GRAPH_ID);
+                config_in_user_slot.get_or_insert_with(|| arc.clone());
                 aliases.push(arc);
                 id_to_iri.push(None);
                 continue;
@@ -277,6 +287,7 @@ impl GraphRegistry {
             iri_to_id,
             id_to_iri,
             aliases,
+            config_in_user_slot,
             next_id,
         })
     }
@@ -297,6 +308,7 @@ impl GraphRegistry {
         let mut id_to_iri: Vec<Option<Arc<str>>> = vec![None; capacity];
         let mut iri_to_id: HashMap<Arc<str>, GraphId> = HashMap::with_capacity(entries.len());
         let mut aliases = Vec::new();
+        let mut config_in_user_slot = None;
 
         for &(g_id, iri) in entries {
             if g_id == 0 {
@@ -318,6 +330,7 @@ impl GraphRegistry {
             // As in `seed_from_root_iris`.
             if g_id >= FIRST_USER_GRAPH_ID && names_config_graph(iri) {
                 iri_to_id.insert(arc.clone(), CONFIG_GRAPH_ID);
+                config_in_user_slot.get_or_insert_with(|| arc.clone());
                 aliases.push(arc);
                 continue;
             }
@@ -332,6 +345,7 @@ impl GraphRegistry {
             iri_to_id,
             id_to_iri,
             aliases,
+            config_in_user_slot,
             next_id,
         })
     }
@@ -458,6 +472,13 @@ impl GraphRegistry {
 
     /// Other ledgers' config graph IRIs the commits carry, each the config
     /// graph here. Not in [`Self::iter_entries`].
+    /// A config graph IRI the index root holds as an ordinary graph, if any:
+    /// its rows sit under a user graph's id, where the config graph is not
+    /// read, so the config cannot be read until the index is rebuilt.
+    pub fn config_in_user_slot(&self) -> Option<&str> {
+        self.config_in_user_slot.as_deref()
+    }
+
     pub fn iter_aliases(&self) -> impl Iterator<Item = (GraphId, &str)> {
         self.aliases
             .iter()

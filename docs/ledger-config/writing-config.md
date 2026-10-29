@@ -14,6 +14,8 @@ For a ledger named `mydb:main`, the config graph is `urn:fluree:mydb:main#config
 
 Any ledger's config graph IRI names this ledger's config graph. A copy restored under another name, or a branch, replays commits that wrote its source's config graph, and that config applies to it. A write naming another ledger's config graph IRI is stored under this ledger's own.
 
+An index built before this rule could hold another ledger's config graph as an ordinary graph (a branch created before its source's first index build, then indexed). That ledger's config cannot be read from such an index, so its queries and transactions are refused (`ConfigUnavailable`) rather than run without it, until `fluree reindex <ledger>` rebuilds the index from its commits.
+
 ## Writing via TriG
 
 TriG is the most natural format for writing to named graphs. Wrap your config triples in a `GRAPH` block targeting the config graph IRI:

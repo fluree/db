@@ -8723,3 +8723,84 @@ async fn a_revert_across_two_config_graph_iris_restores_the_setting() {
         Some(vec!["rdfs".to_string()])
     );
 }
+
+/// An index from before every ledger's config graph IRI named the config
+/// graph can hold one as an ordinary graph, with its rows under that graph's
+/// id, where the config graph is not read. Its config cannot be read, so
+/// queries and transactions are refused rather than run without it, until a
+/// reindex rebuilds the index from the commits.
+#[tokio::test]
+async fn an_index_holding_a_config_graph_as_an_ordinary_graph_serves_nothing_until_rebuilt() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+    use fluree_db_core::ContentKind;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it-legacy-config:main";
+    genesis_ledger(&fluree, id).await;
+    fluree
+        .graph(id)
+        .transact()
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> . ex:seed ex:p 1 .
+             GRAPH <urn:legacy:holder> { ex:a ex:p 1 . }",
+        )
+        .commit()
+        .await
+        .unwrap();
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+
+    // The root as such an index lists the graph: under another ledger's
+    // config graph IRI.
+    let store = fluree.content_store(&fluree.storage_namespace(id).await.unwrap());
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let mut root = IndexRoot::decode(
+        &store
+            .get(record.index_head_id.as_ref().unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let slot = root
+        .graph_iris
+        .iter()
+        .position(|iri| iri == "urn:legacy:holder")
+        .unwrap();
+    assert!(slot >= 2, "{:?}", root.graph_iris);
+    root.graph_iris[slot] = config_graph_iri("it-legacy-source:main");
+    let legacy = store
+        .put(ContentKind::IndexRoot, &root.encode())
+        .await
+        .unwrap();
+    support::publish_built_index(&fluree, id, record.index_t, &legacy).await;
+
+    let query = json!({
+        "from": id,
+        "select": "?o",
+        "where": {"@id": "http://example.org/seed", "http://example.org/p": "?o"}
+    });
+    let refused = fluree
+        .query_connection(&query)
+        .await
+        .expect_err("a query is refused");
+    assert!(refused.to_string().contains("fluree reindex"), "{refused}");
+    let ledger = fluree.ledger(id).await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@id": "http://example.org/b", "http://example.org/p": 2}),
+        )
+        .await
+        .expect_err("a transaction is refused");
+
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    fluree
+        .query_connection(&query)
+        .await
+        .expect("served once rebuilt");
+}
