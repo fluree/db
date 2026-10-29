@@ -18,7 +18,7 @@ use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
-use fluree_vocab::namespaces::{EMPTY, FLUREE_DB, XSD};
+use fluree_vocab::namespaces::{FLUREE_DB, XSD};
 use fluree_vocab::{fluree, xsd, xsd_names};
 use std::sync::Arc;
 
@@ -447,22 +447,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     }
 
     /// Resolve a typed literal's datatype IRI to the Sid that names it in
-    /// term-identity positions (triple-pattern constraints, VALUES rows).
-    ///
-    /// A registered namespace resolves to its canonical Sid. An IRI whose
-    /// canonical prefix is NOT registered on this ledger resolves to the
-    /// EMPTY-namespace full-IRI Sid — the same form the storage side's
-    /// non-strict `encode_iri` produces, and the form the JSON-LD query
-    /// surface already uses (`fluree-db-query/src/parse/lower.rs`). Ingest
-    /// registers every namespace it stores, so no stored term can carry a
-    /// datatype in an unregistered namespace: the EMPTY-namespace Sid
-    /// matches nothing, which is the spec answer for a term that does not
-    /// exist. (The previous `xsd:string` fallback made
-    /// `"a"^^ex:NoSuchType` match every plain-string `"a"` row — #1686.)
+    /// term-identity positions (triple-pattern constraints, VALUES rows),
+    /// by the rule expression evaluation shares
+    /// ([`IriEncoder::encode_datatype`]). A datatype in a namespace this
+    /// ledger has not registered matches nothing, which is the spec answer
+    /// for a term that does not exist. (The previous `xsd:string` fallback
+    /// made `"a"^^ex:NoSuchType` match every plain-string `"a"` row — #1686.)
     fn datatype_sid(&self, dt_iri: &str) -> Sid {
-        self.encoder
-            .encode_iri(dt_iri)
-            .unwrap_or_else(|| Sid::new(EMPTY, dt_iri))
+        self.encoder.encode_datatype(dt_iri)
     }
 
     /// Convert a SPARQL term to a Binding (for VALUES rows).

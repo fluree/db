@@ -19,6 +19,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use super::helpers::WELL_KNOWN_DATATYPES;
+use crate::parse::encode::IriEncoder;
 use crate::parse::UnresolvedDatatypeConstraint;
 
 /// Errors that can occur during arithmetic operations
@@ -830,12 +831,9 @@ impl ComparableValue {
                                 .to_string(),
                         )
                     })?;
-                    let dt = ctx
-                        .active_snapshot
-                        .encode_iri_strict(&dt_iri)
-                        .ok_or_else(|| {
-                            QueryError::InvalidFilter(format!("Unknown datatype IRI: {dt_iri}"))
-                        })?;
+                    // Any IRI is a datatype (§17.4.2.9), including one in a
+                    // namespace this ledger has never seen.
+                    let dt = ctx.active_snapshot.encode_datatype(&dt_iri);
                     Ok(Binding::lit(val, dt))
                 }
                 // No datatype constraint rides along on the value, so recover it
