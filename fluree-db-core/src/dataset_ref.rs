@@ -1136,9 +1136,18 @@ impl<'a> TargetLedger<'a> {
 
     /// The graph registered under exactly `iri`, else a new graph by it: one
     /// registry lookup, and `iri` moves into the position as it came (a
-    /// borrow stays a borrow).
+    /// borrow stays a borrow). A reserved graph is named by the IRI at its
+    /// slot, whichever of its IRIs `iri` is, so a write to another ledger's
+    /// config graph IRI lands in this ledger's config graph under one name.
     fn registered_under<'i>(&self, iri: Cow<'i, str>) -> GraphPosition<'i> {
         match self.names.graph_id(&iri) {
+            Some(g_id @ (TXN_META_GRAPH_ID | CONFIG_GRAPH_ID)) => {
+                let iri = match self.names.reserved_iri(g_id) {
+                    Some(slot) if slot != iri.as_ref() => Cow::Owned(slot.to_owned()),
+                    _ => iri,
+                };
+                GraphPosition::Registered { g_id, iri }
+            }
             Some(g_id) => GraphPosition::Registered { g_id, iri },
             None => GraphPosition::New(iri),
         }
@@ -1931,11 +1940,24 @@ mod tests {
                 "{written}"
             );
         }
-        // A table that names no reserved IRI is asked for the ledger's own.
+        // A table that names no reserved IRI is asked for the ledger's own,
+        // which is the config graph as any ledger's is.
         let by_iri = |iri: &str| registry.graph_id_for_iri(iri);
         assert_eq!(
             TargetLedger::new(&id, &by_iri).graph_position("L:feature#config"),
-            GraphPosition::New("urn:fluree:L:feature#config".into())
+            GraphPosition::Registered {
+                g_id: CONFIG_GRAPH_ID,
+                iri: "urn:fluree:L:feature#config".into()
+            }
+        );
+        // Another ledger's config graph IRI is this ledger's config graph,
+        // under the IRI at its slot.
+        assert_eq!(
+            target.graph_position("urn:fluree:other:main#config"),
+            GraphPosition::Registered {
+                g_id: CONFIG_GRAPH_ID,
+                iri: "urn:fluree:L:main#config".into()
+            }
         );
     }
 

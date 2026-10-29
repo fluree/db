@@ -721,6 +721,7 @@ impl crate::Fluree {
                 let (_view, outcome) = self
                     .stage_merge(
                         target_state.clone(),
+                        source_branch,
                         net.unwrap_or_default(),
                         &all_conflict_keys,
                         &opts.conflict_strategy,
@@ -735,7 +736,7 @@ impl crate::Fluree {
             } else if let (Some(base), Some(diff)) = (fast_forward_base, diff.as_ref()) {
                 // A fast-forward: the check the merge runs before adopting the
                 // commits, when it runs one.
-                self.validate_fast_forward(base, &source_store, diff)
+                self.validate_fast_forward(base, source_branch, &source_store, diff)
                     .await?
                     .map(|outcome| ValidationSummary {
                         conforms: outcome.conforms(),

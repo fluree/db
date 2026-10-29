@@ -12,6 +12,8 @@ urn:fluree:{ledger_id}#config
 
 For a ledger named `mydb:main`, the config graph is `urn:fluree:mydb:main#config`.
 
+Any ledger's config graph IRI names this ledger's config graph. A copy restored under another name, or a branch, replays commits that wrote its source's config graph, and that config applies to it. A write naming another ledger's config graph IRI is stored under this ledger's own.
+
 ## Writing via TriG
 
 TriG is the most natural format for writing to named graphs. Wrap your config triples in a `GRAPH` block targeting the config graph IRI:
@@ -234,7 +236,7 @@ Writing the same value again is not refused. The checks read only the transactio
 
 Merges (fast-forwards included), rebases and reverts re-check the integrity of the target's config groups: a result that would leave a setting group's fields outside the config graph, or a single-valued setting with two values, is refused as a conflict with the target's state (HTTP 409), naming the group. A branch that carries a split config from before these checks is refused until the config is repaired ([Repairing a config split across graphs](#repairing-a-config-split-across-graphs)).
 
-A branch's config graph (`urn:fluree:mydb:dev#config`) configures that branch only. A merge or rebase that would carry what a branch wrote there into another branch is refused (HTTP 409), since on the target it would be an ordinary graph rather than config: make the change on the target itself. The same holds for a branch's `#txn-meta` graph. Merging from a branch the target was created from (its parent, directly or not) is not affected, because that branch's config graph was already an ordinary graph on the target when it forked. In the other direction, the target's own config graph (`urn:fluree:mydb:main#config`) is an ordinary graph on its branches: a merge that would change it (or the target's `#txn-meta` graph) with what a branch wrote there is refused the same way. A branch's config is changed on that branch.
+A branch starts with the config of the branch it was created from. Config written on a branch configures that branch only: a merge that would carry it into another branch is refused (HTTP 409); make the change on the target itself. Merging from a branch the target was created from (its parent, directly or not) carries that branch's config changes since the fork into the target, as the fork carried the earlier ones. A merge never changes the target's `#txn-meta` graph, and no branch operation writes another branch's `#txn-meta` graph unless the target was created from that branch.
 
 A transaction that writes only the config graph is never validated against SHACL shapes or uniqueness constraints, and never needs a shapes, schema or constraints source to be available: you can always turn SHACL or uniqueness off, or point a source somewhere else, even when the source it names is gone. Policy is the exception. A config write is still subject to the ledger's policy, including a policy source in another ledger, because policy decides who may change the config.
 

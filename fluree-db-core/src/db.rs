@@ -523,6 +523,11 @@ impl LedgerSnapshot {
                 )));
             }
         }
+        for (g_id, iri) in self.graph_registry.iter_aliases() {
+            if let Some(sid) = self.encode_iri(iri) {
+                map.insert(sid, g_id);
+            }
+        }
         Ok(map)
     }
 

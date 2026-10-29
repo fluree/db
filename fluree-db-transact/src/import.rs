@@ -88,7 +88,8 @@ mod inner {
                 graph_iri: iri.to_string(),
             });
         }
-        if iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id) {
+        // Any ledger's config graph IRI is this ledger's config graph.
+        if fluree_db_core::graph_registry::names_config_graph(iri) {
             return Err(TransactError::ConfigGraphImportUnsupported {
                 graph_iri: iri.to_string(),
             });

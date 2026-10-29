@@ -724,6 +724,7 @@ pub async fn incremental_index(
 
     // ---- Phase 1: Resolve incremental commits ----
     let resolve_config = IncrementalResolveConfig {
+        ledger_id: ledger_id.to_string(),
         base_root_id: base_root_id.clone(),
         head_commit_id,
         from_t,
