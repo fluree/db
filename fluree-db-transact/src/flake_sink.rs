@@ -4,10 +4,10 @@
 //! Turtle INSERT, converting parsed triples directly into assertion flakes.
 
 use crate::error::TransactError;
-use crate::generate::{infer_datatype, validate_value_dt_pair};
+use crate::generate::{infer_datatype, validate_value_dt_pair, DT_STRING};
 use crate::lists::PendingList;
 use crate::namespace::{NamespaceRegistry, NsAllocator};
-use crate::value_convert::{convert_native_literal, convert_string_literal};
+use crate::value_convert::{convert_native_literal, convert_string_literal, LiteralCheck};
 #[cfg(test)]
 use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::DatatypeConstraint;
@@ -298,8 +298,20 @@ impl GraphSink for FlakeSink<'_> {
 
     fn term_literal(&mut self, value: &str, datatype: Datatype, language: Option<&str>) -> TermId {
         let dt_iri = datatype.as_iri();
-        let (flake_value, dt_sid) =
-            convert_string_literal(value, dt_iri, &mut NsAllocator::Exclusive(self.ns_registry));
+        let (flake_value, dt_sid) = match convert_string_literal(
+            value,
+            dt_iri,
+            &mut NsAllocator::Exclusive(self.ns_registry),
+            LiteralCheck::Strict,
+        ) {
+            Ok(converted) => converted,
+            // An ill-typed literal fails the write; the placeholder term
+            // is never stored, since `into_flakes` returns the error.
+            Err(e) => {
+                self.invariant_error.get_or_insert(e);
+                (FlakeValue::String(value.to_string()), DT_STRING.clone())
+            }
+        };
 
         let dtc = match language {
             Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang)),

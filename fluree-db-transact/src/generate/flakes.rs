@@ -408,6 +408,20 @@ impl<'a> FlakeGenerator<'a> {
                 self.canonicalize(sid);
             }
             self.canonicalize(&mut dt);
+
+            // A literal bound at run time (`STRDT`, `str-dt`, a stored value
+            // a WHERE matched) arrives as text under its datatype. Parse it as
+            // an insert parses the same literal: a valid lexical form is
+            // stored as its value, and an ill-typed one fails the write with
+            // the insert's error. A template constant was parsed where it was
+            // written (`value_convert` for RDF text).
+            if let (TemplateTerm::Var(_), FlakeValue::String(lexical)) = (&template.object, &o) {
+                if dt != *DT_STRING && dt != *DT_LANG_STRING {
+                    if let Some(dt_iri) = self.decode_sid(&dt) {
+                        o = crate::value_convert::typed_lexical(lexical, &dt_iri)?;
+                    }
+                }
+            }
         }
 
         // Late hard guard for storage invariants: catches (FlakeValue, dt)

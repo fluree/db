@@ -1280,24 +1280,23 @@ fn cases_bulk_import_text() -> Vec<Case> {
     ]
 }
 
-/// `ex:a` 1.5, plus `inf` / `-inf` text under `xsd:double` (`ex:t`, `ex:n`)
-/// and `xsd:float` (`ex:ft`), written as Turtle, which keeps them as text.
+/// Create `ledger_id` holding `inf` / `-inf` text under `xsd:double` and
+/// `xsd:float`, ill-typed literals a transaction refuses but an earlier bulk
+/// import stored, beside two numbers.
 async fn write_inf_text(fluree: &Fluree, ledger_id: &str) {
-    let turtle = format!(
-        "@prefix ex: <{EX}> .\n@prefix xsd: <{XSD}> .\n\
-         ex:a ex:v \"1.5\"^^xsd:double .\n\
-         ex:b ex:v \"-2.5\"^^xsd:double .\n\
-         ex:t ex:v \"inf\"^^xsd:double .\n\
-         ex:n ex:v \"-inf\"^^xsd:double .\n\
-         ex:ft ex:f \"inf\"^^xsd:float .\n"
-    );
-    fluree
-        .graph(ledger_id)
-        .transact()
-        .insert_turtle(&turtle)
-        .commit()
-        .await
-        .expect("Turtle insert of inf text");
+    support::ledger_with_stored_ill_typed_literals(
+        fluree,
+        ledger_id,
+        &format!(
+            "<{EX}a> <{EX}v> \"1.5\"^^<{XSD}double> .\n<{EX}b> <{EX}v> \"-2.5\"^^<{XSD}double> ."
+        ),
+        &[
+            (&format!("{EX}t"), &format!("{EX}v"), "inf", "double"),
+            (&format!("{EX}n"), &format!("{EX}v"), "-inf", "double"),
+            (&format!("{EX}ft"), &format!("{EX}f"), "inf", "float"),
+        ],
+    )
+    .await;
 }
 
 fn cases_inf_text() -> Vec<Case> {
@@ -1373,7 +1372,6 @@ async fn inf_text_reads_as_infinity_in_arithmetic_and_aggregates() {
     let fluree = memory_fluree();
     let mut failures = Vec::new();
     let ledger_id = "special-doubles:inf-text";
-    fluree.create_ledger(ledger_id).await.expect("create");
     write_inf_text(&fluree, ledger_id).await;
     let novelty = fluree.ledger(ledger_id).await.expect("load");
     failures.extend(check_cases(&fluree, "novelty", &novelty, cases_inf_text()).await);
@@ -1670,8 +1668,8 @@ async fn a_reindex_stores_the_text_of_a_previous_bulk_import_as_numbers() {
 // ---------------------------------------------------------------------------
 
 /// Spellings outside the XSD lexical space are not `xsd:double` or
-/// `xsd:float` values. JSON-LD and SPARQL refuse them as ill-typed literals;
-/// Turtle keeps them as ill-typed literals, which are not numbers.
+/// `xsd:float` values: JSON-LD, SPARQL and Turtle refuse them as ill-typed
+/// literals.
 #[tokio::test]
 async fn non_xsd_spellings_are_not_doubles() {
     let fluree = memory_fluree();
@@ -1746,32 +1744,24 @@ async fn non_xsd_spellings_are_not_doubles() {
         assert_eq!(read, [token], "{lexical}");
     }
 
-    // Turtle keeps the other spellings as ill-typed literals.
+    // Turtle refuses them too.
     let turtle = format!(
         "@prefix ex: <{EX}> .\n@prefix xsd: <{XSD}> .\n\
-         ex:t1 ex:v \"inf\"^^xsd:double .\nex:t2 ex:v \"nan\"^^xsd:float ."
+         ex:t1 ex:v \"inf\"^^xsd:double ."
     );
-    fluree
+    let err = fluree
         .graph(ledger_id)
         .transact()
         .insert_turtle(&turtle)
         .commit()
         .await
-        .expect("Turtle keeps ill-typed literals");
-    let ledger = fluree.ledger(ledger_id).await.expect("load");
-    let kept = sparql_tokens(
-        &fluree,
-        &ledger,
-        "SELECT ?l WHERE { ?s ex:v ?v FILTER(?s IN (ex:t1, ex:t2) && !isNumeric(?v)) \
-         BIND(CONCAT(STR(?v), \"^^\", STR(DATATYPE(?v))) AS ?l) }",
-    )
-    .await;
-    let mut kept = kept;
-    kept.sort();
-    assert_eq!(
-        kept,
-        [format!("inf^^{XSD}double"), format!("nan^^{XSD}float")]
+        .expect_err("Turtle insert must refuse the spelling");
+    assert!(
+        err.to_string()
+            .contains("Parse error: Cannot parse 'inf' as xsd:double"),
+        "Turtle: {err}"
     );
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
 
     // A cast reads the XSD lexical space too (F&O 3.1 §19.2).
     let casts = sparql_tokens(

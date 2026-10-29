@@ -22,7 +22,7 @@ mod inner {
     use crate::import_sink::ImportSink;
     use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
     use crate::parse::trig_meta::{parse_trig_phase1, resolve_trig_meta, RawObject, RawTerm};
-    use crate::value_convert::convert_string_literal;
+    use crate::value_convert::{convert_string_literal, LiteralCheck};
     use fluree_db_core::ns_encoding::NsSplitMode;
     use fluree_db_core::CommitId;
     use fluree_db_core::{
@@ -1179,8 +1179,12 @@ mod inner {
                 Some(lang.clone()),
             )),
             RawObject::TypedLiteral { value, datatype } => {
-                let (fv, dt) =
-                    convert_string_literal(value, datatype, &mut NsAllocator::Cached(ns));
+                let (fv, dt) = convert_string_literal(
+                    value,
+                    datatype,
+                    &mut NsAllocator::Cached(ns),
+                    LiteralCheck::Lenient,
+                )?;
                 Ok((fv, dt, None))
             }
         }

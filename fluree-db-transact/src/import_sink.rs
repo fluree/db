@@ -26,9 +26,9 @@ mod inner {
     use crate::commit_v2::StreamingCommitWriter;
     use crate::datatype_limit::MAX_NON_RESERVED_DATATYPES;
     use crate::error::TransactError;
-    use crate::generate::{infer_datatype, DT_ID, DT_JSON};
+    use crate::generate::{infer_datatype, DT_ID, DT_JSON, DT_STRING};
     use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
-    use crate::value_convert::{convert_native_literal, convert_string_literal};
+    use crate::value_convert::{convert_native_literal, convert_string_literal, LiteralCheck};
     use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
     use fluree_db_binary_index::RunRecord;
     use fluree_db_core::commit::codec::CommitCodecError;
@@ -1145,7 +1145,16 @@ mod inner {
             language: Option<&str>,
         ) -> TermId {
             let dt_iri = datatype.as_iri();
-            let (flake_value, dt_sid) = convert_string_literal(value, dt_iri, &mut self.ns);
+            let (flake_value, dt_sid) =
+                match convert_string_literal(value, dt_iri, &mut self.ns, LiteralCheck::Lenient) {
+                    Ok(converted) => converted,
+                    // An ill-typed literal fails the import; the placeholder term
+                    // is never committed, since `into_output` returns the error.
+                    Err(e) => {
+                        self.encode_error.get_or_insert(e);
+                        (FlakeValue::String(value.to_string()), DT_STRING.clone())
+                    }
+                };
 
             let dtc = match language {
                 Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang)),

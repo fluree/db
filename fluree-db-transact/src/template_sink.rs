@@ -10,9 +10,9 @@
 //! and parsed literals more strictly than insert did.
 //!
 //! Literals convert exactly as [`FlakeSink`](crate::flake_sink::FlakeSink)
-//! converts them (`value_convert`, lenient: an ill-typed lexical form is
-//! stored as a string with its declared datatype), so a document means the
-//! same thing on every RDF-text lane.
+//! converts them (`value_convert`, strict: an ill-typed lexical form fails
+//! the transaction, as it does in an insert), so a document means the same
+//! thing on every RDF-text lane.
 //!
 //! The driver (`parse::rdf_text`) feeds one sink across a TriG document's
 //! segments, setting the graph scope per segment, so labeled blank nodes are
@@ -20,11 +20,11 @@
 //! document.
 
 use crate::error::TransactError;
-use crate::generate::{bundle_templates, infer_datatype, validate_value_dt_pair};
+use crate::generate::{bundle_templates, infer_datatype, validate_value_dt_pair, DT_STRING};
 use crate::ir::{TemplateTerm, TripleTemplate};
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::parse::txn_meta::check_user_predicate;
-use crate::value_convert::{convert_native_literal, convert_string_literal};
+use crate::value_convert::{convert_native_literal, convert_string_literal, LiteralCheck};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
@@ -602,8 +602,20 @@ impl GraphSink for TemplateSink<'_> {
 
     fn term_literal(&mut self, value: &str, datatype: Datatype, language: Option<&str>) -> TermId {
         let dt_iri = datatype.as_iri();
-        let (flake_value, dt_sid) =
-            convert_string_literal(value, dt_iri, &mut NsAllocator::Exclusive(self.ns));
+        let (flake_value, dt_sid) = match convert_string_literal(
+            value,
+            dt_iri,
+            &mut NsAllocator::Exclusive(self.ns),
+            LiteralCheck::Strict,
+        ) {
+            Ok(converted) => converted,
+            // An ill-typed literal fails the write; the placeholder term
+            // is never staged, since the sink's error is returned first.
+            Err(e) => {
+                self.error.get_or_insert(e);
+                (FlakeValue::String(value.to_string()), DT_STRING.clone())
+            }
+        };
         let dtc = match language {
             Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang)),
             None => DatatypeConstraint::Explicit(dt_sid),
