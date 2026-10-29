@@ -10,7 +10,7 @@
 //! 2. retrieval chunks cut along that structure, each citing the elements
 //!    it was built from and carrying its section path;
 //! 3. an embedding per chunk from a configured OpenAI-compatible endpoint;
-//! 4. entity mentions and relations, when an ontology (`--model`) and
+//! 4. entity mentions and relations, when an ontology (`--ontology`) and
 //!    gazetteers (`--entities`) are given: a deterministic scan links every
 //!    known label to its source IRI, and a language model, grounded on the
 //!    model and told which entities are already known, extracts the rest.
