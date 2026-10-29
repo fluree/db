@@ -7,13 +7,18 @@
 //!
 //! Lane tests (C, D, E, B, A) belong in this binary: they run their shape
 //! through `multigraph::check` and pin their sites with
-//! `multigraph::assert_routing`.
+//! `multigraph::assert_routing`. Lane F (the nested-loop join's batched
+//! probes over a union) runs on fixture F (`support/lane_f.rs`), whose facts
+//! carry the fact-identity cases its probes must keep apart.
 
 #[path = "support/span_capture.rs"]
 mod span_capture;
 
 #[path = "support/multigraph.rs"]
 mod multigraph;
+
+#[path = "support/lane_f.rs"]
+mod lane_f;
 
 use multigraph::{
     assert_routing, check, Fixture, Graphs, Kind, Rows, Run, Scope, Shape, State, Surface, SCOPES,
@@ -1324,4 +1329,354 @@ async fn lane_a_cypher_over_the_union_default_graph() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+const UNION_SCOPES: &[(&str, &str, &str)] = &[
+    ("FROM g1 FROM g2", "", "FROM <urn:g1> FROM <urn:g2>"),
+    (
+        "union default graph",
+        "# PRAGMA union-default-graph: true\n",
+        "",
+    ),
+];
+
+/// `run`'s answers against `want`, and its routing: `must_fire` proceeded,
+/// `must_not_fire` did not.
+fn check_lane_f(
+    label: &str,
+    run: &lane_f::Run,
+    want: &[String],
+    must_fire: &[&str],
+    must_not_fire: &[&str],
+    failures: &mut Vec<String>,
+) {
+    for (lane, got) in [
+        ("fast paths on", &run.fast),
+        ("fast paths off", &run.generic),
+    ] {
+        match got {
+            Ok(rows) if rows == want => {}
+            Ok(rows) => failures.push(format!("{label}: {lane}: {rows:?}, want {want:?}")),
+            Err(e) => failures.push(format!("{label}: {lane}: {e}")),
+        }
+    }
+    for site in must_fire {
+        if !run.proceeded.iter().any(|s| s == site) {
+            failures.push(format!(
+                "{label}: `{site}` did not proceed (proceeded {:?}, fell back {:?})",
+                run.proceeded, run.fell_back
+            ));
+        }
+    }
+    for site in must_not_fire {
+        if run.proceeded.iter().any(|s| s == site) {
+            failures.push(format!("{label}: `{site}` proceeded"));
+        }
+    }
+}
+
+/// Lane F over fixture F: under a union of g1 and g2, every shape answers as
+/// the union's facts do and as the one-graph floor does, with fast paths on
+/// and off, and the union probe answers it; over g1 alone the one-graph
+/// lanes answer and the union site stays off. The membership join keeps its
+/// keep/drop path under the union, and goes exact where a list position
+/// repeats a key.
+///
+/// On JSON-LD a list's members are values, so every shape runs through its
+/// lane. On SPARQL a predicate holding lists is read through the list view,
+/// a list both graphs hold is two lists (its cells are blank nodes local to
+/// each graph), and no batched lane joins that predicate; its list-free twin
+/// on the same ledger is joined by the lane.
+#[tokio::test(flavor = "current_thread")]
+async fn lane_f_union_probes_answer_by_fact() {
+    use lane_f::{Shape, Surface};
+    let fx = lane_f::Fixture::build().await;
+    let mut failures = Vec::new();
+    for &surface in lane_f::SURFACES {
+        for (ledger, floor, lists) in [
+            (lane_f::LEDGER, lane_f::FLOOR, false),
+            (lane_f::LEDGER_LISTS, lane_f::FLOOR_LISTS, true),
+        ] {
+            let facts = lane_f::facts(lists);
+            let g1_facts: Vec<_> = facts
+                .iter()
+                .filter(|f| f.g == lane_f::G1)
+                .cloned()
+                .collect();
+            let floor_facts = lane_f::union_of(&facts);
+            for &shape in lane_f::SHAPES {
+                let label =
+                    |scope: &str| format!("{surface:?} / {shape:?} / {scope} / lists {lists}");
+                let want_floor = lane_f::expected_on(surface, shape, &floor_facts);
+                match fx.on(surface, floor, "", "", shape).await {
+                    Ok(rows) if rows == want_floor => {}
+                    other => failures.push(format!(
+                        "{}: floor {other:?}, want {want_floor:?}",
+                        label("floor")
+                    )),
+                }
+                let want = lane_f::expected_on(surface, shape, &facts);
+                let list_view = surface == Surface::Sparql && lane_f::probes_a_list(shape, &facts);
+                // The membership join's key repeats where its predicate's list
+                // holds one member twice (`y20 q (x20 x20)`).
+                let repeats = lists && lane_f::probes_a_list(shape, &facts);
+                let union_site = shape.site();
+                for (name, prologue, dataset) in UNION_SCOPES {
+                    let run = lane_f::run_on(&fx, surface, ledger, prologue, dataset, shape).await;
+                    let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
+                        _ if list_view => (&[], &[union_site, "nested-loop-batched"]),
+                        // A list position repeating a key sends keep/drop exact.
+                        Shape::Membership if repeats => (&[], &["membership-join"]),
+                        Shape::Membership => (&["membership-join"], &[]),
+                        _ => (&[union_site], &["nested-loop-batched"]),
+                    };
+                    check_lane_f(&label(name), &run, &want, fire, not_fire, &mut failures);
+                    // The union probe names why it stood down on the list view.
+                    if list_view
+                        && !run.fell_back.iter().any(|(site, outcome)| {
+                            site == "nested-loop-batched-union" && outcome == "fallback:list_view"
+                        })
+                    {
+                        failures.push(format!(
+                            "{}: no `fallback:list_view` at the union site ({:?})",
+                            label(name),
+                            run.fell_back
+                        ));
+                    }
+                }
+                // Over one graph the one-graph operators answer: the batched
+                // probes for the subject and existence joins (the planner picks
+                // another join for the object shape there), never the union's.
+                let want_g1 = lane_f::expected_on(surface, shape, &g1_facts);
+                let run = lane_f::run_on(&fx, surface, ledger, "", "FROM <urn:g1>", shape).await;
+                let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
+                    _ if list_view => (&[], &["nested-loop-batched", "nested-loop-batched-union"]),
+                    Shape::Membership if repeats => (&[], &["membership-join"]),
+                    Shape::Membership => (&["membership-join"], &[]),
+                    Shape::Object => (&[], &["nested-loop-batched-union"]),
+                    _ => (&["nested-loop-batched"], &["nested-loop-batched-union"]),
+                };
+                check_lane_f(
+                    &label("FROM g1"),
+                    &run,
+                    &want_g1,
+                    fire,
+                    not_fire,
+                    &mut failures,
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Lane F follows each member's own novelty, per graph and per predicate
+/// (lane B's rule). Novelty outside the union, or on another predicate,
+/// leaves the union probe running. A member the index has no branch for,
+/// whose novelty holds the probed predicate, stands it down (`Novelty`);
+/// for now so does a member with a branch and such novelty. Every answer is
+/// the union's. JSON-LD, where the probed predicate's list members are
+/// values and the probe runs (on SPARQL the list view joins it).
+#[tokio::test(flavor = "current_thread")]
+async fn lane_f_union_probes_follow_each_members_novelty() {
+    use lane_f::{fact, Obj, Shape, G2, LEDGER};
+    let fx = lane_f::Fixture::build().await;
+    let mut facts = lane_f::facts(false);
+    let mut failures = Vec::new();
+    let in_g1_g2 = |facts: &[lane_f::Fact]| -> Vec<lane_f::Fact> {
+        facts
+            .iter()
+            .filter(|f| f.g == lane_f::G1 || f.g == G2)
+            .cloned()
+            .collect()
+    };
+    let (from, pragma) = (UNION_SCOPES[0], UNION_SCOPES[1]);
+    let union = "nested-loop-batched-union";
+    let json = lane_f::Surface::JsonLd;
+
+    // Novelty in g2 on another predicate: g2 holds nothing new for `v`.
+    let other = vec![fact(G2, "z", "other", Obj::Int(1))];
+    fx.write(LEDGER, &other).await;
+    facts.extend(other);
+    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
+    let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
+    check_lane_f("other predicate", &run, &want, &[union], &[], &mut failures);
+
+    // Novelty for `v` in the default graph, which the index has no branch
+    // for: outside `FROM g1 FROM g2`, a member of the union default graph.
+    let default_graph = vec![fact("", "y2", "v", Obj::Str("d".into()))];
+    fx.write(LEDGER, &default_graph).await;
+    facts.extend(default_graph);
+    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
+    let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
+    check_lane_f("novelty outside", &run, &want, &[union], &[], &mut failures);
+    let run = lane_f::run_on(&fx, json, LEDGER, pragma.1, pragma.2, Shape::Subject).await;
+    let want = lane_f::expected(Shape::Subject, &facts);
+    check_lane_f(
+        "branchless member",
+        &run,
+        &want,
+        &[],
+        &[union],
+        &mut failures,
+    );
+    if !run
+        .fell_back
+        .iter()
+        .any(|(s, o)| s == union && o == "fallback:novelty")
+    {
+        failures.push(format!(
+            "branchless member: no `{union}` novelty decline ({:?})",
+            run.fell_back
+        ));
+    }
+
+    // Novelty for `v` in g2, which has a branch.
+    let g2 = vec![fact(G2, "y0", "v", Obj::Dec("4.5"))];
+    fx.write(LEDGER, &g2).await;
+    facts.extend(g2);
+    let run = lane_f::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
+    let want = lane_f::expected(Shape::Subject, &in_g1_g2(&facts));
+    check_lane_f(
+        "member with novelty",
+        &run,
+        &want,
+        &[],
+        &[union],
+        &mut failures,
+    );
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A one-graph join whose probed graph has no PSOT branch: the default graph
+/// (fixture F's facts are all in g1 and g2) and a named graph first written
+/// after the index, each holding left rows in novelty only. The probed
+/// predicate has no novelty there, so the graph holds nothing for the probe:
+/// the join answers with no rows, rather than failing to find the branch.
+#[tokio::test(flavor = "current_thread")]
+async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
+    use lane_f::{fact, Obj, LEDGER};
+    let fx = lane_f::Fixture::build().await;
+    fx.write(
+        LEDGER,
+        &[
+            fact("", "a", "sel", Obj::Iri("y0".into())),
+            fact("urn:g3", "b", "sel", Obj::Iri("y0".into())),
+        ],
+    )
+    .await;
+    let mut failures = Vec::new();
+    let body = lane_f::Shape::Subject.body();
+    let in_g3 = format!("GRAPH <urn:g3> {{ {body} }}");
+    let body = body.as_str();
+    for (name, dataset, body) in [
+        ("default graph", "", body),
+        ("FROM g3", "FROM <urn:g3>", body),
+        ("GRAPH g3", "", in_g3.as_str()),
+    ] {
+        let run = lane_f::run_where(&fx, LEDGER, "", dataset, body, &["y", "o"]).await;
+        check_lane_f(name, &run, &[], &[], &[], &mut failures);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Union rows stay encoded: an arena literal (a big number) leaves its member
+/// with the graph it was read from, so every consumer reads the value its own
+/// graph holds. Fixture F's trap on `vf` (no lists, so SPARQL reads it as
+/// values): `y0 vf` is 1.5 in g1 and 2.5 in g2, both the first big-number
+/// handle of their graph; `y1 vf 3.5` is in both (one fact of the union);
+/// `y10 vf 7.5` is in g2. Each consumer that decodes or keys a binding (scan
+/// output, ORDER BY, FILTER, DISTINCT, GROUP BY) answers by value under both
+/// union spellings, with fast paths on and off, on the index and again with
+/// novelty in one member (which then binds decoded beside the encoded other).
+#[tokio::test(flavor = "current_thread")]
+async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
+    use lane_f::{fact, Obj, G2, LEDGER};
+    let fx = lane_f::Fixture::build().await;
+    let numeric = "?s ex:vf ?o FILTER(isNumeric(?o))";
+    // (label, WHERE body, projected vars, rows on the index, rows added by the
+    // novelty write of `y0 vf 4.5` in g2)
+    type Case<'a> = (&'a str, String, &'a [&'a str], Vec<&'a str>, Vec<&'a str>);
+    let cases: Vec<Case<'_>> = vec![
+        (
+            "scan",
+            "ex:y0 ex:vf ?o".into(),
+            &["o"],
+            vec!["1.5^^decimal", "2.5^^decimal"],
+            vec!["4.5^^decimal"],
+        ),
+        (
+            "ORDER BY, lowest",
+            format!("{{ SELECT ?s ?o WHERE {{ {numeric} }} ORDER BY ?o LIMIT 1 }}"),
+            &["s", "o"],
+            vec!["y0 1.5^^decimal"],
+            vec![],
+        ),
+        (
+            "ORDER BY, highest",
+            format!("{{ SELECT ?s ?o WHERE {{ {numeric} }} ORDER BY DESC(?o) LIMIT 1 }}"),
+            &["s", "o"],
+            vec!["y10 7.5^^decimal"],
+            vec![],
+        ),
+        (
+            "FILTER > 2",
+            "?s ex:vf ?o FILTER(isNumeric(?o) && ?o > 2)".into(),
+            &["s", "o"],
+            vec!["y0 2.5^^decimal", "y1 3.5^^decimal", "y10 7.5^^decimal"],
+            vec!["y0 4.5^^decimal"],
+        ),
+        (
+            "DISTINCT",
+            format!("{{ SELECT DISTINCT ?o WHERE {{ {numeric} }} }}"),
+            &["o"],
+            vec![
+                "1.5^^decimal",
+                "2.5^^decimal",
+                "3.5^^decimal",
+                "7.5^^decimal",
+            ],
+            vec!["4.5^^decimal"],
+        ),
+        (
+            "GROUP BY",
+            format!("{{ SELECT ?o (COUNT(*) AS ?n) WHERE {{ {numeric} }} GROUP BY ?o }}"),
+            &["o", "n"],
+            vec![
+                "1.5^^decimal 1^^integer",
+                "2.5^^decimal 1^^integer",
+                "3.5^^decimal 1^^integer",
+                "7.5^^decimal 1^^integer",
+            ],
+            vec!["4.5^^decimal 1^^integer"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for novelty in [false, true] {
+        if novelty {
+            fx.write(LEDGER, &[fact(G2, "y0", "vf", Obj::Dec("4.5"))])
+                .await;
+        }
+        let phase = if novelty { "novelty in g2" } else { "indexed" };
+        for (scope, prologue, dataset) in UNION_SCOPES {
+            for (label, body, vars, base, added) in &cases {
+                let mut want: Vec<String> = base.iter().map(|s| (*s).to_string()).collect();
+                if novelty {
+                    want.extend(added.iter().map(|s| (*s).to_string()));
+                    want.sort();
+                }
+                let run = lane_f::run_where(&fx, LEDGER, prologue, dataset, body, vars).await;
+                check_lane_f(
+                    &format!("{phase} / {scope} / {label}"),
+                    &run,
+                    &want,
+                    &[],
+                    &[],
+                    &mut failures,
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -30,6 +30,7 @@ use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
     object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
 };
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
@@ -510,7 +511,8 @@ impl PatternOptionalBuilder {
                 p_id,
                 &objects,
                 probe_ops.as_mut(),
-                |obj_idx, s_id| {
+                false,
+                |obj_idx, s_id, _| {
                     for &slot in slots_by_object[obj_idx] {
                         values[slot].push(Binding::encoded_sid(s_id));
                         matched += 1;
@@ -614,7 +616,7 @@ impl PatternOptionalBuilder {
         let mut pattern = self.pattern.clone();
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
-        let mut view: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
+        let mut view: Option<Option<fluree_db_binary_index::TermView>> = None;
         let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             if object_to_unify && instr.position == PatternPosition::Object {
@@ -628,7 +630,7 @@ impl PatternOptionalBuilder {
                     | Binding::EncodedLit { .. }
             );
             let view = if encoded {
-                view.get_or_insert_with(|| ctx.graph_view()).as_ref()
+                view.get_or_insert_with(|| ctx.term_view()).as_ref()
             } else {
                 None
             };
@@ -705,6 +707,7 @@ fn push_cache_key_component(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if position == PatternPosition::Object => {
             key.push(b'L');
@@ -713,6 +716,9 @@ fn push_cache_key_component(
             key.extend_from_slice(&p_id.to_le_bytes());
             key.extend_from_slice(&dt_id.to_le_bytes());
             key.extend_from_slice(&lang_id.to_le_bytes());
+            // An arena handle names its value only with its graph: two
+            // graphs' handle 0 are two values.
+            key.extend_from_slice(&arena_g_id.to_le_bytes());
             true
         }
         // A literal OBJECT is pushed down by value (plus a string term
@@ -1780,13 +1786,13 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .try_collect_vec()?;
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .try_collect_vec()?;
             if seen_seed.insert(seed_key) {
                 seed_rows.push(
                     seed_cols
@@ -1866,7 +1872,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
                     .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
-                    .collect();
+                    .try_collect_vec()?;
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
                     .map(|&c| batch.get_by_col(r, c).clone())
@@ -2224,7 +2230,7 @@ impl AnnotationValueOptionalBuilder {
     async fn sidecar_maps(
         &self,
         ctx: &ExecutionContext<'_>,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+        view: Option<&fluree_db_binary_index::TermView>,
     ) -> Result<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>> {
         crate::annotation_edge_probe::AnnotationSidecarMaps::shared(
             &self.r_subj,
@@ -2243,7 +2249,7 @@ impl AnnotationValueOptionalBuilder {
         pos: &crate::annotation_edge_probe::EdgePos,
         batch: &Batch,
         row: usize,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+        view: Option<&fluree_db_binary_index::TermView>,
     ) -> Result<Option<fluree_db_core::Sid>> {
         use crate::annotation_edge_probe::EdgePos;
         match pos {
@@ -2280,8 +2286,8 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
         {
             return Ok(None);
         }
-        let view = ctx.graph_view();
-        let view = view.as_ref();
+        let view = ctx.one_graph_view();
+        let view = view.as_deref();
 
         // One pass over each reifies predicate (overlay-merged, policy-
         // filtered planned scans) — cached across required batches — then
@@ -2295,7 +2301,7 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
                 self.row_sid(&self.p_src, required_batch, row, view)?,
             );
             let o =
-                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view);
+                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view)?;
             let ((Some(s), Some(p)), false) = (
                 key,
                 matches!(o, crate::group_aggregate::GroupKeyOwned::Absent),
@@ -4708,6 +4714,7 @@ mod tests {
             lang_id: 0,
             i_val: i32::MIN,
             t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         };
         let free = Some(vec![b'u']);
         let positions = [

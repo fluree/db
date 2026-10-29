@@ -25,9 +25,10 @@ use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, CountGroup, Operator,
     OperatorState,
 };
+use crate::union_fact::{FactRef, UnionFactSet};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, TermView};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
@@ -54,7 +55,7 @@ struct GroupedCountDrain {
     output_columns: Vec<usize>,
     groups: hashbrown::HashMap<CompositeGroupKey, CountGroup, FxBuildHasher>,
     key: CompositeGroupKey,
-    graph_view: Option<BinaryGraphView>,
+    graph_view: Option<TermView>,
     counted_rows: u64,
 }
 
@@ -70,13 +71,13 @@ impl GroupedCountDrain {
         };
         self.key.0.clear();
         let dicts = self.graph_view.as_ref().map(TermDicts::of_view);
-        self.key.0.extend(columns.iter().map(|&col| {
-            binding_to_group_key_normalized(
+        for &col in columns {
+            self.key.0.push(binding_to_group_key_normalized(
                 batch.get_by_col(row, col),
                 dicts,
                 self.graph_view.as_ref(),
-            )
-        }));
+            )?);
+        }
         let (_, group) = self
             .groups
             .raw_entry_mut()
@@ -329,6 +330,8 @@ fn upper_bound_s_id(
 pub(crate) struct BatchedSubjectProbeMatch {
     pub subject_id: u64,
     pub object: Option<Binding>,
+    /// The fact's list position; `u32::MAX` when it is not a list item.
+    pub o_i: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -456,9 +459,9 @@ pub(crate) fn substitute_binding(
     pattern: &mut TriplePattern,
     position: PatternPosition,
     binding: &Binding,
-    gv: Option<&BinaryGraphView>,
+    gv: Option<&TermView>,
 ) -> Result<Substitution> {
-    let resolve_subject = |gv: &BinaryGraphView, s_id: u64| -> Result<Arc<str>> {
+    let resolve_subject = |gv: &TermView, s_id: u64| -> Result<Arc<str>> {
         let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
             tracing::debug!(s_id, error = %e, "failed to resolve encoded subject binding");
             QueryError::dictionary_lookup(format!(
@@ -468,7 +471,7 @@ pub(crate) fn substitute_binding(
         Ok(Arc::from(iri))
     };
     let resolve_predicate =
-        |gv: &BinaryGraphView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
+        |gv: &TermView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
 
     match position {
         PatternPosition::Subject | PatternPosition::Predicate => {
@@ -528,6 +531,7 @@ pub(crate) fn substitute_binding(
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             } => {
                 // Decode the encoded literal (novelty-aware via BinaryGraphView).
@@ -538,7 +542,7 @@ pub(crate) fn substitute_binding(
                     return Ok(Substitution::Free);
                 };
                 let val = gv
-                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                     .map_err(|e| {
                         tracing::debug!(
                             o_kind,
@@ -626,6 +630,101 @@ fn grouped_in_substitution() -> QueryError {
     QueryError::Internal(
         "grouped (list-valued) binding reached a correlated substitution".to_string(),
     )
+}
+
+/// Routing-stamp site of the nested-loop join's batched probe lanes over one
+/// graph (subject, object and existence probes).
+pub const NESTED_LOOP_BATCHED_SITE: &str = "nested-loop-batched";
+
+/// Routing-stamp site of the same probes over a default graph of several
+/// graphs of one ledger ([`UnionProbe`]).
+pub const NESTED_LOOP_BATCHED_UNION_SITE: &str = "nested-loop-batched-union";
+
+/// One row a batched subject probe matched ([`NestedLoopJoinOperator::scan_matches`]).
+struct SubjectMatch<'m> {
+    /// The probed subject.
+    s_id: u64,
+    /// The accumulated left rows that probed it.
+    accum: &'m [usize],
+    /// The object the row binds.
+    object: &'m Binding,
+    /// The fact's list position; `u32::MAX` when it is not a list item.
+    o_i: u32,
+}
+
+/// The batched probes over a default graph of several graphs of one ledger
+/// (`IndexScope::Union`): each member's leaves are probed under the context
+/// `DatasetOperator` would give it (its graph, novelty and `t`), and the
+/// matches become one row per fact of the union ([`UnionFactSet`], the key
+/// the general plan's dedup uses). `plans` holds one probe plan per member, in
+/// `ctx.active_graphs()` order.
+struct UnionProbe {
+    plans: Vec<ProbeLanePlan>,
+}
+
+/// Where a batched subject probe reads: one graph's PSOT leaves, or every
+/// member of a union ([`UnionProbe`]).
+enum SubjectProbeSource<'b> {
+    One {
+        branch: &'b fluree_db_binary_index::BranchManifest,
+        leaf_range: std::ops::Range<usize>,
+        probe_ops: Option<ProbeOps>,
+    },
+    Union(Arc<UnionProbe>),
+}
+
+/// A match a union probe collected from one member, before the union keeps
+/// one row per fact.
+struct UnionMatch {
+    /// The probed key: a subject (subject and existence probes) or an object
+    /// (the object probe's `objs` index).
+    key: u64,
+    member: usize,
+    /// The term the row binds, as the member's probe bound it: encoded where
+    /// the index holds it encoded. The union's term view decodes it later,
+    /// and the fact is keyed on it through [`UnionFactSet::insert`], which keys an
+    /// arena literal (it carries its graph) by value.
+    object: Binding,
+    o_i: u32,
+}
+
+impl UnionMatch {
+    fn new(key: u64, member: usize, object: &Binding, o_i: u32) -> Self {
+        Self {
+            key,
+            member,
+            object: object.clone(),
+            o_i,
+        }
+    }
+
+    fn list_index(&self) -> Option<u32> {
+        (self.o_i != u32::MAX).then_some(self.o_i)
+    }
+}
+
+/// The matches a union probe keeps, in member order: every match of a key
+/// only one member matched (a graph holds each fact once), and the first row
+/// of each fact of a key two or more members matched. `insert` puts the fact a
+/// match is into a set of facts of `bindings` bindings
+/// ([`UnionFactSet::insert`]).
+fn union_keep(
+    matches: &[UnionMatch],
+    bindings: usize,
+    mut insert: impl FnMut(&mut UnionFactSet, &UnionMatch) -> Result<bool>,
+) -> Result<Vec<bool>> {
+    let mut first_member: FxHashMap<u64, (usize, bool)> = FxHashMap::default();
+    for m in matches {
+        let entry = first_member.entry(m.key).or_insert((m.member, false));
+        if entry.0 != m.member {
+            entry.1 = true;
+        }
+    }
+    let mut seen = UnionFactSet::new(bindings);
+    matches
+        .iter()
+        .map(|m| Ok(!first_member[&m.key].1 || insert(&mut seen, m)?))
+        .collect()
 }
 
 /// Identifies the source of a left row in `pending_output`.
@@ -856,6 +955,10 @@ pub struct NestedLoopJoinOperator {
     out_schema: Option<Arc<[VarId]>>,
     /// Emit the runtime path decision once per open().
     logged_runtime_mode: bool,
+    /// The batched probes over a union of graphs, decided once per `open()`
+    /// (`plan_union_probe`): `None` until decided, `Some(None)` when they
+    /// stand down.
+    union_probe: Option<Option<Arc<UnionProbe>>>,
     /// Temporal mode captured at planner-time for the late per-row right scan.
     mode: crate::temporal_mode::TemporalMode,
     /// The object→subject hash-join decision that was evaluated and *lost* for
@@ -1084,6 +1187,7 @@ impl NestedLoopJoinOperator {
             right_index_hint,
             out_schema: None,
             logged_runtime_mode: false,
+            union_probe: None,
             mode,
             hj_decision: None,
         }
@@ -1161,7 +1265,7 @@ impl NestedLoopJoinOperator {
         &self,
         left_batch: &Batch,
         left_row: usize,
-        view: Option<&BinaryGraphView>,
+        view: Option<&TermView>,
     ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.right_pattern.clone();
         for instr in &self.bind_instructions {
@@ -1337,6 +1441,7 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.logged_runtime_mode = false;
+        self.union_probe = None;
 
         tracing::trace!(
             left_schema_cols = self.left_schema.len(),
@@ -1422,12 +1527,30 @@ impl Operator for NestedLoopJoinOperator {
                 active_graph_count,
                 "nested loop join runtime path"
             );
+            if use_batched {
+                crate::fast_path_outcome::stamp_fast_path(
+                    NESTED_LOOP_BATCHED_SITE,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+            }
             self.logged_runtime_mode = true;
         }
+        // Over a union of graphs of one ledger the one-graph lanes stand
+        // down (`reads_exactly_one_graph`); the union variant probes every
+        // member instead. Decided once per open, before anything accumulates.
+        if self.union_probe.is_none() {
+            let plan = if use_batched {
+                None
+            } else {
+                self.plan_union_probe(ctx)?.map(Arc::new)
+            };
+            self.union_probe = Some(plan);
+        }
+        let use_batched = use_batched || matches!(self.union_probe, Some(Some(_)));
 
         // Built once for the whole next_batch call (avoids repeated Arc::clone
         // + construction per row).
-        let cached_view = ctx.graph_view();
+        let cached_view = ctx.term_view();
 
         // Process until we have output or exhaust input
         loop {
@@ -1699,7 +1822,7 @@ impl Operator for NestedLoopJoinOperator {
             output_columns,
             groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
-            graph_view: ctx.graph_view(),
+            graph_view: ctx.term_view(),
             counted_rows: 0,
         });
         let result: Result<u64> = async {
@@ -1932,6 +2055,107 @@ impl NestedLoopJoinOperator {
         self.current_left_batch_stored_idx = None;
     }
 
+    /// The batched probes over a default graph of several graphs of one
+    /// ledger, or `None` where they stand down (stamped at
+    /// [`NESTED_LOOP_BATCHED_UNION_SITE`] when the scope is such a union).
+    ///
+    /// Each member is read under the context `DatasetOperator` gives it, and
+    /// must be the member `IndexScope::Union` certified (one store, its
+    /// graph and `t`). A member whose own graph has novelty for the probed
+    /// predicate declines the variant for now (`Novelty`); a member with no
+    /// novelty and no branch holds nothing for it and is no reason to
+    /// decline.
+    fn plan_union_probe(&self, ctx: &ExecutionContext<'_>) -> Result<Option<UnionProbe>> {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        use crate::index_scope::IndexScope;
+        if self.hide_list_members {
+            // SPARQL reads this triple through its view of RDF lists, which no
+            // stored row is (`hiding_list_members` turned the probes off).
+            if let Some(IndexScope::Union(_)) = ctx.index_scope_policy_cleared() {
+                let reason = if crate::execute::fast_paths_disabled() {
+                    FastPathFallback::KillSwitch
+                } else {
+                    FastPathFallback::ListView
+                };
+                stamp_fast_path(
+                    NESTED_LOOP_BATCHED_UNION_SITE,
+                    FastPathOutcome::Fallback(reason),
+                );
+            }
+            return Ok(None);
+        }
+        if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        {
+            return Ok(None);
+        }
+        let Some(IndexScope::Union(set)) = ctx.index_scope_policy_cleared() else {
+            return Ok(None);
+        };
+        let decline = |reason| {
+            stamp_fast_path(
+                NESTED_LOOP_BATCHED_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+            Ok(None)
+        };
+        if crate::execute::fast_paths_disabled() {
+            return decline(FastPathFallback::KillSwitch);
+        }
+        let (Some(pred), Some(store)) =
+            (self.batched_predicate.as_ref(), ctx.binary_store.as_ref())
+        else {
+            return decline(FastPathFallback::GateDeclined);
+        };
+        if ctx.is_history_range() || ctx.eager_materialization {
+            return decline(FastPathFallback::GateDeclined);
+        }
+        if !matches!(
+            crate::fast_path_common::policy_lane_for_predicates(
+                ctx,
+                &[pred],
+                crate::fast_path_common::POLICY_PREDICATE_PROBE_SITE,
+            ),
+            crate::fast_path_common::PredicateFastPath::Allow
+        ) {
+            return decline(FastPathFallback::GateDeclined);
+        }
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return decline(FastPathFallback::StoreMismatch);
+        };
+        if graphs.len() != set.members().len() || !Arc::ptr_eq(store, set.store()) {
+            return decline(FastPathFallback::StoreMismatch);
+        }
+        let mut plans = Vec::with_capacity(graphs.len());
+        for (graph, certified) in graphs.iter().zip(set.members()) {
+            let member_ctx = ctx.with_graph_ref(graph);
+            match member_ctx.index_scope_policy_cleared() {
+                Some(IndexScope::One(member))
+                    if Arc::ptr_eq(member.store(), set.store())
+                        && member.g_id() == certified.g_id()
+                        && member.to_t() == certified.to_t() => {}
+                _ => return decline(FastPathFallback::StoreMismatch),
+            }
+            let plan = if self.batched_object_eligible {
+                object_probe_lane_plan(&member_ctx, store, pred)?
+            } else {
+                subject_probe_lane_plan(&member_ctx, store, pred)?
+            };
+            match plan {
+                ProbeLanePlan::Clean => plans.push(plan),
+                ProbeLanePlan::Merge(_) | ProbeLanePlan::Decline => {
+                    return decline(FastPathFallback::Novelty)
+                }
+            }
+        }
+        stamp_fast_path(NESTED_LOOP_BATCHED_UNION_SITE, FastPathOutcome::Proceed);
+        Ok(Some(UnionProbe { plans }))
+    }
+
+    /// The union probe's plans, when the union variant is running.
+    fn union_plans(&self) -> Option<Arc<UnionProbe>> {
+        self.union_probe.clone().flatten()
+    }
+
     /// Decide how the batched lanes handle the active overlay this call.
     ///
     /// The subject-probe and exists lanes merge overlay ops per probed
@@ -2053,8 +2277,133 @@ impl NestedLoopJoinOperator {
         branch.find_leaves_in_range(&min_key, &max_key, cmp)
     }
 
+    /// Phase 4, from wherever the probe reads ([`SubjectProbeSource`]).
+    #[allow(clippy::too_many_arguments)]
+    fn probe_subjects(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        p_id: u32,
+        unique_s_ids: &[u64],
+        s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
+        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        source: &mut SubjectProbeSource<'_>,
+        on_match: &mut dyn FnMut(SubjectMatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        match source {
+            SubjectProbeSource::One {
+                branch,
+                leaf_range,
+                probe_ops,
+            } => self.scan_matches(
+                ctx,
+                store,
+                branch,
+                leaf_range.clone(),
+                p_id,
+                unique_s_ids,
+                s_id_to_accum,
+                dict_overlay,
+                probe_ops.as_mut(),
+                on_match,
+            ),
+            SubjectProbeSource::Union(union) => self.scan_matches_union(
+                ctx,
+                store,
+                p_id,
+                unique_s_ids,
+                s_id_to_accum,
+                &union.plans,
+                on_match,
+            ),
+        }
+    }
+
+    /// [`Self::scan_matches`] over every member of a union of one ledger's
+    /// graphs, each under its own context, then one row per fact of the union
+    /// ([`union_keep`]). Rows leave decoded ([`UnionMatch`]).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_matches_union(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        p_id: u32,
+        unique_s_ids: &[u64],
+        s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
+        plans: &[ProbeLanePlan],
+        on_match: &mut dyn FnMut(SubjectMatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        use fluree_db_binary_index::RunSortOrder;
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return Err(QueryError::Internal(
+                "a union probe ran without the union's graphs".into(),
+            ));
+        };
+        let mut matches: Vec<UnionMatch> = Vec::new();
+        for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
+            let member_ctx = ctx.with_graph_ref(graph);
+            // A member with no branch holds nothing for the probe: its plan
+            // would have declined had its novelty held the predicate.
+            let Some(branch) = store.branch_for_order(member_ctx.binary_g_id, RunSortOrder::Psot)
+            else {
+                continue;
+            };
+            let leaf_range = Self::find_psot_leaf_range(
+                branch,
+                member_ctx.binary_g_id,
+                p_id,
+                unique_s_ids[0],
+                *unique_s_ids.last().expect("non-empty probe"),
+            );
+            let dict_overlay = make_dict_overlay(&member_ctx, store);
+            let mut probe_ops = match plan {
+                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                _ => None,
+            };
+            self.scan_matches(
+                &member_ctx,
+                store,
+                branch,
+                leaf_range,
+                p_id,
+                unique_s_ids,
+                s_id_to_accum,
+                &dict_overlay,
+                probe_ops.as_mut(),
+                &mut |m| {
+                    matches.push(UnionMatch::new(m.s_id, member, m.object, m.o_i));
+                    Ok(())
+                },
+            )?;
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let keep = union_keep(&matches, 2, |set, m| {
+            Ok(set.insert(
+                [&Binding::encoded_sid(m.key), &m.object],
+                Some(FactRef {
+                    object: None,
+                    list_index: m.list_index(),
+                }),
+                dicts,
+                gv,
+            )?)
+        })?;
+        for (m, keep) in matches.iter().zip(keep) {
+            let Some(accum) = s_id_to_accum.get(&m.key).filter(|_| keep) else {
+                continue;
+            };
+            on_match(SubjectMatch {
+                s_id: m.key,
+                accum,
+                object: &m.object,
+                o_i: m.o_i,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Phase 4: Scan PSOT leaves, matching accumulated subjects and invoking
-    /// `on_match` per matched (left-row group, object) pair.
+    /// `on_match` per matched (left-row group, object) pair ([`SubjectMatch`]).
     ///
     /// Uses V3 column-based leaf loading via `get_leaf_bytes_sync` + `load_leaflet_columns_cached`,
     /// binary-searches for matching subjects within each leaflet's p_id segment, and builds the
@@ -2073,7 +2422,7 @@ impl NestedLoopJoinOperator {
         s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
         mut probe_ops: Option<&mut ProbeOps>,
-        on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
+        on_match: &mut dyn FnMut(SubjectMatch<'_>) -> Result<()>,
     ) -> Result<()> {
         use fluree_db_core::o_type::OType;
 
@@ -2160,8 +2509,8 @@ impl NestedLoopJoinOperator {
                             .o_type_const
                             .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                         let o_key_val = batch.o_key.get(row);
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
                             if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
                                 == RowFate::Drop
                             {
@@ -2183,7 +2532,6 @@ impl NestedLoopJoinOperator {
                         {
                             Binding::encoded_sid(o_key_val)
                         } else {
-                            let o_i = batch.o_i.get_or(row, u32::MAX);
                             let t = batch.t.get_or(row, 0) as i64;
                             build_probe_object_binding(
                                 ctx,
@@ -2192,12 +2540,17 @@ impl NestedLoopJoinOperator {
                                 p_id,
                                 o_type_val,
                                 o_key_val,
-                                o_i,
+                                o_i_val,
                                 t,
                             )?
                         };
 
-                        on_match(accum_indices, &obj_binding)?;
+                        on_match(SubjectMatch {
+                            s_id,
+                            accum: accum_indices,
+                            object: &obj_binding,
+                            o_i: o_i_val,
+                        })?;
                     }
                 }
             }
@@ -2240,7 +2593,12 @@ impl NestedLoopJoinOperator {
                         )?
                     };
                     matched_rows += 1;
-                    on_match(accum_indices, &obj_binding)
+                    on_match(SubjectMatch {
+                        s_id,
+                        accum: accum_indices,
+                        object: &obj_binding,
+                        o_i: op.o_i,
+                    })
                 })?;
             }
         }
@@ -2461,22 +2819,38 @@ impl NestedLoopJoinOperator {
             self.clear_batched_state();
             return Ok(());
         }
-        let branch = store
-            .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
-            .ok_or_else(|| QueryError::Internal("PSOT index not found for graph".into()))?;
-        let leaf_range = Self::find_psot_leaf_range(
-            branch,
-            ctx.binary_g_id,
-            p_id,
-            unique_s_ids[0],
-            *unique_s_ids.last().unwrap(),
-        );
-
-        // One reconciler per flush: probed keys recur across flushes with new
-        // left rows, so consumed-state must not outlive this flush.
-        let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
-            _ => None,
+        let mut source = match self.union_plans() {
+            Some(union) => SubjectProbeSource::Union(union),
+            None => {
+                // A graph the index has no PSOT branch for holds nothing for
+                // the probe: its lane plan would have declined had the
+                // graph's novelty held the predicate. Its left rows (from
+                // novelty) match nothing, as on the object probe.
+                let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+                else {
+                    self.clear_batched_state();
+                    return Ok(());
+                };
+                let leaf_range = Self::find_psot_leaf_range(
+                    branch,
+                    ctx.binary_g_id,
+                    p_id,
+                    unique_s_ids[0],
+                    *unique_s_ids.last().unwrap(),
+                );
+                // One reconciler per flush: probed keys recur across flushes
+                // with new left rows, so consumed-state must not outlive this
+                // flush.
+                let probe_ops = match &self.batched_overlay_mode {
+                    ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                    _ => None,
+                };
+                SubjectProbeSource::One {
+                    branch,
+                    leaf_range,
+                    probe_ops,
+                }
+            }
         };
 
         // Phase 4+5: Scan leaves, scatter matches by accumulator position, emit
@@ -2511,7 +2885,8 @@ impl NestedLoopJoinOperator {
                 vec![Vec::new(); self.batched_accumulator.len()]
             };
             {
-                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                let mut on_match = |m: SubjectMatch<'_>| -> Result<()> {
+                    let (accum_indices, obj) = (m.accum, m.object);
                     // Right-side tail (object + any right-scan inline outputs) is
                     // independent of the left row, so build it once per match.
                     let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
@@ -2550,16 +2925,14 @@ impl NestedLoopJoinOperator {
                     }
                     Ok(())
                 };
-                self.scan_matches(
+                self.probe_subjects(
                     ctx,
                     &store,
-                    branch,
-                    leaf_range,
                     p_id,
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
-                    probe_ops.as_mut(),
+                    &mut source,
                     &mut on_match,
                 )?;
             }
@@ -2595,7 +2968,8 @@ impl NestedLoopJoinOperator {
             let mut scatter: Vec<Vec<Vec<Binding>>> =
                 vec![Vec::new(); self.batched_accumulator.len()];
             {
-                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                let mut on_match = |m: SubjectMatch<'_>| -> Result<()> {
+                    let (accum_indices, obj) = (m.accum, m.object);
                     for &accum_idx in accum_indices {
                         let (batch_idx, row_idx, _) = &self.batched_accumulator[accum_idx];
                         let left_batch = &self.stored_left_batches[*batch_idx];
@@ -2626,23 +3000,25 @@ impl NestedLoopJoinOperator {
                     }
                     Ok(())
                 };
-                self.scan_matches(
+                self.probe_subjects(
                     ctx,
                     &store,
-                    branch,
-                    leaf_range,
                     p_id,
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
-                    probe_ops.as_mut(),
+                    &mut source,
                     &mut on_match,
                 )?;
             }
             self.emit_scatter_to_output(scatter, ctx.batch_size)?;
         }
 
-        if let Some(probe) = &probe_ops {
+        if let SubjectProbeSource::One {
+            probe_ops: Some(probe),
+            ..
+        } = &source
+        {
             tracing::debug!(
                 dropped_rows = probe.dropped_rows,
                 injected_rows = probe.injected_rows,
@@ -2696,25 +3072,6 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
-            debug_assert!(
-                !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
-                "lane plan must decline branchless graphs"
-            );
-            self.clear_batched_state();
-            return Ok(());
-        };
-        let branch = Arc::clone(branch);
-
-        // One reconciler per flush (see `flush_batched_accumulator_binary`).
-        let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
-            _ => None,
-        };
-
-        let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
-        let mut matched_rows: u64 = 0;
-
         let mut objs: Vec<u64> = o_to_accum.keys().copied().collect();
         objs.sort_unstable();
         objs.dedup();
@@ -2723,31 +3080,63 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
         let accums: Vec<&[usize]> = objs.iter().map(|o| o_to_accum[o].as_slice()).collect();
+        let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
+        let mut matched_rows: u64 = 0;
 
-        let this = &*self;
-        for_each_object_probe_match(
-            ctx,
-            &store,
-            &branch,
-            p_id,
-            &objs,
-            probe_ops.as_mut(),
-            |obj_idx, s_id| {
-                this.emit_object_probe_match(
+        if let Some(union) = self.union_plans() {
+            let matches = self.object_matches_union(ctx, &store, p_id, &objs, &union.plans)?;
+            for m in &matches {
+                self.emit_object_probe_match(
                     ctx,
-                    s_id,
-                    accums[obj_idx],
+                    &m.object,
+                    accums[m.key as usize],
                     &mut scatter,
                     &mut matched_rows,
-                )
-            },
-        )?;
-        if let Some(probe) = &probe_ops {
-            tracing::debug!(
-                dropped_rows = probe.dropped_rows,
-                injected_rows = probe.injected_rows,
-                "join batched object flush merged novelty overlay"
-            );
+                )?;
+            }
+        } else {
+            let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
+                debug_assert!(
+                    !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
+                    "lane plan must decline branchless graphs"
+                );
+                self.clear_batched_state();
+                return Ok(());
+            };
+            let branch = Arc::clone(branch);
+
+            // One reconciler per flush (see `flush_batched_accumulator_binary`).
+            let mut probe_ops = match &self.batched_overlay_mode {
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+                _ => None,
+            };
+
+            let this = &*self;
+            for_each_object_probe_match(
+                ctx,
+                &store,
+                &branch,
+                p_id,
+                &objs,
+                probe_ops.as_mut(),
+                false,
+                |obj_idx, s_id, _| {
+                    this.emit_object_probe_match(
+                        ctx,
+                        &Binding::encoded_sid(s_id),
+                        accums[obj_idx],
+                        &mut scatter,
+                        &mut matched_rows,
+                    )
+                },
+            )?;
+            if let Some(probe) = &probe_ops {
+                tracing::debug!(
+                    dropped_rows = probe.dropped_rows,
+                    injected_rows = probe.injected_rows,
+                    "join batched object flush merged novelty overlay"
+                );
+            }
         }
 
         self.emit_scatter_to_output(scatter, ctx.batch_size)?;
@@ -2766,13 +3155,150 @@ impl NestedLoopJoinOperator {
         Ok(())
     }
 
+    /// The object probe over every member of a union, one match per fact of
+    /// the union ([`union_keep`]): a match is `(subject, probed object, list
+    /// position)`, keyed by the probed object's index in `objs`.
+    fn object_matches_union(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        p_id: u32,
+        objs: &[u64],
+        plans: &[ProbeLanePlan],
+    ) -> Result<Vec<UnionMatch>> {
+        use fluree_db_binary_index::RunSortOrder;
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return Err(QueryError::Internal(
+                "a union probe ran without the union's graphs".into(),
+            ));
+        };
+        let mut matches: Vec<UnionMatch> = Vec::new();
+        for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
+            let member_ctx = ctx.with_graph_ref(graph);
+            let Some(branch) = store.branch_for_order(member_ctx.binary_g_id, RunSortOrder::Opst)
+            else {
+                continue;
+            };
+            let mut probe_ops = match plan {
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+                _ => None,
+            };
+            // Charged as the one-graph lane charges: per emitted row, by the
+            // flush.
+            for_each_object_probe_match(
+                &member_ctx,
+                store,
+                branch,
+                p_id,
+                objs,
+                probe_ops.as_mut(),
+                true,
+                |obj_idx, s_id, o_i| {
+                    matches.push(UnionMatch::new(
+                        obj_idx as u64,
+                        member,
+                        &Binding::encoded_sid(s_id),
+                        o_i,
+                    ));
+                    Ok(())
+                },
+            )?;
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let keep = union_keep(&matches, 2, |set, m| {
+            Ok(set.insert(
+                [&m.object, &Binding::encoded_sid(objs[m.key as usize])],
+                Some(FactRef {
+                    object: None,
+                    list_index: m.list_index(),
+                }),
+                dicts,
+                gv,
+            )?)
+        })?;
+        Ok(matches
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(m, keep)| keep.then_some(m))
+            .collect())
+    }
+
+    /// The existence probe over every member of a union, one match per fact
+    /// of the union ([`union_keep`]): a match is `(subject, the term the
+    /// constant object matched, list position)`.
+    fn exists_matches_union(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        pred: &Sid,
+        unique_s_ids: &[u64],
+        plans: &[ProbeLanePlan],
+    ) -> Result<Vec<BatchedSubjectProbeMatch>> {
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return Err(QueryError::Internal(
+                "a union probe ran without the union's graphs".into(),
+            ));
+        };
+        let mut matches: Vec<UnionMatch> = Vec::new();
+        for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
+            let member_ctx = ctx.with_graph_ref(graph);
+            let mut probe_ops = match plan {
+                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                _ => None,
+            };
+            let dict_overlay = make_dict_overlay(&member_ctx, store);
+            let found = batched_subject_probe_binary(
+                &member_ctx,
+                store,
+                &SubjectProbeParams {
+                    pred_sid: pred,
+                    subject_ids: unique_s_ids,
+                    object_bounds: None,
+                    bound_object: Some(&self.right_pattern.o),
+                    emit_object: true,
+                    dict_overlay: dict_overlay.as_ref(),
+                },
+                probe_ops.as_mut(),
+            )?;
+            for m in found {
+                let object = m.object.as_ref().ok_or_else(|| {
+                    QueryError::Internal("an object-emitting probe returned no object".into())
+                })?;
+                matches.push(UnionMatch::new(m.subject_id, member, object, m.o_i));
+            }
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let keep = union_keep(&matches, 1, |set, m| {
+            Ok(set.insert(
+                [&Binding::encoded_sid(m.key)],
+                Some(FactRef {
+                    object: Some(&m.object),
+                    list_index: m.list_index(),
+                }),
+                dicts,
+                gv,
+            )?)
+        })?;
+        Ok(matches
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(m, keep)| {
+                keep.then_some(BatchedSubjectProbeMatch {
+                    subject_id: m.key,
+                    object: None,
+                    o_i: m.o_i,
+                })
+            })
+            .collect())
+    }
+
     /// Emit one matched (subject, left-row group) of the bound-object lane:
     /// build the combined row per accumulator slot through the same inline-op
     /// stages for base and injected matches.
     fn emit_object_probe_match(
         &self,
         ctx: &ExecutionContext<'_>,
-        s_id: u64,
+        subject: &Binding,
         accum_idxs: &[usize],
         scatter: &mut [Vec<Vec<Binding>>],
         matched_rows: &mut u64,
@@ -2784,7 +3310,7 @@ impl NestedLoopJoinOperator {
             })?;
             let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
             for _ in &self.right_new_vars {
-                right_bindings.push(Binding::encoded_sid(s_id));
+                right_bindings.push(subject.clone());
             }
             if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
                 continue;
@@ -2831,37 +3357,43 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        // One reconciler per flush (see `flush_batched_accumulator_binary`).
-        let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
-            _ => None,
+        let pred = self
+            .batched_predicate
+            .as_ref()
+            .expect("batched predicate set");
+        let probe_matches = if let Some(union) = self.union_plans() {
+            self.exists_matches_union(ctx, &store, pred, &unique_s_ids, &union.plans)?
+        } else {
+            // One reconciler per flush (see `flush_batched_accumulator_binary`).
+            let mut probe_ops = match &self.batched_overlay_mode {
+                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                _ => None,
+            };
+            // Needed to decode novelty-minted object values for the
+            // bound-object filter on injected asserts.
+            let dict_overlay = make_dict_overlay(ctx, &store);
+            let probe_matches = batched_subject_probe_binary(
+                ctx,
+                &store,
+                &SubjectProbeParams {
+                    pred_sid: pred,
+                    subject_ids: &unique_s_ids,
+                    object_bounds: None,
+                    bound_object: Some(&self.right_pattern.o),
+                    emit_object: false,
+                    dict_overlay: dict_overlay.as_ref(),
+                },
+                probe_ops.as_mut(),
+            )?;
+            if let Some(probe) = &probe_ops {
+                tracing::debug!(
+                    dropped_rows = probe.dropped_rows,
+                    injected_rows = probe.injected_rows,
+                    "join batched existence flush merged novelty overlay"
+                );
+            }
+            probe_matches
         };
-        // Needed to decode novelty-minted object values for the bound-object
-        // filter on injected asserts.
-        let dict_overlay = make_dict_overlay(ctx, &store);
-        let probe_matches = batched_subject_probe_binary(
-            ctx,
-            &store,
-            &SubjectProbeParams {
-                pred_sid: self
-                    .batched_predicate
-                    .as_ref()
-                    .expect("batched predicate set"),
-                subject_ids: &unique_s_ids,
-                object_bounds: None,
-                bound_object: Some(&self.right_pattern.o),
-                emit_object: false,
-                dict_overlay: dict_overlay.as_ref(),
-            },
-            probe_ops.as_mut(),
-        )?;
-        if let Some(probe) = &probe_ops {
-            tracing::debug!(
-                dropped_rows = probe.dropped_rows,
-                injected_rows = probe.injected_rows,
-                "join batched existence flush merged novelty overlay"
-            );
-        }
 
         let accum_len = self.batched_accumulator.len();
         let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); accum_len];
@@ -2944,7 +3476,7 @@ fn build_probe_object_binding(
     t: i64,
 ) -> Result<Binding> {
     if let Some(binding) =
-        late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
+        late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None, ctx.binary_g_id)
     {
         return Ok(binding);
     }
@@ -3009,6 +3541,7 @@ fn decode_overlay_object(
 /// leaflet the `o_key` column is binary-searched per object, so the work tracks
 /// the matches rather than the leaflet or predicate size. Shared by the
 /// nested-loop join's bound-object lane and OPTIONAL's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn for_each_object_probe_match(
     ctx: &ExecutionContext<'_>,
     store: &BinaryIndexStore,
@@ -3016,7 +3549,8 @@ pub(crate) fn for_each_object_probe_match(
     p_id: u32,
     objs: &[u64],
     mut probe_ops: Option<&mut ObjectProbeOps>,
-    mut visit: impl FnMut(usize, u64) -> Result<()>,
+    with_list_index: bool,
+    mut visit: impl FnMut(usize, u64, u32) -> Result<()>,
 ) -> Result<()> {
     use fluree_db_binary_index::format::run_record_v2::{
         cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
@@ -3103,7 +3637,7 @@ pub(crate) fn for_each_object_probe_match(
             // multi-entry (`@list`) refs in BOTH cache configurations.
             let proj = if need_replay {
                 ColumnProjection::all()
-            } else if probe_ops.is_some() {
+            } else if probe_ops.is_some() || with_list_index {
                 ColumnProjection {
                     output: ColumnSet::CORE.union(ColumnSet::single(
                         fluree_db_binary_index::format::column_block::ColumnId::OI,
@@ -3146,14 +3680,14 @@ pub(crate) fn for_each_object_probe_match(
                         continue;
                     };
                     let s_id = batch.s_id.get_or(row, 0);
+                    let o_i_val = batch.o_i.get_or(row, u32::MAX);
                     if let Some(probe) = probe_ops.as_mut() {
                         let win = probe.object_window(o_key);
-                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
                         if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
                             continue;
                         }
                     }
-                    visit(obj_idx, s_id)?;
+                    visit(obj_idx, s_id, o_i_val)?;
                 }
                 continue;
             };
@@ -3209,13 +3743,19 @@ pub(crate) fn for_each_object_probe_match(
                     }
 
                     let s_id = batch.s_id.get_or(r, 0);
+                    // Read only where it is needed: the overlay merge, and a
+                    // union's fact identity.
+                    let o_i_val = if probe_window.is_some() || with_list_index {
+                        batch.o_i.get_or(r, u32::MAX)
+                    } else {
+                        u32::MAX
+                    };
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                        let o_i_val = batch.o_i.get_or(r, u32::MAX);
                         if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
                             continue;
                         }
                     }
-                    visit(obj_idx, s_id)?;
+                    visit(obj_idx, s_id, o_i_val)?;
                 }
 
                 row = run_end;
@@ -3235,7 +3775,9 @@ pub(crate) fn for_each_object_probe_match(
                 Ok(())
             })?;
             for s_id in injected {
-                visit(obj_idx, s_id)?;
+                // The union probe merges no novelty yet (`plan_union_probe`
+                // declines it), so no caller reads a novelty fact's position.
+                visit(obj_idx, s_id, u32::MAX)?;
             }
         }
     }
@@ -3487,6 +4029,7 @@ fn batched_subject_probe_binary_uncharged(
                     out.push(BatchedSubjectProbeMatch {
                         subject_id: s_id,
                         object,
+                        o_i: batch.o_i.get_or(row, u32::MAX),
                     });
                 }
             }
@@ -3535,6 +4078,7 @@ fn batched_subject_probe_binary_uncharged(
                 out.push(BatchedSubjectProbeMatch {
                     subject_id: s_id,
                     object,
+                    o_i: op.o_i,
                 });
                 Ok(())
             })?;

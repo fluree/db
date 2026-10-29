@@ -144,6 +144,7 @@ fn encoded_lit_from_otype(
         lang_id,
         i_val: i32::MIN,
         t: 0,
+        arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
     };
     Some((ident, b))
 }

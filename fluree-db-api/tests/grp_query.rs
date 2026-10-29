@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_arena_literal_keys.rs"]
+mod it_arena_literal_keys;
 #[path = "it_bounded_overlay_translation.rs"]
 mod it_bounded_overlay_translation;
 #[path = "it_differential_fastpath.rs"]

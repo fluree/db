@@ -160,10 +160,18 @@ impl Expression {
                     p_id,
                     dt_id,
                     lang_id,
+                    arena_g_id,
                     ..
                 }) => {
                     let Some(decoded) = ctx.and_then(|c| {
-                        c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                        c.decode_encoded_value(
+                            *o_kind,
+                            *o_key,
+                            *p_id,
+                            *dt_id,
+                            *lang_id,
+                            *arena_g_id,
+                        )
                     }) else {
                         return Ok(None);
                     };
@@ -507,10 +515,11 @@ pub(crate) fn stored_float_f64<R: RowAccess>(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if *dt_id == DatatypeDictId::FLOAT.as_u16() => {
             match ctx?
-                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
                 .ok()?
             {
                 FlakeValue::Double(d) => Some(d),
@@ -611,6 +620,7 @@ fn binding_effective_bool(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         }) => {
             // A language-tagged literal has no effective boolean value (§17.2.2),
@@ -622,8 +632,9 @@ fn binding_effective_bool(
             if *lang_id != 0 {
                 return Err(ebv_type_error());
             }
-            let decoded =
-                ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id));
+            let decoded = ctx.and_then(|c| {
+                c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
+            });
             match decoded {
                 Some(Ok(val)) => match ComparableValue::try_from(&val) {
                     Ok(cv) => comparable_effective_bool(&cv),

@@ -20,13 +20,10 @@
 //!
 //! See `docs/design/query-execution.md` for the pipeline overview.
 
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use fluree_db_core::{DatatypeConstraint, IndexType, ObjectBounds, Sid};
-use hashbrown::HashMap;
-use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::binary_history::BinaryHistoryScanOperator;
 use crate::binary_scan::{schema_from_pattern_with_emit, BinaryScanOperator, EmitMask};
@@ -37,11 +34,12 @@ use crate::error::{QueryError, Result};
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::index_scope::IndexScope;
 use crate::ir::triple::TriplePattern;
-use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
+use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, CountGroup, Operator, OperatorState, RowFact};
 use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
+use crate::union_fact::{FactRef, UnionFactSet};
 use crate::union_group_count::{
     count_groups_over_union, grouped_position, UnionGroupCount, PARTITIONED_GROUP_BY_UNION_SITE,
 };
@@ -249,6 +247,13 @@ struct DatasetMember {
     ledger_id: Arc<str>,
 }
 
+/// Whether a scan over `members` active graphs deduplicates across them on
+/// fact identity ([`BatchDeduper`]): a union of two or more graphs, in
+/// current mode. A plan over such a union answers as over the merged graph.
+pub(crate) fn union_dedups_on_fact_identity(members: usize, mode: TemporalMode) -> bool {
+    members >= 2 && mode.is_current()
+}
+
 /// Cross-member set-deduplicator for a `>= 2`-member default union.
 ///
 /// Per SPARQL §13.2 the default graph of a dataset is the RDF *merge* (a set)
@@ -261,16 +266,16 @@ struct DatasetMember {
 /// graph alone. This holds a persistent seen-set across `next_batch` calls
 /// (the operator streams one member's batch per call).
 ///
-/// Hashing mirrors [`DistinctOperator`](crate::distinct): bindings are
-/// normalized with [`EqualityNorm`] so a late-materialized
-/// `EncodedSid`/`EncodedLit` and its decoded `Sid`/`Lit` twin collapse to one
-/// row. `Binding`'s manual `Eq`/`Hash` exclude history metadata, so this is
-/// only armed in current mode (see [`DatasetOperator::open`]).
+/// The key is [`UnionFactSet`]'s: bindings are normalized with
+/// [`EqualityNorm`] so a late-materialized `EncodedSid`/`EncodedLit` and its
+/// decoded `Sid`/`Lit` twin collapse to one row. `Binding`'s manual
+/// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
+/// (see [`DatasetOperator::open`]).
 ///
 /// MEMORY CLIFF (documented like `whole_graph_facts`'s): unlike a
 /// single-graph scan, a `>= 2`-member default union is no longer
 /// bounded-memory streaming — the seen-set grows O(distinct emitted facts)
-/// with full normalized `Binding` signatures as keys, exactly like a
+/// (16 bytes per encoded term, a whole `Binding` per decoded one), like a
 /// user-requested `DISTINCT` (which is the price of §13.2 set semantics; a
 /// hash-only key was rejected because a collision would silently DROP a
 /// distinct row). Each RETAINED row charges one unit of fuel, so a fuel
@@ -278,21 +283,15 @@ struct DatasetMember {
 /// it forgoes the per-member count-only shortcut (surfaced to EXPLAIN via
 /// `plan_details.default_union_set_merge`).
 struct BatchDeduper {
-    seen: HashMap<FactRow, (), FxBuildHasher>,
+    /// Armed by the first batch, whose width every later batch must have.
+    seen: Option<UnionFactSet>,
     norm: Option<EqualityNorm>,
-}
-
-/// A union row's dedup key: its normalized bindings and the fact it matched.
-#[derive(PartialEq, Eq, Hash)]
-struct FactRow {
-    bindings: Vec<Binding>,
-    fact: Option<RowFact>,
 }
 
 impl BatchDeduper {
     fn new(ctx: &ExecutionContext<'_>) -> Self {
         Self {
-            seen: HashMap::with_hasher(FxBuildHasher),
+            seen: None,
             norm: equality_norm(ctx),
         }
     }
@@ -306,49 +305,35 @@ impl BatchDeduper {
                 "a union member's row facts do not match its batch".to_string(),
             ));
         }
+        let num_cols = batch.schema().len();
+        let seen = self.seen.get_or_insert_with(|| UnionFactSet::new(num_cols));
+        if seen.bindings() != num_cols {
+            return Err(QueryError::Internal(
+                "a union member's batch has another width than its first".to_string(),
+            ));
+        }
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
-        let normalized_fact = |row: usize| -> Option<RowFact> {
-            facts.map(|f| RowFact {
-                object: f[row]
-                    .object
-                    .as_ref()
-                    .map(|o| normalize_for_key(o, dicts, gv)),
-                list_index: f[row].list_index,
-            })
-        };
+        let fact = |row: usize| facts.map(|f| FactRef::from(&f[row]));
         // A ground (all-constant) pattern emits the empty solution mapping
         // with no columns: one solution per fact it matched.
-        if batch.schema().is_empty() {
+        if num_cols == 0 {
             let mut kept = 0;
             for row in 0..batch.len() {
-                let key = FactRow {
-                    bindings: Vec::new(),
-                    fact: normalized_fact(row),
-                };
-                if self.seen.insert(key, ()).is_none() {
+                if seen.insert([], fact(row), dicts, gv)? {
                     kept += 1;
                 }
             }
             return Ok(Batch::empty_schema_with_len(kept));
         }
-        let num_cols = batch.schema().len();
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
         for row_idx in 0..batch.len() {
-            let key = FactRow {
-                bindings: (0..num_cols)
-                    .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), dicts, gv))
-                    .collect(),
-                fact: normalized_fact(row_idx),
-            };
-            let mut h = FxHasher::default();
-            key.hash(&mut h);
-            let hash = h.finish();
-            let entry = self
-                .seen
-                .raw_entry_mut()
-                .from_hash(hash, |seen| *seen == key);
-            if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
-                v.insert_hashed_nocheck(hash, key, ());
+            let new = seen.insert(
+                (0..num_cols).map(|col| batch.get_by_col(row_idx, col)),
+                fact(row_idx),
+                dicts,
+                gv,
+            )?;
+            if new {
                 for (col_idx, col) in columns.iter_mut().enumerate() {
                     col.push(batch.get_by_col(row_idx, col_idx).clone());
                 }
@@ -406,13 +391,15 @@ pub struct DatasetOperator {
 impl DatasetOperator {
     /// The context member `graph` runs under.
     ///
-    /// Members that are several graphs of one ledger keep the binary cursor,
-    /// but their rows leave for a scope of several graphs, which has no single
-    /// graph view to decode an encoded binding against (`ctx.graph_view()` is
-    /// `None`). A join substituting an undecodable `EncodedSid` would leave the
-    /// position unbound and pair every row with every other, and a NUM_BIG
-    /// handle decodes only against its own graph's arena. So such members
-    /// decode as they scan, where their own view is at hand.
+    /// Members that are several graphs of one ledger keep the binary cursor.
+    /// Their rows leave encoded when the scope can decode them: every member
+    /// reads this context's store and dictionary novelty (a certified
+    /// [`IndexScope::Union`](crate::index_scope::IndexScope::Union)), so an id
+    /// names one term in every member and the scope's
+    /// [`term_view`](ExecutionContext::term_view) decodes it; an arena literal
+    /// carries the graph it was read from. Otherwise (a history range, members
+    /// on another store or novelty) members decode as they scan, where their
+    /// own view is at hand.
     fn member_ctx<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -786,7 +773,7 @@ impl Operator for DatasetOperator {
                 // (all-constant) pattern still emits zero columns even so; those
                 // zero-column batches are the empty solution mapping, which the
                 // deduper collapses to a single solution (`BatchDeduper::retain_new`).
-                self.dedup = if graphs.len() >= 2 && self.mode.is_current() {
+                self.dedup = if union_dedups_on_fact_identity(graphs.len(), self.mode) {
                     // Soundness coupling: arming dedup on a `>= 2`-member union
                     // requires the plan to have forced `EmitMask::ALL` (via
                     // `PlanningContext::multi_default_graph`) so no variable
@@ -814,7 +801,12 @@ impl Operator for DatasetOperator {
                     None
                 };
 
-                self.decode_members = !multi_ledger && graphs.len() >= 2;
+                self.decode_members = !multi_ledger
+                    && graphs.len() >= 2
+                    && !matches!(
+                        ctx.index_scope_policy_cleared(),
+                        Some(crate::index_scope::IndexScope::Union(_))
+                    );
 
                 for graph in &graphs {
                     let mut inner = self.builder.build()?;

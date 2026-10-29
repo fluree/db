@@ -210,11 +210,11 @@ impl GraphOperator {
     fn extract_graph_iri_from_binding(
         ctx: &ExecutionContext<'_>,
         binding: &Binding,
-    ) -> Option<Arc<str>> {
+    ) -> Result<Option<Arc<str>>> {
         if let Some(iri) = binding.get_iri() {
-            return Some(Arc::clone(iri));
+            return Ok(Some(Arc::clone(iri)));
         }
-        match binding {
+        Ok(match binding {
             Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(sid).map(Arc::from),
             Binding::Lit {
                 val: FlakeValue::String(s),
@@ -235,12 +235,14 @@ impl GraphOperator {
             // GRAPH ?g { … }`).
             Binding::EncodedPid { p_id } => ctx
                 .binary_store
-                .as_ref()?
-                .resolve_predicate_iri(*p_id)
+                .as_ref()
+                .and_then(|store| store.resolve_predicate_iri(*p_id))
                 .map(Arc::from),
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
-                let gv = ctx.graph_view()?;
-                match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
+                match crate::group_aggregate::materialize_encoded(
+                    binding,
+                    ctx.term_view().as_ref(),
+                )? {
                     Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(&sid).map(Arc::from),
                     Binding::Lit {
                         val: FlakeValue::String(s),
@@ -250,7 +252,7 @@ impl GraphOperator {
                 }
             }
             _ => None,
-        }
+        })
     }
 
     /// Execute inner patterns in a specific graph, seeded with parent row
@@ -366,15 +368,14 @@ impl GraphOperator {
         // narrows the inner scan. All other shapes rely on the merge-time
         // `{?g → graph}` join below.
         //
-        // The seeding row's arena handles (big numbers, vectors) name values
-        // in the outer graph, and the rows leaving carry handles into this
-        // graph's arenas: each is decoded through its own graph on the way.
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        // Bindings cross to and from this graph encoded (an arena literal
+        // carries its graph), unless one side cannot decode them.
+        let crossing = crate::object_binding::ScopeCrossing::between(ctx, &graph_ctx);
         let mut row: Vec<Binding> = parent_batch
             .row_view(row_idx)
             .expect("row_idx must be valid for batch")
             .to_vec();
-        crossing.enter(&mut row);
+        crossing.enter(&mut row)?;
         let seed = match bind_graph_var {
             Some(var) if self.seed_graph_var && !parent_batch.schema().contains(&var) => {
                 let mut schema_vec = parent_batch.schema().to_vec();
@@ -457,7 +458,7 @@ impl GraphOperator {
                 if let Some(gvar) = bind_graph_var {
                     if let Some(b) = batch.get(inner_row_idx, gvar) {
                         if !matches!(b, Binding::Unbound | Binding::Poisoned)
-                            && Self::extract_graph_iri_from_binding(&graph_ctx, b).as_deref()
+                            && Self::extract_graph_iri_from_binding(&graph_ctx, b)?.as_deref()
                                 != Some(graph_iri.as_ref())
                         {
                             continue;
@@ -493,7 +494,7 @@ impl GraphOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        merged_row.push(crossing.leave(binding));
+                        merged_row.push(crossing.leave(binding)?);
                     }
                 }
 
@@ -563,18 +564,11 @@ impl GraphOperator {
             ));
         }
 
-        // The whole parent batch seeds the source undecoded: sound only
-        // because nothing crosses graphs here. This path runs without an
-        // explicit dataset: with none, the source scope inherits the outer
-        // graph id; under an implicit union default graph, the outer context
-        // has no graph view and the source is no member graph, so neither side
-        // has one. Either way the arena crossing is a no-op both ways.
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
-        debug_assert!(
-            crossing.is_noop(),
-            "batched R2RML GRAPH scope crosses graphs: {graph_iri}"
-        );
-        let seed = BatchSeedOperator::from_batch(parent_batch.clone());
+        // The parent batch seeds the source: encoded, unless the source scope
+        // cannot decode what the outer context binds (an outer union of
+        // graphs over a store the source scope does not read).
+        let crossing = crate::object_binding::ScopeCrossing::between(ctx, &graph_ctx);
+        let seed = BatchSeedOperator::from_batch(crossing.enter_batch(parent_batch)?);
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
             &rewrite_result.patterns,
@@ -632,7 +626,7 @@ impl GraphOperator {
                     merged_row.push(if i < parent_len {
                         binding
                     } else {
-                        crossing.leave(binding)
+                        crossing.leave(binding)?
                     });
                 }
                 self.result_buffer.push(merged_row);
@@ -827,7 +821,7 @@ impl Operator for GraphOperator {
                         // Check if ?g is already bound in parent row
                         if let Some(binding) = parent_batch.get(row_idx, *var) {
                             if let Some(bound_iri) =
-                                Self::extract_graph_iri_from_binding(ctx, binding)
+                                Self::extract_graph_iri_from_binding(ctx, binding)?
                             {
                                 // ?g already bound: use only that graph
                                 if let Some(ds) = ctx.explicit_dataset() {
@@ -1096,14 +1090,14 @@ mod tests {
         // Raw IRI binding — the idiomatic `VALUES ?g { <iri> }` form
         let binding = Binding::Iri(Arc::from("urn:probegraph"));
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             Some(Arc::from("urn:probegraph"))
         );
 
         // Cross-ledger IriMatch carries the canonical IRI
         let binding = Binding::iri_match("urn:other", Sid::new(2, "x"), "other:main");
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             Some(Arc::from("urn:other"))
         );
 
@@ -1116,7 +1110,7 @@ mod tests {
             p_id: None,
         };
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             Some(Arc::from("http://example.org/graph1"))
         );
 
@@ -1129,11 +1123,11 @@ mod tests {
             p_id: None,
         };
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding).unwrap(),
             None
         );
         assert_eq!(
-            GraphOperator::extract_graph_iri_from_binding(&ctx, &Binding::Unbound),
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &Binding::Unbound).unwrap(),
             None
         );
     }

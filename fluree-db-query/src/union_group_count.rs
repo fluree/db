@@ -222,7 +222,7 @@ pub(crate) fn count_groups_over_union(
                 materialized_object_binding(store, o_type, p_id, val, None, None)
             }
         };
-        let group_key = binding_to_group_key_normalized(&binding, dicts, gv);
+        let group_key = binding_to_group_key_normalized(&binding, dicts, gv)?;
         let groups_before = groups.len();
         let group = groups.entry(group_key).or_insert_with(|| CountGroup {
             keys: vec![binding],

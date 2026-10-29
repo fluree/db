@@ -97,11 +97,13 @@ fn datatype_of_binding(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if *o_kind == ObjKind::NUM_BIG.as_u8() => {
             let decoded = ctx.and_then(|c| {
                 let store = c.binary_store.as_deref()?;
-                let val = c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?;
+                let val =
+                    c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?;
                 Some((store, val))
             });
             let Some((store, val)) = decoded else {

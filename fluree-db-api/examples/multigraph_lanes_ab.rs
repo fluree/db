@@ -17,7 +17,10 @@
 //!
 //! Scenarios are `<scope>_<shape>`. Shapes: `group` (A, partitioned GROUP BY),
 //! `cyclic` (B, triangle), `exists` (C, EXISTS in an expression), `count_obj`
-//! (D, bound-object count), `count_pred` (E, per-predicate count), `optional`.
+//! (D, bound-object count), `count_pred` (E, per-predicate count), `optional`,
+//! and three joins the nested-loop join's batched probes answer (F): `sjoin`
+//! (a subject probe), `ojoin` (an object probe) and `xjoin` (an existence
+//! probe).
 //! Scopes over one ledger with 3000 subjects in each of four graphs:
 //! - `sg`: the default graph g0, no dataset; `g1`: `FROM <urn:g1>`;
 //! - `mg`: `FROM <urn:g1> FROM <urn:g2>`, where g2 repeats half of g1's
@@ -31,6 +34,13 @@
 //! scope costs through today's one-graph lanes when its data is one graph.
 //! `f2` is `mg`'s, `f2d` is `mgd`'s, `f3` is `mg3`'s and `fu` is `mgu`'s. Only
 //! the ledgers the selected scenarios read are built.
+//!
+//! Edge-annotation chains (`dgs_*`) read a ledger of their own: 3000 people
+//! in g1, each with a name and an annotated `worksFor`, and g2 repeating half
+//! of them identically plus 1500 more. Shapes `first` (the chain alone),
+//! `count` (its `COUNT(*)`) and `driven` (the chain after `?s ex:name ?n`);
+//! scopes `dgs_g1` (`FROM <urn:g1>`), `dgs_mg` (`FROM <urn:g1> FROM
+//! <urn:g2>`), `dgs_mgu` (the union default graph) and the floor `dgs_f2`.
 //!
 //! Instructions retired are read from the process (`proc_pid_rusage`) on
 //! macOS; elsewhere the instruction columns report wall-clock nanoseconds per
@@ -159,7 +169,32 @@ const FLOOR_MGD: Graphs = &[(None, &[S, U])];
 const FLOOR_MG3: Graphs = &[(None, &[D, S, T])];
 const FLOOR_MGU: Graphs = &[(None, &[D, S, T, U])];
 
+/// One person: a name and an annotated `worksFor` (the reifier is the
+/// person's own `ann`, so a person two graphs hold is one fact each).
+fn person(ttl: &mut String, _prefix: &str, i: usize) {
+    let _ = writeln!(
+        ttl,
+        "ex:p{i} ex:name \"p{i}\" ; ex:worksFor ex:org{} ~ ex:ann{i} {{| ex:role \"r{}\" |}} .",
+        i % 50,
+        i % 7
+    );
+}
+
+const P: Subjects = ("p", 0, N);
+const P_SHIFTED: Subjects = ("p", N / 2, N / 2 + N);
+const P_UNION: Subjects = ("p", 0, N / 2 + N);
+const DGS: Graphs = &[(Some("urn:g1"), &[P]), (Some("urn:g2"), &[P_SHIFTED])];
+const FLOOR_DGS: Graphs = &[(None, &[P_UNION])];
+
 fn trig(graphs: Graphs) -> String {
+    trig_of(graphs, subject)
+}
+
+fn dgs_trig(graphs: Graphs) -> String {
+    trig_of(graphs, person)
+}
+
+fn trig_of(graphs: Graphs, write: fn(&mut String, &str, usize)) -> String {
     let mut trig = String::with_capacity(N * 4 * 200);
     trig.push_str("@prefix ex: <http://example.org/> .\n");
     for (graph, runs) in graphs {
@@ -168,7 +203,7 @@ fn trig(graphs: Graphs) -> String {
         }
         for (prefix, from, to) in *runs {
             for i in *from..*to {
-                subject(&mut trig, prefix, i);
+                write(&mut trig, prefix, i);
             }
         }
         if graph.is_some() {
@@ -213,6 +248,41 @@ const SHAPES: &[(&str, &str, usize)] = &[
         "SELECT ?s ?e {ds} WHERE { ?s ex:name ?n OPTIONAL { ?s ex:email ?e } }",
         20,
     ),
+    (
+        "sjoin",
+        "SELECT ?x ?n {ds} WHERE { ?x ex:knows ?y . ?y ex:name ?n }",
+        10,
+    ),
+    (
+        "ojoin",
+        "SELECT ?x ?y {ds} WHERE { ?x ex:kind ex:T1 . ?y ex:knows ?x }",
+        20,
+    ),
+    (
+        "xjoin",
+        "SELECT ?x ?y {ds} WHERE { ?x ex:knows ?y . ?y ex:kind ex:T1 }",
+        20,
+    ),
+];
+
+type Shapes = &'static [(&'static str, &'static str, usize)];
+
+const DGS_SHAPES: Shapes = &[
+    (
+        "first",
+        "SELECT ?s ?role {ds} WHERE { ?s ex:worksFor ?o {| ex:role ?role |} }",
+        5,
+    ),
+    (
+        "count",
+        "SELECT (COUNT(*) AS ?c) {ds} WHERE { ?s ex:worksFor ?o {| ex:role ?role |} }",
+        5,
+    ),
+    (
+        "driven",
+        "SELECT ?s ?role {ds} WHERE { ?s ex:name ?n . ?s ex:worksFor ?o {| ex:role ?role |} }",
+        3,
+    ),
 ];
 
 /// A scope: its name, the ledger it reads and what that ledger holds, and the
@@ -221,6 +291,8 @@ struct Scope {
     name: &'static str,
     ledger: &'static str,
     graphs: Graphs,
+    trig: fn(Graphs) -> String,
+    shapes: Shapes,
     prologue: &'static str,
     dataset: &'static str,
 }
@@ -230,6 +302,8 @@ const fn scope(name: &'static str, prologue: &'static str, dataset: &'static str
         name,
         ledger: LEDGER,
         graphs: MULTIGRAPH,
+        trig,
+        shapes: SHAPES,
         prologue,
         dataset,
     }
@@ -240,8 +314,24 @@ const fn floor(name: &'static str, ledger: &'static str, graphs: Graphs) -> Scop
         name,
         ledger,
         graphs,
+        trig,
+        shapes: SHAPES,
         prologue: "",
         dataset: "",
+    }
+}
+
+const DGS_LEDGER: &str = "ab/dgs:main";
+
+const fn dgs(name: &'static str, prologue: &'static str, dataset: &'static str) -> Scope {
+    Scope {
+        name,
+        ledger: DGS_LEDGER,
+        graphs: DGS,
+        trig: dgs_trig,
+        shapes: DGS_SHAPES,
+        prologue,
+        dataset,
     }
 }
 
@@ -260,6 +350,18 @@ const SCOPES: &[Scope] = &[
     floor("f2d", "ab/floor-mgd:main", FLOOR_MGD),
     floor("f3", "ab/floor-mg3:main", FLOOR_MG3),
     floor("fu", "ab/floor-mgu:main", FLOOR_MGU),
+    dgs("dgs_g1", "", "FROM <urn:g1>"),
+    dgs("dgs_mg", "", "FROM <urn:g1> FROM <urn:g2>"),
+    dgs("dgs_mgu", "# PRAGMA union-default-graph: true\n", ""),
+    Scope {
+        name: "dgs_f2",
+        ledger: "ab/dgs-floor:main",
+        graphs: FLOOR_DGS,
+        trig: dgs_trig,
+        shapes: DGS_SHAPES,
+        prologue: "",
+        dataset: "",
+    },
 ];
 
 /// The snapshot of the ledger `scope` reads.
@@ -302,7 +404,7 @@ fn main() {
     let scenarios: Vec<(String, &Scope, String, usize)> = SCOPES
         .iter()
         .flat_map(|scope| {
-            SHAPES.iter().map(move |(shape, body, iters)| {
+            scope.shapes.iter().map(move |(shape, body, iters)| {
                 let query = format!(
                     "{}{PREFIXES}{}",
                     scope.prologue,
@@ -330,7 +432,7 @@ fn main() {
             let handle = fluree.ledger_cached(scope.ledger).await.expect("ledger");
             fluree
                 .stage(&handle)
-                .upsert_turtle(&trig(scope.graphs))
+                .upsert_turtle(&(scope.trig)(scope.graphs))
                 .execute()
                 .await
                 .expect("seed");

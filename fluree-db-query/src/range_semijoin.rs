@@ -1255,7 +1255,7 @@ impl Operator for RangeSemiJoinOperator {
                         }
                         Some(Binding::Poisoned) => false,
                         Some(subject) => {
-                            let key = binding_to_group_key_normalized(subject, dicts, gv);
+                            let key = binding_to_group_key_normalized(subject, dicts, gv)?;
                             let mut any = false;
                             for value in index.values.values_of(&key) {
                                 if self.value_passes(c, interval, &batch, row, value, ctx)? {

@@ -666,6 +666,7 @@ pub fn eval_fulltext<R: RowAccess>(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => {
             // Accept either path:
@@ -711,10 +712,15 @@ pub fn eval_fulltext<R: RowAccess>(
 
                         // Doc not in arena (novelty doc appearing as EncodedLit — rare).
                         // Decode string, analyze, score with unified BM25.
-                        if let Some(gv) = ctx.graph_view() {
-                            if let Ok(FlakeValue::String(text)) =
-                                gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
-                            {
+                        if let Some(gv) = ctx.one_graph_view() {
+                            if let Ok(FlakeValue::String(text)) = gv.decode_value_from_kind(
+                                *o_kind,
+                                *o_key,
+                                *p_id,
+                                *dt_id,
+                                *lang_id,
+                                *arena_g_id,
+                            ) {
                                 let doc_term_freqs = Analyzer::shared(prepared.language)
                                     .analyze_to_term_freqs(&text);
                                 let doc_len = doc_term_freqs.values().sum::<u32>();
@@ -736,13 +742,13 @@ pub fn eval_fulltext<R: RowAccess>(
             if !is_fulltext_dt {
                 return Ok(None);
             }
-            let gv = match ctx.and_then(super::super::context::ExecutionContext::graph_view) {
+            let gv = match ctx.and_then(super::super::context::ExecutionContext::one_graph_view) {
                 Some(gv) => gv,
                 None => return Ok(None),
             };
 
             let val = gv
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                 .map_err(|e| {
                     crate::error::QueryError::Internal(format!("fulltext decode_value: {e}"))
                 })?;
