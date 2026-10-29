@@ -592,3 +592,68 @@ async fn lane_e_keys_big_numbers_by_value() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+// ---------------------------------------------------------------------------
+// Lane B: the cyclic join (`Shape::Triangle`).
+
+const CYCLIC: &str = "cyclic_bgp";
+const CYCLIC_UNION: &str = "cyclic_bgp_union";
+
+/// The triangle in every scope and surface of fixture A in `state`, answered
+/// by hand and by the general plan, and routed by scope: the union variant
+/// answers a default graph of several graphs (an empty default graph among
+/// them included: a member that holds nothing adds no edges), and of none;
+/// the one-graph lane answers one graph; neither runs inside `GRAPH` (its
+/// inner plan is seeded, and the planner builds the cyclic operator only for
+/// an unseeded pattern list) or over two ledgers.
+async fn triangle_routes_by_scope(state: State) {
+    let fx = Fixture::build(state).await;
+    let mut failures = Vec::new();
+    let mut runs = 0;
+    for &scope in SCOPES {
+        if !scope.applies(state) {
+            continue;
+        }
+        for surface in [Surface::Sparql, Surface::JsonLd] {
+            if !scope.supports(surface) {
+                continue;
+            }
+            let run = check(&fx, scope, Shape::Triangle, surface, &mut failures).await;
+            let (must_fire, must_not_fire): (&[&str], &[&str]) = match (scope, scope.kind()) {
+                // The planner builds the cyclic operator only for an unseeded
+                // pattern list, and GRAPH seeds its inner plan.
+                (Scope::GraphG2 | Scope::GraphVar, _) | (_, Kind::None) => {
+                    (&[], &[CYCLIC, CYCLIC_UNION])
+                }
+                // Several graphs, an empty default graph among them included,
+                // and a default graph of none.
+                (_, Kind::Union | Kind::Empty) => (&[CYCLIC_UNION], &[CYCLIC]),
+                (_, Kind::One) => (&[CYCLIC], &[CYCLIC_UNION]),
+            };
+            assert_routing(&run, must_fire, must_not_fire, &mut failures);
+            runs += 1;
+        }
+    }
+    assert!(runs > 0, "no scope ran");
+    assert!(
+        failures.is_empty(),
+        "{} of {runs} runs failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn triangle_lanes_indexed() {
+    triangle_routes_by_scope(State::Indexed).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn triangle_lanes_with_novelty_in_g2() {
+    triangle_routes_by_scope(State::Novelty).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn triangle_lanes_read_below_the_index() {
+    triangle_routes_by_scope(State::Indexed2).await;
+}

@@ -1821,19 +1821,26 @@ async fn partitioned_group_by_reads_one_graph() {
     failures.assert_none();
 }
 
-/// A cyclic BGP (the cyclic-join lane, gated by `allow_cursor_fast_path`).
-/// Cycle a→b→c→a spans all three graphs; cycle p→q→r→p lies inside g2. The
-/// lane read `binary_g_id`'s graph alone: nothing over the union (whose
-/// `binary_g_id` is the default graph's), and nothing under `FROM g3 + g2`.
+/// Cycle a→b→c→a spans all three graphs; cycle p→q→r→p lies inside g2.
+const CYCLIC_LANE_TRIG: &str = r"
+    @prefix ex: <http://example.org/> .
+    ex:a ex:knows ex:b .
+    GRAPH <urn:g2> { ex:b ex:knows ex:c . ex:p ex:knows ex:q . ex:q ex:knows ex:r . ex:r ex:knows ex:p . }
+    GRAPH <urn:g3> { ex:c ex:knows ex:a . }
+";
+
+/// A cyclic BGP (the cyclic-join lane) over [`CYCLIC_LANE_TRIG`]. The
+/// one-graph lane read `binary_g_id`'s graph alone: nothing over the union
+/// (whose `binary_g_id` is the default graph's), and nothing under
+/// `FROM g3 + g2`. It answers one graph only; its union variant answers a
+/// default graph of several graphs, or of none.
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_lane_reads_one_graph() {
-    let trig = r"
-        @prefix ex: <http://example.org/> .
-        ex:a ex:knows ex:b .
-        GRAPH <urn:g2> { ex:b ex:knows ex:c . ex:p ex:knows ex:q . ex:q ex:knows ex:r . ex:r ex:knows ex:p . }
-        GRAPH <urn:g3> { ex:c ex:knows ex:a . }
-    ";
-    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-graphs:main", trig).await;
+    let (fluree, handle) =
+        indexed_trig_ledger("it/cyclic-lane-graphs:main", CYCLIC_LANE_TRIG).await;
+    // The union variant answers only with the kill switch off, which other
+    // tests in this binary turn on; hold it off across these queries.
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
     let tri = |prologue: &str, ds: &str| {
         format!(
             "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
@@ -1886,8 +1893,402 @@ async fn cyclic_lane_reads_one_graph() {
             false,
         ),
     ];
+    // Every scope here that is not one graph is the union variant's.
+    let union_cases: Vec<LaneCase> = cases
+        .iter()
+        .cloned()
+        .map(|(label, query, vars, want, one_graph)| (label, query, vars, want, !one_graph))
+        .collect();
     let mut failures = Failures::default();
     check_lane_cases(&fluree, &handle, "cyclic_bgp", cases, &mut failures).await;
+    check_lane_cases(
+        &fluree,
+        &handle,
+        "cyclic_bgp_union",
+        union_cases,
+        &mut failures,
+    )
+    .await;
+    failures.assert_none();
+}
+
+/// A ledger whose triples all live in named graphs: its own default graph
+/// holds nothing, so the index has no branch for it. Read as the union
+/// default graph, that member contributes no edges and the union variant
+/// still answers; `FROM g2 + g3` is the control. Novelty belongs to the
+/// ledger, so after writes the member still holds nothing for `ex:knows`
+/// while the writes land in other graphs; once one lands in the default
+/// graph, the variant stands down and the general plan answers.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_reads_past_an_empty_member() {
+    let trig = r"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g2> { ex:a ex:knows ex:b . ex:b ex:knows ex:c . }
+        GRAPH <urn:g3> { ex:c ex:knows ex:a . }
+    ";
+    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-empty-member:main", trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let tri = |prologue: &str, ds: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
+             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
+        )
+    };
+    let xyz: &'static [&'static str] = &["x", "y", "z"];
+    let abc = rows(&[&["a", "b", "c"], &["b", "c", "a"], &["c", "a", "b"]]);
+    let cases: Vec<LaneCase> = vec![
+        (
+            "the union default graph, its own graph empty",
+            tri(UNION_PRAGMA, ""),
+            xyz,
+            abc.clone(),
+            true,
+        ),
+        (
+            "FROM g2 + g3",
+            tri("", "FROM <urn:g2> FROM <urn:g3>"),
+            xyz,
+            abc,
+            true,
+        ),
+    ];
+    let mut failures = Failures::default();
+    check_lane_cases(&fluree, &handle, "cyclic_bgp_union", cases, &mut failures).await;
+
+    // Novelty on `ex:knows` in g2 and g3 only: the default graph still holds
+    // nothing for it.
+    fluree
+        .stage(&handle)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .
+             GRAPH <urn:g2> { ex:p ex:knows ex:q . ex:q ex:knows ex:r . }
+             GRAPH <urn:g3> { ex:r ex:knows ex:p . }",
+        )
+        .execute()
+        .await
+        .expect("write to g2 and g3");
+    let abc_pqr = rows(&[
+        &["a", "b", "c"],
+        &["b", "c", "a"],
+        &["c", "a", "b"],
+        &["p", "q", "r"],
+        &["q", "r", "p"],
+        &["r", "p", "q"],
+    ]);
+    let cases: Vec<LaneCase> = vec![(
+        "the union default graph, novelty in the other graphs",
+        tri(UNION_PRAGMA, ""),
+        xyz,
+        abc_pqr.clone(),
+        true,
+    )];
+    check_lane_cases(&fluree, &handle, "cyclic_bgp_union", cases, &mut failures).await;
+
+    // Novelty on `ex:knows` in the default graph itself, which the index has
+    // no branch for: its rows live only in novelty, so the variant stands down.
+    fluree
+        .stage(&handle)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .
+             ex:x ex:knows ex:y . ex:y ex:knows ex:z . ex:z ex:knows ex:x .",
+        )
+        .execute()
+        .await
+        .expect("write to the default graph");
+    let mut abc_pqr_xyz = abc_pqr;
+    abc_pqr_xyz.extend(rows(&[
+        &["x", "y", "z"],
+        &["y", "z", "x"],
+        &["z", "x", "y"],
+    ]));
+    abc_pqr_xyz.sort();
+    let cases: Vec<LaneCase> = vec![(
+        "the union default graph, novelty in the default graph",
+        tri(UNION_PRAGMA, ""),
+        xyz,
+        abc_pqr_xyz,
+        false,
+    )];
+    check_lane_cases(&fluree, &handle, "cyclic_bgp_union", cases, &mut failures).await;
+    failures.assert_none();
+}
+
+/// A triangle whose closing edge is a list. `c ex:knows ( a )` in g3 is, in
+/// SPARQL (#2159), an owner edge from c to the list's head cell, whose
+/// `rdf:first` is a: there is no edge `c → a`, so over g2 and g3 no triangle
+/// closes. The block holds a list-view triple, which the cyclic join does not
+/// read, and its union site says so with `fallback:list_view`. JSON-LD reads
+/// the member as a value of `ex:knows`, so the triangle closes three ways
+/// round, and the union variant answers it.
+///
+/// The second triangle closes over `ex:likes` (two plain edges, the most
+/// selective predicate) and the list's `ex:knows` (beside ten edges no
+/// triangle uses), so the block opens with a stored triple and no seed: it
+/// is the planner's list-view guard, not a seed, that keeps the lane from
+/// reading the list's member as an edge.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
+    let ledger_id = "it/cyclic-lane-lists:main";
+    let trig = r"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g2> { ex:a ex:knows ex:b . ex:b ex:knows ex:c . }
+        GRAPH <urn:g3> { ex:c ex:knows ( ex:a ) . }
+        GRAPH <urn:g4> { ex:i ex:likes ex:j . ex:j ex:likes ex:k . }
+        GRAPH <urn:g5> {
+            ex:k ex:knows ( ex:i ) .
+            ex:n0 ex:knows ex:n1 . ex:n1 ex:knows ex:n2 . ex:n2 ex:knows ex:n3 .
+            ex:n3 ex:knows ex:n4 . ex:n4 ex:knows ex:n5 . ex:n5 ex:knows ex:n6 .
+            ex:n6 ex:knows ex:n7 . ex:n7 ex:knows ex:n8 . ex:n8 ex:knows ex:n9 .
+            ex:n9 ex:knows ex:n10 .
+        }
+    ";
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let mut failures = Failures::default();
+    let knows3 = "?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x";
+    let likes2 = "?x ex:likes ?y . ?y ex:likes ?z . ?z ex:knows ?x";
+    for (label, prologue, ds, bgp) in [
+        ("FROM g2 + g3", "", "FROM <urn:g2> FROM <urn:g3>", knows3),
+        ("the union default graph", UNION_PRAGMA, "", knows3),
+        (
+            "FROM g4 + g5, opening on a stored triple",
+            "",
+            "FROM <urn:g4> FROM <urn:g5>",
+            likes2,
+        ),
+    ] {
+        let query = format!("{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} WHERE {{ {bgp} }}");
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["x", "y", "z"]), rows(&[]), label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        failures.eq(
+            stamps(&store, before, "cyclic_bgp_union"),
+            vec!["fallback:list_view".to_string()],
+            &format!("{label}: `cyclic_bgp_union` stamps"),
+        );
+        failures.eq(
+            stamps(&store, before, "cyclic_bgp"),
+            Vec::<String>::new(),
+            &format!("{label}: `cyclic_bgp` stamps"),
+        );
+    }
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "cyclic_bgp_union",
+        JsonLaneCase {
+            label: "JSON-LD, FROM g2 + g3: the list's member closes the triangle",
+            query: json!({
+                "@context": {"ex": EX},
+                "from": [
+                    {"@id": ledger_id, "graph": "urn:g2"},
+                    {"@id": ledger_id, "graph": "urn:g3"}
+                ],
+                "select": ["?x", "?y", "?z"],
+                "where": [
+                    {"@id": "?x", "ex:knows": "?y"},
+                    {"@id": "?y", "ex:knows": "?z"},
+                    {"@id": "?z", "ex:knows": "?x"}
+                ]
+            }),
+            want: rows(&[&["a", "b", "c"], &["b", "c", "a"], &["c", "a", "b"]]),
+            must_fire: true,
+        },
+        &mut failures,
+    )
+    .await;
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "cyclic_bgp_union",
+        JsonLaneCase {
+            label: "JSON-LD, FROM g4 + g5: the list's member closes the triangle",
+            query: json!({
+                "@context": {"ex": EX},
+                "from": [
+                    {"@id": ledger_id, "graph": "urn:g4"},
+                    {"@id": ledger_id, "graph": "urn:g5"}
+                ],
+                "select": ["?x", "?y", "?z"],
+                "where": [
+                    {"@id": "?x", "ex:likes": "?y"},
+                    {"@id": "?y", "ex:likes": "?z"},
+                    {"@id": "?z", "ex:knows": "?x"}
+                ]
+            }),
+            want: rows(&[&["i", "j", "k"]]),
+            must_fire: true,
+        },
+        &mut failures,
+    )
+    .await;
+    failures.assert_none();
+}
+
+/// The cyclic join's union variant sits behind the fast-path kill switch, so
+/// the general plan stays its oracle: with the switch on, the variant stamps
+/// its own site `fallback:kill_switch` and the general plan answers. The
+/// one-graph lane is not behind the switch and still runs.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_stands_down_under_the_kill_switch() {
+    let (fluree, handle) =
+        indexed_trig_ledger("it/cyclic-lane-switch:main", CYCLIC_LANE_TRIG).await;
+    let tri = |ds: &str| {
+        format!(
+            "{PREFIXES}SELECT ?x ?y ?z {ds} \
+             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
+        )
+    };
+    let pqr = rows(&[&["p", "q", "r"], &["q", "r", "p"], &["r", "p", "q"]]);
+    // (label, query, the answer, the site and the outcome it must stamp)
+    let cases = [
+        (
+            "FROM g2 + g3",
+            tri("FROM <urn:g2> FROM <urn:g3>"),
+            pqr.clone(),
+            "cyclic_bgp_union",
+            "fallback:kill_switch",
+        ),
+        (
+            "FROM NAMED g2 alone",
+            tri("FROM NAMED <urn:g2>"),
+            rows(&[]),
+            "cyclic_bgp_union",
+            "fallback:kill_switch",
+        ),
+        (
+            "FROM g2 alone",
+            tri("FROM <urn:g2>"),
+            pqr,
+            "cyclic_bgp",
+            "proceed",
+        ),
+    ];
+    /// Turns the process-wide switch back off on every exit path.
+    struct SwitchedOn;
+    impl Drop for SwitchedOn {
+        fn drop(&mut self) {
+            fluree_db_api::set_fast_paths_disabled(false);
+        }
+    }
+    let mut failures = Failures::default();
+    let _switch = crate::support::FAST_PATH_SWITCH.write().await;
+    let _on = SwitchedOn;
+    fluree_db_api::set_fast_paths_disabled(true);
+    for (label, query, want, site, outcome) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["x", "y", "z"]), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        failures.eq(
+            stamps(&store, before, site),
+            vec![outcome.to_string()],
+            &format!("{label}: `{site}` stamps"),
+        );
+    }
+    failures.assert_none();
+}
+
+/// Over several graphs the cyclic join's union variant declines an
+/// arena-backed object (a big integer here): its key is a handle into a
+/// per-graph arena, so two graphs' equal keys need not be one value. The
+/// variant stamps `fallback:arena_type` and the general plan answers, by
+/// value. One graph keeps the lane. The square's `?v` is an object-only
+/// variable, so the join runs in its encoded-object mode.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_declines_arena_objects() {
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g1> {
+          ex:a1 ex:tag "t1" ; ex:big 123456789012345678901234567890 .
+          ex:b1 ex:tag "t1" ; ex:big 123456789012345678901234567890 .
+        }
+        GRAPH <urn:g2> {
+          ex:a1 ex:tag "t1" ; ex:big 999999999999999999999999999999 .
+          ex:b2 ex:tag "t1" ; ex:big 123456789012345678901234567890 .
+        }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-arena:main", trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let square = |ds: &str| {
+        format!(
+            "{PREFIXES}SELECT ?a ?b ?t ?v {ds} \
+             WHERE {{ ?a ex:tag ?t . ?b ex:tag ?t . ?a ex:big ?v . ?b ex:big ?v }}"
+        )
+    };
+    let big = "123456789012345678901234567890";
+    let one_graph = rows(&[
+        &["a1", "a1", "t1", big],
+        &["a1", "b1", "t1", big],
+        &["b1", "a1", "t1", big],
+        &["b1", "b1", "t1", big],
+    ]);
+    let mut union = one_graph.clone();
+    for row in [
+        ["a1", "a1", "t1", "999999999999999999999999999999"],
+        ["a1", "b2", "t1", big],
+        ["b1", "b2", "t1", big],
+        ["b2", "a1", "t1", big],
+        ["b2", "b1", "t1", big],
+        ["b2", "b2", "t1", big],
+    ] {
+        union.push(row.iter().map(ToString::to_string).collect());
+    }
+    union.sort();
+    // (label, query, the answer, the site and the outcome it must stamp)
+    let cases = [
+        (
+            "FROM g1 FROM g2",
+            square("FROM <urn:g1> FROM <urn:g2>"),
+            union,
+            "cyclic_bgp_union",
+            "fallback:arena_type",
+        ),
+        (
+            "FROM g1",
+            square("FROM <urn:g1>"),
+            one_graph,
+            "cyclic_bgp",
+            "proceed",
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (label, query, want, site, outcome) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["a", "b", "t", "v"]), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        failures.eq(
+            stamps(&store, before, site),
+            vec![outcome.to_string()],
+            &format!("{label}: `{site}` stamps"),
+        );
+    }
     failures.assert_none();
 }
 
@@ -3640,7 +4041,8 @@ async fn geo_search_over_a_default_graph_of_none() {
 /// grouped count reach the same single-graph lanes the SPARQL tests pin; over
 /// the union they must stand down and read every graph. A ledger holding the
 /// same facts in its default graph alone is the oracle, and shows each lane
-/// runs there.
+/// runs there. The cycle's union variant answers the union: its edge p2→p3
+/// is in two graphs and closes the cycle once.
 #[tokio::test(flavor = "current_thread")]
 async fn cypher_lanes_over_the_union_default_graph() {
     let union_id = "it/cypher-lanes-union:main";
@@ -3655,7 +4057,8 @@ async fn cypher_lanes_over_the_union_default_graph() {
     };
     let d = "ex:p1 a ex:Person ; ex:knows ex:p2 ; ex:dept ex:Sales .";
     let g2 = "ex:p2 a ex:Person ; ex:knows ex:p3 ; ex:dept ex:Ops . ex:p5 ex:dept ex:Sales .";
-    let g3 = "ex:p3 a ex:Person ; ex:knows ex:p1 ; ex:dept ex:Sales . ex:p4 a ex:Person .";
+    let g3 = "ex:p3 a ex:Person ; ex:knows ex:p1 ; ex:dept ex:Sales . ex:p4 a ex:Person . \
+              ex:p2 ex:knows ex:p3 .";
     let config = format!(
         "GRAPH <urn:fluree:{union_id}#config> {{ \
          <urn:config:main> a f:LedgerConfig ; f:queryDefaults <urn:config:query> . \
@@ -3686,18 +4089,21 @@ async fn cypher_lanes_over_the_union_default_graph() {
     let person = "`http://example.org/Person`";
     let knows = "`http://example.org/knows`";
     let dept = "`http://example.org/dept`";
-    // (label, Cypher, the lane's routing site, the answer)
-    let cases: Vec<(&str, String, &str, Rows)> = vec![
+    // (label, Cypher, the one-graph lane's routing site, its union variant's
+    // site where it has one, the answer)
+    let cases: Vec<(&str, String, &str, Option<&str>, Rows)> = vec![
         (
             "count of a label",
             format!("MATCH (n:{person}) RETURN count(n) AS c"),
             "whole-graph scalar aggregates",
+            None,
             rows(&[&["4"]]),
         ),
         (
             "a triangle",
             format!("MATCH (a)-[:{knows}]->(b)-[:{knows}]->(c)-[:{knows}]->(a) RETURN a, b, c"),
             "cyclic_bgp",
+            Some("cyclic_bgp_union"),
             rows(&[
                 &["p1", "p2", "p3"],
                 &["p2", "p3", "p1"],
@@ -3708,6 +4114,7 @@ async fn cypher_lanes_over_the_union_default_graph() {
             "a count per related node",
             format!("MATCH (n)-[:{dept}]->(d) RETURN d, count(n) AS c"),
             "partitioned_group_by",
+            None,
             rows(&[&["Ops", "1"], &["Sales", "3"]]),
         ),
     ];
@@ -3715,7 +4122,7 @@ async fn cypher_lanes_over_the_union_default_graph() {
     // Other tests in this binary turn the process-wide kill switch on; the
     // read side keeps it off for these queries unless the environment set it.
     let _switch = crate::support::FAST_PATH_SWITCH.read().await;
-    for (label, cypher, site, want) in cases {
+    for (label, cypher, site, union_site, want) in cases {
         for (scope, handle, must_fire) in [("union", &union, false), ("merged", &merged, true)] {
             let (store, _guard) = init_test_tracing();
             let before = store.all_events().len();
@@ -3735,6 +4142,12 @@ async fn cypher_lanes_over_the_union_default_graph() {
             }
             let fired = stamps(&store, before, site).iter().any(|o| o == "proceed");
             failures.eq(fired, must_fire, &format!("{label}: `{site}` ran"));
+            if let Some(union_site) = union_site {
+                let fired = stamps(&store, before, union_site)
+                    .iter()
+                    .any(|o| o == "proceed");
+                failures.eq(fired, !must_fire, &format!("{label}: `{union_site}` ran"));
+            }
         }
     }
     failures.assert_none();

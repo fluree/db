@@ -446,6 +446,12 @@ path = "tests/it_grouped_projection_lanes.rs"
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
 
+# Own binary: switches the cyclic lane off through FLUREE_CYCLIC_BGP, a
+# process-global env var, for its oracle runs.
+[[test]]
+name = "it_cyclic_bgp_multiplicity"
+path = "tests/it_cyclic_bgp_multiplicity.rs"
+
 [[test]]
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
