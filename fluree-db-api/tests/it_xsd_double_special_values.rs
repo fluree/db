@@ -228,6 +228,11 @@ async fn jsonld_tokens(fluree: &Fluree, ledger: &LedgerState, query: &Value) -> 
                     .as_i64()
                     .map(|i| i.to_string())
                     .unwrap_or_else(|| format!("{}", n.as_f64().expect("number"))),
+                // An ill-typed literal (`inf` text) keeps its `@type`.
+                Value::Object(o) if o.contains_key("@type") => match &o["@value"] {
+                    Value::String(s) => s.clone(),
+                    other => panic!("{query}: unexpected @value {other}"),
+                },
                 other => panic!("{query}: unexpected cell {other}"),
             }
         })

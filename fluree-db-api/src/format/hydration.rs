@@ -41,7 +41,7 @@
 //! that cell rather than dropping the entire row.
 
 use super::config::{FormatterConfig, OutputFormat};
-use super::datatype::is_inferable_datatype;
+use super::datatype::may_print_bare;
 use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
@@ -2055,7 +2055,7 @@ impl<'a> HydrationFormatter<'a> {
         }
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
-        if !is_inferable_datatype(&dt_full) {
+        if !may_print_bare(&dt_full, &flake.o) {
             wrapper.insert("@type".to_string(), json!(dt_compact));
         }
         Ok(JsonValue::Object(wrapper))
@@ -2239,7 +2239,7 @@ impl<'a> HydrationFormatter<'a> {
         }
 
         // Inferable datatypes can omit @type
-        if is_inferable_datatype(&dt_full) {
+        if may_print_bare(&dt_full, &flake.o) {
             return match &flake.o {
                 FlakeValue::String(s) => Ok(JsonValue::String(s.clone())),
                 FlakeValue::Long(n) => Ok(json!(n)),
