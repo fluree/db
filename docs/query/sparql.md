@@ -111,7 +111,7 @@ PREFIX ex: <http://example.org/ns/>
 DESCRIBE ex:alice
 ```
 
-Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`), plus the outgoing triples of each blank node it points to, and of every cell of a [list](#rdf-lists) it points to.
+Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`), plus the outgoing triples of each blank node it points to, and of every cell of a list it points to that is [stored as its triples](#writing-lists). It writes each [list](#lists) the resource holds as a list.
 
 ## Basic Graph Patterns
 
@@ -275,23 +275,23 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 
 A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
 
-### RDF Lists
+### Lists
 
-A list — Turtle `( … )`, JSON-LD `{"@list": [...]}` — is, as RDF, its owner's edge to a head cell and a chain of cells, each with an `rdf:first` (the member) and an `rdf:rest` (the next cell, or `rdf:nil`). SPARQL sees that graph, however the list was written:
+A list (Turtle `( … )`, JSON-LD `{"@list": [...]}`) is stored in order under the subject and property that hold it. SPARQL reads its members as values of that property, as a JSON-LD query does:
 
 ```sparql
-# data: ex:s ex:items (ex:a ex:b ex:c) .
+# data: ex:s ex:items (ex:a ex:b ex:a) .
 
-SELECT ?x WHERE { ex:s ex:items/rdf:rest*/rdf:first ?x }  # ex:a, ex:b, ex:c
-SELECT ?x WHERE { ex:s ex:items/rdf:rest/rdf:first ?x }   # ex:b
-SELECT ?x ?y ?z WHERE { ex:s ex:items (?x ?y ?z) }        # one solution
+SELECT ?x WHERE { ex:s ex:items ?x }                  # ex:a, ex:b, ex:a
+SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
 ```
 
-- `ex:s ex:items ?o` binds `?o` to the head cell, a blank node, not to the members; `?s ?p ?o` and `COUNT(*)` count the owner edge and two triples per member.
-- A cell's blank node (`_:l0-0`, …) names it only within the result that returned it.
-- CONSTRUCT, DESCRIBE and a Graph Store `GET` write a list as `( … )` in Turtle and as `{"@list": [...]}` in JSON-LD, so a graph read and written back is unchanged.
-- JSON-LD queries keep Fluree's view, where the members are the values of their property: `{"@id": "ex:s", "ex:items": "?x"}` binds each member. For a list stored as its triples (see [Lists](#lists) in updates), a JSON-LD crawl shows the members, but a `where` clause binds the list's head.
-- A query over a dataset spanning several ledgers, and a history query, see the members as values.
+- A member that occurs twice in a list is a value twice.
+- A solution carries no position. A JSON-LD crawl, [export](../cli/export.md) and the Graph Store `GET` return each list in order.
+- A CONSTRUCT template triple that repeats a triple pattern of its WHERE (including one inside an OPTIONAL) writes the list entries it reads as the list, in order: `( … )` in Turtle, `{"@list": [...]}` in JSON-LD. DESCRIBE does too. A value stands for every entry holding it, so over the data above, `CONSTRUCT { ex:s ex:items ?x } WHERE { ex:s ex:items ?x FILTER(?x != ex:b) }` writes `ex:s ex:items ( ex:a ex:a )`, and a `LIMIT` keeping one `ex:a` writes both. A value the owner also holds outside the list is written beside it as well, so the output reads back as the data it came from.
+- A template that writes the values under another subject or property, or into a named graph, writes them as values. So does a default graph in which more than one graph holds a list on that subject and property.
+- A list's `rdf:first`/`rdf:rest` cells are not triples SPARQL can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it.
+- A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
 
 ## Query Modifiers
 
@@ -1350,36 +1350,21 @@ INSERT DATA {
 }
 ```
 
-### Lists
+### Writing lists
 
-An update reads and writes lists as [RDF lists](#rdf-lists): a `( … )` in a template writes one, and a WHERE that binds a list's cells lets the templates change them.
+A `( … )` in a template writes a list, stored as a JSON-LD `@list` is. An update reads a list's members as values, as a [query](#lists) does, so a write naming a member reaches it:
 
 ```sparql
-# data: ex:s ex:items (1 2 3) .
+# data: ex:s ex:items (1 2 1 3) .
 
-# Replace a member
-DELETE { ?c rdf:first 2 } INSERT { ?c rdf:first 20 }
-WHERE  { ex:s ex:items/rdf:rest ?c . ?c rdf:first 2 }
-
-# Append
-DELETE { ?last rdf:rest rdf:nil } INSERT { ?last rdf:rest ( 4 ) }
-WHERE  { ex:s ex:items/rdf:rest* ?last . ?last rdf:rest rdf:nil }
-
-# Move the list to another subject
-DELETE { ex:s ex:items ?l } INSERT { ex:t ex:items ?l }
-WHERE  { ex:s ex:items ?l }
+DELETE DATA { ex:s ex:items 1 }                        # ex:s ex:items (2 3)
+INSERT { ex:t ex:copy ?x } WHERE { ex:s ex:items ?x }  # ex:t ex:copy 2, 3
 ```
 
-- `ex:s ex:items 2` is no triple of the list: `DELETE DATA { ex:s ex:items 2 }` leaves the member, and `INSERT DATA { ex:s ex:items 2 }` adds a value beside the list.
-- Deleting a list's edge from its owner leaves its cells, as it does for any RDF list, and `DELETE WHERE { ex:s ?p ?o }` deletes the edge alone. To delete a list with its cells:
-
-  ```sparql
-  DELETE { ex:s ex:items ?l . ?c ?p ?o }
-  WHERE  { ex:s ex:items ?l . ?l rdf:rest* ?c . ?c ?p ?o }
-  ```
-- After `ADD` or `COPY`, a list is in both graphs as the same list, with the same cells.
-- Under a policy, a change to a list's cells is judged as a change to its owner's property, however the list is stored.
-- A list whose cells something else names, or that carries other triples, is stored as its triples; it reads the same. So is a second list on one subject and property, and a list `ADD` or `COPY` leaves in two graphs.
+- Deleting a value deletes every entry of a list that holds it, and the value where it is also stored beside the list, however the delete is written.
+- To replace a list, or change one entry of it, upsert the list from JSON-LD or Turtle.
+- `ADD` and `COPY` copy a graph's lists into the destination and leave the source's as they were. `MOVE` moves them.
+- A list whose cells something else names, or that carries other triples, is stored as its triples, and so is a second list on one subject and property, including one `ADD` brings into a graph that holds a list there.
 
 ### Typed Literals
 

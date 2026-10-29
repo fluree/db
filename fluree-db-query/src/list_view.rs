@@ -891,7 +891,7 @@ fn object_want(
 }
 
 /// A list member as the binding of its value.
-fn member_binding(member: &Flake) -> Binding {
+pub(crate) fn member_binding(member: &Flake) -> Binding {
     match &member.o {
         FlakeValue::Ref(r) => Binding::sid_with_t(r.clone(), member.t),
         v => {

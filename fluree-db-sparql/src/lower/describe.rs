@@ -53,7 +53,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         // CONSTRUCT template: { ?__describe ?__describe_p ?__describe_o .
         //                       ?__describe_cell ?__describe_cell_p ?__describe_cell_o }
-        let template = QueryConstructTemplate::new(vec![
+        let mut template = QueryConstructTemplate::new(vec![
             TriplePattern::new(Ref::Var(describe_var), Ref::Var(p_var), Term::Var(o_var)),
             TriplePattern::new(
                 Ref::Var(cell_var),
@@ -195,6 +195,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 )),
             ]));
         }
+        template.mark_list_entries(&patterns, self.vars);
 
         Ok(Query {
             context: ctx,

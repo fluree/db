@@ -12,7 +12,8 @@
 //!
 //! A list with the same members, in the same order, as the compact list its
 //! property already holds is that list: writing it again restates its
-//! members, as writing a stored fact again restates the fact.
+//! members, at the positions they are stored at, as writing a stored fact
+//! again restates the fact.
 
 use crate::current_facts::{CurrentFacts, ListFree, Slot};
 use crate::error::Result;
@@ -284,7 +285,18 @@ fn encode(lists: Vec<PendingList>, mut compact: HashMap<Owner, Vec<Flake>>) -> V
             continue;
         };
         match compact.get(&owner) {
-            Some(held) if same_members(held, &list.members) => out.extend(list.into_compact()),
+            // The list held is restated as stored, at its own positions:
+            // a delete can leave them apart, and the members written again
+            // name the same entries.
+            Some(held) if same_members(held, &list.members) => {
+                let (g, t) = (owner.0.clone(), list.members.first().map_or(0, |f| f.t));
+                out.extend(held.iter().map(|f| Flake {
+                    g: g.clone(),
+                    t,
+                    op: true,
+                    ..f.clone()
+                }));
+            }
             Some(_) => out.extend(list.into_chain()),
             None => {
                 compact.insert(owner, list.members.clone());

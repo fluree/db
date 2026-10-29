@@ -119,6 +119,7 @@ impl Fluree {
                     &db.snapshot,
                     db.default_context.as_ref(),
                     params,
+                    options.rdf_list_view(),
                 )?
             }
         };
@@ -403,6 +404,7 @@ impl Fluree {
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 params,
+                options.rdf_list_view(),
             )?,
         };
 

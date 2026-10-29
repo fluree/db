@@ -440,7 +440,13 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )?
             }
         };
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
@@ -806,7 +812,13 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )?
             }
         };
 
@@ -891,7 +903,6 @@ impl Fluree {
         let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_sparql_for_view(
             &db.snapshot,
-            db.overlay.as_ref(),
             sparql,
             db.default_context.as_ref(),
             params,
@@ -1026,8 +1037,14 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)
-                    .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )
+                .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
             }
         };
 
@@ -1182,8 +1199,14 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)
-                    .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )
+                .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
             }
         };
 

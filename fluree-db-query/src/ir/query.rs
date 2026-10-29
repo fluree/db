@@ -53,6 +53,21 @@ pub struct ConstructTemplate {
     /// `patterns[triple]` instantiates to. A row that leaves either unbound
     /// contributes no attachment.
     reifications: Vec<TemplateReification>,
+    /// The variables each pattern that restates a triple of the WHERE has
+    /// the list entries of its triple bound to, parallel to `patterns`
+    /// (see [`mark_list_entries`](Self::mark_list_entries)). Empty when no
+    /// pattern restates one.
+    list_entries: Vec<Option<ListEntryVars>>,
+}
+
+/// The variables a CONSTRUCT template triple's list entries are bound to
+/// (`crate::list_entries`): the positions of the entries of the owner's list
+/// that hold the triple's object, and whether the owner also holds the
+/// object beside the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListEntryVars {
+    pub positions: VarId,
+    pub beside: VarId,
 }
 
 /// A reifier attachment in a CONSTRUCT template (see
@@ -80,6 +95,7 @@ impl ConstructTemplate {
             bnode_vars,
             graphs: Vec::new(),
             reifications: Vec::new(),
+            list_entries: Vec::new(),
         }
     }
 
@@ -90,6 +106,9 @@ impl ConstructTemplate {
         if graph.is_some() || !self.graphs.is_empty() {
             self.graphs.resize(self.patterns.len(), None);
             self.graphs.push(graph);
+        }
+        if !self.list_entries.is_empty() {
+            self.list_entries.push(None);
         }
         self.patterns.push(pattern);
         self.patterns.len() - 1
@@ -183,6 +202,58 @@ impl ConstructTemplate {
             self.substitute_var(var, fresh);
         }
     }
+
+    /// Give each default-graph pattern that restates a triple pattern of
+    /// `where_patterns`, or of an OPTIONAL among them, the variables its list
+    /// entries are bound to. Its triples are those the WHERE read, so where
+    /// they are entries of a list, they are written as that list.
+    pub fn mark_list_entries(&mut self, where_patterns: &[Pattern], vars: &mut VarRegistry) {
+        let reified: HashSet<usize> = self.reifications.iter().map(|r| r.triple).collect();
+        let marks: Vec<Option<ListEntryVars>> = (0..self.patterns.len())
+            .map(|i| {
+                let t = &self.patterns[i];
+                let minted = [t.s.as_var(), t.p.as_var(), t.o.as_var()]
+                    .into_iter()
+                    .flatten()
+                    .any(|v| self.bnode_vars.contains(&v));
+                let restates = self.graph(i).is_none()
+                    && !reified.contains(&i)
+                    && t.o.is_var()
+                    && !minted
+                    && reads_triple(where_patterns, t);
+                restates.then(|| ListEntryVars {
+                    positions: vars.get_or_insert(&format!("?__list_positions_{i}")),
+                    beside: vars.get_or_insert(&format!("?__list_beside_{i}")),
+                })
+            })
+            .collect();
+        self.list_entries = if marks.iter().any(Option::is_some) {
+            marks
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// The variables `patterns[i]`'s list entries are bound to, when it
+    /// restates a triple of the WHERE.
+    pub fn list_entries(&self, i: usize) -> Option<ListEntryVars> {
+        self.list_entries.get(i).copied().flatten()
+    }
+
+    /// Whether any pattern restates a triple of the WHERE.
+    pub fn writes_list_entries(&self) -> bool {
+        !self.list_entries.is_empty()
+    }
+}
+
+/// Whether `patterns` read the triple `t`: as one of their triple patterns,
+/// or one of an OPTIONAL's.
+fn reads_triple(patterns: &[Pattern], t: &TriplePattern) -> bool {
+    patterns.iter().any(|pattern| match pattern {
+        Pattern::Triple(w) => w.s == t.s && w.p == t.p && w.o == t.o,
+        Pattern::Optional(inner) => reads_triple(inner, t),
+        _ => false,
+    })
 }
 
 /// A restriction applied to a SELECT query's result stream.
@@ -542,8 +613,9 @@ pub struct Query {
     pub unmatched_optional: crate::binding::UnmatchedOptional,
     /// Answer triple patterns in SPARQL's view of RDF lists, where a list is
     /// its owner edge and `rdf:first`/`rdf:rest` cells and its members are
-    /// not values of their predicate (see [`crate::list_view`]). SPARQL
-    /// lowering sets it; JSON-LD and Cypher keep Fluree's member view.
+    /// not values of their predicate (see [`crate::list_view`]). Set only for
+    /// the Graph Store `GET`, whose output must round trip; every query
+    /// surface reads a list's members as values.
     pub rdf_list_view: bool,
 }
 

@@ -1181,10 +1181,13 @@ type SlotKey = (GraphId, Sid, Sid);
 ///   key can merge terms by its persisted index key. Novelty holds the terms
 ///   of one big integer apart until the next index build, so the intent
 ///   retracts every term of the fact it names, not just one. An intent
-///   with a list position names that position. One without names the first
-///   list entry holding the term, in slot order, else the plain value: the
-///   contract hydration had, under which a value asserted at N list
-///   positions loses exactly one entry per distinct DELETE row. The fact is
+///   with a list position names that position. One without names every
+///   list entry holding the term and the plain value holding it, so a value
+///   is deleted from a list however often the list repeats it, and beside
+///   it, however the delete is written, as witnessed rows delete them when
+///   the WHERE hands each over. Identical intents name the same facts once.
+///   (Hydration named one entry per distinct DELETE row, so identical rows
+///   deleted one entry and a `FILTER` deleted them all.) The fact is
 ///   retracted as read. An intent that names no stored fact stages
 ///   nothing; with `unmatched`, it is also appended there as instantiated,
 ///   for the caller's modify-policy check.
@@ -1214,13 +1217,14 @@ pub(crate) struct DeleteResolver<'l> {
     /// Witnessed rows matched so far, by slot and by the first stored fact
     /// of the facts they can be.
     taken: HashMap<(SlotKey, u32), usize>,
+    /// Intents without a list position already expanded to list entries: one
+    /// naming the same term again names the same entries, so it adds nothing
+    /// (`SlotFacts::named_all`). A value no list holds is never kept here.
+    expanded: HashSet<(SlotKey, Flake)>,
     /// [`NARROW_SLOT`], or another bound for tests.
     narrow_slot: usize,
     /// A fixed [`Self::point_bound`] for tests (`Some(0)`: never).
     point_bound_override: Option<usize>,
-    /// The intents name RDF triples, which list members are not
-    /// (`fluree_db_query::list_view`): an intent never names one.
-    hide_list_members: bool,
 }
 
 impl<'l> DeleteResolver<'l> {
@@ -1233,17 +1237,10 @@ impl<'l> DeleteResolver<'l> {
             wide: Vec::new(),
             wide_index: HashMap::new(),
             taken: HashMap::new(),
+            expanded: HashSet::new(),
             narrow_slot: NARROW_SLOT,
             point_bound_override: None,
-            hide_list_members: false,
         }
-    }
-
-    /// With `hide`, intents never name a list member: a SPARQL write's
-    /// `s p o` is the RDF triple, and a member is no value of `p`.
-    pub(crate) fn hiding_list_members(mut self, hide: bool) -> Self {
-        self.hide_list_members = hide;
-        self
     }
 
     /// For each slot this batch reads (`at`'s `Read` places), the values
@@ -1422,12 +1419,7 @@ impl<'l> DeleteResolver<'l> {
                 },
             );
         }
-        let mut read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
-        if self.hide_list_members {
-            for facts in &mut read_facts {
-                facts.retain(|f| f.flake().m.as_ref().and_then(|m| m.i).is_none());
-            }
-        }
+        let read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
         let mut read: Vec<ReadSlot> = Vec::with_capacity(to_read.len());
         let mut narrow: Vec<(SlotKey, SlotFacts)> = Vec::with_capacity(to_read.len());
         for ((slot, facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {
@@ -1491,6 +1483,35 @@ impl<'l> DeleteResolver<'l> {
                     }
                     None => out.push(Retraction(intent.flake)),
                 }
+            } else if facts.has_entries && list_index_of(&intent.flake).is_none() {
+                // A value without a position is every list entry holding it
+                // (see `named_all`), unless an identical intent named them.
+                let key = (slot.clone(), intent.flake.clone());
+                if self.expanded.contains(&key) {
+                    stats.matched += 1;
+                    continue;
+                }
+                let named = facts.named_all(&intent.flake, keys);
+                if named.is_empty() {
+                    stats.phantom_intents += 1;
+                    if let Some(unmatched) = unmatched.as_deref_mut() {
+                        unmatched.push(intent.flake);
+                    }
+                    continue;
+                }
+                if named
+                    .iter()
+                    .any(|&n| list_index_of(&facts.facts[n].flake).is_some())
+                {
+                    self.expanded.insert(key);
+                }
+                stats.matched += 1;
+                for n in named {
+                    for m in facts.same_fact(n) {
+                        out.push(facts.facts[m].clone().retract(t));
+                    }
+                    out.push(facts.facts[n].retract_named(intent.flake.clone(), t));
+                }
             } else if let Some(n) = facts.named(&intent.flake, keys) {
                 stats.matched += 1;
                 for m in facts.same_fact(n) {
@@ -1542,6 +1563,8 @@ struct SlotFacts {
     terms: Option<Groups<u64>>,
     /// A wide slot's list entries, by `(position, fact)`.
     positions: Vec<(i32, u32)>,
+    /// Whether any fact is a list entry.
+    has_entries: bool,
     /// Each fact's index key, computed when an intent first needs one.
     keys: Option<Vec<Option<IndexKey>>>,
     /// A wide slot's facts by index key, grouped with `keys`.
@@ -1566,6 +1589,7 @@ impl SlotFacts {
     ) -> Self {
         let wide = facts.len() > narrow_slot;
         let terms = wide.then(|| Groups::build(&facts, |_, f| Some(hash(&f.flake)), same_term));
+        let has_entries = facts.iter().any(|f| list_index_of(&f.flake).is_some());
         let mut positions = Vec::new();
         if wide {
             positions = facts
@@ -1583,6 +1607,7 @@ impl SlotFacts {
             hash,
             terms,
             positions,
+            has_entries,
             keys: None,
             by_key: None,
             by_value: None,
@@ -1700,6 +1725,79 @@ impl SlotFacts {
             Some(groups) => self.first_in(groups.get(key), groups, position, by_key),
             None => self.first(position, by_key),
         }
+    }
+
+    /// The stored facts an intent without a list position names, found by
+    /// the lookup [`Self::named`] makes: every list entry holding its term,
+    /// and the first plain value holding it, which [`Self::named`] names
+    /// when there is no entry. So a value is deleted from a list however
+    /// often the list repeats it, and beside it, as witnessed rows delete
+    /// both when the WHERE hands each over.
+    fn named_all(&mut self, intent: &Flake, keys: &IndexKeys) -> Vec<usize> {
+        let hits = 'lookup: {
+            let by_term = |_: usize, f: &StoredFact| same_term(&f.flake, intent);
+            let hits = match &self.terms {
+                Some(terms) => self.all_in(terms.get((self.hash)(intent)), terms, by_term),
+                None => self.all(by_term),
+            };
+            if !hits.is_empty() {
+                break 'lookup hits;
+            }
+            if intent.o.index_keys_by_value() {
+                self.ensure_by_value();
+                let same = |_: usize, f: &StoredFact| same_value(&f.flake, intent);
+                break 'lookup match &self.by_value {
+                    Some(groups) => {
+                        let group = value_hash(intent).and_then(|h| groups.get(h));
+                        self.all_in(group, groups, same)
+                    }
+                    None => self.all(same),
+                };
+            }
+            let Some(key) = self.key_of(keys, intent) else {
+                break 'lookup Vec::new();
+            };
+            self.ensure_keys(keys);
+            let Some(fact_keys) = self.keys.as_deref() else {
+                break 'lookup Vec::new();
+            };
+            let by_key = |n: usize, _: &StoredFact| fact_keys[n] == Some(key);
+            match &self.by_key {
+                Some(groups) => self.all_in(groups.get(key), groups, by_key),
+                None => self.all(by_key),
+            }
+        };
+        let is_entry = |n: usize| list_index_of(&self.facts[n].flake).is_some();
+        let plain = hits.iter().copied().find(|&n| !is_entry(n));
+        hits.into_iter()
+            .filter(|&n| is_entry(n))
+            .chain(plain)
+            .collect()
+    }
+
+    /// Narrow slot: every fact satisfying `pred`, in slot order.
+    fn all(&self, pred: impl Fn(usize, &StoredFact) -> bool) -> Vec<usize> {
+        (0..self.facts.len())
+            .filter(|&n| pred(n, &self.facts[n]))
+            .collect()
+    }
+
+    /// Wide slot: [`Self::all`] through `groups` (`group` is the one the
+    /// intent's key selects).
+    fn all_in<K: Copy + Eq + Hash + Ord>(
+        &self,
+        group: Option<Group>,
+        groups: &Groups<K>,
+        pred: impl Fn(usize, &StoredFact) -> bool,
+    ) -> Vec<usize> {
+        group.map_or_else(Vec::new, |group| {
+            groups
+                .members(group)
+                .iter()
+                .map(|&n| n as usize)
+                .filter(|&n| pred(n, &self.facts[n]))
+                .collect()
+        })
     }
 
     /// The stored fact a witnessed row decodes (see [`DeleteResolver`]).
@@ -2481,11 +2579,11 @@ mod tests {
         }
     }
 
-    /// An intent that is not witnessed names the first list entry holding
-    /// its term, so identical intents name one entry (the accumulator then
-    /// collapses them); an intent with a position names that position.
+    /// An intent that is not witnessed names every list entry holding its
+    /// term and the plain value, and an identical intent names nothing
+    /// again; an intent with a position names that position.
     #[tokio::test]
-    async fn named_intents_name_the_first_entry_or_their_position() {
+    async fn named_intents_name_every_entry_or_their_position() {
         let ledger = ledger(
             vec![vec![
                 flake("a", "items", "v", 1, true, None),
@@ -2508,8 +2606,35 @@ mod tests {
                     narrow_slot,
                 )
                 .await,
-                vec![at("v", 0), at("v", 0), at("v", 1)],
+                vec![at("v", 0), at("v", 1), plain("v"), at("v", 1)],
                 "narrow_slot={narrow_slot}"
+            );
+        }
+    }
+
+    /// Identical intents naming a value a list repeats expand once: each
+    /// entry is retracted once, not once per intent, in one batch or across
+    /// several.
+    #[tokio::test]
+    async fn identical_intents_expand_once() {
+        let ledger = ledger(
+            vec![(0..3)
+                .map(|i| flake("a", "items", "v", 1, true, Some(FlakeMeta::with_index(i))))
+                .collect()],
+            &HashMap::new(),
+        );
+        let named = || intent("items", "v", false, None);
+        let entries = vec![at("v", 0), at("v", 1), at("v", 2)];
+        for narrow_slot in [usize::MAX, 0] {
+            assert_eq!(
+                resolve_batches(&ledger, vec![vec![named(), named(), named()]], narrow_slot).await,
+                entries,
+                "one batch, narrow_slot={narrow_slot}"
+            );
+            assert_eq!(
+                resolve_batches(&ledger, vec![vec![named()], vec![named()]], narrow_slot).await,
+                entries,
+                "two batches, narrow_slot={narrow_slot}"
             );
         }
     }
@@ -2577,15 +2702,17 @@ mod tests {
         let narrow = resolve_batches(&ledger, vec![mixed_intents()], usize::MAX).await;
         let wide = resolve_batches(&ledger, vec![mixed_intents()], 0).await;
         assert_eq!(narrow, wide);
-        let mut expected = vec![
-            plain("v3"),
-            plain("v11"),
-            at("x", 0),
+        let mut expected = vec![plain("v3"), plain("v11")];
+        // `x` named without a position: every entry holding it, and the
+        // plain `x`.
+        expected.extend((0..8).map(|i| at("x", i)));
+        expected.push(plain("x"));
+        expected.extend([
             at("x", 5),
             ("y".to_string(), Some(FlakeMeta::with_lang("EN-us"))),
             plain("v7"),
             ("y".to_string(), Some(FlakeMeta::with_lang("en"))),
-        ];
+        ]);
         expected.extend((0..8).map(|i| at("x", i)));
         expected.extend([plain("x"), plain("x")]);
         assert_eq!(narrow, expected);
@@ -2813,7 +2940,8 @@ mod tests {
             resolve_reading_values(&ledger, &batches, Some(usize::MAX), 1).await;
         assert_eq!(point_reads, 2);
         assert!(unmatched.is_empty(), "{unmatched:?}");
-        assert_eq!(out.len(), 2, "{out:?}");
+        // `y`'s two list entries and its plain value, and `x`.
+        assert_eq!(out.len(), 4, "{out:?}");
     }
 
     /// Witnessed rows read their slot even when one row names it: the k-th

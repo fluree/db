@@ -40,6 +40,11 @@ pub struct QueryExecutionOptions {
     /// stringified child value never equals the parent key — is treated as
     /// dangling, so the templated IRI may not resolve to a real parent subject.
     pub trust_fk_refs: bool,
+    /// Read lists as RDF does: a list is its owner's edge to a head cell and
+    /// a chain of `rdf:first`/`rdf:rest` cells (`fluree_db_query::list_view`),
+    /// so a CONSTRUCT writes it back as the list. Set only by the Graph Store
+    /// `GET`; every query surface reads a list's members as values.
+    rdf_list_view: bool,
     /// Auth-layer-verified identity of the caller, used only for
     /// `f:overrideControl` (`f:IdentityRestricted`) checks on the query path.
     ///
@@ -71,6 +76,7 @@ impl fmt::Debug for QueryExecutionOptions {
         f.debug_struct("QueryExecutionOptions")
             .field("cancellation", &self.cancellation)
             .field("trust_fk_refs", &self.trust_fk_refs)
+            .field("rdf_list_view", &self.rdf_list_view)
             .field("server_identity", &self.server_identity)
             .field("params", &self.params)
             .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
@@ -97,6 +103,19 @@ impl QueryExecutionOptions {
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
         self
+    }
+
+    /// Read lists as their RDF cells (see [`QueryExecutionOptions`]'s
+    /// `rdf_list_view`). Set only by the Graph Store `GET`.
+    #[doc(hidden)]
+    pub fn with_rdf_list_view(mut self, on: bool) -> Self {
+        self.rdf_list_view = on;
+        self
+    }
+
+    /// Whether the query reads lists as their RDF cells.
+    pub(crate) fn rdf_list_view(&self) -> bool {
+        self.rdf_list_view
     }
 
     /// Attach the auth-layer-verified caller identity for override control.

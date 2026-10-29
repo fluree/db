@@ -734,25 +734,10 @@ pub async fn stage_with_graph_delta(
             .clone()
             .unwrap_or_else(generate_txn_id);
 
-        // A SPARQL WHERE reads lists as RDF does (`fluree_db_query::list_view`),
-        // so its rows can name list cells, which nothing stores, and any write
-        // can state a list as a chain of the blank nodes it mints: the writes
-        // that name a cell edit or write the list (`crate::list_edits`), and
-        // can assert cells as triples even when the update only deletes.
-        let view = if txn.rdf_list_view
-            && (txn.sparql_where.is_some() || !txn.where_patterns.is_empty())
-        {
-            fluree_db_query::list_view::view_for(
-                &ledger.snapshot,
-                ledger.as_graph_db_ref(0).overlay,
-                None,
-            )?
-        } else {
-            None
-        };
-        let mut list_edits = (view.is_some()
-            || crate::list_edits::ListEdits::writes_chain(&txn.insert_templates))
-        .then(|| crate::list_edits::ListEdits::new(view, &txn_id));
+        // A write can state a list as a chain of the blank nodes it mints,
+        // which is stored as the list it spells (`crate::list_edits`).
+        let mut list_edits = crate::list_edits::ListEdits::writes_chain(&txn.insert_templates)
+            .then(|| crate::list_edits::ListEdits::new(None, &txn_id));
         let pure_retract = pure_delete && list_edits.is_none();
 
         // Every graph the update writes, fixed or bound per solution, resolves
@@ -1613,9 +1598,6 @@ async fn stage_graph_mgmt(
 
         let new_t = ledger.t() + 1;
         let mut flakes: Vec<Flake> = Vec::new();
-        // What a transfer stages without changing as RDF, which no modify
-        // policy judges: a source's lists stored again as chains.
-        let mut unjudged: HashSet<(Option<Sid>, bool, Flake)> = HashSet::new();
         // Ledger g_id -> graph Sid, for every named graph our flakes touch;
         // becomes the reverse routing map for novelty application / policy.
         let mut graph_sids: HashMap<GraphId, Sid> = HashMap::new();
@@ -1969,18 +1951,13 @@ async fn stage_graph_mgmt(
                         }
                     }
 
-                    // After ADD or COPY each list is in both graphs, the same
-                    // RDF list: the same cells. A compact list's cells are its
-                    // graph's own, so each is stored in both as one chain of
-                    // the same blank nodes, and the source's members as that
-                    // chain too. MOVE's source goes, and its lists move as
-                    // they are.
+                    // The source keeps its lists as they are. COPY and MOVE
+                    // replace the destination, so each list lands there
+                    // compact; ADD keeps it, so a list lands as an ordinary
+                    // write's does, compact unless the destination already
+                    // holds another list on the same subject and property.
                     let is_member = |f: &Flake| f.m.as_ref().is_some_and(|m| m.i.is_some());
-                    if !*clear_src && rehomed.iter().any(is_member) {
-                        if let (Some(src_g), Some(sid)) = (src_g_id, &src_sid) {
-                            graph_sids.entry(src_g).or_insert_with(|| sid.clone());
-                        }
-                        let txn_id = generate_txn_id();
+                    if !*clear_dest && rehomed.iter().any(is_member) {
                         let (members, mut kept): (Vec<Flake>, Vec<Flake>) =
                             rehomed.into_iter().partition(|f| is_member(f));
                         let mut owners: Vec<(Sid, Sid)> = Vec::new();
@@ -1992,32 +1969,22 @@ async fn stage_graph_mgmt(
                             }
                             by_owner.entry(owner).or_default().push(f);
                         }
-                        for (n, owner) in owners.into_iter().enumerate() {
-                            let members = by_owner.remove(&owner).unwrap_or_default();
-                            let chain = crate::lists::PendingList::new(
-                                members,
-                                format!("{txn_id}--g{n}-"),
-                            )
-                            .into_chain();
-                            for f in &chain {
-                                let in_source = Flake {
-                                    g: src_sid.clone(),
-                                    ..f.clone()
-                                };
-                                unjudged.insert((in_source.g.clone(), true, in_source.clone()));
-                                flakes.push(in_source);
-                            }
-                            kept.extend(chain);
-                        }
-                        for f in src_flakes.iter().filter(|f| is_member(f)) {
-                            let retraction = Flake {
-                                op: false,
-                                t: new_t,
-                                ..(*f).clone()
-                            };
-                            unjudged.insert((retraction.g.clone(), false, retraction.clone()));
-                            flakes.push(retraction);
-                        }
+                        // A list stored as a chain beside another is named by
+                        // what it holds, so ADDing it again names the same
+                        // cells and restates them.
+                        let txn_id = generate_txn_id();
+                        let lists = owners
+                            .into_iter()
+                            .map(|owner| {
+                                let mut members = by_owner.remove(&owner).unwrap_or_default();
+                                members.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
+                                let cells = chain_cells_for(&members);
+                                crate::lists::PendingList::new(members, cells)
+                            })
+                            .collect();
+                        kept.extend(
+                            crate::lists::store_lists(&ledger, lists, &txn_id, |_| false).await?,
+                        );
                         rehomed = kept;
                     }
 
@@ -2098,9 +2065,8 @@ async fn stage_graph_mgmt(
                     all.extend(hidden);
                     std::borrow::Cow::Owned(all)
                 };
-                let judged = without_unjudged(&all, &unjudged);
                 enforce_modify_policies(
-                    &judged,
+                    &all,
                     &all,
                     policy,
                     &ledger,
@@ -2605,6 +2571,21 @@ async fn hidden_restatements(
 /// Returns `Ok(())` if all flakes pass policy, or an error if any flake is
 /// denied or a pre-state lookup fails.
 /// `all` without the facts a write stages but leaves unchanged as RDF.
+/// The cell prefix of a chain holding `members` (one list, in order): the
+/// same for the same graph, subject, predicate and members.
+fn chain_cells_for(members: &[Flake]) -> String {
+    use std::fmt::Write;
+    let mut text = String::new();
+    if let Some(first) = members.first() {
+        let _ = write!(text, "{:?}|{:?}|{:?}", first.g, first.s, first.p);
+    }
+    for f in members {
+        let lang = f.m.as_ref().and_then(|m| m.lang.as_deref());
+        let _ = write!(text, "|{:?}^{:?}@{lang:?}", f.o, f.dt);
+    }
+    format!("l{:032x}-", xxhash_rust::xxh3::xxh3_128(text.as_bytes()))
+}
+
 fn without_unjudged<'a>(
     all: &'a [Flake],
     unjudged: &HashSet<(Option<Sid>, bool, Flake)>,
@@ -3438,8 +3419,7 @@ async fn stream_where_into_accumulator(
             },
         );
     }
-    let mut resolver =
-        DeleteResolver::new(ledger, list_free).hiding_list_members(txn.rdf_list_view);
+    let mut resolver = DeleteResolver::new(ledger, list_free);
     let mut resolve_stats = ResolveStats::default();
     // Under a non-root policy, intents that name no stored fact still go to
     // the modify-policy check (see `stage_with_graph_delta`).
