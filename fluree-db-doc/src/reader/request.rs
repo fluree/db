@@ -269,6 +269,16 @@ impl Structure {
         candidates.into_iter().rev().find(|&c| !splits(c))
     }
 
+    /// The innermost element holding characters `[begin, end)` of the
+    /// document's text, for a mention's `doc:sourceElement`.
+    pub fn element_at(&self, begin: usize, end: usize) -> Option<&str> {
+        self.spans
+            .iter()
+            .filter(|(_, s)| s.begin <= begin && end <= s.end)
+            .min_by_key(|(_, s)| s.end - s.begin)
+            .map(|(iri, _)| iri.as_str())
+    }
+
     /// The `xt:document` graph for one part: the elements inside it with
     /// offsets moved to the part's text, the document node carrying that
     /// text, and `doc:sourceDocument` on every element that lacks it.
@@ -622,6 +632,17 @@ mod tests {
         ));
         assert!(nt.contains("\"bbbb\""));
         assert!(nt.contains("<urn:d-b> <https://ns.flur.ee/doc#sourceDocument> <urn:d>"));
+    }
+
+    #[test]
+    fn a_span_belongs_to_the_innermost_element_holding_it() {
+        let s = structure(
+            "aaaa bbbb",
+            &[("t", 0, 9, &["a", "b"]), ("a", 0, 4, &[]), ("b", 5, 9, &[])],
+        );
+        assert_eq!(s.element_at(6, 8), Some("urn:d-b"));
+        assert_eq!(s.element_at(3, 6), Some("urn:d-t"));
+        assert_eq!(s.element_at(3, 12), None);
     }
 
     #[test]

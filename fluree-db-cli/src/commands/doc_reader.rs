@@ -231,9 +231,43 @@ pub fn read_document(
         read.entities += reading.entities;
         read.relations += reading.relations;
         read.linked.extend(reading.linked);
-        read.nodes.extend(reading.nodes);
+        let mut nodes = reading.nodes;
+        source_elements(&structure, &mut nodes);
+        read.nodes.extend(nodes);
     }
     Ok(read)
+}
+
+/// A mention gets `doc:sourceElement`, the element its span sits in, as
+/// the language-model path gives one.
+fn source_elements(structure: &Structure, nodes: &mut [Value]) {
+    use fluree_db_doc::vocab::{DOC_NS, NIF_NS};
+    let mention = format!("{DOC_NS}Mention");
+    let offset = |node: &Value, p: &str| {
+        let v = node
+            .get(format!("{NIF_NS}{p}"))?
+            .as_array()?
+            .first()?
+            .get("@value")?;
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .map(|n| n as usize)
+    };
+    for node in nodes {
+        let is_mention = node
+            .get("@type")
+            .and_then(Value::as_array)
+            .is_some_and(|t| t.iter().any(|t| t == &json!(mention)));
+        let key = format!("{DOC_NS}sourceElement");
+        if !is_mention || node.get(&key).is_some() {
+            continue;
+        }
+        if let (Some(b), Some(e)) = (offset(node, "beginIndex"), offset(node, "endIndex")) {
+            if let Some(element) = structure.element_at(b, e) {
+                node[key] = json!([{ "@id": element }]);
+            }
+        }
+    }
 }
 
 /// `1,032 tokens, cache 900 read / 0 written, 3.4 fuel` for a document line

@@ -6930,7 +6930,8 @@ fn stub_reading(score: f64, claim: bool) -> serde_json::Value {
     let doc = "urn:fluree:doc:memo.md";
     let mut reading = vec![serde_json::json!({
         "@id": format!("{doc}/reading#o31-35"),
-        format!("{RDF}type"): [{ "@id": format!("{R}Occurrence") }],
+        // A reader may write the pipeline's own terms.
+        format!("{RDF}type"): [{ "@id": "https://ns.flur.ee/doc#Mention" }],
         format!("{NIF}beginIndex"): [{ "@value": 31 }],
         format!("{NIF}endIndex"): [{ "@value": 35 }],
         format!("{R}refersTo"): [{ "@id": "https://example.org/org/acme" }],
@@ -7010,6 +7011,7 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
         .stderr(predicate::str::contains(
             "catalog    ont/entities.ttl: 1 record(s)",
         ))
+        .stdout(predicate::str::contains("1 mention(s) of 0 entities (0 new)"))
         .stdout(predicate::str::contains("1 relation(s), 1,032 tokens"))
         .stdout(predicate::str::contains("reading: 1 call(s), 1,032 tokens"))
         .stdout(predicate::str::contains(
@@ -7040,6 +7042,15 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
         "SELECT ?s WHERE { ?s <https://schema.org/worksFor> <https://example.org/org/acme> }";
     let scores = "SELECT ?v WHERE { ?m <http://example.org/r#score> ?v }";
     assert_eq!(sparql_rows(&tmp, "memos", refers), 1);
+    // The mention sits in the paragraph that holds its span.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            "SELECT ?e WHERE { ?m a <https://ns.flur.ee/doc#Mention> ; <https://ns.flur.ee/doc#sourceElement> ?e . ?e a <http://purl.org/spar/doco/Paragraph> }"
+        ),
+        1
+    );
     assert_eq!(sparql_rows(&tmp, "memos", asserted), 1);
     assert_eq!(sparql_rows(&tmp, "memos", edge), 1);
 
