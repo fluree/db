@@ -1148,3 +1148,102 @@ pub async fn stored_int_lists_in(
     lists.sort();
     lists
 }
+
+// =============================================================================
+// Stored ill-typed literals
+// =============================================================================
+
+/// Create `ledger_id` holding `literals`, each `(subject, predicate, lexical,
+/// xsd local name)` stored as an ill-typed literal, as text under its
+/// datatype, beside the valid statements in `turtle`.
+///
+/// Every transaction refuses an ill-typed literal, but a ledger may hold one:
+/// written before transactions refused them, or by bulk import, which keeps
+/// them. A pushed commit carries them in, the way such a commit replicates: a
+/// placeholder string per literal is committed on a sender ledger, its object
+/// and datatype are rewritten in the commit, and the sender's line is pushed
+/// to the new ledger.
+pub async fn ledger_with_stored_ill_typed_literals(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+    turtle: &str,
+    literals: &[(&str, &str, &str, &str)],
+) -> LedgerState {
+    use fluree_db_api::{Base64Bytes, GovernanceOptions, IndexConfig, PushCommitsRequest};
+    use fluree_db_core::commit::codec::{read_commit, write_commit};
+    use fluree_db_core::{FlakeValue, Sid};
+
+    let placeholder = |i: usize| format!("stored-ill-typed-placeholder-{i}");
+    let sender = format!("{ledger_id}-sender");
+    let ledger = fluree.create_ledger(&sender).await.expect("create sender");
+    let mut doc = turtle.to_string();
+    for (i, (subject, predicate, _, _)) in literals.iter().enumerate() {
+        doc.push_str(&format!(
+            "\n<{subject}> <{predicate}> \"{}\" .",
+            placeholder(i)
+        ));
+    }
+    fluree
+        .insert_turtle(ledger, &doc)
+        .await
+        .expect("placeholders");
+
+    let store = fluree.branched_content_store(&sender).await.unwrap();
+    let head = fluree
+        .ledger(&sender)
+        .await
+        .unwrap()
+        .head_commit_id
+        .expect("sender has a head");
+    let plan = fluree_db_core::plan_commit_transfer(store.as_ref(), &head, None)
+        .await
+        .unwrap()
+        .expect("a full line");
+    let mut commits = Vec::new();
+    let mut blobs = std::collections::HashMap::new();
+    for cid in &plan.lineage {
+        let bytes = store.get(cid).await.unwrap();
+        let mut decoded = read_commit(&bytes).unwrap();
+        if let Some(txn) = decoded.txn.clone() {
+            blobs.insert(txn.to_string(), Base64Bytes(store.get(&txn).await.unwrap()));
+        }
+        let mut rewrote = false;
+        for flake in &mut decoded.flakes {
+            for (i, (_, _, lexical, xsd_local)) in literals.iter().enumerate() {
+                if flake.o == FlakeValue::String(placeholder(i)) {
+                    flake.o = FlakeValue::String(lexical.to_string());
+                    flake.dt = Sid::new(fluree_vocab::namespaces::XSD, *xsd_local);
+                    rewrote = true;
+                }
+            }
+        }
+        let bytes = if rewrote {
+            write_commit(&decoded, false, None).unwrap().bytes
+        } else {
+            bytes
+        };
+        commits.push(Base64Bytes(bytes));
+    }
+
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let request = PushCommitsRequest {
+        commits,
+        blobs,
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let index_config = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    fluree
+        .push_commits(
+            ledger_id,
+            request,
+            &GovernanceOptions::default(),
+            &index_config,
+        )
+        .await
+        .expect("push the stored ill-typed literals");
+    fluree.ledger(ledger_id).await.expect("ledger")
+}
