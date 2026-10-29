@@ -315,7 +315,7 @@ It logs whether erasure is available and why not, and its discovery document rep
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--erasure-prover <path>` | beside the server's binary, else on the `PATH` | The `fluree-prover` binary. |
+| `--erasure-prover <path>` | beside the server's binary, else on the `PATH` | The `fluree-prover` binary: a path, or a command name looked up on the `PATH`. |
 | `--disable-erasure` | off | Refuse erasure requests even where a prover is installed. |
 | `--erasure-scratch-dir <dir>` | `<temp>/fluree-erasure` | The prover's temporary files. They hold the plaintext of commits being erased. Each step's directory is removed when the step ends, and a purge removes any that a crashed step left. |
 | `--erasure-prover-threads <n>` | every core | Proving threads. Fewer threads leave transactions their cores. |

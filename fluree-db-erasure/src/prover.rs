@@ -54,19 +54,27 @@ pub struct ProverConfig {
 /// The prover's executable name.
 pub const PROVER_BINARY: &str = "fluree-prover";
 
-/// Where the prover is, as an absolute path: `explicit` when given, else
+/// Where the prover is, as an absolute path: `explicit` when given (a bare
+/// command name looked up on the `PATH` first, as a shell would), else
 /// `fluree-prover` beside the running executable, else the first on the
 /// `PATH`.
 pub fn find_prover(explicit: Option<&Path>) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    find_prover_on(explicit, path)
+}
+
+fn find_prover_on(explicit: Option<&Path>, path: Vec<PathBuf>) -> Option<PathBuf> {
     let found = match explicit {
+        Some(explicit) if is_command_name(explicit) => {
+            Some(find_named(path, explicit).unwrap_or_else(|| explicit.to_path_buf()))
+        }
         Some(explicit) => Some(explicit.to_path_buf()),
         None => {
             let beside = std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(Path::to_path_buf));
-            let path = std::env::var_os("PATH")
-                .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-                .unwrap_or_default();
             find_in(beside.into_iter().chain(path))
         }
     };
@@ -75,8 +83,30 @@ pub fn find_prover(explicit: Option<&Path>) -> Option<PathBuf> {
     found.map(|p| std::path::absolute(&p).unwrap_or(p))
 }
 
+/// Whether `path` is a bare name, with no directory part.
+fn is_command_name(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 fn find_in(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    let name = format!("{PROVER_BINARY}{}", std::env::consts::EXE_SUFFIX);
+    find_named(dirs, Path::new(PROVER_BINARY))
+}
+
+/// The first of `dirs` holding executable `name`, with the platform's
+/// executable suffix when `name` has no extension.
+fn find_named(dirs: impl IntoIterator<Item = PathBuf>, name: &Path) -> Option<PathBuf> {
+    let name = match name.extension() {
+        None => PathBuf::from(format!(
+            "{}{}",
+            name.display(),
+            std::env::consts::EXE_SUFFIX
+        )),
+        Some(_) => name.to_path_buf(),
+    };
     dirs.into_iter()
         .map(|dir| dir.join(&name))
         .find(|candidate| candidate.is_file())
@@ -375,7 +405,10 @@ mod discovery_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use super::{check_prover, check_within, find_in, find_prover, install_prover, PROVER_BINARY};
+    use super::{
+        check_prover, check_within, find_in, find_prover, find_prover_on, install_prover,
+        PROVER_BINARY,
+    };
 
     /// A stand-in prover printing `id` for `--image-id`.
     fn fake(dir: &Path, id: &str) -> std::path::PathBuf {
@@ -423,6 +456,21 @@ mod discovery_tests {
         assert_eq!(
             found,
             std::env::current_dir().unwrap().join("bin/fluree-prover")
+        );
+    }
+
+    /// A bare command name is the first on the `PATH` holding it, and
+    /// resolves where it was given when none does.
+    #[test]
+    fn a_prover_named_by_command_is_found_on_the_path() {
+        let (empty, holding) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let prover = fake(holding.path(), &pinned());
+        let path = vec![empty.path().to_path_buf(), holding.path().to_path_buf()];
+        let named = Path::new(PROVER_BINARY);
+        assert_eq!(find_prover_on(Some(named), path), Some(prover));
+        assert_eq!(
+            find_prover_on(Some(named), vec![empty.path().to_path_buf()]),
+            Some(std::env::current_dir().unwrap().join(PROVER_BINARY))
         );
     }
 

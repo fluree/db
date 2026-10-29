@@ -8,7 +8,7 @@ needs. Only a server that takes erasure requests (`POST /erase`) needs it. Recei
 clone, pull, push or restore), query peers, removals and `f:noHistory` check proofs without it.
 
 A server finds the prover beside its own binary, else on the `PATH`, unless `--erasure-prover`
-names it. At startup it checks that the prover proves an image the release accepts; a prover of
+names it: a path, or a bare command name looked up on the `PATH`. At startup it checks that the prover proves an image the release accepts; a prover of
 another release makes proofs every check refuses. Without a prover of its release, the server runs
 and refuses erasure requests (`501`), and its discovery document reports `erasure.proving: false`.
 
