@@ -263,6 +263,120 @@ async fn index(fluree: &Fluree, ledger: &str) {
 }
 
 // ============================================================================
+// The list fixtures (#2159)
+// ============================================================================
+
+/// Fixture A's list, `L items ("v" "v")` in g2, as the TriG writes it.
+const FIXTURE_A_LIST: &str = "  ex:L ex:items ( \"v\" \"v\" ) .\n";
+
+/// Edges for [`Shape::SubjectProbe`]: `ex:sel` to subjects with an `n`, one
+/// edge in both members.
+const SEL_EDGES: &str = r"
+GRAPH <urn:g1> { ex:s1 ex:sel ex:s2 . ex:a9 ex:sel ex:s3 . }
+GRAPH <urn:g2> { ex:s1 ex:sel ex:s2 . ex:s2 ex:sel ex:s1 . }
+";
+
+/// Lists on every lane's predicate, and on fixture A's list predicate, in
+/// `graph`: each lane's shape can meet a list member. Written to g1 and g2
+/// they are one list fact in both members.
+fn lists_in(graph: &str) -> String {
+    format!(
+        r#"
+GRAPH <{graph}> {{
+  ex:L1 ex:items ( "w" "v" ) .
+  ex:Ln ex:n ( 5 5 ) ; ex:label ( "Ln" ) .
+  ex:Lk ex:kind ( ex:T1 ex:T1 ) .
+  ex:Lm ex:m ( 2 ) .
+  ex:t1a ex:knows ( ex:t1b ) .
+  ex:s1 ex:sel ( ex:s2 ex:s2 ) .
+}}
+"#
+    )
+}
+
+/// Fixture A's list in g1 too, so g1 and g2 hold one list fact.
+const FIXTURE_A_LIST_IN_G1: &str = r#"
+GRAPH <urn:g1> { ex:L ex:items ( "v" "v" ) . }
+"#;
+
+/// Where the list fixtures' lists are. SPARQL reads a pattern a list can
+/// match through its list view (#2159), so on these ledgers each union lane
+/// either answers as the general plan does or stands down with
+/// `fallback:list_view`. They have no
+/// hand-written answers: every shape is checked against the general plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListCase {
+    /// Lists on every lane's predicate in g1 and in g2, as one list fact in
+    /// both, and fixture A's list in both; indexed.
+    TwoMembers,
+    /// Fixture A with no list, indexed; then fixture A's list and the lanes'
+    /// lists are written to g2 and not indexed.
+    NoveltyOnly,
+}
+
+impl Fixture {
+    /// The ledgers of [`Fixture::build`] for `case`: fixture A with
+    /// [`SEL_EDGES`] and the case's lists. The fixture's state is `Indexed`
+    /// for [`ListCase::TwoMembers`] and `Novelty` for
+    /// [`ListCase::NoveltyOnly`].
+    pub async fn build_lists(case: ListCase) -> Self {
+        let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+        let (a, empty_g0) = match case {
+            ListCase::TwoMembers => {
+                let lists = format!("{FIXTURE_A_LIST_IN_G1}{}{}", lists_in(G1), lists_in(G2));
+                (
+                    format!("{FIXTURE_A}{SEL_EDGES}{lists}"),
+                    format!("{FIXTURE_A_EMPTY_G0}{SEL_EDGES}{lists}"),
+                )
+            }
+            ListCase::NoveltyOnly => {
+                let strip = |trig: &str| {
+                    assert!(trig.contains(FIXTURE_A_LIST), "fixture A's list moved");
+                    format!("{}{SEL_EDGES}", trig.replace(FIXTURE_A_LIST, ""))
+                };
+                (strip(FIXTURE_A), strip(FIXTURE_A_EMPTY_G0))
+            }
+        };
+        seed(&fluree, LEDGER, &a).await;
+        let config = union_config(UNION_LEDGER);
+        seed(&fluree, UNION_LEDGER, &format!("{a}\n{config}")).await;
+        seed(&fluree, OTHER_LEDGER, FIXTURE_OTHER).await;
+        seed(&fluree, EMPTY_G0_LEDGER, &empty_g0).await;
+        let config = union_config(EMPTY_G0_UNION_LEDGER);
+        seed(
+            &fluree,
+            EMPTY_G0_UNION_LEDGER,
+            &format!("{empty_g0}\n{config}"),
+        )
+        .await;
+        let state = match case {
+            ListCase::TwoMembers => State::Indexed,
+            ListCase::NoveltyOnly => {
+                let write = format!(
+                    "{}GRAPH <{G2}> {{\n{FIXTURE_A_LIST}}}\n{}",
+                    fixture_a!(prefixes),
+                    lists_in(G2)
+                );
+                for ledger in [LEDGER, UNION_LEDGER, EMPTY_G0_LEDGER, EMPTY_G0_UNION_LEDGER] {
+                    let handle = fluree.ledger_cached(ledger).await.expect("ledger");
+                    fluree
+                        .stage(&handle)
+                        .upsert_turtle(&write)
+                        .execute()
+                        .await
+                        .expect("write the lists to g2");
+                }
+                State::Novelty
+            }
+        };
+        for ledger in [EMPTY_G0_LEDGER, EMPTY_G0_UNION_LEDGER] {
+            assert_no_default_graph_leaf(&fluree, ledger).await;
+        }
+        Self { fluree, state }
+    }
+}
+
+// ============================================================================
 // Scopes (design §5's table)
 // ============================================================================
 
@@ -534,6 +648,13 @@ pub enum Shape {
     Triangle,
     /// A: `COUNT(*)` grouped by `?v` over `?s ex:n ?v`, the partitioned GROUP BY.
     GroupByObject,
+    /// F: `?x ex:sel ?y . ?y ex:n ?v`, the nested-loop join's subject probe.
+    /// Only the list fixtures hold `ex:sel` ([`ListCase`]), and it is checked
+    /// against the general plan there, not by hand.
+    SubjectProbe,
+    /// M2: `?s ex:label ?l FILTER(?l >= "s2")`, a string bound pushed into
+    /// the scan. Checked against the general plan on the list fixtures only.
+    StringBound,
 }
 
 pub const SHAPES: &[Shape] = &[
@@ -566,6 +687,8 @@ impl Shape {
             Shape::PerPredicateCount => "E per-predicate count",
             Shape::Triangle => "B triangle",
             Shape::GroupByObject => "A GROUP BY object",
+            Shape::SubjectProbe => "F subject probe",
+            Shape::StringBound => "M2 string bound",
         }
     }
 
@@ -637,6 +760,34 @@ impl Shape {
                 jsonld_select: &["?v", "(as (count ?s) ?k)"],
                 jsonld_where: || json!([{"@id": "?s", "ex:n": "?v"}]),
                 jsonld_group_by: &["?v"],
+            },
+            Shape::SubjectProbe => Parts {
+                columns: &["x", "y", "v"],
+                sparql_select: "?x ?y ?v",
+                sparql_body: "?x ex:sel ?y . ?y ex:n ?v",
+                sparql_group_by: "",
+                jsonld_select: &["?x", "?y", "?v"],
+                jsonld_where: || {
+                    json!([
+                        {"@id": "?x", "ex:sel": "?y"},
+                        {"@id": "?y", "ex:n": "?v"}
+                    ])
+                },
+                jsonld_group_by: &[],
+            },
+            Shape::StringBound => Parts {
+                columns: &["s", "l"],
+                sparql_select: "?s ?l",
+                sparql_body: "?s ex:label ?l FILTER(?l >= \"s2\")",
+                sparql_group_by: "",
+                jsonld_select: &["?s", "?l"],
+                jsonld_where: || {
+                    json!([
+                        {"@id": "?s", "ex:label": "?l"},
+                        ["filter", [">=", "?l", "s2"]]
+                    ])
+                },
+                jsonld_group_by: &[],
             },
         }
     }
@@ -897,6 +1048,9 @@ fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
             out
         }
         _ => match shape {
+            Shape::SubjectProbe | Shape::StringBound => {
+                panic!("{shape:?} has no hand-written answer: the list fixtures check it against the general plan")
+            }
             // ?x with an `n` above 0 and a label, one row per such `n`.
             Shape::ExistsInExpression => match graphs {
                 Graphs::G0 => rows(&[&["a1"]]),

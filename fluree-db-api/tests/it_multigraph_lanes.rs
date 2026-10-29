@@ -21,8 +21,8 @@ mod multigraph;
 mod lane_f;
 
 use multigraph::{
-    assert_routing, check, Fixture, Graphs, Kind, Rows, Run, Scope, Shape, State, Surface, SCOPES,
-    SHAPES,
+    assert_routing, check, Fixture, Graphs, Kind, ListCase, Rows, Run, Scope, Shape, State,
+    Surface, G1, G2, SCOPES, SHAPES,
 };
 
 /// Every shape, scope and surface over fixture A in `state`.
@@ -1679,4 +1679,151 @@ async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ============================================================================
+// The list fixtures (#2159): every union lane over lists in two members, and
+// over a list only novelty holds
+// ============================================================================
+
+/// The shapes the list fixtures run, and the union site of the lane each
+/// exercises (M2's bound is pushed into each member's scan: it has no union
+/// site, and is checked by its answer alone).
+const LIST_SHAPES: &[(Shape, Option<&str>)] = &[
+    (Shape::ExistsInExpression, Some(EXISTS_SITES.1)),
+    (Shape::BoundObjectCount, Some(OBJECT_COUNT_SITES.1)),
+    (Shape::BoundNumericCount, Some(OBJECT_COUNT_SITES.1)),
+    (Shape::PerPredicateCount, Some(E_UNION)),
+    (Shape::Triangle, Some(CYCLIC_UNION)),
+    (Shape::GroupByObject, Some(A_UNION)),
+    (Shape::SubjectProbe, Some("nested-loop-batched-union")),
+    (Shape::StringBound, None),
+];
+
+/// Every lane shape over a list fixture, in every scope whose default graph
+/// is several graphs or none, on both surfaces: the answer with fast paths
+/// on equals the general plan's. Each lane's predicate holds lists, so under
+/// SPARQL's list view each union site either answers as the general plan
+/// does or stands down, and every lane names `fallback:list_view` at least
+/// once; JSON-LD reads members as values, and over lists in two indexed
+/// members every lane's union site answers at least once.
+async fn lanes_over_lists(case: ListCase) {
+    let fx = Fixture::build_lists(case).await;
+    let mut failures = Vec::new();
+    let mut runs = 0;
+    // Per (shape, surface): the outcomes its lane's union site stamped.
+    let mut seen: Vec<(Shape, Surface, String)> = Vec::new();
+    for &(shape, site) in LIST_SHAPES {
+        for &scope in SCOPES {
+            if !scope.applies(fx.state) || !matches!(scope.kind(), Kind::Union | Kind::Empty) {
+                continue;
+            }
+            for surface in [Surface::Sparql, Surface::JsonLd] {
+                if !scope.supports(surface) {
+                    continue;
+                }
+                let run = multigraph::run(&fx, scope, shape, surface).await;
+                runs += 1;
+                match (&run.fast, &run.generic) {
+                    (Ok(fast), Ok(generic)) if fast == generic => {}
+                    (fast, generic) => failures.push(format!(
+                        "{}: fast paths on {fast:?}, off {generic:?}",
+                        run.label
+                    )),
+                }
+                if let Some(site) = site {
+                    let outcomes = run
+                        .proceeded
+                        .iter()
+                        .filter(|s| *s == site)
+                        .map(|_| "proceed".to_string())
+                        .chain(
+                            run.fell_back
+                                .iter()
+                                .filter(|(s, _)| s == site)
+                                .map(|(_, o)| o.clone()),
+                        );
+                    for outcome in outcomes {
+                        seen.push((shape, surface, outcome));
+                    }
+                }
+            }
+        }
+    }
+    for &(shape, _) in LIST_SHAPES {
+        for surface in [Surface::Sparql, Surface::JsonLd] {
+            let mut outcomes: Vec<&str> = seen
+                .iter()
+                .filter(|(sh, su, _)| *sh == shape && *su == surface)
+                .map(|(_, _, o)| o.as_str())
+                .collect();
+            outcomes.sort_unstable();
+            outcomes.dedup();
+            eprintln!("{case:?} {shape:?} {surface:?}: {outcomes:?}");
+        }
+    }
+    // Each lane was reached: under SPARQL it named its decline, and over
+    // indexed lists its union site answered JSON-LD.
+    for &(shape, site) in LIST_SHAPES {
+        if site.is_none() {
+            continue;
+        }
+        let stamped = |surface, outcome: &str| {
+            seen.iter()
+                .any(|(sh, su, o)| *sh == shape && *su == surface && o == outcome)
+        };
+        if !stamped(Surface::Sparql, "fallback:list_view") {
+            failures.push(format!("{case:?}: {shape:?} never declined with list_view"));
+        }
+        if case == ListCase::TwoMembers && !stamped(Surface::JsonLd, "proceed") {
+            failures.push(format!(
+                "{case:?}: {shape:?}'s union site never answered JSON-LD"
+            ));
+        }
+    }
+    assert!(runs > 0, "no scope ran");
+    assert!(
+        failures.is_empty(),
+        "{} failures over {runs} runs:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lanes_over_lists_in_two_members() {
+    lanes_over_lists(ListCase::TwoMembers).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lanes_over_a_list_only_novelty_holds() {
+    lanes_over_lists(ListCase::NoveltyOnly).await;
+}
+
+/// SPARQL's list view sees a list only novelty holds: over the union, `L`'s
+/// `items` is the list's head, one blank node, not its two members.
+#[tokio::test(flavor = "current_thread")]
+async fn the_list_view_reads_a_list_only_novelty_holds() {
+    let fx = Fixture::build_lists(ListCase::NoveltyOnly).await;
+    let query = format!(
+        "PREFIX ex: <{}>\nSELECT ?o FROM <{G1}> FROM <{G2}> WHERE {{ ex:L ex:items ?o }}",
+        multigraph::EX
+    );
+    let json = fx
+        .view(multigraph::LEDGER)
+        .await
+        .query(&fx.fluree)
+        .sparql(&query)
+        .execute_formatted()
+        .await
+        .expect("query");
+    let bindings = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .clone();
+    assert_eq!(bindings.len(), 1, "one owner edge: {bindings:?}");
+    assert_eq!(
+        bindings[0]["o"]["type"], "bnode",
+        "the list's head: {bindings:?}"
+    );
 }
