@@ -53,7 +53,8 @@ pub struct StagedMerge {
     /// Where the target branch's artifacts live.
     pub target_namespace: StorageNamespace,
     /// What the target's record presented when the merge was prepared,
-    /// which the head publish presents.
+    /// with the source view's generation, which the head publish
+    /// presents.
     pub target_basis: fluree_db_nameservice::WriteBasis,
     /// Fully-qualified source id (`"<ledger>:<source>"`).
     pub source_id: LedgerId,
@@ -160,7 +161,7 @@ impl crate::Fluree {
             let source_id = staged.source_id.clone();
             let target_id = staged.target_id.clone();
             let target_snapshot = staged.rollback_snapshot.clone();
-            let target_basis = staged.target_basis;
+            let target_basis = staged.target_basis.clone();
             let published_head = staged.new_head_id.clone();
 
             match self.apply_merge(staged).await {
@@ -372,8 +373,13 @@ impl crate::Fluree {
             )
             .await?
         };
+        // Built from the source's view too: its generation is presented
+        // with the target's.
+        let target_basis = target_record
+            .write_basis()
+            .with_source(&source_record, source_record.erasure_generation);
         Ok(StagedMerge {
-            target_basis: target_record.write_basis(),
+            target_basis,
             ..staged
         })
     }

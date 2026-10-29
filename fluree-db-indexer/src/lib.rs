@@ -507,7 +507,7 @@ pub async fn publish_index_result(
     publisher
         .publish_index_fenced(
             &result.ledger_id,
-            result.basis,
+            result.basis.clone(),
             result.index_t,
             &result.root_id,
         )

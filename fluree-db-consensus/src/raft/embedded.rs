@@ -239,7 +239,6 @@ impl EmbeddedRaftNode {
                 commits,
                 poison,
                 staged_receipts: Arc::clone(&integration.staged_receipts),
-                erasure: Some(Arc::clone(&integration.erasure)),
             },
             StagingContext {
                 fluree: Arc::clone(&fluree),

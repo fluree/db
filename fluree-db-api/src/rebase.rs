@@ -253,7 +253,7 @@ impl crate::Fluree {
             let staged = self.prepare_rebase(ledger_name, branch, strategy).await?;
             let branch_id = staged.branch_id.clone();
             let rollback_snapshot = staged.rollback_snapshot.clone();
-            let branch_basis = staged.branch_basis;
+            let branch_basis = staged.branch_basis.clone();
 
             match self.apply_rebase(staged).await {
                 Ok(report) => Ok(report),
@@ -393,6 +393,7 @@ impl crate::Fluree {
             // Load the source's state under the branch's id so the
             // post-apply cache reflects the fast-forwarded branch.
             let mut final_state = self.ledger(&source_id).await?;
+            let branch_basis = rebased_basis(&branch_record, &source_record, &final_state);
             std::sync::Arc::make_mut(&mut final_state.snapshot).ledger_id = branch_id.clone();
 
             let write_guard = self.lock_ledger(&branch_id).await?;
@@ -401,7 +402,7 @@ impl crate::Fluree {
                 branch: branch.to_string(),
                 branch_id,
                 branch_namespace,
-                branch_basis: branch_record.write_basis(),
+                branch_basis,
                 source: source_name_owned,
                 source_id,
                 source_head_id: source_head_id.clone(),
@@ -427,6 +428,7 @@ impl crate::Fluree {
         // the branch; both sides' keys and flakes name the config graph as
         // it does.
         let mut current_state = self.ledger(&source_id).await?;
+        let branch_basis = rebased_basis(&branch_record, &source_record, &current_state);
         std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
         let mut config = ConfigGraphs::for_target(&current_state);
 
@@ -577,7 +579,7 @@ impl crate::Fluree {
             branch: branch.to_string(),
             branch_id,
             branch_namespace,
-            branch_basis: branch_record.write_basis(),
+            branch_basis,
             source: source_name_owned,
             source_id,
             source_head_id,
@@ -934,8 +936,12 @@ impl crate::Fluree {
                     "failed to copy index during rebase; branch will replay from genesis"
                 );
             } else if let Some(publisher) = self.nameservice_mode.publisher() {
+                // The index is the source's: published only if no erasure
+                // has reached the source since its record was read.
+                let basis =
+                    branch_basis.with_source(source_record, source_record.erasure_generation);
                 if let Err(e) = publisher
-                    .publish_index_fenced(branch_id, branch_basis, source_record.index_t, index_cid)
+                    .publish_index_fenced(branch_id, basis, source_record.index_t, index_cid)
                     .await
                 {
                     tracing::warn!(%e, "failed to publish index for rebased branch");
@@ -948,6 +954,22 @@ impl crate::Fluree {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// What a rebase's head publish presents: the branch's record, and the
+/// source as both of its views read it, its record and its loaded state.
+/// Generations only rise, so the older of the two is the one to check.
+fn rebased_basis(
+    branch_record: &fluree_db_nameservice::NsRecord,
+    source_record: &fluree_db_nameservice::NsRecord,
+    source_state: &LedgerState,
+) -> fluree_db_nameservice::WriteBasis {
+    let generation = source_record
+        .erasure_generation
+        .min(source_state.write_basis().erasure_generation);
+    branch_record
+        .write_basis()
+        .with_source(source_record, generation)
+}
 
 /// Lightweight summary of a branch commit, collected during the scan pass.
 /// Holds only the CID, `t`, and pre-computed conflict keys — not the full

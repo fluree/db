@@ -3894,7 +3894,7 @@ where
         nameservice,
         alias,
         namespace,
-        basis,
+        basis.clone(),
         chunk_source,
         doc_ids,
         paths.run_dir,
@@ -3958,7 +3958,12 @@ where
                 .await
                 .map_err(|e| ImportError::Storage(format!("flush index artifacts: {e}")))?;
             nameservice
-                .publish_index_fenced(alias, basis, index_result.index_t, &index_result.root_id)
+                .publish_index_fenced(
+                    alias,
+                    basis.clone(),
+                    index_result.index_t,
+                    &index_result.root_id,
+                )
                 .await
                 .map_err(|e| ImportError::Storage(format!("publish index: {e}")))?;
             tracing::info!(
@@ -4343,7 +4348,7 @@ where
                     publish_import_commit_head(
                         env.nameservice,
                         env.alias,
-                        env.basis,
+                        env.basis.clone(),
                         result.t,
                         &result.commit_id,
                     )
@@ -4608,7 +4613,7 @@ where
         storage,
         nameservice,
         alias,
-        basis,
+        basis: basis.clone(),
         namespace,
         config,
         sort_write_semaphore: &sort_write_semaphore,
@@ -5213,8 +5218,14 @@ where
                 elapsed_secs: run_start.elapsed().as_secs_f64(),
             });
             if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
-                publish_import_commit_head(nameservice, alias, basis, result.t, &result.commit_id)
-                    .await?;
+                publish_import_commit_head(
+                    nameservice,
+                    alias,
+                    basis.clone(),
+                    result.t,
+                    &result.commit_id,
+                )
+                .await?;
             }
         }
 
@@ -5477,7 +5488,7 @@ where
                     publish_import_commit_head(
                         nameservice,
                         alias,
-                        basis,
+                        basis.clone(),
                         result.t,
                         &result.commit_id,
                     )
@@ -7946,7 +7957,7 @@ mod publish_import_commit_head_tests {
             .expect("create")
             .write_basis();
 
-        publish_import_commit_head(&ns, alias, basis, 1, &cid("t1"))
+        publish_import_commit_head(&ns, alias, basis.clone(), 1, &cid("t1"))
             .await
             .expect("initial publish creates the head");
         let head = ns
@@ -7957,15 +7968,15 @@ mod publish_import_commit_head_tests {
         assert_eq!(head.t, 1);
         assert_eq!(head.id, Some(cid("t1")));
 
-        publish_import_commit_head(&ns, alias, basis, 5, &cid("t5"))
+        publish_import_commit_head(&ns, alias, basis.clone(), 5, &cid("t5"))
             .await
             .expect("checkpoint fast-forwards");
 
-        publish_import_commit_head(&ns, alias, basis, 5, &cid("t5"))
+        publish_import_commit_head(&ns, alias, basis.clone(), 5, &cid("t5"))
             .await
             .expect("republish of the exact head is a no-op success");
 
-        let err = publish_import_commit_head(&ns, alias, basis, 5, &cid("other"))
+        let err = publish_import_commit_head(&ns, alias, basis.clone(), 5, &cid("other"))
             .await
             .expect_err("equal t under a different id is a divergence");
         assert!(

@@ -770,6 +770,45 @@ mod tests {
         assert_eq!(response, Response::ErasureActivated { activation: 0 });
     }
 
+    /// A write built from another branch's view too, as a merge or rebase
+    /// is from its source, is refused once an erasure reaches that branch,
+    /// though none reached the one it writes.
+    #[test]
+    fn a_write_built_from_a_source_presents_its_generation() {
+        let mut state = ledger_with_queued_request();
+        advance(&mut state, None, 1, 1, 6_000, 11);
+        apply(
+            &mut state,
+            Command::CreateBranch(NewBranch {
+                ledger_id: "test/db".into(),
+                branch: "dev".into(),
+                source_branch: "main".into(),
+                at_commit: None,
+                applied_at_millis: 6_000,
+            }),
+            12,
+        );
+        let dev = RefKey::new("test/db", "dev");
+        activate(&mut state, std::slice::from_ref(&dev));
+        let index = |source_generation| Command::AtGeneration {
+            generations: vec![(dev.clone(), source_generation)],
+            command: Box::new(Command::AdvanceIndexHead(NewIndexHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(50),
+                t: 1,
+                applied_at_millis: 6_000,
+            })),
+        };
+        let stale = apply(&mut state, index(0), 13);
+        assert!(generation_moved(&stale), "{stale:?}");
+        let current = apply(&mut state, index(1), 14);
+        assert!(
+            matches!(current, Response::IndexAdvanced { index_t: 1, .. }),
+            "{current:?}"
+        );
+    }
+
     /// A hold keeps the head where the preparation saw it; it lapses on the
     /// leader's clock, and an activation lifts it.
     #[test]

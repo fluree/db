@@ -402,17 +402,49 @@ fn check_fence_response(response: &SmResponse, ledger_id: &str) -> Result<()> {
     }
 }
 
-/// `command`, made from a view of `key` at erasure `generation`; see
-/// [`SmCommand::AtGeneration`]. A view no erasure has reached presents
-/// none, as every write did before erasure generations.
-fn at_generation(command: SmCommand, key: RefKey, generation: u64) -> SmCommand {
-    if generation == 0 {
+/// `command`, made from a view of `key` at erasure `generation`, and of
+/// `source` if it was built from another branch's view too; see
+/// [`SmCommand::AtGeneration`]. A view of `key` no erasure has reached
+/// presents none, as every write did before erasure generations. A source
+/// is always presented: the state machine checks only what is listed
+/// besides the written branch.
+fn at_generation(
+    command: SmCommand,
+    key: RefKey,
+    generation: u64,
+    source: Option<(RefKey, u64)>,
+) -> SmCommand {
+    let generations: Vec<_> = (generation > 0)
+        .then_some((key, generation))
+        .into_iter()
+        .chain(source)
+        .collect();
+    if generations.is_empty() {
         return command;
     }
     SmCommand::AtGeneration {
-        generations: vec![(key, generation)],
+        generations,
         command: Box::new(command),
     }
+}
+
+/// The source `basis` presents, keyed for the state machine.
+fn basis_source(basis: &WriteBasis) -> Result<Option<(RefKey, u64)>> {
+    basis
+        .source
+        .as_ref()
+        .map(|(id, generation)| Ok((ref_key_of(id)?, *generation)))
+        .transpose()
+}
+
+/// [`at_generation`] for a write to `ledger_id` presenting `basis`.
+fn at_basis(command: SmCommand, ledger_id: &str, basis: &WriteBasis) -> Result<SmCommand> {
+    Ok(at_generation(
+        command,
+        ref_key_of(ledger_id)?,
+        basis.erasure_generation,
+        basis_source(basis)?,
+    ))
 }
 
 /// Why a write the state machine refused for its erasure generation must
@@ -541,7 +573,7 @@ impl IndexPublisher for RaftNameService {
             build_advance_index_command(ledger_id, index_t, index_id)?,
             fence,
         )?;
-        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
+        let cmd = at_basis(cmd, ledger_id, &basis)?;
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
                 check_fence_response(&resp.data, ledger_id)?;
@@ -585,7 +617,7 @@ impl AdminPublisher for RaftNameService {
             build_rewrite_index_command(ledger_id, index_t, index_id)?,
             fence,
         )?;
-        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
+        let cmd = at_basis(cmd, ledger_id, &basis)?;
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
                 check_fence_response(&resp.data, ledger_id)?;
@@ -788,6 +820,9 @@ pub struct StagedCommit {
     pub receipt: AppliedReceipt,
     /// Erasure generation of the view the commit was staged on.
     pub erasure_generation: u64,
+    /// The other branch the commit was built from, and the erasure
+    /// generation of its view; see [`WriteBasis::source`].
+    pub erasure_source: Option<(RefKey, u64)>,
 }
 
 pub mod read_index;
@@ -934,6 +969,7 @@ impl RaftNameService {
             commit_t,
             receipt,
             erasure_generation,
+            erasure_source,
         } = args;
 
         let (tally, flake_count) = match &receipt {
@@ -956,6 +992,7 @@ impl RaftNameService {
             }),
             ref_key.clone(),
             erasure_generation,
+            erasure_source,
         );
 
         let _guard = match self.staged_receipts.as_ref() {
@@ -1100,7 +1137,7 @@ async fn handle_apply_staged_commit(
     State(ns): State<Arc<RaftNameService>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let args: StagedCommit = match postcard::from_bytes::<wire::StagedCommit>(&body) {
+    let args: StagedCommit = match wire::StagedCommit::decode(&body) {
         Ok(args) => args.into(),
         Err(e) => {
             return (
@@ -1443,18 +1480,15 @@ impl CommitPublisher for RaftNameService {
         // endpoint instead of attempting a local propose (which would
         // just bounce back as ForwardToLeader). Without forwarding,
         // the legacy leader-only contract applies.
-        let generation = basis.erasure_generation;
         if let Some(forwarding) = &self.forwarding {
             if !self.is_local_leader(forwarding.id).await {
                 return self
-                    .publish_commit_via_leader(
-                        ledger_id, generation, commit_t, commit_id, forwarding,
-                    )
+                    .publish_commit_via_leader(ledger_id, &basis, commit_t, commit_id, forwarding)
                     .await;
             }
         }
 
-        self.publish_commit_locally(ledger_id, generation, commit_t, commit_id)
+        self.publish_commit_locally(ledger_id, &basis, commit_t, commit_id)
             .await
     }
 
@@ -1481,7 +1515,7 @@ impl RaftNameService {
     async fn publish_commit_locally(
         &self,
         ledger_id: &str,
-        erasure_generation: u64,
+        basis: &WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
@@ -1495,7 +1529,7 @@ impl RaftNameService {
                 self.staged_receipts.as_deref(),
             )?
         };
-        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, erasure_generation);
+        let cmd = at_basis(cmd, ledger_id, basis)?;
 
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
@@ -1552,7 +1586,7 @@ impl RaftNameService {
     async fn publish_commit_via_leader(
         &self,
         ledger_id: &str,
-        erasure_generation: u64,
+        basis: &WriteBasis,
         commit_t: i64,
         commit_id: &ContentId,
         forwarding: &ForwardingConfig,
@@ -1594,7 +1628,8 @@ impl RaftNameService {
             commit_id: commit_id.clone(),
             commit_t,
             receipt,
-            erasure_generation,
+            erasure_generation: basis.erasure_generation,
+            erasure_source: basis_source(basis)?,
         };
 
         let leader_url = self.lookup_leader_raft_url().await.ok_or_else(|| {
@@ -2140,7 +2175,7 @@ impl BranchLifecycle for RaftNameService {
             build_reset_head_command(ledger_id, snapshot)?,
             fence,
         )?;
-        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
+        let cmd = at_basis(cmd, ledger_id, &basis)?;
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         check_erasure_response(&response)?;
@@ -2209,7 +2244,7 @@ impl RefPublisher for RaftNameService {
             }),
             fence,
         )?;
-        let cmd = at_generation(cmd, ref_key_of(ledger_id)?, basis.erasure_generation);
+        let cmd = at_basis(cmd, ledger_id, &basis)?;
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         check_erasure_response(&response)?;
@@ -2514,6 +2549,26 @@ mod tests {
 
     fn cid(seed: u8) -> ContentId {
         ContentId::new(ContentKind::Commit, &[seed])
+    }
+
+    /// A source is presented even at generation 0: the state machine
+    /// checks only what is listed besides the written branch. A write from
+    /// views no erasure has reached goes unwrapped.
+    #[test]
+    fn a_write_built_from_a_source_always_presents_it() {
+        let command = || Command::ReleaseContent { id: cid(1) };
+        let plain = at_basis(command(), "test/db:main", &WriteBasis::default()).unwrap();
+        assert!(matches!(plain, Command::ReleaseContent { .. }), "{plain:?}");
+        let basis = WriteBasis {
+            source: Some(("test/db:dev".into(), 0)),
+            ..WriteBasis::default()
+        };
+        match at_basis(command(), "test/db:main", &basis).unwrap() {
+            Command::AtGeneration { generations, .. } => {
+                assert_eq!(generations, [(RefKey::new("test/db", "dev"), 0)]);
+            }
+            other => panic!("expected AtGeneration, got {other:?}"),
+        }
     }
 
     /// State a test owns and drives directly.
@@ -3045,6 +3100,7 @@ mod tests {
             commit_t: 17,
             receipt,
             erasure_generation: 3,
+            erasure_source: Some((RefKey::new("test/db", "dev"), 2)),
         }
     }
 
@@ -3421,9 +3477,11 @@ mod tests {
             commit_t,
             receipt,
             erasure_generation,
+            erasure_source,
         } = round_tripped;
         assert_eq!(ref_key, args.ref_key);
         assert_eq!(erasure_generation, args.erasure_generation);
+        assert_eq!(erasure_source, args.erasure_source);
         assert_eq!(queue_id, args.queue_id);
         assert_eq!(commit_id, args.commit_id);
         assert_eq!(commit_t, args.commit_t);

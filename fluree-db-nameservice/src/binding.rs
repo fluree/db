@@ -76,10 +76,14 @@ impl std::str::FromStr for Fence {
 /// advances the generation of every branch holding the erased data, and a
 /// write made from a view before it is refused. Other backends keep none and
 /// ignore it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteBasis {
     pub fence: Option<Fence>,
     pub erasure_generation: u64,
+    /// For a write built from another branch's view too, as a merge or
+    /// rebase builds from its source: that branch's id and the view's
+    /// erasure generation.
+    pub source: Option<(String, u64)>,
 }
 
 impl WriteBasis {
@@ -87,7 +91,16 @@ impl WriteBasis {
     pub fn fenced(fence: Option<Fence>) -> Self {
         Self {
             fence,
-            erasure_generation: 0,
+            ..Self::default()
+        }
+    }
+
+    /// This basis, for a write also built from `source`'s view: the
+    /// record it read, at `generation` (see [`Self::source`]).
+    pub fn with_source(self, source: &NsRecord, generation: u64) -> Self {
+        Self {
+            source: Some((source.ledger_id.to_string(), generation)),
+            ..self
         }
     }
 }

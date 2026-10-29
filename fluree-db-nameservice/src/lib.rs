@@ -270,6 +270,7 @@ impl NsRecord {
         WriteBasis {
             fence: self.fence,
             erasure_generation: self.erasure_generation,
+            source: None,
         }
     }
 
@@ -1196,7 +1197,7 @@ pub trait RefPublisher: RefLookup {
             match self
                 .compare_and_set_ref_fenced(
                     ledger_id,
-                    basis,
+                    basis.clone(),
                     RefKind::CommitHead,
                     current.as_ref(),
                     new,

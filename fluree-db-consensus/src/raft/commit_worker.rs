@@ -160,10 +160,6 @@ pub struct PublishingChannel {
     pub commits: Arc<dyn CommitPublisher>,
     pub poison: Arc<dyn QueuePoisonPublisher>,
     pub staged_receipts: Arc<StagedReceiptMap>,
-    /// What this node has installed of the erasure activations, which a
-    /// write staged from the replicated records presents. Unset, it
-    /// presents the replicated generation.
-    pub erasure: Option<Arc<crate::raft::erasure::ErasureNode>>,
 }
 
 /// Handles a [`Worker`] uses to stage a commit locally.
@@ -236,28 +232,6 @@ impl Worker {
     async fn wait_out_hold(&self) {
         while self.held().await {
             tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
-    /// What a write from the branch's replicated record presents, at the
-    /// erasure generation installed here.
-    async fn branch_basis(&self) -> WriteBasis {
-        let installed_through = self
-            .publishing
-            .erasure
-            .as_ref()
-            .map_or(u64::MAX, |node| node.installed_through());
-        let state = self.shared_state.read().await;
-        WriteBasis {
-            fence: state
-                .fences
-                .get(&self.ref_key)
-                .map(|f| fluree_db_nameservice::Fence::from_u64(f.fence)),
-            erasure_generation: crate::raft::state_machine::view_generation(
-                &state,
-                &self.ref_key,
-                installed_through,
-            ),
         }
     }
 
@@ -407,7 +381,11 @@ impl Worker {
         // process under a kind the queue didn't declare.
         check_envelope_kind(entry.body_kind, &envelope)?;
 
-        let StagedOutcome { receipt, install } = match envelope {
+        let StagedOutcome {
+            receipt,
+            install,
+            basis,
+        } = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
             QueuedRequest::Push(push) => self.process_push(*push).await?,
             QueuedRequest::PushWithMerges(push) => self.process_push_with_merges(*push).await?,
@@ -417,11 +395,6 @@ impl Worker {
         };
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
-        // A stage on a cached state presents that state's fence and erasure
-        // generation, so one built on another activation's state, cached
-        // from before a drop and recreate this node has not yet reconciled,
-        // or from before an erasure, is refused.
-        let staged_basis = install.as_ref().map(|i| i.new_state.write_basis());
 
         // Stash the typed receipt through `StashGuard` so an abort
         // mid-publish (ownership flap during the propose await)
@@ -442,7 +415,7 @@ impl Worker {
             receipt,
         );
         match self
-            .publish_head_advance(commit_id.clone(), commit_t, staged_basis)
+            .publish_head_advance(commit_id.clone(), commit_t, basis)
             .await
         {
             Ok(()) => {
@@ -808,6 +781,7 @@ impl Worker {
                     tally: None,
                 }),
                 install: None,
+                basis: snap.write_basis(),
             });
         };
 
@@ -848,6 +822,7 @@ impl Worker {
                 flake_count: receipt.flake_count,
                 tally,
             }),
+            basis: new_state.write_basis(),
             install: Some(StagedStateInstall {
                 write_guard,
                 new_state,
@@ -916,6 +891,7 @@ impl Worker {
                 flake_count: receipt.flake_count,
                 tally: None,
             }),
+            basis: new_state.write_basis(),
             install: Some(StagedStateInstall {
                 write_guard,
                 new_state,
@@ -953,6 +929,7 @@ impl Worker {
             current_head_t,
             current_head_id,
             commit,
+            branch_basis,
             ..
         } = self
             .staging
@@ -978,6 +955,7 @@ impl Worker {
                     strategy: applied_strategy,
                 }),
                 install: None,
+                basis: branch_basis,
             });
         };
 
@@ -1008,6 +986,7 @@ impl Worker {
                 new_state,
                 commit_t,
             }),
+            basis: branch_basis,
         })
     }
 
@@ -1109,6 +1088,7 @@ impl Worker {
                 accepted,
                 indexing: indexing_status,
             }),
+            basis: final_state.write_basis(),
             install: Some(StagedStateInstall {
                 write_guard,
                 new_state: final_state,
@@ -1134,6 +1114,7 @@ impl Worker {
         let StagedMerge {
             target,
             target_namespace,
+            target_basis,
             fast_forward,
             conflict_count,
             commits_copied,
@@ -1207,6 +1188,7 @@ impl Worker {
                 strategy: applied_strategy.unwrap_or(strategy),
             }),
             install,
+            basis: target_basis,
         })
     }
 
@@ -1222,6 +1204,7 @@ impl Worker {
         let branch = self.ref_key.branch.clone();
         let StagedRebase {
             branch_namespace,
+            branch_basis,
             source_head_id,
             source_head_t,
             fast_forward,
@@ -1287,23 +1270,19 @@ impl Worker {
                 new_state: final_state,
                 commit_t: advance_t,
             }),
+            basis: branch_basis,
         })
     }
 
-    /// Publish the head, presenting `staged_basis`, that of the state the
-    /// commit was staged on, or the branch's current one for work staged
-    /// from the nameservice's records rather than a cached state.
+    /// Publish the head, presenting `basis`: what the views the commit was
+    /// staged on presented.
     async fn publish_head_advance(
         &self,
         commit_id: ContentId,
         commit_t: i64,
-        staged_basis: Option<WriteBasis>,
+        basis: WriteBasis,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
-        let basis = match staged_basis {
-            Some(basis) => basis,
-            None => self.branch_basis().await,
-        };
         let fence = basis.fence;
         match self
             .publishing
@@ -1915,6 +1894,10 @@ impl WorkerError {
 pub(crate) struct StagedOutcome {
     receipt: AppliedReceipt,
     install: Option<StagedStateInstall>,
+    /// What the views the commit was staged on present, captured when
+    /// they were read: one taken at publish would label older work with
+    /// a newer erasure generation, or give a branch its source's.
+    basis: WriteBasis,
 }
 
 /// Local state install owed once the publish succeeds. `None` when
@@ -2119,7 +2102,6 @@ mod tests {
                 commits: Arc::clone(&publisher) as _,
                 poison: Arc::new(NoPoison),
                 staged_receipts: Arc::new(StagedReceiptMap::default()),
-                erasure: None,
             },
             StagingContext {
                 fluree: Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory()),
@@ -2138,11 +2120,7 @@ mod tests {
         let (worker, publisher) = fenced_worker(2, false);
 
         let stale = worker
-            .publish_head_advance(
-                cid(1),
-                5,
-                Some(WriteBasis::fenced(Some(Fence::from_u64(1)))),
-            )
+            .publish_head_advance(cid(1), 5, WriteBasis::fenced(Some(Fence::from_u64(1))))
             .await;
         assert!(matches!(stale, Err(WorkerError::Lagged(_))), "{stale:?}");
         assert_eq!(
@@ -2150,9 +2128,83 @@ mod tests {
             [Some(Fence::from_u64(1))]
         );
 
-        // Work staged from the nameservice, with no cached state, presents
-        // the live fence.
-        worker.publish_head_advance(cid(1), 5, None).await.unwrap();
+        // Restaged on the live activation's state, it lands.
+        worker
+            .publish_head_advance(cid(1), 5, WriteBasis::fenced(Some(Fence::from_u64(2))))
+            .await
+            .unwrap();
+    }
+
+    /// A fast-forward merge installs no state to take what its publish
+    /// presents from, and a rebased state is the source's: each carries its
+    /// target's record as it was prepared against, with the source view's
+    /// generation.
+    #[tokio::test]
+    async fn merges_and_rebases_present_the_target_they_were_prepared_on() {
+        let fluree = Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory());
+        let doc =
+            |id: &str| json!({"@context": {"ex": "http://example.org/"}, "@id": id, "ex:n": 1});
+        let main = fluree.create_ledger("test/db").await.unwrap();
+        fluree.insert(main, &doc("ex:a")).await.unwrap();
+        fluree
+            .create_branch("test/db", "dev", None, None)
+            .await
+            .unwrap();
+        let main = fluree.ledger("test/db:main").await.unwrap();
+        fluree.insert(main, &doc("ex:b")).await.unwrap();
+
+        let ns = fluree.nameservice();
+        let dev = ns.lookup("test/db:dev").await.unwrap().unwrap();
+        let source = ns.lookup("test/db:main").await.unwrap().unwrap();
+        assert_ne!(
+            dev.fence, source.fence,
+            "the branches' fences tell them apart"
+        );
+        let expected = dev
+            .write_basis()
+            .with_source(&source, source.erasure_generation);
+
+        let worker = Worker::new(
+            RefKey::new("test/db", "dev"),
+            SharedState::view_of(Arc::new(RwLock::new(NameServiceState::new()))),
+            PublishingChannel {
+                commits: Arc::new(FencedPublisher::default()),
+                poison: Arc::new(NoPoison),
+                staged_receipts: Arc::new(StagedReceiptMap::default()),
+            },
+            StagingContext {
+                fluree: Arc::clone(&fluree),
+                index_config: fluree_db_api::server_defaults::default_index_config(),
+            },
+        );
+
+        let rebased = worker
+            .process_rebase(QueuedRebase {
+                strategy: fluree_db_api::ConflictStrategy::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&rebased.receipt, AppliedReceipt::Rebase(r) if r.fast_forward),
+            "a fast-forward rebase"
+        );
+        assert_eq!(rebased.basis, expected);
+        drop(rebased);
+
+        let merged = worker
+            .process_merge(QueuedMerge {
+                source_branch: "main".into(),
+                target_branch: Some("dev".into()),
+                strategy: fluree_db_api::ConflictStrategy::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&merged.receipt, AppliedReceipt::Merge(m) if m.fast_forward),
+            "a fast-forward merge"
+        );
+        assert!(merged.install.is_none());
+        assert_eq!(merged.basis, expected);
     }
 
     /// A branch frozen since takes no commit: the entry is poisoned, not
@@ -2164,9 +2216,7 @@ mod tests {
             .publish_head_advance(
                 cid(1),
                 5,
-                Some(WriteBasis::fenced(Some(
-                    fluree_db_nameservice::Fence::from_u64(2),
-                ))),
+                WriteBasis::fenced(Some(fluree_db_nameservice::Fence::from_u64(2))),
             )
             .await;
         assert!(
