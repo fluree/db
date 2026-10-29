@@ -551,7 +551,9 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
     use fluree_db_consensus::raft::state_machine::{
         holder_state, ActivateErasure, Command, ErasureCommand, RefKey, Response,
     };
-    use fluree_db_nameservice::{IndexPublisher, NameServiceError};
+    use fluree_db_nameservice::{
+        GraphSourcePublisher, GraphSourceType, IndexPublisher, NameServiceError,
+    };
 
     let (integration, fluree, node, _dirs) = stand_up(9, |config| config).await;
     fluree.create_ledger("erased/db").await.expect("create");
@@ -566,6 +568,15 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
         .expect("lookup")
         .expect("registered");
     assert_eq!(before.erasure_generation, 0);
+    ns.publish_graph_source(
+        "search",
+        "main",
+        GraphSourceType::Bm25,
+        "{}",
+        &["erased/db:main".to_string()],
+    )
+    .await
+    .expect("graph source");
 
     let key = RefKey::new("erased/db", "main");
     integration
@@ -614,6 +625,20 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
         matches!(stale, Err(NameServiceError::ApplyLagged(_))),
         "{stale:?}"
     );
+
+    // A search index presents the generation of the source view it was
+    // built from.
+    let source = |g| [("erased/db:main".to_string(), g)];
+    let stale = ns
+        .publish_graph_source_index("search", "main", &index, 1, &source(0))
+        .await;
+    assert!(
+        matches!(stale, Err(NameServiceError::ApplyLagged(_))),
+        "{stale:?}"
+    );
+    ns.publish_graph_source_index("search", "main", &index, 1, &source(1))
+        .await
+        .expect("an index from the current view publishes");
 
     let receipt = tokio::time::timeout(
         Duration::from_secs(30),

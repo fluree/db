@@ -1372,6 +1372,7 @@ impl GraphSourcePublisher for FileNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let address = Self::index_address(name, branch);
         let cid_str = index_id.to_string();
@@ -2594,7 +2595,7 @@ mod tests {
 
         // Publish graph source index
         let gs_index_cid = ContentId::new(ContentKind::IndexRoot, b"gs-index-1");
-        ns.publish_graph_source_index("my-gs", "main", &gs_index_cid, 42)
+        ns.publish_graph_source_index("my-gs", "main", &gs_index_cid, 42, &[])
             .await
             .unwrap();
 
@@ -2620,12 +2621,12 @@ mod tests {
         let gs_cid_old = ContentId::new(ContentKind::IndexRoot, b"index-old");
         let gs_cid_same = ContentId::new(ContentKind::IndexRoot, b"index-same");
 
-        ns.publish_graph_source_index("gs", "main", &gs_cid_v1, 10)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_v1, 10, &[])
             .await
             .unwrap();
 
         // Higher t should update
-        ns.publish_graph_source_index("gs", "main", &gs_cid_v2, 20)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_v2, 20, &[])
             .await
             .unwrap();
 
@@ -2634,7 +2635,7 @@ mod tests {
         assert_eq!(record.index_t, 20);
 
         // Lower t should be ignored (monotonic rule)
-        ns.publish_graph_source_index("gs", "main", &gs_cid_old, 15)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_old, 15, &[])
             .await
             .unwrap();
 
@@ -2643,7 +2644,7 @@ mod tests {
         assert_eq!(record.index_t, 20);
 
         // Equal t should also be ignored
-        ns.publish_graph_source_index("gs", "main", &gs_cid_same, 20)
+        ns.publish_graph_source_index("gs", "main", &gs_cid_same, 20, &[])
             .await
             .unwrap();
 
@@ -2781,7 +2782,7 @@ mod tests {
 
         // Publish index
         let gs_idx_cid = ContentId::new(ContentKind::IndexRoot, b"gs-index-1");
-        ns.publish_graph_source_index("gs", "main", &gs_idx_cid, 10)
+        ns.publish_graph_source_index("gs", "main", &gs_idx_cid, 10, &[])
             .await
             .unwrap();
 

@@ -674,7 +674,9 @@ async fn a_sync_does_not_publish_a_file_a_release_took() {
 
     let report = fluree.run_purge_pass(id, Duration::ZERO).await.unwrap();
     assert_eq!(report.purged, 1, "{report:?}");
-    let refused = fluree.publish_bm25_manifest(source, &manifest, 2).await;
+    let refused = fluree
+        .publish_bm25_manifest(source, &manifest, 2, &[])
+        .await;
     assert!(
         matches!(
             refused,

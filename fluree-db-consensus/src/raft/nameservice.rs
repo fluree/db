@@ -2092,6 +2092,7 @@ impl GraphSourcePublisher for RaftNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         let cmd = SmCommand::PublishGraphSourceIndex {
             name: name.to_string(),
@@ -2099,7 +2100,22 @@ impl GraphSourcePublisher for RaftNameService {
             index_id: index_id.clone(),
             index_t,
         };
-        match self.submit_lifecycle(cmd).await? {
+        // Built from source views: each presents its generation, as a
+        // write from one view does (see `at_generation`).
+        let cmd = if sources.iter().any(|(_, g)| *g > 0) {
+            SmCommand::AtGeneration {
+                generations: sources
+                    .iter()
+                    .map(|(id, g)| Ok((ref_key_of(id)?, *g)))
+                    .collect::<Result<_>>()?,
+                command: Box::new(cmd),
+            }
+        } else {
+            cmd
+        };
+        let response = self.submit_lifecycle(cmd).await?;
+        check_erasure_response(&response)?;
+        match response {
             SmResponse::GraphSourceIndexAdvanced { .. }
             | SmResponse::GraphSourceIndexStale { .. }
             | SmResponse::GraphSourceNotFound { .. } => Ok(()),

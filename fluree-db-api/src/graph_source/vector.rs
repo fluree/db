@@ -4,6 +4,7 @@
 //! embedded vector similarity search indexes.
 
 #[cfg(feature = "vector")]
+use super::helpers::source_view;
 use crate::graph_source::config::VectorCreateConfig;
 #[cfg(feature = "vector")]
 use crate::graph_source::helpers::{
@@ -221,6 +222,7 @@ impl crate::Fluree {
                 config.effective_branch(),
                 &index_id,
                 source_t,
+                &[source_view(&ledger)],
             )
             .await?;
 
@@ -439,6 +441,7 @@ impl crate::Fluree {
         loaded: Option<&ContentId>,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         let _heads = self.source_heads_lock().await;
         if let Some(loaded) = loaded {
@@ -456,7 +459,7 @@ impl crate::Fluree {
         }
         self.still_stored(graph_source_id, &[index_id]).await?;
         self.publisher()?
-            .publish_graph_source_index(name, branch, index_id, index_t)
+            .publish_graph_source_index(name, branch, index_id, index_t, sources)
             .await?;
         Ok(())
     }
@@ -611,6 +614,7 @@ impl crate::Fluree {
                 Some(&index_cid),
                 &new_index_id,
                 ledger_t,
+                &[source_view(&ledger)],
             )
             .await?;
             info!(
@@ -698,6 +702,7 @@ impl crate::Fluree {
             Some(&index_cid),
             &new_index_id,
             ledger_t,
+            &[source_view(&ledger)],
         )
         .await?;
 
@@ -882,6 +887,7 @@ impl crate::Fluree {
                 None,
                 &new_index_id,
                 ledger_t,
+                &[source_view(&ledger)],
             )
             .await?;
         }

@@ -864,12 +864,18 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     ///
     /// Config updates must NOT reset index watermark.
     /// Index updates must NOT rewrite config.
+    ///
+    /// `sources` names the erasure generation of each source ledger view
+    /// the index was built from (see [`WriteBasis`]); a cluster refuses an
+    /// index built from a view an erasure has since replaced. Other
+    /// backends keep no generations and ignore it.
     async fn publish_graph_source_index(
         &self,
         name: &str,
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()>;
 
     /// Retract a graph source
@@ -1817,9 +1823,10 @@ where
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         (**self)
-            .publish_graph_source_index(name, branch, index_id, index_t)
+            .publish_graph_source_index(name, branch, index_id, index_t, sources)
             .await
     }
 

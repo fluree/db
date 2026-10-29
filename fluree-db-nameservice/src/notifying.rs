@@ -362,9 +362,10 @@ where
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         self.inner
-            .publish_graph_source_index(name, branch, index_id, index_t)
+            .publish_graph_source_index(name, branch, index_id, index_t, sources)
             .await?;
         let graph_source_id = LedgerId::from_parts(name, branch)?;
         self.event_bus

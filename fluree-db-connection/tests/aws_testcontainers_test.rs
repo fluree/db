@@ -819,7 +819,7 @@ async fn nameservice_graph_source_publisher() {
 
     // publish_graph_source_index
     let gs_index_id_1 = test_index_id("gs-index:1");
-    ns.publish_graph_source_index("search-bm25", "main", &gs_index_id_1, 1)
+    ns.publish_graph_source_index("search-bm25", "main", &gs_index_id_1, 1, &[])
         .await
         .unwrap();
     let gs = ns
@@ -831,7 +831,7 @@ async fn nameservice_graph_source_publisher() {
     assert_eq!(gs.index_t, 1);
 
     // Monotonic: stale index ignored
-    ns.publish_graph_source_index("search-bm25", "main", &test_index_id("stale:0"), 0)
+    ns.publish_graph_source_index("search-bm25", "main", &test_index_id("stale:0"), 0, &[])
         .await
         .unwrap();
     let gs = ns

@@ -125,6 +125,9 @@ pub struct GraphDb {
     /// The fence of the branch record the view was loaded from: which
     /// incarnation of the branch it reads.
     pub(crate) fence: Option<fluree_db_nameservice::Fence>,
+    /// That record's erasure generation: which erasures the view reads
+    /// with. An index built from the view presents it.
+    pub(crate) erasure_generation: u64,
 
     /// Graph ID within the ledger (0 = default graph).
     ///
@@ -291,12 +294,13 @@ impl std::fmt::Debug for GraphDb {
 /// The fence of `state`'s branch record, when that record is the branch's
 /// own: a state built from another branch (a rebase replays onto its
 /// source's) carries the other branch's record.
-fn own_fence(state: &LedgerState) -> Option<fluree_db_nameservice::Fence> {
+fn own_basis(state: &LedgerState) -> fluree_db_nameservice::WriteBasis {
     state
         .ns_record
         .as_ref()
         .filter(|record| record.ledger_id.as_str() == state.ledger_id())
-        .and_then(|record| record.fence)
+        .map(fluree_db_nameservice::NsRecord::write_basis)
+        .unwrap_or_default()
 }
 
 impl GraphDb {
@@ -327,6 +331,7 @@ impl GraphDb {
             ledger_id: ledger_id.into(),
             instance_bits: 0,
             fence: None,
+            erasure_generation: 0,
             graph_id: 0,
             policy: None,
             policy_enforcer: None,
@@ -375,7 +380,9 @@ impl GraphDb {
             ledger.ledger_id(),
         );
         gdb.instance_bits = ledger.instance_bits();
-        gdb.fence = own_fence(ledger);
+        let basis = own_basis(ledger);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
         // Extract binary_store from LedgerState's TypeErasedStore
@@ -414,6 +421,7 @@ impl GraphDb {
         );
         gdb.instance_bits = view.instance_bits();
         gdb.fence = view.fence();
+        gdb.erasure_generation = view.erasure_generation();
         gdb.runtime_small_dicts = view.runtime_small_dicts().cloned();
         gdb.historical = true;
         gdb
@@ -511,7 +519,9 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
-        gdb.fence = own_fence(base);
+        let basis = own_basis(base);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.dict_novelty = Some(dict_novelty);
         gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
@@ -546,7 +556,9 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
-        gdb.fence = own_fence(base);
+        let basis = own_basis(base);
+        gdb.fence = basis.fence;
+        gdb.erasure_generation = basis.erasure_generation;
         gdb.runtime_small_dicts = Some(base.runtime_small_dicts.clone());
         // Carry binary store from the base ledger state
         gdb.binary_store = base

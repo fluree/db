@@ -629,6 +629,7 @@ impl GraphSourcePublisher for MemoryNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let key = LedgerId::from_parts(name, branch)?;
         let mut graph_source_records = self.graph_source_records.write();
@@ -1136,11 +1137,11 @@ mod tests {
         let id_v2 = ContentId::new(ContentKind::IndexRoot, b"index-v2");
         let id_old = ContentId::new(ContentKind::IndexRoot, b"index-old");
 
-        ns.publish_graph_source_index("gs", "main", &id_v1, 10)
+        ns.publish_graph_source_index("gs", "main", &id_v1, 10, &[])
             .await
             .unwrap();
 
-        ns.publish_graph_source_index("gs", "main", &id_v2, 20)
+        ns.publish_graph_source_index("gs", "main", &id_v2, 20, &[])
             .await
             .unwrap();
 
@@ -1149,7 +1150,7 @@ mod tests {
         assert_eq!(record.index_t, 20);
 
         // Lower t should be ignored
-        ns.publish_graph_source_index("gs", "main", &id_old, 15)
+        ns.publish_graph_source_index("gs", "main", &id_old, 15, &[])
             .await
             .unwrap();
 

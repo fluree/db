@@ -146,6 +146,15 @@ pub fn expand_prefixed_iri(iri: &str, prefix_map: &HashMap<String, String>) -> O
 /// ledger, judged as its incremental sync judges them: its indexing query's
 /// and, for a vector index, its embedding property. Any other kind of graph
 /// source, or a config that does not parse, may read anything.
+/// What an index built from `ledger` presents for it as a source: its id and
+/// the erasure generation it was loaded at.
+pub(crate) fn source_view(ledger: &fluree_db_ledger::LedgerState) -> (String, u64) {
+    (
+        ledger.ledger_id().to_string(),
+        ledger.write_basis().erasure_generation,
+    )
+}
+
 pub(crate) fn indexed_properties(record: &GraphSourceRecord) -> PropertyDepsAnalysis {
     let unknown = |why: String| PropertyDepsAnalysis {
         incomplete: Some(why),

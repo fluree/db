@@ -1360,6 +1360,7 @@ where
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let key = self.index_key(name, branch);
 

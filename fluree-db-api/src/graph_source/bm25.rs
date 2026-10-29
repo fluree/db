@@ -3,6 +3,7 @@
 //! This module provides APIs for creating, loading, syncing, and dropping
 //! BM25 full-text search indexes.
 
+use super::helpers::source_view;
 use crate::graph_source::config::Bm25CreateConfig;
 use crate::graph_source::helpers::{expand_ids_in_results, extract_prefix_map};
 use crate::graph_source::result::{
@@ -375,7 +376,12 @@ impl crate::Fluree {
 
         // 7. Publish manifest to CAS and head pointer to nameservice
         let index_id = self
-            .publish_bm25_manifest(&graph_source_id, &manifest, source_t)
+            .publish_bm25_manifest(
+                &graph_source_id,
+                &manifest,
+                source_t,
+                &[source_view(&ledger)],
+            )
             .await?;
 
         info!(
@@ -592,12 +598,15 @@ impl crate::Fluree {
     /// the graph source head pointer in nameservice.
     ///
     /// The manifest is content-addressed (keyed by `index_t`), so each
-    /// publish creates a new immutable object in storage.
+    /// publish creates a new immutable object in storage. `sources` is the
+    /// erasure generation of each source view the index was built from; see
+    /// [`GraphSourcePublisher::publish_graph_source_index`](fluree_db_nameservice::GraphSourcePublisher::publish_graph_source_index).
     pub(crate) async fn publish_bm25_manifest(
         &self,
         graph_source_id: &str,
         manifest: &Bm25Manifest,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<ContentId> {
         let (name, branch) = split_ledger_id(graph_source_id).map_err(|e| {
             crate::ApiError::config(format!("Invalid graph source ID '{graph_source_id}': {e}"))
@@ -632,7 +641,7 @@ impl crate::Fluree {
         written.push(&index_id);
         self.still_stored(graph_source_id, &written).await?;
         self.publisher()?
-            .publish_graph_source_index(&name, &branch, &index_id, index_t)
+            .publish_graph_source_index(&name, &branch, &index_id, index_t, sources)
             .await?;
 
         Ok(index_id)
@@ -1363,8 +1372,13 @@ impl crate::Fluree {
             let mut manifest = manifest;
             manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
             let removed = manifest.trim(snapshot_retention());
-            self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
-                .await?;
+            self.publish_bm25_manifest(
+                graph_source_id,
+                &manifest,
+                ledger_t,
+                &[source_view(&ledger)],
+            )
+            .await?;
             if let Some(storage) = self.admin_storage() {
                 delete_old_snapshots(storage, graph_source_id, &removed).await;
             }
@@ -1466,8 +1480,13 @@ impl crate::Fluree {
         let mut manifest = manifest;
         manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
         let removed = manifest.trim(snapshot_retention());
-        self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
-            .await?;
+        self.publish_bm25_manifest(
+            graph_source_id,
+            &manifest,
+            ledger_t,
+            &[source_view(&ledger)],
+        )
+        .await?;
 
         // Best-effort cleanup of old snapshot blobs
         if let Some(storage) = self.admin_storage() {
@@ -1574,8 +1593,13 @@ impl crate::Fluree {
         let mut manifest = manifest;
         manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
         let removed = manifest.trim(snapshot_retention());
-        self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
-            .await?;
+        self.publish_bm25_manifest(
+            graph_source_id,
+            &manifest,
+            ledger_t,
+            &[source_view(&ledger)],
+        )
+        .await?;
 
         // Best-effort cleanup of old snapshot blobs
         if let Some(storage) = self.admin_storage() {
@@ -1787,8 +1811,13 @@ impl crate::Fluree {
         manifest.append(Bm25SnapshotEntry::new(target_t, snapshot_id));
         let removed = manifest.trim(snapshot_retention());
         let effective_t = manifest.head().map(|h| h.index_t).unwrap_or(target_t);
-        self.publish_bm25_manifest(graph_source_id, &manifest, effective_t)
-            .await?;
+        self.publish_bm25_manifest(
+            graph_source_id,
+            &manifest,
+            effective_t,
+            &[(view.ledger_id.to_string(), view.erasure_generation)],
+        )
+        .await?;
 
         // Best-effort cleanup of old snapshot blobs
         if let Some(storage) = self.admin_storage() {
@@ -2139,7 +2168,7 @@ mod head_tests {
         assert_ne!(stale.loaded_from.as_ref(), Some(&rebuilt));
 
         let refused = fluree
-            .publish_bm25_manifest("search:main", &stale, i64::MAX)
+            .publish_bm25_manifest("search:main", &stale, i64::MAX, &[])
             .await;
         assert!(
             matches!(

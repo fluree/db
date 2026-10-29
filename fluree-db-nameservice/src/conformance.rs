@@ -605,7 +605,7 @@ pub async fn a_graph_source_keeps_its_key<S: crate::NameServicePublisher>(store:
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &index, 5)
+        .publish_graph_source_index("search", "main", &index, 5, &[])
         .await
         .unwrap();
 
@@ -1874,11 +1874,11 @@ pub async fn a_graph_source_index_is_replaced_at_the_same_t<S: crate::NameServic
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &cid(IndexRoot, "a"), 5)
+        .publish_graph_source_index("search", "main", &cid(IndexRoot, "a"), 5, &[])
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &cid(IndexRoot, "b"), 5)
+        .publish_graph_source_index("search", "main", &cid(IndexRoot, "b"), 5, &[])
         .await
         .unwrap();
     assert_eq!(head().await, (Some(cid(IndexRoot, "a")), 5));
@@ -1913,7 +1913,7 @@ pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &index("a"), 5)
+        .publish_graph_source_index("search", "main", &index("a"), 5, &[])
         .await
         .unwrap();
     store
@@ -1932,7 +1932,7 @@ pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>
         .await
         .unwrap();
     store
-        .publish_graph_source_index("search", "main", &index("b"), 1)
+        .publish_graph_source_index("search", "main", &index("b"), 1, &[])
         .await
         .unwrap();
     assert_eq!(head(store).await, (false, Some(index("b")), 1), "recreated");

@@ -1541,6 +1541,7 @@ impl GraphSourcePublisher for DynamoDbNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> std::result::Result<(), NameServiceError> {
         let pk = format_ledger_id(name, branch);
         let now = Self::now_epoch_ms().to_string();

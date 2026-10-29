@@ -68,6 +68,8 @@ pub struct HistoricalLedgerView {
     instance_bits: u128,
     /// The fence of the branch record it was loaded from.
     fence: Option<fluree_db_nameservice::Fence>,
+    /// That record's erasure generation.
+    erasure_generation: u64,
 }
 
 impl HistoricalLedgerView {
@@ -201,6 +203,7 @@ impl HistoricalLedgerView {
                 .and_then(fluree_db_core::StorageRoot::instance_bits)
                 .unwrap_or(0),
             fence: record.fence,
+            erasure_generation: record.erasure_generation,
         })
     }
 
@@ -423,6 +426,7 @@ impl HistoricalLedgerView {
             to_t,
             instance_bits: 0,
             fence: None,
+            erasure_generation: 0,
         }
     }
 
@@ -436,6 +440,12 @@ impl HistoricalLedgerView {
     /// a view built from components.
     pub fn fence(&self) -> Option<fluree_db_nameservice::Fence> {
         self.fence
+    }
+
+    /// The erasure generation of the branch record the view was loaded
+    /// from; 0 for a view built from components.
+    pub fn erasure_generation(&self) -> u64 {
+        self.erasure_generation
     }
 
     /// Get the time bound for this view
