@@ -422,7 +422,9 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
             continue;
         }
 
-        // FILTER(LANG(?o) = "en")  (either side order)
+        // FILTER(LANG(?o) = "en")  (either side order). Only `=` is a tag
+        // equality: `!=`, `<`, `langMatches`, `STRSTARTS` or any other
+        // function of LANG(?o) and a string stays a row filter.
         let is_lang_o = |e: &Expression| match (e, obj_var) {
             (Expression::Call { func, args }, Some(ov)) => {
                 matches!(func, Function::Lang { .. })
@@ -431,7 +433,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
             }
             _ => false,
         };
-        if is_lang_o(&args[0]) {
+        if *func == Function::Eq && is_lang_o(&args[0]) {
             if let Expression::Const(FlakeValue::String(tag)) = &args[1] {
                 if let Some(lang_id) = store.resolve_lang_id(tag) {
                     let required_otype =
@@ -443,7 +445,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
             pruned.push(op.clone());
             continue;
         }
-        if is_lang_o(&args[1]) {
+        if *func == Function::Eq && is_lang_o(&args[1]) {
             if let Expression::Const(FlakeValue::String(tag)) = &args[0] {
                 if let Some(lang_id) = store.resolve_lang_id(tag) {
                     let required_otype =
