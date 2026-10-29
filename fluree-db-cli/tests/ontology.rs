@@ -224,15 +224,193 @@ fn trig_and_unknown_formats_are_refused_plainly() {
         "request.trig",
         "<urn:g> { <urn:a> <urn:b> <urn:c> . }",
     );
-    write(&tmp, "schema.sql", "CREATE TABLE t (id int);");
+    write(&tmp, "view.yaml", "tables: []");
     fluree_cmd(&tmp)
         .args(["ontology", "check", "request.trig"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("TriG isn't read yet"));
     fluree_cmd(&tmp)
-        .args(["ontology", "from", "schema.sql"])
+        .args(["ontology", "from", "view.yaml"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("not an RDF file"));
+}
+
+const DDL: &str = r"
+CREATE TABLE companies (
+    company_id SERIAL PRIMARY KEY,
+    name VARCHAR(200) NOT NULL
+);
+CREATE TABLE contacts (
+    id INTEGER PRIMARY KEY,
+    employer_id INTEGER REFERENCES companies(company_id),
+    full_name TEXT,
+    status VARCHAR(10) CHECK (status IN ('active', 'left'))
+);
+COMMENT ON TABLE companies IS 'Customer accounts and partners.';
+";
+
+#[test]
+fn from_sql_ddl() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp, "crm.sql", DDL);
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "crm.sql",
+            "--base",
+            "https://example.com/crm/",
+            "-o",
+            "crm.ttl",
+            "--catalog-out",
+            "status.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "3 classes, 4 properties; 1 enumerated column made a class, with 2 catalog records; 2 primary key columns left out",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("crm.ttl")).unwrap();
+    // a foreign key is a relation labelled without `_id`
+    assert!(ttl.contains("crm:employer a rdf:Property"), "{ttl}");
+    assert!(ttl.contains("rdfs:range crm:Company"), "{ttl}");
+    assert!(
+        ttl.contains("rdfs:comment \"Customer accounts and partners.\""),
+        "{ttl}"
+    );
+    assert!(
+        !ttl.contains("companyId"),
+        "primary keys are left out: {ttl}"
+    );
+    let records = std::fs::read_to_string(tmp.path().join("status.ttl")).unwrap();
+    assert!(records.contains("skos:prefLabel \"active\""), "{records}");
+
+    let (report, code) = check_json(&tmp, &["crm.ttl", "--catalog", "status.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(report["records"], 2);
+    assert_eq!(report["adapted"], serde_json::json!({}));
+}
+
+/// `fixtures/ontology/crm.xlsx`: two sheets, Companies (company_id, name,
+/// industry) and People (id, full_name, company_id, role), the role
+/// repeating two values over eight rows.
+fn workbook(tmp: &TempDir) {
+    let src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ontology/crm.xlsx");
+    std::fs::copy(src, tmp.path().join("crm.xlsx")).unwrap();
+}
+
+#[test]
+fn from_a_workbook_links_sheets() {
+    let tmp = TempDir::new().unwrap();
+    workbook(&tmp);
+    let out = fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "crm.xlsx",
+            "--base",
+            "https://example.com/crm/",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ttl = String::from_utf8(out).unwrap();
+    assert!(ttl.contains("crm:Person a rdfs:Class"), "{ttl}");
+    assert!(
+        ttl.contains("crm:Role a rdfs:Class"),
+        "role is enumerated: {ttl}"
+    );
+    assert!(
+        ttl.contains("rdfs:range crm:Company"),
+        "company_id links People to Companies: {ttl}"
+    );
+}
+
+#[test]
+fn catalog_from_rows() {
+    let tmp = TempDir::new().unwrap();
+    write(
+        &tmp,
+        "accounts.csv",
+        "account_no,name,aliases,industry\n\
+         A-100,Daxin Scientific Supply Co.,Daxin; sales@daxin.example,Lab supplies\n\
+         A-101,Dexin Instruments Ltd.,Dexin,Instruments\n",
+    );
+    write(
+        &tmp,
+        "ontology.ttl",
+        r#"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+           <https://example.com/crm/Organization> a rdfs:Class ; rdfs:label "organization" ;
+             rdfs:comment "A company we deal with." ."#,
+    );
+    fluree_cmd(&tmp)
+        .args([
+            "catalog",
+            "from",
+            "accounts.csv",
+            "--class",
+            "organization",
+            "--ontology",
+            "ontology.ttl",
+            "--label",
+            "name",
+            "--alt",
+            "aliases",
+            "--code",
+            "account_no",
+            "--describe",
+            "industry",
+            "--id",
+            "account_no",
+            "--base",
+            "https://example.com/crm/account/",
+            "-o",
+            "accounts.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "2 records of <https://example.com/crm/Organization>",
+        ))
+        .stderr(predicate::str::contains(
+            "serialized tokens, repeated in every extraction window",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("accounts.ttl")).unwrap();
+    assert!(ttl.contains("skos:hiddenLabel \"A-100\""), "{ttl}");
+    assert!(ttl.contains("\"sales@daxin.example\""), "{ttl}");
+    assert!(
+        ttl.contains("skos:definition \"industry: Lab supplies\""),
+        "{ttl}"
+    );
+
+    let (report, code) = check_json(&tmp, &["ontology.ttl", "--catalog", "accounts.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(report["records"], 2);
+    assert!(
+        report["advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["code"] != "catalog-class-not-in-ontology"),
+        "the records are typed with the ontology's class: {report:#}"
+    );
+
+    fluree_cmd(&tmp)
+        .args([
+            "catalog",
+            "from",
+            "accounts.csv",
+            "--class",
+            "Organization",
+            "--label",
+            "title",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no column \"title\""));
 }

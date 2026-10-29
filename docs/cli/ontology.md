@@ -21,11 +21,14 @@ fluree ontology <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `check` | Report what the extraction model will and won't read of an ontology (and catalog) |
-| `from` | Write an ontology in the shape the extraction model reads well, optionally sliced |
+| `from` | Write an ontology in the shape the extraction model reads well: from tables (CSV, a workbook, SQL DDL), or from RDF, optionally sliced |
 
-Both read Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-` reads stdin, and
-`--input-format turtle|jsonld` says which when the extension doesn't. TriG is
-not read yet: pass the ontology as Turtle, or a saved request as JSON-LD.
+Ontologies are read as Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-`
+reads stdin, and `--input-format turtle|jsonld` says which when the extension
+doesn't. TriG is not read yet: pass the ontology as Turtle, or a saved request
+as JSON-LD. `from` also reads tables: `.csv`/`.tsv`, `.xlsx` and `.sql`.
+
+For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
 ## What the extraction model reads
 
@@ -186,11 +189,107 @@ Finding codes: `no-ontology`, `no-class`, `no-label`, `catalog-blank-node`,
 ## fluree ontology from
 
 ```bash
-fluree ontology from <FILE> [--seed <CLASSES>] [--depth <N>] [--format turtle|jsonld] [-o <FILE>]
+fluree ontology from <FILE> [--base <IRI>] [--enum-max <N>] [--catalog-out <FILE>] [--format turtle|jsonld] [-o <FILE>]
+fluree ontology from <FILE.ttl|.jsonld> [--seed <CLASSES>] [--depth <N>] [--format turtle|jsonld] [-o <FILE>]
 ```
 
-Reads an RDF ontology and writes it with what the extraction model reads made
-explicit:
+The ontology goes to stdout, or to the file `-o` names; a summary of what was
+made goes to stderr. Run `fluree ontology check` on the result to see what the
+extraction model will read of it.
+
+### From tables
+
+A CSV file (`.csv`, `.tsv`: one table, named for the file), a workbook
+(`.xlsx`: a table per sheet, the first row its header) or SQL DDL (`.sql`:
+`CREATE TABLE` statements) becomes an ontology by the rules that measurably
+help the extraction model:
+
+- **labels in words**: a table is a class labelled with its name in words,
+  singular (`DAMAGE_REPORTS` becomes "damage report"), and a column a
+  property labelled with its name in words (`opened_at` becomes "opened at");
+- **IRIs minted from the labels** (`DamageReport`, `openedAt`), since the
+  model reads the local name beside the label;
+- **foreign keys become relations** from the table's class to the class of
+  the table referenced, labelled without the key suffix (`employer_id`
+  becomes "employer"), with a short description ("A contact's employer: a
+  company.");
+- **enumerated columns become a class with a catalog record per value**, the
+  shape the model reads best for a closed set of kinds;
+- **descriptions are copied** from `COMMENT ON TABLE|COLUMN`, inline
+  `COMMENT '...'` and a table's `COMMENT = '...'`;
+- **primary keys are left out**, as are views, indexes and everything that
+  describes the database rather than the things in it.
+
+Foreign keys are read from `REFERENCES` and `FOREIGN KEY` in DDL. In a CSV or a
+workbook, a column named `id`, or the table's name in the singular with `_id`
+(`company_id` in `companies`), is the primary key, and any other column ending
+in `id` is a foreign key, to the sheet it names if there is one.
+
+Enumerated columns come from `CHECK (col IN (...))`, a MySQL `ENUM(...)` type
+or a PostgreSQL `CREATE TYPE ... AS ENUM` in DDL. In a CSV or a workbook, a
+text column is enumerated when it has at most `--enum-max` distinct short
+values (default 12), each repeated (at least twice as many rows as values, and
+five rows). Column datatypes come from the DDL, or from the values (integers,
+decimals, ISO dates and date-times, booleans; a number with a leading zero is a
+code and stays text).
+
+The DDL is parsed with a generic SQL dialect, then PostgreSQL's, MySQL's and
+Snowflake's; statements none of them can parse are skipped and counted.
+
+| Option | Description |
+|--------|-------------|
+| `--base <IRI>` | Namespace for minted IRIs (default: `https://example.com/<file name>/`) |
+| `--enum-max <N>` | Most distinct values an enumerated column may have, for CSV and workbooks (default: 12; 0 never enumerates) |
+| `--catalog-out <FILE>` | Write enumerated columns' records here instead of with the ontology |
+| `--format <FORMAT>` | `turtle` (default) or `jsonld` |
+| `-o, --output <FILE>` | Write to this file instead of stdout |
+
+```bash
+fluree ontology from schema.sql --base https://example.com/crm/ > ontology.ttl
+fluree ontology from accounts.csv -o ontology.ttl
+fluree ontology from crm.xlsx --catalog-out kinds.ttl -o ontology.ttl
+```
+
+From this DDL:
+
+```sql
+CREATE TABLE companies (company_id SERIAL PRIMARY KEY, name VARCHAR(200));
+CREATE TABLE contacts (
+    id INTEGER PRIMARY KEY,
+    employer_id INTEGER REFERENCES companies(company_id),
+    status VARCHAR(10) CHECK (status IN ('active', 'left'))
+);
+COMMENT ON TABLE companies IS 'Customer accounts and partners.';
+```
+
+`fluree ontology from crm.sql --base https://example.com/crm/` writes (in part):
+
+```turtle
+crm:Company a rdfs:Class ;
+    rdfs:comment "Customer accounts and partners." ;
+    rdfs:label "company" .
+
+crm:employer a rdf:Property ;
+    rdfs:comment "A contact's employer: a company." ;
+    rdfs:domain crm:Contact ;
+    rdfs:label "employer" ;
+    rdfs:range crm:Company .
+
+crm:Status a rdfs:Class ;
+    rdfs:label "status" .
+
+<https://example.com/crm/Status/active> a crm:Status ;
+    skos:prefLabel "active" .
+```
+
+What tables can't say is what the extraction model gains most from next:
+descriptions that say what counts and name the words people use ("the desk"
+for the hire desk). `check` lists the terms without one.
+
+### From RDF
+
+An RDF ontology (Turtle or JSON-LD) is written back with what the extraction
+model reads made explicit:
 
 - SKOS labels and definitions copied into `rdfs:label` and `rdfs:comment`;
 - a label made from the IRI where there is none;
@@ -204,9 +303,6 @@ Domains, ranges and other axioms are kept: the extraction model doesn't see
 them, but a reading can still be checked against them. Catalog records in the
 file are kept, and one with an `rdfs:label` but no SKOS label gets it as
 `skos:prefLabel` (and its `rdfs:comment` as `skos:definition`).
-
-A summary of what changed goes to stderr; the ontology goes to stdout, or to
-the file `-o` names.
 
 | Option | Description |
 |--------|-------------|
@@ -244,5 +340,6 @@ records are kept when they are typed with a kept class or have no type.
 
 ## See also
 
+- [`catalog`](catalog.md): a catalog of records from rows you already have
 - [`doc`](doc.md): ingest documents and extract entities and relations with an ontology
 - [`validate`](validate.md): validate data against SHACL shapes
