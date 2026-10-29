@@ -3523,6 +3523,17 @@ fn build_operator_tree_inner(
         &query.patterns,
         query.post_values.as_ref(),
     );
+    // The grouped count over several graphs (or none) never sees a list-view
+    // triple's rows, which its scan does not carry alone; say so where the
+    // query is the lane's shape.
+    if list_view
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+    {
+        crate::union_group_count::stamp_list_view_decline(query);
+    }
     apply_solution_modifiers(
         operator,
         query.grouping.as_ref(),

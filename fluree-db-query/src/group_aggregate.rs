@@ -50,6 +50,7 @@ use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use rustc_hash::{FxBuildHasher, FxHashSet};
+use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::Instrument;
@@ -985,18 +986,33 @@ impl Operator for GroupAggregateOperator {
         }
 
         // A join can count matches before expanding them into output rows when
-        // all group keys come from its driving side. Other aggregates and
-        // DISTINCT retain ordinary row consumption.
+        // all group keys come from its driving side, and a union of graphs can
+        // count one pattern's rows from its members' indexes. Every aggregate
+        // must count rows: `COUNT(*)`, or `COUNT(?v)` of a variable the child
+        // shows bound in every row. Other aggregates and DISTINCT retain
+        // ordinary row consumption.
         if self.emit_iter.is_none()
             && !self.group_key_indices.is_empty()
             && !self.agg_specs.is_empty()
             && self
                 .agg_specs
                 .iter()
-                .all(|spec| matches!(spec.function, AggregateFn::CountAll))
+                .all(|spec| matches!(spec.function, AggregateFn::CountAll | AggregateFn::Count(_)))
         {
+            let bound_vars: SmallVec<[VarId; 4]> = self
+                .agg_specs
+                .iter()
+                .filter_map(|spec| match spec.function {
+                    AggregateFn::Count(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
             let group_vars = &self.in_schema[..self.group_key_indices.len()];
-            if let Some(groups) = self.child.drain_grouped_count(ctx, group_vars).await? {
+            if let Some(groups) = self
+                .child
+                .drain_grouped_count(ctx, group_vars, &bound_vars)
+                .await?
+            {
                 let states = groups
                     .into_iter()
                     .map(|group| {

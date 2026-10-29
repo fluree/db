@@ -793,7 +793,7 @@ impl Shape {
 /// sorted.
 pub type Rows = Vec<Vec<String>>;
 
-fn rows(rows: &[&[&str]]) -> Rows {
+pub fn rows(rows: &[&[&str]]) -> Rows {
     let mut out: Rows = rows
         .iter()
         .map(|r| r.iter().map(|s| (*s).to_string()).collect())
@@ -1085,7 +1085,7 @@ fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
 // ============================================================================
 
 /// Strip `ex:` (either spelling) from a value.
-fn short(value: &str) -> String {
+pub fn short(value: &str) -> String {
     value
         .strip_prefix(EX)
         .or_else(|| value.strip_prefix("ex:"))
@@ -1093,7 +1093,7 @@ fn short(value: &str) -> String {
         .to_string()
 }
 
-fn sparql_rows(result: &JsonValue, vars: &[&str]) -> Rows {
+pub fn sparql_rows(result: &JsonValue, vars: &[&str]) -> Rows {
     let bindings = result["results"]["bindings"]
         .as_array()
         .unwrap_or_else(|| panic!("SPARQL results: {result}"));
@@ -1124,7 +1124,7 @@ fn json_value(v: &JsonValue) -> String {
     }
 }
 
-fn jsonld_rows(result: &JsonValue) -> Rows {
+pub fn jsonld_rows(result: &JsonValue) -> Rows {
     let mut out: Rows = result
         .as_array()
         .unwrap_or_else(|| panic!("JSON-LD rows: {result}"))
@@ -1221,19 +1221,30 @@ pub fn switch() -> &'static tokio::sync::Mutex<()> {
 /// span capture) and with `set_fast_paths_disabled(true)`, holding the switch
 /// lock across both.
 pub async fn run(fx: &Fixture, scope: Scope, shape: Shape, surface: Surface) -> Run {
-    let _switch = switch().lock().await;
     let label = format!(
         "{} / {} / {surface:?} / {:?}",
         shape.name(),
         scope.name(),
         fx.state
     );
+    run_query(label, || answer(fx, scope, shape, surface)).await
+}
+
+/// Run `query` twice, with fast paths on (under span capture) and with
+/// `set_fast_paths_disabled(true)`, holding the switch lock across both: a
+/// lane test's own query, outside the shapes.
+pub async fn run_query<F, Fut>(label: String, query: F) -> Run
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Rows, String>>,
+{
+    let _switch = switch().lock().await;
     set_fast_paths_disabled(false);
     let (store, guard) = init_test_tracing();
-    let fast = answer(fx, scope, shape, surface).await;
+    let fast = query().await;
     drop(guard);
     set_fast_paths_disabled(true);
-    let generic = answer(fx, scope, shape, surface).await;
+    let generic = query().await;
     set_fast_paths_disabled(false);
     Run {
         label,
@@ -1252,7 +1263,8 @@ pub async fn run(fx: &Fixture, scope: Scope, shape: Shape, surface: Surface) -> 
     }
 }
 
-fn outcomes(store: &SpanStore) -> Vec<(String, String)> {
+/// The fast-path outcomes `store` captured, as `(site, outcome)`.
+pub fn outcomes(store: &SpanStore) -> Vec<(String, String)> {
     store
         .all_events()
         .iter()
