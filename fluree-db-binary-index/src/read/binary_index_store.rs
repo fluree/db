@@ -416,6 +416,9 @@ pub struct BinaryIndexStore {
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
+    /// Per `(graph, predicate)` vector arena, whether it holds no value
+    /// twice. See [`Self::vector_handles_name_values`].
+    vector_handle_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
     /// The predicates with list rows, built on first use. See
     /// [`Self::list_predicate_ids`].
     list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
@@ -502,6 +505,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_handle_proofs: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -690,6 +694,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_handle_proofs: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -2550,19 +2555,74 @@ impl BinaryIndexStore {
 
     /// Whether `(g_id, p_id)`'s object keys name values one to one, so a
     /// consumer may count or group the predicate's objects by their raw
-    /// `(o_type, o_key)`. Two arenas break that within one predicate: a
+    /// `(o_type, o_key)`. Two arenas can break that within one predicate: a
     /// vector arena, which gives every stored fact its own handle
-    /// (`OType::o_key_is_predicate_identifying`), and a legacy NumBig arena
-    /// with scale-variant duplicates ([`Self::graph_numbig_has_duplicate_handles`]).
-    pub fn objects_keyed_by_value(&self, g_id: GraphId, p_id: u32) -> bool {
+    /// (`OType::o_key_is_predicate_identifying`), unless it holds no value
+    /// twice ([`Self::vector_handles_name_values`]); and a legacy NumBig arena
+    /// with scale-variant duplicates
+    /// ([`Self::graph_numbig_has_duplicate_handles`]).
+    pub fn objects_keyed_by_value(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
         let Some(gi) = self.graph_indexes.get(&g_id) else {
-            return true;
+            return Ok(true);
         };
-        !gi.vectors.contains_key(&p_id)
-            && !gi
-                .numbig
-                .get(&p_id)
-                .is_some_and(crate::arena::numbig::NumBigArena::has_duplicate_handles)
+        if gi
+            .numbig
+            .get(&p_id)
+            .is_some_and(crate::arena::numbig::NumBigArena::has_duplicate_handles)
+        {
+            return Ok(false);
+        }
+        self.vector_handles_name_values(g_id, p_id)
+    }
+
+    /// Whether `(g_id, p_id)`'s vector arena holds no value twice, so within
+    /// the predicate a vector's handle names its value. True without an
+    /// arena. The arena is immutable for the store's lifetime, so the answer
+    /// is computed once, on first use, by hashing every vector in it (shards
+    /// read without entering the shared cache) and comparing the vectors of
+    /// any hash that repeats. Concurrent first callers may each compute it.
+    pub fn vector_handles_name_values(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+        let Some(arena) = self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(true);
+        };
+        if let Some(&proven) = self.vector_handle_proofs.read().get(&(g_id, p_id)) {
+            return Ok(proven);
+        }
+        let mut hashes: Vec<(u64, u32)> = Vec::with_capacity(arena.len() as usize);
+        arena.scan_all(|handle, components| {
+            hashes.push((
+                fluree_db_core::value::vector_f32_bits_hash(components),
+                handle,
+            ));
+            std::ops::ControlFlow::Continue(())
+        })?;
+        hashes.sort_unstable();
+        let mut distinct = true;
+        for pair in hashes.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                let a = arena.lookup_vector(pair[0].1)?;
+                let b = arena.lookup_vector(pair[1].1)?;
+                if let (Some(a), Some(b)) = (a, b) {
+                    let same = a.as_f32().len() == b.as_f32().len()
+                        && a.as_f32()
+                            .iter()
+                            .zip(b.as_f32())
+                            .all(|(x, y)| x.to_bits() == y.to_bits());
+                    if same {
+                        distinct = false;
+                        break;
+                    }
+                }
+            }
+        }
+        self.vector_handle_proofs
+            .write()
+            .insert((g_id, p_id), distinct);
+        Ok(distinct)
     }
 
     /// Whether any NumBig arena of `g_id` holds one value under several

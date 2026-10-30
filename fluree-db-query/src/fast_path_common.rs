@@ -435,7 +435,8 @@ pub(crate) fn driver_subject_boundaries(
 /// that scopes a NumBig handle, and within one predicate `o_i` only splits a
 /// group it fully contains. They check
 /// `BinaryIndexStore::objects_keyed_by_value` instead: a vector arena does not
-/// deduplicate, and a legacy decimal arena keeps a handle per scale variant.
+/// deduplicate, so it may hold a value twice, and a legacy decimal arena keeps
+/// a handle per scale variant.
 ///
 /// Metadata-first: `HAS_O_I` is a leaflet flag, and a homogeneous leaflet's
 /// o_type is answered by `o_type_const` — no payload touched. A mixed leaflet

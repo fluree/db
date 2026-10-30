@@ -884,12 +884,15 @@ pub(crate) fn group_count_v6(
     cancellation: &QueryCancellation,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
-    // Where one value can sit under several keys (a vector arena, a legacy
-    // decimal arena), its rows are neither one run nor adjacent in POST
+    // Where one value can sit under several keys (a vector arena holding a
+    // value twice, a legacy decimal arena), its rows are neither one run nor adjacent in POST
     // order, and the run-length count would split its group
     // (`BinaryIndexStore::objects_keyed_by_value`). Callers fall back on the
     // error.
-    if !store.objects_keyed_by_value(g_id, p_id) {
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
         return Err(QueryError::Internal(
             "group count: the predicate's object keys are not values".to_string(),
         ));
@@ -1434,7 +1437,10 @@ fn compute_group_by_object_star_topk(
     };
     // Groups key on `(o_type, o_key)`, which names a value only where
     // `BinaryIndexStore::objects_keyed_by_value` holds.
-    if !store.objects_keyed_by_value(g_id, p_id) {
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
         return Ok(None);
     }
     let mut out = ColumnSet::EMPTY;

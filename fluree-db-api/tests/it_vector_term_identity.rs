@@ -13,8 +13,10 @@
 //! wrong answer.
 //!
 //! The fast paths that key objects on the raw index key decline a predicate
-//! (or graph) that holds vectors. Each decline is stamped and paired with a
-//! canary on a string predicate of the same ledger that the fast path serves.
+//! whose vector arena holds a value twice (or a graph that holds vectors).
+//! Each decline is stamped and paired with a canary on a string predicate of
+//! the same ledger that the fast path serves; a vector predicate that holds
+//! no value twice keeps the per-predicate lanes.
 
 #![cfg(feature = "native")]
 
@@ -496,7 +498,7 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
     let (store, _guard) = init_test_tracing();
 
     // (site, vector query, its rows, string canary, its rows)
-    let pairs: [CanaryPair; 3] = [
+    let pairs: [CanaryPair; 4] = [
         (
             "COUNT(DISTINCT)",
             "SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE { ?s ex:w ?v }",
@@ -510,6 +512,15 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
              ORDER BY DESC(?n) LIMIT 5",
             &["n=1,v=[0.25,0.75]", "n=2,v=[0.5,0.5]"],
             "SELECT ?l (COUNT(?s) AS ?n) WHERE { ?s ex:label ?l } GROUP BY ?l \
+             ORDER BY DESC(?n) LIMIT 5",
+            &["l=x,n=2", "l=y,n=1"],
+        ),
+        (
+            "group_by_object_star_topk",
+            "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:w ?v . ?s ex:label ?l } GROUP BY ?v \
+             ORDER BY DESC(?n) LIMIT 5",
+            &["n=1,v=[0.25,0.75]", "n=2,v=[0.5,0.5]"],
+            "SELECT ?l (COUNT(?s) AS ?n) WHERE { ?s ex:label ?l . ?s ex:w ?v } GROUP BY ?l \
              ORDER BY DESC(?n) LIMIT 5",
             &["l=x,n=2", "l=y,n=1"],
         ),
@@ -538,6 +549,37 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
         assert!(
             !served(&store, before, site),
             "{site} must decline a predicate holding vectors: {:?}",
+            stamped(&store, before, "")
+        );
+    }
+
+    // A vector predicate that holds no value twice keeps the per-predicate
+    // lanes: there a handle names its value.
+    let held_once: [(&str, &str, &[&str]); 3] = [
+        (
+            "COUNT(DISTINCT)",
+            "SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE { ?s ex:j1 ?v }",
+            &["n=2"],
+        ),
+        (
+            "group_by_object_count_topk",
+            "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:j1 ?v } GROUP BY ?v \
+             ORDER BY DESC(?n) LIMIT 5",
+            &["n=1,v=[0.125,0.875]", "n=1,v=[0.75,0.25]"],
+        ),
+        (
+            "group_by_object_star_topk",
+            "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:j1 ?v . ?s ex:k1 ?k } GROUP BY ?v \
+             ORDER BY DESC(?n) LIMIT 5",
+            &["n=1,v=[0.125,0.875]", "n=1,v=[0.75,0.25]"],
+        ),
+    ];
+    for (site, query, rows) in held_once {
+        let before = store.find_events("fast-path outcome").len();
+        assert_eq!(sparql(&db, query).await, rows, "{site} rows");
+        assert!(
+            served(&store, before, site),
+            "{site} must serve a vector predicate holding no value twice: {:?}",
             stamped(&store, before, "")
         );
     }

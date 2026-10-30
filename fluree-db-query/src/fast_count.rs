@@ -1837,14 +1837,18 @@ struct PredicateLeadPartial {
 ///
 /// `None` where one value can sit under several keys
 /// ([`BinaryIndexStore::objects_keyed_by_value`]): a vector arena gives every
-/// stored fact its own handle, and a legacy decimal arena gives each scale
-/// variant one, so the lead groups would count keys rather than values.
+/// stored fact its own handle (unless it holds no value twice), and a legacy
+/// decimal arena gives each scale variant one, so the lead groups would count
+/// keys rather than values.
 pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
 ) -> Result<Option<u64>> {
-    if !store.objects_keyed_by_value(g_id, p_id) {
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
         return Ok(None);
     }
     count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)
