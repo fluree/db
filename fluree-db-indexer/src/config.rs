@@ -195,7 +195,9 @@ pub struct IndexerConfig {
     /// Default: 10 ([`DEFAULT_HARD_MAX_OLD_INDEXES`]).
     ///
     /// Bounds the chain of a ledger that publishes faster than the age guard,
-    /// which would otherwise keep every version inside it. Overriding the guard
+    /// which would otherwise keep every version inside it. It never reaches a
+    /// version `gc_max_old_indexes` keeps, so a ceiling at or below the floor
+    /// is raised to it. Overriding the guard
     /// can release artifacts a query that started against an older version
     /// still needs, and the ceiling bounds versions rather than bytes; see
     /// [`crate::gc::CleanGarbageConfig::hard_max_old_indexes`].

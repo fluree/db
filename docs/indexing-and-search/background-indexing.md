@@ -294,7 +294,7 @@ The process that runs the indexer collects garbage, so its settings are the ones
 
 #### How the settings combine
 
-The collector keeps each old version until it has been superseded for longer than the age guard, and collects everything past the ceiling whatever its age. A floor, if set, is kept regardless of either; a ceiling below the floor has no effect. With the defaults:
+The collector keeps each old version until it has been superseded for longer than the age guard, and collects everything past the ceiling whatever its age. A floor, if set, is kept regardless of either, and a ceiling at or below the floor is raised to it: the floor's versions are kept, and every version past them goes whatever its age. With the defaults:
 
 | Publish rate | Old versions kept | Decided by |
 |--------------|-------------------|------------|
@@ -316,7 +316,7 @@ Each pass logs what it left at `INFO`. A pass that releases something logs `Garb
 
 - `retained`: the versions left on the chain, the current one included.
 - `retention_target`: the floor, counting the current version (`1 + gc_max_old_indexes`, so `1` by default).
-- `past_target`: the retained versions beyond the floor, which the age guard is holding. With the default floor of 0, that is every old version kept. With the ceiling set, it stays at or below `gc_hard_max_old_indexes − gc_max_old_indexes` unless a garbage manifest could not be read.
+- `past_target`: the retained versions beyond the floor, which the age guard is holding. With the default floor of 0, that is every old version kept. With the ceiling set, it stays at or below `gc_hard_max_old_indexes − gc_max_old_indexes`, and at 0 once the floor reaches the ceiling, unless a garbage manifest could not be read.
 - `stopped_by`: present when the pass stopped before the oldest version. `age_guard` means the next version was inside `gc_min_time_mins`. `unreadable_manifest` means a garbage manifest could not be read.
 
 The completion line also carries `age_guard_overridden`: the versions collected past the ceiling while still inside the age guard. A non-zero value means the ceiling, not the age guard, is limiting retention, and a query still reading one of those versions may have lost it.

@@ -1691,6 +1691,21 @@ impl BackgroundIndexerWorker {
     /// 3. Resolves waiters based on min_t predicate
     /// 4. Handles cancellation and backoff
     pub async fn run(mut self) {
+        // A floor above the ceiling is usually a floor raised before the
+        // ceiling had a default. It still keeps what it asked for, but the age
+        // guard no longer holds anything past it, and nothing else says so.
+        // Equal is left quiet: that is how a fixed retention count is set.
+        if let Some(ceiling) = self.config.gc_hard_max_old_indexes {
+            if self.config.gc_max_old_indexes > ceiling {
+                warn!(
+                    gc_max_old_indexes = self.config.gc_max_old_indexes,
+                    gc_hard_max_old_indexes = ceiling,
+                    "GC floor is above the version ceiling, so the floor is the ceiling: \
+                     old versions past it are collected whatever their age"
+                );
+            }
+        }
+
         // Catch up on ledgers that are already behind, whether or not an event
         // bus was wired.
         //

@@ -121,8 +121,10 @@
 //! version's artifacts released underneath it; past the ceiling they go anyway.
 //! At the default of 10, a ledger publishing every 6 s can collect a version a
 //! query started on a minute earlier. Raise it for a ledger that publishes fast
-//! and serves long queries. A ceiling below `max_old_indexes` has no effect:
-//! the floor wins.
+//! and serves long queries. The ceiling never reaches a version the floor
+//! keeps, so a ceiling at or below `max_old_indexes` is raised to it: the
+//! floor's versions are kept, and every version past them goes whatever its
+//! age.
 //!
 //! [`CleanGarbageConfig::hard_max_old_indexes`] of `None` sets no ceiling; the
 //! default lives in the indexer's configuration
@@ -237,8 +239,8 @@ pub struct CleanGarbageResult {
     /// usually at the age guard, or failed to release a version. Versions
     /// published while it ran are not counted.
     pub retained: usize,
-    /// Versions collected past `hard_max_old_indexes`, where the age guard was
-    /// not applied. Non-zero means a query that was still reading one of them
+    /// Versions collected past `hard_max_old_indexes` while still inside the
+    /// age guard. Non-zero means a query that was still reading one of them
     /// may have lost artifacts it needed.
     pub age_guard_overridden: usize,
     /// Number of old index versions cleaned up
