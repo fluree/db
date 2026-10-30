@@ -169,7 +169,8 @@ fn staged_writes(state: &NameServiceState, command: &Command) -> Vec<RefKey> {
             ledger_id, branch, ..
         } => vec![RefKey::new(ledger_id, branch)],
         // A graph source's index is built from its source branches.
-        Command::PublishGraphSourceIndex { name, branch, .. } => state
+        Command::PublishGraphSourceIndex { name, branch, .. }
+        | Command::RewriteGraphSourceIndex { name, branch, .. } => state
             .graph_sources
             .get(&fluree_db_core::ledger_id::format_ledger_id(name, branch))
             .map(|record| {
@@ -273,7 +274,9 @@ pub(super) fn adds_holders(command: &Command) -> bool {
         | Command::DeleteBranch { .. }
         | Command::ResetGraphSourceIndex { .. }
         | Command::Erasure(_)
-        | Command::Collect(_) => false,
+        | Command::Collect(_)
+        | Command::ClearFrozenIndex { .. }
+        | Command::RewriteGraphSourceIndex { .. } => false,
         Command::Fenced { command, .. }
         | Command::AtGeneration { command, .. }
         | Command::Seen { command, .. } => adds_holders(command),
@@ -1086,6 +1089,18 @@ mod tests {
             command: Box::new(Command::ReleaseContent { id: cid(1) }),
         };
         assert_eq!(bytes(&wrapped)[..3], [29, 0, 8]);
+        // A purge's writes, appended after collection's.
+        let clear = Command::ClearFrozenIndex {
+            key: RefKey::new("l", "main"),
+        };
+        assert_eq!(bytes(&clear)[0], 33);
+        let rewrite = Command::RewriteGraphSourceIndex {
+            name: "s".into(),
+            branch: "main".into(),
+            index_id: cid(1),
+            index_t: 1,
+        };
+        assert_eq!(bytes(&rewrite)[0], 34);
     }
 
     /// Snapshots deployed clusters hold, taken before erasure state was

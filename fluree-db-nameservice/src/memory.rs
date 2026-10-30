@@ -676,6 +676,7 @@ impl GraphSourcePublisher for MemoryNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let key = LedgerId::from_parts(name, branch)?;
         if let Some(record) = self.graph_source_records.write().get_mut(&key) {
@@ -885,8 +886,8 @@ mod lifecycle_conformance {
 }
 
 #[cfg(test)]
-mod single_node_conformance {
-    crate::single_node_conformance_tests!((super::MemoryNameService::new(), ()));
+mod purge_conformance {
+    crate::purge_conformance_tests!((super::MemoryNameService::new(), ()));
 }
 
 #[cfg(test)]

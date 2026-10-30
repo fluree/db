@@ -1824,6 +1824,8 @@ pub async fn a_frozen_branchs_index_head_clears<S: crate::NameServicePublisher>(
         .await
         .unwrap();
     for (ledger, fence) in [("mydb:main", main.fence), ("mydb:dev", dev.fence)] {
+        // Indexed, so committed.
+        advance_commit(store, ledger, fence, 3).await;
         store
             .publish_index_allow_equal_fenced(
                 ledger,
@@ -1883,12 +1885,12 @@ pub async fn a_graph_source_index_is_replaced_at_the_same_t<S: crate::NameServic
         .unwrap();
     assert_eq!(head().await, (Some(cid(IndexRoot, "a")), 5));
     store
-        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "b"), 5)
+        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "b"), 5, &[])
         .await
         .unwrap();
     assert_eq!(head().await, (Some(cid(IndexRoot, "b")), 5));
     store
-        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "c"), 4)
+        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "c"), 4, &[])
         .await
         .unwrap();
     assert_eq!(head().await, (Some(cid(IndexRoot, "b")), 5));
@@ -2247,9 +2249,10 @@ where
     a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
 }
 
-/// The cases only single-node backends support: the writes a purge makes.
+/// The writes a purge makes, which the backends it runs on support (file,
+/// memory, and the Raft nameservice, whose suite runs them itself).
 #[macro_export]
-macro_rules! single_node_conformance_tests {
+macro_rules! purge_conformance_tests {
     ($make:expr) => {
         $crate::lifecycle_conformance_tests!(@cases $make;
             a_frozen_branchs_index_head_clears,

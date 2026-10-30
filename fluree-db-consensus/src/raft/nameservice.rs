@@ -700,6 +700,18 @@ impl AdminPublisher for RaftNameService {
             ))),
         }
     }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        let cmd = SmCommand::ClearFrozenIndex {
+            key: ref_key_of(ledger_id)?,
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::FrozenIndexCleared { cleared } => Ok(cleared),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for ClearFrozenIndex: {other:?}"
+            ))),
+        }
+    }
 }
 
 /// Peek the queue_id at the front of `ref_key`'s queue; surface an
@@ -2603,6 +2615,43 @@ impl GraphSourcePublisher for RaftNameService {
             | SmResponse::GraphSourceNotFound { .. } => Ok(()),
             other => Err(NameServiceError::storage(format!(
                 "unexpected Response variant for PublishGraphSourceIndex: {other:?}"
+            ))),
+        }
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+        sources: &[(String, u64)],
+    ) -> Result<()> {
+        let cmd = SmCommand::RewriteGraphSourceIndex {
+            name: name.to_string(),
+            branch: branch.to_string(),
+            index_id: index_id.clone(),
+            index_t,
+        };
+        let cmd = if sources.iter().any(|(_, g)| *g > 0) {
+            SmCommand::AtGeneration {
+                generations: sources
+                    .iter()
+                    .map(|(id, g)| Ok((ref_key_of(id)?, *g)))
+                    .collect::<Result<_>>()?,
+                command: Box::new(cmd),
+            }
+        } else {
+            cmd
+        };
+        let response = self.submit_lifecycle(cmd).await?;
+        check_erasure_response(&response)?;
+        match response {
+            SmResponse::GraphSourceIndexAdvanced { .. }
+            | SmResponse::GraphSourceIndexStale { .. }
+            | SmResponse::GraphSourceNotFound { .. } => Ok(()),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for RewriteGraphSourceIndex: {other:?}"
             ))),
         }
     }

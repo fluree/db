@@ -998,6 +998,17 @@ pub enum Command {
     /// deleting, since the writer may have stored one of its addresses
     /// unchecked. Outermost: it may wrap [`Self::AtGeneration`].
     Seen { seen: u64, command: Box<Command> },
+    /// Clear the index head of `key`'s branch if it is frozen: a purge
+    /// released its index, and nothing loads a frozen branch.
+    ClearFrozenIndex { key: RefKey },
+    /// [`Self::PublishGraphSourceIndex`], also replacing a head at the same
+    /// `t`: an index rebuilt from the same state, as a purge rebuilds one.
+    RewriteGraphSourceIndex {
+        name: String,
+        branch: String,
+        index_id: ContentId,
+        index_t: i64,
+    },
 }
 
 impl Command {
@@ -1671,6 +1682,9 @@ pub enum Response {
     CollectionMoved { deleting: Option<u64> },
     /// [`CollectCommand::Enable`] applied.
     CollectionEnabled,
+    /// [`Command::ClearFrozenIndex`]: whether the branch was frozen, and
+    /// its index head cleared.
+    FrozenIndexCleared { cleared: bool },
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1916,7 +1930,22 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             branch,
             index_id,
             index_t,
-        } => apply_publish_graph_source_index(state, name, branch, index_id, index_t),
+        } => apply_publish_graph_source_index(state, name, branch, index_id, index_t, false),
+        Command::RewriteGraphSourceIndex {
+            name,
+            branch,
+            index_id,
+            index_t,
+        } => apply_publish_graph_source_index(state, name, branch, index_id, index_t, true),
+        Command::ClearFrozenIndex { key } => {
+            let frozen = state.fences.get(&key).is_some_and(|f| f.frozen);
+            if frozen {
+                if let Some(entry) = state.refs.get_mut(&key) {
+                    entry.index = None;
+                }
+            }
+            Response::FrozenIndexCleared { cleared: frozen }
+        }
         Command::RetractGraphSource { name, branch } => {
             apply_retract_graph_source(state, name, branch)
         }
@@ -2921,18 +2950,21 @@ fn apply_publish_graph_source(
     Response::GraphSourcePublished
 }
 
+/// Publish a graph source's index head at a higher `t`, or at the same `t`
+/// when `allow_equal`.
 fn apply_publish_graph_source_index(
     state: &mut NameServiceState,
     name: String,
     branch: String,
     index_id: ContentId,
     index_t: i64,
+    allow_equal: bool,
 ) -> Response {
     let graph_source_id = format_ledger_id(&name, &branch);
     let Some(record) = state.graph_sources.get_mut(&graph_source_id) else {
         return Response::GraphSourceNotFound { graph_source_id };
     };
-    if index_t <= record.index_t {
+    if index_t < record.index_t || (index_t == record.index_t && !allow_equal) {
         return Response::GraphSourceIndexStale {
             current_t: record.index_t,
         };

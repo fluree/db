@@ -1442,6 +1442,7 @@ impl GraphSourcePublisher for FileNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        _sources: &[(String, u64)],
     ) -> Result<()> {
         let address = Self::index_address(name, branch);
         let cid_str = index_id.to_string();
@@ -1916,8 +1917,8 @@ mod lifecycle_conformance {
 }
 
 #[cfg(test)]
-mod single_node_conformance {
-    crate::single_node_conformance_tests!({
+mod purge_conformance {
+    crate::purge_conformance_tests!({
         let dir = tempfile::tempdir().unwrap();
         (super::FileNameService::new(dir.path()), dir)
     });

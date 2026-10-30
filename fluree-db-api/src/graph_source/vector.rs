@@ -878,7 +878,13 @@ impl crate::Fluree {
             let _heads = self.source_heads_lock().await;
             self.still_stored(graph_source_id, &[&new_index_id]).await?;
             self.publisher()?
-                .publish_graph_source_index_allow_equal(&name, &branch, &new_index_id, ledger_t)
+                .publish_graph_source_index_allow_equal(
+                    &name,
+                    &branch,
+                    &new_index_id,
+                    ledger_t,
+                    &[source_view(&ledger)],
+                )
                 .await?;
         } else {
             self.publish_vector_head(

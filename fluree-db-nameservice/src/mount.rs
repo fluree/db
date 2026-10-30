@@ -460,12 +460,13 @@ impl GraphSourcePublisher for CompositeNameService {
         branch: &str,
         index_id: &ContentId,
         index_t: i64,
+        sources: &[(String, u64)],
     ) -> Result<()> {
         if let Some(err) = self.reject_mounted_write(name) {
             return Err(err);
         }
         self.local
-            .publish_graph_source_index_allow_equal(name, branch, index_id, index_t)
+            .publish_graph_source_index_allow_equal(name, branch, index_id, index_t, sources)
             .await
     }
 }

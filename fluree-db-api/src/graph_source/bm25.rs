@@ -722,7 +722,13 @@ impl crate::Fluree {
         })?;
         let _heads = self.source_heads_lock().await;
         self.publisher()?
-            .publish_graph_source_index_allow_equal(&name, &branch, &head, source_t)
+            .publish_graph_source_index_allow_equal(
+                &name,
+                &branch,
+                &head,
+                source_t,
+                &[source_view(&ledger)],
+            )
             .await?;
         Ok(head)
     }
