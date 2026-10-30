@@ -85,7 +85,7 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// (content-addressed, hence identical) are in place. A 64-bit random token
 /// drawn once per process makes that collision negligible without needing a
 /// node id plumbed down from whoever knows one.
-fn process_token() -> u64 {
+pub(super) fn process_token() -> u64 {
     static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *TOKEN.get_or_init(rand::random::<u64>)
 }
@@ -192,14 +192,16 @@ fn staging_token(name: &str) -> Option<&str> {
     }
 }
 
-/// The pid a write-ahead log replay names its temporary file with
-/// (`<name>.wal-replay.<pid>.tmp`): a crash mid-replay leaves it, holding a
-/// full copy of the record's bytes.
-fn replay_temp_pid(name: &str) -> Option<&str> {
+/// Who a write-ahead log replay's temporary file
+/// (`<name>.wal-replay.<owner>.tmp`) is: a crash mid-replay leaves it,
+/// holding a full copy of the record's bytes. The owner is the process
+/// token, or the pid an earlier release named it with, which is never this
+/// process's to keep: containers on one storage commonly share pids.
+fn replay_temp_owner(name: &str) -> Option<&str> {
     let rest = name.strip_suffix(TMP_SUFFIX)?;
-    let (head, pid) = rest.rsplit_once('.')?;
+    let (head, owner) = rest.rsplit_once('.')?;
     let prefix = head.strip_suffix(".wal-replay")?;
-    (!prefix.is_empty() && is_plain_decimal(pid)).then_some(pid)
+    (!prefix.is_empty() && (is_process_token(owner) || is_plain_decimal(owner))).then_some(owner)
 }
 
 /// How long a staging file must have gone untouched before a sweep may
@@ -310,7 +312,6 @@ fn sweep_staging(
 ) -> StagingSweep {
     let mut sweep = StagingSweep::default();
     let own_token = format!("{:016x}", process_token());
-    let own_pid = std::process::id().to_string();
     let now = std::time::SystemTime::now();
     let mut budget = budget;
     let mut dirs = vec![base.to_path_buf()];
@@ -362,9 +363,9 @@ fn sweep_staging(
             // `STALE_STAGING_AGE` argues an age threshold must not judge.
             // A replay's temporary file is the replay's own to clean up, the
             // same rules otherwise: a replay writes it and renames it at once.
-            let own = match (staging_token(&name), replay_temp_pid(&name)) {
+            let own = match (staging_token(&name), replay_temp_owner(&name)) {
                 (Some(token), _) => token == own_token.as_str(),
-                (None, Some(pid)) => pid == own_pid.as_str(),
+                (None, Some(owner)) => owner == own_token.as_str(),
                 (None, None) => continue,
             };
             // Rule 1: ours, whatever its age.
@@ -3246,12 +3247,18 @@ mod tests {
     #[test]
     fn a_crashed_replays_temporary_file_is_swept() {
         let dir = tempfile::tempdir().unwrap();
-        let theirs = dir.path().join("a.bin.wal-replay.1.tmp");
+        let theirs = dir.path().join("a.bin.wal-replay.0123456789abcdef.tmp");
+        // Named by an earlier release with a pid, this process's own pid
+        // among them: another container's.
+        let pid_named = dir
+            .path()
+            .join(format!("c.bin.wal-replay.{}.tmp", std::process::id()));
         let ours = dir
             .path()
-            .join(format!("b.bin.wal-replay.{}.tmp", std::process::id()));
-        std::fs::write(&theirs, b"bytes").unwrap();
-        std::fs::write(&ours, b"bytes").unwrap();
+            .join(format!("b.bin.wal-replay.{:016x}.tmp", process_token()));
+        for file in [&theirs, &pid_named, &ours] {
+            std::fs::write(file, b"bytes").unwrap();
+        }
         let day = std::time::Duration::from_secs(86_400);
         assert_eq!(
             FileStorage::sweep_staging_older_than(dir.path(), day).unwrap(),
@@ -3259,8 +3266,8 @@ mod tests {
         );
         assert!(theirs.exists(), "too young");
         let swept = FileStorage::sweep_staging_older_than(dir.path(), std::time::Duration::ZERO);
-        assert_eq!(swept.unwrap(), 1);
-        assert!(!theirs.exists());
+        assert_eq!(swept.unwrap(), 2);
+        assert!(!theirs.exists() && !pid_named.exists());
         assert!(ours.exists());
     }
 

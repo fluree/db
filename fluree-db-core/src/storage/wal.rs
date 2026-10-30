@@ -931,9 +931,9 @@ fn write_page_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_file_name(format!(
-        "{}.wal-replay.{}.tmp",
+        "{}.wal-replay.{:016x}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        super::file::process_token()
     ));
     let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
