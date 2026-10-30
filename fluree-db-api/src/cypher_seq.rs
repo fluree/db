@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 use fluree_db_cypher::ast::{
     CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
-    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, RemoveItem, ReturnClause,
-    SetClause, SetItem, Statement, Update, Variable, WriteClause,
+    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, RemoveClause, RemoveItem,
+    ReturnClause, SetClause, SetItem, Statement, Update, Variable, WriteClause,
 };
 use fluree_db_cypher::span::SourceSpan;
 use fluree_db_ledger::IndexConfig;
@@ -748,27 +748,113 @@ impl RowTable {
 /// The variables a SET, REMOVE or DELETE clause writes to.
 fn clause_targets(clause: &WriteClause) -> Vec<&str> {
     match clause {
-        WriteClause::Set(s) => s
-            .items
-            .iter()
-            .map(|item| match item {
-                SetItem::Property { target, .. }
-                | SetItem::MapMerge { target, .. }
-                | SetItem::MapReplace { target, .. }
-                | SetItem::Labels { target, .. } => target.name.as_str(),
-            })
-            .collect(),
-        WriteClause::Remove(r) => r
-            .items
-            .iter()
-            .map(|item| match item {
-                RemoveItem::Property { target, .. } | RemoveItem::Labels { target, .. } => {
-                    target.name.as_str()
-                }
-            })
-            .collect(),
+        WriteClause::Set(s) => s.items.iter().map(set_item_target).collect(),
+        WriteClause::Remove(r) => r.items.iter().map(remove_item_target).collect(),
         WriteClause::Delete(d) => d.targets.iter().map(|t| t.name.as_str()).collect(),
         WriteClause::Create(_) | WriteClause::Merge(_) | WriteClause::Foreach(_) => Vec::new(),
+    }
+}
+
+/// A SET, REMOVE or DELETE clause as the parts it stages in, each with the
+/// rows that seed it (`None`: every row in `table`), leaving out a part no
+/// row binds.
+///
+/// When every row binds every target, the clause stages whole. Otherwise each
+/// target's writes stage on their own, seeded with the rows that bind that
+/// target, in the clause's order. Items on different targets are independent
+/// (a SET that writes one key twice was split at the repeat, and the rest
+/// write distinct keys or labels), so staging them apart writes what staging
+/// them together would. A DELETE's relationship targets go last: a node's
+/// DETACH DELETE beside them takes every relationship on the node, which a
+/// relationship's DELETE staged first would refuse if the edge carries
+/// another.
+fn parts_by_bound_target(
+    clause: &WriteClause,
+    table: &RowTable,
+    rel_vars: &[RelBinding],
+) -> Vec<(WriteClause, Option<RowTable>)> {
+    if table.rows.is_empty() {
+        return Vec::new();
+    }
+    let targets = clause_targets(clause);
+    let Some(bound) = table.bound_on(&targets) else {
+        return vec![(clause.clone(), None)];
+    };
+    let mut distinct: Vec<&str> = Vec::new();
+    for t in targets {
+        if !distinct.contains(&t) {
+            distinct.push(t);
+        }
+    }
+    if distinct.len() == 1 {
+        return if bound.rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![(clause.clone(), Some(bound))]
+        };
+    }
+    if matches!(clause, WriteClause::Delete(_)) {
+        let is_rel = |t: &&str| rel_vars.iter().any(|r| r.name == *t);
+        distinct.sort_by_key(|t| is_rel(t));
+    }
+    distinct
+        .into_iter()
+        .filter_map(|target| {
+            let rows = table.bound_on(&[target]);
+            if rows.as_ref().is_some_and(|r| r.rows.is_empty()) {
+                return None;
+            }
+            Some((clause_on(clause, target), rows))
+        })
+        .collect()
+}
+
+/// The part of a SET, REMOVE or DELETE clause that writes to `target`.
+fn clause_on(clause: &WriteClause, target: &str) -> WriteClause {
+    match clause {
+        WriteClause::Set(s) => WriteClause::Set(SetClause {
+            items: s
+                .items
+                .iter()
+                .filter(|item| set_item_target(item) == target)
+                .cloned()
+                .collect(),
+            span: s.span,
+        }),
+        WriteClause::Remove(r) => WriteClause::Remove(RemoveClause {
+            items: r
+                .items
+                .iter()
+                .filter(|item| remove_item_target(item) == target)
+                .cloned()
+                .collect(),
+            span: r.span,
+        }),
+        WriteClause::Delete(d) => WriteClause::Delete(DeleteClause {
+            targets: d
+                .targets
+                .iter()
+                .filter(|t| t.name == target)
+                .cloned()
+                .collect(),
+            ..d.clone()
+        }),
+        WriteClause::Create(_) | WriteClause::Merge(_) | WriteClause::Foreach(_) => clause.clone(),
+    }
+}
+
+fn set_item_target(item: &SetItem) -> &str {
+    match item {
+        SetItem::Property { target, .. }
+        | SetItem::MapMerge { target, .. }
+        | SetItem::MapReplace { target, .. }
+        | SetItem::Labels { target, .. } => &target.name,
+    }
+}
+
+fn remove_item_target(item: &RemoveItem) -> &str {
+    match item {
+        RemoveItem::Property { target, .. } | RemoveItem::Labels { target, .. } => &target.name,
     }
 }
 
@@ -912,31 +998,40 @@ impl Fluree {
                     .await?;
                 }
                 WriteClause::Set(_) | WriteClause::Remove(_) | WriteClause::Delete(_) => {
-                    // A row that leaves the clause's target unbound (an
-                    // OPTIONAL MATCH that found nothing) writes nothing. The
+                    // A row that leaves one of the clause's targets unbound
+                    // (an OPTIONAL MATCH that found nothing) skips the
+                    // clause's writes to that target and keeps the rest. The
                     // seeded `VALUES` would leave the target free for the
-                    // clause's own lookup of stored values to bind, so such
-                    // rows are not seeded.
-                    let targets = clause_targets(clause);
-                    let bound = table.bound_on(&targets);
-                    let table = bound.as_ref().unwrap_or(&table);
-                    if !table.rows.is_empty() {
-                        let edges = match clause {
+                    // clause's own lookup of stored values to bind, so each
+                    // part is seeded only with the rows that bind its target.
+                    let parts = parts_by_bound_target(clause, &table, &rel_vars);
+                    let last_part = parts.len().saturating_sub(1);
+                    for (pi, (part, rows)) in parts.into_iter().enumerate() {
+                        let edges = match &part {
                             WriteClause::Delete(d) => rel_delete_edges(&rel_vars, d, span),
                             _ => Vec::new(),
                         };
+                        let skolem = if last_part == 0 {
+                            clause_skolem.clone()
+                        } else {
+                            format!("{clause_skolem}-t{pi}")
+                        };
                         self.seq_stage_seeded(
                             &mut stager,
-                            table,
+                            rows.as_ref().unwrap_or(&table),
                             edges,
-                            vec![clause.clone()],
-                            Some(clause_skolem),
+                            vec![part],
+                            Some(skolem),
                             ledger_id,
                             index_config,
                             policy,
                             tracker,
                             span,
-                            after,
+                            if pi == last_part {
+                                after
+                            } else {
+                                StateAfter::Read
+                            },
                         )
                         .await?;
                     }

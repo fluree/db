@@ -1930,6 +1930,55 @@ async fn a_relationship_delete_needs_no_endpoint_names_or_direction() {
     }
 }
 
+// ---- A write clause with several targets after an OPTIONAL MATCH -----------
+//
+// A row that leaves one of a clause's targets unbound skips only the writes to
+// that target, as in Cypher; its writes to the targets it binds stand.
+
+#[tokio::test]
+async fn an_optional_match_that_leaves_one_target_unbound_writes_the_others() {
+    // `a` knows no one, so its row leaves `m` unbound; `b` knows `a`. The SET
+    // writes `age` on both and `seen` on `a` (through `b`'s row), and the
+    // REMOVE then takes `a`'s `seen`.
+    let got = twins(
+        r#"MATCH (n:P) OPTIONAL MATCH (n)-[:knows]->(m:P) SET n.age = 1, m.seen = true REMOVE n.seen"#,
+        r#"INSERT { ?n <age> 1 . ?m <seen> true }
+           WHERE { ?n a <P> OPTIONAL { ?n <knows> ?m . ?m a <P> } } ;
+           DELETE { ?n <seen> ?o } WHERE { ?n a <P> ; <seen> ?o }"#,
+    )
+    .await;
+    assert_twins(
+        "OPTIONAL MATCH, SET on both targets, REMOVE",
+        got,
+        seeded_with(&[("a age 1", Some("")), ("b age 1", Some(""))]),
+        (2, 0),
+    );
+}
+
+#[tokio::test]
+async fn an_optional_match_that_leaves_one_delete_target_unbound_deletes_the_other() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) OPTIONAL MATCH (n)-[:knows]->(m:P) SET n.x = 1 DETACH DELETE n, m"#,
+        r#"INSERT { ?n <x> 1 } WHERE { ?n a <P> ; <id> "a" } ;
+           DELETE { ?n ?p ?o . ?s ?q ?n } WHERE { ?n a <P> ; <id> "a" { ?n ?p ?o } UNION { ?s ?q ?n } }"#,
+    )
+    .await;
+    let want = seeded_with(&[
+        ("a http://www.w3.org/1999/02/22-rdf-syntax-ns#type P", None),
+        ("a id a", None),
+        ("a name x", None),
+        ("a tags t1", None),
+        ("a tags t2", None),
+        ("b knows a", None),
+    ]);
+    assert_twins(
+        "OPTIONAL MATCH, SET then DETACH DELETE n, m",
+        got,
+        want,
+        (0, 6),
+    );
+}
+
 // ---- A relationship's DELETE beside a clause the driver doesn't stage -----
 
 /// A statement with a clause the driver defers keeps the single `Txn`, a
