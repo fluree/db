@@ -14,13 +14,15 @@
 
 use super::{Column, Model, Table};
 use sqlparser::ast::{
-    ColumnOption, CommentDef, CommentObject, CreateTable, CreateTableOptions, DataType, Expr,
-    ObjectName, SqlOption, Statement, TableConstraint, UserDefinedTypeRepresentation,
+    AlterTableOperation, ColumnOption, CommentDef, CommentObject, CreateTable, CreateTableOptions,
+    DataType, Expr, ObjectName, SqlOption, Statement, TableConstraint,
+    UserDefinedTypeRepresentation,
 };
 use sqlparser::dialect::{
     Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SnowflakeDialect,
 };
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -51,7 +53,7 @@ pub fn read(sql: &str) -> Result<(Model, usize), SqlError> {
     let (statements, skipped) = statements.unwrap_or_else(|| {
         let mut out = Vec::new();
         let mut skipped = 0;
-        for piece in sql.split(';').filter(|p| !p.trim().is_empty()) {
+        for piece in statements_of(sql).iter().filter(|p| !p.trim().is_empty()) {
             match dialects
                 .iter()
                 .find_map(|d| Parser::parse_sql(*d, piece).ok())
@@ -67,6 +69,74 @@ pub fn read(sql: &str) -> Result<(Model, usize), SqlError> {
         return Err(SqlError(first_error));
     }
     Ok((model, skipped))
+}
+
+/// The text of each statement, split at the semicolons the SQL tokenizer
+/// finds, so one inside a string literal (`COMMENT 'open; or closed'`) or a
+/// quoted name doesn't cut a statement short. Text the tokenizer can't read
+/// at all is split on every `;`.
+fn statements_of(sql: &str) -> Vec<String> {
+    let dialect = GenericDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+        return sql.split(';').map(str::to_string).collect();
+    };
+    let mut out = vec![String::new()];
+    for token in tokens {
+        if token == Token::SemiColon {
+            out.push(String::new());
+        } else if let Some(current) = out.last_mut() {
+            current.push_str(&token.to_string());
+        }
+    }
+    out
+}
+
+/// A name's parts, unquoted and joined with `.` (`crm.users`).
+fn qualified(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|part| match part {
+            sqlparser::ast::ObjectNamePart::Identifier(id) => id.value.clone(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The column a key's index entry names (`id`, `` `id` ``, `"Id"`).
+fn key_column(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(ids) => ids.last().map(|i| i.value.clone()).unwrap_or_default(),
+        other => other
+            .to_string()
+            .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+            .to_string(),
+    }
+}
+
+/// The quoted strings in a piece of SQL text, `''` unescaped.
+fn quoted_strings(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            continue;
+        }
+        let mut value = String::new();
+        loop {
+            match chars.next() {
+                Some('\'') if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    value.push('\'');
+                }
+                Some('\'') | None => break,
+                Some(ch) => value.push(ch),
+            }
+        }
+        out.push(value);
+    }
+    out
 }
 
 /// The last part of a (possibly qualified, possibly quoted) name.
@@ -128,7 +198,29 @@ fn in_list(expr: &Expr) -> Option<(String, Vec<String>)> {
                 list.iter().map(|v| unquote(&v.to_string())).collect(),
             ))
         }
+        // pg_dump: ((status)::text = ANY ((ARRAY['a'::character varying, ...])::text[]))
+        Expr::AnyOp {
+            left,
+            compare_op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+            ..
+        } => {
+            let column = column_of(left)?;
+            let values = quoted_strings(&right.to_string());
+            (!values.is_empty()).then_some((column, values))
+        }
         Expr::Nested(inner) => in_list(inner),
+        _ => None,
+    }
+}
+
+/// The column an expression names, through parentheses and casts.
+fn column_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::CompoundIdentifier(ids) => ids.last().map(|i| i.value.clone()),
+        Expr::Nested(inner) => column_of(inner),
+        Expr::Cast { expr, .. } => column_of(expr),
         _ => None,
     }
 }
@@ -154,12 +246,101 @@ fn model(statements: &[Statement]) -> Model {
             );
         }
     }
-    let mut tables: Vec<Table> = Vec::new();
+    // each table with its qualified name (`crm.users`), and the checks its
+    // constraints carry until every constraint has been read
+    let mut tables: Vec<(String, Table, Vec<Expr>)> = Vec::new();
     for s in statements {
         if let Statement::CreateTable(create) = s {
-            tables.push(table(create, &enums));
+            let (table, checks) = table(create, &enums);
+            tables.push((qualified(&create.name), table, checks));
         }
     }
+    // pg_dump adds keys, foreign keys and checks after the tables
+    let mut unplaced = 0;
+    for s in statements {
+        let Statement::AlterTable(alter) = s else {
+            continue;
+        };
+        let name = qualified(&alter.name);
+        let short = last(&alter.name);
+        let at = tables
+            .iter()
+            .position(|(q, _, _)| q.eq_ignore_ascii_case(&name))
+            .or_else(|| {
+                tables
+                    .iter()
+                    .position(|(_, t, _)| t.name.eq_ignore_ascii_case(&short))
+            });
+        let Some((_, table, checks)) = at.map(|i| &mut tables[i]) else {
+            unplaced += 1;
+            continue;
+        };
+        for op in &alter.operations {
+            if let AlterTableOperation::AddConstraint { constraint, .. } = op {
+                apply_constraint(table, constraint, checks);
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    if unplaced > 0 {
+        notes.push(format!(
+            "{unplaced} ALTER TABLE statement(s) name tables the input doesn't create, and were passed over"
+        ));
+    }
+    for (_, table, checks) in &mut tables {
+        for check in checks.drain(..) {
+            if let Some((name, values)) = in_list(&check) {
+                if let Some(col) = table
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(&name))
+                {
+                    col.values = values;
+                }
+            }
+        }
+    }
+    // tables of one name in two schemas stay apart, named with the schema
+    let mut by_short: HashMap<String, usize> = HashMap::new();
+    for (_, t, _) in &tables {
+        *by_short.entry(t.name.to_lowercase()).or_default() += 1;
+    }
+    for (q, t, _) in &mut tables {
+        if by_short[&t.name.to_lowercase()] > 1 {
+            notes.push(format!(
+                "{q}: named with its schema, since another schema has a table {:?}",
+                t.name
+            ));
+            t.name = q.clone();
+        }
+    }
+    // references resolve to the qualified table when one is named, else to
+    // the one table of that name
+    let names: Vec<(String, String)> = tables
+        .iter()
+        .map(|(q, t, _)| (q.to_lowercase(), t.name.clone()))
+        .collect();
+    for (_, t, _) in &mut tables {
+        for c in &mut t.columns {
+            let Some(r) = c.references.clone() else {
+                continue;
+            };
+            let short = r.rsplit('.').next().unwrap_or(&r).to_lowercase();
+            let resolved = names
+                .iter()
+                .find(|(q, _)| *q == r.to_lowercase())
+                .or_else(|| {
+                    let matching: Vec<_> = names
+                        .iter()
+                        .filter(|(q, _)| q.rsplit('.').next() == Some(short.as_str()))
+                        .collect();
+                    (matching.len() == 1).then(|| matching[0])
+                })
+                .map(|(_, name)| name.clone());
+            c.references = Some(resolved.unwrap_or(short));
+        }
+    }
+    let mut tables: Vec<Table> = tables.into_iter().map(|(_, t, _)| t).collect();
     for s in statements {
         let Statement::Comment {
             object_type,
@@ -177,11 +358,18 @@ fn model(statements: &[Statement]) -> Model {
             .collect();
         match object_type {
             CommentObject::Table => {
-                if let Some(t) = tables
-                    .iter_mut()
-                    .find(|t| parts.last().is_some_and(|n| t.name.eq_ignore_ascii_case(n)))
-                {
-                    t.description = Some(text.clone());
+                // the table named with its schema, else the one of that name
+                let full = parts.join(".");
+                let at = tables
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(&full))
+                    .or_else(|| {
+                        tables.iter().position(|t| {
+                            parts.last().is_some_and(|n| t.name.eq_ignore_ascii_case(n))
+                        })
+                    });
+                if let Some(i) = at {
+                    tables[i].description = Some(text.clone());
                 }
             }
             CommentObject::Column if parts.len() >= 2 => {
@@ -198,10 +386,35 @@ fn model(statements: &[Statement]) -> Model {
             _ => {}
         }
     }
-    Model { tables }
+    Model { tables, notes }
 }
 
-fn table(create: &CreateTable, enums: &HashMap<String, Vec<String>>) -> Table {
+/// A table constraint, in CREATE TABLE or added by ALTER TABLE.
+fn apply_constraint(t: &mut Table, constraint: &TableConstraint, checks: &mut Vec<Expr>) {
+    match constraint {
+        TableConstraint::PrimaryKey(pk) => {
+            for c in &pk.columns {
+                t.primary_key.push(key_column(&c.column.expr));
+            }
+        }
+        TableConstraint::ForeignKey(fk) => {
+            let target = qualified(&fk.foreign_table);
+            for c in &fk.columns {
+                if let Some(col) = t
+                    .columns
+                    .iter_mut()
+                    .find(|x| x.name.eq_ignore_ascii_case(&c.value))
+                {
+                    col.references = Some(target.clone());
+                }
+            }
+        }
+        TableConstraint::Check(check) => checks.push((*check.expr).clone()),
+        _ => {}
+    }
+}
+
+fn table(create: &CreateTable, enums: &HashMap<String, Vec<String>>) -> (Table, Vec<Expr>) {
     let mut t = Table {
         name: last(&create.name),
         description: create.comment.as_ref().map(comment_text),
@@ -248,7 +461,9 @@ fn table(create: &CreateTable, enums: &HashMap<String, Vec<String>>) -> Table {
         for option in &def.options {
             match &option.option {
                 ColumnOption::PrimaryKey(_) => t.primary_key.push(column.name.clone()),
-                ColumnOption::ForeignKey(fk) => column.references = Some(last(&fk.foreign_table)),
+                ColumnOption::ForeignKey(fk) => {
+                    column.references = Some(qualified(&fk.foreign_table));
+                }
                 ColumnOption::Check(check) => checks.push((*check.expr).clone()),
                 ColumnOption::Comment(text) => column.description = Some(text.clone()),
                 _ => {}
@@ -257,40 +472,9 @@ fn table(create: &CreateTable, enums: &HashMap<String, Vec<String>>) -> Table {
         t.columns.push(column);
     }
     for constraint in &create.constraints {
-        match constraint {
-            TableConstraint::PrimaryKey(pk) => {
-                for c in &pk.columns {
-                    t.primary_key.push(unquote(&c.column.expr.to_string()));
-                }
-            }
-            TableConstraint::ForeignKey(fk) => {
-                let target = last(&fk.foreign_table);
-                for c in &fk.columns {
-                    if let Some(col) = t
-                        .columns
-                        .iter_mut()
-                        .find(|x| x.name.eq_ignore_ascii_case(&c.value))
-                    {
-                        col.references = Some(target.clone());
-                    }
-                }
-            }
-            TableConstraint::Check(check) => checks.push((*check.expr).clone()),
-            _ => {}
-        }
+        apply_constraint(&mut t, constraint, &mut checks);
     }
-    for check in checks {
-        if let Some((name, values)) = in_list(&check) {
-            if let Some(col) = t
-                .columns
-                .iter_mut()
-                .find(|c| c.name.eq_ignore_ascii_case(&name))
-            {
-                col.values = values;
-            }
-        }
-    }
-    t
+    (t, checks)
 }
 
 #[cfg(test)]
@@ -376,6 +560,7 @@ mod tests {
         let t = &m.tables[0];
         assert_eq!(t.name, "orders");
         assert_eq!(t.description.as_deref(), Some("Customer orders"));
+        assert_eq!(t.primary_key, ["id"], "a backticked key matches its column");
         assert_eq!(t.columns[1].values, vec!["new", "paid"]);
         assert_eq!(
             t.columns[1].description.as_deref(),
@@ -386,5 +571,87 @@ mod tests {
     #[test]
     fn nothing_readable() {
         assert!(read("SELECT 1;").is_err());
+    }
+
+    #[test]
+    fn mysql_backticked_primary_key() {
+        let (m, _) = read(
+            "CREATE TABLE `orders` (`id` int NOT NULL, `state` varchar(10), PRIMARY KEY (`id`));",
+        )
+        .unwrap();
+        assert_eq!(m.tables[0].primary_key, ["id"]);
+    }
+
+    #[test]
+    fn pg_dump_constraints_after_the_tables() {
+        let (m, skipped) = read(
+            r"
+CREATE TABLE public.companies (id integer NOT NULL, name text);
+CREATE TABLE public.contacts (
+    id integer NOT NULL,
+    employer_id integer,
+    status character varying(10),
+    CONSTRAINT contacts_status_check CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'left'::character varying])::text[])))
+);
+ALTER TABLE ONLY public.companies ADD CONSTRAINT companies_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.contacts ADD CONSTRAINT contacts_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.contacts
+    ADD CONSTRAINT contacts_employer_id_fkey FOREIGN KEY (employer_id) REFERENCES public.companies(id);
+",
+        )
+        .unwrap();
+        assert_eq!(skipped, 0);
+        let t = |n: &str| m.tables.iter().find(|t| t.name == n).unwrap();
+        assert_eq!(t("companies").primary_key, ["id"]);
+        assert_eq!(t("contacts").primary_key, ["id"]);
+        let c = |n: &str| {
+            t("contacts")
+                .columns
+                .iter()
+                .find(|c| c.name == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(c("employer_id").references.as_deref(), Some("companies"));
+        assert_eq!(c("status").values, ["active", "left"]);
+    }
+
+    #[test]
+    fn a_semicolon_in_a_string_doesnt_split_a_statement() {
+        // DELIMITER makes every dialect refuse the whole text, so statements
+        // are read one by one
+        let (m, skipped) = read(
+            "DELIMITER ;;\nCREATE TABLE a (id int PRIMARY KEY, state varchar(9) COMMENT 'open; or closed');\nCREATE TABLE b (id int);\nCOMMENT ON TABLE b IS 'Notes; misc';\n",
+        )
+        .unwrap();
+        assert!(skipped >= 1, "DELIMITER is skipped");
+        let a = m
+            .tables
+            .iter()
+            .find(|t| t.name == "a")
+            .expect("table a is read");
+        assert_eq!(a.columns[1].description.as_deref(), Some("open; or closed"));
+        let b = m.tables.iter().find(|t| t.name == "b").unwrap();
+        assert_eq!(b.description.as_deref(), Some("Notes; misc"));
+    }
+
+    #[test]
+    fn same_table_name_in_two_schemas() {
+        let (m, _) = read(
+            "CREATE TABLE crm.users (id int PRIMARY KEY, status text CHECK (status IN ('a', 'b')));\nCREATE TABLE billing.users (id int PRIMARY KEY, plan_id int);\nCREATE TABLE billing.invoices (id int PRIMARY KEY, user_id int REFERENCES billing.users(id));",
+        )
+        .unwrap();
+        let names: Vec<&str> = m.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["crm.users", "billing.users", "invoices"]);
+        let invoices = m.tables.iter().find(|t| t.name == "invoices").unwrap();
+        assert_eq!(
+            invoices.columns[1].references.as_deref(),
+            Some("billing.users")
+        );
+        assert!(
+            m.notes.iter().any(|n| n.contains("crm.users")),
+            "{:?}",
+            m.notes
+        );
     }
 }

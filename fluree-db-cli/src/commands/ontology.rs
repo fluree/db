@@ -1,8 +1,8 @@
 //! `fluree ontology` and `fluree catalog` — ontology and catalog tools for
 //! document extraction.
 //!
-//! `ontology check` reports what an extraction model will and won't read of
-//! an ontology (and catalog), applying the model's input policy locally;
+//! `ontology check` reports what an HTTP reader will and won't read of an
+//! ontology (and catalog), applying its input policy locally;
 //! `ontology from` writes an ontology in the shape the model reads well, from
 //! RDF or from tables (CSV, a workbook, SQL DDL); `catalog from` writes SKOS
 //! records from rows. All read files only: no project, no ledger, nothing
@@ -221,13 +221,13 @@ fn print_report(file: &Path, report: &Report, names: &Names) {
         }
     }
     print_counts(
-        "Read another way by the extraction model",
+        "Read another way by the reader",
         &report.adapted,
         &report.examples.adapted,
         names,
     );
     print_counts(
-        "Not read by the extraction model",
+        "Not read by the reader",
         &report.not_shown,
         &report.examples.not_shown,
         names,
@@ -355,7 +355,7 @@ fn default_base(path: &Path) -> String {
 /// (`shop` for `https://example.com/shop/`), else `ex`.
 fn base_prefix(base: &str) -> String {
     let segment = base
-        .trim_end_matches(['/', '#'])
+        .trim_end_matches(['/', '#', ':'])
         .rsplit(['/', '#', ':'])
         .next()
         .unwrap_or_default();
@@ -463,6 +463,14 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
         _ => tabular::model(&read_sheets(&args.file)?, args.enum_max),
     };
     let out = convert::emit(&model, &EmitOptions { base: base.clone() });
+    // an empty ontology is never a result: say what was found instead
+    if out.classes == 0 {
+        return Err(CliError::Input(format!(
+            "{}: no tables found to make classes from",
+            args.file.display()
+        )));
+    }
+    notes.extend(out.notes.iter().cloned());
     let declared = vec![(base_prefix(&base), base.clone())];
     let format = output_format(args.format);
     match &args.catalog_out {
@@ -525,9 +533,7 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
     if args.base.is_none() {
         eprintln!("IRIs minted under {base}; set --base to your own namespace");
     }
-    eprintln!(
-        "run `fluree ontology check` on the result to see what the extraction model will read"
-    );
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
     Ok(())
 }
 
@@ -579,9 +585,7 @@ fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
             .collect();
         eprintln!("rewritten: {}", changes.join("; "));
     }
-    eprintln!(
-        "run `fluree ontology check` on the result to see what the extraction model will read"
-    );
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
     Ok(())
 }
 
@@ -658,6 +662,12 @@ fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
             count(out.merged, "row", "rows")
         ));
     }
+    if out.kept_apart > 0 {
+        summary.push_str(&format!(
+            "; {} kept apart from another whose id reads alike in an IRI (suffixed)",
+            count(out.kept_apart, "record", "records")
+        ));
+    }
     if out.without_label > 0 {
         summary.push_str(&format!(
             "; {} without a name left out",
@@ -693,4 +703,22 @@ fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
         eprintln!("class minted as <{class}>; pass --ontology to use your ontology's class");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prefix_is_named_for_the_namespace() {
+        assert_eq!(base_prefix("https://example.com/shop/"), "shop");
+        assert_eq!(base_prefix("https://example.com/crm#"), "crm");
+        assert_eq!(base_prefix("urn:acme:crm:"), "crm");
+        // a segment that isn't a usable prefix falls back to ex
+        assert_eq!(base_prefix("https://example.com/2026/"), "ex");
+        assert_eq!(
+            base_prefix("https://example.com/a-very-long-namespace-name/"),
+            "ex"
+        );
+    }
 }

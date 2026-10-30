@@ -4,8 +4,17 @@ Ontology tools for document extraction. An extraction model reads documents
 against your ontology (the classes and properties to look for) and, optionally,
 a catalog of records you already have. How the ontology is written changes the
 reading a lot: labels in words, and descriptions that say what counts, find far
-more than column names do. These commands show what the extraction model will
-and won't read of an ontology, and rewrite one into the shape it reads well.
+more than column names do. `check` shows what an **HTTP reader** will and won't
+read of an ontology, and `from` rewrites one into the shape extraction models
+read well.
+
+An HTTP reader is an extraction model reached over HTTP that reads a whole
+document against your ontology: the `[doc.reader]` that `fluree doc ingest`
+can read with. `check` mirrors the ontology input policy such a reader applies.
+`fluree doc ingest`'s language-model extractor (`[doc.llm]`) reads more of an
+ontology than an HTTP reader does (domains and ranges, `schema:domainIncludes`,
+every parent class), so the "not read" counts and the advice about domains,
+ranges and parents describe an HTTP reader only.
 
 They read files only: no `.fluree/` directory, no ledger, and nothing is sent
 anywhere.
@@ -20,8 +29,8 @@ fluree ontology <COMMAND>
 
 | Command | Description |
 |---------|-------------|
-| `check` | Report what the extraction model will and won't read of an ontology (and catalog) |
-| `from` | Write an ontology in the shape the extraction model reads well: from tables (CSV, a workbook, SQL DDL), or from RDF, optionally sliced |
+| `check` | Report what an HTTP reader will and won't read of an ontology (and catalog) |
+| `from` | Write an ontology in the shape extraction models read well: from tables (CSV, a workbook, SQL DDL), or from RDF, optionally sliced |
 
 Ontologies are read as Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-`
 reads stdin, and `--input-format turtle|jsonld` says which when the extension
@@ -32,9 +41,9 @@ export as `.json`).
 
 For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
-## What the extraction model reads
+## What an HTTP reader reads
 
-Of each class and property, the extraction model sees:
+Of each class and property, an HTTP reader sees:
 
 - its `rdfs:label`;
 - its `rdfs:comment`;
@@ -66,8 +75,9 @@ A request carries at most 2,000,000 bytes, 48,000 characters of text in up to
 whole catalog are repeated in every window, so a large catalog leaves less
 room for text.
 
-These are the rules of the extraction model `check` mirrors; another extractor
-may read more of an ontology.
+These are the rules of an HTTP reader using input policy `ontology-adapter-v1`;
+`fluree doc ingest`'s language-model extractor reads more of an ontology (see
+above).
 
 ## How a file is split
 
@@ -93,7 +103,7 @@ Applies the input policy locally and reports, in four parts:
   without a SKOS label or an IRI, a window over its token limit, a file over
   the byte limit).
 - **Read another way**: what the policy adapted, counted by kind.
-- **Not read**: the ontology's triples the extraction model never sees,
+- **Not read**: the ontology's triples the reader never sees,
   counted by predicate (`rdfs:domain`, `owl:equivalentClass`, `rdfs:subClassOf
   (a second parent)`, `(not a shown term)` for triples about something that is
   neither a class nor a property, ...).
@@ -103,7 +113,7 @@ Applies the input policy locally and reports, in four parts:
   each property connects said in its description.
 
 It also estimates the serialized tokens the ontology and catalog cost per
-window. The extraction model's tokenizer isn't part of the CLI, so this is an
+window. The reader's tokenizer isn't part of the CLI, so this is an
 estimate from character counts, good to about a tenth.
 
 | Option | Description |
@@ -127,13 +137,13 @@ fluree ontology check schemaorg.ttl --seed schema:Person,schema:Organization --j
 fund.ttl: 5 classes, 1 property
 About 942 serialized tokens per window before document text (a window holds 200,000).
 
-Read another way by the extraction model
+Read another way by the reader
   blank-node triples dropped              4  e.g. ex:Custodian
   rdfs:comment from skos:definition       1  e.g. ex:Custodian
   rdfs:label from skos:prefLabel          2  e.g. ex:Bank, ex:Custodian
   rdfs:label from the IRI                 1  e.g. ex:Asset
 
-Not read by the extraction model
+Not read by the reader
   owl:onProperty                          1
   owl:someValuesFrom                      1
   rdf:type owl:Restriction                1
@@ -144,10 +154,10 @@ Not read by the extraction model
 
 Advice
   • 5 of 6 classes and properties have no description (rdfs:comment or skos:definition). After
-    labels, descriptions help the extraction model most: say what counts and what doesn't, and
+    labels, descriptions help the reader most: say what counts and what doesn't, and
     name the words people use for it.
       ex:Asset, ex:Bank, ex:Person and 2 more
-  • The extraction model reads an IRI's local name beside its label, and a local name like
+  • The reader reads an IRI's local name beside its label, and a local name like
     "employer_id" reads as a key column even when the label says "employer". Mint these IRIs
     from their labels.
       ex:employer_id
@@ -181,7 +191,7 @@ the two compare line for line. `slice` appears only with `--seed`.
 `estimate.document_chars` is the room left for text in one window, at most
 48,000.
 
-Finding codes: `no-ontology`, `no-class`, `no-label`, `catalog-blank-node`,
+Finding codes: `no-ontology`, `no-class`, `no-label`, `owl-machinery`, `catalog-blank-node`,
 `catalog-no-label`, `window-full` and `too-many-bytes` fail a request;
 `no-description`, `label-not-words`, `local-name-not-words`,
 `opaque-local-name`, `large-vocabulary`, `domain-range-not-shown`,
@@ -196,15 +206,15 @@ fluree ontology from <FILE.ttl|.jsonld> [--seed <CLASSES>] [--depth <N>] [--form
 ```
 
 The ontology goes to stdout, or to the file `-o` names; a summary of what was
-made goes to stderr. Run `fluree ontology check` on the result to see what the
-extraction model will read of it.
+made goes to stderr. Run `fluree ontology check` on the result to see what an
+HTTP reader will read of it.
 
 ### From tables and semantic layers
 
 A CSV file (`.csv`, `.tsv`: one table, named for the file), a workbook
 (`.xlsx`: a table per sheet, the first row its header) or SQL DDL (`.sql`:
 `CREATE TABLE` statements) becomes an ontology by the rules that measurably
-help the extraction model:
+help an extraction model:
 
 - **labels in words**: a table is a class labelled with its name in words,
   singular (`DAMAGE_REPORTS` becomes "damage report"), and a column a
@@ -222,13 +232,17 @@ help the extraction model:
 - **primary keys are left out**, as are views, indexes and everything that
   describes the database rather than the things in it.
 
-Foreign keys are read from `REFERENCES` and `FOREIGN KEY` in DDL. In a CSV or a
-workbook, a column named `id`, or the table's name in the singular with `_id`
-(`company_id` in `companies`), is the primary key, and any other column ending
-in `id` is a foreign key, to the sheet it names if there is one.
+Keys and foreign keys are read from `PRIMARY KEY`, `REFERENCES` and
+`FOREIGN KEY` in `CREATE TABLE`, and from `ALTER TABLE … ADD CONSTRAINT`, which
+is where pg_dump writes them. In a CSV or a workbook, a column named `id`, or
+the table's name in the singular with `_id` (`company_id` in `companies`,
+`CustomerID` in `Customers`), is the primary key; any other column ending in
+`id` is a foreign key when it names another sheet (`customer_id` beside a
+`customers` sheet), and otherwise stays a value (`tax_id` reads "tax id").
 
-Enumerated columns come from `CHECK (col IN (...))`, a MySQL `ENUM(...)` type
-or a PostgreSQL `CREATE TYPE ... AS ENUM` in DDL. In a CSV or a workbook, a
+Enumerated columns come from `CHECK (col IN (...))` (or pg_dump's
+`(col)::text = ANY (ARRAY[...])`), a MySQL `ENUM(...)` type or a PostgreSQL
+`CREATE TYPE ... AS ENUM` in DDL. In a CSV or a workbook, a
 text column is enumerated when it has at most `--enum-max` distinct short
 values (default 12), each repeated (at least twice as many rows as values, and
 five rows). Column datatypes come from the DDL, or from the values (integers,
@@ -240,24 +254,48 @@ A **Snowflake semantic view** (or Cortex Analyst semantic model) as YAML
 descriptions and synonyms are copied ("Also called: riders, clients."),
 dimensions, time dimensions and facts become properties typed from their
 `data_type`, a dimension with `is_enum: true` and `sample_values` is
-enumerated, and each relationship is a foreign key from its left column to the
-right table (`CUSTOMER_ID` in `orders_to_customers` becomes the relation
+enumerated, and each relationship is a foreign key from its many side to its
+one side (`CUSTOMER_ID` in `orders_to_customers` becomes the relation
 "customer"). Metrics, filters and verified queries describe queries, not
-things, and are left out.
+things, and are left out. Values are read as written: a dimension named `NO`
+or a sample value `007` stays that, rather than YAML's `false` or `7`, and a
+key given twice keeps its last value.
 
 A **Databricks Genie space** export (`.json`, the `serialized_space` its API
-returns) gives tables, columns and join specs, but no descriptions: those are
-Unity Catalog's table and column comments. Pass them with `--comments` as JSON,
-`{"table": {"": "table comment", "column": "column comment"}}` (one query on
-`information_schema` gives them). SQL snippets and instructions are left out.
+returns) gives tables, columns (with any synonyms and descriptions the space
+sets, as strings or lists of strings; columns it excludes are left out) and
+join specs, read in the direction their relationship type gives (a one-to-many
+join is turned round; a many-to-many one makes no key). Table and column
+descriptions mostly live in Unity Catalog's comments instead: pass them with
+`--comments` as JSON, `{"table": {"": "table comment", "column": "column
+comment"}}` (one query on `information_schema` gives them). Columns the comments
+name that the export doesn't list are added, since an export may list only the
+columns that have settings. SQL snippets and instructions are left out. Joins
+naming a table the export doesn't have, join SQL with no `` `alias`.`column` ``
+pairs, and comments for tables the export doesn't have are counted in the
+summary.
 
-A foreign key named for a code or number (`HIRE_CODE` into `PRODUCTS`) takes
-its target's label ("product"), since the name says what it is, not what role
-it plays. A key used by several tables is one relation, described for them
-all ("The account of a contact, booking or quote.").
+A foreign key keeps its words without the key suffix (`origin_airport_code`
+becomes "origin airport", `employer_no` "employer"), and takes the target's
+label only when nothing is left (`id`). A key with the same name in several
+tables is one relation, described for them all ("The account of a contact,
+booking or quote.").
 
 The DDL is parsed with a generic SQL dialect, then PostgreSQL's, MySQL's and
-Snowflake's; statements none of them can parse are skipped and counted.
+Snowflake's. When none parses the whole file (mysqldump's `DELIMITER`, say),
+each statement is tried on its own, split where the SQL tokenizer finds a
+semicolon (so one inside a string doesn't cut a statement short), and the
+statements none can parse are skipped and counted. Tables of the same name in
+two schemas (`crm.users`, `billing.users`) stay apart, named with their schema.
+
+Two source names never become one term. Two columns of the same name in
+different tables (`name`) share one property; any other clash gets a suffixed
+IRI, and a label already taken is qualified with the column's full name
+(`employer id` beside `employer`) or the table's name in front (`ticket status`
+beside `status`). Enumerated values that read alike in an IRI (`Net 30`,
+`net-30`) keep records of their own. Everything left out or qualified is
+counted in the summary on stderr, and a file that yields no classes is an error,
+not an empty ontology.
 
 | Option | Description |
 |--------|-------------|
@@ -309,24 +347,29 @@ crm:Status a rdfs:Class ;
     skos:prefLabel "active" .
 ```
 
-What tables can't say is what the extraction model gains most from next:
+What tables can't say is what an extraction model gains most from next:
 descriptions that say what counts and name the words people use ("the desk"
 for the hire desk). `check` lists the terms without one.
 
 ### From RDF
 
-An RDF ontology (Turtle or JSON-LD) is written back with what the extraction
-model reads made explicit:
+An RDF ontology (Turtle or JSON-LD) is written back with what an HTTP reader
+reads made explicit:
 
-- SKOS labels and definitions copied into `rdfs:label` and `rdfs:comment`;
+- SKOS labels and definitions moved into `rdfs:label` and `rdfs:comment` (the
+  SKOS statement a fallback would read is replaced by the RDFS one);
 - a label made from the IRI where there is none;
 - labels that read as identifiers rewritten in words (`worksFor` becomes
   "works for", `employer_id` "employer id");
 - `owl:Class` and the OWL property types also declared `rdfs:Class` and
   `rdf:Property`;
-- OWL restrictions and other blank-node constructs dropped.
+- OWL restrictions and other blank-node constructs dropped;
+- OWL axioms written as nodes of their own (`[] a owl:AllDisjointClasses`) and
+  declarations of annotation properties and datatypes dropped, since a reader
+  would read them as catalog records and refuse the request; the summary counts
+  them.
 
-Domains, ranges and other axioms are kept: the extraction model doesn't see
+Domains, ranges and other axioms are kept: an HTTP reader doesn't see
 them, but a reading can still be checked against them. Catalog records in the
 file are kept, and one with an `rdfs:label` but no SKOS label gets it as
 `skos:prefLabel` (and its `rdfs:comment` as `skos:definition`).
@@ -347,7 +390,7 @@ fluree ontology check people.ttl
 
 ## Slicing
 
-Every class and property in the ontology is shown to the extraction model in
+Every class and property in the ontology is shown to the reader in
 every window. A whole public vocabulary costs tens of thousands of tokens and
 blurs which of several overlapping terms applies (schema.org alone is over a
 thousand classes and 1,600 properties), so slice it to what your documents
@@ -368,5 +411,6 @@ records are kept when they are typed with a kept class or have no type.
 ## See also
 
 - [`catalog`](catalog.md): a catalog of records from rows you already have
-- [`doc`](doc.md): ingest documents and extract entities and relations with an ontology
+- [`doc`](doc.md): `fluree doc ingest` extracts with an ontology; its
+  language-model extractor reads more of an ontology than an HTTP reader does
 - [`validate`](validate.md): validate data against SHACL shapes

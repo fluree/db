@@ -162,6 +162,59 @@ impl Parsed {
     }
 }
 
+/// OWL axioms written as nodes of their own (`[] a owl:AllDisjointClasses ;
+/// owl:members (...)`): a reader reads them as catalog records.
+pub const OWL_AXIOM_TYPES: &[&str] = &[
+    "http://www.w3.org/2002/07/owl#AllDisjointClasses",
+    "http://www.w3.org/2002/07/owl#AllDifferent",
+    "http://www.w3.org/2002/07/owl#AllDisjointProperties",
+    "http://www.w3.org/2002/07/owl#NegativePropertyAssertion",
+    "http://www.w3.org/2002/07/owl#Axiom",
+];
+
+/// Declarations that are neither a class nor a property a reader shows:
+/// read as catalog records too.
+pub const OWL_DECLARATION_TYPES: &[&str] = &[
+    "http://www.w3.org/2002/07/owl#AnnotationProperty",
+    "http://www.w3.org/2002/07/owl#OntologyProperty",
+    "http://www.w3.org/2000/01/rdf-schema#Datatype",
+];
+
+/// The OWL machinery in a catalog: axiom nodes (with the blank nodes their
+/// lists use) and declarations of annotation properties and datatypes, as
+/// ontology editors such as Protégé write them. A reader splitting a flat
+/// graph files them as catalog records and refuses them (records need IRIs
+/// and SKOS labels). Returns (every subject involved, the axioms and
+/// declarations themselves).
+pub fn owl_machinery(catalog: &[Quad]) -> (HashSet<Term>, Vec<(Term, String)>) {
+    let mut roots: Vec<(Term, String)> = Vec::new();
+    for q in catalog {
+        if !q.is(RDF_TYPE) {
+            continue;
+        }
+        if let Some(t) = q.object.as_iri() {
+            let axiom = OWL_AXIOM_TYPES.contains(&t) && q.subject.is_blank();
+            if axiom || OWL_DECLARATION_TYPES.contains(&t) {
+                roots.push((q.subject.clone(), t.to_string()));
+            }
+        }
+    }
+    let mut involved: HashSet<Term> = roots.iter().map(|(s, _)| s.clone()).collect();
+    let mut stack: Vec<Term> = roots
+        .iter()
+        .filter(|(s, _)| s.is_blank())
+        .map(|(s, _)| s.clone())
+        .collect();
+    while let Some(node) = stack.pop() {
+        for q in catalog {
+            if q.subject == node && q.object.is_blank() && involved.insert(q.object.clone()) {
+                stack.push(q.object.clone());
+            }
+        }
+    }
+    (involved, roots)
+}
+
 /// A flat graph split as the request reader splits Turtle.
 fn split_flat(quads: &[Quad]) -> Split {
     let mut schema: HashSet<&Term> = quads
