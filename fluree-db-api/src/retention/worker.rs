@@ -353,11 +353,7 @@ impl Fluree {
     /// times are compared against it rather than the clock.
     pub async fn run_retention_at(&self, ledger_id: &str, now_ms: i64) -> Result<PassReport> {
         let ns = self.publisher()?;
-        if registry::read(ns, self.registry_objects(), ledger_id)
-            .await?
-            .1
-            .is_none()
-        {
+        if registry::read_stored(ns, ledger_id).await?.1.is_none() {
             self.probe_and_activate(ledger_id, 0).await?;
         }
         let limits = RetentionLimits::default();

@@ -585,8 +585,8 @@ impl Fluree {
         limits: &RetentionLimits,
     ) -> Result<PassReport> {
         let ns = self.publisher()?;
-        let (_, registration) = registry::read(ns, self.registry_objects(), ledger_id).await?;
-        let Some(registration) = registration else {
+        let (_, stored) = registry::read_stored(ns, ledger_id).await?;
+        let Some(stored) = stored else {
             return Ok(PassReport {
                 inactive: true,
                 ..Default::default()
@@ -595,28 +595,31 @@ impl Fluree {
         let Some(record) = ns.lookup(ledger_id).await? else {
             return Err(ApiError::NotFound(ledger_id.to_string()));
         };
-        let heartbeat_due = registration
+        // Its scalars decide an idle pass, without its lists being read.
+        let shell = registry::shell(&stored)?;
+        let heartbeat_due = shell
             .last_pass_ms
             .is_none_or(|last| now_ms - last >= limits.heartbeat_ms);
-        let published = registration.journal.is_empty()
-            || registration.checkpointed == registration.journal.generation;
+        let published =
+            registry::journal_empty(&stored) || shell.checkpointed == shell.journal.generation;
         // Nothing committed, due, waiting or unpublished since the last
         // pass: done, with no ledger load.
         if !heartbeat_due && published {
             if let Some((watermark_t, pending)) = cache.idle(
                 ledger_id,
-                registration.schedule.as_deref(),
+                shell.schedule.as_deref(),
                 record.commit_t,
                 now_ms,
             ) {
                 return Ok(PassReport {
                     watermark_t,
                     pending,
-                    problems: registration.problems.clone(),
+                    problems: shell.problems,
                     ..Default::default()
                 });
             }
         }
+        let registration = registry::resolve(&stored, self.registry_objects()).await?;
         let store = self
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
             .await?;

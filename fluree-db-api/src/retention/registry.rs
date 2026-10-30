@@ -151,6 +151,13 @@ impl Default for ChunkCache {
     }
 }
 
+#[cfg(test)]
+impl ChunkCache {
+    pub(crate) fn clear(&self) {
+        self.0.lock().clear();
+    }
+}
+
 /// Where chunks are stored, and those read.
 #[derive(Clone, Copy)]
 pub(crate) struct Objects<'a> {
@@ -423,6 +430,14 @@ pub(crate) async fn resolve_journal(
         journal.removals = listed.read.as_ref().clone();
     }
     Ok(journal)
+}
+
+/// The registration `stored` holds without its chunked lists: its scalars,
+/// journal generation and rules, and job summaries, for a check that needs
+/// no more.
+pub(crate) fn shell(stored: &serde_json::Value) -> Result<Registration> {
+    serde_json::from_value(stored.clone())
+        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))
 }
 
 /// The registration `stored` holds, its lists read from the chunks it names.
@@ -1156,6 +1171,54 @@ mod tests {
         let ns = fluree.publisher().unwrap();
         let read_back = read(ns, elsewhere, &id).await.unwrap().1.unwrap();
         assert_eq!(read_back.journal.removals, vec![removal(0)]);
+    }
+
+    /// A pass with nothing to do reads no chunk: its registration's scalars
+    /// and journal identity decide it.
+    #[tokio::test]
+    async fn an_idle_retention_pass_reads_no_chunk() {
+        let (_dir, fluree, id) = ledger("t/idle").await;
+        fluree
+            .graph(&id)
+            .transact()
+            .insert(&serde_json::json!({
+                "@id": "http://example.org/alice",
+                "http://example.org/email": "a@secret"
+            }))
+            .commit()
+            .await
+            .unwrap();
+        fluree
+            .remove_occurrences(
+                &id,
+                super::super::removal::RemovalRequest {
+                    matching: vec![super::super::FactSelector {
+                        subject: "http://example.org/alice".into(),
+                        predicate: "http://example.org/email".into(),
+                        graph: None,
+                        object: Some(serde_json::json!("a@secret")),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fluree.run_retention(&id).await.unwrap();
+        fluree.run_retention(&id).await.unwrap();
+        let ns = fluree.publisher().unwrap();
+        let stored = read_stored(ns, &id).await.unwrap().1.unwrap();
+        assert!(
+            stored.pointer("/journal/removalChunks").is_some(),
+            "{stored}"
+        );
+
+        // Gone from storage and from this process: a pass reading them fails.
+        let storage = fluree.admin_storage().unwrap();
+        for address in chunk_objects(&fluree).await {
+            storage.delete(&address).await.unwrap();
+        }
+        fluree.retention.chunks.clear();
+        fluree.run_retention(&id).await.unwrap();
     }
 
     struct Member;

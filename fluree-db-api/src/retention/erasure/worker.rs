@@ -151,9 +151,15 @@ impl Fluree {
         };
         let mut held = Vec::new();
         for branch in ledgers {
-            if let Ok((_, Some(registration))) =
-                registry::read(ns, self.registry_objects(), branch).await
-            {
+            let Ok((_, Some(stored))) = registry::read_stored(ns, branch).await else {
+                continue;
+            };
+            // Most passes find nothing pending: decided without the jobs'
+            // chunks being read.
+            if !registry::shell(&stored).is_ok_and(|s| s.erasures.iter().any(ErasureJob::pending)) {
+                continue;
+            }
+            if let Ok(registration) = registry::resolve(&stored, self.registry_objects()).await {
                 held.extend(
                     registration
                         .erasures
@@ -296,8 +302,9 @@ impl Fluree {
         let now = now_ms();
         let mut due = std::collections::BTreeSet::new();
         for branch in ledgers {
-            if let Ok((_, Some(registration))) =
-                registry::read(ns, self.registry_objects(), branch).await
+            if let Ok((_, Some(registration))) = registry::read_stored(ns, branch)
+                .await
+                .and_then(|(c, stored)| Ok((c, stored.map(|s| registry::shell(&s)).transpose()?)))
             {
                 let purge = registration
                     .erasures
@@ -736,9 +743,10 @@ impl Fluree {
             return;
         };
         for branch in ledgers {
-            let Ok((_, Some(registration))) =
-                registry::read(ns, self.registry_objects(), branch).await
-            else {
+            let Ok((_, Some(stored))) = registry::read_stored(ns, branch).await else {
+                continue;
+            };
+            let Ok(registration) = registry::shell(&stored) else {
                 continue;
             };
             for job in &registration.erasures {
