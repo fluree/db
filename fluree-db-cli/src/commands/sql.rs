@@ -70,8 +70,15 @@ fn endpoint_auth(args: &SqlMapArgs) -> CliResult<fluree_db_api::IcebergAuthConfi
         .map_err(usage)
 }
 
-/// The `sql/map` body for a remote server, its auth as the structured `auth`
-/// the stored config holds.
+/// The `sql/map` body for a remote server.
+///
+/// A bearer token or OAuth2 client credentials go as the flat fields, which
+/// every server version reads. A server older than the structured `auth`
+/// does not refuse a field it does not know: given `auth`, it would register
+/// the source with no auth and say nothing. Only what has no flat field (a
+/// Google identity) goes as the structured `auth`, which such a server still
+/// drops. The server converts the flat fields with the codec
+/// [`endpoint_auth`] uses, so both store the same record.
 #[cfg(feature = "iceberg")]
 fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
@@ -106,9 +113,30 @@ fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
     if args.allow_duplicate_subjects {
         obj.insert("allow_duplicate_subjects".into(), true.into());
     }
-    let auth = endpoint_auth(args)?;
-    if auth != fluree_db_api::IcebergAuthConfig::None {
-        body["auth"] = serde_json::to_value(auth).map_err(|e| CliError::Input(e.to_string()))?;
+    use fluree_db_api::IcebergAuthConfig;
+    match endpoint_auth(args)? {
+        IcebergAuthConfig::None => {}
+        IcebergAuthConfig::Bearer { .. } | IcebergAuthConfig::OAuth2ClientCredentials { .. } => {
+            let flags = &args.auth;
+            for (key, value) in [
+                ("auth_bearer", &flags.auth_bearer),
+                ("auth_bearer_env", &flags.auth_bearer_env),
+                ("oauth2_token_url", &flags.oauth2_token_url),
+                ("oauth2_client_id", &flags.oauth2_client_id),
+                ("oauth2_client_secret", &flags.oauth2_client_secret),
+                ("oauth2_client_secret_env", &flags.oauth2_client_secret_env),
+                ("oauth2_scope", &flags.oauth2_scope),
+                ("oauth2_audience", &flags.oauth2_audience),
+            ] {
+                if let Some(v) = value {
+                    body[key] = v.clone().into();
+                }
+            }
+        }
+        auth => {
+            body["auth"] =
+                serde_json::to_value(auth).map_err(|e| CliError::Input(e.to_string()))?;
+        }
     }
     Ok(body)
 }
@@ -366,6 +394,108 @@ mod tests {
             google,
             fluree_db_api::IcebergAuthConfig::Google { .. }
         ));
+    }
+
+    /// The `sql/map` body for `flags`, and the auth a server stores from it.
+    fn remote_body(flags: &[&str]) -> (serde_json::Value, fluree_db_api::IcebergAuthConfig) {
+        let mapping = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(mapping.path(), "").unwrap();
+        let mut args = parse(flags);
+        args.r2rml = mapping.path().to_path_buf();
+        let body = args_to_json(&args).unwrap();
+        let mut fields = body.as_object().unwrap().clone();
+        for key in [
+            "name",
+            "endpoint",
+            "r2rml",
+            "r2rml_type",
+            "branch",
+            "dialect",
+            "protocol",
+            "catalog",
+            "schema",
+            "user",
+            "model",
+            "session",
+            "default_allow",
+            "allow_duplicate_subjects",
+        ] {
+            fields.remove(key);
+        }
+        let stored = fluree_db_api::sql_auth_from_json(
+            fields,
+            &fluree_db_api::SecretRules::listed("TRINO_TOKEN,TRINO_SECRET,SA_KEY", false),
+        )
+        .unwrap();
+        assert_eq!(stored, endpoint_auth(&args).unwrap(), "{flags:?}");
+        (body, stored)
+    }
+
+    #[test]
+    fn a_remote_sql_map_sends_what_has_a_flat_form_as_the_flat_fields() {
+        // A server older than the structured `auth` ignores it and registers
+        // the source with no auth; the flat fields are what it reads.
+        let oauth2 = [
+            "--oauth2-token-url",
+            "https://t.example.com/token",
+            "--oauth2-client-id",
+            "c",
+            "--oauth2-scope",
+            "s",
+            "--oauth2-audience",
+            "a",
+        ];
+        for (flags, flat) in [
+            (vec!["--auth-bearer", "t"], vec![("auth_bearer", "t")]),
+            (
+                vec!["--auth-bearer-env", "TRINO_TOKEN"],
+                vec![("auth_bearer_env", "TRINO_TOKEN")],
+            ),
+            (
+                [&oauth2[..], &["--oauth2-client-secret", "x"]].concat(),
+                vec![
+                    ("oauth2_token_url", "https://t.example.com/token"),
+                    ("oauth2_client_id", "c"),
+                    ("oauth2_client_secret", "x"),
+                    ("oauth2_scope", "s"),
+                    ("oauth2_audience", "a"),
+                ],
+            ),
+            (
+                [&oauth2[..], &["--oauth2-client-secret-env", "TRINO_SECRET"]].concat(),
+                vec![
+                    ("oauth2_token_url", "https://t.example.com/token"),
+                    ("oauth2_client_id", "c"),
+                    ("oauth2_client_secret_env", "TRINO_SECRET"),
+                    ("oauth2_scope", "s"),
+                    ("oauth2_audience", "a"),
+                ],
+            ),
+        ] {
+            let (body, _) = remote_body(&flags);
+            assert!(body.get("auth").is_none(), "{flags:?}: {body}");
+            for (key, value) in flat {
+                assert_eq!(body[key], value, "{flags:?}: {body}");
+            }
+        }
+
+        // No auth: neither form.
+        let (body, stored) = remote_body(&[]);
+        assert_eq!(stored, fluree_db_api::IcebergAuthConfig::None);
+        assert!(body.get("auth").is_none() && body.get("auth_bearer").is_none());
+
+        // A Google identity has no flat field: the structured `auth`.
+        for flags in [
+            vec!["--auth-google-adc"],
+            vec!["--auth-google-service-account-env", "SA_KEY"],
+        ] {
+            let (body, stored) = remote_body(&flags);
+            assert!(matches!(
+                stored,
+                fluree_db_api::IcebergAuthConfig::Google { .. }
+            ));
+            assert_eq!(body["auth"]["type"], "google", "{flags:?}: {body}");
+        }
     }
 
     #[test]
