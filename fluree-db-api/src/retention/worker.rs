@@ -60,6 +60,13 @@ pub(crate) struct RetentionRuntime {
     /// When registration chunks were last swept (epoch ms).
     #[cfg(not(target_arch = "wasm32"))]
     chunks_swept_ms: AtomicI64,
+    /// See [`super::registry::Objects`].
+    pub(crate) registry_writes: tokio::sync::RwLock<()>,
+    /// Where a test holds a sweep of registration chunks, before deleting.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) sweep_hold:
+        parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Set on a file-backed instance.
     #[cfg(feature = "native")]
     pub(crate) erasure: std::sync::OnceLock<Arc<super::erasure::ErasureRuntime>>,

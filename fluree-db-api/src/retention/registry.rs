@@ -156,11 +156,18 @@ impl Default for ChunkCache {
 pub(crate) struct Objects<'a> {
     storage: &'a dyn Storage,
     cache: &'a ChunkCache,
+    /// Held to write a registration, from its chunks to its record, and
+    /// exclusively by a sweep from reading names to deleting.
+    writes: Option<&'a tokio::sync::RwLock<()>>,
 }
 
 impl<'a> Objects<'a> {
     pub(crate) fn new(storage: &'a dyn Storage, cache: &'a ChunkCache) -> Self {
-        Objects { storage, cache }
+        Objects {
+            storage,
+            cache,
+            writes: None,
+        }
     }
 
     fn address(&self, hash: &str) -> String {
@@ -273,8 +280,10 @@ impl crate::Fluree {
     /// Where this instance keeps registrations' chunks; `None` without
     /// managed storage, which keeps them inline.
     pub(crate) fn registry_objects(&self) -> Option<Objects<'_>> {
-        self.admin_storage()
-            .map(|storage| Objects::new(storage, &self.retention.chunks))
+        self.admin_storage().map(|storage| Objects {
+            writes: Some(&self.retention.registry_writes),
+            ..Objects::new(storage, &self.retention.chunks)
+        })
     }
 
     /// Every chunk a registration names: a branch's, visible or not (one a
@@ -300,17 +309,23 @@ impl crate::Fluree {
     }
 
     /// Delete the chunks no registration names that a sweep at least
-    /// `grace` earlier also found unnamed. Listed before the names are read,
-    /// so a chunk written meanwhile waits for a later sweep. Whether
-    /// anything was deleted is the count returned.
+    /// `grace` earlier also found unnamed; the count deleted. No
+    /// registration is written meanwhile. Only an instance that holds its
+    /// storage's lock, and is no cluster member, sweeps: another process's
+    /// write, or a member's, could name a chunk again between the names
+    /// being read and the delete.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn sweep_registration_chunks(
         &self,
         grace: std::time::Duration,
     ) -> Result<usize> {
+        if self.retention.replicas.get().is_some() || self.blob_pins().is_none() {
+            return Ok(0);
+        }
         let Some(objects) = self.registry_objects() else {
             return Ok(0);
         };
+        let _sweeping = self.retention.registry_writes.write().await;
         let prefix = format!(
             "fluree:{}://{OBJECTS_DIR}/",
             objects.storage.storage_method()
@@ -340,6 +355,14 @@ impl crate::Fluree {
                 }
             }
             *unnamed = still;
+        }
+        #[cfg(test)]
+        {
+            let hold = self.retention.sweep_hold.lock().clone();
+            if let Some((reached, proceed)) = hold {
+                reached.notify_one();
+                proceed.notified().await;
+            }
         }
         let mut deleted = doomed.len();
         for (address, e) in objects.storage.delete_many(&doomed).await {
@@ -594,6 +617,12 @@ pub(crate) async fn update_fenced(
         let (config, current) = read(ns, objects, ledger_id).await?;
         let Some(mut next) = update(current.as_ref()) else {
             return Ok(current);
+        };
+        // No sweep deletes a chunk between this write storing or naming it
+        // and its record taking effect.
+        let _writing = match objects.and_then(|o| o.writes) {
+            Some(writes) => Some(writes.read().await),
+            None => None,
         };
         let value = store(&mut next, current.as_ref(), objects).await?;
         let (v, mut payload) = match &config {
@@ -1068,5 +1097,100 @@ mod tests {
         let elsewhere = Some(Objects::new(fluree.admin_storage().unwrap(), &fresh));
         let read_back = read(ns, elsewhere, &id).await.unwrap().1.unwrap();
         assert_eq!(read_back.journal, stale.journal);
+    }
+
+    /// A sweep and a registration write exclude each other: a write naming
+    /// again a chunk the sweep is about to delete waits for the delete, then
+    /// stores the chunk again.
+    #[tokio::test]
+    async fn a_write_naming_a_chunk_being_swept_waits_and_stores_it_again() {
+        let (_dir, fluree, id) = ledger("t/race").await;
+        let fluree = Arc::new(fluree);
+        let write = |removals: Vec<Removal>| {
+            let fluree = Arc::clone(&fluree);
+            let id = id.clone();
+            async move {
+                update(
+                    fluree.publisher().unwrap(),
+                    fluree.registry_objects(),
+                    &id,
+                    |current| {
+                        let mut next = current.cloned().unwrap_or_default();
+                        next.journal.removals = removals.clone();
+                        Some(next)
+                    },
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+        write(vec![removal(0)]).await.unwrap();
+        write(vec![removal(1)]).await.unwrap();
+        let grace = std::time::Duration::from_millis(20);
+        assert_eq!(fluree.sweep_registration_chunks(grace).await.unwrap(), 0);
+        tokio::time::sleep(grace).await;
+
+        let (reached, proceed) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *fluree.retention.sweep_hold.lock() = Some((Arc::clone(&reached), Arc::clone(&proceed)));
+        let sweep = {
+            let fluree = Arc::clone(&fluree);
+            tokio::spawn(async move { fluree.sweep_registration_chunks(grace).await })
+        };
+        reached.notified().await;
+        let named_again = tokio::spawn(write(vec![removal(0)]));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !named_again.is_finished(),
+            "a write named the chunk while the sweep was about to delete it"
+        );
+        *fluree.retention.sweep_hold.lock() = None;
+        proceed.notify_one();
+        assert_eq!(sweep.await.unwrap().unwrap(), 1);
+        named_again.await.unwrap().unwrap();
+
+        let fresh = ChunkCache::default();
+        let elsewhere = Some(Objects::new(fluree.admin_storage().unwrap(), &fresh));
+        let ns = fluree.publisher().unwrap();
+        let read_back = read(ns, elsewhere, &id).await.unwrap().1.unwrap();
+        assert_eq!(read_back.journal.removals, vec![removal(0)]);
+    }
+
+    struct Member;
+
+    #[async_trait::async_trait]
+    impl crate::retention::replicas::ReplicaSync for Member {
+        async fn sync_reads(&self) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    /// A cluster member does not sweep: another member's write is not
+    /// ordered with its delete yet.
+    #[tokio::test]
+    async fn a_cluster_member_does_not_sweep() {
+        let (_dir, fluree, id) = ledger("t/member").await;
+        let (ns, objects) = (fluree.publisher().unwrap(), fluree.registry_objects());
+        for n in 0..2 {
+            update(ns, objects, &id, |current| {
+                let mut next = current.cloned().unwrap_or_default();
+                next.journal.removals = vec![removal(n)];
+                Some(next)
+            })
+            .await
+            .unwrap();
+        }
+        fluree.set_retention_replicas(Arc::new(Member));
+        let grace = std::time::Duration::from_millis(1);
+        fluree.sweep_registration_chunks(grace).await.unwrap();
+        tokio::time::sleep(grace).await;
+        assert_eq!(fluree.sweep_registration_chunks(grace).await.unwrap(), 0);
+        assert_eq!(chunk_objects(&fluree).await.len(), 2);
     }
 }
