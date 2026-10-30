@@ -444,6 +444,11 @@ pub struct PurgeProgress {
     /// copies are cleaned after.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_ms: Option<i64>,
+    /// On a cluster: when, every member having cleaned, the logs stopped
+    /// members left were retired; what a replay of one wrote back is
+    /// collected from then before the job completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purged_ms: Option<i64>,
     /// Files deleted.

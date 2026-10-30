@@ -433,7 +433,34 @@ impl Fluree {
             return Ok(report);
         }
         self.retire_stopped_logs().await?;
+        let retired_ms = match jobs
+            .iter()
+            .filter_map(|(_, j)| j.purge.as_ref().and_then(|p| p.retired_ms))
+            .min()
+        {
+            Some(ms) => ms,
+            None => {
+                let ms = now_ms();
+                self.update_purge(jobs, |p| p.retired_ms = Some(ms)).await?;
+                ms
+            }
+        };
         let plan = self.plan_purge(ledger).await?;
+        // What a replay wrote back, a request's envelope among it, is
+        // garbage: collected before the job completes.
+        let ledgers: BTreeSet<LedgerName> = plan
+            .rebuild
+            .iter()
+            .chain(&plan.retracted)
+            .filter_map(|b| LedgerId::parse(b).ok())
+            .map(|id| id.ledger_name())
+            .collect();
+        for ledger in &ledgers {
+            if !self.resolve_garbage(ledger.as_str(), retired_ms).await? {
+                report.waiting = true;
+                return Ok(report);
+            }
+        }
         let mut deleted = 0;
         for address in plan
             .originals

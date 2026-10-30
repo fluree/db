@@ -928,6 +928,35 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
     );
     assert!(!original.exists(), "the original is deleted");
 
+    // A member stopped with a write still in its log, of a request's
+    // envelope holding the erased value, collected since: a replay brings it
+    // back, and it is collected again before the job completes.
+    use fluree_db_core::StorageWrite as _;
+    let envelope_bytes = br#"{"resurrected":"a@secret"}"#;
+    let envelope = fluree_db_core::content_address(
+        "file",
+        fluree_db_core::ContentKind::Txn,
+        &record.storage_namespace(),
+        &fluree_db_core::ContentId::new(fluree_db_core::ContentKind::Txn, envelope_bytes)
+            .address_digest(),
+    );
+    let envelope_file = dirs
+        .1
+        .path()
+        .join(envelope.trim_start_matches("fluree:file://"));
+    let stopped = fluree_db_core::FileStorage::new(dirs.1.path())
+        .with_durability(fluree_db_core::Durability::Wal)
+        .with_wal_owner("node-99");
+    stopped.recover_wal().unwrap();
+    stopped.hold_wal_segments_for_test().unwrap();
+    stopped
+        .write_bytes(&envelope, envelope_bytes)
+        .await
+        .unwrap();
+    stopped.simulate_crash_for_test();
+    drop(stopped);
+    std::fs::remove_file(&envelope_file).unwrap();
+
     // Its members clean their own copies, then it is purged: a member that
     // has not reported holds it, named.
     integration
@@ -980,6 +1009,10 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
     assert!(job
         .purge
         .is_some_and(|p| p.purged_ms.is_some() && p.blocked.is_none()));
+    assert!(
+        !envelope_file.exists(),
+        "the envelope a replay brought back"
+    );
     assert!(integration
         .shared_state
         .read()
