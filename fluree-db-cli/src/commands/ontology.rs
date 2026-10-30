@@ -1,6 +1,6 @@
 //! `fluree ontology` — ontology tools for document extraction.
 //!
-//! `check` reports what an extraction model will and won't read of an
+//! `check` reports what an HTTP reader will and won't read of an
 //! ontology (and catalog), applying the model's input policy locally;
 //! `from` writes an ontology in the shape the model reads well. Both read
 //! files only: no project, no ledger, nothing sent anywhere. The logic is in
@@ -213,13 +213,13 @@ fn print_report(file: &Path, report: &Report, names: &Names) {
         }
     }
     print_counts(
-        "Read another way by the extraction model",
+        "Read another way by the reader",
         &report.adapted,
         &report.examples.adapted,
         names,
     );
     print_counts(
-        "Not read by the extraction model",
+        "Not read by the reader",
         &report.not_shown,
         &report.examples.not_shown,
         names,
@@ -333,8 +333,6 @@ fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
             .collect();
         eprintln!("rewritten: {}", changes.join("; "));
     }
-    eprintln!(
-        "run `fluree ontology check` on the result to see what the extraction model will read"
-    );
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
     Ok(())
 }

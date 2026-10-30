@@ -207,13 +207,21 @@ fn seed_slices_a_vocabulary() {
     assert_eq!(report["properties"], 1);
     assert_eq!(report["slice"]["classes_total"], 4);
 
-    fluree_cmd(&tmp)
-        .args(["ontology", "check", "vocab.ttl", "--seed", "Spaceship"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains(
-            "no class in the ontology matches --seed",
-        ));
+    // a label, a prefixed name or an IRI that names no class is refused, never
+    // an empty slice
+    for seed in ["Spaceship", "ex:Persn", "<https://example.com/Persn>"] {
+        fluree_cmd(&tmp)
+            .args(["ontology", "check", "vocab.ttl", "--seed", seed])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "no class in the ontology matches --seed",
+            ));
+        fluree_cmd(&tmp)
+            .args(["ontology", "from", "vocab.ttl", "--seed", seed])
+            .assert()
+            .code(2);
+    }
 }
 
 #[test]

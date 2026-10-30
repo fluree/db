@@ -4,8 +4,17 @@ Ontology tools for document extraction. An extraction model reads documents
 against your ontology (the classes and properties to look for) and, optionally,
 a catalog of records you already have. How the ontology is written changes the
 reading a lot: labels in words, and descriptions that say what counts, find far
-more than column names do. These commands show what the extraction model will
-and won't read of an ontology, and rewrite one into the shape it reads well.
+more than column names do. `check` shows what an **HTTP reader** will and won't
+read of an ontology, and `from` rewrites one into the shape extraction models
+read well.
+
+An HTTP reader is an extraction model reached over HTTP that reads a whole
+document against your ontology: the `[doc.reader]` that `fluree doc ingest`
+can read with. `check` mirrors the ontology input policy such a reader applies.
+`fluree doc ingest`'s language-model extractor (`[doc.llm]`) reads more of an
+ontology than an HTTP reader does (domains and ranges, `schema:domainIncludes`,
+every parent class), so the "not read" counts and the advice about domains,
+ranges and parents describe an HTTP reader only.
 
 They read files only: no `.fluree/` directory, no ledger, and nothing is sent
 anywhere.
@@ -20,16 +29,16 @@ fluree ontology <COMMAND>
 
 | Command | Description |
 |---------|-------------|
-| `check` | Report what the extraction model will and won't read of an ontology (and catalog) |
-| `from` | Write an ontology in the shape the extraction model reads well, optionally sliced |
+| `check` | Report what an HTTP reader will and won't read of an ontology (and catalog) |
+| `from` | Write an ontology in the shape extraction models read well, optionally sliced |
 
 Both read Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-` reads stdin, and
 `--input-format turtle|jsonld` says which when the extension doesn't. TriG is
 not read yet: pass the ontology as Turtle, or a saved request as JSON-LD.
 
-## What the extraction model reads
+## What an HTTP reader reads
 
-Of each class and property, the extraction model sees:
+Of each class and property, an HTTP reader sees:
 
 - its `rdfs:label`;
 - its `rdfs:comment`;
@@ -61,8 +70,9 @@ A request carries at most 2,000,000 bytes, 48,000 characters of text in up to
 whole catalog are repeated in every window, so a large catalog leaves less
 room for text.
 
-These are the rules of the extraction model `check` mirrors; another extractor
-may read more of an ontology.
+These are the rules of an HTTP reader using input policy `ontology-adapter-v1`;
+`fluree doc ingest`'s language-model extractor reads more of an ontology (see
+above).
 
 ## How a file is split
 
@@ -88,7 +98,7 @@ Applies the input policy locally and reports, in four parts:
   without a SKOS label or an IRI, a window over its token limit, a file over
   the byte limit).
 - **Read another way**: what the policy adapted, counted by kind.
-- **Not read**: the ontology's triples the extraction model never sees,
+- **Not read**: the ontology's triples the reader never sees,
   counted by predicate (`rdfs:domain`, `owl:equivalentClass`, `rdfs:subClassOf
   (a second parent)`, `(not a shown term)` for triples about something that is
   neither a class nor a property, ...).
@@ -98,7 +108,7 @@ Applies the input policy locally and reports, in four parts:
   each property connects said in its description.
 
 It also estimates the serialized tokens the ontology and catalog cost per
-window. The extraction model's tokenizer isn't part of the CLI, so this is an
+window. The reader's tokenizer isn't part of the CLI, so this is an
 estimate from character counts, good to about a tenth.
 
 | Option | Description |
@@ -122,13 +132,13 @@ fluree ontology check schemaorg.ttl --seed schema:Person,schema:Organization --j
 fund.ttl: 5 classes, 1 property
 About 942 serialized tokens per window before document text (a window holds 200,000).
 
-Read another way by the extraction model
+Read another way by the reader
   blank-node triples dropped              4  e.g. ex:Custodian
   rdfs:comment from skos:definition       1  e.g. ex:Custodian
   rdfs:label from skos:prefLabel          2  e.g. ex:Bank, ex:Custodian
   rdfs:label from the IRI                 1  e.g. ex:Asset
 
-Not read by the extraction model
+Not read by the reader
   owl:onProperty                          1
   owl:someValuesFrom                      1
   rdf:type owl:Restriction                1
@@ -139,10 +149,10 @@ Not read by the extraction model
 
 Advice
   • 5 of 6 classes and properties have no description (rdfs:comment or skos:definition). After
-    labels, descriptions help the extraction model most: say what counts and what doesn't, and
+    labels, descriptions help the reader most: say what counts and what doesn't, and
     name the words people use for it.
       ex:Asset, ex:Bank, ex:Person and 2 more
-  • The extraction model reads an IRI's local name beside its label, and a local name like
+  • The reader reads an IRI's local name beside its label, and a local name like
     "employer_id" reads as a key column even when the label says "employer". Mint these IRIs
     from their labels.
       ex:employer_id
@@ -176,7 +186,7 @@ the two compare line for line. `slice` appears only with `--seed`.
 `estimate.document_chars` is the room left for text in one window, at most
 48,000.
 
-Finding codes: `no-ontology`, `no-class`, `no-label`, `catalog-blank-node`,
+Finding codes: `no-ontology`, `no-class`, `no-label`, `owl-machinery`, `catalog-blank-node`,
 `catalog-no-label`, `window-full` and `too-many-bytes` fail a request;
 `no-description`, `label-not-words`, `local-name-not-words`,
 `opaque-local-name`, `large-vocabulary`, `domain-range-not-shown`,
@@ -189,18 +199,23 @@ Finding codes: `no-ontology`, `no-class`, `no-label`, `catalog-blank-node`,
 fluree ontology from <FILE> [--seed <CLASSES>] [--depth <N>] [--format turtle|jsonld] [-o <FILE>]
 ```
 
-Reads an RDF ontology and writes it with what the extraction model reads made
+Reads an RDF ontology and writes it with what an HTTP reader reads made
 explicit:
 
-- SKOS labels and definitions copied into `rdfs:label` and `rdfs:comment`;
+- SKOS labels and definitions moved into `rdfs:label` and `rdfs:comment` (the
+  SKOS statement a fallback would read is replaced by the RDFS one);
 - a label made from the IRI where there is none;
 - labels that read as identifiers rewritten in words (`worksFor` becomes
   "works for", `employer_id` "employer id");
 - `owl:Class` and the OWL property types also declared `rdfs:Class` and
   `rdf:Property`;
-- OWL restrictions and other blank-node constructs dropped.
+- OWL restrictions and other blank-node constructs dropped;
+- OWL axioms written as nodes of their own (`[] a owl:AllDisjointClasses`) and
+  declarations of annotation properties and datatypes dropped, since a reader
+  would read them as catalog records and refuse the request; the summary counts
+  them.
 
-Domains, ranges and other axioms are kept: the extraction model doesn't see
+Domains, ranges and other axioms are kept: an HTTP reader doesn't see
 them, but a reading can still be checked against them. Catalog records in the
 file are kept, and one with an `rdfs:label` but no SKOS label gets it as
 `skos:prefLabel` (and its `rdfs:comment` as `skos:definition`).
@@ -224,7 +239,7 @@ fluree ontology check people.ttl
 
 ## Slicing
 
-Every class and property in the ontology is shown to the extraction model in
+Every class and property in the ontology is shown to the reader in
 every window. A whole public vocabulary costs tens of thousands of tokens and
 blurs which of several overlapping terms applies (schema.org alone is over a
 thousand classes and 1,600 properties), so slice it to what your documents
@@ -244,5 +259,6 @@ records are kept when they are typed with a kept class or have no type.
 
 ## See also
 
-- [`doc`](doc.md): ingest documents and extract entities and relations with an ontology
+- [`doc`](doc.md): `fluree doc ingest` extracts with an ontology; its
+  language-model extractor reads more of an ontology than an HTTP reader does
 - [`validate`](validate.md): validate data against SHACL shapes

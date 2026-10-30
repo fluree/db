@@ -1,6 +1,7 @@
 //! Ontology and catalog tools for document extraction.
 //!
-//! An extraction model that reads documents against a caller's ontology sees
+//! An HTTP reader (an extraction model reached over HTTP that reads documents
+//! against a caller's ontology, `fluree doc ingest`'s `[doc.reader]`) sees
 //! only part of it: each class's and property's label, its comment, one
 //! parent class, the SHACL shapes that target a class and the IRI's local
 //! name. It does not see domains, ranges, a second parent, SKOS annotations
