@@ -600,12 +600,6 @@ impl GarbagePlan {
         self.planned.is_empty()
     }
 
-    /// Whether the plan releases a version past the ceiling, inside the age
-    /// guard.
-    pub fn overrides_age_guard(&self) -> bool {
-        self.planned.iter().any(|p| p.overrides_age_guard)
-    }
-
     /// The result of a pass that releases none of this plan.
     pub fn unreleased(&self) -> CleanGarbageResult {
         CleanGarbageResult {
@@ -1853,12 +1847,6 @@ mod tests {
             };
 
             let store = test_store(&storage);
-            let plan = plan_garbage(&store, &cid3, &config).await.unwrap();
-            assert_eq!(
-                plan.overrides_age_guard(),
-                overrides,
-                "superseded {age_mins} minutes ago"
-            );
             let result = clean_garbage(&store, &cid3, config).await.unwrap();
 
             assert_eq!(

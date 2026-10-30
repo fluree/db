@@ -572,6 +572,26 @@ impl crate::NameServiceLookup for FileNameService {
         Ok(records)
     }
 
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        let ledger_dir = self
+            .storage
+            .path_of(&format!("fluree:file://{NS_VERSION}/{ledger_name}"))?;
+        let mut records = Vec::new();
+
+        for relative in Self::walk_ns_json_files(&ledger_dir).await? {
+            let relative = format!("{ledger_name}/{}", ns_record_stem(&relative));
+            // Strict, as in `all_records`; nested ledgers under the same
+            // directory are told apart by the record's name.
+            if let Some(record) = self.read_record_at(&relative).await? {
+                if record.name == ledger_name {
+                    records.push(record);
+                }
+            }
+        }
+
+        Ok(records)
+    }
+
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
         let ns_dir = self.storage.base_path().join(NS_VERSION);
         let mut records = Vec::new();
@@ -2987,6 +3007,46 @@ mod tests {
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].branch, "main");
+    }
+
+    /// `branch_records` lists one ledger's branches, retracted ones included,
+    /// and fails on a record it cannot read rather than leave it out: GC reads
+    /// a missing branch as one with nothing to protect. Another ledger's
+    /// records are never read.
+    #[tokio::test]
+    async fn test_file_branch_records_lists_one_ledger_strictly() {
+        let (temp, ns) = setup().await;
+        for id in ["mydb:main", "mydb:dev", "mydb/nested:main", "other:main"] {
+            ns.publish_commit(id, 1, &test_cid(id)).await.unwrap();
+        }
+        ns.retract("mydb:dev").await.unwrap();
+        let ns_dir = temp.path().join(NS_VERSION);
+        tokio::fs::write(ns_dir.join("other/main.json"), b"not json")
+            .await
+            .unwrap();
+        assert!(ns.all_records().await.is_err());
+
+        let mut branches: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        branches.sort();
+        assert_eq!(
+            branches,
+            ["dev", "main"],
+            "retracted kept, nested ledger left out"
+        );
+
+        tokio::fs::write(ns_dir.join("mydb/dev.json"), b"not json")
+            .await
+            .unwrap();
+        assert!(
+            ns.branch_records("mydb").await.is_err(),
+            "an unreadable branch fails the listing"
+        );
     }
 
     #[tokio::test]

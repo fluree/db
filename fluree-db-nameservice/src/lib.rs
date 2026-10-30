@@ -464,6 +464,22 @@ pub trait NameServiceLookup:
             .collect())
     }
 
+    /// Every branch record of `ledger_name`, retracted ones included, for a
+    /// caller that decides what to delete from it.
+    ///
+    /// Unlike [`list_branches`](Self::list_branches), a record that cannot be
+    /// read fails the call: a branch missing from the result would count as
+    /// one with nothing to protect. A retracted branch is restorable, so it is
+    /// listed too.
+    ///
+    /// The default implementation filters [`all_records`](Self::all_records),
+    /// which is O(ledgers). Backends that can list one ledger's branches
+    /// directly override it, and wrappers must forward it.
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        let all = self.all_records().await?;
+        Ok(all.into_iter().filter(|r| r.name == ledger_name).collect())
+    }
+
     /// Read both head pointers without assembling a full [`NsRecord`].
     ///
     /// Prefer this (or [`RefLookup::get_ref`] for a single head) over
@@ -1470,6 +1486,10 @@ where
 
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         (**self).list_branches(ledger_name).await
+    }
+
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        (**self).branch_records(ledger_name).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {

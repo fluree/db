@@ -3602,6 +3602,7 @@ dependencies = [
  "async-trait",
  "fluree-db-core",
  "fluree-vocab",
+ "futures",
  "parking_lot",
  "rand 0.8.8",
  "serde",

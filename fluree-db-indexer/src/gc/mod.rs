@@ -40,12 +40,14 @@
 //! defer it, and both would consume the manifests that named it. The worker
 //! serialises passes per ledger name for that reason.
 //!
-//! Which branches are siblings comes from a listing that may be minutes old,
-//! because `all_records()` is O(ledgers) on every nameservice backend, plus
-//! every branch this process has built since, which is the only way a fork
-//! the listing predates can reference more than its source did. Each
-//! sibling's *head* is never cached: it is one consistent `lookup`, made as
-//! the pass releases. See [`current_sibling_heads`].
+//! Which branches are siblings comes from a listing of the ledger's own
+//! branches (`NameServiceLookup::branch_records`), taken as the pass
+//! releases, plus every branch this process has built: DynamoDB lists through
+//! an eventually consistent index, so a branch created a moment ago can be
+//! missing from it. The listing is one ledger's records, not the
+//! nameservice's, because the pass holds that ledger's builds while it runs.
+//! Each sibling's *head* is one consistent `lookup`, made as the pass
+//! releases. See [`current_sibling_heads`].
 //!
 //! Blobs named by manifests the collector has already consumed, and anything
 //! orphaned off the chain, are reachable only by [`plan_sweep`], which

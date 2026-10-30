@@ -1621,6 +1621,31 @@ mod tests {
         assert_eq!(branches[0].branch, "main");
     }
 
+    /// The default `branch_records` keeps what `list_branches` drops: a
+    /// retracted branch is restorable, so GC must still see it.
+    #[tokio::test]
+    async fn branch_records_keeps_retracted_branches() {
+        let ns = MemoryNameService::new();
+        ns.init("mydb:main").await.unwrap();
+        let cid = test_commit_id("commit-1");
+        ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
+        ns.create_branch("mydb", "dead", "main", None)
+            .await
+            .unwrap();
+        ns.retract("mydb:dead").await.unwrap();
+        ns.init("other:main").await.unwrap();
+
+        let mut branches: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        branches.sort();
+        assert_eq!(branches, ["dead", "main"]);
+    }
+
     #[tokio::test]
     async fn drop_branch_refuses_parent_with_children() {
         let ns = MemoryNameService::new();

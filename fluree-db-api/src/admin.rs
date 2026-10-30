@@ -1419,7 +1419,7 @@ impl crate::Fluree {
         warnings: &mut Vec<String>,
     ) -> Vec<ContentId> {
         let backend = self.backend();
-        let records = match self.nameservice().all_records().await {
+        let records = match self.nameservice().branch_records(ledger_id.name()).await {
             Ok(records) => records,
             Err(e) => {
                 warnings.push(format!(
@@ -2456,10 +2456,10 @@ impl crate::Fluree {
                         }
                         _ => None,
                     };
-                    // A reindex is rare enough for a full listing; the
-                    // worker's own passes avoid one. A failed listing
-                    // defers every shared blob.
-                    let siblings = match gc_nameservice.all_records().await {
+                    // Listed inside the release window, so only this
+                    // ledger's branches. A failed listing defers every
+                    // shared blob.
+                    let siblings = match gc_nameservice.branch_records(gc_ledger_id.name()).await {
                         Ok(records) => {
                             let mut ids: Vec<LedgerId> = siblings_of(&records, &gc_ledger_id)
                                 .into_iter()

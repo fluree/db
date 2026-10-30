@@ -695,6 +695,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
         self.reader().all_records().await
     }
 
+    async fn branch_records(
+        &self,
+        ledger_name: &str,
+    ) -> std::result::Result<
+        Vec<fluree_db_nameservice::NsRecord>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().branch_records(ledger_name).await
+    }
+
     async fn heads(
         &self,
         ledger_id: &str,
