@@ -102,10 +102,18 @@ impl Fluree {
         // Each erased original's digest, with its transaction document's,
         // which the replacement keeps in its envelope.
         let mut txn_of: BTreeMap<String, Option<String>> = BTreeMap::new();
+        // The folders of originals a purge already deleted: their
+        // transaction documents are found without them.
+        let mut deleted_in: Vec<(String, String)> = Vec::new();
         let mut superseded = BTreeSet::new();
         for commit in &erased {
             let cid = commit_id(commit)?;
             if let Some(held) = runtime.index.erased(&cid).await? {
+                for address in &held.replaced_at {
+                    if let Some((folder, _)) = address.rsplit_once("/commit/") {
+                        deleted_in.push((folder.to_string(), cid.address_digest()));
+                    }
+                }
                 let latest = held.steps.last().map(|s| s.replacement.as_str());
                 let proved = jobs
                     .iter()
@@ -152,6 +160,11 @@ impl Fluree {
             };
             plan.originals.push(address.clone());
             if let Some(txn) = txn {
+                named.insert((folder, txn));
+            }
+        }
+        for (folder, digest) in &deleted_in {
+            if let Some(Some(txn)) = txn_of.get(digest) {
                 named.insert((folder, txn));
             }
         }

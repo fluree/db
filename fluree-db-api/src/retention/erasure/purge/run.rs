@@ -122,6 +122,11 @@ impl Fluree {
             report.waiting = true;
             return Ok(report);
         }
+        // What a stopped member's log would write back is back before the
+        // plan lists what to delete.
+        if clustered {
+            self.retire_stopped_logs().await?;
+        }
         let clock = Instant::now();
         let plan = self.plan_purge(ledger).await?;
         report.timings.plan += clock.elapsed();
@@ -320,6 +325,10 @@ impl Fluree {
         if clustered {
             self.retire_stopped_logs().await?;
         }
+        // A document a replay wrote back since the scan goes too: the scan
+        // was taken before the originals, the only other source, went.
+        let others: Vec<&String> = plan.transactions.iter().chain(&plan.superseded).collect();
+        let mut deleted = self.delete_files(&others).await?;
         // Their folders' histories still read them: a later erasure of the
         // same commit must find them.
         self.erasure_runtime()?
@@ -327,7 +336,7 @@ impl Fluree {
             .record_replaced_at(&plan.originals)
             .await?;
         let originals: Vec<&String> = plan.originals.iter().collect();
-        let deleted = self.delete_files(&originals).await?;
+        deleted += self.delete_files(&originals).await?;
         report.deleted += deleted;
         let runtime = self.erasure_runtime()?;
         for address in plan

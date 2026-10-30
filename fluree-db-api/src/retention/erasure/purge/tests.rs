@@ -65,6 +65,75 @@ fn holds(captured: &[super::Captured], value: &str) -> bool {
         .any(|c| matches!(&c.flake.o, FlakeValue::String(s) if s == value))
 }
 
+/// A transaction document written back after a purge's scan, as a stopped
+/// member's log replays it, is deleted with the originals, and found once
+/// they are gone: by the folders the purge recorded deleting them from.
+#[tokio::test]
+async fn a_document_written_back_after_the_scan_is_purged() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/replayed").await.unwrap();
+    let id = "t/replayed:main";
+    fluree
+        .graph(id)
+        .transact()
+        .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
+        .insert(&json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}))
+        .commit()
+        .await
+        .unwrap();
+    erase(&fluree, id, email("alice", "a@secret")).await;
+    let plan = fluree.plan_purge(id).await.unwrap();
+    assert_eq!(plan.transactions.len(), 1, "{plan:?}");
+    let document = dir
+        .path()
+        .join(plan.transactions[0].strip_prefix("fluree:file://").unwrap());
+    let bytes = std::fs::read(&document).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("a@secret"));
+
+    // The pass scanned and deleted the originals; then the document came
+    // back.
+    let request = fluree
+        .retention_status(id)
+        .await
+        .unwrap()
+        .registration
+        .unwrap()
+        .erasures[0]
+        .request_id
+        .clone();
+    fluree
+        .update_job(id, &request, |j| {
+            j.stage = super::super::ErasureStage::Purging;
+            let p = j.purge.get_or_insert_with(Default::default);
+            p.rebuilt_ms = Some(1);
+            p.scanned_ms = Some(1);
+        })
+        .await
+        .unwrap();
+    let runtime = fluree.erasure_runtime().unwrap();
+    runtime
+        .index
+        .record_replaced_at(&plan.originals)
+        .await
+        .unwrap();
+    for address in plan.originals.iter().chain(&plan.transactions) {
+        runtime.index.delete_raw(address).await.unwrap();
+    }
+    std::fs::write(&document, &bytes).unwrap();
+    assert_eq!(
+        fluree.plan_purge(id).await.unwrap().transactions,
+        plan.transactions
+    );
+
+    let report = fluree
+        .run_purge_pass(id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert!(!document.exists());
+}
+
 /// On a cluster a purge plans only the jobs every member has installed: a
 /// member that has not still reads the originals, and may write them back.
 #[tokio::test]
