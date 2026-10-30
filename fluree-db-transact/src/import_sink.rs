@@ -1744,6 +1744,20 @@ mod inner {
             assert_ne!(b3, b4);
         }
 
+        /// An anonymous node's id is part of its document's import: a later
+        /// import of the same file agrees with an earlier one only while this
+        /// spelling holds, so it is pinned exactly.
+        #[test]
+        fn anonymous_nodes_mint_the_ids_a_reimport_agrees_on() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = ImportSink::new(&mut ns, 1, "doc".to_string(), 3, true).unwrap();
+            let ids: Vec<String> = [sink.term_blank(None), sink.term_blank(None)]
+                .into_iter()
+                .map(|t| sink.resolve_sid(t).unwrap().name_str().to_string())
+                .collect();
+            assert_eq!(ids, ["fdb-doc--b3-1", "fdb-doc--b3-2"]);
+        }
+
         #[test]
         fn test_list_items() {
             let mut ns = NamespaceRegistry::new();
