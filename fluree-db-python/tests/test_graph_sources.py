@@ -358,6 +358,20 @@ def test_a_google_identity_is_never_a_literal_key_and_its_config_is_checked(conn
     path.write_text("[]")
     with pytest.raises(InvalidRequestError, match="Workload Identity Federation"):
         conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(path))
+    # A path may be a plain string, and is read like a Path: the configuration
+    # reaches the engine.
+    path.write_text(json.dumps(wif))
+    for given in (path, str(path)):
+        with pytest.raises(InvalidRequestError, match="credential_source"):
+            conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(given))
+    # A missing file is a clear refusal, not a bare FileNotFoundError.
+    missing = tmp_path / "missing.json"
+    with pytest.raises(InvalidRequestError, match="cannot read the Workload Identity"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(missing))
+    with pytest.raises(InvalidRequestError, match="no file is at the path given"):
+        conn.map_iceberg(
+            "x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(str(missing))
+        )
     with pytest.raises(InvalidRequestError, match="storage scope"):
         conn.map_iceberg(
             "x",

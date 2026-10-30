@@ -113,17 +113,7 @@ class Google:
         if isinstance(credentials, EnvVar):
             return {"source": "service_account", "key": {"env_var": credentials.name}}
         if isinstance(credentials, os.PathLike):
-            text = Path(credentials).read_text(encoding="utf-8")
-            try:
-                config = json.loads(text)
-            except ValueError:
-                config = None
-            if not isinstance(config, dict):
-                raise InvalidRequestError(
-                    f"{os.fspath(credentials)} does not hold a Workload Identity Federation "
-                    "credential configuration (a JSON object)"
-                )
-            return {"source": "external_account", "config": config}
+            return _wif_file(Path(credentials), os.fspath(credentials))
         if isinstance(credentials, Mapping):
             return {"source": "external_account", "config": dict(credentials)}
         if credentials == "metadata":
@@ -131,11 +121,16 @@ class Google:
         if credentials == "application_default":
             return {"source": "application_default"}
         if isinstance(credentials, str):
+            # Any other string is the path of a WIF configuration file, unless
+            # it is JSON text: a key given literally. Neither is repeated in a
+            # refusal, since the string may be a key.
+            if not credentials.lstrip().startswith("{") and Path(credentials).is_file():
+                return _wif_file(Path(credentials), "the file given")
             raise InvalidRequestError(
                 'Google credentials are "metadata", "application_default", an EnvVar holding a '
                 "service-account key (a key is never given literally, since it would be stored "
                 "with the source), or a Workload Identity Federation configuration (a dict, or "
-                "the path of its file)"
+                "the path of its file; no file is at the path given)"
             )
         raise TypeError(
             "Google credentials are a str, an EnvVar, a dict or a path, not "
@@ -159,6 +154,27 @@ class Google:
         if self.quota_project is not None:
             spec["quota_project"] = self.quota_project
         return spec
+
+
+def _wif_file(path: Path, named: str) -> dict[str, Any]:
+    """A Workload Identity Federation credential configuration from its file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise InvalidRequestError(
+            f"cannot read the Workload Identity Federation credential configuration {named}: "
+            f"{e.strerror or type(e).__name__}"
+        ) from None
+    try:
+        config = json.loads(text)
+    except ValueError:
+        config = None
+    if not isinstance(config, dict):
+        raise InvalidRequestError(
+            f"{named} does not hold a Workload Identity Federation credential configuration "
+            "(a JSON object)"
+        )
+    return {"source": "external_account", "config": config}
 
 
 Auth = Union[Bearer, OAuth2, Google]
