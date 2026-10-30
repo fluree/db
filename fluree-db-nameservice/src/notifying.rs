@@ -78,10 +78,6 @@ where
         self.inner.all_records().await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        self.inner.list_branches(ledger_name).await
-    }
-
     async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         self.inner.branch_records(ledger_name).await
     }

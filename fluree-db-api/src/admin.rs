@@ -628,9 +628,10 @@ impl crate::Fluree {
             ..Default::default()
         };
 
-        // 1. Snapshot every record under this ledger name. Use `all_records`
-        // (not `list_branches`, which excludes retracted) so hard-drop cleans
-        // up retracted-but-not-purged branches too. Keep the snapshots in
+        // 1. Snapshot every record under this ledger name, retracted ones
+        // included, so hard-drop cleans up retracted-but-not-purged branches
+        // too. `all_records` rather than `branch_records`: the nested-ledger
+        // check needs the whole listing anyway. Keep the snapshots in
         // memory — the CID-walk fallback needs them after the records are
         // purged from the nameservice.
         // Enumeration failures propagate as errors: silently coercing them
@@ -2608,9 +2609,10 @@ impl crate::Fluree {
     /// Hold every branch of `ledger_name` excluded from indexing and collect
     /// their index heads.
     ///
-    /// Enumerates through `all_records` rather than `list_branches` so that
-    /// **retracted** branches participate. A soft drop is reversible until the
-    /// name is purged, so a soft-dropped branch's index must survive a sweep.
+    /// Enumerates every record under the name, so that **retracted** branches
+    /// participate, through `all_records`, which the nested-ledger check needs
+    /// too. A soft drop is reversible until the name is purged, so a
+    /// soft-dropped branch's index must survive a sweep.
     /// Its own artifacts are safe either way — an unlisted branch contributes
     /// no prefix to scan — but dict blobs are shared across a ledger's
     /// branches, so omitting one would reclaim dicts it still reads.

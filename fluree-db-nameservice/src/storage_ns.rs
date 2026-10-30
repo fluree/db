@@ -584,25 +584,10 @@ where
         self.load_heads(&ledger_name, &branch).await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        let mut records = Vec::new();
-
-        for key in self.ledger_record_keys(ledger_name).await? {
-            // Keys under `{ledger_name}/` also include nested ledgers
-            // (`{ledger_name}/sub/main.json`); the record says which it is.
-            if let Ok(Some(record)) = self.read_record_at(&key).await {
-                if record.name == ledger_name && !record.retracted {
-                    records.push(record);
-                }
-            }
-        }
-
-        Ok(records)
-    }
-
     /// One LIST under the ledger's prefix and a bounded number of record
     /// reads in flight, so the cost follows this ledger's branches, not the
-    /// store's ledgers.
+    /// store's ledgers. Keys under the prefix include nested ledgers
+    /// (`{ledger_name}/sub/main.json`); the record says which it is.
     async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         let keys = self.ledger_record_keys(ledger_name).await?;
         let records: Vec<Option<NsRecord>> = stream::iter(keys)
@@ -2185,10 +2170,10 @@ mod tests {
             ]
         );
 
-        let acme: Vec<_> = ns.list_branches("acme").await.unwrap();
+        let acme: Vec<_> = ns.branch_records("acme").await.unwrap();
         assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
         let mut mydb: Vec<String> = ns
-            .list_branches("mydb")
+            .branch_records("mydb")
             .await
             .unwrap()
             .into_iter()

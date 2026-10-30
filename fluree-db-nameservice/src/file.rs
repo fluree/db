@@ -336,7 +336,7 @@ impl FileNameService {
         // yields a clean not-found and callers fall back to graph-source
         // resolution — instead of failing to deserialize NsFileV2 with a
         // "missing field `f:ledger`" error. This is the single guard shared by
-        // all ledger read paths (`lookup`, `list_branches`, `all_records`).
+        // all ledger read paths (`lookup`, `branch_records`, `all_records`).
         if Self::is_graph_source_from_bytes(&main_bytes) {
             return Ok(None);
         }
@@ -551,7 +551,7 @@ impl crate::NameServiceLookup for FileNameService {
         self.load_heads(&ledger_name, &branch).await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         let ledger_dir = self
             .storage
             .path_of(&format!("fluree:file://{NS_VERSION}/{ledger_name}"))?;
@@ -562,26 +562,6 @@ impl crate::NameServiceLookup for FileNameService {
             // (`{ledger_name}/sub/main.json`); the record says which it is.
             // Graph-source records are skipped by `read_record_at` (Ok(None)).
             let relative = format!("{ledger_name}/{}", ns_record_stem(&relative));
-            if let Ok(Some(record)) = self.read_record_at(&relative).await {
-                if record.name == ledger_name && !record.retracted {
-                    records.push(record);
-                }
-            }
-        }
-
-        Ok(records)
-    }
-
-    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        let ledger_dir = self
-            .storage
-            .path_of(&format!("fluree:file://{NS_VERSION}/{ledger_name}"))?;
-        let mut records = Vec::new();
-
-        for relative in Self::walk_ns_json_files(&ledger_dir).await? {
-            let relative = format!("{ledger_name}/{}", ns_record_stem(&relative));
-            // Strict, as in `all_records`; nested ledgers under the same
-            // directory are told apart by the record's name.
             if let Some(record) = self.read_record_at(&relative).await? {
                 if record.name == ledger_name {
                     records.push(record);
@@ -1924,10 +1904,10 @@ mod tests {
             ]
         );
 
-        let acme: Vec<_> = ns.list_branches("acme").await.unwrap();
+        let acme: Vec<_> = ns.branch_records("acme").await.unwrap();
         assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
         let mut mydb: Vec<String> = ns
-            .list_branches("mydb")
+            .branch_records("mydb")
             .await
             .unwrap()
             .into_iter()
@@ -2050,7 +2030,7 @@ mod tests {
             assert!(ns.index_path(name, branch).is_err(), "{name}:{branch}");
             assert!(ns.commits_path(name, branch).is_err(), "{name}:{branch}");
         }
-        assert!(ns.list_branches("../beside").await.is_err());
+        assert!(ns.branch_records("../beside").await.is_err());
     }
 
     /// A branch whose name begins with `/` is no ledger address: publishing,
@@ -2299,7 +2279,7 @@ mod tests {
     }
 
     /// The graph-source skip is now a single guard fused into `load_record`, so
-    /// the listing paths (`list_branches` / `all_records`) must keep excluding
+    /// the listing paths (`branch_records` / `all_records`) must keep excluding
     /// graph-source records without their own pre-check. A coexisting real ledger
     /// still resolves (#1369).
     #[tokio::test]
@@ -2317,8 +2297,8 @@ mod tests {
         assert!(ns.lookup("realdb:main").await.unwrap().is_some());
         assert!(matches!(ns.lookup("gs:main").await, Ok(None)));
 
-        // list_branches / all_records exclude the graph-source record.
-        assert!(ns.list_branches("gs").await.unwrap().is_empty());
+        // branch_records / all_records exclude the graph-source record.
+        assert!(ns.branch_records("gs").await.unwrap().is_empty());
         let all = ns.all_records().await.unwrap();
         assert_eq!(all.len(), 1, "all_records should list only the ledger");
         assert_eq!(all[0].ledger_id, "realdb:main");
@@ -2943,7 +2923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_list_branches() {
+    async fn test_file_branch_records() {
         let (_temp, ns) = setup().await;
         ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-3");
@@ -2957,7 +2937,7 @@ mod tests {
         // Also create a different ledger to ensure filtering works
         ns.init("other:main").await.unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
+        let branches = ns.branch_records("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
         let mut names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
         names.sort();
@@ -2965,7 +2945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_list_branches_with_slashes() {
+    async fn test_file_branch_records_with_slashes() {
         let (_temp, ns) = setup().await;
         ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
@@ -2978,7 +2958,7 @@ mod tests {
             .await
             .unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
+        let branches = ns.branch_records("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
         let mut names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
         names.sort();
@@ -2986,27 +2966,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_list_branches_unknown_ledger() {
+    async fn test_file_branch_records_unknown_ledger() {
         let (_temp, ns) = setup().await;
-        let branches = ns.list_branches("nonexistent").await.unwrap();
+        let branches = ns.branch_records("nonexistent").await.unwrap();
         assert!(branches.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_file_list_branches_excludes_retracted() {
-        let (_temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
-        let cid = test_cid("commit-1");
-        ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
-
-        ns.create_branch("mydb", "dead", "main", None)
-            .await
-            .unwrap();
-        ns.retract("mydb:dead").await.unwrap();
-
-        let branches = ns.list_branches("mydb").await.unwrap();
-        assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0].branch, "main");
     }
 
     /// `branch_records` lists one ledger's branches, retracted ones included,

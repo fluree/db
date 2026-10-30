@@ -180,19 +180,6 @@ impl NameServiceLookup for CompositeNameService {
         Ok(records)
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        match self.mount_for(ledger_name) {
-            Some((mount, remote)) => Ok(mount
-                .lookup
-                .list_branches(remote)
-                .await?
-                .into_iter()
-                .map(|r| mount.localize_record(r))
-                .collect::<Result<_>>()?),
-            None => self.local.list_branches(ledger_name).await,
-        }
-    }
-
     async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         match self.mount_for(ledger_name) {
             Some((mount, remote)) => mount
