@@ -117,8 +117,10 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 
 | Command | Description |
 |---------|-------------|
+| [`login`](login.md) | Sign this machine in to a fluree.ai account |
+| [`logout`](logout.md) | Sign this machine out of its fluree.ai account |
 | [`token`](token.md) | Create, inspect, and manage JWS tokens |
-| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token) |
+| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token), and show the account sign-in |
 
 ### Configuration
 
