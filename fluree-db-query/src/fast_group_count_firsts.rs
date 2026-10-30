@@ -884,13 +884,14 @@ pub(crate) fn group_count_v6(
     cancellation: &QueryCancellation,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
-    // A vector's `o_key` is one fact's arena handle, so equal vectors are
-    // neither one run nor adjacent in POST order
-    // (`OType::o_key_is_predicate_identifying`): the run-length count would
-    // split each value's group. Callers fall back on the error.
-    if store.holds_vectors(g_id, p_id) {
+    // Where one value can sit under several keys (a vector arena, a legacy
+    // decimal arena), its rows are neither one run nor adjacent in POST
+    // order, and the run-length count would split its group
+    // (`BinaryIndexStore::objects_keyed_by_value`). Callers fall back on the
+    // error.
+    if !store.objects_keyed_by_value(g_id, p_id) {
         return Err(QueryError::Internal(
-            "group count: predicate holds vectors, whose keys are not values".to_string(),
+            "group count: the predicate's object keys are not values".to_string(),
         ));
     }
 
@@ -1431,9 +1432,9 @@ fn compute_group_by_object_star_topk(
             Ok(Some(crate::binding::Batch::empty(schema)?))
         };
     };
-    // Groups key on `(o_type, o_key)`, which for a vector is one fact's
-    // arena handle, not its value (`OType::o_key_is_predicate_identifying`).
-    if store.holds_vectors(g_id, p_id) {
+    // Groups key on `(o_type, o_key)`, which names a value only where
+    // `BinaryIndexStore::objects_keyed_by_value` holds.
+    if !store.objects_keyed_by_value(g_id, p_id) {
         return Ok(None);
     }
     let mut out = ColumnSet::EMPTY;

@@ -1835,15 +1835,16 @@ struct PredicateLeadPartial {
 /// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
 /// excluded), so the 14-byte `p+o` prefix defines a group.
 ///
-/// `None` for a predicate that holds vectors: a vector's `o_key` is one
-/// fact's handle, not its value's ([`OType::o_key_is_predicate_identifying`]),
-/// so the lead groups count stored facts rather than distinct vectors.
+/// `None` where one value can sit under several keys
+/// ([`BinaryIndexStore::objects_keyed_by_value`]): a vector arena gives every
+/// stored fact its own handle, and a legacy decimal arena gives each scale
+/// variant one, so the lead groups would count keys rather than values.
 pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
 ) -> Result<Option<u64>> {
-    if store.holds_vectors(g_id, p_id) {
+    if !store.objects_keyed_by_value(g_id, p_id) {
         return Ok(None);
     }
     count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)

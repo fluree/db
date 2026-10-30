@@ -1741,18 +1741,9 @@ impl BinaryIndexStore {
             .filter(|&dims| dims != 0)
     }
 
-    /// Whether `(g_id, p_id)` has a vector arena, so its rows may hold vector
-    /// objects. Their `o_key` is not a value identity even within the
-    /// predicate (`OType::o_key_is_predicate_identifying`), so a consumer that
-    /// keys objects on `(o_type, o_key)` declines when this holds.
-    pub fn holds_vectors(&self, g_id: GraphId, p_id: u32) -> bool {
-        self.graph_indexes
-            .get(&g_id)
-            .is_some_and(|gi| gi.vectors.contains_key(&p_id))
-    }
-
-    /// Whether any predicate of `g_id` has a vector arena (see
-    /// [`Self::holds_vectors`]).
+    /// Whether any predicate of `g_id` has a vector arena, whose object keys
+    /// are not value identities even within the predicate
+    /// (`OType::o_key_is_predicate_identifying`).
     pub fn graph_holds_vectors(&self, g_id: GraphId) -> bool {
         self.graph_indexes
             .get(&g_id)
@@ -2555,6 +2546,23 @@ impl BinaryIndexStore {
             .get(&g_id)
             .and_then(|graph| graph.numbig.get(&p_id))
             .is_some_and(crate::arena::numbig::NumBigArena::is_decimal_only)
+    }
+
+    /// Whether `(g_id, p_id)`'s object keys name values one to one, so a
+    /// consumer may count or group the predicate's objects by their raw
+    /// `(o_type, o_key)`. Two arenas break that within one predicate: a
+    /// vector arena, which gives every stored fact its own handle
+    /// (`OType::o_key_is_predicate_identifying`), and a legacy NumBig arena
+    /// with scale-variant duplicates ([`Self::graph_numbig_has_duplicate_handles`]).
+    pub fn objects_keyed_by_value(&self, g_id: GraphId, p_id: u32) -> bool {
+        let Some(gi) = self.graph_indexes.get(&g_id) else {
+            return true;
+        };
+        !gi.vectors.contains_key(&p_id)
+            && !gi
+                .numbig
+                .get(&p_id)
+                .is_some_and(crate::arena::numbig::NumBigArena::has_duplicate_handles)
     }
 
     /// Whether any NumBig arena of `g_id` holds one value under several

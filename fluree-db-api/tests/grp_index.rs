@@ -31,6 +31,8 @@ mod it_ledger_info_reindex_size;
 mod it_memory_storage_reads;
 #[path = "it_notify_incremental.rs"]
 mod it_notify_incremental;
+#[path = "it_numbig_legacy_identity.rs"]
+mod it_numbig_legacy_identity;
 #[path = "it_reasoning_reindex.rs"]
 mod it_reasoning_reindex;
 #[path = "it_reindex_class_stats.rs"]
