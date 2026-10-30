@@ -24,7 +24,10 @@
 //! ones shared verdicts on the same ledger, and the store's part was its
 //! address, which a store built after another was dropped can reuse. Both
 //! surfaces run on one ledger here, in both orders, and a rebuilt store is
-//! checked against a dropped one.
+//! checked against a dropped one. Nor did the key say which view's
+//! dictionary an id came from: two staged previews over one store give their
+//! own new strings the same ids, so a verdict is now remembered only for an
+//! id the store itself persisted.
 
 use crate::support::{query_jsonld_formatted, query_sparql_formatted};
 use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder, ReindexOptions};
@@ -280,6 +283,68 @@ async fn a_rebuilt_store_does_not_answer_for_a_dropped_one() {
         }
         drop(ledger);
         drop(fluree);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Two staged previews over one indexed ledger each introduce a string the
+/// index doesn't hold. Each preview's dictionary layer gives its new strings
+/// ids of its own above the persisted ones, so the two previews give one id
+/// to different strings, and a verdict remembered in one must not answer in
+/// the other. The string reaches the filter encoded through the join: the
+/// scan decodes every row once there is novelty, but the join's probe keeps
+/// a string encoded, view-local id and all.
+#[tokio::test(flavor = "current_thread")]
+async fn previews_over_one_store_do_not_share_verdicts_for_their_own_strings() {
+    use fluree_db_api::{GraphDb, QueryInput};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/filter-pushdown-previews:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    fluree
+        .insert_turtle(
+            ledger,
+            "@prefix : <http://example.org/#> .\n:seed :kind :thing ; :v \"seed\" .",
+        )
+        .await
+        .expect("seed");
+    fluree
+        .reindex(id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    assert!(ledger.snapshot.range_provider.is_some(), "setup");
+
+    let q = r#"PREFIX : <http://example.org/#> SELECT ?s WHERE { ?s :kind :thing . ?s :v ?v FILTER(REGEX(?v, "b")) }"#;
+    let mut failures = Vec::new();
+    for (round, value) in ["xyz", "abc", "xyz", "abc"].into_iter().enumerate() {
+        let staged = fluree
+            .stage_owned(ledger.clone())
+            .insert(&json!({
+                "@context": {"ex": "http://example.org/#"},
+                "@id": "ex:new",
+                "ex:kind": {"@id": "ex:thing"},
+                "ex:v": value
+            }))
+            .stage()
+            .await
+            .expect("stage");
+        let preview = GraphDb::from_staged(&staged).expect("preview");
+        let out = fluree
+            .query(&preview, QueryInput::Sparql(q))
+            .await
+            .expect("query");
+        let got = subjects(&out.to_jsonld(&preview.snapshot).expect("jsonld"));
+        let want: Vec<String> = if value == "abc" {
+            vec!["new".into()]
+        } else {
+            vec![]
+        };
+        if got != want {
+            failures.push(format!(
+                "round {round} ({value:?}): {got:?}, expected {want:?}"
+            ));
+        }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
