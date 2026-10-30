@@ -1002,9 +1002,10 @@ fn cached_wif_identity(wif: &str, ctx: &IdentityContext) -> Option<Arc<GoogleIde
 
 /// A warm plan reuses the identity it built (a key parse and an HTTP
 /// client), but authorizes the secret behind it on every plan: the resolver
-/// is asked each time, before the cache. The proof is not cached either:
-/// each plan asks the identity for a token again, here signed by a subject
-/// that cannot sign it.
+/// is asked each time, before the cache. The proof is not skipped either:
+/// each plan asks the identity for a token, here signed by a subject that
+/// cannot sign it, and each is refused. (The token cache backs off after the
+/// failed exchange, so the subject is asked once in that window.)
 #[tokio::test]
 async fn a_warm_plan_reuses_its_google_identity_but_resolves_and_proves_it_every_time() {
     let wif = serde_json::Value::Object(gcloud_wif_config()).to_string();
@@ -1023,7 +1024,7 @@ async fn a_warm_plan_reuses_its_google_identity_but_resolves_and_proves_it_every
             .await
             .expect_err("the subject signs nothing");
         assert!(err.to_string().contains("subject unavailable"), "{err}");
-        assert_eq!(subject.calls(), attempt, "proved on every plan");
+        assert_eq!(subject.calls(), 1, "one exchange per backoff window");
         assert_eq!(resolver.calls(), attempt, "resolved on every plan");
         let cached = cached_wif_identity(&wif, &ctx).expect("the identity is cached");
         match &first {
