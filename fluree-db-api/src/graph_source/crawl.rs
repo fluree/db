@@ -309,6 +309,7 @@ pub(crate) async fn expand_wildcard_crawl(
             ),
         ));
     }
+    refuse_depth(input, &projection)?;
 
     // Cluster B (D4): a constant-IRI select-map root routes onto the proven
     // bound-subject scan machinery (a dedicated single-subject expansion), not the
@@ -803,6 +804,37 @@ pub(crate) async fn maybe_expand_crawl(
         format_config,
     )
     .await
+}
+
+/// Refuse a `depth` the crawl cannot honour. Native hydration expands each
+/// reference `depth` levels into the referenced node's own properties; the
+/// crawl renders a reference as `{"@id": …}` and expands none, so a positive
+/// `depth` on a selection that reads properties would be answered as `0`.
+/// `["@id"]` and `["@type"]` read no reference, so any depth answers the same
+/// there. A `depth` that is not a non-negative integer is refused as native
+/// refuses it.
+fn refuse_depth(input: &JsonValue, projection: &CrawlProjection) -> Result<()> {
+    let Some(obj) = input.as_object() else {
+        return Ok(());
+    };
+    let depth = fluree_db_query::parse::options::parse_depth(obj)
+        .map_err(|e| crate::ApiError::invalid_query(e.to_string()))?;
+    let reads_references = match projection {
+        CrawlProjection::Wildcard => true,
+        CrawlProjection::IdOnly => false,
+        CrawlProjection::Predicates { predicates, .. } => !predicates.is_empty(),
+    };
+    if depth > 0 && reads_references {
+        return Err(crate::ApiError::Query(
+            fluree_db_query::QueryError::r2rml_unsupported_pattern(format!(
+                "`depth` ({depth}) on a subgraph crawl over a graph source is not supported: \
+                 the crawl renders each reference as its `@id` and expands none, so it \
+                 would answer as `depth: 0`. Crawl each referenced subject with its own \
+                 `{{\"select\": {{\"<iri>\": [\"*\"]}}}}` instead."
+            )),
+        ));
+    }
+    Ok(())
 }
 
 /// Recognize a single-column subgraph crawl `{"select": {"?s": [...]}, ...}` in
@@ -2822,6 +2854,73 @@ mod e2e {
             .expect("an override naming no limit replaces the body's")
             .expect("crawl shape is handled");
         assert_eq!(out.as_array().unwrap().len(), 2_000);
+    }
+
+    // `depth` expands references on a native ledger; the crawl expands none,
+    // so a positive depth on a selection that reads properties is refused
+    // (400) rather than answered as depth 0. Selections that read no
+    // reference, and depth 0, answer as before; a malformed depth is refused
+    // as native refuses it.
+    #[tokio::test]
+    async fn crawl_refuses_a_depth_it_cannot_honour() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let with_depth = |projection: JsonValue, depth: JsonValue| {
+            let mut q = person_crawl(projection, None);
+            q["depth"] = depth;
+            q
+        };
+        for projection in [json!(["*"]), json!(["v:name"]), json!(["@id", "v:name"])] {
+            let err = try_crawl(
+                &provider,
+                &view,
+                &with_depth(projection.clone(), json!(2)),
+                None,
+            )
+            .await
+            .expect_err("a positive depth that would expand references is refused");
+            assert!(
+                matches!(
+                    err,
+                    crate::ApiError::Query(
+                        fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. }
+                    )
+                ),
+                "{projection}: {err:?}"
+            );
+            assert_eq!(err.status_code(), 400, "{projection}: {err}");
+            assert!(err.to_string().contains("depth"), "{projection}: {err}");
+        }
+        let detail = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"http://example.org/person/1": ["*"]},
+            "depth": 1,
+        });
+        let err = try_crawl(&provider, &view, &detail, None)
+            .await
+            .expect_err("a constant-IRI crawl refuses a positive depth too");
+        assert_eq!(err.status_code(), 400, "{err}");
+
+        for (projection, depth) in [
+            (json!(["@id"]), json!(3)),
+            (json!(["@type"]), json!(3)),
+            (json!(["*"]), json!(0)),
+        ] {
+            try_crawl(
+                &provider,
+                &view,
+                &with_depth(projection.clone(), depth.clone()),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{projection} at depth {depth}: {e}"))
+            .expect("crawl shape is handled");
+        }
+
+        let err = try_crawl(&provider, &view, &with_depth(json!(["*"]), json!(-1)), None)
+            .await
+            .expect_err("a negative depth is refused");
+        assert_eq!(err.status_code(), 400, "{err}");
     }
 
     // The flat query carries the reasoning keys. With RDFS and an inline

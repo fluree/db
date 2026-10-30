@@ -278,6 +278,7 @@ For genuinely unbounded traversal, materialize the graph source into a native le
 
 - **A top-level `values`** — dropping it would return every subject the `where` matches, not the ones `values` names. Put the constraint in the `where` clause instead.
 - **`groupBy` / `having`** — dropping them would return subjects whose groups `having` rejects. Select the grouped variables with a flat `select` instead.
+- **A positive `depth`** on a selection that reads properties (`["*"]` or a property list) — on a native ledger `depth` expands each reference into the referenced node's own properties, but the rewrite renders a reference as its `@id` and expands none, so it would answer as `depth: 0`. Select each referenced subject with its own `"select": {"<iri>": ["*"]}` instead. `["@id"]` and `["@type"]` read no reference, so they take any `depth`.
 - **An `offset` past 10,000 subjects** — each page reads every subject before it again, so paging that deep is refused. Narrow the `where` clause instead.
 
 A flat `select` (`"select": ["?s", "?name"]`) is not a subgraph selection: it takes `values`, `groupBy` and `having` as usual.
