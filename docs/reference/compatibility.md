@@ -353,6 +353,10 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 Changes within v1 that a client may need to account for.
 
+#### Writing schema triples is checked by modify policy
+
+Schema triples (`rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`, and `rdf:type` declaring a class or property) used to be exempt from `f:modify` policy, so any identity able to transact could write or retract them. A policy on a class or property also covers its subclasses and subproperties, so writing the hierarchy changes what policies allow. Schema triples are now checked like any other flake. An identity with `f:defaultAllow` or no policy is unaffected. A restricted identity that maintains the ontology needs modify permission for those triples, for example an `f:onProperty` policy on `rdfs:subPropertyOf` and `rdfs:subClassOf`. This includes `CLEAR` and `DROP` of a graph holding schema triples. Reading the schema is unchanged: view policy still lets every schema triple through. See [Schema writes](../security/policy-in-transactions.md#schema-writes).
+
 #### SHACL is enforced only where the ledger config enables it (breaking)
 
 Shapes no longer enable SHACL on their own. A ledger that holds shapes but has no config setting `f:shaclEnabled true` used to validate every write against them in reject mode; it now validates nothing until its config enables SHACL, ledger-wide or per graph. Ledgers whose config already enables SHACL are unchanged, and so are configs without a SHACL group, which were already unenforced. The same applies to shapes published through GraphQL or `fluree model entity define`, and to branch merge, rebase, revert and push. In a GraphQL schema, `sh:minCount ≥ 1` makes a field non-null only where the config enables SHACL; elsewhere the field is nullable.

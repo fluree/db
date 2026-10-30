@@ -2978,8 +2978,8 @@ async fn test_graph_mgmt_honors_modify_policy() {
     let ledger_id = "it/graph-mgmt-policy:main";
     let ledger = genesis_ledger(&fluree, ledger_id);
 
-    // One non-schema flake in the default graph (schema flakes bypass modify
-    // policy via is_schema_flake, so use a plain triple).
+    // One plain triple in the default graph (a schema triple is judged alike:
+    // `test_clear_default_schema_flakes_follow_modify_policy`).
     let ledger = run_sparql_update(
         &fluree,
         ledger,
@@ -4884,15 +4884,13 @@ WHERE { ?s ex:handle ?h }",
     }
 }
 
-/// N3 contract pin: schema flakes (rdfs:Class / rdfs:subClassOf …) are exempt
-/// from modify policy (`is_schema_flake`), so a view-only, default-deny
-/// identity CAN `CLEAR DEFAULT` a schema-only default graph — the documented
-/// (policy-unblockable) ontology-wipe footgun. The companion test above
-/// proves the SAME identity is rejected for non-schema flakes, so this pins
-/// the boundary rather than a policy hole: if the always-allow schema
-/// exemption is ever narrowed, this test flips and the change is deliberate.
+/// Schema flakes (rdfs:Class / rdfs:subClassOf …) are judged by modify
+/// policy like any other, so a view-only, default-deny identity cannot
+/// `CLEAR DEFAULT` a schema-only default graph, as the companion test above
+/// shows it cannot clear a plain triple. Writing the hierarchy widens what
+/// policies on its classes and properties allow, so it is not exempt.
 #[tokio::test]
-async fn test_clear_default_schema_flakes_bypass_modify_policy() {
+async fn test_clear_default_schema_flakes_follow_modify_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/graph-mgmt-schema-policy:main";
     let ledger = genesis_ledger(&fluree, ledger_id);
@@ -4930,18 +4928,17 @@ INSERT DATA { <http://example.org/MyClass> a rdfs:Class }",
     .await
     .expect("build policy context");
 
-    // CLEAR DEFAULT succeeds — the schema retraction is not policy-blockable.
     let result = fluree
         .stage_owned(ledger.clone())
         .txn(Txn::clear_default_graph())
         .policy(policy_ctx)
         .execute()
-        .await
-        .expect("schema-only CLEAR DEFAULT bypasses modify policy (N3 contract)");
+        .await;
+    assert!(result.is_err(), "a view-only identity cleared the ontology");
     assert_eq!(
-        count_in_default(&fluree, &result.ledger).await,
-        0,
-        "the ontology was wiped by a view-only identity — the pinned N3 contract"
+        count_in_default(&fluree, &ledger).await,
+        1,
+        "the class declaration survives"
     );
 }
 

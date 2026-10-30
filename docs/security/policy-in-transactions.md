@@ -89,6 +89,10 @@ Enforcement is also independent of the **wire format**: the check runs on the st
 
 Class targeting on the write side is **exact**: an `f:onClass` modify policy governs *every* flake whose subject is an instance of the class — including properties the class has never carried before. (Read-side class targeting uses the committed class→property index; write-side targeting matches by the subject's classes directly, since a write may introduce class/property combinations no committed data predicts.)
 
+### Schema writes
+
+Schema triples — `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`, and `rdf:type` declaring a class or property — are checked against `f:modify` like any other flake. A policy on a class or property also covers its subclasses or subproperties, so the hierarchy is part of what policy protects: an identity needs modify permission for the schema triple itself, for example an `f:onProperty` policy on `rdfs:subPropertyOf`, or `f:defaultAllow`. Every identity can still read the schema; view policy lets it through.
+
 ## Write verbs
 
 `f:action` accepts three write verbs — `f:create`, `f:update`, `f:delete` — that refine `f:modify` by the subject's **lifecycle** within the transaction:

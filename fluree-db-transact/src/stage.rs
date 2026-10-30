@@ -30,8 +30,7 @@ use fluree_db_core::{
 };
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
-    is_schema_flake, lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError,
-    WriteFlakeInfo, WriteVerb,
+    lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError, WriteFlakeInfo, WriteVerb,
 };
 use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use fluree_db_query::parse::{lower_unresolved_patterns, UnresolvedPattern};
@@ -1633,12 +1632,11 @@ async fn stage_graph_mgmt(
                 // N3 (documented footgun): CLEAR/DROP DEFAULT and CLEAR/DROP ALL
                 // retract the WHOLE default graph, including schema flakes
                 // (rdfs:Class, rdfs:subClassOf, …). That is spec-correct — CLEAR
-                // is an unconditional whole-graph retraction — but a one-line
-                // `CLEAR ALL` strips the ontology, and because `is_schema_flake`
-                // exempts schema flakes from modify policy, that retraction is
-                // not policy-blockable. `COPY/MOVE <g> TO DEFAULT` reach the
-                // same wholesale default-graph retraction through their
-                // `clear_dest` pass, so the footgun applies to them equally.
+                // is an unconditional whole-graph retraction — so a one-line
+                // `CLEAR ALL` strips the ontology. Under a modify policy the
+                // schema's retraction is judged like any other flake's.
+                // `COPY/MOVE <g> TO DEFAULT` reach the same wholesale
+                // default-graph retraction through their `clear_dest` pass.
                 let mut targets: Vec<(GraphId, Option<Sid>)> = Vec::new();
                 match target {
                     GraphTarget::Default => targets.push((0, None)),
@@ -2918,11 +2916,6 @@ async fn enforce_modify_policy_per_flake(
     let empty_classes: Vec<Sid> = Vec::new();
 
     for flake in flakes {
-        // Schema flakes always allowed (needed for internal operations)
-        if is_schema_flake(&flake.p, &flake.o) {
-            continue;
-        }
-
         // Resolve the graph for this flake and get/create a cached executor.
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
         let executor = executors.entry(g_id).or_insert_with(|| {
