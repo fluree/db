@@ -921,6 +921,28 @@ async fn drop_branch_with_children_deferred() {
         .unwrap();
     assert!(record.retracted);
 
+    // Users no longer see dev; the nameservice still lists it, since a
+    // soft-dropped branch is restorable and GC must protect what it reads.
+    let mut listed: Vec<String> = fluree
+        .list_branches("mydb")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.branch)
+        .collect();
+    listed.sort();
+    assert_eq!(listed, ["feature", "main"]);
+    let mut recorded: Vec<String> = fluree
+        .nameservice()
+        .branch_records("mydb")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.branch)
+        .collect();
+    recorded.sort();
+    assert_eq!(recorded, ["dev", "feature", "main"]);
+
     // feature still works (can transact)
     let feature = fluree.ledger("mydb:feature").await.unwrap();
     let txn2 = json!({

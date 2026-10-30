@@ -76,8 +76,25 @@ Supported:
 - `defaults` (partial):
   - `defaults.indexing.reindexMinBytes` / `reindexMaxBytes` are applied as the default `IndexConfig` for writes
   - `defaults.indexing.indexingEnabled=false` suppresses background index triggers
-  - `defaults.indexing.maxOldIndexes` sets the maximum number of old index versions to retain before GC (default: 5)
-  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 15)
+  - `defaults.indexing.gcMinTimeMins`: minutes a superseded index version is kept, so a query that started on it can finish (default: 15)
+  - `defaults.indexing.gcHardMaxOldIndexes`: past this many old index versions, a version is collected even inside `gcMinTimeMins` (default: 10)
+  - `defaults.indexing.maxOldIndexes`: old index versions always kept, whatever their age (default: 0)
+
+  The three retention keys apply only where this connection runs the indexer. See [Index Retention](../indexing-and-search/background-indexing.md#index-retention) for how they combine.
+
+  ```json
+  {
+    "@id": "connection",
+    "@type": "Connection",
+    "indexStorage": {"@id": "fileStorage"},
+    "defaults": {
+      "indexing": {
+        "gcMinTimeMins": 30,
+        "gcHardMaxOldIndexes": 40
+      }
+    }
+  }
+  ```
 
 ### addressIdentifiers (read routing)
 
