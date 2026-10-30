@@ -274,10 +274,11 @@ Pick that maximum depth deliberately and state it wherever the query is document
 
 For genuinely unbounded traversal, materialize the graph source into a native ledger first — see [Materializing a Native Twin](iceberg.md#materializing-a-native-twin). A native ledger evaluates all of these patterns normally.
 
-**JSON-LD subgraph selections.** A JSON-LD subgraph selection over a graph source (`"select": {"?s": ["*"]}`, an explicit property list, or `["@id"]`) is answered by rewriting it into a flat table scan and grouping the rows per subject. Three query keys have no place in that rewrite, so a subgraph selection that carries one is refused with **HTTP 400 `err:r2rml/UnsupportedPattern`** instead of being answered without it:
+**JSON-LD subgraph selections.** A JSON-LD subgraph selection over a graph source (`"select": {"?s": ["*"]}`, an explicit property list, or `["@id"]`) is answered by rewriting it into a flat table scan and grouping the rows per subject. Some query keys have no place in that rewrite, so a subgraph selection that carries one is refused with **HTTP 400 `err:r2rml/UnsupportedPattern`** instead of being answered without it:
 
 - **A top-level `values`** — dropping it would return every subject the `where` matches, not the ones `values` names. Put the constraint in the `where` clause instead.
 - **`groupBy` / `having`** — dropping them would return subjects whose groups `having` rejects. Select the grouped variables with a flat `select` instead.
+- **An `offset` past 10,000 subjects** — each page reads every subject before it again, so paging that deep is refused. Narrow the `where` clause instead.
 
 A flat `select` (`"select": ["?s", "?name"]`) is not a subgraph selection: it takes `values`, `groupBy` and `having` as usual.
 

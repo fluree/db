@@ -53,8 +53,8 @@ const TRIPLES_PER_SUBJECT_BUDGET: usize = 64;
 /// Maximum subject OFFSET a crawl may request. OFFSET paging re-scans and then
 /// discards the first `offset` subjects on every page (the flat triple budget
 /// covers `offset + limit` subjects), so a deep offset silently becomes a large
-/// remote scan; past this depth the crawl errors with guidance instead. Browse
-/// paging (the surface this exists for) stays far below it.
+/// remote scan; past this depth the crawl is refused (400) with guidance
+/// instead. Browse paging (the surface this exists for) stays far below it.
 const MAX_CRAWL_OFFSET_SUBJECTS: usize = 10_000;
 
 /// Query keys the crawl rewrite replaces or refuses: the projection and query
@@ -337,11 +337,15 @@ pub(crate) async fn expand_wildcard_crawl(
     let where_clause = where_clause.expect("a variable-subject crawl always has a WHERE");
 
     if offset > MAX_CRAWL_OFFSET_SUBJECTS {
-        return Err(crate::ApiError::query(format!(
-            "crawl offset {offset} exceeds the virtual-dataset paging ceiling \
-             ({MAX_CRAWL_OFFSET_SUBJECTS}); narrow the query with a WHERE filter \
-             instead of paging this deep"
-        )));
+        // The caller's to change, so a 400, as the other crawl refusals are.
+        return Err(crate::ApiError::Query(
+            fluree_db_query::QueryError::r2rml_unsupported_pattern(format!(
+                "a subgraph crawl over a graph source pages at most \
+                 {MAX_CRAWL_OFFSET_SUBJECTS} subjects deep (the paging ceiling), and this \
+                 one asks for offset {offset}: each page re-reads every subject before it. \
+                 Narrow the query with a WHERE filter instead of paging this deep."
+            )),
+        ));
     }
 
     // Rewrite the crawl into a flat scan: keep the original WHERE (it binds and
@@ -1886,6 +1890,8 @@ mod e2e {
             err.to_string().contains("paging ceiling"),
             "error must explain the ceiling, got: {err}"
         );
+        // The caller's to change: a 400, like the crawl's other refusals.
+        assert_eq!(err.status_code(), 400, "{err}");
     }
 
     /// A batch with `id` (Int64), one nullable String column, and one FK column
