@@ -5,8 +5,8 @@
 //! flakes from the native binary index. An R2RML graph source has **no**
 //! binary-index flakes — its data lives in Iceberg and is only reachable through
 //! the R2RML operator — so native hydration resolves every subject to `null` and
-//! the crawl returns an empty array (`[]`), which is what makes the Solo
-//! virtual-dataset "View Instances" screen come back empty.
+//! the crawl returns an empty array (`[]`), so a browse screen listing a
+//! source's instances comes back empty.
 //!
 //! This module expands a wildcard crawl over a graph source through the R2RML
 //! operator instead: it rewrites the crawl into a SINGLE flat wildcard scan
@@ -738,8 +738,8 @@ pub(crate) fn is_wildcard_crawl(input: &JsonValue) -> bool {
 /// (native) formatting — when: the kill-switch is off, there is no R2RML
 /// provider, the input is not JSON-LD, the view is not graph-source-backed
 /// (`graph_source_id` is `None`, i.e. a genuinely native ledger), or the crawl
-/// shape is not one this module handles. This is what makes the Solo virtual
-/// dataset "View Instances" screen return data instead of `[]`.
+/// shape is not one this module handles. This is what makes a browse screen
+/// listing a source's instances return data instead of `[]`.
 ///
 /// The flat query the crawl runs carries the request's options (see
 /// [`carried_query_options`]), its fuel limit among them. `tracker` is a
