@@ -2654,8 +2654,9 @@ pub enum OntologyAction {
     /// DDL (.sql), a Snowflake semantic view (.yaml), a Databricks Genie space
     /// export (.json, with --comments for Unity Catalog's descriptions), a dbt
     /// project's semantic models and model properties (.yml, or the project's
-    /// directory), or an Apache Ossie semantic model (.yaml, .json). An Ossie
-    /// ontology is written as it is, keeping its IRIs.
+    /// directory), an Apache Ossie semantic model (.yaml, .json), or a Neo4j
+    /// schema export (.json, from apoc.meta.schema() or db.schema.visualization()).
+    /// An Ossie ontology is written as it is, keeping its IRIs.
     /// Tables become classes and columns properties, labelled
     /// in words (`employer_id` reads "employer"); foreign keys become
     /// relations; enumerated columns become a class with a catalog record per
@@ -2775,6 +2776,8 @@ pub enum OntologyFromFormat {
     Dbt,
     /// An Apache Ossie semantic model or ontology (YAML or JSON)
     Ossie,
+    /// A Neo4j schema export: apoc.meta.schema() or db.schema.visualization() (JSON)
+    Neo4j,
 }
 
 /// `fluree catalog` subcommands.

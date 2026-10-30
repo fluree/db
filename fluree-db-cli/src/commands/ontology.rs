@@ -311,6 +311,7 @@ enum Source {
     Genie,
     Dbt,
     Ossie,
+    Neo4j,
 }
 
 fn source(path: &Path, flag: Option<OntologyFromFormat>) -> Source {
@@ -323,6 +324,7 @@ fn source(path: &Path, flag: Option<OntologyFromFormat>) -> Source {
         Some(OntologyFromFormat::Genie) => return Source::Genie,
         Some(OntologyFromFormat::Dbt) => return Source::Dbt,
         Some(OntologyFromFormat::Ossie) => return Source::Ossie,
+        Some(OntologyFromFormat::Neo4j) => return Source::Neo4j,
         None => {}
     }
     if path.is_dir() {
@@ -337,7 +339,7 @@ fn source(path: &Path, flag: Option<OntologyFromFormat>) -> Source {
         Some("xlsx" | "xlsm") => Source::Workbook,
         Some("sql" | "ddl") => Source::Sql,
         Some("yaml" | "yml") => Source::Yaml,
-        // Genie exports and Ossie documents are JSON too; anything else JSON is JSON-LD
+        // Genie exports, Ossie documents and Neo4j schemas are JSON too; anything else JSON is JSON-LD
         Some("json") => match std::fs::read_to_string(path)
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -346,6 +348,7 @@ fn source(path: &Path, flag: Option<OntologyFromFormat>) -> Source {
             Some(v) if convert::ossie::is_semantic_model(&v) || convert::ossie::is_ontology(&v) => {
                 Source::Ossie
             }
+            Some(v) if convert::neo4j::is_neo4j(&v) => Source::Neo4j,
             _ => Source::Rdf,
         },
         _ => Source::Rdf,
@@ -585,6 +588,16 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
                 ));
             }
         }
+        Source::Neo4j => {
+            let (model, left_out) = convert::neo4j::read(&read_document(&args.file)?)
+                .ok_or_else(|| failed(&"not a Neo4j schema export (apoc.meta.schema() or db.schema.visualization())"))?;
+            if left_out > 0 {
+                notes.push(format!(
+                    "{left_out} relationship propert(ies) left out: an RDF property has no place for them"
+                ));
+            }
+            tables(model)
+        }
         _ => tables(tabular::model(&read_sheets(&args.file)?, args.enum_max)),
     };
     // an empty ontology is never a result: say what was found instead
@@ -674,6 +687,13 @@ fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
     let (parsed, _) = parse_file(&args.file, rdf_format)?;
     let out = write::rewrite(&parsed, &args.seed, args.depth)
         .map_err(|e| CliError::Usage(e.to_string()))?;
+    // an empty ontology is never a result
+    if out.classes == 0 {
+        return Err(CliError::Input(format!(
+            "{}: no classes found (declare classes with rdfs:Class or owl:Class)",
+            args.file.display()
+        )));
+    }
     let prefixes = write::used_prefixes(&out.quads, &parsed.prefixes);
     emit(
         &out.quads,
