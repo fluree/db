@@ -279,6 +279,23 @@ pub(super) fn adds_holders(command: &Command) -> bool {
     }
 }
 
+/// `key`, a branch just made from `source`, holds the history `source`
+/// held: it joins every activation that reached `source`, so a member that
+/// has not installed one reads it as behind, and its generation becomes the
+/// number of activations listing it, as every branch's is.
+pub(super) fn inherit(state: &mut NameServiceState, key: &RefKey, source: &RefKey) {
+    let mut listed = 0;
+    for activation in state.erasure.activations.values_mut() {
+        if activation.holders.contains(source) && !activation.holders.contains(key) {
+            activation.holders.push(key.clone());
+        }
+        listed += u64::from(activation.holders.contains(key));
+    }
+    if listed > 0 {
+        state.erasure.generations.insert(key.clone(), listed);
+    }
+}
+
 /// The branch `command` advances with history from elsewhere, as a merge,
 /// rebase or push does, and its head before: an existing branch that did
 /// not hold the erased data can after.
@@ -807,6 +824,68 @@ mod tests {
             matches!(current, Response::IndexAdvanced { index_t: 1, .. }),
             "{current:?}"
         );
+    }
+
+    /// A branch made from a source an erasure reached holds that history: it
+    /// joins the activation, so a member that has not installed it reads the
+    /// branch as behind, and its generation counts it. A write to it from a
+    /// view before is refused.
+    #[test]
+    fn a_branch_made_from_an_erased_source_joins_its_activations() {
+        use super::super::FencedBranchRecord;
+
+        let mut state = ledger_with_queued_request();
+        advance(&mut state, None, 1, 1, 6_000, 11);
+        activate(&mut state, &[main_key()]);
+        apply(
+            &mut state,
+            Command::CreateBranch(NewBranch {
+                ledger_id: "test/db".into(),
+                branch: "dev".into(),
+                source_branch: "main".into(),
+                at_commit: None,
+                applied_at_millis: 6_000,
+            }),
+            12,
+        );
+        let dev = RefKey::new("test/db", "dev");
+        assert!(state.erasure.activations[&0].holders.contains(&dev));
+        assert_eq!(generation(&state, &dev), 1);
+        assert_eq!(
+            view_generation(&state, &dev, 0),
+            0,
+            "behind until installed"
+        );
+        assert_eq!(view_generation(&state, &dev, 1), 1);
+        let index = Command::AdvanceIndexHead(NewIndexHead {
+            ledger_id: "test/db".into(),
+            branch: "dev".into(),
+            new_index_head: cid(50),
+            t: 1,
+            applied_at_millis: 6_000,
+        });
+        let stale = apply(&mut state, index, 13);
+        assert!(generation_moved(&stale), "{stale:?}");
+
+        // A branch record inserted with its source, as a fenced create makes it.
+        let feature = RefKey::new("test/db", "feature");
+        apply(
+            &mut state,
+            Command::InsertBranchRecord(FencedBranchRecord {
+                key: feature.clone(),
+                fence: Some(9),
+                frozen: false,
+                retracted: false,
+                head: Some((cid(1), 1)),
+                index: None,
+                source_branch: Some("dev".into()),
+                branches: 0,
+                applied_at_millis: 6_000,
+            }),
+            14,
+        );
+        assert!(state.erasure.activations[&0].holders.contains(&feature));
+        assert_eq!(generation(&state, &feature), 1);
     }
 
     /// A hold keeps the head where the preparation saw it; it lapses on the

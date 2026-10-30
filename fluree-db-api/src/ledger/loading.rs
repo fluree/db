@@ -364,14 +364,28 @@ impl Fluree {
                     );
                 } else {
                     // A name reused after an erasure reached an earlier branch
-                    // under it keeps that branch's erasure generation.
+                    // under it keeps that branch's erasure generation, and a
+                    // branch takes those of the erasures its source's history
+                    // holds. The index is the source's, as read.
                     let basis = match publisher.lookup(new_id.as_ref()).await? {
                         Some(record) => record.write_basis(),
                         None => WriteBasis::fenced(new_fence),
-                    };
-                    self.index_publisher()?
+                    }
+                    .with_source(&source_record, source_record.erasure_generation);
+                    match self
+                        .index_publisher()?
                         .publish_index_fenced(&new_id, basis, source_record.index_t, index_cid)
-                        .await?;
+                        .await
+                    {
+                        Ok(()) => {}
+                        // An erasure this member has not installed yet reached
+                        // the source: its index is of a view from before.
+                        Err(NameServiceError::ApplyLagged(e)) => tracing::warn!(
+                            error = %e, source = %source_id, branch = %new_id,
+                            "source index not copied; branch will replay from its commits"
+                        ),
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
         }

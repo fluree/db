@@ -1948,6 +1948,9 @@ fn insert_branch_record(
         })
         .branches
         .push(key.branch.clone());
+    if let Some(source) = &record.source_branch {
+        erasure::inherit(state, &key, &RefKey::new(&key.ledger_name, source));
+    }
     let born = record.head.is_some();
     match record.head {
         Some((head, t)) => {
@@ -2281,8 +2284,9 @@ fn create_branch(state: &mut NameServiceState, log_index: u64, args: NewBranch) 
         src.branches = src.branches.saturating_add(1);
     }
 
+    let key = RefKey::new(&ledger_id, &branch);
     state.refs.insert(
-        RefKey::new(&ledger_id, &branch),
+        key.clone(),
         RefEntry {
             head: head.clone(),
             t,
@@ -2293,6 +2297,7 @@ fn create_branch(state: &mut NameServiceState, log_index: u64, args: NewBranch) 
             branches: 0,
         },
     );
+    erasure::inherit(state, &key, &source_key);
 
     Response::BranchCreated {
         ledger_id: full,

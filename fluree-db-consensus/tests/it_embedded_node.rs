@@ -790,6 +790,22 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
     })
     .await;
     assert!(is_replacement(&store.get(&asserted).await.expect("read")));
+    // A branch made from the erased history takes its erasure, and the
+    // source's index with it.
+    fluree
+        .create_branch("erasing/db", "after", None, None)
+        .await
+        .expect("branch");
+    let after = ns
+        .lookup("erasing/db:after")
+        .await
+        .expect("lookup")
+        .expect("branch record");
+    assert_eq!(after.erasure_generation, 1);
+    assert!(
+        after.index_head_id.is_some(),
+        "the source's index was copied"
+    );
     let purge = fluree.run_purge_pass(id, Duration::ZERO).await;
     assert!(purge.is_err(), "a cluster purged: {purge:?}");
     eventually("the job's effective state", async || {
