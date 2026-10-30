@@ -784,7 +784,10 @@ impl DiskArtifactCache {
     }
 
     pub fn best_effort_write(&self, target: &Path, bytes: &[u8]) {
-        if self.budget_bytes == 0 {
+        // Only a write that creates the entry registers: a registered write
+        // keeps an eviction of its path away for its whole run. One that
+        // races another to create it is still caught by `write_atomic`.
+        if self.budget_bytes == 0 || target.exists() {
             return;
         }
 
@@ -798,6 +801,8 @@ impl DiskArtifactCache {
             let (known, size) = state.known_bytes();
             (id, known, size)
         };
+        #[cfg(test)]
+        pause_at(&self.state, "registered");
         if size {
             self.spawn_sizing();
         }
@@ -1320,6 +1325,11 @@ mod tests {
             let _ = self.go.send(true);
         }
 
+        /// Whether an operation has parked here.
+        fn is_reached(&self) -> bool {
+            self.reached.try_recv().is_ok()
+        }
+
         /// Make the parked operation panic where it is.
         fn panic(&self) {
             let _ = self.go.send(false);
@@ -1543,6 +1553,33 @@ mod tests {
             checked.release();
         });
         assert_exact(&cache, &dir, 100);
+    }
+
+    /// A write of an entry already on disk changes nothing, so it doesn't
+    /// hold the entry: an eviction meanwhile removes it.
+    #[test]
+    fn a_write_of_an_entry_on_disk_leaves_it_to_an_eviction() {
+        let dir = temp_cache_dir("write-cached");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cached.leaf");
+        fs::write(&target, [0u8; 100]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 100);
+        std::thread::scope(|scope| {
+            let registered = arm(&cache, "registered");
+            let write = scope.spawn(|| cache.best_effort_write(&target, &[0u8; 100]));
+            // A write that holds the entry parks once it does; one that
+            // doesn't returns.
+            let deadline = std::time::Instant::now() + PAUSE_LIMIT;
+            while !write.is_finished() && !registered.is_reached() {
+                assert!(std::time::Instant::now() < deadline, "the write hung");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cache.evict_entry(&target);
+            registered.release();
+        });
+        assert!(!target.exists(), "the write kept the entry from the eviction");
+        assert_exact(&cache, &dir, 0);
     }
 
     /// A released object's entry must go, or a later read sees a blob storage
