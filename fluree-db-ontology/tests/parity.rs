@@ -90,3 +90,22 @@ fn schema_org_style() {
         })
     );
 }
+
+/// An ontology as Protégé writes one: an `owl:AllDisjointClasses` axiom and
+/// an annotation property declaration. The service's reader files both as
+/// catalog records and refuses the request ("Schema terms and catalog
+/// identities must have IRIs", for the axiom's blank node; with only the
+/// declaration, "Catalog records require SKOS labels"). `check` says so.
+#[test]
+fn protege_owl_machinery_is_refused() {
+    let path = format!("{}/tests/fixtures/protege.ttl", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(path).unwrap();
+    let report = check(
+        &parse(&text, RdfFormat::Turtle, None).unwrap(),
+        &CheckOptions::default(),
+    )
+    .unwrap();
+    let codes: Vec<&str> = report.will_fail.iter().map(|f| f.code).collect();
+    assert_eq!(codes, ["owl-machinery"]);
+    assert_eq!(report.will_fail[0].count, 2);
+}

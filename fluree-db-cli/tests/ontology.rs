@@ -207,13 +207,21 @@ fn seed_slices_a_vocabulary() {
     assert_eq!(report["properties"], 1);
     assert_eq!(report["slice"]["classes_total"], 4);
 
-    fluree_cmd(&tmp)
-        .args(["ontology", "check", "vocab.ttl", "--seed", "Spaceship"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains(
-            "no class in the ontology matches --seed",
-        ));
+    // a label, a prefixed name or an IRI that names no class is refused, never
+    // an empty slice
+    for seed in ["Spaceship", "ex:Persn", "<https://example.com/Persn>"] {
+        fluree_cmd(&tmp)
+            .args(["ontology", "check", "vocab.ttl", "--seed", seed])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "no class in the ontology matches --seed",
+            ));
+        fluree_cmd(&tmp)
+            .args(["ontology", "from", "vocab.ttl", "--seed", seed])
+            .assert()
+            .code(2);
+    }
 }
 
 #[test]
@@ -687,6 +695,41 @@ fn from_an_ossie_semantic_model_in_json() {
     assert!(ttl.contains("rdfs:range sales:Customer"), "{ttl}");
 }
 
+#[test]
+fn a_dbt_project_resolves_doc_blocks_and_names_files_it_cannot_read() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("proj/models")).unwrap();
+    write(
+        &tmp,
+        "proj/models/docs.md",
+        "{% docs orders_desc %}\nOne row per order.\n{% enddocs %}\n",
+    );
+    write(
+        &tmp,
+        "proj/models/schema.yml",
+        "models:\n  - name: orders\n    description: \"{{ doc('orders_desc') }}\"\n    columns:\n      - {name: id, data_tests: [unique, not_null]}\n      - {name: total}\n",
+    );
+    write(&tmp, "proj/models/broken.yml", "models: [unclosed\n");
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "proj",
+            "--base",
+            "https://example.com/p/",
+            "-o",
+            "p.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "broken.yml: skipped, not valid YAML",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("p.ttl")).unwrap();
+    assert!(ttl.contains("rdfs:comment \"One row per order.\""), "{ttl}");
+    assert!(!ttl.contains("{{"), "{ttl}");
+}
+
 /// `CALL apoc.meta.schema() YIELD value RETURN value`, exported as JSON, for a
 /// small movies graph.
 const NEO4J_SCHEMA: &str = r#"[{"value": {
@@ -739,4 +782,21 @@ fn from_a_neo4j_schema() {
     assert!(ttl.contains("rdfs:range movies:Movie"), "{ttl}");
     let (report, code) = check_json(&tmp, &["movies.ttl"]);
     assert_eq!(code, 0, "{report:#}");
+}
+
+#[test]
+fn json_ld_is_never_read_as_another_source() {
+    let tmp = TempDir::new().unwrap();
+    // JSON-LD whose keys a converter might mistake for its own
+    write(
+        &tmp,
+        "data.json",
+        r#"{"@context": {"ex": "https://example.com/"}, "nodes": [], "relationships": [],
+            "datasets": [], "@graph": [{"@id": "ex:acme", "ex:name": "Acme"}]}"#,
+    );
+    fluree_cmd(&tmp)
+        .args(["ontology", "from", "data.json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no classes found"));
 }

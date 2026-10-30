@@ -8,13 +8,14 @@
 //!   zero is a code, and stays text);
 //! - a column named `id`, or the table's name in the singular with `_id`
 //!   (`company_id` in `companies`), is the primary key;
-//! - any other column ending in `id` (`employer_id`, `employerId`) is a
-//!   foreign key, to the sheet whose name it names if there is one;
+//! - any other column ending in `id` (`employer_id`, `CustomerID`) is a
+//!   foreign key when it names another sheet (`customer_id` and a
+//!   `customers` sheet); otherwise it stays a value (`tax_id`, "tax id");
 //! - a text column with at most `enum_max` distinct short values, each
 //!   repeated (at least twice as many rows as values, and five rows), is
 //!   enumerated.
 
-use super::{class_label, Column, Model, Table};
+use super::{class_label, strip_word_suffix, Column, Model, Table};
 use crate::words::name_words;
 use std::collections::BTreeSet;
 
@@ -169,7 +170,8 @@ fn is_date(v: &str) -> bool {
 }
 
 fn is_date_time(v: &str) -> bool {
-    v.len() > 10 && is_date(&v[..10]) && matches!(v.as_bytes()[10], b'T' | b' ')
+    // by bytes: the 10th may fall inside a multi-byte character
+    v.get(..10).is_some_and(is_date) && matches!(v.as_bytes().get(10), Some(b'T' | b' '))
 }
 
 fn is_boolean(v: &str) -> bool {
@@ -183,7 +185,7 @@ fn is_boolean(v: &str) -> bool {
 /// "employer". `None` when the name doesn't end in "id".
 fn key_stem(name: &str) -> Option<String> {
     let words = name_words(name)?;
-    let stem = words.strip_suffix(" id")?;
+    let stem = strip_word_suffix(&words, "id")?;
     Some(stem.to_string())
 }
 
@@ -219,14 +221,14 @@ pub fn model(sheets: &[Sheet], enum_max: usize) -> Model {
             match key_stem(header) {
                 _ if lower == "id" => table.primary_key.push(header.clone()),
                 Some(stem) if class_label(&stem) == own => table.primary_key.push(header.clone()),
+                // a key to another sheet is a relation; `tax_id`, naming no
+                // sheet, stays a value ("tax id")
                 Some(stem) => {
                     let wanted = class_label(&stem);
-                    column.references = Some(
-                        labels
-                            .iter()
-                            .find(|(label, _)| *label == wanted)
-                            .map_or(stem, |(_, name)| name.clone()),
-                    );
+                    column.references = labels
+                        .iter()
+                        .find(|(label, _)| *label == wanted)
+                        .map(|(_, name)| name.clone());
                 }
                 None => {}
             }
@@ -245,7 +247,10 @@ pub fn model(sheets: &[Sheet], enum_max: usize) -> Model {
         }
         tables.push(table);
     }
-    Model { tables }
+    Model {
+        tables,
+        ..Model::default()
+    }
 }
 
 #[cfg(test)]
@@ -269,7 +274,7 @@ mod tests {
         let t = &m.tables[0];
         assert_eq!(t.primary_key, vec!["id"]);
         let col = |n: &str| t.columns.iter().find(|c| c.name == n).unwrap();
-        assert_eq!(col("employer_id").references.as_deref(), Some("employer"));
+        assert_eq!(col("employer_id").references, None, "no sheet named for it");
         assert_eq!(col("status").values, vec!["active", "left"]);
         assert_eq!(col("joined").datatype, Some("date"));
         assert_eq!(
@@ -309,5 +314,27 @@ mod tests {
         assert_eq!(infer_datatype(&["yes", "No"]), Some("boolean"));
         assert_eq!(infer_datatype(&["007"]), Some("string"));
         assert_eq!(infer_datatype(&[]), None);
+    }
+
+    #[test]
+    fn multi_byte_text_and_upper_case_ids() {
+        let sheet = read_csv(
+            "OrderID,CustomerID,city,tax_id\n1,7,Kraków Główny,PL-1\n2,8,東京都千代田区,PL-2\n",
+            "orders",
+        )
+        .unwrap();
+        let customers = Sheet {
+            name: "customers".into(),
+            headers: vec!["CustomerID".into()],
+            rows: vec![],
+        };
+        let m = model(&[sheet, customers], 12);
+        let orders = &m.tables[0];
+        assert_eq!(orders.primary_key, ["OrderID"]);
+        let col = |n: &str| orders.columns.iter().find(|c| c.name == n).unwrap();
+        assert_eq!(col("CustomerID").references.as_deref(), Some("customers"));
+        assert_eq!(col("city").datatype, Some("string"));
+        assert_eq!(col("tax_id").references, None);
+        assert_eq!(m.tables[1].primary_key, ["CustomerID"]);
     }
 }

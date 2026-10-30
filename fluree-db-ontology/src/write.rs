@@ -86,6 +86,20 @@ pub fn rewrite(parsed: &Parsed, seeds: &[String], depth: usize) -> Result<Rewrit
         Some(s) => slice::slice_catalog(&split.catalog, s),
         None => split.catalog,
     };
+    // OWL axioms and annotation property declarations would be read as
+    // records, and refused: they go, counted
+    let (machinery, roots) = crate::read::owl_machinery(&catalog);
+    if !machinery.is_empty() {
+        catalog.retain(|q| !machinery.contains(&q.subject));
+        let axioms = roots.iter().filter(|(s, _)| s.is_blank()).count();
+        let declarations = roots.len() - axioms;
+        if axioms > 0 {
+            counts.insert(OWL_AXIOMS_DROPPED.to_string(), axioms);
+        }
+        if declarations > 0 {
+            counts.insert(DECLARATIONS_DROPPED.to_string(), declarations);
+        }
+    }
     for (key, n) in skos_for_records(&mut catalog) {
         counts.insert(key.to_string(), n);
     }
@@ -106,6 +120,8 @@ pub fn rewrite(parsed: &Parsed, seeds: &[String], depth: usize) -> Result<Rewrit
 
 /// What [`rewrite`] reports beside the input policy's own keys.
 pub const LABELS_IN_WORDS: &str = "rdfs:label in words";
+pub const OWL_AXIOMS_DROPPED: &str = "OWL axioms dropped";
+pub const DECLARATIONS_DROPPED: &str = "annotation property and datatype declarations dropped";
 pub const RECORD_LABELS: &str = "skos:prefLabel from rdfs:label (catalog)";
 pub const RECORD_DEFINITIONS: &str = "skos:definition from rdfs:comment (catalog)";
 
@@ -126,7 +142,10 @@ fn label_words(quads: &mut [Quad], shown: &policy::Shown) -> usize {
         let Some((text, lang, _)) = policy::literal(&q.object) else {
             continue;
         };
-        if text.contains(' ') || !words::reads_as_identifier(&text) && !is_camel_word(&text) {
+        if text.contains(' ')
+            || !words::reads_as_identifier(&text) && !is_camel_word(&text)
+            || is_brand_style(&text)
+        {
             continue;
         }
         if let Some(in_words) = words::name_words(&text).filter(|w| *w != text) {
@@ -141,6 +160,13 @@ fn label_words(quads: &mut [Quad], shown: &policy::Shown) -> usize {
 }
 
 /// `AboutPage`: one token of capitalized words run together.
+/// `iPhone`, `eBay`: one lower-case letter before a capital is a name
+/// written that way, not words run together.
+fn is_brand_style(text: &str) -> bool {
+    let mut c = text.chars();
+    matches!((c.next(), c.next()), (Some(a), Some(b)) if a.is_lowercase() && b.is_uppercase())
+}
+
 fn is_camel_word(text: &str) -> bool {
     text.chars().skip(1).any(|c| c.is_ascii_uppercase())
         && text.chars().any(|c| c.is_ascii_lowercase())
@@ -332,5 +358,71 @@ mod tests {
         .unwrap();
         let back = parse(&jsonld, RdfFormat::JsonLd, None).unwrap();
         assert_eq!(back.quads.len(), again.quads.len(), "{jsonld}");
+    }
+
+    #[test]
+    fn labels_in_words_but_not_brand_names() {
+        let parsed = parse(
+            r#"@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+               @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+               <https://ex.com/worksFor> a rdf:Property ; rdfs:label "worksFor" .
+               <https://ex.com/Phone> a rdfs:Class ; rdfs:label "iPhone" .
+               <https://ex.com/Shop> a rdfs:Class ; rdfs:label "eBay" .
+               <https://ex.com/Page> a rdfs:Class ; rdfs:label "AboutPage" ."#,
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let out = rewrite(&parsed, &[], 1).unwrap();
+        let label = |iri: &str| -> String {
+            out.quads
+                .iter()
+                .find(|q| q.subject.as_iri() == Some(iri) && q.is(RDFS_LABEL))
+                .and_then(|q| policy::literal(&q.object))
+                .map(|(t, ..)| t)
+                .unwrap()
+        };
+        assert_eq!(label("https://ex.com/worksFor"), "works for");
+        assert_eq!(label("https://ex.com/Page"), "about page");
+        assert_eq!(label("https://ex.com/Phone"), "iPhone");
+        assert_eq!(label("https://ex.com/Shop"), "eBay");
+        assert_eq!(out.adapted.get(LABELS_IN_WORDS), Some(&2));
+    }
+
+    #[test]
+    fn owl_machinery_is_dropped_and_counted() {
+        let parsed = parse(
+            r#"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+               @prefix owl: <http://www.w3.org/2002/07/owl#> .
+               @prefix dc: <http://purl.org/dc/elements/1.1/> .
+               <https://ex.com/p> a owl:Ontology ; dc:creator "Someone" .
+               dc:creator a owl:AnnotationProperty .
+               <https://ex.com/A> a owl:Class ; rdfs:label "a thing" .
+               <https://ex.com/B> a owl:Class ; rdfs:label "b thing" .
+               [] a owl:AllDisjointClasses ; owl:members ( <https://ex.com/A> <https://ex.com/B> ) .
+               <https://ex.com/acme> a <https://ex.com/A> ; rdfs:label "Acme" ."#,
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let before = crate::check(&parsed, &crate::CheckOptions::default()).unwrap();
+        assert!(
+            before.will_fail.iter().any(|f| f.code == "owl-machinery"),
+            "{:?}",
+            before.will_fail
+        );
+        let out = rewrite(&parsed, &[], 1).unwrap();
+        assert_eq!(out.adapted.get(OWL_AXIOMS_DROPPED), Some(&1));
+        assert_eq!(out.adapted.get(DECLARATIONS_DROPPED), Some(&1));
+        assert_eq!(out.records, 1, "the real record stays");
+        let ttl = serialize(
+            &out.quads,
+            &used_prefixes(&out.quads, &parsed.prefixes),
+            OutputFormat::Turtle,
+        )
+        .unwrap();
+        let again = parse(&ttl, RdfFormat::Turtle, None).unwrap();
+        let after = crate::check(&again, &crate::CheckOptions::default()).unwrap();
+        assert!(after.passes(), "{:?}\n{ttl}", after.will_fail);
     }
 }

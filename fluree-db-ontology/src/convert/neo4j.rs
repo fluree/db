@@ -15,7 +15,9 @@
 //! - relationship properties have no place on an RDF property, and are left
 //!   out and counted.
 
-use super::{class_label, Column, Model, Table};
+use super::{class_label, is_jsonld, Column, Model, Table};
+#[cfg(test)]
+use crate::vocab::{RDFS_COMMENT, RDFS_LABEL};
 use crate::words::name_words;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,7 +56,7 @@ fn visualization(doc: &Value) -> Option<(&Vec<Value>, &Vec<Value>)> {
 
 /// Whether a JSON document is a Neo4j schema export this module reads.
 pub fn is_neo4j(doc: &Value) -> bool {
-    apoc_map(doc).is_some() || visualization(doc).is_some()
+    !is_jsonld(doc) && (apoc_map(doc).is_some() || visualization(doc).is_some())
 }
 
 /// A Neo4j property type as an XSD datatype's local name.
@@ -83,25 +85,51 @@ fn article(word: &str) -> &'static str {
     }
 }
 
-/// The sentence a relationship reads: "A person works at a company."
-fn sentence(start: &str, relation: &str, targets: &[String]) -> String {
-    let start = class_label(start);
-    let targets: Vec<String> = targets
+/// "a person", "an apple, a pear or a plum".
+fn some(labels: &[String]) -> String {
+    let phrases: Vec<String> = labels
         .iter()
         .map(|t| {
             let l = class_label(t);
             format!("{} {l}", article(&l))
         })
         .collect();
-    let objects = match targets.as_slice() {
+    match phrases.as_slice() {
         [] => String::new(),
-        [one] => format!(" {one}"),
-        [rest @ .., last] => format!(" {} or {last}", rest.join(", ")),
-    };
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// The sentence a relationship reads, from every label it starts at: "A
+/// person or a robot works at a company."
+fn sentence(starts: &[String], relation: &str, targets: &[String]) -> String {
     let words = name_words(relation).unwrap_or_else(|| relation.to_lowercase());
-    let mut s = format!("{} {start} {words}{objects}.", article(&start));
-    s[..1].make_ascii_uppercase();
+    let objects = some(targets);
+    let mut s = if objects.is_empty() {
+        format!("{} {words}.", some(starts))
+    } else {
+        format!("{} {words} {objects}.", some(starts))
+    };
+    if let Some(first) = s.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
     s
+}
+
+/// Relationship columns for each (start label, relationship type, targets),
+/// each described for every label the type starts at.
+fn add_relations(tables: &mut [Table], found: &[(String, String, Vec<String>)]) {
+    let mut starts: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    for (start, rel, _) in found {
+        starts.entry(rel.as_str()).or_default().push(start.clone());
+    }
+    for (start, rel, targets) in found {
+        if let Some(t) = tables.iter_mut().find(|t| t.name == *start) {
+            t.columns
+                .push(relation(&starts[rel.as_str()], rel, targets));
+        }
+    }
 }
 
 fn is_key(label: &str, property: &str, unique: bool) -> bool {
@@ -125,6 +153,7 @@ pub fn read(doc: &Value) -> Option<(Model, usize)> {
 
 fn from_apoc(map: &serde_json::Map<String, Value>) -> (Model, usize) {
     let mut tables = Vec::new();
+    let mut found: Vec<(String, String, Vec<String>)> = Vec::new();
     let mut left_out = 0;
     for (label, node) in map {
         if node.get("type").and_then(Value::as_str) != Some("node") {
@@ -148,6 +177,7 @@ fn from_apoc(map: &serde_json::Map<String, Value>) -> (Model, usize) {
             }
         }
         if let Some(Value::Object(rels)) = node.get("relationships") {
+            let label = label.clone();
             for (rel, r) in rels {
                 if r.get("direction").and_then(Value::as_str) != Some("out") {
                     continue;
@@ -164,19 +194,29 @@ fn from_apoc(map: &serde_json::Map<String, Value>) -> (Model, usize) {
                 if let Some(Value::Object(props)) = r.get("properties") {
                     left_out += props.len();
                 }
-                table.columns.push(relation(label, rel, &targets));
+                found.push((label.clone(), rel.clone(), targets));
             }
         }
         tables.push(table);
     }
-    (Model { tables }, left_out)
+    add_relations(&mut tables, &found);
+    (
+        Model {
+            tables,
+            notes: Vec::new(),
+        },
+        left_out,
+    )
 }
 
-/// A relationship type as a column of its start label's table.
-fn relation(start: &str, rel: &str, targets: &[String]) -> Column {
+/// A relationship type as a column of a start label's table, labelled with
+/// the verb it is (`HAS_KEY`, "has key") and described as the sentence it
+/// reads from every label it starts at.
+fn relation(starts: &[String], rel: &str, targets: &[String]) -> Column {
     Column {
         name: rel.to_string(),
-        description: Some(sentence(start, rel, targets)),
+        label: Some(name_words(rel).unwrap_or_else(|| rel.to_lowercase())),
+        description: Some(sentence(starts, rel, targets)),
         // one label at the other end is the range; several have none
         references: match targets {
             [one] => Some(one.clone()),
@@ -251,13 +291,15 @@ fn from_visualization(nodes: &[Value], relationships: &[Value]) -> Model {
             .or_default()
             .insert(target);
     }
-    for ((start, rel), targets) in rels {
-        let targets: Vec<String> = targets.into_iter().collect();
-        if let Some(t) = tables.iter_mut().find(|t| t.name == start) {
-            t.columns.push(relation(&start, &rel, &targets));
-        }
+    let found: Vec<(String, String, Vec<String>)> = rels
+        .into_iter()
+        .map(|((start, rel), targets)| (start, rel, targets.into_iter().collect()))
+        .collect();
+    add_relations(&mut tables, &found);
+    Model {
+        tables,
+        notes: Vec::new(),
     }
-    Model { tables }
 }
 
 #[cfg(test)]
@@ -332,5 +374,50 @@ mod tests {
             &serde_json::json!({"@context": {}, "@graph": []})
         ));
         assert!(!is_neo4j(&serde_json::json!({"data_sources": {}})));
+    }
+
+    #[test]
+    fn relationship_types_are_verbs_described_for_every_start() {
+        let doc = serde_json::json!({
+            "Person": {"type": "node", "properties": {}, "relationships": {
+                "WORKS_AT": {"direction": "out", "labels": ["Company"], "properties": {}},
+                "HAS_KEY": {"direction": "out", "labels": ["Key"], "properties": {}}}},
+            "Robot": {"type": "node", "properties": {}, "relationships": {
+                "WORKS_AT": {"direction": "out", "labels": ["Company"], "properties": {}}}},
+            "Company": {"type": "node", "properties": {}, "relationships": {}},
+            "Key": {"type": "node", "properties": {}, "relationships": {}}
+        });
+        let (m, _) = read(&doc).unwrap();
+        let out = super::super::emit(
+            &m,
+            &super::super::EmitOptions {
+                base: "https://ex.com/".into(),
+            },
+        );
+        let literal = |s: &str, p: &str| -> Option<String> {
+            out.ontology
+                .iter()
+                .find(|q| q.subject.as_iri() == Some(s) && q.is(p))
+                .and_then(|q| q.object.as_literal().map(|(v, ..)| v.lexical()))
+        };
+        assert_eq!(
+            literal("https://ex.com/hasKey", RDFS_LABEL).as_deref(),
+            Some("has key")
+        );
+        assert_eq!(
+            literal("https://ex.com/hasKey", RDFS_COMMENT).as_deref(),
+            Some("A person has key a key.")
+        );
+        assert_eq!(
+            literal("https://ex.com/worksAt", RDFS_COMMENT).as_deref(),
+            Some("A person or a robot works at a company.")
+        );
+    }
+
+    #[test]
+    fn json_ld_with_nodes_is_not_a_neo4j_schema() {
+        assert!(!is_neo4j(&serde_json::json!({
+            "@context": {}, "nodes": [], "relationships": []
+        })));
     }
 }

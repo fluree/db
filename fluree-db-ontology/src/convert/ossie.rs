@@ -26,11 +26,12 @@
 //!   out.
 
 use super::sql::xsd_for;
-use super::{camel, pascal, slug, Column, Converted, Model, Table};
+use super::{camel, from_yaml, is_jsonld, pascal, slug, Column, Converted, Model, Table};
 use crate::read::Quad;
 use crate::vocab::*;
 use crate::words::name_words;
 use fluree_graph_ir::Term;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -51,16 +52,148 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a document is an Ossie semantic model.
+/// Whether a document is an Ossie semantic model (and not JSON-LD).
 pub fn is_semantic_model(doc: &Value) -> bool {
-    doc.get("datasets").and_then(Value::as_array).is_some()
+    !is_jsonld(doc) && doc.get("datasets").and_then(Value::as_array).is_some()
 }
 
-/// Whether a document is an Ossie ontology.
+/// Whether a document is an Ossie ontology (and not JSON-LD).
 pub fn is_ontology(doc: &Value) -> bool {
-    doc.get("ontology")
-        .and_then(Value::as_array)
-        .is_some_and(|items| items.iter().any(|i| i.get("concept").is_some()))
+    !is_jsonld(doc)
+        && doc
+            .get("ontology")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|i| i.get("concept").is_some()))
+}
+
+/// The fields of an Ossie document this module reads, typed as text, so a
+/// YAML document's values are kept as written (a concept named `NO`, a
+/// requirement `Code == 007`) rather than typed by YAML.
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct Doc {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefixes: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ontology: Option<Vec<Concept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    datasets: Option<Vec<Dataset>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relationships: Option<Vec<DatasetRelationship>>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct Concept {
+    concept: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    description: Option<String>,
+    extends: Option<Vec<String>>,
+    requires: Option<Vec<String>>,
+    relationships: Option<Vec<Relationship>>,
+    iri: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct Relationship {
+    name: Option<String>,
+    description: Option<String>,
+    roles: Option<Vec<Role>>,
+    verbalizes: Option<Vec<String>>,
+    iri: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct Role {
+    concept: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct Dataset {
+    name: Option<String>,
+    description: Option<String>,
+    primary_key: Option<Vec<String>>,
+    ai_context: Option<AiContext>,
+    fields: Option<Vec<Field>>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct Field {
+    name: Option<String>,
+    description: Option<String>,
+    datatype: Option<String>,
+    ai_context: Option<AiContext>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct DatasetRelationship {
+    name: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    from_columns: Option<Vec<String>>,
+    to_columns: Option<Vec<String>>,
+}
+
+/// `ai_context`: instructions as text, or a map with synonyms.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AiContext {
+    Text(String),
+    Map {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        synonyms: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for AiContext {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Fields {
+            synonyms: Option<Vec<String>>,
+            instructions: Option<String>,
+        }
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = AiContext;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("text or a map")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<AiContext, E> {
+                Ok(AiContext::Text(v.to_string()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<AiContext, A::Error> {
+                let f = Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(AiContext::Map {
+                    synonyms: f.synonyms,
+                    instructions: f.instructions,
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// An Ossie document as the values this module reads: JSON as it is, YAML
+/// through typed fields so its values are kept as written.
+pub fn document(text: &str) -> Result<Value, String> {
+    if crate::read::RdfFormat::sniff(text) == crate::read::RdfFormat::JsonLd {
+        return serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"));
+    }
+    let doc: Doc = from_yaml(text).map_err(|e| format!("invalid YAML: {e}"))?;
+    serde_json::to_value(doc).map_err(|e| e.to_string())
 }
 
 /// `ai_context`'s synonyms, and any instructions it gives as text.
@@ -152,7 +285,10 @@ pub fn semantic_model(doc: &Value) -> Model {
             }
         }
     }
-    Model { tables }
+    Model {
+        tables,
+        notes: Vec::new(),
+    }
 }
 
 const BUILT_IN_VALUES: &[&str] = &[
@@ -160,20 +296,40 @@ const BUILT_IN_VALUES: &[&str] = &[
 ];
 
 /// The values an enumerated value type's `requires` lists:
-/// `Code == 'A' OR Code == 'B'` (or `IN ('A', 'B')`).
+/// `Code == 'A' OR Code == 'B'` (or `Code IN ('A', 'B')`), `OR` and `IN` in
+/// any case. A value with its own quote inside is not read as one.
 fn enumeration(concept: &str, requires: &[String]) -> Vec<String> {
+    let quoted = |s: &str| -> Option<String> {
+        let s = s.trim();
+        let q = s.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+        let inner = s.strip_prefix(q)?.strip_suffix(q)?;
+        (!inner.contains(q)).then(|| inner.to_string())
+    };
+    // split on a keyword surrounded by spaces, in any case
+    let split = |text: &str, word: &str| -> Vec<String> {
+        let upper = text.to_uppercase();
+        let needle = format!(" {word} ");
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut at = 0;
+        while let Some(found) = upper[at..].find(&needle) {
+            let i = at + found;
+            out.push(text[start..i].to_string());
+            start = i + needle.len();
+            at = start;
+        }
+        out.push(text[start..].to_string());
+        out
+    };
     let mut values = Vec::new();
     for r in requires {
-        let quoted = |s: &str| -> Option<String> {
-            let s = s.trim();
-            s.strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-                .or_else(|| s.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                .map(str::to_string)
-        };
-        if let Some((lhs, rhs)) = r.split_once(" IN ") {
-            if lhs.trim() == concept {
-                let inner = rhs.trim().trim_start_matches('(').trim_end_matches(')');
+        let parts = split(r, "IN");
+        if parts.len() == 2 {
+            if parts[0].trim() == concept {
+                let inner = parts[1]
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')');
                 let found: Option<Vec<String>> = inner.split(',').map(quoted).collect();
                 if let Some(found) = found {
                     values.extend(found);
@@ -181,8 +337,7 @@ fn enumeration(concept: &str, requires: &[String]) -> Vec<String> {
             }
             continue;
         }
-        let parts: Vec<&str> = r.split(" OR ").collect();
-        let found: Option<Vec<String>> = parts
+        let found: Option<Vec<String>> = split(r, "OR")
             .iter()
             .map(|p| {
                 let (lhs, rhs) = p.split_once("==")?;
@@ -196,6 +351,27 @@ fn enumeration(concept: &str, requires: &[String]) -> Vec<String> {
     }
     values
 }
+
+/// Whether an IRI from a document is one: a scheme, and no whitespace.
+fn is_iri(iri: &str) -> bool {
+    let Some((scheme, rest)) = iri.split_once(':') else {
+        return false;
+    };
+    !rest.is_empty()
+        && !iri.chars().any(char::is_whitespace)
+        && scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+}
+
+/// Schemes an IRI may use without the document declaring them as prefixes.
+const SCHEMES: &[&str] = &[
+    "http", "https", "urn", "tag", "mailto", "file", "ftp", "did",
+];
 
 fn article(word: &str) -> &'static str {
     if word.starts_with(['a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U']) {
@@ -248,12 +424,25 @@ pub fn ontology(doc: &Value, base: &str) -> Converted {
             }
         }
     }
-    let expand = |iri: &str| -> String {
-        match iri.split_once(':') {
+    // a declared prefix expands; an undeclared one, no scheme or whitespace
+    // isn't an IRI, and the term is minted instead (and noted)
+    let bad_iris = std::cell::RefCell::new(Vec::<String>::new());
+    let expand = |iri: &str| -> Option<String> {
+        let expanded = match iri.split_once(':') {
             Some((p, local)) if !local.starts_with("//") && prefixes.contains_key(p) => {
                 format!("{}{local}", prefixes[p])
             }
-            _ => iri.to_string(),
+            Some((p, local)) if local.starts_with("//") || SCHEMES.contains(&p) => iri.to_string(),
+            _ => {
+                bad_iris.borrow_mut().push(iri.to_string());
+                return None;
+            }
+        };
+        if is_iri(&expanded) {
+            Some(expanded)
+        } else {
+            bad_iris.borrow_mut().push(iri.to_string());
+            None
         }
     };
     let concepts: Vec<&Value> = list(doc, "ontology")
@@ -317,7 +506,7 @@ pub fn ontology(doc: &Value, base: &str) -> Converted {
         }
         let label = name_words(&name).unwrap_or_else(|| name.to_lowercase());
         let iri = text(c, "iri")
-            .map(|i| expand(&i))
+            .and_then(|i| expand(&i))
             .unwrap_or_else(|| mint(pascal(&label)));
         class_iri.insert(name.clone(), iri.clone());
         if !values.is_empty() {
@@ -419,7 +608,7 @@ pub fn ontology(doc: &Value, base: &str) -> Converted {
             match roles.as_slice() {
                 [] => {
                     let iri = text(r, "iri")
-                        .map(|i| expand(&i))
+                        .and_then(|i| expand(&i))
                         .unwrap_or_else(|| mint(camel(&label)));
                     property(
                         &mut out,
@@ -444,7 +633,7 @@ pub fn ontology(doc: &Value, base: &str) -> Converted {
                         }
                     }
                     let iri = text(r, "iri")
-                        .map(|i| expand(&i))
+                        .and_then(|i| expand(&i))
                         .unwrap_or_else(|| mint(camel(&label)));
                     let range = range_of(&player);
                     property(&mut out, &iri, &label, description, &domain, range);
@@ -477,6 +666,14 @@ pub fn ontology(doc: &Value, base: &str) -> Converted {
                 }
             }
         }
+    }
+    let bad = bad_iris.into_inner();
+    if !bad.is_empty() {
+        out.notes.push(format!(
+            "{} iri value(s) aren't IRIs (an undeclared prefix, no scheme, or whitespace) and were minted instead: {}",
+            bad.len(),
+            bad.join(", ")
+        ));
     }
     out
 }
@@ -641,5 +838,75 @@ relationships:
             verbalize("{CancelationReason} has description- {String}"),
             "A cancelation reason has description a string."
         );
+    }
+
+    #[test]
+    fn iris_that_arent_are_minted_and_noted() {
+        let doc = document(
+            r"
+name: T
+prefixes: {schema: https://schema.org/}
+ontology:
+- {concept: Airport, type: EntityType, iri: schema:Airport}
+- {concept: Gate, type: EntityType, iri: ex:Gate}
+- {concept: Lounge, type: EntityType, iri: Gate Thing}
+- {concept: Runway, type: EntityType, iri: 'https://ex.com/Runway'}
+",
+        )
+        .unwrap();
+        let out = ontology(&doc, "https://ex.com/t/");
+        let classes: Vec<String> = out
+            .ontology
+            .iter()
+            .filter(|q| q.is(RDF_TYPE))
+            .filter_map(|q| q.subject.as_iri().map(str::to_string))
+            .collect();
+        assert!(classes.contains(&"https://schema.org/Airport".to_string()));
+        assert!(classes.contains(&"https://ex.com/Runway".to_string()));
+        assert!(
+            classes.contains(&"https://ex.com/t/Gate".to_string()),
+            "{classes:?}"
+        );
+        assert!(
+            classes.contains(&"https://ex.com/t/Lounge".to_string()),
+            "{classes:?}"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("ex:Gate") && n.contains("Gate Thing")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn enumerations_in_any_case_and_no_stray_quotes() {
+        assert_eq!(
+            enumeration("Code", &["Code == 'A' or Code == 'B'".to_string()]),
+            ["A", "B"]
+        );
+        assert_eq!(
+            enumeration("Code", &["Code in ('A', 'B')".to_string()]),
+            ["A", "B"]
+        );
+        assert!(enumeration("Code", &["Code == 'A' or Code == 'B".to_string()]).is_empty());
+        assert!(enumeration("Code", &["Code == 'it's'".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn yaml_values_are_kept_as_written() {
+        let doc =
+            document("name: T\nontology:\n- concept: NO\n  type: EntityType\n  description: 007\n")
+                .unwrap();
+        assert!(is_ontology(&doc));
+        let out = ontology(&doc, "https://ex.com/t/");
+        assert!(out.ontology.iter().any(|q| q.is(RDFS_COMMENT)
+            && q.object
+                .as_literal()
+                .is_some_and(|(v, ..)| v.lexical() == "007")));
+        assert!(!is_ontology(
+            &serde_json::json!({"@context": {}, "ontology": [{"concept": "A"}]})
+        ));
     }
 }
