@@ -13,6 +13,7 @@ use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::{Fluree, FlureeBuilder};
 use fluree_db_doc::gazetteer::{Gazetteer, GazetteerBuilder};
 use fluree_db_doc::model::{Model, ModelBuilder};
+use fluree_db_nameservice::{GraphSourceKind, GraphSourceType};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -88,12 +89,23 @@ impl Opened {
                 let ledger_id = context::to_ledger_id(alias)?;
                 let graph_source = if fluree.ledger_exists(&ledger_id).await? {
                     false
-                } else if is_graph_source(&fluree, &ledger_id).await? {
-                    true
                 } else {
-                    return Err(CliError::NotFound(format!(
-                        "{alias}: no such ledger or graph source (a file source needs a .ttl, .nt, .jsonld or .json extension)"
-                    )));
+                    match graph_source_type(&fluree, &ledger_id).await? {
+                        Some(t) if t.kind() == GraphSourceKind::Mapped => true,
+                        // An index answers searches, not the label queries
+                        // a source is read with.
+                        Some(t) => {
+                            return Err(CliError::Usage(format!(
+                                "{alias} is {}, not a table mapped as a graph source; a source is a ledger, a file, or a graph source from `fluree iceberg|sql|delta map`",
+                                describe(&t)
+                            )))
+                        }
+                        None => {
+                            return Err(CliError::NotFound(format!(
+                                "{alias}: no such ledger or graph source (a file source needs a .ttl, .nt, .jsonld or .json extension)"
+                            )))
+                        }
+                    }
                 };
                 Ok(Self {
                     fluree,
@@ -150,18 +162,30 @@ impl Opened {
     }
 }
 
-/// A graph source this build can read. Without the `iceberg` feature the
-/// table readers are not compiled in, so a mapped source reads as missing
-/// rather than failing on its first query.
-async fn is_graph_source(fluree: &Fluree, id: &str) -> CliResult<bool> {
+/// The type of a live graph source named `id`, when this build can read
+/// one. Without the `iceberg` feature the table readers are not compiled
+/// in, so a graph source reads as missing rather than failing on its first
+/// query.
+async fn graph_source_type(fluree: &Fluree, id: &str) -> CliResult<Option<GraphSourceType>> {
     if !cfg!(feature = "iceberg") {
-        return Ok(false);
+        return Ok(None);
     }
     Ok(fluree
         .nameservice()
         .lookup_graph_source(id)
         .await?
-        .is_some_and(|r| !r.retracted))
+        .filter(|r| !r.retracted)
+        .map(|r| r.source_type))
+}
+
+/// A graph source that is not a mapped table, as an error names it.
+fn describe(t: &GraphSourceType) -> String {
+    match t {
+        GraphSourceType::Bm25 => "a BM25 full-text index".to_string(),
+        GraphSourceType::Vector => "a vector index".to_string(),
+        GraphSourceType::Geo => "a geospatial index".to_string(),
+        other => format!("a graph source of type {}", other.to_type_string()),
+    }
 }
 
 pub async fn load_model(source: &Source, dirs: &FlureeDir) -> CliResult<Model> {

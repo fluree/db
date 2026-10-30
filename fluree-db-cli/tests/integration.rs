@@ -5741,6 +5741,25 @@ fn doc_ingest_catalog_names_the_entities_and_model_is_no_longer_the_ontology() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("--model"));
+
+    // The first run built the ledger's full-text index, `memos-text`: a
+    // graph source, but an index, not a mapped table, so it is refused by
+    // what it is rather than read as a catalog with no labels.
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "notes",
+            "--catalog",
+            "memos-text",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "memos-text is a BM25 full-text index, not a table mapped as a graph source",
+        ));
 }
 
 #[test]
