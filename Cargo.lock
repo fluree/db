@@ -3203,6 +3203,7 @@ dependencies = [
  "fluree-db-nameservice",
  "fluree-db-nameservice-sync",
  "fluree-db-novelty",
+ "fluree-db-ontology",
  "fluree-db-query",
  "fluree-db-r2rml",
  "fluree-db-server",
@@ -3604,6 +3605,7 @@ dependencies = [
  "async-trait",
  "fluree-db-core",
  "fluree-vocab",
+ "futures",
  "parking_lot",
  "rand 0.8.8",
  "serde",
@@ -3660,6 +3662,20 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "fluree-db-ontology"
+version = "4.2.4"
+dependencies = [
+ "fluree-graph-format",
+ "fluree-graph-ir",
+ "fluree-graph-json-ld",
+ "fluree-graph-turtle",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3902,6 +3918,7 @@ dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
  "fluree-db-query",
+ "fluree-graph-ir",
  "fluree-graph-json-ld",
  "fluree-vocab",
  "insta",
