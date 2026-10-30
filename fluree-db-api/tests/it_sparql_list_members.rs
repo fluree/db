@@ -632,6 +632,61 @@ async fn construct_reads_the_list_its_default_graph_holds() {
     assert!(!ttl.contains('('), "{ttl}");
 }
 
+/// Each value's entries are bound once, on the first solution naming it: a
+/// list repeating a value N times binds N positions in all, not N².
+#[tokio::test]
+async fn construct_binds_each_values_entries_once() {
+    use fluree_db_query::binding::Binding;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "construct-repeats",
+        "ex:s ex:nums (7 7 7 7 7 7 7 7) .",
+    )
+    .await;
+    let ledger = load(&fluree, &id).await;
+    let text = format!("{PREFIX}CONSTRUCT {{ ?s ex:nums ?o }} WHERE {{ ?s ex:nums ?o }}");
+    let result = support::query_sparql(&fluree, &ledger, &text)
+        .await
+        .expect("construct");
+    let vars = result
+        .output
+        .construct_template()
+        .and_then(|t| t.list_entries(0))
+        .expect("the template restates the WHERE");
+    let (mut rows, mut positions) = (0, 0);
+    for batch in &result.batches {
+        for row in 0..batch.len() {
+            if let Some(Binding::List(at)) = batch.get(row, vars.positions) {
+                rows += 1;
+                positions += at.len();
+            }
+        }
+    }
+    assert_eq!((rows, positions), (8, 8));
+    let ttl = turtle(&fluree, &ledger, &text).await;
+    assert!(ttl.contains("ex:s ex:nums ( 7 7 7 7 7 7 7 7 ) ."), "{ttl}");
+}
+
+/// The variables a list's entries are bound to are new to the query: one
+/// the query names as they would be named is its own.
+#[tokio::test]
+async fn construct_variables_alias_none_of_the_querys() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "construct-names", "ex:s ex:nums (3 1 3) .").await;
+    let ledger = load(&fluree, &id).await;
+    for var in [
+        "?__list_positions_0",
+        "?__list_beside_1",
+        "?__list_positions_2",
+    ] {
+        let text = format!("{PREFIX}CONSTRUCT {{ ?s ex:nums {var} }} WHERE {{ ?s ex:nums {var} }}");
+        let ttl = turtle(&fluree, &ledger, &text).await;
+        assert!(ttl.contains("ex:s ex:nums ( 3 1 3 ) ."), "{var}: {ttl}");
+    }
+}
+
 /// ADD again after an index build changes nothing, though the build holds
 /// the list's `-0.0` as `0.0`: the list ADD put beside another is found by
 /// its members.

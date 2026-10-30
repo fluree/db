@@ -62,8 +62,8 @@ pub struct ConstructTemplate {
 
 /// The variables a CONSTRUCT template triple's list entries are bound to
 /// (`crate::list_entries`): the positions of the entries of the owner's list
-/// that hold the triple's object, and whether the owner also holds the
-/// object beside the list.
+/// that hold the triple's object (an empty list when an earlier solution
+/// named them), and whether the owner also holds the object beside the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListEntryVars {
     pub positions: VarId,
@@ -198,7 +198,7 @@ impl ConstructTemplate {
             .filter(|v| !grouping.group_row_binds(*v) && !self.bnode_vars.contains(v))
             .collect();
         for var in unbound {
-            let fresh = vars.get_or_insert(&format!("?__construct_unbound_{}", vars.len()));
+            let fresh = vars.fresh("?__construct_unbound_");
             self.substitute_var(var, fresh);
         }
     }
@@ -206,7 +206,9 @@ impl ConstructTemplate {
     /// Give each default-graph pattern that restates a triple pattern of
     /// `where_patterns`, or of an OPTIONAL among them, the variables its list
     /// entries are bound to. Its triples are those the WHERE read, so where
-    /// they are entries of a list, they are written as that list.
+    /// they are entries of a list, they are written as that list. Called
+    /// once the query's variables are registered, so the new ones alias
+    /// none.
     pub fn mark_list_entries(&mut self, where_patterns: &[Pattern], vars: &mut VarRegistry) {
         let reified: HashSet<usize> = self.reifications.iter().map(|r| r.triple).collect();
         let marks: Vec<Option<ListEntryVars>> = (0..self.patterns.len())
@@ -222,8 +224,8 @@ impl ConstructTemplate {
                     && !minted
                     && reads_triple(where_patterns, t);
                 restates.then(|| ListEntryVars {
-                    positions: vars.get_or_insert(&format!("?__list_positions_{i}")),
-                    beside: vars.get_or_insert(&format!("?__list_beside_{i}")),
+                    positions: vars.fresh("?__list_positions_"),
+                    beside: vars.fresh("?__list_beside_"),
                 })
             })
             .collect();

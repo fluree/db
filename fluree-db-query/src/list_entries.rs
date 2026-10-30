@@ -42,6 +42,9 @@ pub struct ListEntriesOperator {
     /// Each owner's list as this request read it; `None` for an owner with
     /// no list, or lists in several graphs.
     held: HashMap<(Sid, Sid), Option<Arc<Held>>>,
+    /// The owners and values whose entries a solution has been bound to:
+    /// later solutions naming them are bound to none.
+    bound: HashSet<(Sid, Sid, Binding)>,
 }
 
 /// An owner's list, and the values it holds beside it.
@@ -68,6 +71,7 @@ impl ListEntriesOperator {
             view,
             schema: schema.into(),
             held: HashMap::new(),
+            bound: HashSet::new(),
         }
     }
 
@@ -108,8 +112,9 @@ impl ListEntriesOperator {
         Ok(Batch::from_parts(Arc::clone(&self.schema), columns, len)?)
     }
 
-    /// The positions of the entries holding row `row`'s object of `t`, and
-    /// whether the owner holds it beside them; `None` when no entry does.
+    /// The positions of the entries holding row `row`'s object of `t`, none
+    /// when an earlier solution named them, and whether the owner holds it
+    /// beside them; `None` when no entry does.
     async fn entries(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -128,12 +133,11 @@ impl ListEntriesOperator {
             return Ok(None);
         };
         let o = decoded(ctx, o);
-        let key = (s, p);
-        let held = match self.held.get(&key) {
+        let held = match self.held.get(&(s.clone(), p.clone())) {
             Some(held) => held.clone(),
             None => {
-                let held = read_held(ctx, graphs, &key.0, &key.1).await?.map(Arc::new);
-                self.held.insert(key, held.clone());
+                let held = read_held(ctx, graphs, &s, &p).await?.map(Arc::new);
+                self.held.insert((s.clone(), p.clone()), held.clone());
                 held
             }
         };
@@ -143,11 +147,15 @@ impl ListEntriesOperator {
         let Some(at) = held.entries.get(&o) else {
             return Ok(None);
         };
+        let beside = held.beside.contains(&o);
+        if !self.bound.insert((s, p, o)) {
+            return Ok(Some((Vec::new(), beside)));
+        }
         let at = at
             .iter()
             .map(|&i| Binding::lit(FlakeValue::Long(i), Sid::xsd_integer()))
             .collect();
-        Ok(Some((at, held.beside.contains(&o))))
+        Ok(Some((at, beside)))
     }
 }
 
@@ -247,6 +255,7 @@ impl Operator for ListEntriesOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.held.clear();
+        self.bound.clear();
         self.child.open(ctx).await
     }
 
@@ -260,6 +269,7 @@ impl Operator for ListEntriesOperator {
     fn close(&mut self) {
         self.child.close();
         self.held.clear();
+        self.bound.clear();
     }
 
     fn estimated_rows(&self) -> Option<usize> {
