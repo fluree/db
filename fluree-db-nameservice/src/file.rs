@@ -24,8 +24,8 @@
 //! - A database with transactions
 
 use crate::ns_format::{
-    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
-    NS_VERSION,
+    merge_heads, ns_context, parse_record, BranchPointRef, IndexRef, LedgerRef, NsFileV2,
+    NsIndexFileV2, NS_VERSION,
 };
 use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
@@ -295,10 +295,7 @@ impl FileNameService {
     ) -> Result<Option<T>> {
         use fluree_db_core::StorageRead;
         match self.storage.read_bytes(address).await {
-            Ok(bytes) => {
-                let parsed = serde_json::from_slice(&bytes)?;
-                Ok(Some(parsed))
-            }
+            Ok(bytes) => Ok(Some(parse_record(&bytes, address)?)),
             Err(fluree_db_core::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(NameServiceError::from(e)),
         }
@@ -350,7 +347,7 @@ impl FileNameService {
             return Ok(None);
         }
 
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, &main_address)?;
         let Some(ledger_id) =
             crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, &main_address)
         else {
@@ -419,7 +416,7 @@ impl FileNameService {
         if Self::is_graph_source_from_bytes(&main_bytes) {
             return Ok(None);
         }
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, &main_address)?;
         let index_file: Option<NsIndexFileV2> = self
             .read_json_from_address(&Self::index_address(ledger_name, branch))
             .await?;
@@ -439,7 +436,8 @@ impl FileNameService {
             .map_err(|e| NameServiceError::storage(format!("Failed to read {main_path:?}: {e}")))?;
 
         // Parse just enough to check @type
-        let parsed: serde_json::Value = serde_json::from_str(&content)?;
+        let parsed: serde_json::Value =
+            parse_record(content.as_bytes(), &main_path.display().to_string())?;
         Ok(Self::is_graph_source_from_json(&parsed))
     }
 
@@ -3006,9 +3004,10 @@ mod tests {
         tokio::fs::write(ns_dir.join("mydb/dev.json"), b"not json")
             .await
             .unwrap();
+        let err = ns.branch_records("mydb").await.unwrap_err();
         assert!(
-            ns.branch_records("mydb").await.is_err(),
-            "an unreadable branch fails the listing"
+            err.to_string().contains("mydb/dev.json"),
+            "an unreadable branch fails the listing, naming its record: {err}"
         );
     }
 

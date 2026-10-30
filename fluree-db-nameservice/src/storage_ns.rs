@@ -18,8 +18,8 @@
 //! Under contention, operations will retry with exponential backoff.
 
 use crate::ns_format::{
-    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
-    NS_VERSION,
+    merge_heads, ns_context, parse_record, BranchPointRef, IndexRef, LedgerRef, NsFileV2,
+    NsIndexFileV2, NS_VERSION,
 };
 use crate::{
     deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, BranchLifecycle,
@@ -326,10 +326,7 @@ where
     /// Read and parse a JSON file from storage
     async fn read_json<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
         match self.storage.read_bytes(key).await {
-            Ok(bytes) => {
-                let parsed = serde_json::from_slice(&bytes)?;
-                Ok(Some(parsed))
-            }
+            Ok(bytes) => Ok(Some(parse_record(&bytes, key)?)),
             Err(CoreError::NotFound(_)) => Ok(None),
             Err(e) => Err(NameServiceError::storage(format!(
                 "Failed to read {key}: {e}"
@@ -353,7 +350,7 @@ where
         if Self::is_graph_source_from_bytes(&main_bytes) {
             return Ok(None);
         }
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, &main_key)?;
         let index_file: Option<NsIndexFileV2> =
             self.read_json(&self.index_key(ledger_name, branch)).await?;
         Ok(Some(merge_heads(&main, index_file.as_ref())))
@@ -427,7 +424,7 @@ where
             return Ok(None);
         }
 
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, main_key)?;
         let Some(ledger_id) =
             crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, main_key)
         else {
@@ -829,7 +826,7 @@ where
                 // Record exists — check if it's retracted (dropped) and allow re-creation
                 match self.storage.read_bytes(&key).await {
                     Ok(existing_bytes) => {
-                        let existing: NsFileV2 = serde_json::from_slice(&existing_bytes)?;
+                        let existing: NsFileV2 = parse_record(&existing_bytes, &key)?;
                         if existing.status == "retracted" {
                             // Overwrite the retracted record with a fresh one
                             self.storage.write_bytes(&key, &bytes).await.map_err(|e| {
@@ -1519,7 +1516,7 @@ where
             }
         };
 
-        let file: NsFileV2 = serde_json::from_slice(&data)?;
+        let file: NsFileV2 = parse_record(&data, &key)?;
 
         Ok(Some(file.to_status_value()))
     }
@@ -1617,7 +1614,7 @@ where
             }
         };
 
-        let file: NsFileV2 = serde_json::from_slice(&data)?;
+        let file: NsFileV2 = parse_record(&data, &key)?;
 
         Ok(Some(file.to_config_value()))
     }
@@ -2222,9 +2219,10 @@ mod tests {
             .write_bytes(&ns.ns_key("mydb", "dev"), b"not json")
             .await
             .unwrap();
+        let err = ns.branch_records("mydb").await.unwrap_err();
         assert!(
-            ns.branch_records("mydb").await.is_err(),
-            "an unreadable branch fails the listing"
+            err.to_string().contains("mydb/dev.json"),
+            "an unreadable branch fails the listing, naming its record: {err}"
         );
     }
 
