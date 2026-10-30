@@ -15,7 +15,6 @@ use regex::{Regex, RegexBuilder};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use crate::var_registry::VarId;
 
@@ -52,7 +51,8 @@ enum EncodedBindingCacheKey {
     },
 }
 
-type EncodedBoolPredicateKey = (usize, u16, u64, EncodedBindingCacheKey);
+/// (store instance id, graph, expression hash, encoded binding).
+type EncodedBoolPredicateKey = (u64, u16, u64, EncodedBindingCacheKey);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CacheableBoolPredicate {
@@ -253,8 +253,11 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
         return Ok(None);
     };
 
+    // The store's instance id, not its address: a dropped store's address can
+    // be reused by the next one built, and its verdicts would then answer for
+    // a different dictionary (an ABA misread).
     let cache_key = (
-        Arc::as_ptr(store) as usize,
+        store.store_id(),
         ctx.binary_g_id,
         spec.expr_hash,
         binding_key,
@@ -432,8 +435,7 @@ fn analyze_bool_cache_inner(expr: &Expression, state: &mut impl Hasher) -> BoolC
             may_materialize: false,
         },
         Expression::Call { func, args } => {
-            hash_function(func, state);
-            args.len().hash(state);
+            hash_function_and_arity(func, args.len(), state);
 
             let mut vars = VarUsage::None;
             let mut supported = function_supported_for_bool_cache(func);
@@ -628,11 +630,40 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
     )
 }
 
-fn hash_function(func: &Function, state: &mut impl Hasher) {
+/// A call's function, fields included, and its arity.
+///
+/// `Lang { strict }` and `Datatype { strict }` answer differently in each
+/// mode, so SPARQL's strict verdict must not answer for JSON-LD's lenient one.
+/// The mode rides in the arity word's top bit instead of a write of its own:
+/// a one-byte write would leave every later word write in the walk straddling
+/// the hasher's buffer, and costs the analysis about 8%.
+fn hash_function_and_arity(func: &Function, arity: usize, state: &mut impl Hasher) {
     std::mem::discriminant(func).hash(state);
-    if let Function::Custom(name) = func {
-        name.hash(state);
-    }
+    let mode = match func {
+        Function::Lang { strict } | Function::Datatype { strict } => u64::from(*strict) << 63,
+        Function::Custom(name) => {
+            name.hash(state);
+            0
+        }
+        _ => {
+            debug_assert!(
+                carries_no_field(func),
+                "{func:?} carries a field the filter hash does not take"
+            );
+            0
+        }
+    };
+    (arity as u64 | mode).hash(state);
+}
+
+/// Whether `func`'s own hash, which follows its equality, is its variant
+/// alone: true for every function without fields.
+fn carries_no_field(func: &Function) -> bool {
+    let mut whole = DefaultHasher::new();
+    func.hash(&mut whole);
+    let mut variant = DefaultHasher::new();
+    std::mem::discriminant(func).hash(&mut variant);
+    whole.finish() == variant.finish()
 }
 
 fn hash_flake_value(value: &FlakeValue, state: &mut impl Hasher) {
@@ -932,5 +963,58 @@ mod tests {
             0,
             0
         ));
+    }
+    /// `Function`'s hash follows its equality, fields included, so the strict
+    /// and lenient `LANG` / `DATATYPE` of SPARQL and JSON-LD never share an
+    /// encoded bool-predicate cache entry.
+    #[test]
+    fn strict_and_lenient_functions_hash_apart() {
+        fn hash_of(func: &Function) -> u64 {
+            let mut h = DefaultHasher::new();
+            func.hash(&mut h);
+            h.finish()
+        }
+        for (a, b) in [
+            (
+                Function::Lang { strict: true },
+                Function::Lang { strict: false },
+            ),
+            (
+                Function::Datatype { strict: true },
+                Function::Datatype { strict: false },
+            ),
+        ] {
+            assert_ne!(a, b);
+            assert_ne!(hash_of(&a), hash_of(&b), "{a:?} / {b:?}");
+            assert_eq!(hash_of(&a), hash_of(&a.clone()), "{a:?}");
+            assert!(!carries_no_field(&a), "{a:?}");
+        }
+        assert!(carries_no_field(&Function::Eq));
+        assert!(!carries_no_field(&Function::Custom("f".to_string())));
+
+        let funcs: [fn(bool) -> Function; 2] = [
+            |strict| Function::Lang { strict },
+            |strict| Function::Datatype { strict },
+        ];
+        for func in funcs {
+            let is_empty = |strict| {
+                Expression::call(
+                    Function::Eq,
+                    vec![
+                        Expression::call(
+                            Function::Str,
+                            vec![Expression::call(
+                                func(strict),
+                                vec![Expression::Var(VarId(0))],
+                            )],
+                        ),
+                        Expression::Const(FlakeValue::String(String::new())),
+                    ],
+                )
+            };
+            let strict = analyze_cacheable_bool_predicate(&is_empty(true)).expect("cacheable");
+            let lenient = analyze_cacheable_bool_predicate(&is_empty(false)).expect("cacheable");
+            assert_ne!(strict.expr_hash, lenient.expr_hash, "{:?}", func(true));
+        }
     }
 }
