@@ -199,9 +199,9 @@ fn sparql_cases() -> Vec<Case> {
             &["at_d", "at_s"],
         ),
         case("time < string", AT, &[r#"?o < "11:00:00""#], &["at_t"]),
-        // solo's decision pager (fluree-lambda-identity `store.rs`): the
-        // standalone form is pushed, the paging form is evaluated (`=` is
-        // false there, so only the strictly earlier decision comes back).
+        // A keyset pager over decision timestamps: the standalone form is
+        // pushed, the paging form is evaluated (`=` is false there, so only
+        // the strictly earlier decision comes back).
         // Pushed into the join's per-subject probes of `ex:at`, which check
         // the bound row by row; there is no POST range to seek.
         Case {
