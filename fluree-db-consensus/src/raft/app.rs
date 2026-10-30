@@ -119,11 +119,8 @@ impl AppStateMachine for NameServiceApp {
     /// does not drop the demoted voter — growing the cluster, say —
     /// re-promotes it, opening an `unreachable_after`-long window where
     /// work rendezvouses to an unreachable node.
-    fn apply_membership(
-        state: &mut NameServiceState,
-        membership: &MembershipView,
-        _log_index: u64,
-    ) {
+    fn apply_membership(state: &mut NameServiceState, membership: &MembershipView, log_index: u64) {
+        state.membership_index = log_index;
         let new_voters: BTreeSet<NodeId> = membership.voters.clone();
         let surviving_demotions: BTreeSet<NodeId> = state
             .configured_voters
@@ -951,6 +948,7 @@ mod tests {
         let expected: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
         assert_eq!(state.configured_voters, expected);
         assert_eq!(state.worker_eligible_voters, expected);
+        assert_eq!(state.membership_index, 1, "the membership in force");
     }
 
     #[tokio::test]

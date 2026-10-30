@@ -166,7 +166,9 @@ impl Collector for RaftNameService {
         if self.state.read().await.collect.enabled {
             return Ok(true);
         }
-        let (me, members): (NodeId, Vec<(NodeId, ClusterNode)>) = {
+        // The members and the index of the membership in force, together:
+        // `Enable` is refused if the membership changes before it applies.
+        let (me, members, membership): (NodeId, Vec<(NodeId, ClusterNode)>, u64) = {
             let metrics = self.raft.metrics();
             let metrics = metrics.borrow();
             (
@@ -176,6 +178,10 @@ impl Collector for RaftNameService {
                     .nodes()
                     .map(|(id, node)| (*id, node.clone()))
                     .collect(),
+                metrics
+                    .membership_config
+                    .log_id()
+                    .map_or(0, |log_id| log_id.index),
             )
         };
         let loopback = members
@@ -196,11 +202,16 @@ impl Collector for RaftNameService {
                 return Ok(false);
             }
         }
-        match self.propose_collect(CollectCommand::Enable).await? {
+        match self
+            .propose_collect(CollectCommand::Enable { membership })
+            .await?
+        {
             SmResponse::CollectionEnabled => {
                 tracing::info!("every member checks its writes: the cluster collects garbage");
                 Ok(true)
             }
+            // A member joined or left while they were asked: ask again.
+            SmResponse::MembershipMoved { .. } => Ok(false),
             other => Err(unexpected("Enable", other)),
         }
     }

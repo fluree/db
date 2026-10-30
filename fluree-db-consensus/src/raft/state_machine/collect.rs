@@ -61,8 +61,10 @@ pub enum CollectCommand {
     Delete { number: u64 },
     /// Intent `number`'s deletes are done.
     Complete { number: u64 },
-    /// Every member checks its writes against intents: collect from now.
-    Enable,
+    /// Every member of the membership at log index `membership` checks its
+    /// writes against intents: collect from now. Refused if the membership
+    /// changed since: a member added meanwhile was not checked.
+    Enable { membership: u64 },
 }
 
 /// The intent whose deletion has begun that a write presenting `seen`
@@ -133,7 +135,12 @@ pub(super) fn apply(
             collect.intents.remove(&number);
             Response::IntentClosed { number }
         }
-        CollectCommand::Enable => {
+        CollectCommand::Enable { membership } => {
+            if membership != state.membership_index {
+                return Response::MembershipMoved {
+                    current: state.membership_index,
+                };
+            }
             collect.enabled = true;
             Response::CollectionEnabled
         }
@@ -281,8 +288,14 @@ mod tests {
             apply_command(&mut state, cas(RefKind::CommitHead), 8),
             refused
         );
+        state.membership_index = 3;
         assert_eq!(
-            collect(&mut state, CollectCommand::Enable),
+            collect(&mut state, CollectCommand::Enable { membership: 2 }),
+            Response::MembershipMoved { current: 3 }
+        );
+        assert!(!state.collect.enabled, "checked another membership");
+        assert_eq!(
+            collect(&mut state, CollectCommand::Enable { membership: 3 }),
             Response::CollectionEnabled
         );
         assert_eq!(
@@ -308,8 +321,8 @@ mod tests {
             vec![31, 3, 1]
         );
         assert_eq!(
-            bytes(&Command::Collect(CollectCommand::Enable)),
-            vec![31, 4]
+            bytes(&Command::Collect(CollectCommand::Enable { membership: 2 })),
+            vec![31, 4, 2]
         );
         let seen = Command::Seen {
             seen: 2,
@@ -320,37 +333,12 @@ mod tests {
         assert_eq!(bytes(&seen)[..3], [32, 2, 8]);
     }
 
-    /// Snapshots taken before collection state restore with their erasure
-    /// state; one taken now keeps its intents, and a damaged one is refused
-    /// rather than restored without them.
+    /// A snapshot keeps its intents; a damaged one is refused rather than
+    /// restored without them.
     #[test]
-    fn snapshots_from_before_collection_state_restore() {
+    fn snapshots_keep_collection_state() {
         let mut state = NameServiceState::new();
         state.erasure.next_activation = 3;
-        let v3 = super::super::NameServiceStateV3 {
-            refs: state.refs.clone(),
-            ledgers: state.ledgers.clone(),
-            retracted: state.retracted.clone(),
-            idempotency: state.idempotency.clone(),
-            queues: state.queues.clone(),
-            next_queue_id: state.next_queue_id,
-            recently_cleared: state.recently_cleared.clone(),
-            evicted_idempotency_count: state.evicted_idempotency_count,
-            queue_config: state.queue_config,
-            status: state.status.clone(),
-            config: state.config.clone(),
-            graph_sources: state.graph_sources.clone(),
-            worker_eligible_voters: state.worker_eligible_voters.clone(),
-            configured_voters: state.configured_voters.clone(),
-            bindings: state.bindings.clone(),
-            dropped: state.dropped.clone(),
-            fences: state.fences.clone(),
-            erasure: state.erasure.clone(),
-        };
-        let restored =
-            NameServiceState::from_snapshot(&postcard::to_allocvec(&v3).unwrap()).unwrap();
-        assert_eq!(restored, state);
-
         condemn(&mut state, "a");
         spare(&mut state, 0, "x");
         let bytes = state.to_snapshot().unwrap();

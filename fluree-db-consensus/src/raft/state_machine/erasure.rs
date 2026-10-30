@@ -1180,38 +1180,14 @@ mod tests {
         assert_eq!(state.erasure_cleanup.cleaned[&3].applied, 4);
     }
 
-    /// Snapshots taken before cleanup state restore with their collection
-    /// state; one taken now keeps it.
+    /// A snapshot keeps the state appended after the released layout's,
+    /// purges, members' cleanup and the membership index among it; a
+    /// damaged one is refused rather than restored without it.
     #[test]
-    fn snapshots_from_before_cleanup_state_restore() {
+    fn snapshots_keep_cleanup_state_and_the_membership_index() {
         let mut state = ledger_with_queued_request();
-        state.collect.next_intent = 2;
-        let v4 = super::super::NameServiceStateV4 {
-            refs: state.refs.clone(),
-            ledgers: state.ledgers.clone(),
-            retracted: state.retracted.clone(),
-            idempotency: state.idempotency.clone(),
-            queues: state.queues.clone(),
-            next_queue_id: state.next_queue_id,
-            recently_cleared: state.recently_cleared.clone(),
-            evicted_idempotency_count: state.evicted_idempotency_count,
-            queue_config: state.queue_config,
-            status: state.status.clone(),
-            config: state.config.clone(),
-            graph_sources: state.graph_sources.clone(),
-            worker_eligible_voters: state.worker_eligible_voters.clone(),
-            configured_voters: state.configured_voters.clone(),
-            bindings: state.bindings.clone(),
-            dropped: state.dropped.clone(),
-            fences: state.fences.clone(),
-            erasure: state.erasure.clone(),
-            collect: state.collect.clone(),
-        };
-        let restored =
-            NameServiceState::from_snapshot(&postcard::to_allocvec(&v4).unwrap()).unwrap();
-        assert_eq!(restored, state);
-
         state.erasure_cleanup.purged.insert(0, 12);
+        state.membership_index = 7;
         let bytes = state.to_snapshot().unwrap();
         assert_eq!(NameServiceState::from_snapshot(&bytes).unwrap(), state);
         assert!(NameServiceState::from_snapshot(&bytes[..bytes.len() - 1]).is_err());

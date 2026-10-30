@@ -1028,8 +1028,9 @@ async fn condemn(
         })
         .collect();
     let hash = fluree.put_intent(entries).await.expect("intent stored");
+    let membership = integration.shared_state.read().await.membership_index;
     for command in [
-        CollectCommand::Enable,
+        CollectCommand::Enable { membership },
         CollectCommand::Condemn {
             intent: hash.clone(),
         },
@@ -1131,13 +1132,14 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
     let bytes = serde_json::to_vec(&intent).unwrap();
     let hash = fluree_db_core::sha256_hex(&bytes);
 
+    let membership = integration.shared_state.read().await.membership_index;
     let refused = condemned
         .scoped(async {
             storage.write_bytes(&address, b"stray").await.unwrap();
             // Deleting before this node can load the intent: its object is
             // written only after.
             for command in [
-                CollectCommand::Enable,
+                CollectCommand::Enable { membership },
                 CollectCommand::Condemn {
                     intent: hash.clone(),
                 },
@@ -1249,6 +1251,8 @@ async fn collection_waits_until_every_member_checks_its_writes() {
             let checks = Arc::clone(&checks);
             move || async move {
                 if checks.load(Ordering::SeqCst) {
+                    // Slowly: a membership change can land meanwhile.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
                     Ok(postcard::to_allocvec(&36u64).unwrap())
                 } else {
                     Err(axum::http::StatusCode::NOT_FOUND)
@@ -1281,7 +1285,39 @@ async fn collection_waits_until_every_member_checks_its_writes() {
     assert_eq!(waiting.condemned, 0, "{waiting:?}");
     assert!(!integration.shared_state.read().await.collect.enabled);
 
+    // A member of an earlier release joining while the others are asked
+    // was never asked: collection is not enabled.
     checks.store(true, Ordering::SeqCst);
+    let joins = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        integration
+            .raft
+            .add_learner(
+                37,
+                fluree_db_consensus::raft::ClusterNode::new(
+                    "http://127.0.0.1:9/raft/nameservice",
+                    "http://127.0.0.1:9",
+                ),
+                false,
+            )
+            .await
+            .expect("learner added");
+    };
+    let (raced, ()) = tokio::join!(
+        fluree.collect_garbage_settled(Duration::ZERO, Duration::ZERO),
+        joins
+    );
+    assert_eq!(raced.unwrap().condemned, 0);
+    assert!(!integration.shared_state.read().await.collect.enabled);
+    integration
+        .raft
+        .change_membership(
+            openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([37])),
+            false,
+        )
+        .await
+        .expect("learner removed");
+
     let enabled = fluree
         .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
         .await
