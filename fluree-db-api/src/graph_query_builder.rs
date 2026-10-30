@@ -295,6 +295,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             &view,
             input.as_jsonld(),
             r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
+            None,
             execution.clone(),
             &format_config,
         )
@@ -351,8 +352,9 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         // Intercept a virtual-dataset subgraph crawl BEFORE dispatch, exactly
         // like `execute_formatted` — otherwise the same crawl issued with
         // tracking headers falls through to native hydration and returns [].
-        // The crawl has no fuel/policy/time stats, so it returns a 200 with
-        // empty tracking (mirrors `FromQueryBuilder::execute_tracked`).
+        // The crawl enforces the request's fuel limit but reports no
+        // fuel/policy/time stats, so it returns a 200 with empty tracking
+        // (mirrors `FromQueryBuilder::execute_tracked`).
         #[cfg(feature = "iceberg")]
         {
             let fc = format_config
@@ -363,6 +365,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                 &db,
                 input.as_jsonld(),
                 r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
+                tracking.as_ref(),
                 execution.clone(),
                 &fc,
             )

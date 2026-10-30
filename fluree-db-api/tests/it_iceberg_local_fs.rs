@@ -1776,6 +1776,168 @@ async fn a_graph_source_crawl_refuses_group_by_and_having() {
     }
 }
 
+/// A subgraph crawl over a graph source keeps the request's options: its
+/// fuel limit, from the body's `opts` or a tracked request's override, on the
+/// connection and the graph terminals alike, and its reasoning keys. The crawl runs
+/// a rewritten flat query, which used to carry only the context, `select`,
+/// `where`, `orderBy` and `limit`, so a crawl ran without its fuel limit and
+/// without reasoning. SPARQL has no subgraph crawl, so there is no twin.
+#[tokio::test]
+async fn crawl_over_a_graph_source_keeps_its_query_options() {
+    use fluree_db_api::{TrackedQueryResponse, TrackingOptions};
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("optioned-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+
+    let crawl = |extra: Value| {
+        let mut q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "ex:Person"},
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            q[k] = v.clone();
+        }
+        q
+    };
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+    let fuel_exceeded = |err: &ApiError| {
+        matches!(
+            err,
+            ApiError::Query(fluree_db_query::QueryError::FuelLimitExceeded(_))
+        )
+    };
+    let tracked_fuel_exceeded =
+        |status: u16, error: &str| status == 400 && error.to_lowercase().contains("fuel");
+    // Five people with a name and a score cost more than 1.001 fuel: the
+    // 1.000 floor and one thousandth per row.
+    let tight = json!({"opts": {"max-fuel": 1.001}});
+    let generous = json!({"opts": {"max-fuel": 1_000_000}});
+    let with_from = |mut q: Value| {
+        q["from"] = json!("optioned-people:main");
+        q
+    };
+
+    // Connection terminal, body limit.
+    let ok = fluree
+        .query_from()
+        .jsonld(&with_from(crawl(generous.clone())))
+        .execute_formatted()
+        .await
+        .expect("a crawl under its limit succeeds");
+    assert_eq!(rows(&ok), 5, "{ok}");
+    let err = fluree
+        .query_from()
+        .jsonld(&with_from(crawl(tight.clone())))
+        .execute_formatted()
+        .await
+        .expect_err("a crawl past its body fuel limit fails");
+    assert!(fuel_exceeded(&err), "connection, body limit: {err:?}");
+
+    // Graph terminal, body limit.
+    let graph = fluree.graph("optioned-people:main");
+    let err = graph
+        .query()
+        .with_r2rml()
+        .jsonld(&crawl(tight.clone()))
+        .execute_formatted()
+        .await
+        .expect_err("a crawl past its body fuel limit fails");
+    assert!(fuel_exceeded(&err), "graph, body limit: {err:?}");
+
+    // Tracked terminals: the override's limit holds, and replaces the body's.
+    let override_limit = TrackingOptions {
+        track_fuel: true,
+        max_fuel: Some(1_001),
+        ..TrackingOptions::default()
+    };
+    let check_tracked = |label: &str,
+                         limited: Result<TrackedQueryResponse, _>,
+                         lifted: Result<TrackedQueryResponse, _>| {
+        let limited: fluree_db_api::TrackedErrorResponse =
+            limited.expect_err(&format!("{label}: the override's limit holds"));
+        assert!(
+            tracked_fuel_exceeded(limited.status, &limited.error),
+            "{label}: {} {}",
+            limited.status,
+            limited.error
+        );
+        let lifted = lifted.unwrap_or_else(|e| {
+            panic!("{label}: an override with no limit lifts the body's: {e:?}")
+        });
+        assert_eq!(rows(&lifted.result), 5, "{label}: {:?}", lifted.result);
+    };
+    check_tracked(
+        "connection",
+        fluree
+            .query_from()
+            .jsonld(&with_from(crawl(json!({}))))
+            .tracking(override_limit.clone())
+            .execute_tracked()
+            .await,
+        fluree
+            .query_from()
+            .jsonld(&with_from(crawl(tight.clone())))
+            .track_all()
+            .execute_tracked()
+            .await,
+    );
+    check_tracked(
+        "graph",
+        graph
+            .query()
+            .with_r2rml()
+            .jsonld(&crawl(json!({})))
+            .tracking(override_limit.clone())
+            .execute_tracked()
+            .await,
+        graph
+            .query()
+            .with_r2rml()
+            .jsonld(&crawl(tight.clone()))
+            .track_all()
+            .execute_tracked()
+            .await,
+    );
+
+    // Reasoning reaches the flat query's parser: an unknown mode is refused,
+    // as on a flat query, where the crawl used to answer as if none were named.
+    // (`crawl::e2e::crawl_carries_reasoning` shows an RDFS crawl answering the
+    // subclass's instances.)
+    for (label, query) in [
+        (
+            "crawl",
+            with_from(crawl(json!({"reasoning": "no-such-mode"}))),
+        ),
+        (
+            "flat",
+            with_from(json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": ["?s"],
+                "where": {"@id": "?s", "@type": "ex:Person"},
+                "reasoning": "no-such-mode",
+            })),
+        ),
+    ] {
+        let err = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .expect_err("an unknown reasoning mode is refused");
+        assert!(err.to_string().contains("reasoning"), "{label}: {err}");
+    }
+}
+
 /// SPARQL twin of the crawl ordering. SPARQL has no subgraph crawl: the
 /// shape that picks a page of subjects by ORDER BY and returns their triples is
 /// a CONSTRUCT, which runs on the ordinary R2RML path and keeps only the

@@ -33,7 +33,7 @@ use fluree_db_query::Binding;
 
 use crate::format::{format_node_object_binding, FormatterConfig, IriCompactor};
 use crate::view::{GraphDb, QueryInput};
-use crate::{Fluree, QueryExecutionOptions, Result};
+use crate::{Fluree, QueryExecutionOptions, Result, TrackingOptions};
 
 /// Fresh variable names for the injected wildcard scan. The leading `?__` keeps
 /// them from colliding with any user variable.
@@ -56,6 +56,89 @@ const TRIPLES_PER_SUBJECT_BUDGET: usize = 64;
 /// remote scan; past this depth the crawl errors with guidance instead. Browse
 /// paging (the surface this exists for) stays far below it.
 const MAX_CRAWL_OFFSET_SUBJECTS: usize = 10_000;
+
+/// Query keys the crawl rewrite replaces or refuses: the projection and query
+/// form, the WHERE it extends, the modifiers it re-applies after grouping or
+/// carries itself (`limit`, `offset`, `orderBy`), the ones it refuses
+/// (`values`, `groupBy`, `having`), and `depth`, which shapes a subgraph
+/// selection's output and has no meaning on the flat `select`.
+const CRAWL_OWNED_KEYS: &[&str] = &[
+    "select",
+    "selectOne",
+    "select-one",
+    "selectDistinct",
+    "select-distinct",
+    "construct",
+    "ask",
+    "where",
+    "limit",
+    "offset",
+    "orderBy",
+    "order-by",
+    "values",
+    "groupBy",
+    "group-by",
+    "having",
+    "depth",
+];
+
+/// Dataset keys, at the top level or in `opts`. The caller resolved them into
+/// the view the crawl runs on, so the flat query must not name them again:
+/// read on a view, they are refused as a cross-ledger `from`.
+const DATASET_KEYS: &[&str] = &["from", "ledger", "fromNamed", "from-named", "to"];
+
+/// The spellings of a fuel limit in `opts` (see `TrackingOptions::from_opts_value`).
+const MAX_FUEL_KEYS: &[&str] = &["max-fuel", "max_fuel", "maxFuel"];
+
+/// Every key of the crawl's query that the flat query carries unchanged: all
+/// of them but [`CRAWL_OWNED_KEYS`] and [`DATASET_KEYS`]. That includes the
+/// context, `opts` (the fuel limit, `meta`, the parse switches such as
+/// `strictCompactIri` and `objectVarParsing`, and the policy keys, already
+/// applied to the view), the reasoning keys (`reasoning`, `rules`,
+/// `ontology`, `reasoningBudget`, `reasoningTime`) and `distinct`.
+///
+/// The keys the rewrite owns are listed, not the ones it keeps, so a query
+/// option added later reaches the flat query without a change here. A list
+/// of kept keys is what dropped `reasoning` and `opts`, `max-fuel` among
+/// them, so that a crawl ran without its fuel limit.
+fn carried_query_options(obj: &Map<String, JsonValue>) -> Map<String, JsonValue> {
+    let mut carried: Map<String, JsonValue> = obj
+        .iter()
+        .filter(|(key, _)| {
+            !CRAWL_OWNED_KEYS.contains(&key.as_str()) && !DATASET_KEYS.contains(&key.as_str())
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if let Some(JsonValue::Object(opts)) = carried.get_mut("opts") {
+        opts.retain(|key, _| !DATASET_KEYS.contains(&key.as_str()));
+    }
+    carried
+}
+
+/// Make the flat query's fuel limit the one a tracked request's override
+/// names. The override replaces the body's `opts` fuel limit, as it does for
+/// every other tracked query (`tracked_query_tracker`), including when it
+/// names none. An untracked request passes no override and keeps the body's.
+fn apply_fuel_override(carried: &mut Map<String, JsonValue>, tracking: Option<&TrackingOptions>) {
+    let Some(tracking) = tracking else {
+        return;
+    };
+    let opts = carried
+        .entry("opts".to_string())
+        .or_insert_with(|| JsonValue::Object(Map::new()));
+    if !opts.is_object() {
+        // A malformed `opts` is the query parser's to refuse; leave it.
+        return;
+    }
+    let opts = opts.as_object_mut().expect("checked above");
+    opts.retain(|key, _| !MAX_FUEL_KEYS.contains(&key.as_str()));
+    if let Some(limit) = tracking.max_fuel {
+        opts.insert(
+            "max-fuel".to_string(),
+            json!(fluree_db_core::tracking::micro_to_fuel(limit)),
+        );
+    }
+}
 
 /// Distinct object-var name for the i-th explicit predicate of a predicate-list
 /// crawl. A DISTINCT var per predicate is REQUIRED: a shared object var makes
@@ -110,8 +193,10 @@ struct DetectedCrawl<'a> {
     /// present for a [`CrawlRoot::Var`]; typically `None` for a
     /// [`CrawlRoot::Iri`] (the subject is already bound by the constant).
     where_clause: Option<&'a JsonValue>,
-    /// The query's `@context`, if any (carried onto the flat query).
-    context: Option<&'a JsonValue>,
+    /// The query's keys the flat query carries unchanged (see
+    /// [`carried_query_options`]): the context, `opts`, reasoning, and the
+    /// rest.
+    carried: Map<String, JsonValue>,
     /// The crawl's subject LIMIT, if any.
     limit: Option<usize>,
     /// The crawl's subject OFFSET (0 when absent). Applied to the grouped
@@ -165,19 +250,21 @@ impl SubjectAcc {
 /// per-subject JSON-LD documents. Returns `Ok(None)` when `input` is not a
 /// wildcard crawl this path handles, so the caller falls back to normal
 /// formatting.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn expand_wildcard_crawl(
     fluree: &Fluree,
     view: &GraphDb,
     input: &JsonValue,
     provider: &dyn fluree_db_query::r2rml::R2rmlProvider,
     table_provider: &dyn fluree_db_query::r2rml::R2rmlTableProvider,
+    tracking: Option<&TrackingOptions>,
     execution: QueryExecutionOptions,
     format_config: &FormatterConfig,
 ) -> Result<Option<JsonValue>> {
     let Some(DetectedCrawl {
         root,
         where_clause,
-        context,
+        mut carried,
         limit,
         offset,
         order_by,
@@ -186,6 +273,7 @@ pub(crate) async fn expand_wildcard_crawl(
     else {
         return Ok(None);
     };
+    apply_fuel_override(&mut carried, tracking);
 
     // C1: a top-level `values` clause is NOT consumed by crawl planning
     // (`detect_wildcard_crawl` / `build_flat_query` never read it), so it would
@@ -234,7 +322,7 @@ pub(crate) async fn expand_wildcard_crawl(
                 view,
                 iri,
                 where_clause,
-                context,
+                &carried,
                 &projection,
                 provider,
                 table_provider,
@@ -274,7 +362,7 @@ pub(crate) async fn expand_wildcard_crawl(
     let flat_query = build_flat_query(
         subject_var,
         where_clause,
-        context,
+        &carried,
         flat_limit,
         order_by,
         &projection,
@@ -475,7 +563,7 @@ async fn expand_bound_subject_select_map(
     view: &GraphDb,
     subject_iri: &str,
     where_clause: Option<&JsonValue>,
-    context: Option<&JsonValue>,
+    carried: &Map<String, JsonValue>,
     projection: &CrawlProjection,
     provider: &dyn fluree_db_query::r2rml::R2rmlProvider,
     table_provider: &dyn fluree_db_query::r2rml::R2rmlTableProvider,
@@ -488,10 +576,7 @@ async fn expand_bound_subject_select_map(
     // constraint.
     let mut where_patterns: Vec<JsonValue> = where_clause.map(where_as_array).unwrap_or_default();
     where_patterns.push(json!({ "@id": subject_iri, CRAWL_PRED: CRAWL_OBJ }));
-    let mut flat = Map::new();
-    if let Some(ctx) = context {
-        flat.insert("@context".to_string(), ctx.clone());
-    }
+    let mut flat = carried.clone();
     flat.insert("select".to_string(), json!([CRAWL_PRED, CRAWL_OBJ]));
     flat.insert("where".to_string(), JsonValue::Array(where_patterns));
     let flat_query = JsonValue::Object(flat);
@@ -675,6 +760,10 @@ pub(crate) fn is_wildcard_crawl(input: &JsonValue) -> bool {
 /// (`graph_source_id` is `None`, i.e. a genuinely native ledger), or the crawl
 /// shape is not one this module handles. This is what makes the Solo virtual
 /// dataset "View Instances" screen return data instead of `[]`.
+///
+/// The flat query the crawl runs carries the request's options (see
+/// [`carried_query_options`]); `tracking` is a tracked request's override,
+/// whose fuel limit replaces the body's, and `None` on an untracked one.
 pub(crate) async fn maybe_expand_crawl(
     fluree: &Fluree,
     view: &GraphDb,
@@ -683,6 +772,7 @@ pub(crate) async fn maybe_expand_crawl(
         &dyn fluree_db_query::r2rml::R2rmlProvider,
         &dyn fluree_db_query::r2rml::R2rmlTableProvider,
     )>,
+    tracking: Option<&TrackingOptions>,
     execution: QueryExecutionOptions,
     format_config: &FormatterConfig,
 ) -> Result<Option<JsonValue>> {
@@ -704,6 +794,7 @@ pub(crate) async fn maybe_expand_crawl(
         json,
         provider,
         table_provider,
+        tracking,
         execution,
         format_config,
     )
@@ -741,7 +832,7 @@ fn detect_wildcard_crawl_inner(
         .and_then(JsonValue::as_u64)
         .map(|n| n as usize)
         .unwrap_or(0);
-    let context = obj.get("@context");
+    let carried = carried_query_options(obj);
     let order_by = obj
         .get("orderBy")
         .or_else(|| obj.get("order-by"))
@@ -753,7 +844,7 @@ fn detect_wildcard_crawl_inner(
         Some(DetectedCrawl {
             root: CrawlRoot::Var(root_key.as_str()),
             where_clause: Some(obj.get("where")?),
-            context,
+            carried,
             limit,
             offset,
             order_by,
@@ -768,7 +859,7 @@ fn detect_wildcard_crawl_inner(
         Some(DetectedCrawl {
             root: CrawlRoot::Iri(root_key.as_str()),
             where_clause: obj.get("where"),
-            context,
+            carried,
             limit,
             offset,
             order_by,
@@ -848,7 +939,7 @@ fn where_as_array(where_clause: &JsonValue) -> Vec<JsonValue> {
 fn build_flat_query(
     subject_var: &str,
     where_clause: &JsonValue,
-    context: Option<&JsonValue>,
+    carried: &Map<String, JsonValue>,
     flat_limit: Option<usize>,
     order_by: Option<&JsonValue>,
     projection: &CrawlProjection,
@@ -893,10 +984,7 @@ fn build_flat_query(
         }
     };
 
-    let mut query = Map::new();
-    if let Some(ctx) = context {
-        query.insert("@context".to_string(), ctx.clone());
-    }
+    let mut query = carried.clone();
     query.insert("select".to_string(), JsonValue::Array(select));
     query.insert("where".to_string(), JsonValue::Array(where_patterns));
     if let Some(order_by) = order_by {
@@ -940,7 +1028,7 @@ mod tests {
         let DetectedCrawl {
             root,
             where_clause,
-            context,
+            carried,
             limit,
             offset,
             order_by,
@@ -950,7 +1038,10 @@ mod tests {
         assert_eq!(limit, Some(3));
         assert_eq!(offset, 6);
         assert!(order_by.is_none());
-        assert!(context.is_some());
+        assert_eq!(
+            JsonValue::Object(carried),
+            json!({"@context": {"v": "http://example/org/ns"}})
+        );
         assert_eq!(
             where_clause,
             Some(&json!({"@id": "?s", "@type": "v:Geography"}))
@@ -1059,13 +1150,90 @@ mod tests {
     }
 
     #[test]
+    fn carried_options_keep_every_key_the_rewrite_does_not_own() {
+        let input = json!({
+            "@context": {"v": "http://example/org/ns"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s"},
+            "limit": 3,
+            "offset": 1,
+            "orderBy": "?s",
+            "depth": 2,
+            "from": "src:main",
+            "fromNamed": ["other:main"],
+            "distinct": true,
+            "reasoning": "rdfs",
+            "rules": [],
+            "ontology": {"@id": "v:A"},
+            "reasoningBudget": {"maxFacts": 10},
+            "reasoningTime": "2026-01-01T00:00:00Z",
+            "opts": {
+                "max-fuel": 5,
+                "meta": true,
+                "strictCompactIri": false,
+                "objectVarParsing": false,
+                "identity": "did:example:1",
+                "from": "src:main",
+                "to": "src:main@t:2"
+            }
+        });
+        let carried = carried_query_options(input.as_object().unwrap());
+        assert_eq!(
+            JsonValue::Object(carried),
+            json!({
+                "@context": {"v": "http://example/org/ns"},
+                "distinct": true,
+                "reasoning": "rdfs",
+                "rules": [],
+                "ontology": {"@id": "v:A"},
+                "reasoningBudget": {"maxFacts": 10},
+                "reasoningTime": "2026-01-01T00:00:00Z",
+                "opts": {
+                    "max-fuel": 5,
+                    "meta": true,
+                    "strictCompactIri": false,
+                    "objectVarParsing": false,
+                    "identity": "did:example:1"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn fuel_override_replaces_the_body_limit() {
+        let body = json!({"opts": {"maxFuel": 5, "meta": true}});
+        let body = body.as_object().unwrap();
+
+        let mut untracked = body.clone();
+        apply_fuel_override(&mut untracked, None);
+        assert_eq!(&untracked, body, "no override keeps the body's limit");
+
+        let mut limited = body.clone();
+        let tracking = TrackingOptions {
+            max_fuel: Some(2_500),
+            ..TrackingOptions::default()
+        };
+        apply_fuel_override(&mut limited, Some(&tracking));
+        assert_eq!(
+            JsonValue::Object(limited),
+            json!({"opts": {"max-fuel": 2.5, "meta": true}})
+        );
+
+        let mut lifted = body.clone();
+        apply_fuel_override(&mut lifted, Some(&TrackingOptions::default()));
+        assert_eq!(JsonValue::Object(lifted), json!({"opts": {"meta": true}}));
+    }
+
+    #[test]
     fn flat_query_injects_single_wildcard_scan() {
         let context = json!({"v": "http://example/org/ns"});
         let where_clause = json!({"@id": "?s", "@type": "v:Geography"});
+        let mut carried = Map::new();
+        carried.insert("@context".to_string(), context.clone());
         let flat = build_flat_query(
             "?s",
             &where_clause,
-            Some(&context),
+            &carried,
             Some(256),
             None,
             &CrawlProjection::Wildcard,
@@ -1092,7 +1260,7 @@ mod tests {
             build_flat_query(
                 "?s",
                 &where_clause,
-                None,
+                &Map::new(),
                 Some(64),
                 Some(&order_by),
                 &CrawlProjection::Wildcard,
@@ -1123,7 +1291,7 @@ mod tests {
         let flat = build_flat_query(
             "?s",
             &where_clause,
-            None,
+            &Map::new(),
             None,
             None,
             &CrawlProjection::Wildcard,
@@ -1142,7 +1310,7 @@ mod tests {
         let flat = build_flat_query(
             "?s",
             &where_clause,
-            None,
+            &Map::new(),
             None,
             None,
             &CrawlProjection::IdOnly,
@@ -1162,7 +1330,7 @@ mod tests {
             want_type: true,
             want_id: false,
         };
-        let flat = build_flat_query("?s", &where_clause, None, None, None, &projection);
+        let flat = build_flat_query("?s", &where_clause, &Map::new(), None, None, &projection);
         // Select: subject, one distinct object var per predicate, then type.
         assert_eq!(
             flat["select"],
@@ -1356,6 +1524,7 @@ mod e2e {
             crawl,
             provider,
             provider,
+            None,
             QueryExecutionOptions::new(),
             config,
         )
@@ -1707,6 +1876,7 @@ mod e2e {
             &crawl,
             &provider,
             &provider,
+            None,
             QueryExecutionOptions::new(),
             &FormatterConfig::default(),
         )
@@ -2240,6 +2410,7 @@ mod e2e {
             &crawl,
             &provider,
             &provider,
+            None,
             QueryExecutionOptions::new(),
             &FormatterConfig::default(),
         )
@@ -2284,6 +2455,7 @@ mod e2e {
             &flat,
             &provider,
             &provider,
+            None,
             QueryExecutionOptions::new(),
             &FormatterConfig::default(),
         )
@@ -2514,6 +2686,7 @@ mod e2e {
             &view,
             Some(&crawl),
             None,
+            None,
             QueryExecutionOptions::new(),
             &FormatterConfig::default(),
         )
@@ -2522,6 +2695,183 @@ mod e2e {
         assert!(
             out.is_none(),
             "a native ledger select-map must fall through to native hydration"
+        );
+    }
+
+    /// Run a crawl and return the expansion's result, error or not.
+    async fn try_crawl(
+        provider: &MockCrawlProvider,
+        view: &GraphDb,
+        crawl: &JsonValue,
+        tracking: Option<&TrackingOptions>,
+    ) -> Result<Option<JsonValue>> {
+        let fluree = FlureeBuilder::memory().build_memory();
+        expand_wildcard_crawl(
+            &fluree,
+            view,
+            crawl,
+            provider,
+            provider,
+            tracking,
+            QueryExecutionOptions::new(),
+            &FormatterConfig::default(),
+        )
+        .await
+    }
+
+    fn is_fuel_exceeded(err: &crate::ApiError) -> bool {
+        matches!(
+            err,
+            crate::ApiError::Query(fluree_db_query::QueryError::FuelLimitExceeded(_))
+        )
+    }
+
+    /// The 2,000-row `orders` class as a wildcard crawl, with `extra` merged
+    /// into the query object.
+    fn order_crawl(extra: JsonValue) -> JsonValue {
+        let mut q = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "v:Order"},
+        });
+        let obj = q.as_object_mut().unwrap();
+        for (k, v) in extra.as_object().unwrap() {
+            obj.insert(k.clone(), v.clone());
+        }
+        q
+    }
+
+    // The flat query the crawl runs carries the request's `opts`, so its fuel
+    // limit holds: 2,000 rows cost more than 1.1 fuel. The same crawl without
+    // a limit, or with a generous one, answers every subject.
+    #[tokio::test]
+    async fn crawl_enforces_the_body_fuel_limit() {
+        let provider = small_and_large_provider();
+        let (_ledger, view) = genesis_view();
+
+        let unlimited = try_crawl(&provider, &view, &order_crawl(json!({})), None)
+            .await
+            .expect("an unlimited crawl succeeds")
+            .expect("crawl shape is handled");
+        assert_eq!(unlimited.as_array().unwrap().len(), 2_000);
+
+        let generous = order_crawl(json!({"opts": {"max-fuel": 1_000_000}}));
+        let generous = try_crawl(&provider, &view, &generous, None)
+            .await
+            .expect("a crawl under its limit succeeds")
+            .expect("crawl shape is handled");
+        assert_eq!(generous.as_array().unwrap().len(), 2_000);
+
+        for key in ["max-fuel", "maxFuel"] {
+            let tight = order_crawl(json!({"opts": {key: 1.1}}));
+            let err = try_crawl(&provider, &view, &tight, None)
+                .await
+                .expect_err("a crawl past its fuel limit must fail");
+            assert!(
+                is_fuel_exceeded(&err),
+                "{key}: want fuel exceeded, got {err:?}"
+            );
+        }
+    }
+
+    // A constant-IRI selection runs its own flat query; it carries `opts` too.
+    // A limit below the query floor is refused before anything runs.
+    #[tokio::test]
+    async fn bound_subject_crawl_enforces_the_body_fuel_limit() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let detail = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"http://example.org/person/1": ["*"]},
+            "opts": {"max-fuel": 0.5}
+        });
+        let err = try_crawl(&provider, &view, &detail, None)
+            .await
+            .expect_err("a sub-floor fuel limit must refuse the detail crawl");
+        assert!(is_fuel_exceeded(&err), "want fuel exceeded, got {err:?}");
+    }
+
+    // A tracked request's override replaces the body's fuel limit, as on every
+    // other tracked query: its limit holds, and an override naming none lifts
+    // the body's.
+    #[tokio::test]
+    async fn crawl_takes_the_tracked_override_fuel_limit() {
+        let provider = small_and_large_provider();
+        let (_ledger, view) = genesis_view();
+
+        let tight = TrackingOptions {
+            max_fuel: Some(fluree_db_core::tracking::fuel_to_micro(1.1)),
+            track_fuel: true,
+            ..TrackingOptions::default()
+        };
+        let err = try_crawl(&provider, &view, &order_crawl(json!({})), Some(&tight))
+            .await
+            .expect_err("the override's fuel limit must hold");
+        assert!(is_fuel_exceeded(&err), "want fuel exceeded, got {err:?}");
+
+        let none = TrackingOptions::all_enabled();
+        let body_limited = order_crawl(json!({"opts": {"max-fuel": 1.1}}));
+        let out = try_crawl(&provider, &view, &body_limited, Some(&none))
+            .await
+            .expect("an override naming no limit replaces the body's")
+            .expect("crawl shape is handled");
+        assert_eq!(out.as_array().unwrap().len(), 2_000);
+    }
+
+    // The flat query carries the reasoning keys. With RDFS and an inline
+    // ontology making Person a subclass of Agent, a crawl of Agent answers the
+    // people; without reasoning it answers nobody.
+    #[tokio::test]
+    async fn crawl_carries_reasoning() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let agent_crawl = |reasoning: Option<&str>| {
+            let mut q = json!({
+                "@context": {"v": "http://example.org/"},
+                "select": {"?s": ["@id"]},
+                "where": {"@id": "?s", "@type": "v:Agent"},
+                "ontology": {
+                    "@context": {
+                        "v": "http://example.org/",
+                        "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                    },
+                    "@id": "v:Person",
+                    "rdfs:subClassOf": {"@id": "v:Agent"}
+                }
+            });
+            if let Some(mode) = reasoning {
+                q["reasoning"] = json!(mode);
+            }
+            q
+        };
+        let plain = run_crawl(&provider, &view, &agent_crawl(None)).await;
+        assert!(plain.is_empty(), "no reasoning, no Agent: {plain:?}");
+        let reasoned = run_crawl(&provider, &view, &agent_crawl(Some("rdfs"))).await;
+        assert_eq!(
+            ids(&reasoned),
+            ["v:person/1", "v:person/2"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            "RDFS makes every Person an Agent"
+        );
+    }
+
+    // A reasoning key the flat query reads is the parser's to check: an
+    // unknown mode is refused, where dropping the key answered as if none
+    // were named.
+    #[tokio::test]
+    async fn crawl_refuses_an_unknown_reasoning_mode() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let mut crawl = person_crawl(json!(["*"]), None);
+        crawl["reasoning"] = json!("no-such-mode");
+        let err = try_crawl(&provider, &view, &crawl, None)
+            .await
+            .expect_err("an unknown reasoning mode must be refused");
+        assert!(
+            err.to_string().contains("reasoning"),
+            "the refusal names reasoning: {err}"
         );
     }
 }

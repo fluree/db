@@ -801,11 +801,15 @@ impl<'a> FromQueryBuilder<'a> {
     /// multi-source crawl must NOT collapse to a single source), or when the
     /// resolved view is not graph-source-backed (a genuinely native ledger, which
     /// `maybe_expand_crawl` filters out).
+    ///
+    /// `tracking` is a tracked request's override, whose fuel limit replaces
+    /// the body's; untracked terminals pass `None`.
     #[cfg(feature = "iceberg")]
     async fn try_expand_crawl(
         &self,
         json: &JsonValue,
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
+        tracking: Option<&TrackingOptions>,
         execution: &QueryExecutionOptions,
         format_config: &FormatterConfig,
     ) -> Result<Option<JsonValue>> {
@@ -848,6 +852,7 @@ impl<'a> FromQueryBuilder<'a> {
             &view,
             Some(json),
             r2rml,
+            tracking,
             execution.clone(),
             format_config,
         )
@@ -1165,7 +1170,7 @@ impl<'a> FromQueryBuilder<'a> {
         if let Some(json) = input.as_jsonld() {
             let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
             if let Some(expanded) = self
-                .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
+                .try_expand_crawl(json, r2rml_pair, None, &execution, &format_config)
                 .await?
             {
                 return Ok((expanded, Vec::new()));
@@ -1339,7 +1344,7 @@ impl<'a> FromQueryBuilder<'a> {
         if let Some(json) = input.as_jsonld() {
             let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
             if let Some(expanded) = self
-                .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
+                .try_expand_crawl(json, r2rml_pair, None, &execution, &format_config)
                 .await?
             {
                 return serde_json::to_string(&expanded).map_err(ApiError::from);
@@ -1512,8 +1517,9 @@ impl<'a> FromQueryBuilder<'a> {
             .map(QueryInput::JsonLd)
             .unwrap_or(input);
         // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
-        // dispatching the tracked query. The crawl has no fuel/policy/time stats,
-        // so it returns a 200 response with empty tracking. Boxed like the
+        // dispatching the tracked query. The crawl enforces the request's fuel
+        // limit but reports no fuel/policy/time stats, so it returns a 200
+        // response with empty tracking. Boxed like the
         // dispatch futures below to keep this frame small (fluree/db#1408).
         #[cfg(feature = "iceberg")]
         if let Some(json) = input.as_jsonld() {
@@ -1521,7 +1527,15 @@ impl<'a> FromQueryBuilder<'a> {
             let fc = format_config
                 .clone()
                 .unwrap_or_else(|| self.core.default_format());
-            match Box::pin(self.try_expand_crawl(json, r2rml_pair, &execution, &fc)).await {
+            match Box::pin(self.try_expand_crawl(
+                json,
+                r2rml_pair,
+                tracking.as_ref(),
+                &execution,
+                &fc,
+            ))
+            .await
+            {
                 Ok(Some(expanded)) => {
                     return Ok(TrackedQueryResponse::success(expanded, None));
                 }
