@@ -151,7 +151,9 @@ impl Fluree {
         };
         let mut held = Vec::new();
         for branch in ledgers {
-            if let Ok((_, Some(registration))) = registry::read(ns, branch).await {
+            if let Ok((_, Some(registration))) =
+                registry::read(ns, self.registry_objects(), branch).await
+            {
                 held.extend(
                     registration
                         .erasures
@@ -294,7 +296,9 @@ impl Fluree {
         let now = now_ms();
         let mut due = std::collections::BTreeSet::new();
         for branch in ledgers {
-            if let Ok((_, Some(registration))) = registry::read(ns, branch).await {
+            if let Ok((_, Some(registration))) =
+                registry::read(ns, self.registry_objects(), branch).await
+            {
                 let purge = registration
                     .erasures
                     .iter()
@@ -732,7 +736,9 @@ impl Fluree {
             return;
         };
         for branch in ledgers {
-            let Ok((_, Some(registration))) = registry::read(ns, branch).await else {
+            let Ok((_, Some(registration))) =
+                registry::read(ns, self.registry_objects(), branch).await
+            else {
                 continue;
             };
             for job in &registration.erasures {
@@ -1097,7 +1103,8 @@ impl Fluree {
     }
 
     async fn job(&self, branch: &str, request_id: &str) -> Result<ErasureJob> {
-        let (_, registration) = registry::read(self.publisher()?, branch).await?;
+        let (_, registration) =
+            registry::read(self.publisher()?, self.registry_objects(), branch).await?;
         registration
             .and_then(|r| r.erasures.into_iter().find(|j| j.request_id == request_id))
             .ok_or_else(|| ApiError::internal(format!("erasure {request_id} is gone")))
@@ -1109,16 +1116,21 @@ impl Fluree {
         request_id: &str,
         change: impl Fn(&mut ErasureJob),
     ) -> Result<()> {
-        registry::update(self.publisher()?, branch, |current| {
-            let mut next = current?.clone();
-            let job = next
-                .erasures
-                .iter_mut()
-                .find(|j| j.request_id == request_id)?;
-            let before = job.clone();
-            change(job);
-            (*job != before).then_some(next)
-        })
+        registry::update(
+            self.publisher()?,
+            self.registry_objects(),
+            branch,
+            |current| {
+                let mut next = current?.clone();
+                let job = next
+                    .erasures
+                    .iter_mut()
+                    .find(|j| j.request_id == request_id)?;
+                let before = job.clone();
+                change(job);
+                (*job != before).then_some(next)
+            },
+        )
         .await?;
         Ok(())
     }

@@ -420,7 +420,9 @@ async fn a_later_release_job_keeps_its_fields_through_this_releases_work() {
         .await
         .unwrap();
     let ns = fluree.publisher().unwrap();
-    let (_, read) = registry::read(ns, id).await.unwrap();
+    let (_, read) = registry::read(ns, fluree.registry_objects(), id)
+        .await
+        .unwrap();
     let mut stored = serde_json::to_value(read.unwrap()).unwrap();
     let job = &mut stored["erasures"][0];
     job["stage"] = "remoteQueued".into();
@@ -428,9 +430,11 @@ async fn a_later_release_job_keeps_its_fields_through_this_releases_work() {
     job["commits"][0]["remoteSlot"] = 3.into();
     let later = job.clone();
     let registration: registry::Registration = serde_json::from_value(stored).unwrap();
-    registry::update(ns, id, |_| Some(registration.clone()))
-        .await
-        .unwrap();
+    registry::update(ns, fluree.registry_objects(), id, |_| {
+        Some(registration.clone())
+    })
+    .await
+    .unwrap();
 
     fluree.run_erasure_pass(id).await.unwrap();
     fluree

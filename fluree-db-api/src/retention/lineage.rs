@@ -132,7 +132,10 @@ impl Fluree {
     async fn publish_checkpoint(&self, record: &NsRecord) -> Result<()> {
         let ns = self.publisher()?;
         let ledger_id = record.ledger_id.as_str();
-        let Some(registration) = registry::read(ns, ledger_id).await?.1 else {
+        let Some(registration) = registry::read(ns, self.registry_objects(), ledger_id)
+            .await?
+            .1
+        else {
             return Ok(());
         };
         let journal = &registration.journal;
@@ -161,14 +164,22 @@ impl Fluree {
         }
 
         let (generation, lineage) = (journal.generation, lineage.to_string());
-        registry::update_fenced(ns, ledger_id, record.fence, |current| {
-            let current = current?;
-            (current.checkpointed < generation || current.lineage.is_none()).then(|| Registration {
-                checkpointed: current.checkpointed.max(generation),
-                lineage: Some(lineage.clone()),
-                ..current.clone()
-            })
-        })
+        registry::update_fenced(
+            ns,
+            self.registry_objects(),
+            ledger_id,
+            record.fence,
+            |current| {
+                let current = current?;
+                (current.checkpointed < generation || current.lineage.is_none()).then(|| {
+                    Registration {
+                        checkpointed: current.checkpointed.max(generation),
+                        lineage: Some(lineage.clone()),
+                        ..current.clone()
+                    }
+                })
+            },
+        )
         .await?;
         Ok(())
     }
@@ -198,6 +209,7 @@ impl Fluree {
         let lineage = lineage.map(ToString::to_string);
         let restored = registry::restore(
             self.publisher()?,
+            self.registry_objects(),
             record,
             archived,
             lineage.as_deref(),
@@ -220,12 +232,18 @@ impl Fluree {
             .retract_removed(&record, &registration.journal.removals, branches)
             .await?;
         if !removals.is_empty() {
-            registry::update_fenced(ns, ledger_id, record.fence, |current| {
-                let mut next = current?.clone();
-                next.journal.removals.extend(removals.iter().cloned());
-                next.journal.generation += 1;
-                Some(next)
-            })
+            registry::update_fenced(
+                ns,
+                self.registry_objects(),
+                ledger_id,
+                record.fence,
+                |current| {
+                    let mut next = current?.clone();
+                    next.journal.removals.extend(removals.iter().cloned());
+                    next.journal.generation += 1;
+                    Some(next)
+                },
+            )
             .await?;
         }
         let record = self.restored_record(pending).await?;
@@ -244,7 +262,11 @@ impl Fluree {
     ) -> Result<Option<ContentId>> {
         let ns = self.publisher()?;
         for record in records {
-            if let Some(registration) = registry::read(ns, record.ledger_id.as_str()).await?.1 {
+            if let Some(registration) =
+                registry::read(ns, self.registry_objects(), record.ledger_id.as_str())
+                    .await?
+                    .1
+            {
                 if registration.lineage.is_some() {
                     return self.ledger_lineage(record, &registration).await;
                 }

@@ -449,7 +449,15 @@ impl Fluree {
             accepted.reconciled = received.reconciled;
         }
         if let Some(journal) = journal {
-            registry::restore(self.publisher()?, &record, Some(journal), None, None).await?;
+            registry::restore(
+                self.publisher()?,
+                self.registry_objects(),
+                &record,
+                Some(journal),
+                None,
+                None,
+            )
+            .await?;
             self.checkpoint_journal(ledger_id.as_str()).await?;
             self.retention.mark_active(ledger_id.as_str());
         }
@@ -569,11 +577,15 @@ impl Fluree {
             }
         }
         if let Some(journal) = &journal {
-            let current = registry::read(self.publisher()?, ledger_id.as_str())
-                .await?
-                .1
-                .map(|r| r.journal)
-                .unwrap_or_default();
+            let current = registry::read(
+                self.publisher()?,
+                self.registry_objects(),
+                ledger_id.as_str(),
+            )
+            .await?
+            .1
+            .map(|r| r.journal)
+            .unwrap_or_default();
             let adds = journal.journal.removals.iter().any(|r| {
                 !current
                     .removals
@@ -617,7 +629,15 @@ impl Fluree {
             .await?;
         }
         if let Some(journal) = journal {
-            registry::restore(self.publisher()?, &record, Some(journal), None, None).await?;
+            registry::restore(
+                self.publisher()?,
+                self.registry_objects(),
+                &record,
+                Some(journal),
+                None,
+                None,
+            )
+            .await?;
             self.checkpoint_journal(ledger_id.as_str()).await?;
             self.retention.mark_active(ledger_id.as_str());
         }
@@ -1638,10 +1658,15 @@ impl Fluree {
     async fn record_jobs(&self, branch: &str, jobs: &[super::ErasureJob]) -> Result<()> {
         // A pass under way would mark a job that grew purged.
         let _purging = self.erasure_runtime()?.purging.lock().await;
-        let recorded = registry::update(self.publisher()?, branch, |current| {
-            let mut next = current.cloned().unwrap_or_default();
-            add_jobs(&mut next, jobs).then_some(next)
-        })
+        let recorded = registry::update(
+            self.publisher()?,
+            self.registry_objects(),
+            branch,
+            |current| {
+                let mut next = current.cloned().unwrap_or_default();
+                add_jobs(&mut next, jobs).then_some(next)
+            },
+        )
         .await;
         match recorded {
             Ok(_) => {
@@ -1740,6 +1765,7 @@ impl Fluree {
         }
         registry::update_fenced(
             self.publisher()?,
+            self.registry_objects(),
             record.ledger_id.as_str(),
             record.fence,
             |current| {

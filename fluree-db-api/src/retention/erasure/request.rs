@@ -249,7 +249,8 @@ impl Fluree {
             })
             .collect();
         let request_id = request_id(&ledger_id, &manifest);
-        let (_, registration) = registry::read(ns, ledger_id.as_str()).await?;
+        let (_, registration) =
+            registry::read(ns, self.registry_objects(), ledger_id.as_str()).await?;
         if let Some(job) = registration
             .as_ref()
             .and_then(|r| r.erasures.iter().find(|j| j.request_id == request_id))
@@ -290,7 +291,7 @@ impl Fluree {
             as_written: None,
         };
         let recorded = job.clone();
-        registry::update(ns, ledger_id.as_str(), |current| {
+        registry::update(ns, self.registry_objects(), ledger_id.as_str(), |current| {
             let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
                 active_since_t: authorized_t,
                 watermark_t: authorized_t - 1,

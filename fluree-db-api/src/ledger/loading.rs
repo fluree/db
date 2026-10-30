@@ -330,11 +330,17 @@ impl Fluree {
             // source does: without what the source's journal removed. Copied
             // before the branch is listed, so nothing reads it without.
             |fence| async move {
-                crate::retention::registry::inherit(publisher, from, to, Some(fence))
-                    .await
-                    .map_err(|e| {
-                        NameServiceError::Storage(format!("the source's removal journal: {e}"))
-                    })
+                crate::retention::registry::inherit(
+                    publisher,
+                    self.registry_objects(),
+                    from,
+                    to,
+                    Some(fence),
+                )
+                .await
+                .map_err(|e| {
+                    NameServiceError::Storage(format!("the source's removal journal: {e}"))
+                })
             },
         )
         .await

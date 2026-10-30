@@ -150,11 +150,17 @@ async fn a_restore_interrupted_after_its_retraction_journals_it_when_resumed() {
         fluree.prepare_restore(entry, records).await?;
         let record = store.raw_record(source).await?.unwrap();
         let head = record.commit_head_id.unwrap().to_string();
-        registry::update_fenced(store, source, record.fence, |current| {
-            let mut next = current?.clone();
-            next.journal.removals.retain(|r| r.commit != head);
-            Some(next)
-        })
+        registry::update_fenced(
+            store,
+            fluree.registry_objects(),
+            source,
+            record.fence,
+            |current| {
+                let mut next = current?.clone();
+                next.journal.removals.retain(|r| r.commit != head);
+                Some(next)
+            },
+        )
         .await
         .unwrap();
         Err(NameServiceError::storage("stopped"))

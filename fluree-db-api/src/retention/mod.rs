@@ -115,13 +115,14 @@ impl Fluree {
         ledger_id: &str,
     ) -> Result<Option<serde_json::Value>> {
         let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();
-        registry::archived(&self.nameservice_mode, &ledger_id).await
+        registry::archived(&self.nameservice_mode, self.registry_objects(), &ledger_id).await
     }
 
     /// The retention status of `ledger_id`.
     pub async fn retention_status(&self, ledger_id: &str) -> Result<RetentionStatus> {
         let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();
-        let (_, registration) = registry::read(&self.nameservice_mode, &ledger_id).await?;
+        let (_, registration) =
+            registry::read(&self.nameservice_mode, self.registry_objects(), &ledger_id).await?;
         let now = worker::now_ms();
         Ok(RetentionStatus {
             active: registration.is_some(),

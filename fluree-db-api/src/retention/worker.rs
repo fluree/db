@@ -52,6 +52,8 @@ pub(crate) struct RetentionRuntime {
     backfills: parking_lot::Mutex<HashSet<String>>,
     /// Set on a cluster node.
     pub(crate) replicas: std::sync::OnceLock<Arc<dyn super::replicas::ReplicaSync>>,
+    /// Registration chunks read.
+    pub(crate) chunks: super::registry::ChunkCache,
     /// Set on a file-backed instance.
     #[cfg(feature = "native")]
     pub(crate) erasure: std::sync::OnceLock<Arc<super::erasure::ErasureRuntime>>,
@@ -262,15 +264,20 @@ impl Fluree {
             match outcome {
                 Ok(_) => {
                     if let Ok(ns) = fluree.publisher() {
-                        let _ = registry::update(ns, &ledger_id, |current| {
-                            let current = current?;
-                            (current.history_backfilled < generation).then(|| {
-                                registry::Registration {
-                                    history_backfilled: generation,
-                                    ..current.clone()
-                                }
-                            })
-                        })
+                        let _ = registry::update(
+                            ns,
+                            fluree.registry_objects(),
+                            &ledger_id,
+                            |current| {
+                                let current = current?;
+                                (current.history_backfilled < generation).then(|| {
+                                    registry::Registration {
+                                        history_backfilled: generation,
+                                        ..current.clone()
+                                    }
+                                })
+                            },
+                        )
                         .await;
                     }
                     tracing::info!(
@@ -333,7 +340,11 @@ impl Fluree {
     /// times are compared against it rather than the clock.
     pub async fn run_retention_at(&self, ledger_id: &str, now_ms: i64) -> Result<PassReport> {
         let ns = self.publisher()?;
-        if registry::read(ns, ledger_id).await?.1.is_none() {
+        if registry::read(ns, self.registry_objects(), ledger_id)
+            .await?
+            .1
+            .is_none()
+        {
             self.probe_and_activate(ledger_id, 0).await?;
         }
         let limits = RetentionLimits::default();
@@ -399,7 +410,7 @@ impl Fluree {
         let mut registered: HashMap<String, i64> = HashMap::new();
         for record in records.iter().filter(|r| !r.retracted) {
             let id = record.ledger_id.to_string();
-            if let Some(r) = registry::read(ns, &id).await?.1 {
+            if let Some(r) = registry::read(ns, self.registry_objects(), &id).await?.1 {
                 registered.insert(id, r.active_since_t);
             }
         }
@@ -414,7 +425,7 @@ impl Fluree {
             };
             let source_id = format!("{}:{source}", record.name);
             if let Some(since) = registered.get(&source_id) {
-                registry::activate(ns, &id, *since).await?;
+                registry::activate(ns, self.registry_objects(), &id, *since).await?;
                 self.retention.mark_active(&id);
             }
         }
@@ -428,7 +439,11 @@ impl Fluree {
             return Ok(());
         }
         let ns = self.publisher()?;
-        if registry::read(ns, &id).await?.1.is_some() {
+        if registry::read(ns, self.registry_objects(), &id)
+            .await?
+            .1
+            .is_some()
+        {
             self.retention.mark_active(&id);
             return Ok(());
         }
@@ -445,8 +460,11 @@ impl Fluree {
         }
         if let Some(source) = &record.source_branch {
             let source_id = format!("{}:{source}", record.name);
-            if let Some(r) = registry::read(ns, &source_id).await?.1 {
-                registry::activate(ns, &id, r.active_since_t).await?;
+            if let Some(r) = registry::read(ns, self.registry_objects(), &source_id)
+                .await?
+                .1
+            {
+                registry::activate(ns, self.registry_objects(), &id, r.active_since_t).await?;
                 self.retention.mark_active(&id);
                 return Ok(());
             }
@@ -456,7 +474,7 @@ impl Fluree {
             .await?;
         match probe_activation(store.as_ref(), &head, from).await? {
             Some(since) => {
-                registry::activate(ns, &id, since).await?;
+                registry::activate(ns, self.registry_objects(), &id, since).await?;
                 self.retention.mark_active(&id);
             }
             None => {

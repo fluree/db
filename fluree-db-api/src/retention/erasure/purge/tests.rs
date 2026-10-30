@@ -373,7 +373,7 @@ async fn a_purge_rewrites_a_schedule_holding_an_erased_fact() {
         .await
         .unwrap();
     let ns = fluree.publisher().unwrap();
-    registry::update(ns, id, |r| {
+    registry::update(ns, fluree.registry_objects(), id, |r| {
         Some(registry::Registration {
             schedule: Some(blob.to_string()),
             ..r?.clone()
@@ -387,7 +387,7 @@ async fn a_purge_rewrites_a_schedule_holding_an_erased_fact() {
         .await
         .unwrap();
     assert_eq!(report.purged, 1, "{report:?}");
-    let current = registry::read(ns, id)
+    let current = registry::read(ns, fluree.registry_objects(), id)
         .await
         .unwrap()
         .1

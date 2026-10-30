@@ -337,7 +337,10 @@ impl Fluree {
                 continue;
             }
             let branch = record.ledger_id.to_string();
-            if let Some(registration) = registry::read(ns, &branch).await?.1 {
+            if let Some(registration) = registry::read(ns, self.registry_objects(), &branch)
+                .await?
+                .1
+            {
                 jobs.extend(
                     registration
                         .erasures
@@ -407,7 +410,10 @@ impl Fluree {
                 let Some(record) = self.nameservice().lookup(branch).await? else {
                     continue;
                 };
-                let Some(blob) = registry::read(ns, branch).await?.1.and_then(|r| r.schedule)
+                let Some(blob) = registry::read(ns, self.registry_objects(), branch)
+                    .await?
+                    .1
+                    .and_then(|r| r.schedule)
                 else {
                     continue;
                 };
@@ -442,7 +448,7 @@ impl Fluree {
                     .await?
                     .to_string();
                 let (pending, next_due_ms) = (schedule.len() as u64, schedule.next_due_ms());
-                registry::update(ns, branch, |r| {
+                registry::update(ns, self.registry_objects(), branch, |r| {
                     let r = r?;
                     (r.schedule.as_deref() == Some(blob.as_str())).then(|| registry::Registration {
                         schedule: Some(rewritten.clone()),

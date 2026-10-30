@@ -280,6 +280,9 @@ pub struct ErasureJob {
     #[serde(default)]
     pub signatures: SignatureMode,
     pub stage: ErasureStage,
+    /// Kept outside the registration's record where it can be (see
+    /// [`crate::retention::registry`]), which then omits it.
+    #[serde(default)]
     pub commits: Vec<CommitErasure>,
     /// The properties (IRIs) of the occurrences it erases, as each branch
     /// that held one decoded it. Empty when one did not decode, or for a job

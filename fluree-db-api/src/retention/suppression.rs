@@ -178,6 +178,8 @@ pub(crate) struct HistoricalRead {
 /// a read names.
 pub(crate) struct Suppression {
     pub(crate) journal: Journal,
+    /// The journal's identity as its record names it.
+    identity: String,
     /// The removals whose commit the branch holds, by predicate, as indexes
     /// into the journal's removals. One whose commit the branch does not
     /// hold (merged from another copy of the lineage) is left out.
@@ -194,7 +196,7 @@ struct RemovedOf {
 }
 
 impl Suppression {
-    fn new(journal: Journal, applies: &[bool]) -> Self {
+    fn new(journal: Journal, identity: String, applies: &[bool]) -> Self {
         let mut removed: HashMap<String, RemovedOf> = HashMap::new();
         for (i, removal) in journal.removals.iter().enumerate() {
             if !applies.get(i).copied().unwrap_or(true) {
@@ -206,7 +208,11 @@ impl Suppression {
                 None => of.any_subject.push(i),
             }
         }
-        Suppression { journal, removed }
+        Suppression {
+            journal,
+            identity,
+            removed,
+        }
     }
 
     /// The predicate of a removal that a read of `reads`, as of `to` (or
@@ -256,9 +262,10 @@ pub(crate) enum Freshness {
     Behind { journal: Option<bool> },
 }
 
-/// Suppressions held between reads, by branch. One is reused only for an
-/// equal journal: a ledger created again under a dropped one's name starts
-/// its generations over.
+/// Suppressions held between reads, by branch. One is reused only for a
+/// journal of the same identity, which its record names without its chunks
+/// being read: a ledger created again under a dropped one's name starts its
+/// generations over.
 #[derive(Default)]
 pub(crate) struct SuppressionCache {
     by_ledger: parking_lot::Mutex<HashMap<String, Arc<Suppression>>>,
@@ -346,22 +353,24 @@ impl Fluree {
             self.confirm_journal_current(ledger_id).await?;
         }
         let token = self.retention.watch.token();
-        let (_, registration) = registry::read(ns, ledger_id).await?;
-        let journal = registration.map(|r| r.journal).filter(|j| !j.is_empty());
+        let (_, stored) = registry::read_stored(ns, ledger_id).await?;
+        let stored = stored.filter(|s| !registry::journal_empty(s));
         self.retention
             .watch
-            .learn_journal(ledger_id, journal.is_some(), token);
-        let Some(journal) = journal else {
+            .learn_journal(ledger_id, stored.is_some(), token);
+        let Some(stored) = stored else {
             return Ok(None);
         };
+        let identity = registry::journal_identity(&stored);
         let cache = &self.retention.suppressions;
         if let Some(cached) = cache.by_ledger.lock().get(ledger_id) {
-            if cached.journal == journal {
+            if cached.identity == identity {
                 return Ok(Some(Arc::clone(cached)));
             }
         }
+        let journal = registry::resolve_journal(&stored, self.registry_objects()).await?;
         let applies = self.removals_applying(ledger_id, &journal).await;
-        let suppression = Arc::new(Suppression::new(journal, &applies));
+        let suppression = Arc::new(Suppression::new(journal, identity, &applies));
         cache
             .by_ledger
             .lock()
@@ -645,7 +654,11 @@ mod tests {
             removals,
             ..Default::default()
         };
-        let carol = Suppression::new(journal(vec![removal(Some("ex:carol"), "c1")]), &[true]);
+        let carol = Suppression::new(
+            journal(vec![removal(Some("ex:carol"), "c1")]),
+            String::new(),
+            &[true],
+        );
         let refuses = |s: &Suppression, r: Reads, t| s.removal_needed(&r, t, t, true).is_some();
         assert!(refuses(
             &carol,
@@ -680,14 +693,15 @@ mod tests {
         assert!(carol.removal_needed(&ranged, 50, 60, false).is_some());
         assert!(carol.removal_needed(&ranged, 51, 60, false).is_none());
 
-        let unknown = Suppression::new(journal(vec![removal(None, "c1")]), &[true]);
+        let unknown = Suppression::new(journal(vec![removal(None, "c1")]), String::new(), &[true]);
         assert!(refuses(
             &unknown,
             reads(&[(Some("ex:erin"), "ex:likes")]),
             30
         ));
 
-        let elsewhere = Suppression::new(journal(vec![removal(None, "c1")]), &[false]);
+        let elsewhere =
+            Suppression::new(journal(vec![removal(None, "c1")]), String::new(), &[false]);
         assert!(!refuses(&elsewhere, Reads::Everything, 30));
     }
 }

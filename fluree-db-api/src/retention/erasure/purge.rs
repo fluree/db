@@ -69,7 +69,10 @@ impl Fluree {
                 continue;
             }
             let branch = record.ledger_id.to_string();
-            let Some(registration) = registry::read(ns, &branch).await?.1 else {
+            let Some(registration) = registry::read(ns, self.registry_objects(), &branch)
+                .await?
+                .1
+            else {
                 continue;
             };
             jobs.extend(registration.erasures.iter().cloned());

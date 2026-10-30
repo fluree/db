@@ -1093,7 +1093,11 @@ impl crate::Fluree {
         let ns = self.publisher()?;
         for record in records.iter().filter(|r| !r.frozen) {
             let id = record.ledger_id.to_string();
-            if crate::retention::registry::read(ns, &id).await?.1.is_some() {
+            if crate::retention::registry::read(ns, self.registry_objects(), &id)
+                .await?
+                .1
+                .is_some()
+            {
                 self.retention.mark_active(&id);
             }
         }

@@ -585,7 +585,7 @@ impl Fluree {
         limits: &RetentionLimits,
     ) -> Result<PassReport> {
         let ns = self.publisher()?;
-        let (_, registration) = registry::read(ns, ledger_id).await?;
+        let (_, registration) = registry::read(ns, self.registry_objects(), ledger_id).await?;
         let Some(registration) = registration else {
             return Ok(PassReport {
                 inactive: true,
@@ -755,7 +755,7 @@ impl Fluree {
             if journal_changed {
                 self.retention.watch.journal_changing(ledger_id);
             }
-            registry::update(ns, ledger_id, |current| {
+            registry::update(ns, self.registry_objects(), ledger_id, |current| {
                 // Another owner (or a re-activation) may have moved it on.
                 match current {
                     Some(c) if c.watermark_t > next.watermark_t => None,
@@ -786,7 +786,9 @@ impl Fluree {
             }
         }
         cache.put(ledger_id, blob, schedule, persisted_at);
-        let current = registry::read(ns, ledger_id).await?.1;
+        let current = registry::read(ns, self.registry_objects(), ledger_id)
+            .await?
+            .1;
         // Also a journal an earlier pass or removal could not publish.
         if current
             .as_ref()
@@ -974,7 +976,7 @@ impl Fluree {
             .await?;
         let found = probe_activation(store.as_ref(), &head, after_t).await?;
         if let Some(since) = found {
-            registry::activate(ns, ledger_id, since).await?;
+            registry::activate(ns, self.registry_objects(), ledger_id, since).await?;
         }
         Ok(found)
     }

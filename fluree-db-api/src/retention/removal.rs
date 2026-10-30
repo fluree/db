@@ -397,20 +397,25 @@ impl Fluree {
             ..Default::default()
         };
         let mut conflict = None;
-        let registration = registry::update(self.publisher()?, ledger_id, |current| {
-            let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
-                active_since_t: since,
-                watermark_t: since - 1,
-                ..Default::default()
-            });
-            match next.journal.merge(&incoming) {
-                Ok(changed) => (changed || current.is_none()).then_some(next),
-                Err(e) => {
-                    conflict = Some(e);
-                    None
+        let registration = registry::update(
+            self.publisher()?,
+            self.registry_objects(),
+            ledger_id,
+            |current| {
+                let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
+                    active_since_t: since,
+                    watermark_t: since - 1,
+                    ..Default::default()
+                });
+                match next.journal.merge(&incoming) {
+                    Ok(changed) => (changed || current.is_none()).then_some(next),
+                    Err(e) => {
+                        conflict = Some(e);
+                        None
+                    }
                 }
-            }
-        })
+            },
+        )
         .await?
         .unwrap_or_default();
         if let Some(e) = conflict {

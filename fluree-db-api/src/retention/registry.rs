@@ -6,11 +6,36 @@
 //! every nameservice backend persists, Raft replicates (`PushConfig`), and a
 //! ledger backup does not roll back. Written with compare-and-set under the
 //! branch fence, so a stale owner cannot overwrite a newer checkpoint.
+//!
+//! The record holds what is bounded. The lists that grow, the journal's
+//! removals and each erasure job's commits and joined occurrences, are kept
+//! outside it where the instance has managed storage: split by position into
+//! chunks of [`CHUNK`] items, each an immutable object under
+//! `@retention/registration/` named by the hash of its bytes, which the
+//! record names. A write stores only the chunks that changed, and a list
+//! equal to the one read is not serialized again. Without managed storage the
+//! lists stay inline, as a record written before chunks still has them.
 
+use std::any::Any;
+use std::sync::Arc;
+
+use fluree_db_core::Storage;
 use fluree_db_nameservice::{ConfigCasResult, ConfigPayload, ConfigValue, NameServicePublisher};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::journal::{Journal, Removal};
+#[cfg(feature = "native")]
+use super::removal::OccurrenceRef;
 use crate::{ApiError, Result};
+
+/// Items in a chunk of a list kept outside the record.
+pub(crate) const CHUNK: usize = 512;
+
+/// Chunks a process keeps read.
+const CACHED_CHUNKS: usize = 4096;
+
+const OBJECTS_DIR: &str = "@retention/registration";
 
 /// Key of the registration in the config record's `extra` map.
 pub const EXTRA_KEY: &str = "retention";
@@ -72,25 +97,368 @@ pub struct Registration {
         with = "super::erasure::jobs_as_written"
     )]
     pub erasures: Vec<super::erasure::ErasureJob>,
+    /// The chunks the record names, as read.
+    #[serde(skip)]
+    pub(crate) named: Named,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// The branch's registration, if any, with the config value it was read from.
-pub(crate) async fn read<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
+/// The chunks a record names, with the lists as read from them, so a write
+/// of a list unchanged names them again without serializing it. Never part
+/// of a registration's equality.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Named(Option<Arc<Chunks>>);
+
+impl PartialEq for Named {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+struct Chunks {
+    removals: Option<Listed<Removal>>,
+    /// By erasure request id.
+    #[cfg(feature = "native")]
+    jobs: std::collections::HashMap<String, JobLists>,
+}
+
+#[derive(Debug)]
+struct Listed<T> {
+    chunks: Vec<String>,
+    read: Arc<Vec<T>>,
+}
+
+#[cfg(feature = "native")]
+#[derive(Debug, Default)]
+struct JobLists {
+    commits: Option<Listed<super::erasure::CommitErasure>>,
+    added: Option<Listed<OccurrenceRef>>,
+}
+
+/// Chunks read in this process, by hash. Objects never change, so an entry
+/// is never stale.
+pub(crate) struct ChunkCache(parking_lot::Mutex<lru::LruCache<String, Arc<dyn Any + Send + Sync>>>);
+
+impl Default for ChunkCache {
+    fn default() -> Self {
+        ChunkCache(parking_lot::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(CACHED_CHUNKS).expect("nonzero"),
+        )))
+    }
+}
+
+/// Where chunks are stored, and those read.
+#[derive(Clone, Copy)]
+pub(crate) struct Objects<'a> {
+    storage: &'a dyn Storage,
+    cache: &'a ChunkCache,
+}
+
+impl<'a> Objects<'a> {
+    pub(crate) fn new(storage: &'a dyn Storage, cache: &'a ChunkCache) -> Self {
+        Objects { storage, cache }
+    }
+
+    fn address(&self, hash: &str) -> String {
+        format!(
+            "fluree:{}://{OBJECTS_DIR}/{hash}.json",
+            self.storage.storage_method()
+        )
+    }
+
+    async fn chunk<T>(&self, hash: &str) -> Result<Arc<Vec<T>>>
+    where
+        T: DeserializeOwned + Send + Sync + 'static,
+    {
+        if let Some(cached) = self.cache.0.lock().get(hash).cloned() {
+            if let Ok(chunk) = cached.downcast::<Vec<T>>() {
+                return Ok(chunk);
+            }
+        }
+        let bytes = self.storage.read_bytes(&self.address(hash)).await?;
+        if fluree_db_core::sha256_hex(&bytes) != hash {
+            return Err(ApiError::internal(format!(
+                "retention registration chunk {hash} does not match its hash"
+            )));
+        }
+        let chunk: Arc<Vec<T>> = Arc::new(serde_json::from_slice(&bytes).map_err(|e| {
+            ApiError::internal(format!("retention registration chunk {hash}: {e}"))
+        })?);
+        self.cache.0.lock().put(
+            hash.to_string(),
+            chunk.clone() as Arc<dyn Any + Send + Sync>,
+        );
+        Ok(chunk)
+    }
+
+    async fn read_list<T>(&self, chunks: Vec<String>) -> Result<Listed<T>>
+    where
+        T: DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        let mut read = Vec::new();
+        for hash in &chunks {
+            read.extend(self.chunk::<T>(hash).await?.iter().cloned());
+        }
+        Ok(Listed {
+            chunks,
+            read: Arc::new(read),
+        })
+    }
+
+    /// Store `items` as chunks, naming again each chunk equal to the one
+    /// `before` read at its position.
+    async fn write_list<T>(&self, items: &[T], before: Option<&Listed<T>>) -> Result<Vec<String>>
+    where
+        T: Serialize + PartialEq,
+    {
+        let mut out = Vec::with_capacity(items.len().div_ceil(CHUNK));
+        for (k, chunk) in items.chunks(CHUNK).enumerate() {
+            let same = before.and_then(|b| {
+                let old = b.read.chunks(CHUNK).nth(k)?;
+                (old == chunk).then(|| b.chunks[k].clone())
+            });
+            let hash = match same {
+                Some(hash) => hash,
+                None => {
+                    let bytes = serde_json::to_vec(chunk).map_err(|e| {
+                        ApiError::internal(format!("retention registration chunk: {e}"))
+                    })?;
+                    let hash = fluree_db_core::sha256_hex(&bytes);
+                    self.storage
+                        .write_bytes(&self.address(&hash), &bytes)
+                        .await?;
+                    hash
+                }
+            };
+            out.push(hash);
+        }
+        Ok(out)
+    }
+}
+
+impl crate::Fluree {
+    /// Where this instance keeps registrations' chunks; `None` without
+    /// managed storage, which keeps them inline.
+    pub(crate) fn registry_objects(&self) -> Option<Objects<'_>> {
+        self.admin_storage()
+            .map(|storage| Objects::new(storage, &self.retention.chunks))
+    }
+}
+
+fn unreadable() -> ApiError {
+    ApiError::internal(
+        "the retention registration names chunks this instance cannot read: it has no managed \
+         storage",
+    )
+}
+
+fn chunk_refs(value: Option<&serde_json::Value>) -> Result<Option<Vec<String>>> {
+    value
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| ApiError::internal(format!("retention registration chunks: {e}")))
+}
+
+/// The journal's identity as `stored` names it: equal for equal journals,
+/// without reading its chunks.
+pub(crate) fn journal_identity(stored: &serde_json::Value) -> String {
+    let journal = stored.get("journal").cloned().unwrap_or_default();
+    fluree_db_core::sha256_hex(&serde_json::to_vec(&journal).unwrap_or_default())
+}
+
+/// Whether `stored`'s journal suppresses nothing, without reading its chunks.
+pub(crate) fn journal_empty(stored: &serde_json::Value) -> bool {
+    let empty = |key: &str| {
+        stored
+            .pointer(&format!("/journal/{key}"))
+            .and_then(|v| v.as_array())
+            .is_none_or(Vec::is_empty)
+    };
+    empty("historyRules") && empty("removals") && empty("removalChunks")
+}
+
+/// The journal `stored` holds, its removals read from their chunks.
+pub(crate) async fn resolve_journal(
+    stored: &serde_json::Value,
+    objects: Option<Objects<'_>>,
+) -> Result<Journal> {
+    let mut journal: Journal = match stored.get("journal") {
+        Some(journal) => serde_json::from_value(journal.clone())
+            .map_err(|e| ApiError::internal(format!("retention journal: {e}")))?,
+        None => Journal::default(),
+    };
+    if let Some(refs) = chunk_refs(stored.pointer("/journal/removalChunks"))? {
+        let listed = objects
+            .ok_or_else(unreadable)?
+            .read_list::<Removal>(refs)
+            .await?;
+        journal.removals = listed.read.as_ref().clone();
+    }
+    Ok(journal)
+}
+
+/// The registration `stored` holds, its lists read from the chunks it names.
+pub(crate) async fn resolve(
+    stored: &serde_json::Value,
+    objects: Option<Objects<'_>>,
+) -> Result<Registration> {
+    let mut registration: Registration = serde_json::from_value(stored.clone())
+        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))?;
+    let mut chunks = Chunks::default();
+    if let Some(refs) = chunk_refs(stored.pointer("/journal/removalChunks"))? {
+        let listed = objects.ok_or_else(unreadable)?.read_list(refs).await?;
+        registration.journal.removals = listed.read.as_ref().clone();
+        chunks.removals = Some(listed);
+    }
+    #[cfg(feature = "native")]
+    if let Some(jobs) = stored.get("erasures").and_then(|e| e.as_array()) {
+        for (stored, job) in jobs.iter().zip(registration.erasures.iter_mut()) {
+            // A later release's, kept as written.
+            if job.as_written.is_some() {
+                continue;
+            }
+            let mut lists = JobLists::default();
+            if let Some(refs) = chunk_refs(stored.get("commitChunks"))? {
+                let listed = objects.ok_or_else(unreadable)?.read_list(refs).await?;
+                job.commits = listed.read.as_ref().clone();
+                lists.commits = Some(listed);
+            }
+            if let Some(refs) = chunk_refs(stored.get("addedChunks"))? {
+                let listed = objects.ok_or_else(unreadable)?.read_list(refs).await?;
+                job.added = listed.read.as_ref().clone();
+                lists.added = Some(listed);
+            }
+            chunks.jobs.insert(job.request_id.clone(), lists);
+        }
+    }
+    registration.named = Named(Some(Arc::new(chunks)));
+    Ok(registration)
+}
+
+/// `registration`'s stored form: inline without `objects`, else with its
+/// lists as chunks, those unchanged since it was read named again.
+pub(crate) async fn store(
+    registration: &mut Registration,
+    objects: Option<Objects<'_>>,
+) -> Result<serde_json::Value> {
+    let to_value = |r: &Registration| {
+        serde_json::to_value(r)
+            .map_err(|e| ApiError::internal(format!("retention registration: {e}")))
+    };
+    let Some(objects) = objects else {
+        return to_value(registration);
+    };
+    let named = registration.named.0.clone().unwrap_or_default();
+    let removals = std::mem::take(&mut registration.journal.removals);
+    #[cfg(feature = "native")]
+    let lists: Vec<Option<(Vec<super::erasure::CommitErasure>, Vec<OccurrenceRef>)>> = registration
+        .erasures
+        .iter_mut()
+        .map(|job| {
+            job.as_written.is_none().then(|| {
+                (
+                    std::mem::take(&mut job.commits),
+                    std::mem::take(&mut job.added),
+                )
+            })
+        })
+        .collect();
+    let shell = to_value(registration);
+    let written = async {
+        let removal_chunks = objects
+            .write_list(&removals, named.removals.as_ref())
+            .await?;
+        #[cfg(feature = "native")]
+        let mut job_chunks = Vec::with_capacity(lists.len());
+        #[cfg(feature = "native")]
+        for (job, lists) in registration.erasures.iter().zip(&lists) {
+            let Some((commits, added)) = lists else {
+                job_chunks.push(None);
+                continue;
+            };
+            let before = named.jobs.get(&job.request_id);
+            let commits = objects
+                .write_list(commits, before.and_then(|b| b.commits.as_ref()))
+                .await?;
+            let added = objects
+                .write_list(added, before.and_then(|b| b.added.as_ref()))
+                .await?;
+            job_chunks.push(Some((commits, added)));
+        }
+        #[cfg(not(feature = "native"))]
+        let job_chunks: Vec<Option<(Vec<String>, Vec<String>)>> = Vec::new();
+        Ok::<_, ApiError>((removal_chunks, job_chunks))
+    }
+    .await;
+    // Restored before any error returns.
+    registration.journal.removals = removals;
+    #[cfg(feature = "native")]
+    for (job, lists) in registration.erasures.iter_mut().zip(lists) {
+        if let Some((commits, added)) = lists {
+            job.commits = commits;
+            job.added = added;
+        }
+    }
+    let (removal_chunks, job_chunks) = written?;
+    let mut value = shell?;
+    if !removal_chunks.is_empty() {
+        // Without its removals the journal may read as empty, which
+        // serializing skips; its generation and rules are kept all the same.
+        let mut journal = serde_json::to_value(Journal {
+            generation: registration.journal.generation,
+            history_rules: registration.journal.history_rules.clone(),
+            removals: Vec::new(),
+        })
+        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))?;
+        journal["removalChunks"] = serde_json::json!(removal_chunks);
+        value["journal"] = journal;
+    }
+    if let Some(jobs) = value.get_mut("erasures").and_then(|e| e.as_array_mut()) {
+        for (stored, chunks) in jobs.iter_mut().zip(job_chunks) {
+            let Some((commits, added)) = chunks else {
+                continue;
+            };
+            if !commits.is_empty() {
+                stored["commitChunks"] = serde_json::json!(commits);
+            }
+            if !added.is_empty() {
+                stored["addedChunks"] = serde_json::json!(added);
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// The branch's stored registration, as its config record holds it, with
+/// that record.
+pub(crate) async fn read_stored<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
     ns: &N,
     ledger_id: &str,
-) -> Result<(Option<ConfigValue>, Option<Registration>)> {
+) -> Result<(Option<ConfigValue>, Option<serde_json::Value>)> {
     let config = ns.get_config(ledger_id).await?;
-    let registration = config
+    let stored = config
         .as_ref()
         .and_then(|c| c.payload.as_ref())
         .and_then(|p| p.extra.get(EXTRA_KEY))
-        .map(|v| serde_json::from_value::<Registration>(v.clone()))
-        .transpose()
-        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))?;
+        .cloned();
+    Ok((config, stored))
+}
+
+/// The branch's registration, if any, with the config value it was read from.
+pub(crate) async fn read<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
+    ns: &N,
+    objects: Option<Objects<'_>>,
+    ledger_id: &str,
+) -> Result<(Option<ConfigValue>, Option<Registration>)> {
+    let (config, stored) = read_stored(ns, ledger_id).await?;
+    let registration = match stored {
+        Some(stored) => Some(resolve(&stored, objects).await?),
+        None => None,
+    };
     Ok((config, registration))
 }
 
@@ -99,30 +467,31 @@ pub(crate) async fn read<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
 /// Retries a lost compare-and-set against the record as it then is.
 pub(crate) async fn update(
     ns: &dyn NameServicePublisher,
+    objects: Option<Objects<'_>>,
     ledger_id: &str,
     update: impl FnMut(Option<&Registration>) -> Option<Registration>,
 ) -> Result<Option<Registration>> {
     let Some(record) = ns.lookup(ledger_id).await? else {
         return Err(ApiError::NotFound(ledger_id.to_string()));
     };
-    update_fenced(ns, ledger_id, record.fence, update).await
+    update_fenced(ns, objects, ledger_id, record.fence, update).await
 }
 
 /// [`update`] under `fence`, for a record not yet visible to lookups (a
 /// ledger being restored).
 pub(crate) async fn update_fenced(
     ns: &dyn NameServicePublisher,
+    objects: Option<Objects<'_>>,
     ledger_id: &str,
     fence: Option<fluree_db_nameservice::Fence>,
     mut update: impl FnMut(Option<&Registration>) -> Option<Registration>,
 ) -> Result<Option<Registration>> {
     for _ in 0..CAS_ATTEMPTS {
-        let (config, current) = read(ns, ledger_id).await?;
-        let Some(next) = update(current.as_ref()) else {
+        let (config, current) = read(ns, objects, ledger_id).await?;
+        let Some(mut next) = update(current.as_ref()) else {
             return Ok(current);
         };
-        let value = serde_json::to_value(&next)
-            .map_err(|e| ApiError::internal(format!("retention registration: {e}")))?;
+        let value = store(&mut next, objects).await?;
         let (v, mut payload) = match &config {
             Some(c) => (c.v, c.payload.clone().unwrap_or_default()),
             None => (0, ConfigPayload::default()),
@@ -147,15 +516,16 @@ pub(crate) async fn update_fenced(
 /// the source has no registration.
 pub(crate) async fn inherit(
     ns: &dyn NameServicePublisher,
+    objects: Option<Objects<'_>>,
     source_id: &str,
     branch_id: &str,
     fence: Option<fluree_db_nameservice::Fence>,
 ) -> Result<()> {
-    let Some(source) = read(ns, source_id).await?.1 else {
+    let Some(source) = read(ns, objects, source_id).await?.1 else {
         return Ok(());
     };
     let mut conflict = None;
-    update_fenced(ns, branch_id, fence, |current| {
+    update_fenced(ns, objects, branch_id, fence, |current| {
         let mut next = current.cloned().unwrap_or_else(|| Registration {
             active_since_t: source.active_since_t,
             watermark_t: source.active_since_t - 1,
@@ -176,10 +546,11 @@ pub(crate) async fn inherit(
 /// and everything else an existing registration holds.
 pub(crate) async fn activate(
     ns: &dyn NameServicePublisher,
+    objects: Option<Objects<'_>>,
     ledger_id: &str,
     since_t: i64,
 ) -> Result<()> {
-    update(ns, ledger_id, |current| match current {
+    update(ns, objects, ledger_id, |current| match current {
         Some(r) if r.active_since_t <= since_t => None,
         Some(r) => Some(Registration {
             active_since_t: since_t,
@@ -218,9 +589,10 @@ impl ArchivedRetention {
 /// The archive's retention section for `ledger_id`, if it is registered.
 pub(crate) async fn archived<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
     ns: &N,
+    objects: Option<Objects<'_>>,
     ledger_id: &str,
 ) -> Result<Option<serde_json::Value>> {
-    let Some(registration) = read(ns, ledger_id).await?.1 else {
+    let Some(registration) = read(ns, objects, ledger_id).await?.1 else {
         return Ok(None);
     };
     let archived = ArchivedRetention {
@@ -241,6 +613,7 @@ pub(crate) async fn archived<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
 /// is kept, and takes what the journal adds to its own.
 pub(crate) async fn restore(
     ns: &dyn NameServicePublisher,
+    objects: Option<Objects<'_>>,
     record: &fluree_db_nameservice::NsRecord,
     archived: Option<ArchivedRetention>,
     lineage: Option<&str>,
@@ -262,30 +635,238 @@ pub(crate) async fn restore(
         ..Default::default()
     });
     let mut conflict = None;
-    let registration =
-        update_fenced(
-            ns,
-            record.ledger_id.as_str(),
-            record.fence,
-            |current| match current {
-                Some(current) => {
-                    let mut next = current.clone();
-                    let merged = match next.journal.merge(&journal) {
-                        Ok(merged) => merged,
-                        Err(e) => {
-                            conflict = Some(e);
-                            return None;
-                        }
-                    };
-                    let adopted = next.lineage.is_none() && lineage.is_some();
-                    if adopted {
-                        next.lineage = lineage.map(str::to_string);
+    let registration = update_fenced(
+        ns,
+        objects,
+        record.ledger_id.as_str(),
+        record.fence,
+        |current| match current {
+            Some(current) => {
+                let mut next = current.clone();
+                let merged = match next.journal.merge(&journal) {
+                    Ok(merged) => merged,
+                    Err(e) => {
+                        conflict = Some(e);
+                        return None;
                     }
-                    (merged || adopted).then_some(next)
+                };
+                let adopted = next.lineage.is_none() && lineage.is_some();
+                if adopted {
+                    next.lineage = lineage.map(str::to_string);
                 }
-                None => fresh.clone(),
-            },
-        )
-        .await?;
+                (merged || adopted).then_some(next)
+            }
+            None => fresh.clone(),
+        },
+    )
+    .await?;
     conflict.map_or(Ok(registration), |e| Err(e.into()))
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::retention::erasure::ErasureJob;
+    use crate::{Fluree, FlureeBuilder};
+
+    fn removal(n: usize) -> Removal {
+        Removal {
+            request_id: "removal-1".into(),
+            commit: format!("commit-{n}"),
+            slot: n as u32,
+            predicate: "http://example.org/email".into(),
+            from_t: 1,
+            until_t: Some(2),
+            scope_t: 2,
+            subject: None,
+        }
+    }
+
+    fn job() -> ErasureJob {
+        let commits: Vec<_> = (0..3)
+            .map(|n| {
+                serde_json::json!({
+                    "commit": format!("commit-{n}"), "t": 1, "slots": [0],
+                    "ledgerId": "t/chunks:main", "branches": ["t/chunks:main"],
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "requestId": "erasure-1", "acceptedMs": 1, "authorizedT": 1,
+            "stage": "proving", "commits": commits,
+            "added": [{"commit": "commit-0", "slot": 1}],
+        }))
+        .unwrap()
+    }
+
+    async fn ledger(name: &str) -> (tempfile::TempDir, Fluree, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        fluree.create_ledger(name).await.unwrap();
+        (dir, fluree, format!("{name}:main"))
+    }
+
+    async fn chunk_objects(fluree: &Fluree) -> Vec<String> {
+        let storage = fluree.admin_storage().unwrap();
+        let mut objects = storage
+            .list_prefix(&format!(
+                "fluree:{}://{OBJECTS_DIR}/",
+                storage.storage_method()
+            ))
+            .await
+            .unwrap();
+        objects.sort();
+        objects
+    }
+
+    /// A registration's journal and erasure jobs are kept as chunks its
+    /// record names. They read back as written; a write changing neither
+    /// stores no chunk and leaves the journal's identity; one appending a
+    /// removal stores only its last chunk again.
+    #[tokio::test]
+    async fn growing_lists_are_kept_as_chunks_the_record_names() {
+        let (_dir, fluree, id) = ledger("t/chunks").await;
+        let (ns, objects) = (fluree.publisher().unwrap(), fluree.registry_objects());
+        let removals: Vec<Removal> = (0..CHUNK + 10).map(removal).collect();
+        let written = Registration {
+            active_since_t: 1,
+            journal: Journal {
+                generation: 1,
+                history_rules: Vec::new(),
+                removals: removals.clone(),
+            },
+            erasures: vec![job()],
+            ..Default::default()
+        };
+        update(ns, objects, &id, |_| Some(written.clone()))
+            .await
+            .unwrap();
+
+        let stored = read_stored(ns, &id).await.unwrap().1.unwrap();
+        let journal_chunks = |stored: &serde_json::Value| -> Vec<String> {
+            serde_json::from_value(stored["journal"]["removalChunks"].clone()).unwrap()
+        };
+        assert_eq!(journal_chunks(&stored).len(), 2);
+        assert!(stored["journal"].get("removals").is_none(), "{stored}");
+        assert_eq!(stored["journal"]["generation"], 1);
+        assert_eq!(stored["erasures"][0]["commits"], serde_json::json!([]));
+        assert_eq!(
+            stored["erasures"][0]["commitChunks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            stored["erasures"][0]["addedChunks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let read_back = read(ns, objects, &id).await.unwrap().1.unwrap();
+        assert_eq!(read_back, written);
+
+        let chunks = chunk_objects(&fluree).await;
+        let identity = journal_identity(&stored);
+        update(ns, objects, &id, |current| {
+            Some(Registration {
+                pending: 7,
+                ..current.unwrap().clone()
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(chunk_objects(&fluree).await, chunks);
+        let unchanged = read_stored(ns, &id).await.unwrap().1.unwrap();
+        assert_eq!(journal_identity(&unchanged), identity);
+
+        update(ns, objects, &id, |current| {
+            let mut next = current.unwrap().clone();
+            next.journal.removals.push(removal(9_999));
+            next.journal.generation += 1;
+            Some(next)
+        })
+        .await
+        .unwrap();
+        assert_eq!(chunk_objects(&fluree).await.len(), chunks.len() + 1);
+        let appended = read_stored(ns, &id).await.unwrap().1.unwrap();
+        let (before, after) = (journal_chunks(&unchanged), journal_chunks(&appended));
+        assert_eq!(before[0], after[0], "the first chunk is named again");
+        assert_ne!(before[1], after[1]);
+        assert_ne!(journal_identity(&appended), identity);
+        let read_back = read(ns, objects, &id).await.unwrap().1.unwrap();
+        assert_eq!(read_back.journal.removals.len(), CHUNK + 11);
+    }
+
+    /// A registration stored inline, as without managed storage, reads as
+    /// before and is stored in chunks on its next change.
+    #[tokio::test]
+    async fn an_inline_registration_is_chunked_on_its_next_change() {
+        let (_dir, fluree, id) = ledger("t/inline").await;
+        let (ns, objects) = (fluree.publisher().unwrap(), fluree.registry_objects());
+        let written = Registration {
+            active_since_t: 1,
+            journal: Journal {
+                generation: 1,
+                history_rules: Vec::new(),
+                removals: vec![removal(0)],
+            },
+            erasures: vec![job()],
+            ..Default::default()
+        };
+        update(ns, None, &id, |_| Some(written.clone()))
+            .await
+            .unwrap();
+        let stored = read_stored(ns, &id).await.unwrap().1.unwrap();
+        assert_eq!(stored["journal"]["removals"].as_array().unwrap().len(), 1);
+        assert!(chunk_objects(&fluree).await.is_empty());
+        assert_eq!(read(ns, objects, &id).await.unwrap().1.unwrap(), written);
+
+        update(ns, objects, &id, |current| {
+            Some(Registration {
+                pending: 1,
+                ..current.unwrap().clone()
+            })
+        })
+        .await
+        .unwrap();
+        let stored = read_stored(ns, &id).await.unwrap().1.unwrap();
+        assert!(stored["journal"].get("removals").is_none(), "{stored}");
+        assert_eq!(chunk_objects(&fluree).await.len(), 3);
+        let read_back = read(ns, objects, &id).await.unwrap().1.unwrap();
+        assert_eq!(read_back.journal, written.journal);
+        assert_eq!(read_back.erasures, written.erasures);
+    }
+
+    /// A chunk equal to the one read at its position is named again, not
+    /// serialized or stored; a changed one is stored.
+    #[tokio::test]
+    async fn an_unchanged_chunk_is_named_again_without_being_stored() {
+        let storage = fluree_db_core::MemoryStorage::new();
+        let cache = ChunkCache::default();
+        let objects = Objects::new(&storage, &cache);
+        let items: Vec<Removal> = (0..=CHUNK).map(removal).collect();
+        let before = Listed {
+            chunks: vec!["as-read-0".into(), "as-read-1".into()],
+            read: Arc::new(items.clone()),
+        };
+        let mut next = items;
+        next[CHUNK].slot += 1;
+        let chunks = objects.write_list(&next, Some(&before)).await.unwrap();
+        assert_eq!(chunks[0], "as-read-0");
+        assert_ne!(chunks[1], "as-read-1");
+        let storage: &dyn Storage = &storage;
+        let stored = storage
+            .list_prefix(&format!(
+                "fluree:{}://{OBJECTS_DIR}/",
+                storage.storage_method()
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "{stored:?}");
+    }
 }
