@@ -354,10 +354,13 @@ mod tests {
         while calls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
-        let served = held
-            .get_or_renew(standing, || slow(Arc::clone(&gate), Arc::clone(&calls)))
-            .await;
-        assert_eq!(served.unwrap().0, "held", "served without waiting");
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            held.get_or_renew(standing, || slow(Arc::clone(&gate), Arc::clone(&calls))),
+        )
+        .await
+        .expect("served without waiting for the renewal in flight");
+        assert_eq!(served.unwrap().0, "held");
         gate.notify_one();
         assert_eq!(in_flight.await.unwrap().unwrap().0, "renewed");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
