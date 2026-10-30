@@ -559,18 +559,17 @@ pub(crate) async fn plan_storage(
             if scheme != LocationScheme::Gs {
                 return Err(refuse("the catalog's Google identity", "gs://"));
             }
-            let key = identity_key("catalog", auth, ctx);
-            let identity = cached_identity(key, || async {
-                let hydrated = auth.hydrate(ctx.secret_resolver.as_ref()).await?;
-                hydrated.google_identity(ctx)?.ok_or_else(|| {
+            // Resolved on every plan, before the cache: see `cached_identity`.
+            let hydrated = auth.hydrate(ctx.secret_resolver.as_ref()).await?;
+            let identity = cached_identity("catalog", &hydrated, ctx, |auth| {
+                auth.google_identity(ctx)?.ok_or_else(|| {
                     IcebergError::Config(
                         "io.storage_auth `catalog` needs a REST catalog authenticated with a \
                          Google identity (auth type `google` or `google_metadata`)"
                             .to_string(),
                     )
                 })
-            })
-            .await?;
+            })?;
             // The catalog's quota project bills its BigLake calls; storage
             // reads use the catalog's identity but not its quota project.
             // Sent to GCS, `x-goog-user-project` is a requester-pays billing
@@ -585,12 +584,16 @@ pub(crate) async fn plan_storage(
             if scheme != LocationScheme::Gs {
                 return Err(refuse("the source's Google identity", "gs://"));
             }
-            let key = identity_key("google", &(&credentials, &quota_project), ctx);
-            let identity = cached_identity(key, || async {
-                let hydrated = credentials.hydrate(ctx.secret_resolver.as_ref()).await?;
-                GoogleIdentity::new(&hydrated, quota_project.as_deref(), ctx)
-            })
-            .await?;
+            // Resolved on every plan, before the cache: see `cached_identity`.
+            let hydrated = credentials.hydrate(ctx.secret_resolver.as_ref()).await?;
+            let identity = cached_identity(
+                "google",
+                &(&hydrated, &quota_project),
+                ctx,
+                |(credentials, quota_project)| {
+                    GoogleIdentity::new(credentials, quota_project.as_deref(), ctx)
+                },
+            )?;
             // Only the quota project configured for storage bills its reads,
             // not one a credential file names for itself.
             let user_project = quota_project.clone();
@@ -600,22 +603,19 @@ pub(crate) async fn plan_storage(
 }
 
 /// The key a built storage identity is cached under: its kind, a digest of
-/// the configuration as stored (references, not resolved secrets) and the
-/// identity context, which names whose secrets the resolver resolves (see
-/// [`fluree_db_iceberg::SecretResolver::scope_id`]), the policy and the AWS
-/// subject. In memory only.
-fn identity_key(kind: &str, stored: &impl serde::Serialize, ctx: &IdentityContext) -> String {
+/// the configuration it was built from, *resolved* (the secrets a reference
+/// names, not the reference), and the identity context (the policy, the AWS
+/// subject, the resolver's scope id). In memory only.
+fn identity_key(kind: &str, resolved: &impl serde::Serialize, ctx: &IdentityContext) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(serde_json::to_vec(stored).unwrap_or_default());
-    let digest: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let digest = Sha256::digest(serde_json::to_vec(resolved).unwrap_or_default());
+    let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("{kind}\u{1f}{digest}\u{1f}{}", ctx.cache_scope())
 }
 
-/// The storage identities planned so far, process-wide, so a warm query's
-/// plan neither hydrates its secret (a secret-store call) nor rebuilds the
-/// identity (a key parse and an HTTP client). Bounded by the catalog-client
-/// TTL (`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`), so a rotated secret behind a
-/// reference is picked up within it, as for catalog clients.
+/// The storage identities built so far, process-wide, so a warm query's
+/// plan does not rebuild its identity (a key parse and an HTTP client).
+/// Bounded by the catalog-client TTL (`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`).
 fn identities() -> &'static moka::sync::Cache<String, Arc<GoogleIdentity>> {
     static CACHE: std::sync::OnceLock<moka::sync::Cache<String, Arc<GoogleIdentity>>> =
         std::sync::OnceLock::new();
@@ -629,23 +629,36 @@ fn identities() -> &'static moka::sync::Cache<String, Arc<GoogleIdentity>> {
     })
 }
 
-/// The identity cached under `key`, else the one `build` makes (cached when
-/// caching is on). The token proof still runs on every plan
-/// ([`google_plan`]); only the construction is shared.
-async fn cached_identity<F, Fut>(key: String, build: F) -> IcebergResult<Arc<GoogleIdentity>>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = IcebergResult<GoogleIdentity>>,
-{
+/// The identity cached for `resolved`, else the one `build` makes from it
+/// (cached when caching is on).
+///
+/// `resolved` is the source's identity configuration after the caller's
+/// secret resolver hydrated it, which the caller does on every plan, before
+/// this lookup: the resolver authorizes each use, not only the first. The key
+/// is a digest of exactly what `build` is given, and building refuses a
+/// reference left unresolved, so an entry exists only under the digest of
+/// resolved secrets: a caller is served a cached identity only by presenting
+/// what it was built from. One whose resolver refuses the reference fails at
+/// hydration and never reaches the cache; one whose resolver maps the
+/// reference to another secret keys another entry. A rotated secret keys a
+/// new entry at once.
+///
+/// The token proof still runs on every plan ([`google_plan`]); only the
+/// construction is shared.
+fn cached_identity<T: serde::Serialize>(
+    kind: &str,
+    resolved: &T,
+    ctx: &IdentityContext,
+    build: impl FnOnce(&T) -> IcebergResult<GoogleIdentity>,
+) -> IcebergResult<Arc<GoogleIdentity>> {
     let caching =
         super::catalog_session::cache_enabled() && super::cache::rest_client_ttl_secs() > 0;
-    if caching {
-        if let Some(identity) = identities().get(&key) {
-            return Ok(identity);
-        }
+    let key = caching.then(|| identity_key(kind, resolved, ctx));
+    if let Some(identity) = key.as_ref().and_then(|key| identities().get(key)) {
+        return Ok(identity);
     }
-    let identity = Arc::new(build().await?);
-    if caching {
+    let identity = Arc::new(build(resolved)?);
+    if let Some(key) = key {
         identities().insert(key, Arc::clone(&identity));
     }
     Ok(identity)

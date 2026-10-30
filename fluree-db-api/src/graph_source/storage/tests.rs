@@ -908,18 +908,35 @@ async fn a_host_identitys_plan_is_refused_for_a_gcs_endpoint_its_token_may_not_r
 }
 
 /// An AWS subject that counts the WIF exchanges it is asked to sign, and has
-/// no credentials for any of them.
-#[derive(Debug, Default)]
-struct CountingSubject(std::sync::atomic::AtomicUsize);
+/// no credentials for any of them. Its principal names it in the identity
+/// context's cache scope, so each test's identities are its own.
+#[derive(Debug)]
+struct CountingSubject {
+    principal: &'static str,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingSubject {
+    fn new(principal: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            principal,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 #[async_trait]
 impl AwsSubjectCredentials for CountingSubject {
     fn principal_key(&self) -> String {
-        "tenant-c:counting".to_string()
+        self.principal.to_string()
     }
 
     async fn credentials(&self) -> fluree_db_iceberg::Result<fluree_db_iceberg::AwsCredentials> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(IcebergError::Credential("subject unavailable".to_string()))
     }
 
@@ -928,39 +945,153 @@ impl AwsSubjectCredentials for CountingSubject {
     }
 }
 
-/// A warm plan reuses the identity it built: the secret behind a source's
-/// Google identity is resolved (a secret-store call, for an embedder) once,
-/// not once per query. The proof is not cached: each plan asks the identity
-/// for a token again, here signed by a subject that cannot sign it.
+/// A resolver with no scope id (every resolver of the process maps a
+/// reference to the same secret) that resolves for its caller only when the
+/// caller is allowed the secret, and refuses it otherwise.
+#[derive(Debug)]
+struct UnscopedResolver {
+    secret: Option<String>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl UnscopedResolver {
+    fn new(secret: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            secret,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl fluree_db_iceberg::SecretResolver for UnscopedResolver {
+    async fn resolve_secret(
+        &self,
+        _secret_ref: &str,
+    ) -> Result<String, fluree_db_iceberg::SecretResolveError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.secret.clone().ok_or_else(|| {
+            fluree_db_iceberg::SecretResolveError::Denied("not this caller's".to_string())
+        })
+    }
+}
+
+/// A source's own WIF identity, its config behind `reference`.
+fn wif_by_ref(reference: &str) -> IoConfig {
+    ambient_io().with_storage_auth(StorageAuth::Google {
+        credentials: GoogleCredentials::ExternalAccount {
+            config: ExternalAccountConfig::Ref(secret_ref(reference)),
+        },
+        quota_project: None,
+    })
+}
+
+/// The cached identity `plan_storage` would serve `ctx` for `io`'s Google
+/// credentials, resolved to `wif` (`None` when none is cached).
+fn cached_wif_identity(wif: &str, ctx: &IdentityContext) -> Option<Arc<GoogleIdentity>> {
+    let resolved = GoogleCredentials::ExternalAccount {
+        config: ExternalAccountConfig::Ref(ConfigValue::literal(wif)),
+    };
+    let key = identity_key("google", &(&resolved, &None::<String>), ctx);
+    identities().get(&key)
+}
+
+/// A warm plan reuses the identity it built (a key parse and an HTTP
+/// client), but authorizes the secret behind it on every plan: the resolver
+/// is asked each time, before the cache. The proof is not cached either:
+/// each plan asks the identity for a token again, here signed by a subject
+/// that cannot sign it.
 #[tokio::test]
-async fn a_warm_plan_resolves_its_google_identity_once_and_proves_it_every_time() {
-    let resolver = TenantResolver::new(
-        "tenant-c",
-        serde_json::Value::Object(gcloud_wif_config()).to_string(),
-    );
-    let subject = Arc::new(CountingSubject::default());
+async fn a_warm_plan_reuses_its_google_identity_but_resolves_and_proves_it_every_time() {
+    let wif = serde_json::Value::Object(gcloud_wif_config()).to_string();
+    let resolver = TenantResolver::new("tenant-c", wif.clone());
+    let subject = CountingSubject::new("tenant-c:counting");
     let ctx = IdentityContext {
         secret_resolver: Some(resolver.clone()),
         aws_subject: Some(subject.clone()),
         ..IdentityContext::default()
     };
-    let io = ambient_io().with_storage_auth(StorageAuth::Google {
-        credentials: GoogleCredentials::ExternalAccount {
-            config: ExternalAccountConfig::Ref(secret_ref("wif-warm-plan")),
-        },
-        quota_project: None,
-    });
+    let io = wif_by_ref("wif-warm-plan");
     let direct = CatalogConfig::direct("gs://lake/wh/t");
+    let mut first = None;
     for attempt in 1..=2 {
         let err = plan(&direct, &io, GS_META, &ctx)
             .await
             .expect_err("the subject signs nothing");
         assert!(err.to_string().contains("subject unavailable"), "{err}");
-        assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), attempt);
+        assert_eq!(subject.calls(), attempt, "proved on every plan");
+        assert_eq!(resolver.calls(), attempt, "resolved on every plan");
+        let cached = cached_wif_identity(&wif, &ctx).expect("the identity is cached");
+        match &first {
+            None => first = Some(cached),
+            Some(first) => assert!(Arc::ptr_eq(first, &cached), "built once"),
+        }
     }
-    assert_eq!(
-        resolver.calls(),
-        1,
-        "the second plan resolved the secret again"
+}
+
+/// A cached identity is served only to a caller whose own resolver resolves
+/// the secret behind it. Under a resolver with no scope id, two callers'
+/// identity contexts are alike, so only the resolver's answer tells them
+/// apart: a second caller naming the first one's reference, whose resolver
+/// refuses it, is refused by its resolver. It is not served the first
+/// caller's identity, and nothing is signed for it.
+#[tokio::test]
+async fn a_caller_whose_resolver_refuses_the_secret_is_not_served_the_cached_identity() {
+    let wif = serde_json::Value::Object(gcloud_wif_config()).to_string();
+    let subject = CountingSubject::new("shared:refusal");
+    let context = |resolver: Arc<UnscopedResolver>| IdentityContext {
+        secret_resolver: Some(resolver),
+        aws_subject: Some(subject.clone()),
+        ..IdentityContext::default()
+    };
+    let (owner, other) = (
+        UnscopedResolver::new(Some(wif.clone())),
+        UnscopedResolver::new(None),
     );
+    let (owner_ctx, other_ctx) = (context(owner.clone()), context(other.clone()));
+    assert_eq!(owner_ctx.cache_scope(), other_ctx.cache_scope());
+    let io = wif_by_ref("owner-wif");
+    let direct = CatalogConfig::direct("gs://lake/wh/t");
+
+    let err = plan(&direct, &io, GS_META, &owner_ctx)
+        .await
+        .expect_err("the subject signs nothing");
+    assert!(err.to_string().contains("subject unavailable"), "{err}");
+    assert!(cached_wif_identity(&wif, &owner_ctx).is_some(), "cached");
+    let signed = subject.calls();
+
+    let err = plan(&direct, &io, GS_META, &other_ctx)
+        .await
+        .expect_err("the other caller's resolver refuses the reference");
+    assert!(err.to_string().contains("denied"), "{err}");
+    assert_eq!(other.calls(), 1, "the other caller's resolver was asked");
+    assert_eq!(subject.calls(), signed, "nothing was signed for it");
+
+    // The same, through a REST catalog's own Google identity.
+    let catalog = rest_with(
+        "https://catalog.example",
+        AuthConfig::Google {
+            credentials: GoogleCredentials::ExternalAccount {
+                config: ExternalAccountConfig::Ref(secret_ref("owner-wif")),
+            },
+            scopes: None,
+            quota_project: None,
+        },
+    );
+    let io = ambient_io().with_storage_auth(StorageAuth::Catalog);
+    let err = plan(&catalog, &io, GS_META, &owner_ctx)
+        .await
+        .expect_err("the subject signs nothing");
+    assert!(err.to_string().contains("subject unavailable"), "{err}");
+    let signed = subject.calls();
+    let err = plan(&catalog, &io, GS_META, &other_ctx)
+        .await
+        .expect_err("the other caller's resolver refuses the reference");
+    assert!(err.to_string().contains("denied"), "{err}");
+    assert_eq!(other.calls(), 2);
+    assert_eq!(subject.calls(), signed, "nothing was signed for it");
 }
