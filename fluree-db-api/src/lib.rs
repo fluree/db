@@ -1036,11 +1036,12 @@ where
     async fn delete_unlogged(
         &self,
         address: &str,
-    ) -> std::result::Result<(), fluree_db_core::Error> {
+        until: std::time::Instant,
+    ) -> std::result::Result<bool, fluree_db_core::Error> {
         if Self::route_to_commit(address) {
-            self.commit.delete_unlogged(address).await
+            self.commit.delete_unlogged(address, until).await
         } else {
-            self.index.delete_unlogged(address).await
+            self.index.delete_unlogged(address, until).await
         }
     }
 
@@ -1280,8 +1281,9 @@ impl StorageWrite for AddressIdentifierResolverStorage {
     async fn delete_unlogged(
         &self,
         address: &str,
-    ) -> std::result::Result<(), fluree_db_core::Error> {
-        self.default.delete_unlogged(address).await
+        until: std::time::Instant,
+    ) -> std::result::Result<bool, fluree_db_core::Error> {
+        self.default.delete_unlogged(address, until).await
     }
 
     async fn delete_many(&self, addresses: &[String]) -> Vec<(String, fluree_db_core::Error)> {
@@ -3993,6 +3995,8 @@ struct RootHold {
     /// On a cluster's leader: when it first saw each open intent, which
     /// begins deleting a settle period later.
     intents_seen: Arc<parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>>,
+    /// On a cluster member: held through each collection pass.
+    cluster_pass: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Fluree {

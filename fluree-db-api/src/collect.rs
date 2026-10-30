@@ -34,6 +34,10 @@ const INTENT_DIR: &str = "@retention/collect/intent";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntentObject {
+    /// Drawn for each intent: no two intents share a name, so a delete of
+    /// a closed intent's object, however late or replayed, removes no
+    /// other's.
+    pub nonce: String,
     pub entries: Vec<IntentEntry>,
 }
 
@@ -94,16 +98,22 @@ impl Fluree {
 }
 
 impl Fluree {
-    pub(crate) fn intent_address(&self, method: &str, hash: &str) -> String {
+    /// Where the intent object `hash` names lives, under storage `method`.
+    pub fn intent_address(&self, method: &str, hash: &str) -> String {
         format!("fluree:{method}://{INTENT_DIR}/{hash}.json")
     }
 
-    /// Store `intent`, immutable and named by its hash, which it returns.
-    pub async fn put_intent(&self, intent: &IntentObject) -> Result<String> {
+    /// Store an intent condemning `entries`, immutable and named by its
+    /// hash, which it returns.
+    pub async fn put_intent(&self, entries: Vec<IntentEntry>) -> Result<String> {
         let storage = self
             .admin_storage()
             .ok_or_else(|| ApiError::internal("collection needs managed storage"))?;
-        let bytes = serde_json::to_vec(intent)?;
+        let intent = IntentObject {
+            nonce: hex::encode(rand::random::<[u8; 16]>()),
+            entries,
+        };
+        let bytes = serde_json::to_vec(&intent)?;
         let hash = hex::encode(Sha256::digest(&bytes));
         let address = self.intent_address(storage.storage_method(), &hash);
         storage.write_bytes(&address, &bytes).await?;
@@ -152,20 +162,27 @@ tokio::task_local! {
 /// scope: what the command publishing it presents.
 pub fn seen() -> Option<u64> {
     SCOPE
-        .try_with(|scope| scope.seen.load(Ordering::SeqCst))
+        .try_with(|scope| {
+            scope
+                .seen
+                .load(Ordering::SeqCst)
+                .min(scope.ceiling.load(Ordering::SeqCst))
+        })
         .ok()
 }
 
-/// Present no more than `epoch` for the write under way here: it publishes
-/// something stored outside its scope, after this member had loaded
-/// `epoch` intents.
+/// Present no more than `epoch` for the write under way here, whatever
+/// loads after: it publishes something another task stored, after this
+/// member had loaded `epoch` intents, which no load finds in the scope.
 pub fn lower_seen(epoch: u64) {
-    let _ = SCOPE.try_with(|scope| scope.seen.fetch_min(epoch, Ordering::SeqCst));
+    let _ = SCOPE.try_with(|scope| scope.ceiling.fetch_min(epoch, Ordering::SeqCst));
 }
 
 /// One write under way.
 struct Scope {
     seen: AtomicU64,
+    /// What [`lower_seen`] bounds `seen` to.
+    ceiling: AtomicU64,
     stored: Mutex<Vec<String>>,
 }
 
@@ -237,6 +254,7 @@ impl Condemned {
             let mut inner = self.inner.lock();
             let scope = Arc::new(Scope {
                 seen: AtomicU64::new(inner.loaded),
+                ceiling: AtomicU64::new(u64::MAX),
                 stored: Mutex::default(),
             });
             inner.scopes.retain(|s| s.strong_count() > 0);
@@ -480,6 +498,23 @@ mod tests {
             })
             .await;
         assert_eq!(seen_after, Some(1), "fenced by intent 1");
+    }
+
+    /// A scope publishing what another task stored presents no more than
+    /// the intents loaded when that task began: a load cannot find the
+    /// other task's store in the scope to spare it.
+    #[tokio::test]
+    async fn a_scope_lowered_for_another_tasks_store_stays_lowered() {
+        let (condemned, spares) = active();
+        let seen_after = condemned
+            .scoped(async {
+                lower_seen(0);
+                condemned.load(0, vec!["raw".into()]).await.unwrap();
+                seen()
+            })
+            .await;
+        assert_eq!(seen_after, Some(0));
+        assert!(spares.spared.lock().is_empty());
     }
 
     /// A store to a condemned address spares it once; refused, it waits

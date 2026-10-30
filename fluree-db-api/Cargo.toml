@@ -861,6 +861,8 @@ fluree-db-spatial = { path = "../fluree-db-spatial" }
 tokio = { workspace = true }
 # Platform directory resolution (XDG on Linux, Application Support on macOS)
 dirs = "5"
+# Cluster collection: each intent object's nonce.
+rand = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 fluree-db-transact = { path = "../fluree-db-transact" }

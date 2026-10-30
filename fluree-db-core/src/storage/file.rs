@@ -1840,12 +1840,14 @@ impl StorageWrite for FileStorage {
             .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
 
-    async fn delete_unlogged(&self, address: &str) -> Result<()> {
+    async fn delete_unlogged(&self, address: &str, until: std::time::Instant) -> Result<bool> {
         let (key, path) = self.resolve_key(address)?;
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || storage.delete_key_unlogged_blocking(&key, &path))
-            .await
-            .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            storage.delete_key_unlogged_blocking(&key, &path, until)
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
 
     /// One blocking task for the whole batch rather than one per address:
@@ -1888,11 +1890,20 @@ impl FileStorage {
     /// Unlink `path` with no WAL record, then flush its directory. Ordered
     /// with writes to the key like any delete; a replay of an earlier write
     /// may bring the file back, never take a later one away.
-    fn delete_key_unlogged_blocking(&self, key: &str, path: &std::path::Path) -> Result<()> {
+    fn delete_key_unlogged_blocking(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        until: std::time::Instant,
+    ) -> Result<bool> {
         let _operation = self.begin_operation(self.durability, key)?;
+        // Checked once the locks are held: waiting for them may outlast it.
+        if std::time::Instant::now() >= until {
+            return Ok(false);
+        }
         match std::fs::remove_file(path) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(e) => {
                 return Err(crate::error::Error::io(format!(
                     "Failed to delete {}: {e}",
@@ -1901,7 +1912,7 @@ impl FileStorage {
             }
         }
         Self::sync_parent_dirs(&self.base_path, &[key.to_string()])?;
-        Ok(())
+        Ok(true)
     }
 
     /// Unlink `path`, recording the delete in the WAL first when one is
@@ -3628,10 +3639,11 @@ mod wal_tests {
             .write_bytes("fluree:file://a.bin", b"a")
             .await
             .unwrap();
-        storage
-            .delete_unlogged("fluree:file://a.bin")
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(storage
+            .delete_unlogged("fluree:file://a.bin", until)
             .await
-            .unwrap();
+            .unwrap());
         assert!(!dir.path().join("a.bin").exists());
         publish(&storage, b"h").await;
         storage.simulate_crash_for_test();
@@ -3647,6 +3659,28 @@ mod wal_tests {
             storage.read_bytes("fluree:file://a.bin").await.unwrap(),
             b"a"
         );
+    }
+
+    /// An unlogged delete whose deadline passes while it waits for the
+    /// storage's locks deletes nothing.
+    #[tokio::test]
+    async fn an_unlogged_delete_past_its_deadline_once_it_holds_the_locks_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        let exclusive = storage.root_gate().unwrap().write_owned().await;
+        let delete = {
+            let storage = storage.clone();
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            tokio::spawn(async move { storage.delete_unlogged("fluree:file://a.bin", until).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        drop(exclusive);
+        assert!(!delete.await.unwrap().unwrap());
+        assert!(dir.path().join("a.bin").exists());
     }
 
     /// Replay applies records in order, so a delete cannot resurrect what it

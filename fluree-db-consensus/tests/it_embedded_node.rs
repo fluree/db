@@ -859,20 +859,18 @@ async fn condemn(
     fluree: &fluree_db_api::Fluree,
     addresses: &[String],
 ) -> String {
-    use fluree_db_api::collect::{IntentEntry, IntentObject};
+    use fluree_db_api::collect::IntentEntry;
     use fluree_db_consensus::raft::state_machine::{CollectCommand, Command};
-    let intent = IntentObject {
-        entries: addresses
-            .iter()
-            .map(|address| IntentEntry {
-                address: address.clone(),
-                reason: "test".into(),
-                ledger: None,
-                record: None,
-            })
-            .collect(),
-    };
-    let hash = fluree.put_intent(&intent).await.expect("intent stored");
+    let entries = addresses
+        .iter()
+        .map(|address| IntentEntry {
+            address: address.clone(),
+            reason: "test".into(),
+            ledger: None,
+            record: None,
+        })
+        .collect();
+    let hash = fluree.put_intent(entries).await.expect("intent stored");
     integration
         .raft
         .client_write(Command::Collect(CollectCommand::Condemn {
@@ -960,6 +958,7 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
     let storage = fluree.admin_storage().unwrap();
     let address = "fluree:file://fenced/main/txn/stray.json".to_string();
     let intent = IntentObject {
+        nonce: String::new(),
         entries: vec![IntentEntry {
             address: address.clone(),
             reason: "test".into(),
@@ -967,7 +966,8 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
             record: None,
         }],
     };
-    let hash = fluree_db_core::sha256_hex(&serde_json::to_vec(&intent).unwrap());
+    let bytes = serde_json::to_vec(&intent).unwrap();
+    let hash = fluree_db_core::sha256_hex(&bytes);
 
     let refused = condemned
         .scoped(async {
@@ -986,7 +986,13 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
                     .await
                     .unwrap();
             }
-            assert_eq!(fluree.put_intent(&intent).await.unwrap(), hash);
+            storage
+                .write_bytes(
+                    &fluree.intent_address(storage.storage_method(), &hash),
+                    &bytes,
+                )
+                .await
+                .unwrap();
             eventually("the intent loads", async || condemned.loaded() == 1).await;
             push().await
         })

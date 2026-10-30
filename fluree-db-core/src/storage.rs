@@ -444,10 +444,15 @@ pub trait StorageWrite: Debug + Send + Sync {
 
     /// Delete an object so that no write-ahead log replay can redo the
     /// delete: a later write of the same address survives a replay of this
-    /// storage's log. Durable on return. The default is [`Self::delete`],
-    /// for backends that keep no log of their deletes.
-    async fn delete_unlogged(&self, address: &str) -> Result<()> {
-        self.delete(address).await
+    /// storage's log. Nothing is deleted if `until` has passed when the
+    /// unlink would begin: `false` then. Durable on return. The default is
+    /// [`Self::delete`], for backends that keep no log of their deletes.
+    async fn delete_unlogged(&self, address: &str, until: std::time::Instant) -> Result<bool> {
+        if std::time::Instant::now() >= until {
+            return Ok(false);
+        }
+        self.delete(address).await?;
+        Ok(true)
     }
 
     /// Make every write this storage reported complete short of the device
@@ -661,8 +666,8 @@ impl StorageWrite for Arc<dyn Storage> {
         self.as_ref().delete_many(addresses).await
     }
 
-    async fn delete_unlogged(&self, address: &str) -> Result<()> {
-        self.as_ref().delete_unlogged(address).await
+    async fn delete_unlogged(&self, address: &str, until: std::time::Instant) -> Result<bool> {
+        self.as_ref().delete_unlogged(address, until).await
     }
 
     async fn sync(&self) -> Result<()> {

@@ -434,7 +434,6 @@ async fn a_collection_out_of_time_loads_nothing() {
 
 pub(crate) mod cluster {
     use std::collections::{BTreeMap, HashSet};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -442,6 +441,7 @@ pub(crate) mod cluster {
     use fluree_db_core::{content_address, ContentId, ContentKind, ContentStore as _};
     use parking_lot::Mutex;
     use serde_json::json;
+    use tokio::sync::Notify;
 
     use super::file_fluree;
     use crate::collect::Collector;
@@ -456,7 +456,10 @@ pub(crate) mod cluster {
         intents: Mutex<BTreeMap<u64, Open>>,
         next: Mutex<u64>,
         queued: Mutex<HashSet<ContentId>>,
-        deposed: AtomicBool,
+        /// How many more leases this member is granted; unlimited if `None`.
+        leases: Mutex<Option<usize>>,
+        /// The next `delete` answers once this is notified.
+        hold_delete: Mutex<Option<Arc<Notify>>>,
     }
 
     impl Cluster {
@@ -480,10 +483,15 @@ pub(crate) mod cluster {
         }
 
         async fn delete(&self, number: u64) -> Result<Option<Vec<String>>> {
-            Ok(self.intents.lock().get_mut(&number).map(|intent| {
+            let deleting = self.intents.lock().get_mut(&number).map(|intent| {
                 intent.1 = true;
                 intent.2.clone()
-            }))
+            });
+            let hold = self.hold_delete.lock().take();
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            Ok(deleting)
         }
 
         async fn complete(&self, number: u64) -> Result<()> {
@@ -504,7 +512,13 @@ pub(crate) mod cluster {
         }
 
         async fn lease(&self) -> Option<Instant> {
-            (!self.deposed.load(Ordering::SeqCst)).then(|| Instant::now() + Duration::from_secs(1))
+            let mut leases = self.leases.lock();
+            match leases.as_mut() {
+                Some(0) => return None,
+                Some(left) => *left -= 1,
+                None => {}
+            }
+            Some(Instant::now() + Duration::from_secs(1))
         }
     }
 
@@ -620,20 +634,113 @@ pub(crate) mod cluster {
         }
 
         // The spared one's writer abandoned it: reconciliation records it
-        // again and it is condemned, but the member is deposed before it
-        // deletes anything; the next pass carries the intent on.
+        // again and it is condemned, but the member is deposed once its
+        // deletion has begun, before it deletes anything; the next pass
+        // carries the intent on.
         fluree.reconcile_garbage("swept").await.unwrap().unwrap();
         let third = pass(&fluree, &cluster).await;
         assert_eq!((third.condemned, third.resolved), (1, 2), "{third:?}");
-        cluster.deposed.store(true, Ordering::SeqCst);
+        *cluster.leases.lock() = Some(1);
         let deposed = pass(&fluree, &cluster).await;
         assert_eq!(deposed.deleted, 0, "{deposed:?}");
         assert!(exists(&strays[1].1).await);
         assert!(cluster.intents.lock()[&1].1, "left deleting");
-        cluster.deposed.store(false, Ordering::SeqCst);
+        *cluster.leases.lock() = None;
         let resumed = pass(&fluree, &cluster).await;
         assert_eq!(resumed.deleted, 1, "{resumed:?}");
         assert!(!exists(&strays[1].1).await);
         assert!(cluster.intents.lock().is_empty());
+    }
+
+    /// A ledger with one recorded stray nothing references, and its
+    /// address.
+    async fn one_stray(fluree: &Fluree) -> String {
+        fluree.create_ledger("stray").await.unwrap();
+        let ledger = fluree.ledger("stray:main").await.unwrap();
+        fluree
+            .insert(
+                ledger,
+                &json!({"@id": "http://example.org/a", "http://example.org/name": "a"}),
+            )
+            .await
+            .unwrap();
+        let namespace = fluree.storage_namespace("stray:main").await.unwrap();
+        let id = fluree
+            .content_store(&namespace)
+            .put(ContentKind::Txn, b"{\"stray\":true}")
+            .await
+            .unwrap();
+        fluree.reconcile_garbage("stray").await.unwrap().unwrap();
+        content_address("file", ContentKind::Txn, &namespace, &id.address_digest())
+    }
+
+    /// A pass waits for one under way: neither closes an intent the other
+    /// still deletes.
+    #[tokio::test]
+    async fn a_pass_waits_for_the_one_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        one_stray(&fluree).await;
+        let cluster = Arc::new(Cluster::default());
+        assert_eq!(pass(&fluree, &cluster).await.condemned, 1);
+
+        let release = Arc::new(Notify::new());
+        *cluster.hold_delete.lock() = Some(release.clone());
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            pass(&fluree, &cluster).await
+        };
+        let open_meanwhile = async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let open = !cluster.intents.lock().is_empty();
+            release.notify_one();
+            open
+        };
+        let (_, _, open_meanwhile) = tokio::join!(pass(&fluree, &cluster), second, open_meanwhile);
+        assert!(
+            open_meanwhile,
+            "closed while the first pass was deleting it"
+        );
+        assert!(cluster.intents.lock().is_empty());
+    }
+
+    /// A member that does not lead writes no intent.
+    #[tokio::test]
+    async fn a_member_that_does_not_lead_writes_no_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        let stray = one_stray(&fluree).await;
+        let cluster = Arc::new(Cluster::default());
+        *cluster.leases.lock() = Some(0);
+        assert_eq!(pass(&fluree, &cluster).await.condemned, 0);
+        let intents = dir.path().join("@retention/collect/intent");
+        assert!(
+            std::fs::read_dir(&intents).map_or(true, |mut d| d.next().is_none()),
+            "an intent object was written"
+        );
+        assert!(fluree
+            .admin_storage()
+            .unwrap()
+            .exists(&stray)
+            .await
+            .unwrap());
+    }
+
+    /// Intents condemning the same entries are named apart, so a late
+    /// delete of one's object never removes the other's.
+    #[tokio::test]
+    async fn intents_condemning_the_same_entries_are_named_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        let entries = vec![crate::collect::IntentEntry {
+            address: "fluree:file://x/main/txn/a.json".into(),
+            reason: "test".into(),
+            ledger: None,
+            record: None,
+        }];
+        let first = fluree.put_intent(entries.clone()).await.unwrap();
+        let second = fluree.put_intent(entries).await.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fluree.intent(&first).await.unwrap().entries.len(), 1);
     }
 }

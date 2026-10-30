@@ -134,6 +134,8 @@ impl Collector for RaftNameService {
         self.raft.get_read_log_id().await.ok()?;
         let (share, of) = LEASE_SHARE;
         let window = Duration::from_millis(self.raft.config().election_timeout_max) * share / of;
-        Some(started + window)
+        // Confirming leadership may itself outlast the window.
+        let until = started + window;
+        (Instant::now() < until).then_some(until)
     }
 }
