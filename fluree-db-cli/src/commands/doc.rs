@@ -265,7 +265,7 @@ async fn setup_extraction(
                 drop_off_model: false,
             },
             concurrency: 1,
-            fingerprint: reader.fingerprint.clone(),
+            fingerprint: reader.session.fingerprint(),
             gazetteer_counts: reader.catalog_counts.clone(),
             reader: Some(Arc::new(reader)),
         }));
@@ -425,7 +425,7 @@ struct Extracted {
     chunks_failed: usize,
     first_failure: Option<String>,
     /// A reader's account of the read, when one made it.
-    read: Option<doc_reader::Read>,
+    read: Option<fluree_db_doc::reader::Read>,
 }
 
 /// Scan every chunk for known entities, ask the language model about each,
@@ -536,7 +536,7 @@ async fn run_extraction(
 
 /// A reader's account of a document in the shape the language-model path
 /// reports and commits: its nodes, and counts in the same columns.
-fn read_extracted(mut read: doc_reader::Read) -> Extracted {
+fn read_extracted(mut read: fluree_db_doc::reader::Read) -> Extracted {
     let stats = fluree_db_doc::extract::ExtractionStats {
         llm_mentions: read.mentions,
         entities_known: read.linked.len(),
@@ -830,7 +830,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 ExtractionStamp {
                     fingerprint: setup.fingerprint.clone(),
                     model: match &setup.reader {
-                        Some(r) => Some(r.model.clone()),
+                        Some(r) => Some(r.session.model.clone()),
                         None => setup.extractor.as_ref().map(|x| x.model_name().to_string()),
                     },
                     mentions: stats.map_or(0, |s| s.gazetteer_mentions + s.llm_mentions),
@@ -932,7 +932,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     note.push_str(&format!(", {} chunk(s) not extracted", x.chunks_failed));
                 }
                 if let Some(read) = &x.read {
-                    let usage = doc_reader::usage_note(&read.usage);
+                    let usage = read.usage.note();
                     if !usage.is_empty() {
                         note.push_str(&format!(", {usage}"));
                     }
@@ -1070,7 +1070,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             );
         }
         if totals.reader_calls > 0 {
-            let usage = doc_reader::usage_note(&totals.reader_usage);
+            let usage = totals.reader_usage.note();
             println!(
                 "  reading: {} call(s){}{}",
                 totals.reader_calls,
@@ -1164,13 +1164,14 @@ fn announce(
             eprintln!(
                 "  ontology   {} ({} classes and properties)",
                 args.ontology.as_deref().unwrap_or(""),
-                r.ontology_terms()
+                r.session.ontology_terms()
             );
             eprintln!(
                 "  extraction {} via {} (reads each document whole{})",
-                r.model,
-                r.client.url(),
-                r.cache
+                r.session.model,
+                r.session.client.url(),
+                r.session
+                    .cache
                     .as_deref()
                     .map(|c| format!("; cache: {c}"))
                     .unwrap_or_default()
@@ -1485,7 +1486,7 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     eprintln!(
         "{} read {file_name} with {model} via {}",
         "→".dimmed(),
-        setup.client.url()
+        setup.session.client.url()
     );
 
     let (p, iri) = (path.clone(), doc_iri.clone());
@@ -1530,7 +1531,7 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         out.push('\n');
     }
 
-    let usage = doc_reader::usage_note(&read.usage);
+    let usage = read.usage.note();
     eprintln!(
         "{} {} mention(s), {} entit{}, {} relation(s); {} call(s){}{}",
         "✓".green(),

@@ -98,6 +98,35 @@ async with fluree.aio.connect("./data") as conn:
     rows = await people.query("SELECT ...")
 ```
 
+## Reading documents
+
+`fluree.doc.read` reads one document with an extraction model reached over
+HTTP, exactly as [`fluree doc read`](../cli/doc.md#fluree-doc-read) does: it
+parses the file (PDF, Word, PowerPoint, HTML, Markdown, text, spreadsheets,
+transcripts, email), sends its text and structure with your ontology and
+catalog, and returns the reading, which inserts into a ledger as it is:
+
+```python
+import fluree
+
+reading = fluree.doc.read("invoice.pdf", ontology="invoices.ttl",
+                          catalog="suppliers.ttl", model="reader-small")
+print(reading.usage.note)                  # 1,032 tokens
+for m in reading.mentions():               # text, begin, end, class, entity, score, element
+    print(m["text"], "->", m["entity"])
+
+with fluree.connect("./data") as conn:
+    conn.create("invoices").insert(reading.to_jsonld())
+```
+
+`text=` reads a string instead of a file; `catalog` takes several files, each
+optionally `(file, class IRI)`; `to_turtle()` and `claims()` give the reading
+as Turtle and as rows. The credential is the first present of: `api_key` with
+`auth_header` (sent as is to `url`), `api_key` alone (a Fluree.ai API key,
+traded for an hour's token), this machine's `fluree login`,
+and `FLUREE_AI_API_KEY`. With `cache_dir`, a request read once is answered
+from there afterwards.
+
 ## Next steps
 
 - The [Python guide](https://fluree.github.io/db/python/guide.html) for the

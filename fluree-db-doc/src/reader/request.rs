@@ -494,6 +494,57 @@ pub fn char_slice(text: &str, begin: usize, end: usize) -> &str {
     &text[byte(begin)..byte(end)]
 }
 
+/// What a catalog record carries in a request: its names, a short
+/// description, and its types. The CLI asks a ledger or graph source for the
+/// same predicates; this is the filter for a catalog read from a file.
+pub const RECORD_PREDICATES: [&str; 10] = [
+    "http://www.w3.org/2004/02/skos/core#prefLabel",
+    "http://www.w3.org/2004/02/skos/core#altLabel",
+    "http://www.w3.org/2004/02/skos/core#hiddenLabel",
+    "http://www.w3.org/2004/02/skos/core#definition",
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "http://www.w3.org/2000/01/rdf-schema#comment",
+    "https://schema.org/name",
+    "https://schema.org/alternateName",
+    "https://schema.org/legalName",
+    "https://schema.org/description",
+];
+
+/// The catalog records in `graph`: every subject with at least one name or
+/// description among [`RECORD_PREDICATES`] (and, with `class`, of that
+/// type), with only those triples and its types. Everything else about a
+/// subject stays behind, because the whole catalog goes into every window.
+pub fn catalog_records_of(graph: &Graph, class: Option<&str>) -> Graph {
+    let type_p = format!("{RDF_NS}type");
+    let is_record_p = |t: &fluree_graph_ir::Triple| {
+        t.predicate()
+            .as_iri()
+            .is_some_and(|p| RECORD_PREDICATES.contains(&p))
+    };
+    let typed = |s: &Term| {
+        graph.iter().any(|t| {
+            t.subject() == s
+                && t.predicate().as_iri() == Some(type_p.as_str())
+                && t.object().as_iri() == class
+        })
+    };
+    let subjects: BTreeSet<Term> = graph
+        .iter()
+        .filter(|t| t.subject().is_iri() && is_record_p(t) && t.object().as_literal().is_some())
+        .map(|t| t.subject().clone())
+        .filter(|s| class.is_none() || typed(s))
+        .collect();
+    let mut out = Graph::new();
+    for t in graph.iter() {
+        if subjects.contains(t.subject())
+            && (is_record_p(t) || t.predicate().as_iri() == Some(type_p.as_str()))
+        {
+            out.add(t.clone());
+        }
+    }
+    out
+}
+
 /// The ontology's size, for [`PromptSize`]: its classes and properties.
 pub fn ontology_terms(ontology: &Graph) -> usize {
     let type_p = format!("{RDF_NS}type");
@@ -717,6 +768,27 @@ mod tests {
             "{nt}"
         );
         assert!(nt.contains("<urn:ex:s> \"0\" ."), "{nt}");
+    }
+
+    #[test]
+    fn a_file_catalog_keeps_records_names_and_types_only() {
+        let g = parse_turtle(
+            r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+            @prefix ex: <urn:ex:> .
+            ex:acme a ex:Org ; skos:prefLabel "Acme" ; ex:revenue 12 .
+            ex:jane a ex:Person ; skos:prefLabel "Jane" .
+            ex:Org a <http://www.w3.org/2000/01/rdf-schema#Class> ."#,
+        )
+        .unwrap();
+        let all = catalog_records_of(&g, None);
+        assert_eq!(catalog_records(&all), 2);
+        let nt = fluree_graph_format::format_ntriples(&all).unwrap();
+        assert!(
+            !nt.contains("revenue") && !nt.contains("rdf-schema#Class"),
+            "{nt}"
+        );
+        let orgs = catalog_records_of(&g, Some("urn:ex:Org"));
+        assert_eq!(catalog_records(&orgs), 1);
     }
 
     #[test]
