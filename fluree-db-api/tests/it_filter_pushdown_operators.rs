@@ -53,14 +53,14 @@ const CASES: &[(&str, &[&str])] = &[
     (r#"LANG(?v) < "en""#, &["d", "e", "f", "h"]),
     (r#"LANG(?v) > "en""#, &["b", "c"]),
     (r#"LANG(?v) = """#, &["d", "e", "f", "h"]),
-    (r#"DATATYPE(?v) = xsd:string"#, &["d", "e"]),
-    (r#"DATATYPE(?v) != xsd:string"#, &["a", "b", "c", "f", "h"]),
+    (r"DATATYPE(?v) = xsd:string", &["d", "e"]),
+    (r"DATATYPE(?v) != xsd:string", &["a", "b", "c", "f", "h"]),
     (
         r#"STR(DATATYPE(?v)) != "x""#,
         &["a", "b", "c", "d", "e", "f", "h"],
     ),
-    (r#"isIRI(?v)"#, &["g"]),
-    (r#"isLiteral(?v)"#, &["a", "b", "c", "d", "e", "f", "h"]),
+    (r"isIRI(?v)", &["g"]),
+    (r"isLiteral(?v)", &["a", "b", "c", "d", "e", "f", "h"]),
     (r#"STR(?v) = "abc""#, &["a", "b", "c", "d"]),
     (r#"STR(?v) != "abc""#, &["e", "f", "g", "h"]),
     (r#"STRSTARTS(STR(?v), "ab")"#, &["a", "b", "c", "d", "e"]),
@@ -198,7 +198,7 @@ async fn filters_over_a_function_of_the_object_answer_alike_on_every_lane() {
     let _guard = FastPathGuard;
     let mut expected: Vec<(String, Vec<String>)> = Vec::new();
     for (filter, keeps) in CASES {
-        let keeps: Vec<String> = keeps.iter().map(|s| s.to_string()).collect();
+        let keeps: Vec<String> = keeps.iter().map(ToString::to_string).collect();
         expected.push((format!("SPARQL FILTER({filter})"), keeps.clone()));
         expected.push((
             format!("SPARQL COUNT FILTER({filter})"),
@@ -208,7 +208,7 @@ async fn filters_over_a_function_of_the_object_answer_alike_on_every_lane() {
     for (filter, keeps) in JSONLD_CASES {
         expected.push((
             format!("JSON-LD {filter}"),
-            keeps.iter().map(|s| s.to_string()).collect(),
+            keeps.iter().map(ToString::to_string).collect(),
         ));
     }
 
