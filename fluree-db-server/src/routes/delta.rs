@@ -82,6 +82,61 @@ fn connection(
     Ok(conn)
 }
 
+/// The fields `delta/map` takes beside its connection. A read-only route
+/// ignores them rather than refusing them, so a client can send one payload
+/// to browse, preview, verify, generate and map. A route's own field of the
+/// same name (`table` on preview, `tables` on generate) is read by the route
+/// before this applies; a key no Delta route knows is still refused.
+const MAP_ONLY_FIELDS: &[&str] = &[
+    "name",
+    "root",
+    "tables",
+    "r2rml",
+    "r2rml_type",
+    "branch",
+    "model",
+    "default_allow",
+    "delete_column",
+    "delete_values",
+    "order_by",
+];
+
+/// The Azure principal's flat fields: for tables the request places itself
+/// (`delta/map`, `delta/r2rml/validate`). Unity issues a Unity table's
+/// credentials.
+const AZURE_FIELDS: &[&str] = &[
+    "azure_tenant_id",
+    "azure_client_id",
+    "azure_client_secret",
+    "azure_client_secret_env",
+];
+
+/// The storage fields, which a route that reads only the catalog ignores.
+const S3_FIELDS: &[&str] = &["s3_region", "s3_endpoint", "s3_path_style"];
+
+/// A read-only route's connection fields, without what only `delta/map`
+/// uses: the map-only fields, the Azure principal, and, when the route reads
+/// no table (`reads_storage` false), every storage option.
+fn read_only_fields(mut fields: ConnectionFields, reads_storage: bool) -> ConnectionFields {
+    for key in MAP_ONLY_FIELDS.iter().chain(AZURE_FIELDS) {
+        fields.remove(*key);
+    }
+    if reads_storage {
+        if let Some(io) = fields
+            .get_mut("io")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            io.remove("azure");
+        }
+    } else {
+        fields.remove("io");
+        for key in S3_FIELDS {
+            fields.remove(*key);
+        }
+    }
+    fields
+}
+
 /// A catalog route's Unity Catalog connection, which it cannot do without.
 fn required_unity(conn: fluree_db_api::DeltaConnection) -> Result<fluree_db_api::DeltaUnityConfig> {
     conn.unity.ok_or_else(|| {
@@ -285,23 +340,21 @@ pub struct DeltaGenerateRequest {
     pub options: fluree_db_api::GenerateOptions,
 }
 
-/// A Unity-placed table's connection: Unity issues its credentials, so an
-/// Azure principal would be ignored, and is refused.
+/// A Unity-placed table's connection (preview, verify): its S3 options, and
+/// no Azure principal, since Unity issues the table's credentials.
 fn unity_table_connection(
     fields: ConnectionFields,
     rules: &fluree_db_api::SecretRules,
 ) -> Result<fluree_db_api::DeltaConnection> {
-    let conn = connection(fields, true, rules)?;
-    if conn.io.azure.is_some() {
-        return Err(super::iceberg::input_error(
-            fluree_db_api::GraphSourceInputError::invalid(
-                "azure",
-                "Unity Catalog issues a Unity table's storage credentials; an Azure service \
-                 principal applies to delta/map and delta/r2rml/validate",
-            ),
-        ));
-    }
-    Ok(conn)
+    connection(read_only_fields(fields, true), true, rules)
+}
+
+/// A catalog-only route's connection (browse, generate): no storage options.
+fn unity_catalog_connection(
+    fields: ConnectionFields,
+    rules: &fluree_db_api::SecretRules,
+) -> Result<fluree_db_api::DeltaConnection> {
+    connection(read_only_fields(fields, false), false, rules)
 }
 
 /// POST /v1/fluree/delta/catalog/browse
@@ -314,7 +367,7 @@ pub async fn delta_catalog_browse(
         let req: DeltaBrowseRequest = parse_body(request).await?;
         async {
             let rules = fluree_db_api::SecretRules::server(&state.fluree);
-            let unity = required_unity(connection(req.connection, false, &rules)?)?;
+            let unity = required_unity(unity_catalog_connection(req.connection, &rules)?)?;
             let listing = state
                 .fluree
                 .browse_delta_unity(&unity, req.depth)
@@ -392,7 +445,7 @@ fn generate_request(
         ));
     }
     Ok(fluree_db_api::GenerateDeltaR2rmlRequest {
-        unity: required_unity(connection(req.connection, false, rules)?)?,
+        unity: required_unity(unity_catalog_connection(req.connection, rules)?)?,
         tables: req.tables,
         base_namespace: req.base_namespace,
         per_table_overrides: req
@@ -645,6 +698,83 @@ mod tests {
             .unwrap()
             .to_string()
             .contains(fluree_db_api::SECRET_ENV_VARS_ENV));
+    }
+
+    #[test]
+    fn a_read_only_route_ignores_what_only_map_takes() {
+        // One payload, sent to browse, preview, verify, generate and map.
+        let unity = serde_json::json!({"unity_uri": "https://workspace.example.com",
+            "unity_catalog": "main", "auth_bearer_env": "UNITY_TOKEN"});
+        let mut body = unity.clone();
+        for (key, value) in serde_json::json!({
+            "name": "sales", "root": "s3://lake/t", "tables": {"orders": "s3://lake/orders"},
+            "r2rml": "", "r2rml_type": "text/turtle", "branch": "main", "model": "m:main",
+            "default_allow": true, "delete_column": "op", "delete_values": ["d"],
+            "order_by": "ts", "s3_region": "us-east-2", "s3_endpoint": "https://s3.example.com",
+            "s3_path_style": true, "azure_tenant_id": "t", "azure_client_id": "c",
+            "azure_client_secret_env": "SP_SECRET",
+        })
+        .as_object()
+        .unwrap()
+        {
+            body[key] = value.clone();
+        }
+        let rules = rules("UNITY_TOKEN,SP_SECRET");
+        let json = |v| serde_json::to_value(v).unwrap();
+        let bare = json(
+            fluree_db_api::delta_connection_from_json(
+                unity.as_object().unwrap().clone(),
+                false,
+                &rules,
+            )
+            .unwrap()
+            .unity,
+        );
+
+        let browse: DeltaBrowseRequest = serde_json::from_value(body.clone()).unwrap();
+        let conn = unity_catalog_connection(browse.connection, &rules).unwrap();
+        assert_eq!(json(conn.unity), bare);
+        let mut generate = body.clone();
+        generate["tables"] = serde_json::json!(["sales.orders"]);
+        generate["base_namespace"] = "https://example.org/".into();
+        let generate: DeltaGenerateRequest = serde_json::from_value(generate).unwrap();
+        assert_eq!(
+            json(Some(generate_request(generate, &rules).unwrap().unity)),
+            bare
+        );
+        let mut table = body.clone();
+        table["table"] = "sales.orders".into();
+        let table: DeltaTableRequest = serde_json::from_value(table).unwrap();
+        let conn = unity_table_connection(table.connection, &rules).unwrap();
+        // The S3 options of a Unity table are read; the Azure principal is not.
+        assert_eq!(conn.io.s3_region.as_deref(), Some("us-east-2"));
+        assert!(conn.io.azure.is_none());
+        assert!(build_delta_config(serde_json::from_value(body.clone()).unwrap(), &rules).is_ok());
+
+        // Likewise structured: `io` on a catalog-only route, `io.azure` on a
+        // table route.
+        let structured = serde_json::json!({
+            "unity": {"uri": "https://workspace.example.com", "catalog": "main",
+                "auth": {"type": "bearer", "token": {"env_var": "UNITY_TOKEN"}}},
+            "io": {"s3_region": "us-east-2", "azure": {"type": "client_secret",
+                "tenant_id": "t", "client_id": "c", "client_secret": {"env_var": "SP_SECRET"}}},
+        });
+        let browse: DeltaBrowseRequest = serde_json::from_value(structured.clone()).unwrap();
+        let conn = unity_catalog_connection(browse.connection, &rules);
+        assert!(conn.is_ok(), "{:?}", conn.err());
+        let mut table = structured;
+        table["table"] = "sales.orders".into();
+        let table: DeltaTableRequest = serde_json::from_value(table).unwrap();
+        let conn = unity_table_connection(table.connection, &rules).unwrap();
+        assert!(conn.io.azure.is_none());
+        assert_eq!(conn.io.s3_region.as_deref(), Some("us-east-2"));
+
+        // A key no Delta route knows is still refused.
+        let mut unknown = body;
+        unknown["unity_schemaa"] = "s".into();
+        let browse: DeltaBrowseRequest = serde_json::from_value(unknown).unwrap();
+        let e = unity_catalog_connection(browse.connection, &rules).unwrap_err();
+        assert!(e.to_string().contains("unity_schemaa"), "{e}");
     }
 
     #[test]
