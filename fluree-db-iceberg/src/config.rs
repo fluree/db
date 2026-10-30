@@ -376,11 +376,13 @@ impl IcebergGsConfig {
 ///
 /// # Serde
 ///
-/// Uses a helper enum with `#[serde(untagged)]` to accept both the new tagged
-/// format (`{"type": "rest", ...}`) and the legacy flat struct format
-/// (`{"uri": "...", "auth": ...}`).
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(from = "CatalogConfigHelper", into = "CatalogConfigHelper")]
+/// Serialized tagged (`{"type": "rest", ...}`). Read tagged, or in the legacy
+/// untyped form (`{"uri": "...", "auth": ...}`, a REST catalog). A stated
+/// `type` selects its variant: input that is not that variant is refused,
+/// naming the key where it stops (`table_location` missing, `type` unknown),
+/// never read as another variant.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(into = "CatalogConfigHelper")]
 #[allow(clippy::large_enum_variant)] // Config type, not in hot paths
 pub enum CatalogConfig {
     /// Discover metadata via an Iceberg REST catalog API.
@@ -566,100 +568,136 @@ impl CatalogConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Serde helper: supports both tagged enum format and legacy flat struct format.
+// Serde: tagged out; tagged or legacy untyped in.
 // ---------------------------------------------------------------------------
 
-/// Internal serde helper that uses `#[serde(untagged)]` to accept both the
-/// new tagged format (`{"type": "rest", ...}`) and the legacy flat struct
-/// format (`{"uri": "...", "auth": ...}`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-enum CatalogConfigHelper {
-    /// New tagged format.
-    Tagged(TaggedCatalogConfig),
-    /// Legacy flat struct format (deserializes as Rest).
-    Legacy(LegacyCatalogConfig),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// The serialized form: always tagged.
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 #[allow(clippy::large_enum_variant)]
-enum TaggedCatalogConfig {
+enum CatalogConfigHelper {
     Rest {
-        #[serde(default = "default_catalog_type")]
         catalog_type: String,
         uri: String,
-        #[serde(default)]
         auth: AuthConfig,
-        #[serde(default)]
         warehouse: Option<String>,
     },
     Direct {
         table_location: String,
     },
     Glue {
-        #[serde(default)]
         region: Option<String>,
-        #[serde(default)]
         catalog_id: Option<String>,
     },
     S3Tables {
-        #[serde(default)]
         region: Option<String>,
         table_bucket_arn: String,
     },
 }
 
-/// Legacy format: flat struct with `uri` as a required field.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct LegacyCatalogConfig {
-    #[serde(default = "default_catalog_type")]
-    catalog_type: String,
-    uri: String,
-    #[serde(default)]
-    auth: AuthConfig,
-    #[serde(default)]
-    warehouse: Option<String>,
+/// A catalog's `type`.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CatalogKind {
+    Rest,
+    Direct,
+    Glue,
+    S3Tables,
 }
 
 fn default_catalog_type() -> String {
     "polaris".to_string()
 }
 
-impl From<CatalogConfigHelper> for CatalogConfig {
-    fn from(helper: CatalogConfigHelper) -> Self {
-        match helper {
-            CatalogConfigHelper::Tagged(TaggedCatalogConfig::Rest {
-                catalog_type,
-                uri,
-                auth,
-                warehouse,
-            })
-            | CatalogConfigHelper::Legacy(LegacyCatalogConfig {
-                catalog_type,
-                uri,
-                auth,
-                warehouse,
-            }) => CatalogConfig::Rest {
-                catalog_type,
-                uri,
-                auth,
-                warehouse,
-            },
-            CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location }) => {
-                CatalogConfig::Direct { table_location }
+/// Read by key rather than through `#[serde(untagged)]`: an untagged reading
+/// falls back to the legacy REST form whenever the stated variant does not
+/// parse (so `{"type": "direct", "uri": …}` read as REST), and its one error
+/// says only that no variant matched. Each key is read as its own type, so a
+/// refusal names the key; which variant the keys make is decided by `type`
+/// alone, and its absence means the legacy REST form. Keys no variant knows
+/// are ignored, as serde ignores them everywhere a record is read.
+impl<'de> Deserialize<'de> for CatalogConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_map(CatalogConfigVisitor)
+    }
+}
+
+struct CatalogConfigVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CatalogConfigVisitor {
+    type Value = CatalogConfig;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a catalog configuration object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<CatalogConfig, A::Error> {
+        use serde::de::Error;
+
+        fn set<'de, A: serde::de::MapAccess<'de>, T: Deserialize<'de>>(
+            map: &mut A,
+            slot: &mut Option<T>,
+            name: &'static str,
+        ) -> std::result::Result<(), A::Error> {
+            if slot.is_some() {
+                return Err(A::Error::duplicate_field(name));
             }
-            CatalogConfigHelper::Tagged(TaggedCatalogConfig::Glue { region, catalog_id }) => {
-                CatalogConfig::Glue { region, catalog_id }
-            }
-            CatalogConfigHelper::Tagged(TaggedCatalogConfig::S3Tables {
-                region,
-                table_bucket_arn,
-            }) => CatalogConfig::S3Tables {
-                region,
-                table_bucket_arn,
-            },
+            *slot = Some(map.next_value()?);
+            Ok(())
         }
+
+        let mut kind: Option<CatalogKind> = None;
+        let mut catalog_type: Option<String> = None;
+        let mut uri: Option<String> = None;
+        let mut auth: Option<AuthConfig> = None;
+        let mut warehouse: Option<Option<String>> = None;
+        let mut table_location: Option<String> = None;
+        let mut region: Option<Option<String>> = None;
+        let mut catalog_id: Option<Option<String>> = None;
+        let mut table_bucket_arn: Option<String> = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => set(&mut map, &mut kind, "type")?,
+                "catalog_type" => set(&mut map, &mut catalog_type, "catalog_type")?,
+                "uri" => set(&mut map, &mut uri, "uri")?,
+                "auth" => set(&mut map, &mut auth, "auth")?,
+                "warehouse" => set(&mut map, &mut warehouse, "warehouse")?,
+                "table_location" => set(&mut map, &mut table_location, "table_location")?,
+                "region" => set(&mut map, &mut region, "region")?,
+                "catalog_id" => set(&mut map, &mut catalog_id, "catalog_id")?,
+                "table_bucket_arn" => set(&mut map, &mut table_bucket_arn, "table_bucket_arn")?,
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        let required = |value: Option<String>, name: &'static str| {
+            value.ok_or_else(|| A::Error::missing_field(name))
+        };
+        Ok(match kind.unwrap_or(CatalogKind::Rest) {
+            CatalogKind::Rest => CatalogConfig::Rest {
+                catalog_type: catalog_type.unwrap_or_else(default_catalog_type),
+                uri: required(uri, "uri")?,
+                auth: auth.unwrap_or_default(),
+                warehouse: warehouse.flatten(),
+            },
+            CatalogKind::Direct => CatalogConfig::Direct {
+                table_location: required(table_location, "table_location")?,
+            },
+            CatalogKind::Glue => CatalogConfig::Glue {
+                region: region.flatten(),
+                catalog_id: catalog_id.flatten(),
+            },
+            CatalogKind::S3Tables => CatalogConfig::S3Tables {
+                region: region.flatten(),
+                table_bucket_arn: required(table_bucket_arn, "table_bucket_arn")?,
+            },
+        })
     }
 }
 
@@ -671,25 +709,25 @@ impl From<CatalogConfig> for CatalogConfigHelper {
                 uri,
                 auth,
                 warehouse,
-            } => CatalogConfigHelper::Tagged(TaggedCatalogConfig::Rest {
+            } => CatalogConfigHelper::Rest {
                 catalog_type,
                 uri,
                 auth,
                 warehouse,
-            }),
+            },
             CatalogConfig::Direct { table_location } => {
-                CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location })
+                CatalogConfigHelper::Direct { table_location }
             }
             CatalogConfig::Glue { region, catalog_id } => {
-                CatalogConfigHelper::Tagged(TaggedCatalogConfig::Glue { region, catalog_id })
+                CatalogConfigHelper::Glue { region, catalog_id }
             }
             CatalogConfig::S3Tables {
                 region,
                 table_bucket_arn,
-            } => CatalogConfigHelper::Tagged(TaggedCatalogConfig::S3Tables {
+            } => CatalogConfigHelper::S3Tables {
                 region,
                 table_bucket_arn,
-            }),
+            },
         }
     }
 }
@@ -1025,6 +1063,50 @@ mod tests {
     }
 
     // ── New tagged format ──
+
+    #[test]
+    fn a_stated_catalog_type_is_never_read_as_another() {
+        let read = |json: &str| serde_json::from_str::<CatalogConfig>(json);
+        // A Direct without its location, or a misspelled type, used to read
+        // as a legacy REST catalog because `uri` was present.
+        let e = read(r#"{"type": "direct", "uri": "https://c"}"#).unwrap_err();
+        assert!(
+            e.to_string().contains("missing field `table_location`"),
+            "{e}"
+        );
+        let e = read(r#"{"type": "dirct", "uri": "https://c"}"#).unwrap_err();
+        assert!(e.to_string().contains("unknown variant"), "{e}");
+        let e = read(r#"{"type": "s3tables", "uri": "https://c"}"#).unwrap_err();
+        assert!(e.to_string().contains("table_bucket_arn"), "{e}");
+        let e = read(r#"{"type": "rest", "uri": "https://c", "uri": "https://d"}"#).unwrap_err();
+        assert!(e.to_string().contains("duplicate field `uri`"), "{e}");
+        assert!(read(r#"["rest"]"#).is_err());
+        // No type is the legacy REST form; unknown keys are ignored on read.
+        assert_eq!(
+            read(r#"{"uri": "https://c", "extra": 1}"#).unwrap(),
+            CatalogConfig::rest("https://c")
+        );
+        assert!(read(r#"{"warehouse": "w"}"#).is_err());
+        // Each variant reads back what it writes.
+        for config in [
+            CatalogConfig::Rest {
+                catalog_type: "rest".into(),
+                uri: "https://c".into(),
+                auth: AuthConfig::Bearer {
+                    token: crate::config_value::ConfigValue::from_env("T"),
+                },
+                warehouse: Some("w".into()),
+            },
+            CatalogConfig::rest("https://c"),
+            CatalogConfig::direct("s3://b/w/ns/t"),
+            CatalogConfig::glue(Some("us-east-1".into()), Some("123".into())),
+            CatalogConfig::glue(None, None),
+            CatalogConfig::s3_tables(None, "arn:aws:s3tables:us-east-1:1:bucket/b"),
+        ] {
+            let json = serde_json::to_string(&config).unwrap();
+            assert_eq!(read(&json).unwrap(), config, "{json}");
+        }
+    }
 
     #[test]
     fn test_parse_tagged_rest_config() {

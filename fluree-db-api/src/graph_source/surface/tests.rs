@@ -231,6 +231,58 @@ fn the_legacy_untagged_catalog_a_stored_record_may_hold_is_accepted() {
 }
 
 #[test]
+fn a_stated_catalog_type_selects_its_variant() {
+    // A Direct catalog missing its table location, or a misspelled type, was
+    // read as a legacy REST catalog (`uri` given), and `type` being in the
+    // canonical output let the strict check pass it.
+    for (body, path, said) in [
+        (
+            json!({"catalog": {"type": "direct", "uri": URI}}),
+            "catalog",
+            "missing field `table_location`",
+        ),
+        (
+            json!({"catalog": {"type": "dirct", "uri": URI}}),
+            "catalog.type",
+            "unknown variant, expected one of `rest`, `direct`, `glue`, `s3tables`",
+        ),
+        (
+            json!({"catalog": {"type": "s3tables", "uri": URI}}),
+            "catalog",
+            "missing field `table_bucket_arn`",
+        ),
+        // A refusal inside a structured catalog names its path, not an
+        // internal type.
+        (
+            json!({"catalog": {"type": "rest", "uri": URI, "auth": {"type": "bearr"}}}),
+            "catalog.auth.type",
+            "unknown variant",
+        ),
+        (
+            json!({"catalog": {"type": "rest", "uri": URI, "warehouse": 7}}),
+            "catalog.warehouse",
+            "invalid type: a number, expected a string",
+        ),
+        (
+            json!({"catalog": {"type": quoted(), "uri": URI}}),
+            "catalog.type",
+            "unknown variant",
+        ),
+    ] {
+        let e = refused(body.clone());
+        assert_eq!(e.field, path, "{body}: {e}");
+        assert!(e.to_string().contains(said), "{body}: {e}");
+        assert!(!e.to_string().contains("CatalogConfigHelper"), "{e}");
+        assert_quiet(&body, &e);
+    }
+    // A type that parses is still that type.
+    let direct = connection(json!({"catalog": {"type": "direct",
+        "table_location": "s3://b/w/ns/t"}}))
+    .unwrap();
+    assert_eq!(stored(direct)["catalog"]["type"], "direct");
+}
+
+#[test]
 fn flat_and_structured_fields_may_not_be_mixed() {
     let e = refused(json!({"catalog": {"type": "rest", "uri": URI}, "auth_bearer": "t"}));
     assert_eq!(e.field, "auth_bearer");
