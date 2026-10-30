@@ -53,6 +53,7 @@ use crate::error::{Result, TransactError};
 use crate::namespace::NamespaceRegistry;
 use crate::parse::txn_meta::check_user_predicate;
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES};
+use fluree_graph_ir::syntax::reserved_blank_label;
 use fluree_graph_turtle::{tokenize, Token, TokenKind};
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
@@ -808,7 +809,7 @@ impl<'a> TrigMetaParser<'a> {
 
     fn fresh_reifier(&mut self) -> TermValue {
         self.anon_reifiers += 1;
-        TermValue::BlankNode(format!("-r{}", self.anon_reifiers))
+        TermValue::BlankNode(reserved_blank_label("r", self.anon_reifiers))
     }
 
     fn predicate_is_reifies(&self, predicate: &TermValue) -> Result<bool> {

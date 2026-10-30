@@ -132,11 +132,12 @@ impl std::str::FromStr for IndexType {
 
 // === Helper functions for comparing flake components ===
 
-/// Compare objects, taking datatype into account
+/// Compare objects, taking datatype into account: the object part of every
+/// index order.
 ///
 /// Same datatype: compare values directly
 /// Different datatypes: compare by type discriminant, then datatype
-fn cmp_object(f1: &Flake, f2: &Flake) -> Ordering {
+pub fn cmp_object(f1: &Flake, f2: &Flake) -> Ordering {
     // First compare values
     f1.o.cmp(&f2.o)
         // Then compare datatypes if values are equal

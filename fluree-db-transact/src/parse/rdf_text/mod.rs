@@ -456,6 +456,17 @@ impl GraphSink for Capture<'_, '_> {
     ) -> SinkResult {
         self.sink.emit_quad(subject, predicate, object, graph)
     }
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        graph: TermId,
+        index: i32,
+    ) -> SinkResult {
+        self.sink
+            .emit_quad_list_item(subject, predicate, object, graph, index)
+    }
     fn end_statement(&mut self) {
         self.sink.end_statement();
     }
@@ -743,6 +754,25 @@ mod tests {
         let anon: Vec<&String> = subjects.iter().filter(|s| s.starts_with("_:-b")).collect();
         assert_eq!(anon.len(), 2);
         assert_ne!(anon[0], anon[1], "`[]` in two blocks is two nodes");
+    }
+
+    /// An upsert scopes a document's blank nodes by its content, so an
+    /// anonymous node's stored id ends in the label minted here. Re-upserting a
+    /// payload resolves to the nodes it made before only while this spelling
+    /// holds, so it is pinned exactly.
+    #[test]
+    fn anonymous_nodes_mint_the_labels_an_upsert_resolves_by() {
+        let (parsed, ns) = parse_ok(
+            &format!("{EX}[] ex:p 1 .\n[] ex:p 2 .\n"),
+            Placement::AsWritten,
+        );
+        let subjects: Vec<String> = parsed
+            .parts
+            .templates
+            .iter()
+            .map(|t| term(&ns, &t.subject))
+            .collect();
+        assert_eq!(subjects, ["_:-b1", "_:-b2"]);
     }
 
     /// A stable Fluree blank-node id (`_:fdb-…`) in a block addresses the

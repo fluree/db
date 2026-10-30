@@ -20,6 +20,11 @@
 //! - **Rebuild path**: events → run file → `build_index` → decode → replay.
 //!   The rebuild sees the full log as one window, so both presence and
 //!   row `t` must match the reference everywhere.
+//!
+//! A second enumeration puts a same-`t` retract/assert pair (in either
+//! stored order) at one event slot. The reference walks events in
+//! [`op_order`], so the pair holds the assert ([`fluree_db_core::same_t`]);
+//! both pipelines must agree with it, and so with each other.
 
 use std::collections::HashMap;
 
@@ -32,6 +37,7 @@ use fluree_db_binary_index::read::leaf_access::{FullBlobLeafHandle, LeafHandle};
 use fluree_db_binary_index::replay_leaflet;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::same_t::op_order;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::ContentId;
@@ -60,17 +66,29 @@ const EVENT_TS: [u32; 4] = [3, 5, 7, 9];
 const TARGETS: [u32; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 /// One case: base state and the window's op sequence (ops assigned to
-/// `EVENT_TS[..len]` in order).
+/// `EVENT_TS[..len]` in order). With `pair_at = Some(i)`, slot `i` holds a
+/// same-`t` retract and assert instead of one op, listed retract-first when
+/// `ops[i]` is 0 and assert-first when it is 1.
 #[derive(Clone, Copy)]
 struct Case {
     base_present: bool,
     ops: [u8; 4],
     len: usize,
+    pair_at: Option<usize>,
 }
 
 impl Case {
     fn events(&self) -> Vec<(u32, u8)> {
-        (0..self.len).map(|i| (EVENT_TS[i], self.ops[i])).collect()
+        let mut events = Vec::new();
+        for (i, (&t, &op)) in EVENT_TS.iter().zip(&self.ops).take(self.len).enumerate() {
+            if self.pair_at == Some(i) {
+                events.push((t, op));
+                events.push((t, 1 - op));
+            } else {
+                events.push((t, op));
+            }
+        }
+        events
     }
 
     fn describe(&self) -> String {
@@ -105,8 +123,24 @@ fn all_cases() -> Vec<Case> {
                     base_present,
                     ops,
                     len,
+                    pair_at: None,
                 });
             }
+        }
+    }
+    cases
+}
+
+/// Every op-chain up to length 3 with a same-`t` pair at each slot, in both
+/// stored orders, for both base states.
+fn pair_cases() -> Vec<Case> {
+    let mut cases = Vec::new();
+    for case in all_cases().into_iter().filter(|c| c.len <= 3) {
+        for pair_at in 0..case.len {
+            cases.push(Case {
+                pair_at: Some(pair_at),
+                ..case
+            });
         }
     }
     cases
@@ -121,6 +155,8 @@ fn reference(case: &Case, target: u32) -> (bool, Option<u32>) {
         all.push((BASE_T, 1));
     }
     all.extend(case.events());
+    // Chronological, and at one `t` the op that holds last.
+    all.sort_by_key(|&(t, op)| op_order(t, op == 1));
 
     let mut present = false;
     let mut run_start = None;
@@ -391,6 +427,39 @@ fn incremental_replay_matches_reference() {
                 row_t,
                 expected_incremental_t(&case, target, winner),
                 "row t mismatch: {} target={target}",
+                case.describe()
+            );
+        }
+    }
+}
+
+/// Same-`t` pairs: both pipelines answer as the reference (the pair holds
+/// the assert), at every boundary, so an incremental build and a rebuild
+/// agree. Case ids continue past `all_cases`' so scratch dirs stay distinct.
+#[test]
+fn same_t_pairs_replay_alike_on_both_pipelines() {
+    let offset = all_cases().len();
+    for (n, case) in pair_cases().into_iter().enumerate() {
+        let case_id = offset + n;
+        let (incremental, winner) = run_incremental(&case, case_id);
+        let rebuilt = run_rebuild(&case, case_id);
+        for &target in &TARGETS {
+            let (expect_present, expect_run_start) = reference(&case, target);
+            let (present, row_t) = incremental.fact_at(target);
+            assert_eq!(
+                (present, row_t),
+                (
+                    expect_present,
+                    expected_incremental_t(&case, target, winner)
+                ),
+                "incremental: {} target={target}",
+                case.describe()
+            );
+            let (present, row_t) = rebuilt.fact_at(target);
+            assert_eq!(
+                (present, row_t),
+                (expect_present, expect_run_start),
+                "rebuild: {} target={target}",
                 case.describe()
             );
         }
