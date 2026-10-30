@@ -695,3 +695,101 @@ async fn an_activation_whose_response_was_lost_completes() {
     );
     assert_eq!(map_objects(&fluree).await.len(), 1);
 }
+
+/// A cluster member that, the first time acceptance confirms it is current,
+/// finds another member made a branch meanwhile: from the head before the
+/// removal, with its source's journal as it was before it held it.
+struct BranchedMeanwhile {
+    publisher: Arc<dyn fluree_db_nameservice::NameServicePublisher>,
+    at: (ContentId, i64),
+    made: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::retention::replicas::ReplicaSync for BranchedMeanwhile {
+    async fn sync_reads(&self) -> std::result::Result<(), String> {
+        if !self.made.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let name = fluree_db_core::LedgerName::parse("t/meanwhile").unwrap();
+            fluree_db_nameservice::lifecycle::create_branch_with(
+                self.publisher.as_ref(),
+                &name,
+                "late",
+                "main",
+                Some(self.at.clone()),
+                |_| async { Ok(()) },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn await_replicas(&self, _: Duration) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// On a cluster, a branch another member makes while a request is accepted,
+/// which neither the listing nor its copied journal covers, is removed from
+/// too: it would otherwise keep the erased value as current state.
+#[tokio::test]
+async fn acceptance_removes_from_a_branch_another_member_made_meanwhile() {
+    use crate::retention::{RetentionBatch, RetentionWriter, SubmitOutcome};
+
+    struct Direct<'a>(&'a Fluree);
+    #[async_trait::async_trait]
+    impl RetentionWriter for Direct<'_> {
+        async fn submit(
+            &self,
+            ledger_id: &str,
+            batch: RetentionBatch,
+        ) -> crate::Result<SubmitOutcome> {
+            crate::retention::writer::outcome_of(
+                self.0.commit_retention_batch(ledger_id, batch).await,
+            )
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/meanwhile").await.unwrap();
+    let id = "t/meanwhile:main";
+    let t1 = insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    let asserted = commit_at(&fluree, id, t1).await;
+    fluree.set_retention_replicas(Arc::new(BranchedMeanwhile {
+        publisher: fluree.nameservice_mode().publisher_arc().unwrap(),
+        at: (asserted, t1),
+        made: false.into(),
+    }));
+
+    let receipt = fluree
+        .accept_erasure(&Direct(&fluree), id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    let late = "t/meanwhile:late";
+    assert!(
+        receipt.removals.iter().any(|r| r.ledger_id == late),
+        "{:?}",
+        receipt.removals
+    );
+    let results = fluree
+        .query_connection(&json!({
+            "from": late,
+            "select": "?o",
+            "where": {"@id": "http://example.org/alice", "http://example.org/email": "?o"}
+        }))
+        .await
+        .unwrap();
+    let ledger = fluree.ledger(late).await.unwrap();
+    let emails = results.to_jsonld(&ledger.snapshot).unwrap();
+    assert_eq!(
+        emails,
+        json!([]),
+        "the value stays current on the late branch"
+    );
+}

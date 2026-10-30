@@ -64,6 +64,10 @@ pub struct ErasureReceipt {
 /// How many times the authorizing commit is retried against a moving head.
 const ATTEMPTS: usize = 5;
 
+/// How many times acceptance removes from branches made meanwhile before it
+/// gives up.
+const APPEARING_ROUNDS: usize = 8;
+
 impl Fluree {
     /// Erase the selected occurrences permanently, committing directly. See
     /// [`Self::erase_occurrences_with`].
@@ -123,7 +127,7 @@ impl Fluree {
             .await
     }
 
-    async fn accept_erasure(
+    pub(crate) async fn accept_erasure(
         &self,
         writer: &dyn RetentionWriter,
         ledger_id: &str,
@@ -159,35 +163,77 @@ impl Fluree {
         let mut removed = Accepted::default();
         self.remove_on(writer, &branches, &removal_request, true, &mut removed)
             .await?;
-        // Other ledgers holding the same commits, such as copies restored
-        // from an archive, read the replacements too: the occurrences found
-        // are removed there as well, with what ends their spans there.
-        let commits: Vec<&str> = removed
-            .found
-            .keys()
-            .map(|(commit, _)| commit.as_str())
-            .collect();
-        let copies: Vec<String> = self
-            .copies_holding(&ledger_id, &commits)
-            .await?
-            .into_iter()
-            .map(|r| r.ledger_id.to_string())
-            .collect();
-        if !copies.is_empty() {
-            let named = RemovalRequest {
-                occurrences: removed
-                    .found
-                    .keys()
-                    .map(|(commit, slot)| OccurrenceRef {
-                        commit: commit.clone(),
-                        slot: *slot,
-                    })
-                    .collect(),
-                matching: Vec::new(),
+        for round in 0.. {
+            // Other ledgers holding the same commits, such as copies restored
+            // from an archive, read the replacements too: the occurrences
+            // found are removed there as well, with what ends their spans
+            // there.
+            let commits: Vec<&str> = removed
+                .found
+                .keys()
+                .map(|(commit, _)| commit.as_str())
+                .collect();
+            let copies: Vec<String> = self
+                .copies_holding(&ledger_id, &commits)
+                .await?
+                .into_iter()
+                .map(|r| r.ledger_id.to_string())
+                .filter(|id| !branches.contains(id))
+                .collect();
+            if !copies.is_empty() {
+                let named = RemovalRequest {
+                    occurrences: removed
+                        .found
+                        .keys()
+                        .map(|(commit, slot)| OccurrenceRef {
+                            commit: commit.clone(),
+                            slot: *slot,
+                        })
+                        .collect(),
+                    matching: Vec::new(),
+                };
+                self.remove_on(writer, &copies, &named, false, &mut removed)
+                    .await?;
+                branches.extend(copies);
+            }
+            // The admission lock is this process's: on a cluster another
+            // member can make a branch meanwhile, copying its source's
+            // journal before it held the removal. Once this member has
+            // applied what the cluster committed, a branch listed now and
+            // not before is removed from too, until none appears; one made
+            // later copies the removal.
+            let Some(replicas) = self.retention.replicas.get() else {
+                break;
             };
-            self.remove_on(writer, &copies, &named, false, &mut removed)
+            replicas.sync_reads().await.map_err(|e| {
+                ApiError::ReplicaNotCurrent(format!(
+                    "this member cannot confirm it lists every branch of {ledger_id} ({e}); \
+                     retry the request"
+                ))
+            })?;
+            let appeared: Vec<String> = ns
+                .list_branches(ledger_id.name())
+                .await?
+                .into_iter()
+                .filter(|r| !r.retracted)
+                .map(|r| r.ledger_id.to_string())
+                .filter(|id| !branches.contains(id))
+                .collect();
+            if appeared.is_empty() {
+                break;
+            }
+            if round == APPEARING_ROUNDS {
+                return Err(ApiError::http(
+                    409,
+                    format!(
+                        "branches of {ledger_id} kept being made while the request was \
+                         accepted; retry it"
+                    ),
+                ));
+            }
+            self.remove_on(writer, &appeared, &removal_request, false, &mut removed)
                 .await?;
-            branches.extend(copies);
+            branches.extend(appeared);
         }
         let Accepted {
             found,
