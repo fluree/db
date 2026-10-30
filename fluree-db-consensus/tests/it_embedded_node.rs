@@ -682,6 +682,105 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
     node.shutdown().await;
 }
 
+/// A member transfers none of a ledger's history (a clone's pack, a page of
+/// commits, a commit object) until it has installed the erasure activations
+/// it applied: before, it would send what they erase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_transfers_wait_until_the_member_installs_its_erasures() {
+    use fluree_db_consensus::raft::state_machine::{
+        holder_state, ActivateErasure, Command, ErasureCommand, RefKey,
+    };
+
+    let (integration, fluree, node, (_raft_dir, data_dir)) = stand_up(9, |config| config).await;
+    let ledger = "transfer/db:main";
+    fluree.create_ledger("transfer/db").await.expect("create");
+    node.committer
+        .transact(bulk_request_round(ledger, 3, 0))
+        .await
+        .expect("transaction");
+    // Activated before its manifest is stored, the erasure cannot be
+    // installed yet.
+    let manifest = fluree_db_core::sha256_hex(b"[]");
+    integration
+        .raft
+        .client_write(Command::Erasure(ErasureCommand::Track))
+        .await
+        .expect("track");
+    let (holder, holder_set) = {
+        let state = integration.shared_state.read().await;
+        (
+            holder_state(&state, &RefKey::new("transfer/db", "main")),
+            state.erasure.holder_set,
+        )
+    };
+    integration
+        .raft
+        .client_write(Command::Erasure(ErasureCommand::Activate(
+            ActivateErasure {
+                manifest: manifest.clone(),
+                holder_set,
+                holders: vec![holder],
+                applied_at_millis: 0,
+            },
+        )))
+        .await
+        .expect("activate");
+
+    let handle = fluree.ledger_cached(ledger).await.expect("handle");
+    let head = handle
+        .snapshot()
+        .await
+        .head_commit_id
+        .clone()
+        .expect("head");
+    let pack = async || {
+        let request = fluree_db_api::pack::full_ledger_pack_request(&handle, false)
+            .await
+            .expect("pack request");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let stats = fluree_db_api::pack::stream_pack(&fluree, &handle, &request, tx).await;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            bytes.extend(chunk.expect("chunk"));
+        }
+        (
+            stats.commits_sent,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    };
+    let (sent, stream) = pack().await;
+    assert_eq!(sent, 0, "{stream}");
+    assert!(stream.contains("not yet installed"), "{stream}");
+    let page = fluree
+        .export_commit_range(&handle, &Default::default())
+        .await;
+    assert!(
+        matches!(page, Err(fluree_db_api::ApiError::ReplicaNotCurrent(_))),
+        "{page:?}"
+    );
+    let object = fluree.erased_object(ledger, &head).await;
+    assert!(
+        matches!(object, Err(fluree_db_api::ApiError::ReplicaNotCurrent(_))),
+        "{:?}",
+        object.err()
+    );
+
+    let manifests = data_dir.path().join("@retention/erasure/manifest");
+    std::fs::create_dir_all(&manifests).expect("manifest folder");
+    std::fs::write(manifests.join(format!("{manifest}.json")), b"[]").expect("manifest");
+    eventually("the node to install the activation", async || {
+        fluree.erased_object(ledger, &head).await.is_ok()
+    })
+    .await;
+    let (sent, stream) = pack().await;
+    assert!(sent >= 1, "{stream}");
+    fluree
+        .export_commit_range(&handle, &Default::default())
+        .await
+        .expect("a page of commits");
+    node.shutdown().await;
+}
+
 /// An erasure made on a cluster publishes through Raft: the leader
 /// activates a manifest of it, the member installs the manifest and reports
 /// it, reads of the erased commit return its replacement, writes resume on

@@ -51,18 +51,32 @@ impl Fluree {
     /// On a cluster replica, wait until the local copy of `ledger_id`'s
     /// journal is current. Whether there was anything to confirm.
     pub(crate) async fn confirm_journal_current(&self, ledger_id: &str) -> Result<bool> {
+        self.confirm_current(ledger_id, "retry, or read as of the current head")
+            .await
+    }
+
+    /// On a cluster replica, refuse to hand out `ledger_id`'s raw history
+    /// (a transfer, a commit's content) until its journal is current and it
+    /// has installed the erasures reaching the ledger: before, it could
+    /// hand out what they erase.
+    pub async fn confirm_history_current(&self, ledger_id: &str) -> Result<()> {
+        self.confirm_current(ledger_id, "retry").await.map(|_| ())
+    }
+
+    async fn confirm_current(&self, ledger_id: &str, advice: &str) -> Result<bool> {
         let Some(replicas) = self.retention.replicas.get() else {
             return Ok(false);
         };
         replicas.sync_reads().await.map_err(|e| {
             ApiError::ReplicaNotCurrent(format!(
                 "this replica cannot confirm it holds {ledger_id}'s current removal journal \
-                 ({e}); retry, or read as of the current head"
+                 ({e}); {advice}"
             ))
         })?;
-        replicas.erasures_installed(ledger_id).await.map_err(|e| {
-            ApiError::ReplicaNotCurrent(format!("{e}; retry, or read as of the current head"))
-        })?;
+        replicas
+            .erasures_installed(ledger_id)
+            .await
+            .map_err(|e| ApiError::ReplicaNotCurrent(format!("{e}; {advice}")))?;
         Ok(true)
     }
 

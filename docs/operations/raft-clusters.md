@@ -282,6 +282,10 @@ refused, since nothing checked them: the nameservice ref endpoint's commit-head 
 library API on a member. Writes through the cluster's transaction, push, merge, rebase and revert
 endpoints, archive restores and named-graph drops are checked and accepted.
 
+A member hands out a ledger's raw history (clones, pulls, commit pages, object requests,
+`fluree show`) only once it holds what the cluster committed and has installed the erasures among it;
+until then it answers `503`, and the client retries.
+
 ## Admin HTTP surface
 
 All four `fluree cluster` actions map 1:1 to a single HTTP call. Useful when scripting in environments where the CLI isn't available.

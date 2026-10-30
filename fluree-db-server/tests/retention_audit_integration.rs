@@ -244,3 +244,67 @@ async fn erasure_needs_a_prover_and_file_storage() {
     };
     assert!(file.validate().is_ok(), "{:?}", file.validate());
 }
+
+/// A cluster replica that has not installed the erasures it applied hands a
+/// ledger's raw history to no one, an auditor included.
+#[tokio::test]
+async fn a_replica_short_of_its_erasures_serves_no_raw_history() {
+    struct NotInstalled;
+    #[async_trait::async_trait]
+    impl fluree_db_api::retention::replicas::ReplicaSync for NotInstalled {
+        async fn sync_reads(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+        async fn erasures_installed(&self, ledger_id: &str) -> Result<(), String> {
+            Err(format!(
+                "this node has not yet installed an erasure activated on {ledger_id}"
+            ))
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        data_auth_mode: fluree_db_server::config::DataAuthMode::Required,
+        data_auth_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = std::sync::Arc::new(AppState::new(cfg, telemetry).await.unwrap());
+    let app = build_router(state.clone());
+    let ledger = "replica:main";
+    let key = SigningKey::from_bytes(&[12u8; 32]);
+    let auditor = token(&key, ledger, true);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/fluree/create",
+        None,
+        Some(json!({"ledger": ledger})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/fluree/insert/{ledger}"),
+        Some(&auditor),
+        Some(json!({"@context": {"ex": "http://example.org/"},
+                    "insert": {"@id": "ex:alice", "ex:name": "Alice"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let show = format!("/v1/fluree/show/{ledger}?commit=t:1");
+    let (status, body) = call(&app, "GET", &show, Some(&auditor), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    state
+        .fluree
+        .set_retention_replicas(std::sync::Arc::new(NotInstalled));
+    let (status, body) = call(&app, "GET", &show, Some(&auditor), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}

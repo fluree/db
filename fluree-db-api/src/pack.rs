@@ -298,7 +298,12 @@ pub async fn stream_pack(
 ) -> PackStreamResult {
     // The journal travels with the commits, so the copy serves no history
     // its source no longer serves.
-    let journal = match fluree.retention_archive_section(handle.id()).await {
+    let journal = match async {
+        fluree.confirm_history_current(handle.id()).await?;
+        fluree.retention_archive_section(handle.id()).await
+    }
+    .await
+    {
         Ok(journal) => journal,
         Err(e) => {
             let mut buf = Vec::new();

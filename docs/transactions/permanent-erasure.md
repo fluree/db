@@ -187,7 +187,11 @@ release; until then it refuses with `501`. What differs from a single node:
 - **Not covered:** the Raft log and its snapshots carry ids, not ledger data. A value reaches them
   only quoted in free text, such as a failed transaction's error message; they are compacted as
   usual, not purged. Query peers' memory is `unverified`, as on a single node.
-- **Received erasures:** an archive, pull or push carrying erased history is still refused (`501`).
+- **Transfers.** A member hands out a ledger's raw history (packs for clones and pulls, commit pages,
+  object requests, `fluree show`) only once it has installed the activations it applied, answering
+  `503` (retry) until then; what it sends carries erased commits as their erasures, as a single node
+  does. History holding erased commits is not yet received: an archive restore or a push of it is
+  refused, including a push of commits made on a clone of a ledger the cluster erased.
 
 ## Archives
 

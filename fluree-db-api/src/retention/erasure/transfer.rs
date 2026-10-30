@@ -870,6 +870,12 @@ impl Fluree {
         ledger_id: &str,
         id: &ContentId,
     ) -> Result<Option<ErasedObject>> {
+        if matches!(
+            id.content_kind(),
+            Some(fluree_db_core::ContentKind::Txn | fluree_db_core::ContentKind::Commit)
+        ) {
+            self.confirm_history_current(ledger_id).await?;
+        }
         let Some(runtime) = self.retention.erasure.get() else {
             return Ok(None);
         };
