@@ -199,6 +199,28 @@ async fn a_deposed_leaders_purge_deletes_nothing() {
     assert!(index(dir.path()) >= indexed, "an index file was deleted");
 }
 
+/// A cluster member's cleanup evicts the cached state of the purge's
+/// holders: one loaded before the purge's rewrite holds the older index.
+#[tokio::test]
+async fn a_members_cleanup_evicts_the_holders_cached_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/cached").await.unwrap();
+    let id = "t/cached:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    fluree.ledger_cached(id).await.unwrap();
+    let manager = fluree.ledger_manager().unwrap();
+    let ledger = crate::LedgerId::parse(id).unwrap();
+    assert!(manager.get_loaded_handle(&ledger).await.is_some());
+    fluree.clean_after_purge(&[id.to_string()]).await.unwrap();
+    assert!(manager.get_loaded_handle(&ledger).await.is_none());
+}
+
 /// On a cluster a purge plans only the jobs every member has installed: a
 /// member that has not still reads the originals, and may write them back.
 #[tokio::test]

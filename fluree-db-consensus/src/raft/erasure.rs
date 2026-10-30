@@ -44,8 +44,9 @@ pub trait ErasureInstall: Send + Sync {
     async fn install(&self, number: u64, activation: &Activation) -> Result<(), String>;
 
     /// Clean this node's own copies of what the leader purged from the
-    /// shared storage. An error is retried.
-    async fn clean(&self) -> Result<(), String>;
+    /// shared storage, the cached state of `holders` among them. An error is
+    /// retried.
+    async fn clean(&self, holders: &[String]) -> Result<(), String>;
 }
 
 /// This node's erasure installation state.
@@ -222,23 +223,35 @@ async fn clean(
     nameservice: &RaftNameService,
 ) {
     use std::sync::atomic::Ordering;
-    let (purged, reported) = {
+    let (purged, holders, reported) = {
         let state = state.read().await;
         let installed = node.installed_through();
-        let purged = state
-            .erasure_cleanup
-            .purged
-            .iter()
-            .filter(|(activation, _)| **activation < installed)
-            .map(|(_, index)| *index)
-            .max();
-        (purged, state.erasure_cleanup.cleaned.get(&node.id).copied())
+        let cleaned = node.cleaned.load(Ordering::Acquire);
+        let mut purged = None;
+        let mut holders = std::collections::BTreeSet::new();
+        for (activation, index) in &state.erasure_cleanup.purged {
+            if *activation >= installed {
+                continue;
+            }
+            purged = purged.max(Some(*index));
+            if *index > cleaned {
+                if let Some(applied) = state.erasure.activations.get(activation) {
+                    holders.extend(applied.holders.iter().map(RefKey::ledger_id));
+                }
+            }
+        }
+        let holders: Vec<String> = holders.into_iter().collect();
+        (
+            purged,
+            holders,
+            state.erasure_cleanup.cleaned.get(&node.id).copied(),
+        )
     };
     let Some(purged) = purged else {
         return;
     };
     if node.cleaned.load(Ordering::Acquire) < purged {
-        if let Err(error) = install.clean().await {
+        if let Err(error) = install.clean(&holders).await {
             tracing::warn!(%error, purged, "cleaning after an erasure purge failed; retrying");
             return;
         }

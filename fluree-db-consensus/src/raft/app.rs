@@ -575,8 +575,10 @@ fn event_for(
             commit_id: commit_id.clone(),
             commit_t: *commit_t,
         }),
+        // A rewrite at the same `t` (a purge's) replaces the index a member
+        // has cached as much as an advance does.
         (
-            Command::AdvanceIndexHead(args),
+            Command::AdvanceIndexHead(args) | Command::RewriteIndexHead(args),
             Response::IndexAdvanced {
                 index_t,
                 index_head,
@@ -813,6 +815,35 @@ mod tests {
             drain_releases(&mut poisoned),
             vec![("test/db:main".to_string(), cid(3))]
         );
+    }
+
+    /// An index rewritten at the same `t`, as a purge rewrites one, is
+    /// announced as an advance is: members reload what they cached.
+    #[test]
+    fn an_index_rewrite_is_announced() {
+        let command = Command::RewriteIndexHead(crate::raft::state_machine::NewIndexHead {
+            ledger_id: "test/db".into(),
+            branch: "main".into(),
+            new_index_head: cid(2),
+            t: 3,
+            applied_at_millis: 1_000,
+        });
+        let mut response = Response::IndexAdvanced {
+            index_t: 3,
+            index_head: cid(2),
+        };
+        let mut effects = Vec::new();
+        NameServiceObserver::new().on_command(
+            &NameServiceState::default(),
+            &command,
+            &mut response,
+            1,
+            &mut effects,
+        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Event(NameServiceEvent::LedgerIndexPublished { index_t: 3, .. })
+        )));
     }
 
     /// A write presenting a fence reaches the observer wrapped, as it was

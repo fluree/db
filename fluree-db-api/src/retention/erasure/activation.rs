@@ -81,10 +81,14 @@ impl Fluree {
     }
 
     /// Clean this cluster member's own copies once the shared storage is
-    /// purged: retire its write-ahead log, whose segments may hold what the
-    /// purge deleted and would write it back on a replay, and drop what this
-    /// process decoded from the released indexes.
-    pub async fn clean_after_purge(&self) -> Result<()> {
+    /// purged: evict the cached state of `holders`, which a load before the
+    /// purge's rewrite holds an older index in, retire its write-ahead log,
+    /// whose segments may hold what the purge deleted and would write it
+    /// back on a replay, and drop what this process decoded from the
+    /// released indexes. A query still reading an evicted index keeps it
+    /// until it finishes.
+    pub async fn clean_after_purge(&self, holders: &[String]) -> Result<()> {
+        self.evict_erased(holders).await;
         if let Some(root) = self.config.index_storage.path.clone() {
             tokio::task::spawn_blocking(move || {
                 fluree_db_core::FileStorage::checkpoint_wal(root.as_ref())
