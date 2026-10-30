@@ -196,3 +196,88 @@ async fn a_restore_interrupted_after_its_retraction_journals_it_when_resumed() {
         "the restore's retraction is not journaled: {journal:?}"
     );
 }
+
+/// A restore stopped after it wrote its registration keeps the chunks that
+/// registration names through sweeps: its records are not visible yet, but
+/// a resumed restore reads them.
+#[tokio::test]
+async fn a_stopped_restore_keeps_its_registration_chunks_through_sweeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    fluree.create_ledger("t/stopped").await.unwrap();
+    let source = "t/stopped:main";
+    for (who, value) in [("alice", "a@old"), ("bob", "b@old")] {
+        fluree
+            .graph(source)
+            .transact()
+            .insert(&json!({
+                "@id": format!("http://example.org/{who}"),
+                "http://example.org/email": value
+            }))
+            .commit()
+            .await
+            .unwrap();
+        fluree
+            .remove_occurrences(source, email(who, value))
+            .await
+            .unwrap();
+    }
+    let instance = fluree
+        .drop_ledger("t/stopped", DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+
+    // Stopped once its registration holds a journal the drop's copy does not.
+    let store = fluree.publisher().unwrap();
+    let stopped = lifecycle::restore_dropped_with(store, &instance, |entry, records| async {
+        fluree.prepare_restore(entry, records).await?;
+        let record = store.raw_record(source).await?.unwrap();
+        registry::update_fenced(
+            store,
+            fluree.registry_objects(),
+            source,
+            record.fence,
+            |current| {
+                let mut next = current?.clone();
+                next.journal.removals.truncate(1);
+                Some(next)
+            },
+        )
+        .await
+        .unwrap();
+        Err(NameServiceError::storage("stopped"))
+    })
+    .await;
+    assert!(stopped.is_err());
+    let stored = registry::read_stored(store, source)
+        .await
+        .unwrap()
+        .1
+        .unwrap();
+    let named: Vec<String> =
+        serde_json::from_value(stored["journal"]["removalChunks"].clone()).unwrap();
+
+    let grace = std::time::Duration::from_millis(20);
+    fluree.sweep_registration_chunks(grace).await.unwrap();
+    tokio::time::sleep(grace).await;
+    fluree.sweep_registration_chunks(grace).await.unwrap();
+    let storage = fluree.admin_storage().unwrap();
+    for hash in &named {
+        let address = format!(
+            "fluree:{}://@retention/registration/{hash}.json",
+            storage.storage_method()
+        );
+        assert!(storage.exists(&address).await.unwrap(), "{hash} was swept");
+    }
+    lifecycle::resume_restore_with(store, &instance, |entry, records| {
+        fluree.prepare_restore(entry, records)
+    })
+    .await
+    .unwrap()
+    .expect("resumed");
+}

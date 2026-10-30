@@ -277,13 +277,14 @@ impl crate::Fluree {
             .map(|storage| Objects::new(storage, &self.retention.chunks))
     }
 
-    /// Every chunk a registration names: a branch's, or one a dropped
-    /// ledger keeps for its restore.
+    /// Every chunk a registration names: a branch's, visible or not (one a
+    /// create or restore under way, or stopped, has written), or one a
+    /// dropped ledger keeps for its restore.
     #[cfg(not(target_arch = "wasm32"))]
     async fn named_chunks(&self) -> Result<std::collections::HashSet<String>> {
         let ns = self.publisher()?;
         let mut named = std::collections::HashSet::new();
-        for record in self.nameservice().all_records().await? {
+        for record in ns.all_raw_records().await? {
             if let (_, Some(stored)) = read_stored(ns, record.ledger_id.as_str()).await? {
                 named_in(&stored, &mut named);
             }
