@@ -434,11 +434,14 @@ fn directory_bytes(root: &Path) -> io::Result<u64> {
     Ok(walked_bytes(&scan_cache_entries(root)?))
 }
 
+/// Test hook: runs on each file a walk on this thread lists, before the
+/// walk reads its size.
+#[cfg(test)]
+type ListedHook = Box<dyn FnMut(&Path)>;
+
 #[cfg(test)]
 thread_local! {
-    /// Test hook: runs on each file a walk on this thread lists, before the
-    /// walk reads its size.
-    static ON_LISTED: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+    static ON_LISTED: std::cell::RefCell<Option<ListedHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
