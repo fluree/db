@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fluree_db_api::collect::Collector;
+use fluree_db_api::collect::{Collector, Lease};
 use fluree_db_api::{ApiError, ContentId, Fluree, Result};
 use fluree_db_core::ledger_id::split_ledger_id;
 
@@ -221,13 +221,18 @@ impl Collector for RaftNameService {
             })
     }
 
-    async fn lease(&self) -> Option<Instant> {
+    async fn lease(&self) -> Option<Lease> {
+        let term = self.raft.metrics().borrow().current_term;
         let started = Instant::now();
         self.raft.get_read_log_id().await.ok()?;
+        // Confirmed in the term it read, or not at all.
+        if self.raft.metrics().borrow().current_term != term {
+            return None;
+        }
         let (share, of) = LEASE_SHARE;
         let window = Duration::from_millis(self.raft.config().election_timeout_max) * share / of;
         // Confirming leadership may itself outlast the window.
         let until = started + window;
-        (Instant::now() < until).then_some(until)
+        (Instant::now() < until).then_some(Lease { until, term })
     }
 }

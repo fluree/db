@@ -89,7 +89,12 @@ impl Fluree {
         // lands once another leader may be writing an index it would remove.
         match self.collector() {
             Some(collector) => {
-                let lease = crate::collect::LeaderLease::new(Arc::clone(collector));
+                let Some(first) = collector.lease().await else {
+                    return Err(ApiError::http(409, "a cluster purges on its leader"));
+                };
+                // Bound to the term it begins in: led again later, its plan
+                // and holds may no longer hold.
+                let lease = crate::collect::LeaderLease::new(Arc::clone(collector), first);
                 fluree_db_core::FileStorage::within_lease(
                     lease,
                     Box::pin(self.purge_pass(ledger, release_after)),
@@ -105,11 +110,6 @@ impl Fluree {
         // On a cluster the leader purges the shared storage, for jobs every
         // member has installed: none reads or writes back what they erase.
         let clustered = self.collected_by_cluster();
-        if let Some(collector) = self.collector() {
-            if collector.lease().await.is_none() {
-                return Err(ApiError::http(409, "a cluster purges on its leader"));
-            }
-        }
         // The holders stay those the pass planned for: a branch made from
         // one would copy an index not yet erased, and a restore would
         // rebuild into folders the release deletes.

@@ -460,6 +460,10 @@ pub(crate) mod cluster {
         leases: Mutex<Option<usize>>,
         /// The next `delete` answers once this is notified.
         hold_delete: Mutex<Option<Arc<Notify>>>,
+        /// The term its leases are granted in.
+        pub(crate) term: std::sync::atomic::AtomicU64,
+        /// How long a lease lasts: a second if unset.
+        pub(crate) lease_ms: Mutex<Option<u64>>,
     }
 
     impl Cluster {
@@ -527,14 +531,17 @@ pub(crate) mod cluster {
             false
         }
 
-        async fn lease(&self) -> Option<Instant> {
+        async fn lease(&self) -> Option<crate::collect::Lease> {
             let mut leases = self.leases.lock();
             match leases.as_mut() {
                 Some(0) => return None,
                 Some(left) => *left -= 1,
                 None => {}
             }
-            Some(Instant::now() + Duration::from_secs(1))
+            Some(crate::collect::Lease {
+                until: Instant::now() + Duration::from_millis(self.lease_ms.lock().unwrap_or(1000)),
+                term: self.term.load(std::sync::atomic::Ordering::SeqCst),
+            })
         }
     }
 
@@ -758,5 +765,62 @@ pub(crate) mod cluster {
         let second = fluree.put_intent(entries).await.unwrap();
         assert_ne!(first, second);
         assert_eq!(fluree.intent(&first).await.unwrap().entries.len(), 1);
+    }
+
+    /// A pass's deletes are the term's it began in: led again in a later
+    /// term, it deletes nothing more, and a pass begun in that term carries
+    /// the intent on.
+    #[tokio::test]
+    async fn a_pass_led_again_in_a_later_term_deletes_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        let stray = one_stray(&fluree).await;
+        let cluster = Arc::new(Cluster::default());
+        assert_eq!(pass(&fluree, &cluster).await.condemned, 1);
+
+        let release = Arc::new(Notify::new());
+        *cluster.hold_delete.lock() = Some(release.clone());
+        let later_term = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cluster
+                .term
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            release.notify_one();
+        };
+        let (stopped, ()) = tokio::join!(pass(&fluree, &cluster), later_term);
+        assert_eq!(stopped.deleted, 0, "{stopped:?}");
+        assert!(fluree
+            .admin_storage()
+            .unwrap()
+            .exists(&stray)
+            .await
+            .unwrap());
+
+        assert_eq!(pass(&fluree, &cluster).await.deleted, 1);
+        assert!(!fluree
+            .admin_storage()
+            .unwrap()
+            .exists(&stray)
+            .await
+            .unwrap());
+    }
+
+    /// A leader's lease taken again in a later term is not its: lost.
+    #[tokio::test]
+    async fn a_leader_lease_is_lost_once_its_term_ends() {
+        use fluree_db_core::DeleteLease;
+        let cluster = Arc::new(Cluster::default());
+        let first = cluster.lease().await.unwrap();
+        let expired = crate::collect::Lease {
+            until: Instant::now(),
+            ..first
+        };
+        let lease = crate::collect::LeaderLease::new(cluster.clone(), expired);
+        assert!(lease.until().await.is_some(), "taken again in its term");
+        cluster
+            .term
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let lease = crate::collect::LeaderLease::new(cluster.clone(), expired);
+        assert!(lease.until().await.is_none());
     }
 }

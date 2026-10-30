@@ -83,9 +83,15 @@ impl Fluree {
         // still deletes.
         let _pass = self.root.cluster_pass.lock().await;
         // A member that does not lead writes no intent it cannot condemn.
-        if collector.lease().await.is_none() || !collector.enable().await? {
+        let Some(first) = collector.lease().await else {
+            return Ok(report);
+        };
+        if !collector.enable().await? {
             return Ok(report);
         }
+        // Its deletes are this term's: led again later, what it found may
+        // not hold.
+        let term = first.term;
         let mut condemned = HashSet::new();
         for (number, hash, deleting) in collector.open().await {
             let first_seen = *self
@@ -97,7 +103,7 @@ impl Fluree {
             if deleting || first_seen.elapsed() >= settle {
                 if deadline.is_some_and(|d| Instant::now() >= d)
                     || !self
-                        .delete_intent(collector, number, &hash, deadline, &mut report)
+                        .delete_intent(collector, term, number, &hash, deadline, &mut report)
                         .await?
                 {
                     return Ok(report);
@@ -147,6 +153,7 @@ impl Fluree {
     async fn delete_intent(
         &self,
         collector: &Arc<dyn Collector>,
+        term: u64,
         number: u64,
         hash: &str,
         deadline: Option<Instant>,
@@ -188,7 +195,7 @@ impl Fluree {
                     report.resolved += 1;
                     continue;
                 }
-                if !delete_leased(storage, collector, &mut lease, &address).await? {
+                if !delete_leased(storage, collector, term, &mut lease, &address).await? {
                     return Ok(false);
                 }
                 report.deleted += 1;
@@ -223,7 +230,7 @@ impl Fluree {
                 if queued.contains(&blob.id) || holders.references(self, &blob).await? {
                     report.resolved += 1;
                 } else {
-                    if !delete_leased(storage, collector, &mut lease, &entry.address).await? {
+                    if !delete_leased(storage, collector, term, &mut lease, &entry.address).await? {
                         return Ok(false);
                     }
                     report.deleted += 1;
@@ -330,24 +337,20 @@ impl Fluree {
     }
 }
 
-/// Delete `address` within this member's lease as leader, taking a new one
-/// once it has run out: `false`, with nothing deleted, when the member no
-/// longer leads or the lease ran out before the unlink could begin.
+/// Delete `address` within this member's lease as leader in `term`, taking
+/// a new one once it has run out: `false`, with nothing deleted, when the
+/// member no longer leads in that term or the lease ran out before the
+/// unlink could begin.
 async fn delete_leased(
     storage: &dyn fluree_db_core::Storage,
     collector: &Arc<dyn Collector>,
-    lease: &mut Option<Instant>,
+    term: u64,
+    lease: &mut Option<crate::collect::Lease>,
     address: &str,
 ) -> Result<bool> {
-    let until = match *lease {
-        Some(until) if Instant::now() < until => until,
-        _ => {
-            *lease = collector.lease().await;
-            let Some(until) = *lease else {
-                return Ok(false);
-            };
-            until
-        }
+    *lease = crate::collect::Lease::renewed(*lease, term, collector.as_ref()).await;
+    let Some(held) = *lease else {
+        return Ok(false);
     };
-    Ok(storage.delete_unlogged(address, until).await?)
+    Ok(storage.delete_unlogged(address, held.until).await?)
 }

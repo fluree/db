@@ -79,7 +79,7 @@ pub trait Collector: Send + Sync + std::fmt::Debug {
     /// Until when this member, as leader, may delete: no other leader can
     /// be elected, and complete an intent, before then. `None` when it is
     /// not the leader.
-    async fn lease(&self) -> Option<std::time::Instant>;
+    async fn lease(&self) -> Option<Lease>;
 
     /// Whether the cluster collects, enabling it once every member checks
     /// its writes: before, a member a release behind may be unable to read
@@ -91,19 +91,46 @@ pub trait Collector: Send + Sync + std::fmt::Debug {
     async fn requests_recorded_by(&self, ledger: &str, ms: i64) -> bool;
 }
 
+/// A leader's lease: until when it may delete, in which term it leads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub until: std::time::Instant,
+    pub term: u64,
+}
+
+impl Lease {
+    /// This lease taken again, if it still holds; else a new one in the
+    /// same term from `collector`. Lost (`None`) once the member no longer
+    /// leads in that term, even if it leads again: what it planned in the
+    /// term may no longer hold.
+    pub(crate) async fn renewed(
+        held: Option<Self>,
+        term: u64,
+        collector: &dyn Collector,
+    ) -> Option<Self> {
+        match held {
+            Some(lease) if std::time::Instant::now() < lease.until => Some(lease),
+            _ => collector.lease().await.filter(|lease| lease.term == term),
+        }
+    }
+}
+
 /// A cluster leader's lease, bounding the deletes of work under way (see
 /// [`fluree_db_core::FileStorage::within_lease`]): taken again through the
-/// collector as it runs out, and lost once this member no longer leads.
+/// collector as it runs out, in the term it began in, and lost once this
+/// member no longer leads in that term.
 pub(crate) struct LeaderLease {
     collector: Arc<dyn Collector>,
-    until: Mutex<Option<std::time::Instant>>,
+    term: u64,
+    held: Mutex<Option<Lease>>,
 }
 
 impl LeaderLease {
-    pub(crate) fn new(collector: Arc<dyn Collector>) -> Arc<Self> {
+    pub(crate) fn new(collector: Arc<dyn Collector>, first: Lease) -> Arc<Self> {
         Arc::new(Self {
             collector,
-            until: Mutex::new(None),
+            term: first.term,
+            held: Mutex::new(Some(first)),
         })
     }
 }
@@ -111,13 +138,10 @@ impl LeaderLease {
 #[async_trait]
 impl fluree_db_core::DeleteLease for LeaderLease {
     async fn until(&self) -> Option<std::time::Instant> {
-        let held = *self.until.lock();
-        if held.is_some_and(|until| std::time::Instant::now() < until) {
-            return held;
-        }
-        let renewed = self.collector.lease().await;
-        *self.until.lock() = renewed;
-        renewed
+        let held = *self.held.lock();
+        let renewed = Lease::renewed(held, self.term, self.collector.as_ref()).await;
+        *self.held.lock() = renewed;
+        renewed.map(|lease| lease.until)
     }
 }
 

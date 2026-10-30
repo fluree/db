@@ -189,10 +189,10 @@ async fn a_deposed_leaders_purge_deletes_nothing() {
             .sum()
     }
     let indexed = index(dir.path());
-    // Leading when it starts, deposed after.
-    fluree.set_collector(Arc::new(
-        crate::garbage::tests::cluster::Cluster::with_leases(1),
-    ));
+    // Leading when it starts, deposed as its lease runs out.
+    let cluster = crate::garbage::tests::cluster::Cluster::with_leases(1);
+    *cluster.lease_ms.lock() = Some(0);
+    fluree.set_collector(Arc::new(cluster));
     let pass = fluree.run_purge_pass(id, std::time::Duration::ZERO).await;
     assert!(pass.is_err(), "{pass:?}");
     assert!(original.exists());
