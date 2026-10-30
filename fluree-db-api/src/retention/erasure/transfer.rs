@@ -2045,6 +2045,7 @@ fn received_jobs(
                         rebuilt_ms: Some(now),
                         ..Default::default()
                     }),
+                    cluster: None,
                     as_written: None,
                 });
             job.commits.push(super::CommitErasure {

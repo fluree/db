@@ -825,6 +825,7 @@ pub struct StagedCommit {
     pub erasure_source: Option<(RefKey, u64)>,
 }
 
+mod activation;
 pub mod read_index;
 mod wire;
 
@@ -4015,5 +4016,74 @@ mod tests {
             .wait_erasures_installed("test/db:main", std::time::Duration::from_millis(50))
             .await
             .is_ok());
+    }
+
+    /// The leader prepares an erasure only once it has installed every
+    /// activation it applied; an applied manifest is found by its hash; an
+    /// activation is installed everywhere once every voter reported it.
+    #[tokio::test]
+    async fn the_activator_reads_what_members_installed() {
+        use crate::raft::erasure::ErasureNode;
+        use crate::raft::state_machine::{
+            holder_state, ActivateErasure, ErasureCommand, Incarnation,
+        };
+        use fluree_db_api::retention::erasure::ErasureActivator;
+
+        let state = fresh_state();
+        apply_cmd(&state, Command::Erasure(ErasureCommand::Track), 1).await;
+        apply_cmd(
+            &state,
+            Command::CreateLedger(NewLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                created_at_millis: 0,
+            }),
+            2,
+        )
+        .await;
+        let (holder, holder_set) = {
+            let s = state.read().await;
+            (
+                holder_state(&s, &RefKey::new("test/db", "main")),
+                s.erasure.holder_set,
+            )
+        };
+        apply_cmd(
+            &state,
+            Command::Erasure(ErasureCommand::Activate(ActivateErasure {
+                manifest: "m".into(),
+                holder_set,
+                holders: vec![holder],
+                applied_at_millis: 0,
+            })),
+            3,
+        )
+        .await;
+        let node = Arc::new(ErasureNode::new(1, 7));
+        let ns = RaftNameService::new(view(&state), stub_raft().await)
+            .with_erasure_node(Arc::clone(&node));
+
+        assert_eq!(ns.holder_set().await.unwrap(), None, "not installed here");
+        node.mark_installed(1);
+        assert_eq!(ns.holder_set().await.unwrap(), Some(holder_set));
+        assert_eq!(ns.applied("m").await, Some(0));
+        assert_eq!(ns.applied("other").await, None);
+
+        state.write().await.configured_voters = [1, 2].into();
+        let ready = |node| {
+            Command::Erasure(ErasureCommand::Ready {
+                through: 1,
+                node,
+                incarnation: Incarnation {
+                    process: node,
+                    storage: node,
+                },
+            })
+        };
+        apply_cmd(&state, ready(1), 4).await;
+        assert!(!ns.installed_everywhere(0).await);
+        apply_cmd(&state, ready(2), 5).await;
+        assert!(ns.installed_everywhere(0).await);
+        assert!(!ns.installed_everywhere(1).await);
     }
 }

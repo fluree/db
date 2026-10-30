@@ -14,8 +14,9 @@ use fluree_db_erasure::{ProveRequest, ProverError};
 use fluree_db_nameservice::NsRecord;
 use futures::FutureExt;
 
+use super::activation::{ErasureActivator, HOLD};
 use super::index::{Artifact, ErasedCommit, ErasureStep, REFRESH};
-use super::{CommitErasure, ErasureJob, ErasureStage, ProvedStep};
+use super::{ClusterPublication, CommitErasure, ErasureJob, ErasureStage, ProvedStep};
 use crate::retention::lineage::span_ends;
 use crate::retention::registry;
 use crate::retention::removal::OccurrenceRef;
@@ -56,6 +57,19 @@ enum Need {
     Publish,
     /// To prove: the requested slots the published erasure still holds.
     Prove(Vec<u32>),
+}
+
+/// What [`Fluree::prepare_publication`] found.
+enum Prepared {
+    /// Not ready: the job waits, or was given more to prove.
+    Waiting,
+    /// The published erasures already remove what the job asks for.
+    Covered,
+    /// Ready to publish `erased` over `holders`, the branches as found.
+    Ready {
+        holders: Vec<NsRecord>,
+        erased: Vec<ErasedCommit>,
+    },
 }
 
 fn need(task: &CommitErasure, held: Option<&ErasedCommit>) -> Need {
@@ -232,6 +246,7 @@ impl Fluree {
                 tracing::warn!(request = %job.request_id, error = %e, "erasure: not published");
             }
         }
+        self.record_effective(ledgers).await;
         let Some((branch, request_id, commit)) = work.prove else {
             return;
         };
@@ -271,6 +286,11 @@ impl Fluree {
         let (Some(runtime), Ok(ns)) = (self.retention.erasure.get(), self.publisher()) else {
             return;
         };
+        // A cluster's members do not yet exclude its deletes from their
+        // writes; see `run_purge_pass`.
+        if self.retention.replicas.get().is_some() {
+            return;
+        }
         let now = now_ms();
         let mut due = std::collections::BTreeSet::new();
         for branch in ledgers {
@@ -373,6 +393,7 @@ impl Fluree {
             }
             report.waiting_for_index = 0;
         }
+        self.record_effective(&ledgers).await;
         Ok(report)
     }
 
@@ -549,16 +570,209 @@ impl Fluree {
     /// erasure of each commit removes every slot the job asks for.
     async fn publish_when_indexed(&self, branch: &str, job: &ErasureJob) -> Result<()> {
         let runtime = self.erasure_runtime()?;
-        // No branch is made between the check and the publication.
-        let admission = runtime.admission.lock().await;
+        if let Some(activator) = runtime.activator.get() {
+            if !self
+                .activate_when_indexed(activator.as_ref(), branch, job)
+                .await?
+            {
+                return Ok(());
+            }
+        } else {
+            // No branch is made between the check and the publication.
+            let admission = runtime.admission.lock().await;
+            match self.prepare_publication(branch, job).await? {
+                Prepared::Waiting => return Ok(()),
+                Prepared::Covered => {}
+                Prepared::Ready { holders, erased } => {
+                    self.store_authorization(branch, job).await?;
+                    runtime.index.publish(erased).await?;
+                    for holder in &holders {
+                        self.announce_refresh(&holder.ledger_id).await;
+                    }
+                }
+            }
+            drop(admission);
+        }
+        if self.needs(job).await?.iter().any(|n| *n != Need::Covered) {
+            return Err(ApiError::internal(format!(
+                "erasure {} published without removing every requested slot",
+                job.request_id
+            )));
+        }
+        // Another instance on this storage reads the replacements once it
+        // lists the maps again; it has by the time this reports, whether
+        // the maps were written now or before a restart.
+        tokio::time::sleep(REFRESH * 2).await;
+        self.update_job(branch, &job.request_id, |j| {
+            j.stage = ErasureStage::Published;
+            j.published_ms = Some(now_ms());
+            j.last_error = None;
+        })
+        .await
+    }
+
+    /// [`Self::publish_when_indexed`] on a cluster member: activate a
+    /// manifest of the prepared erasures through `activator`. A holder that
+    /// moved or was added since preparation refuses the activation; the
+    /// holders' heads are then held while it is prepared once more. Whether
+    /// the job is published.
+    async fn activate_when_indexed(
+        &self,
+        activator: &dyn ErasureActivator,
+        branch: &str,
+        job: &ErasureJob,
+    ) -> Result<bool> {
+        let mut held = None;
+        let published = self
+            .activation_attempts(activator, branch, job, &mut held)
+            .await;
+        if let Some(holders) = held {
+            if let Err(e) = activator.release(&holders).await {
+                tracing::warn!(request = %job.request_id, error = %e, "erasure: hold not released; it lapses");
+            }
+        }
+        published
+    }
+
+    async fn activation_attempts(
+        &self,
+        activator: &dyn ErasureActivator,
+        branch: &str,
+        job: &ErasureJob,
+        held: &mut Option<Vec<NsRecord>>,
+    ) -> Result<bool> {
+        let runtime = self.erasure_runtime()?;
+        loop {
+            // Holders are found after the version is read: one added since
+            // refuses the activation.
+            let Some(holder_set) = activator.holder_set().await? else {
+                return Ok(false);
+            };
+            let admission = runtime.admission.lock().await;
+            let (holders, erased) = match self.prepare_publication(branch, job).await? {
+                Prepared::Waiting => return Ok(false),
+                Prepared::Covered => return self.covered_in_cluster(activator, branch, job).await,
+                Prepared::Ready { holders, erased } => (holders, erased),
+            };
+            self.store_authorization(branch, job).await?;
+            let manifest = runtime.index.put_manifest(&erased).await?;
+            // Recorded before activating: should the activation apply and
+            // its record here be lost, the next pass finds it applied.
+            self.record_publication(branch, job, &manifest, None)
+                .await?;
+            if let Some(activation) = activator.activate(&manifest, holder_set, &holders).await? {
+                // For the instances that only list the map objects.
+                runtime.index.publish(erased).await?;
+                self.record_publication(branch, job, &manifest, Some(activation))
+                    .await?;
+                return Ok(true);
+            }
+            drop(admission);
+            if held.is_some() {
+                return Ok(false);
+            }
+            activator.hold(&holders, HOLD).await?;
+            *held = Some(holders);
+        }
+    }
+
+    /// A cluster job every commit of which is covered: by its own
+    /// activation, or by others'. One whose activation applied before it was
+    /// recorded here has its map object written now.
+    async fn covered_in_cluster(
+        &self,
+        activator: &dyn ErasureActivator,
+        branch: &str,
+        job: &ErasureJob,
+    ) -> Result<bool> {
+        let Some(ClusterPublication {
+            manifest,
+            activation: None,
+            ..
+        }) = &job.cluster
+        else {
+            return Ok(true);
+        };
+        if let Some(activation) = activator.applied(manifest).await {
+            let runtime = self.erasure_runtime()?;
+            runtime
+                .index
+                .publish(runtime.index.manifest(manifest).await?)
+                .await?;
+            self.record_publication(branch, job, manifest, Some(activation))
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn record_publication(
+        &self,
+        branch: &str,
+        job: &ErasureJob,
+        manifest: &str,
+        activation: Option<u64>,
+    ) -> Result<()> {
+        self.update_job(branch, &job.request_id, |j| {
+            j.cluster = Some(ClusterPublication {
+                manifest: manifest.to_string(),
+                activation,
+                effective_ms: None,
+            });
+        })
+        .await
+    }
+
+    /// Record, on the cluster jobs of `ledgers` whose activation every
+    /// member has installed, when it became effective for serving.
+    async fn record_effective(&self, ledgers: &[String]) {
+        let (Some(runtime), Ok(ns)) = (self.retention.erasure.get(), self.publisher()) else {
+            return;
+        };
+        let Some(activator) = runtime.activator.get() else {
+            return;
+        };
+        for branch in ledgers {
+            let Ok((_, Some(registration))) = registry::read(ns, branch).await else {
+                continue;
+            };
+            for job in &registration.erasures {
+                let Some(ClusterPublication {
+                    activation: Some(activation),
+                    effective_ms: None,
+                    ..
+                }) = &job.cluster
+                else {
+                    continue;
+                };
+                if activator.installed_everywhere(*activation).await {
+                    let now = now_ms();
+                    if let Err(e) = self
+                        .update_job(branch, &job.request_id, |j| {
+                            if let Some(cluster) = &mut j.cluster {
+                                cluster.effective_ms = Some(now);
+                            }
+                        })
+                        .await
+                    {
+                        tracing::warn!(request = %job.request_id, error = %e, "erasure: effective state not recorded");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `job` can publish, and over what. Asks for the index builds
+    /// its holders lack, and joins the commits ending its spans that it
+    /// lacks or proves again those proved on an erasure published since.
+    async fn prepare_publication(&self, branch: &str, job: &ErasureJob) -> Result<Prepared> {
+        let runtime = self.erasure_runtime()?;
         let Some(holders) = self.holders(branch, job).await? else {
             // Dropped: its branches, and what their indexes hold, can be
             // restored, so the gate waits until they are.
-            return Ok(());
+            return Ok(Prepared::Waiting);
         };
         let lagging = self.lagging_branches(&holders, job).await?;
         if !lagging.is_empty() {
-            drop(admission);
             match &self.indexing_mode {
                 IndexingMode::Background(handle) => {
                     for (b, t) in &lagging {
@@ -576,16 +790,15 @@ impl Fluree {
                     .await?;
                 }
             }
-            return Ok(());
+            return Ok(Prepared::Waiting);
         }
         let added = self.unclaimed_span_ends(branch, &holders, job).await?;
         if !added.is_empty() {
-            drop(admission);
-            return self
-                .update_job(branch, &job.request_id, |j| add_commits(j, &added))
-                .await;
+            self.update_job(branch, &job.request_id, |j| add_commits(j, &added))
+                .await?;
+            return Ok(Prepared::Waiting);
         }
-        let mut published = Vec::with_capacity(job.commits.len());
+        let mut erased = Vec::with_capacity(job.commits.len());
         let mut stale = Vec::new();
         for task in &job.commits {
             let held = runtime.index.erased(&commit_id(&task.commit)?).await?;
@@ -594,71 +807,50 @@ impl Fluree {
                 // before a crash lost the job's update.
                 (Need::Covered, _) => {}
                 (Need::Publish, Some(proved)) => {
-                    let mut erased = held.unwrap_or_else(|| ErasedCommit {
+                    let mut next = held.unwrap_or_else(|| ErasedCommit {
                         commit: task.commit.clone(),
                         ledger_id: task.ledger_id.clone(),
                         txn: None,
                         steps: Vec::new(),
                         replaced_at: Vec::new(),
                     });
-                    if erased.txn.is_none() {
+                    if next.txn.is_none() {
                         let bytes = self
                             .commit_bytes(&task.branches[0], &commit_id(&task.commit)?)
                             .await?;
-                        erased.txn = read_commit_envelope(&bytes)
+                        next.txn = read_commit_envelope(&bytes)
                             .map_err(|e| ApiError::internal(format!("{}: {e}", task.commit)))?
                             .txn
                             .map(|t| t.address_digest());
                     }
-                    erased.steps.push(ErasureStep {
+                    next.steps.push(ErasureStep {
                         request_id: job.request_id.clone(),
                         slots: proved.slots.clone(),
                         replacement: proved.replacement.clone(),
                         proof: proved.proof.clone(),
                     });
-                    published.push(erased);
+                    erased.push(next);
                 }
                 // Proved on an erasure published since: prove it again.
                 _ => stale.push(task.commit.clone()),
             }
         }
         if !stale.is_empty() {
-            drop(admission);
-            return self
-                .update_job(branch, &job.request_id, |j| {
-                    j.stage = ErasureStage::Proving;
-                    for task in &mut j.commits {
-                        if stale.contains(&task.commit) {
-                            task.proved = None;
-                        }
+            self.update_job(branch, &job.request_id, |j| {
+                j.stage = ErasureStage::Proving;
+                for task in &mut j.commits {
+                    if stale.contains(&task.commit) {
+                        task.proved = None;
                     }
-                })
-                .await;
+                }
+            })
+            .await?;
+            return Ok(Prepared::Waiting);
         }
-        if !published.is_empty() {
-            self.store_authorization(branch, job).await?;
-            runtime.index.publish(published).await?;
-            for holder in &holders {
-                self.announce_refresh(&holder.ledger_id).await;
-            }
-        }
-        drop(admission);
-        if self.needs(job).await?.iter().any(|n| *n != Need::Covered) {
-            return Err(ApiError::internal(format!(
-                "erasure {} published without removing every requested slot",
-                job.request_id
-            )));
-        }
-        // Another instance on this storage reads the replacements once it
-        // lists the maps again; it has by the time this reports, whether
-        // the maps were written now or before a restart.
-        tokio::time::sleep(REFRESH * 2).await;
-        self.update_job(branch, &job.request_id, |j| {
-            j.stage = ErasureStage::Published;
-            j.published_ms = Some(now_ms());
-            j.last_error = None;
+        Ok(match erased.is_empty() {
+            true => Prepared::Covered,
+            false => Prepared::Ready { holders, erased },
         })
-        .await
     }
 
     /// Store what authorized `job`, requested on `branch`, for transfers of

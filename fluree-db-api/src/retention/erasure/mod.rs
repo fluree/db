@@ -27,6 +27,7 @@
 //! Supported: a single node with file storage, v4 commits with SHA2-256
 //! CIDs. Requests elsewhere are refused.
 
+mod activation;
 pub(crate) mod index;
 pub(crate) mod purge;
 mod request;
@@ -36,6 +37,7 @@ mod worker;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+pub use activation::ErasureActivator;
 pub use fluree_db_erasure::{
     check_prover, find_prover, install_prover, Prover, ProverConfig, SubprocessProver, Verifier,
     PROVER_BINARY, REDACT_IMAGE_IDS,
@@ -98,6 +100,8 @@ pub(crate) struct ErasureRuntime {
         parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::RwLock<Reconciled>>>>,
     /// Keys [`Reconciled`]'s hashes, so they do not stand for the values.
     fact_keys: std::collections::hash_map::RandomState,
+    /// Set on a cluster member: publications go through it.
+    pub(crate) activator: std::sync::OnceLock<Arc<dyn ErasureActivator>>,
 }
 
 /// What reconciling a branch with received erasures took out of its
@@ -121,6 +125,7 @@ impl ErasureRuntime {
             rebuilt_on_restore: Default::default(),
             fences: Default::default(),
             fact_keys: Default::default(),
+            activator: Default::default(),
         }
     }
 
@@ -296,10 +301,30 @@ pub struct ErasureJob {
     pub added: Vec<crate::retention::removal::OccurrenceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge: Option<PurgeProgress>,
+    /// On a cluster: its publication's activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<ClusterPublication>,
     /// A job in a later release's stage as stored, with the fields this
     /// release does not know: a registration writes it back so.
     #[serde(skip)]
     pub(crate) as_written: Option<std::sync::Arc<AsWritten>>,
+}
+
+/// A job's publication on a cluster: published once its manifest's
+/// activation applied, effective for serving once every member installed
+/// it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterPublication {
+    /// The hash of the manifest last prepared for activation.
+    pub manifest: String,
+    /// Its activation, once applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<u64>,
+    /// When every member had installed it (epoch ms): from then no member
+    /// serves the erased history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_ms: Option<i64>,
 }
 
 /// A job's stored form, and how this release read it.

@@ -46,6 +46,9 @@ shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
 graphql = ["dep:fluree-db-graphql", "shacl"]
 # Temporary benchmark examples (opt-in so `cargo test` stays fast)
 benchmarks = []
+# Entry points for other crates' tests, such as accepting an erasure on a
+# cluster member. Never enabled outside dev-dependencies.
+testing = []
 # Remote search client (HTTP client for remote search service)
 search-remote-client = ["dep:reqwest"]
 # Embedded vector search (HNSW-based approximate nearest neighbor)

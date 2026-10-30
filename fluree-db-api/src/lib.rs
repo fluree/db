@@ -5280,17 +5280,17 @@ impl Fluree {
         self.clear_decoded();
     }
 
-    /// Read with an erasure a cluster activated over `holders`: as
-    /// [`Self::refresh_ledger`] for each, then wait until every read of a
-    /// commit or transaction document begun before this has finished, since
-    /// one may still return an original.
-    pub async fn install_erasures(&self, holders: &[String]) {
+    /// After installing erasures over `holders`: as [`Self::refresh_ledger`]
+    /// for each, then wait until every read of a commit or transaction
+    /// document begun before this has finished, since one may still return
+    /// an original.
+    #[cfg(feature = "native")]
+    pub(crate) async fn evict_erased(&self, holders: &[String]) {
         self.expire_erasures();
         for holder in holders {
             self.disconnect_ledger(holder).await;
         }
         self.clear_decoded();
-        #[cfg(feature = "native")]
         if let Some(runtime) = self.retention.erasure.get() {
             runtime.index.drain().await;
         }

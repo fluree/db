@@ -215,6 +215,9 @@ impl EmbeddedRaftNode {
         fluree.set_retention_replicas(Arc::new(
             crate::raft::nameservice::read_index::RaftReplicaSync(Arc::clone(&nameservice)),
         ));
+        // This member's publications of erasures activate through the
+        // cluster.
+        fluree.set_erasure_activator(Arc::clone(&nameservice) as _);
         let erasure_installer = {
             let cancel = CancellationToken::new();
             let task = tokio::spawn(crate::raft::erasure::run_installer(
@@ -323,8 +326,10 @@ impl crate::raft::erasure::ErasureInstall for EngineInstall {
         activation: &crate::raft::state_machine::Activation,
     ) -> Result<(), String> {
         let holders: Vec<String> = activation.holders.iter().map(RefKey::ledger_id).collect();
-        self.0.install_erasures(&holders).await;
-        Ok(())
+        self.0
+            .install_erasures(&activation.manifest, &holders)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

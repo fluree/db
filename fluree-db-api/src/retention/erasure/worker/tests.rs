@@ -444,3 +444,254 @@ async fn a_later_release_job_keeps_its_fields_through_this_releases_work() {
     assert_eq!(jobs.as_array().map(Vec::len), Some(2), "{jobs}");
     assert!(jobs.as_array().unwrap().contains(&later), "{jobs}");
 }
+
+/// A cluster's activations as the worker meets them: the first `refusals`
+/// are refused, each later one applies. At each, the manifest holds the
+/// erasures and nothing reads them yet.
+#[derive(Debug, Default)]
+struct Cluster {
+    index: std::sync::OnceLock<Arc<crate::retention::erasure::index::ErasureIndex>>,
+    refusals: std::sync::atomic::AtomicUsize,
+    /// The next activation applies, but its response is lost.
+    lose_response: std::sync::atomic::AtomicBool,
+    calls: parking_lot::Mutex<Vec<&'static str>>,
+    applied: parking_lot::Mutex<Vec<String>>,
+}
+
+impl Cluster {
+    fn on(fluree: &Fluree, refusals: usize) -> Arc<Self> {
+        let cluster = Arc::new(Cluster {
+            refusals: refusals.into(),
+            ..Default::default()
+        });
+        let index = fluree.erasure_runtime().unwrap().index.clone();
+        cluster.index.set(index).unwrap();
+        fluree.set_erasure_activator(cluster.clone());
+        cluster
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.calls.lock())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::retention::erasure::ErasureActivator for Cluster {
+    async fn holder_set(&self) -> crate::Result<Option<u64>> {
+        self.calls.lock().push("holder_set");
+        Ok(Some(1))
+    }
+
+    async fn hold(
+        &self,
+        holders: &[fluree_db_nameservice::NsRecord],
+        _: Duration,
+    ) -> crate::Result<()> {
+        assert!(!holders.is_empty());
+        self.calls.lock().push("hold");
+        Ok(())
+    }
+
+    async fn release(&self, _: &[fluree_db_nameservice::NsRecord]) -> crate::Result<()> {
+        self.calls.lock().push("release");
+        Ok(())
+    }
+
+    async fn activate(
+        &self,
+        manifest: &str,
+        _: u64,
+        holders: &[fluree_db_nameservice::NsRecord],
+    ) -> crate::Result<Option<u64>> {
+        assert!(!holders.is_empty());
+        self.calls.lock().push("activate");
+        let index = self.index.get().unwrap();
+        let erased = index.manifest(manifest).await.unwrap();
+        assert!(!erased.is_empty());
+        for e in &erased {
+            let cid: ContentId = e.commit.parse().unwrap();
+            assert!(
+                index.erased(&cid).await.unwrap().is_none(),
+                "read as erased before its activation"
+            );
+        }
+        if self.refusals.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.refusals
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(None);
+        }
+        let number = {
+            let mut applied = self.applied.lock();
+            applied.push(manifest.to_string());
+            applied.len() as u64 - 1
+        };
+        if self
+            .lose_response
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::ApiError::internal("the response was lost"));
+        }
+        Ok(Some(number))
+    }
+
+    async fn applied(&self, manifest: &str) -> Option<u64> {
+        self.applied
+            .lock()
+            .iter()
+            .position(|m| m == manifest)
+            .map(|n| n as u64)
+    }
+
+    async fn installed_everywhere(&self, _: u64) -> bool {
+        true
+    }
+}
+
+/// A requested erasure, proved and indexed, ready to publish.
+async fn ready_to_publish(fluree: &Fluree, name: &str) -> (String, String, ContentId) {
+    fluree.create_ledger(name).await.unwrap();
+    let id = format!("{name}:main");
+    let t1 = insert(
+        fluree,
+        &id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    let asserted = commit_at(fluree, &id, t1).await;
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    fluree.run_erasure_pass(&id).await.unwrap();
+    reindex(fluree, &id).await;
+    (id, receipt.request_id, asserted)
+}
+
+async fn map_objects(fluree: &Fluree) -> Vec<String> {
+    let runtime = fluree.erasure_runtime().unwrap();
+    runtime
+        .index
+        .list_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.contains("/erasure/map/"))
+        .collect()
+}
+
+async fn reads_replacement(fluree: &Fluree, id: &str, commit: &ContentId) -> bool {
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = fluree.content_store(&record.storage_namespace());
+    is_replacement(&store.get(commit).await.unwrap())
+}
+
+/// On a cluster, publication is the activation of a manifest: nothing
+/// reads the erasures before it applies, one refused holds the holders and
+/// prepares again, and the map objects are written once it has applied.
+#[tokio::test]
+async fn a_cluster_publishes_through_an_activation_of_its_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    let cluster = Cluster::on(&fluree, 1);
+    let (id, request_id, asserted) = ready_to_publish(&fluree, "t/cluster").await;
+    cluster.calls();
+
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    assert_eq!(
+        cluster.calls(),
+        [
+            "holder_set",
+            "activate",
+            "hold",
+            "holder_set",
+            "activate",
+            "release"
+        ]
+    );
+    let job = fluree.job(&id, &request_id).await.unwrap();
+    assert_eq!(job.stage, ErasureStage::Published);
+    let publication = job.cluster.unwrap();
+    assert_eq!(publication.activation, Some(0));
+    assert_eq!(
+        *cluster.applied.lock(),
+        std::slice::from_ref(&publication.manifest)
+    );
+    assert!(publication.effective_ms.is_some());
+    let maps = map_objects(&fluree).await;
+    assert_eq!(maps.len(), 1, "{maps:?}");
+    assert!(maps[0].ends_with(&format!("/{}.json", publication.manifest)));
+    assert!(reads_replacement(&fluree, &id, &asserted).await);
+}
+
+/// Refused again under the hold, the activation lifts it and publishes
+/// nothing; a later pass prepares and activates afresh.
+#[tokio::test]
+async fn an_activation_refused_under_the_hold_releases_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    let cluster = Cluster::on(&fluree, 2);
+    let (id, request_id, asserted) = ready_to_publish(&fluree, "t/cluster-refused").await;
+    cluster.calls();
+
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 0, "{report:?}");
+    assert_eq!(
+        cluster.calls(),
+        [
+            "holder_set",
+            "activate",
+            "hold",
+            "holder_set",
+            "activate",
+            "release"
+        ]
+    );
+    let job = fluree.job(&id, &request_id).await.unwrap();
+    assert_eq!(job.stage, ErasureStage::Indexing);
+    assert_eq!(job.cluster.as_ref().and_then(|c| c.activation), None);
+    assert!(map_objects(&fluree).await.is_empty());
+    assert!(!reads_replacement(&fluree, &id, &asserted).await);
+
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    assert!(reads_replacement(&fluree, &id, &asserted).await);
+}
+
+/// An activation that applied but whose response was lost is found applied
+/// once the member has installed its manifest, which it reads by: its map
+/// object is written then, and the job records it.
+#[tokio::test]
+async fn an_activation_whose_response_was_lost_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    let cluster = Cluster::on(&fluree, 0);
+    cluster
+        .lose_response
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (id, request_id, asserted) = ready_to_publish(&fluree, "t/cluster-lost").await;
+
+    assert!(fluree.run_erasure_pass(&id).await.is_err());
+    let manifest = cluster.applied.lock()[0].clone();
+    assert!(map_objects(&fluree).await.is_empty());
+    assert!(!reads_replacement(&fluree, &id, &asserted).await);
+    // This member's installer installs what the cluster applied.
+    fluree
+        .install_erasures(&manifest, std::slice::from_ref(&id))
+        .await
+        .unwrap();
+    assert!(reads_replacement(&fluree, &id, &asserted).await);
+    assert!(map_objects(&fluree).await.is_empty());
+
+    cluster.calls();
+    fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(cluster.calls(), ["holder_set"], "nothing activated again");
+    let job = fluree.job(&id, &request_id).await.unwrap();
+    assert_eq!(job.stage, ErasureStage::Published);
+    let publication = job.cluster.unwrap();
+    assert_eq!(
+        (publication.manifest.as_str(), publication.activation),
+        (manifest.as_str(), Some(0))
+    );
+    assert_eq!(map_objects(&fluree).await.len(), 1);
+}

@@ -3627,6 +3627,7 @@ dependencies = [
  "dashmap",
  "fluree-db-api",
  "fluree-db-core",
+ "fluree-db-erasure",
  "fluree-db-ledger",
  "fluree-db-nameservice",
  "fluree-db-transact",

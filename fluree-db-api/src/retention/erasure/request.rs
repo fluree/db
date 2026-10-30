@@ -100,15 +100,42 @@ impl Fluree {
         request: ErasureRequest,
         requester: Option<String>,
     ) -> Result<ErasureReceipt> {
+        // Published, a cluster's erasures could not yet be purged.
+        if self.retention.replicas.get().is_some() {
+            return Err(unsupported("a cluster cannot erase permanently yet"));
+        }
+        self.accept_erasure(writer, ledger_id, request, requester)
+            .await
+    }
+
+    /// [`Self::erase_occurrences_with`] on a cluster member, which refuses
+    /// it: for tests of a cluster's publication.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub async fn erase_occurrences_in_cluster(
+        &self,
+        writer: &dyn RetentionWriter,
+        ledger_id: &str,
+        request: ErasureRequest,
+        requester: Option<String>,
+    ) -> Result<ErasureReceipt> {
+        self.accept_erasure(writer, ledger_id, request, requester)
+            .await
+    }
+
+    async fn accept_erasure(
+        &self,
+        writer: &dyn RetentionWriter,
+        ledger_id: &str,
+        request: ErasureRequest,
+        requester: Option<String>,
+    ) -> Result<ErasureReceipt> {
         let runtime = self.erasure_runtime()?;
         if runtime.config.is_none() {
             return Err(unsupported(
                 "no prover is available: install one with `fluree prover install`, beside the \
                  server's binary, or name it with `--erasure-prover`",
             ));
-        }
-        if self.retention.replicas.get().is_some() {
-            return Err(unsupported("a cluster cannot erase permanently yet"));
         }
         let ledger_id = LedgerId::parse(ledger_id)?;
         let ns = self.publisher()?;
@@ -213,6 +240,7 @@ impl Fluree {
             published_ms: None,
             added: Vec::new(),
             purge: None,
+            cluster: None,
             as_written: None,
         };
         let recorded = job.clone();
@@ -678,6 +706,7 @@ mod tests {
             published_ms: None,
             added: Vec::new(),
             purge: None,
+            cluster: None,
             as_written: None,
         }
     }

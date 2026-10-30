@@ -78,6 +78,9 @@ dashmap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # The lifecycle conformance suite, run against a single-node raft.
 fluree-db-nameservice = { path = "../fluree-db-nameservice", features = ["conformance"] }
+# A cluster's erasure publication, proved without a zkVM.
+fluree-db-api = { path = "../fluree-db-api", features = ["testing"] }
+fluree-db-erasure = { path = "../fluree-db-erasure", features = ["testing"] }
 tempfile = "3.19"
 
 [lints]

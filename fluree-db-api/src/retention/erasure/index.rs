@@ -730,6 +730,39 @@ impl ErasureIndex {
         Ok(())
     }
 
+    /// Store erasures a cluster is to activate as a manifest, outside the
+    /// map objects so no member reads them before the activation; returns
+    /// its hash, which names it. Its bytes are those of the map object
+    /// [`Self::publish`] writes of the same erasures.
+    pub(crate) async fn put_manifest(&self, erased: &[ErasedCommit]) -> Result<String> {
+        let bytes = serde_json::to_vec(erased).map_err(|e| ApiError::internal(e.to_string()))?;
+        let hash = sha256_hex(&bytes);
+        self.storage
+            .write_bytes(&self.address(&format!("manifest/{hash}.json")), &bytes)
+            .await?;
+        Ok(hash)
+    }
+
+    /// The erasures of manifest `hash`, checked against it.
+    pub(crate) async fn manifest(&self, hash: &str) -> Result<Vec<ErasedCommit>> {
+        let bytes = self
+            .storage
+            .read_bytes(&self.address(&format!("manifest/{hash}.json")))
+            .await?;
+        if sha256_hex(&bytes) != hash {
+            return Err(ApiError::internal(format!(
+                "erasure manifest {hash} does not match its hash"
+            )));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| ApiError::internal(format!("erasure manifest {hash}: {e}")))
+    }
+
+    /// Read `erased`, an activated manifest's, as published here.
+    pub(crate) fn install_manifest(&self, erased: Vec<ErasedCommit>) {
+        self.install(erased);
+    }
+
     /// Write a map object named by its hash; returns its address.
     async fn write_map(&self, erased: &[ErasedCommit]) -> Result<String> {
         let bytes = serde_json::to_vec(erased).map_err(|e| ApiError::internal(e.to_string()))?;

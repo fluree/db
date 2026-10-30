@@ -194,6 +194,20 @@ async fn stand_up(
     EmbeddedRaftNode,
     (tempfile::TempDir, tempfile::TempDir),
 ) {
+    stand_up_with(node_id, |builder| builder, configure).await
+}
+
+/// [`stand_up`], with the engine's builder adjusted by `build`.
+async fn stand_up_with(
+    node_id: u64,
+    build: impl FnOnce(FlureeBuilder) -> FlureeBuilder,
+    configure: impl FnOnce(EmbeddedRaftConfig) -> EmbeddedRaftConfig,
+) -> (
+    Arc<RaftIntegration>,
+    Arc<fluree_db_api::Fluree>,
+    EmbeddedRaftNode,
+    (tempfile::TempDir, tempfile::TempDir),
+) {
     let raft_dir = tempfile::tempdir().expect("raft dir");
     let data_dir = tempfile::tempdir().expect("data dir");
     let integration = Arc::new(
@@ -212,10 +226,11 @@ async fn stand_up(
         let _ = axum::serve(listener, app).await;
     });
     let ns: Arc<dyn NameServicePublisher> = integration.nameservice();
+    let builder = FlureeBuilder::file(data_dir.path().to_string_lossy().as_ref())
+        .with_event_bus(Arc::clone(&integration.event_bus))
+        .with_storage_wal_owner(format!("node-{node_id}"));
     let fluree = Arc::new(
-        FlureeBuilder::file(data_dir.path().to_string_lossy().as_ref())
-            .with_event_bus(Arc::clone(&integration.event_bus))
-            .with_storage_wal_owner(format!("node-{node_id}"))
+        build(builder)
             .build_client_with_nameservice(NameServiceMode::ReadWrite(ns))
             .await
             .expect("engine builds"),
@@ -555,8 +570,13 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
         GraphSourcePublisher, GraphSourceType, IndexPublisher, NameServiceError,
     };
 
-    let (integration, fluree, node, _dirs) = stand_up(9, |config| config).await;
+    let (integration, fluree, node, (_raft_dir, data_dir)) = stand_up(9, |config| config).await;
     fluree.create_ledger("erased/db").await.expect("create");
+    // A manifest erasing nothing: what the activation installs.
+    let manifest = fluree_db_core::sha256_hex(b"[]");
+    let manifests = data_dir.path().join("@retention/erasure/manifest");
+    std::fs::create_dir_all(&manifests).expect("manifest folder");
+    std::fs::write(manifests.join(format!("{manifest}.json")), b"[]").expect("manifest");
     node.committer
         .transact(bulk_request_round("erased/db:main", 3, 0))
         .await
@@ -592,7 +612,7 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
         .raft
         .client_write(Command::Erasure(ErasureCommand::Activate(
             ActivateErasure {
-                manifest: "prepared".into(),
+                manifest,
                 holder_set,
                 holders: vec![holder],
                 applied_at_millis: 0,
@@ -659,5 +679,141 @@ async fn writes_from_before_an_erasure_activation_are_refused_and_later_ones_lan
     .expect("a transaction after the activation lands in time")
     .expect("a transaction after the activation lands");
     assert!(receipt.commit.t > before.commit_t);
+    node.shutdown().await;
+}
+
+/// An erasure made on a cluster publishes through Raft: the leader
+/// activates a manifest of it, the member installs the manifest and reports
+/// it, reads of the erased commit return its replacement, writes resume on
+/// the new generation, and the job records the activation and when every
+/// member had installed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_erasure_publishes_through_an_activation_every_member_installs() {
+    use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
+    use fluree_db_api::retention::FactSelector;
+    use fluree_db_consensus::raft::state_machine::{generation, RefKey};
+    use fluree_db_core::commit::codec::replacement::is_replacement;
+    use fluree_db_core::ContentStore;
+
+    let (integration, fluree, node, _dirs) = stand_up_with(
+        16,
+        |builder| {
+            builder.with_erasure(ErasureConfig {
+                prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+        },
+        |config| config,
+    )
+    .await;
+    let id = "erasing/db:main";
+    fluree.create_ledger("erasing/db").await.expect("create");
+    let mut request = bulk_request(id, 1);
+    request.body = TransactionBody::JsonLdInsert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/email": "a@secret"
+    }));
+    let asserted_t = node
+        .committer
+        .transact(request)
+        .await
+        .expect("insert")
+        .commit
+        .t;
+    let ns = integration.nameservice();
+    let record = ns.lookup(id).await.expect("lookup").expect("registered");
+    let store = fluree.content_store(&record.storage_namespace());
+    let asserted = fluree_db_core::collect_first_parent_cids(
+        store.as_ref(),
+        record.commit_head_id.as_ref().expect("head"),
+        0,
+    )
+    .await
+    .expect("chain")
+    .into_iter()
+    .find(|(t, _)| *t == asserted_t)
+    .expect("asserting commit")
+    .1;
+
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::new(
+        std::sync::OnceLock::from(Arc::clone(&node.committer)),
+    ));
+    let erasure = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(serde_json::json!("a@secret")),
+        }],
+        ..Default::default()
+    };
+    // Refused, as long as a cluster cannot purge what it publishes.
+    let refused = fluree
+        .erase_occurrences_with(&writer, id, erasure.clone(), None)
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    fluree
+        .erase_occurrences_in_cluster(&writer, id, erasure, None)
+        .await
+        .expect("accepted");
+    fluree.run_erasure_pass(id).await.expect("proved");
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("indexed");
+    let report = fluree.run_erasure_pass(id).await.expect("published");
+    assert_eq!(report.published, 1, "{report:?}");
+
+    let job = fluree
+        .retention_status(id)
+        .await
+        .expect("status")
+        .registration
+        .expect("registered")
+        .erasures
+        .remove(0);
+    let publication = job.cluster.expect("published through the cluster");
+    assert_eq!(publication.activation, Some(0));
+    {
+        let state = integration.shared_state.read().await;
+        assert_eq!(state.erasure.activations[&0].manifest, publication.manifest);
+        assert_eq!(generation(&state, &RefKey::new("erasing/db", "main")), 1);
+    }
+    eventually("the member's readiness report", async || {
+        let state = integration.shared_state.read().await;
+        state
+            .erasure
+            .installed
+            .get(&16)
+            .is_some_and(|installed| installed.through == 1)
+    })
+    .await;
+    assert!(is_replacement(&store.get(&asserted).await.expect("read")));
+    let purge = fluree.run_purge_pass(id, Duration::ZERO).await;
+    assert!(purge.is_err(), "a cluster purged: {purge:?}");
+    eventually("the job's effective state", async || {
+        fluree.run_erasure_pass(id).await.expect("pass");
+        fluree
+            .retention_status(id)
+            .await
+            .expect("status")
+            .registration
+            .is_some_and(|r| {
+                r.erasures[0]
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|c| c.effective_ms.is_some())
+            })
+    })
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        node.committer.transact(bulk_request_round(id, 3, 1)),
+    )
+    .await
+    .expect("a transaction after the activation lands in time")
+    .expect("a transaction after the activation lands");
     node.shutdown().await;
 }

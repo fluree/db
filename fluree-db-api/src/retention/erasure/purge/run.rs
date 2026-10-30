@@ -85,6 +85,11 @@ impl Fluree {
         release_after: Duration,
     ) -> Result<PurgeReport> {
         let runtime = self.erasure_runtime()?;
+        // A delete here could remove what another member is writing back,
+        // and its local copies are out of reach.
+        if self.retention.replicas.get().is_some() {
+            return Err(ApiError::http(501, "a cluster cannot purge erasures yet"));
+        }
         // The holders stay those the pass planned for: a branch made from
         // one would copy an index not yet erased, and a restore would
         // rebuild into folders the release deletes.
