@@ -1,0 +1,20 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix ex: <https://ex.com/fund/> .
+<https://ex.com/fund> a owl:Ontology ; rdfs:label "fund ontology" ; owl:versionInfo "1" .
+ex:Custodian a owl:Class ; skos:prefLabel "custodian"@en, "dépositaire"@fr ; skos:definition "A bank holding assets."@en-GB, "Une banque."@fr ;
+  rdfs:subClassOf ex:ServiceProvider, ex:Bank ;
+  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:holds ; owl:someValuesFrom ex:Asset ] ;
+  owl:equivalentClass ex:Depositary .
+ex:ServiceProvider a rdfs:Class ; rdfs:label "service provider" .
+ex:Bank a owl:Class ; skos:prefLabel "bank" .
+ex:Asset a owl:Class .
+ex:TransferAgent a owl:Class ; rdfs:label "transfer agent" ; rdfs:comment "Keeps the register." ; skos:definition "unused" ; skos:altLabel "TA" .
+ex:holds a owl:ObjectProperty ; rdfs:domain [ owl:unionOf ( ex:Custodian ex:Bank ) ] ; rdfs:range ex:Asset .
+ex:employer_id a rdf:Property ; rdfs:label "employer" ; rdfs:domain ex:Person ; rdfs:range ex:Bank .
+ex:hasLEI a owl:DatatypeProperty ; rdfs:range <http://www.w3.org/2001/XMLSchema#string> ; a owl:FunctionalProperty .
+ex:servedBy a owl:ObjectProperty ; owl:inverseOf ex:serves ; rdfs:label "served by" .
+ex:Person a rdfs:Class ; rdfs:label "person"@de , "person" .
+ex:Depositary a owl:Class ; rdfs:label "depositary" .

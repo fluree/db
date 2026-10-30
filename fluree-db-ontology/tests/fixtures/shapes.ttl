@@ -1,0 +1,21 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <https://ex.com/s/> .
+ex:Person a rdfs:Class, sh:NodeShape ; rdfs:label "person" ;
+  sh:property [ sh:path ex:employer ; sh:class ex:Org ; sh:maxCount 1 ; sh:minLength 2 ] ;
+  sh:property [ sh:path [ sh:inversePath ex:employs ] ] ;
+  sh:property [ sh:path ex:name ; sh:datatype xsd:string ; sh:in ( "a" "b" ) ; sh:name "name" ] ;
+  sh:closed true .
+ex:Org a rdfs:Class ; rdfs:label "organization" .
+ex:OrgShape a sh:NodeShape ; sh:targetClass ex:Org ; sh:targetNode ex:acme ;
+  sh:property [ sh:path ex:city ; sh:datatype xsd:string, xsd:token ; sh:in ( [ ex:x 1 ] ) ; sh:pattern 5 ] ;
+  sh:property [ sh:path ( ex:a ex:b ) ] ;
+  sh:or ( [ sh:path ex:x ] ) .
+ex:employer a rdf:Property ; rdfs:label "employer" ; rdfs:domain ex:Person ; rdfs:range ex:Org .
+ex:name a rdf:Property ; rdfs:label "name" ; rdfs:domain ex:Person ; rdfs:range xsd:string .
+ex:city a rdf:Property ; rdfs:label "city" ; rdfs:domain ex:Org ; rdfs:range xsd:string .
+ex:employs a rdf:Property ; rdfs:label "employs" ; rdfs:domain ex:Org .
+ex:LooseShape sh:targetClass ex:Org ; sh:property [ sh:path ex:name ; sh:minCount "x" ] .
+ex:PShape a sh:PropertyShape ; sh:targetClass ex:Person ; sh:path ex:name ; sh:class ex:Org ; sh:severity sh:Warning .

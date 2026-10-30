@@ -262,6 +262,23 @@ pub fn is_blank_node_label(label: &str) -> bool {
     )
 }
 
+/// The label (without `_:`) of an anonymous node a parser or sink mints:
+/// `-{kind}{n}`. A `BLANK_NODE_LABEL` can't start with `-`, so no label a
+/// user writes is one and a minted node never merges with a written one.
+/// `-` is legal mid-label, so a stored id holding it (`fdb-{scope}-{label}`)
+/// is a `BLANK_NODE_LABEL` and serializes as written.
+///
+/// `kind` and `n` must keep that true: no character a label can't hold, and
+/// no trailing `.`. A debug build checks every label minted.
+pub fn reserved_blank_label(kind: &str, n: impl std::fmt::Display) -> String {
+    let label = format!("-{kind}{n}");
+    debug_assert!(
+        !is_blank_node_label(&label) && is_blank_node_label(&format!("x{label}")),
+        "{label} is not a reserved blank-node label"
+    );
+    label
+}
+
 /// Whether `tag` is a language tag proper: `[a-zA-Z]+ ('-' [a-zA-Z0-9]+)*`,
 /// the first subtag letters only and no subtag empty.
 pub fn is_lang_tag_body(tag: &str) -> bool {
@@ -414,6 +431,29 @@ mod tests {
         for bad in ["", "-a", ".a", "a.", "a/b", "a:b"] {
             assert!(!is_blank_node_label(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_reserved_label_cannot_be_written_but_serializes_in_a_stored_id() {
+        for label in [
+            reserved_blank_label("b", 1),
+            reserved_blank_label("b", "0-7"),
+            reserved_blank_label("bnpl", 0),
+            reserved_blank_label("anon", 12),
+        ] {
+            assert!(!is_blank_node_label(&label), "{label} can be written");
+            let stored = format!("fdb-01h-0-{label}");
+            assert!(is_blank_node_label(&stored), "{stored} does not serialize");
+        }
+    }
+
+    /// A caller whose label would end in `.`, or hold a character a label
+    /// can't, is caught where it mints rather than when the id is written.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not a reserved blank-node label")]
+    fn a_label_that_breaks_the_rule_fails_in_a_debug_build() {
+        reserved_blank_label("b", "0.");
     }
 
     #[test]

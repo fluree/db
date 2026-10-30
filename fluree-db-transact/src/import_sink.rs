@@ -41,6 +41,7 @@ mod inner {
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_indexer::run_index::spool::{SpoolFileInfo, SpoolWriter};
+    use fluree_graph_ir::syntax::reserved_blank_label;
     use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
@@ -1108,12 +1109,8 @@ mod inner {
                     id
                 }
                 None => {
-                    // Anonymous mint: leading '-' keeps the namespace
-                    // disjoint from every lexable user label (labels cannot
-                    // start with '-'), while the full skolemized
-                    // `fdb-{skolem_base}--b{sub_chunk}-{N}` stays
-                    // serializable — see `FlakeSink::term_blank` for the full
-                    // rationale.
+                    // Anonymous mint: a reserved label,
+                    // `fdb-{skolem_base}--b{sub_chunk}-{N}` once skolemized.
                     //
                     // `sub_chunk` is in the label because the counter alone is
                     // NOT enough: it restarts at 0 in every sink (one per
@@ -1131,7 +1128,10 @@ mod inner {
                     // import, so adding one file to the front of a directory
                     // would renumber every anonymous node behind it.
                     self.blank_counter += 1;
-                    let label = format!("-b{}-{}", self.sub_chunk, self.blank_counter);
+                    let label = reserved_blank_label(
+                        "b",
+                        format_args!("{}-{}", self.sub_chunk, self.blank_counter),
+                    );
                     let sid = self.skolemize(&label);
                     self.add_term(ResolvedTerm::Sid(sid))
                 }
@@ -1742,6 +1742,20 @@ mod inner {
             assert_eq!(b1, b2);
             assert_ne!(b1, b3);
             assert_ne!(b3, b4);
+        }
+
+        /// An anonymous node's id is part of its document's import: a later
+        /// import of the same file agrees with an earlier one only while this
+        /// spelling holds, so it is pinned exactly.
+        #[test]
+        fn anonymous_nodes_mint_the_ids_a_reimport_agrees_on() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = ImportSink::new(&mut ns, 1, "doc".to_string(), 3, true).unwrap();
+            let ids: Vec<String> = [sink.term_blank(None), sink.term_blank(None)]
+                .into_iter()
+                .map(|t| sink.resolve_sid(t).unwrap().name_str().to_string())
+                .collect();
+            assert_eq!(ids, ["fdb-doc--b3-1", "fdb-doc--b3-2"]);
         }
 
         #[test]
