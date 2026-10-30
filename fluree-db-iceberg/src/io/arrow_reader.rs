@@ -543,13 +543,16 @@ fn prepare_comparisons(
     plan.iter()
         .map(|(pos, op, value)| {
             let target = comparison_type(schema.field(*pos).data_type());
-            let literal = exact_literal(value, &target);
+            let literal = column_kind(&target)
+                .filter(|&column| comparable(*op, literal_kind(value), column))
+                .and_then(|_| exact_literal(value, &target))
+                .and_then(|literal| total_order_zero(*op, literal));
             if literal.is_none() {
                 tracing::debug!(
                     literal = ?value,
                     column_type = ?target,
-                    "row filter: the literal has no exact value in the column type, so this \
-                     comparison keeps every row and the in-engine FILTER decides"
+                    "row filter: the literal does not compare exactly with the column, so \
+                     this comparison keeps every row and the in-engine FILTER decides"
                 );
             }
             PreparedComparison {
@@ -590,6 +593,124 @@ fn eval_conjunction(
         });
     }
     Ok(acc)
+}
+
+/// The kind of value a literal holds or a column compares as, for deciding
+/// whether the row filter may compare the two at all (see [`comparable`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ValueKind {
+    Boolean,
+    Integer,
+    Decimal,
+    Float,
+    Text,
+    Binary,
+    Temporal,
+}
+
+fn literal_kind(value: &LiteralValue) -> ValueKind {
+    match value {
+        LiteralValue::Boolean(_) => ValueKind::Boolean,
+        LiteralValue::Int32(_) | LiteralValue::Int64(_) => ValueKind::Integer,
+        LiteralValue::Decimal { .. } => ValueKind::Decimal,
+        LiteralValue::Float32(_) | LiteralValue::Float64(_) => ValueKind::Float,
+        LiteralValue::String(_) => ValueKind::Text,
+        LiteralValue::Bytes(_) => ValueKind::Binary,
+        LiteralValue::Date(_) | LiteralValue::Timestamp(_) | LiteralValue::TimestampTz(_) => {
+            ValueKind::Temporal
+        }
+    }
+}
+
+/// The kind a column of comparison type `t` compares as; `None` for a type the
+/// row filter does not compare (`Float16` among them: no Iceberg type decodes
+/// to it, and [`total_order_zero`] does not cover it).
+fn column_kind(t: &DataType) -> Option<ValueKind> {
+    use DataType as D;
+    Some(match t {
+        D::Boolean => ValueKind::Boolean,
+        D::Int8 | D::Int16 | D::Int32 | D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => {
+            ValueKind::Integer
+        }
+        D::Decimal128(..) | D::Decimal256(..) => ValueKind::Decimal,
+        D::Float32 | D::Float64 => ValueKind::Float,
+        D::Utf8 | D::LargeUtf8 | D::Utf8View => ValueKind::Text,
+        D::Binary | D::LargeBinary | D::BinaryView | D::FixedSizeBinary(_) => ValueKind::Binary,
+        D::Date32 | D::Date64 | D::Timestamp(..) => ValueKind::Temporal,
+        _ => return None,
+    })
+}
+
+/// Whether the row filter may compare a `literal` with a `column` by `op`:
+/// whether the column's own comparison keeps every row the engine's FILTER
+/// does.
+///
+/// An exact conversion is not enough. An integer literal converts exactly to a
+/// string column's `"1000"`, and the column then compares as text, where the
+/// engine reads an `xsd:integer` map over that column as numbers: `"999" <
+/// "1000"` is false, so the row filter would drop the 999 the FILTER keeps.
+/// Likewise `true` against a column holding `"1"`. So a literal compares only
+/// with a column of its own kind, or across kinds where both sides compare by
+/// value: integers with decimals and with floats (`exact_literal` refuses a
+/// value the column type cannot hold). A decimal and a float do not: a decimal
+/// round-trips through a float by rounding back (0.1), while the engine
+/// compares the two exactly.
+///
+/// A string compares with a date or timestamp column by any operator: the
+/// engine orders a plain string against a date or dateTime by parsing it as
+/// that type, which is what the cast does, and `exact_literal` accepts only
+/// the column's own rendering of a value. Against any other column a string
+/// compares only by `=`, where the round trip makes it the rendering of the
+/// one value it matches (`"10"`, never `"010"`): a cell that renders as the
+/// string is that value. Ordering it would compare values where the engine
+/// compares the string, or nothing at all.
+fn comparable(op: ComparisonOp, literal: ValueKind, column: ValueKind) -> bool {
+    use ValueKind as K;
+    literal == column
+        || matches!(
+            (literal, column),
+            (K::Integer, K::Decimal | K::Float)
+                | (K::Decimal | K::Float, K::Integer)
+                | (K::Text, K::Temporal)
+        )
+        || (literal == K::Text && op == ComparisonOp::Eq && column != K::Binary)
+}
+
+/// A float column compared with a zero literal, as the zero whose comparison
+/// the column's kernels agree on with the engine; `None` to keep every row.
+///
+/// arrow-ord's float comparisons follow IEEE 754 totalOrder, which puts -0.0
+/// below 0.0, where the engine (like SPARQL) holds the two equal: `?d >= 0`
+/// keeps a -0.0 cell in the engine, and `cmp::gt_eq(-0.0, 0.0)` is false. For
+/// the ordering operators one signed zero agrees: `< -0.0` and `>= -0.0` split
+/// the negatives from both zeros, `<= 0.0` and `> 0.0` both zeros from the
+/// positives. Equality would need both zeros, so it keeps every row. Any other
+/// literal orders against both zeros alike, and against NaN cells totalOrder
+/// can only keep extra rows (the engine compares nothing with NaN).
+fn total_order_zero(op: ComparisonOp, literal: ArrayRef) -> Option<ArrayRef> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, Float64Type};
+    let negative = match op {
+        ComparisonOp::Lt | ComparisonOp::GtEq => true,
+        ComparisonOp::LtEq | ComparisonOp::Gt => false,
+        ComparisonOp::Eq | ComparisonOp::NotEq => {
+            let zero = match literal.data_type() {
+                DataType::Float64 => literal.as_primitive::<Float64Type>().value(0) == 0.0,
+                DataType::Float32 => literal.as_primitive::<Float32Type>().value(0) == 0.0,
+                _ => false,
+            };
+            return (!zero).then_some(literal);
+        }
+    };
+    Some(match literal.data_type() {
+        DataType::Float64 if literal.as_primitive::<Float64Type>().value(0) == 0.0 => {
+            Arc::new(Float64Array::from(vec![if negative { -0.0 } else { 0.0 }]))
+        }
+        DataType::Float32 if literal.as_primitive::<Float32Type>().value(0) == 0.0 => {
+            Arc::new(Float32Array::from(vec![if negative { -0.0 } else { 0.0 }]))
+        }
+        _ => literal,
+    })
 }
 
 /// The type a column is compared in. Our tabular time representation is an
@@ -1066,6 +1187,119 @@ mod row_filter_tests {
             &DataType::Timestamp(TimeUnit::Millisecond, None)
         )
         .is_some());
+    }
+
+    /// A literal converts exactly to a column whose own order is not the
+    /// engine's: an integer to a string column's "1000", which then compares
+    /// as text ("999" < "1000" is false), a boolean to "true" (where the cell
+    /// holds "1"), a decimal to a double (0.1 rounds back to itself). Those
+    /// keep every row; a string against a date column still compares as a
+    /// date, which is how the engine orders a plain string against one.
+    /// (Equality of an integer with a string cell would be sound for "1000",
+    /// but not for "01000", which the engine reads as 1000 too.)
+    #[test]
+    fn a_literal_compares_only_with_a_column_that_orders_as_the_engine() {
+        let text = || -> ArrayRef { Arc::new(StringArray::from(vec!["999", "1000", "1"])) };
+        for op in OPS {
+            assert_eq!(
+                kept(text(), op, LiteralValue::Int64(1000)),
+                [0, 1, 2],
+                "{op:?}"
+            );
+            assert_eq!(
+                kept(text(), op, LiteralValue::Int32(1000)),
+                [0, 1, 2],
+                "{op:?}"
+            );
+            assert_eq!(
+                kept(text(), op, LiteralValue::Boolean(true)),
+                [0, 1, 2],
+                "{op:?}"
+            );
+            let doubles: ArrayRef = Arc::new(Float64Array::from(vec![0.1, 0.2]));
+            let tenth = LiteralValue::Decimal {
+                unscaled: 1,
+                scale: 1,
+            };
+            assert_eq!(kept(doubles, op, tenth), [0, 1], "{op:?}");
+            let decimals = decimal_column(&[1, 2], 38, 1);
+            assert_eq!(
+                kept(decimals, op, LiteralValue::Float64(0.1)),
+                [0, 1],
+                "{op:?}"
+            );
+            // A string orders against a number nowhere but in a string column;
+            // by `=` it matches the one value it renders.
+            let ints: ArrayRef = Arc::new(Int64Array::from(vec![1, 1000]));
+            let want: &[usize] = if op == ComparisonOp::Eq {
+                &[1]
+            } else {
+                &[0, 1]
+            };
+            assert_eq!(
+                kept(ints, op, LiteralValue::String("1000".into())),
+                want,
+                "{op:?}"
+            );
+        }
+        // Same kind, or integers against floats and decimals: still compared.
+        assert_eq!(
+            kept(text(), ComparisonOp::Lt, LiteralValue::String("2".into())),
+            [1, 2]
+        );
+        let doubles: ArrayRef = Arc::new(Float64Array::from(vec![0.5, 2.0]));
+        assert_eq!(kept(doubles, ComparisonOp::Gt, LiteralValue::Int64(1)), [1]);
+        let days: ArrayRef = Arc::new(Date32Array::from(vec![19_723, 19_724]));
+        assert_eq!(
+            kept(
+                days,
+                ComparisonOp::Gt,
+                LiteralValue::String("2024-01-01".into())
+            ),
+            [1]
+        );
+    }
+
+    /// arrow-ord orders floats by IEEE totalOrder (-0.0 < 0.0); the engine
+    /// holds -0.0 = 0. Against every spelling of a zero literal, the ordering
+    /// operators keep exactly the IEEE matches (and, as for any literal, a NaN
+    /// cell totalOrder puts past it), and equality keeps every row.
+    #[test]
+    fn a_zero_literal_against_a_float_column_keeps_both_zeros() {
+        // -0.0, 0.0, 1.5, -1.5, NaN
+        let f64s =
+            || -> ArrayRef { Arc::new(Float64Array::from(vec![-0.0, 0.0, 1.5, -1.5, f64::NAN])) };
+        let f32s =
+            || -> ArrayRef { Arc::new(Float32Array::from(vec![-0.0, 0.0, 1.5, -1.5, f32::NAN])) };
+        let zeros = [
+            LiteralValue::Int64(0),
+            LiteralValue::Int32(0),
+            LiteralValue::Float64(0.0),
+            LiteralValue::Float64(-0.0),
+        ];
+        for column in [f64s, f32s] {
+            for zero in &zeros {
+                for (op, want) in [
+                    (ComparisonOp::Lt, vec![3]),
+                    (ComparisonOp::LtEq, vec![0, 1, 3]),
+                    (ComparisonOp::Gt, vec![2, 4]),
+                    (ComparisonOp::GtEq, vec![0, 1, 2, 4]),
+                    (ComparisonOp::Eq, vec![0, 1, 2, 3, 4]),
+                    (ComparisonOp::NotEq, vec![0, 1, 2, 3, 4]),
+                ] {
+                    assert_eq!(kept(column(), op, zero.clone()), want, "{op:?} {zero:?}");
+                }
+            }
+            // A non-zero literal orders against both zeros alike.
+            assert_eq!(
+                kept(column(), ComparisonOp::Gt, LiteralValue::Int64(-1)),
+                [0, 1, 2, 4]
+            );
+            assert_eq!(
+                kept(column(), ComparisonOp::Eq, LiteralValue::Int64(-1)),
+                Vec::<usize>::new()
+            );
+        }
     }
 
     /// Exact literals still narrow: the conversion is not a blanket keep-all.

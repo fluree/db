@@ -21,6 +21,9 @@
 //! - `amounts` — decimal columns for FILTER pushdown: `ratio` is `decimal(38,9)`
 //!   (BigQuery's `NUMERIC`) with values one grid step either side of 0.05 and
 //!   1.05; `price` is `decimal(5,2)`, too narrow to hold a literal like 1000.
+//! - `literals` — string columns a mapping reads as `xsd:integer` (`ntext`:
+//!   "999", "1000", …) and `xsd:boolean` (`btext`: "1", "true", …), and a
+//!   double column holding -0.0 and 0.0.
 //!
 //! The fixtures' metadata carries the ABSOLUTE paths they were written under
 //! (`file:///tmp/...`), so reading them from a checkout also proves the
@@ -35,6 +38,7 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/people_backlog fluree-db-api/tests/fixtures/iceberg/silver/people_backlog
 //! cp -r /tmp/fluree-local-iceberg/silver/people_window fluree-db-api/tests/fixtures/iceberg/silver/people_window
 //! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
+//! cp -r /tmp/fluree-local-iceberg/silver/literals fluree-db-api/tests/fixtures/iceberg/silver/literals
 //! ```
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
@@ -1727,4 +1731,144 @@ async fn decimal_filters_answer_exactly() {
         .collect();
     ids.sort_unstable();
     assert_eq!(ids, [1, 2, 3, 4, 5], "JSON-LD (< ?p 1000): {rows}");
+}
+
+const LITERALS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#LiteralsMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.literals" ] ;
+        rr:subjectMap [ rr:template "http://example.org/literal/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:n ;
+            rr:objectMap [ rr:column "ntext" ; rr:datatype xsd:integer ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:b ;
+            rr:objectMap [ rr:column "btext" ; rr:datatype xsd:boolean ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:d ;
+            rr:objectMap [ rr:column "f64" ; rr:datatype xsd:double ]
+        ] .
+"#;
+
+/// The ids (sorted) that `FILTER(?v <op> <lit>)` over `ex:<pred>` returns, on
+/// SPARQL (`sparql_lit`) and on its JSON-LD twin (`jsonld_lit`).
+async fn literal_ids(
+    fluree: &fluree_db_api::Fluree,
+    pred: &str,
+    op: &str,
+    sparql_lit: &str,
+    jsonld_lit: &str,
+) -> (Vec<i64>, Vec<i64>) {
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?id FROM <literals:main> \
+         WHERE {{ ?s ex:id ?id ; ex:{pred} ?v FILTER(?v {op} {sparql_lit}) }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut ids: Vec<i64> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| b["id"]["value"].as_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "literals:main",
+        "select": ["?id"],
+        "where": [
+            {"@id": "?s", "ex:id": "?id", format!("ex:{pred}"): "?v"},
+            ["filter", format!("({op} ?v {jsonld_lit})")]
+        ],
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{jsonld}: {e}"));
+    let mut jsonld_ids: Vec<i64> = rows
+        .as_array()
+        .unwrap_or_else(|| panic!("array result: {rows}"))
+        .iter()
+        .map(|row| {
+            row.as_i64()
+                .or_else(|| row[0].as_i64())
+                .unwrap_or_else(|| panic!("id in {rows}"))
+        })
+        .collect();
+    jsonld_ids.sort_unstable();
+    (ids, jsonld_ids)
+}
+
+/// A pushed comparison must not compare in an order the engine does not. An
+/// `xsd:integer` or `xsd:boolean` map over a string column orders by value in
+/// the engine, where the column's own comparison is by text ("999" < "1000"
+/// is false; "1" is not "true"). And the engine treats -0.0 as equal to 0,
+/// where the Arrow kernels order -0.0 below 0.0. Each case below lost a true
+/// match to the row filter before it was fixed.
+#[tokio::test]
+async fn literal_filters_compare_as_the_engine_does() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/literals",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("literals", &location, LITERALS_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create literals graph source");
+
+    // ntext: 1="999" 2="1000" 3="50" 4="-5" 5="7"
+    // btext: 1="1" 2="true" 3="0" 4="false" 5=null
+    // f64:   1=-0.0 2=0.0 3=1.5 4=-1.5 5=null
+    let cases: [(&str, &str, &str, &str, &[i64]); 13] = [
+        ("n", "<", "1000", "1000", &[1, 3, 4, 5]),
+        ("n", ">=", "50", "50", &[1, 2, 3]),
+        ("n", "=", "1000", "1000", &[2]),
+        ("b", "=", "true", "true", &[1, 2]),
+        ("b", "=", "false", "false", &[3, 4]),
+        ("d", ">=", "0", "0", &[1, 2, 3]),
+        ("d", "<=", "0", "0", &[1, 2, 4]),
+        ("d", ">", "0", "0", &[3]),
+        ("d", "<", "0", "0", &[4]),
+        ("d", "=", "0", "0", &[1, 2]),
+        ("d", ">=", "0.0e0", "0.0", &[1, 2, 3]),
+        ("d", "<=", "-0.0e0", "-0.0", &[1, 2, 4]),
+        ("d", ">", "-1.5e0", "-1.5", &[1, 2, 3]),
+    ];
+    let mut failures = Vec::new();
+    for (pred, op, sparql_lit, jsonld_lit, want) in cases {
+        let (sparql, jsonld) = literal_ids(&fluree, pred, op, sparql_lit, jsonld_lit).await;
+        if sparql != want {
+            failures.push(format!(
+                "SPARQL FILTER(?{pred} {op} {sparql_lit}): {sparql:?} != {want:?}"
+            ));
+        }
+        if jsonld != want {
+            failures.push(format!(
+                "JSON-LD ({op} ?{pred} {jsonld_lit}): {jsonld:?} != {want:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }

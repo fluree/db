@@ -14,6 +14,9 @@
   `ratio` is `decimal(38,9)` (BigQuery's `NUMERIC`), with values on either
   side of 0.05 and 1.05 one grid step apart; `price` is `decimal(5,2)`, the
   narrow column a literal like 1000 does not fit.
+- `silver.literals`: one snapshot of text that a mapping reads as numbers or
+  booleans (`ntext`: "999" and "1000", whose text order is not their numeric
+  order; `btext`: "1" and "true"), and a double column holding both zeros.
 """
 import shutil, sys
 from decimal import Decimal
@@ -142,3 +145,22 @@ amounts.append(pa.table({
 }, schema=amounts_schema))
 amounts = catalog.load_table("silver.amounts")
 print("amounts table_location:", amounts.location())
+
+# ---------------------------------------------------------------------------
+# silver.literals: text read as numbers or booleans, and signed zeros.
+# ---------------------------------------------------------------------------
+literals_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("ntext", pa.string()),
+    pa.field("btext", pa.string()),
+    pa.field("f64", pa.float64()),
+])
+literals = catalog.create_table("silver.literals", schema=literals_schema)
+literals.append(pa.table({
+    "id": pa.array([1, 2, 3, 4, 5], pa.int64()),
+    "ntext": pa.array(["999", "1000", "50", "-5", "7"]),
+    "btext": pa.array(["1", "true", "0", "false", None]),
+    "f64": pa.array([-0.0, 0.0, 1.5, -1.5, None], pa.float64()),
+}, schema=literals_schema))
+literals = catalog.load_table("silver.literals")
+print("literals table_location:", literals.location())
