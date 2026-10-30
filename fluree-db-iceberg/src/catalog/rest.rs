@@ -201,6 +201,10 @@ impl RestCatalogClient {
             // requests. Reused across the 429/503 retries; a token that
             // expires during them is a 401, renewed below.
             let auth_headers = self.auth.request_headers(&url).await?;
+            let quota_project = auth_headers
+                .get("x-goog-user-project")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
 
             // Bound concurrent catalog requests process-wide so a fan-out — the
             // slice-1 prefetch, a wildcard crawl, or a raised scan concurrency —
@@ -269,8 +273,22 @@ impl RestCatalogClient {
                     // closed), typed so the hint names the fix instead of a
                     // broader grant.
                     if status == reqwest::StatusCode::FORBIDDEN && needs_quota_project(&body) {
-                        return Err(IcebergError::CatalogQuotaProjectRequired {
-                            table: path.to_string(),
+                        // Google gives the same refusal when the request did
+                        // name a quota project the identity may not bill to:
+                        // then the fix is a grant on that project, not
+                        // setting one.
+                        return Err(match quota_project {
+                            None => IcebergError::CatalogQuotaProjectRequired {
+                                table: path.to_string(),
+                            },
+                            Some(project) => IcebergError::CatalogAccessDenied {
+                                table: path.to_string(),
+                                message: format!(
+                                    "Catalog request failed ({status}): the request bills to \
+                                     quota project {project}, and {} {body}",
+                                    crate::error::QUOTA_PROJECT_PERMISSION
+                                ),
+                            },
                         });
                     }
                     let message = format!("Catalog request failed ({status}): {body}");
@@ -754,6 +772,56 @@ mod tests {
             matches!(err, IcebergError::CatalogQuotaProjectRequired { .. }),
             "{err:?}"
         );
+    }
+
+    /// Fixed headers, including the quota project Google requests bill to.
+    #[derive(Debug)]
+    struct QuotaProjectAuth(&'static str);
+
+    #[async_trait]
+    impl SendCatalogAuth for QuotaProjectAuth {
+        async fn request_headers(&self, _url: &str) -> Result<reqwest::header::HeaderMap> {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("authorization", "Bearer t".parse().unwrap());
+            headers.insert("x-goog-user-project", self.0.parse().unwrap());
+            Ok(headers)
+        }
+        async fn refresh(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Google refuses a request that names a quota project the identity may
+    /// not bill to with the same reason it gives one that names none. When
+    /// one was named, setting one is not the fix: the refusal is the
+    /// catalog's denial, naming that project and the permission it lacks.
+    #[tokio::test]
+    async fn a_refused_quota_project_that_was_sent_is_a_permission_denial_on_it() {
+        let user_project_denied = serde_json::json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "USER_PROJECT_DENIED"}]}});
+        let server = mock_catalog().await;
+        serve_config(&server, serde_json::json!({})).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/db/tables/events"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(user_project_denied))
+            .mount(&server)
+            .await;
+        let mut client = warehouse_client(&server.uri(), Some("quota-project-sent"));
+        client.auth = Arc::new(QuotaProjectAuth("billing-project"));
+        let err = loads(&client, "db").await.unwrap_err();
+        match &err {
+            IcebergError::CatalogAccessDenied { table, message } => {
+                assert_eq!(table, "db.events");
+                assert!(
+                    message.starts_with("Catalog request failed (403"),
+                    "{message}"
+                );
+                assert!(message.contains("billing-project"), "{message}");
+                assert!(message.contains("serviceusage.services.use"), "{message}");
+            }
+            other => panic!("expected CatalogAccessDenied, got {other:?}"),
+        }
+        assert!(!err.to_string().contains("set quota_project"), "{err}");
     }
 
     /// A provider's token exchange runs before the request takes its

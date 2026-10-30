@@ -405,18 +405,23 @@ pub(crate) fn concise_chain(err: &dyn std::error::Error) -> String {
     shown
 }
 
-fn denial_hint(scheme: &str) -> &'static str {
+/// What Google's refusal of a named quota project means: the identity may
+/// not bill requests to it. Said by the GCS denial hint and the catalog's
+/// refusal of a request that named one.
+pub(crate) const QUOTA_PROJECT_PERMISSION: &str = "the identity lacks \
+    serviceusage.services.use on the project its requests bill to (x-goog-user-project): \
+    grant it roles/serviceusage.serviceUsageConsumer there, or bill another project.";
+
+fn denial_hint(scheme: &str) -> String {
     match scheme {
-        "gs" => {
+        "gs" => format!(
             "The identity lacks storage.objects.get (or storage.objects.list) on this object, \
-             or the object no longer exists. UserProjectAccessDenied means the identity lacks \
-             serviceusage.services.use on the project its requests bill to \
-             (x-goog-user-project)."
-        }
-        _ => {
-            "The credentials lack permission for this object, or — without s3:ListBucket — the \
-             object no longer exists (a missing object also surfaces as AccessDenied)."
-        }
+             or the object no longer exists. UserProjectAccessDenied means \
+             {QUOTA_PROJECT_PERMISSION}"
+        ),
+        _ => "The credentials lack permission for this object, or — without s3:ListBucket — the \
+              object no longer exists (a missing object also surfaces as AccessDenied)."
+            .to_string(),
     }
 }
 
