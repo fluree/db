@@ -3736,7 +3736,7 @@ pub struct Fluree {
     remote_service: Option<Arc<dyn fluree_db_query::remote_service::RemoteServiceExecutor>>,
     /// What graph-source auth providers are built with: the injected resolver
     /// for `ConfigValue::SecretRef` references (`None` in OSS/CLI, where they
-    /// fail closed; a host such as solo injects a tenant-scoped one via
+    /// fail closed; a multi-tenant host injects a tenant-scoped one via
     /// [`Fluree::with_secret_resolver`] — db never sees tenant identity, the
     /// resolver authorizes itself), the host-identity policy, and the AWS
     /// subject that signs Workload Identity Federation exchanges.
