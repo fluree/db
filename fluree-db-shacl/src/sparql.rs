@@ -569,9 +569,15 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::ResourceLimit(_)
         | QueryError::NeedFetch(_)
         | QueryError::StorageAccessDenied { .. }
+        | QueryError::StorageSchemeNotServed { .. }
         | QueryError::Nameservice(_)
         | QueryError::CatalogCredentialsNotVended { .. }
         | QueryError::CatalogAccessDenied { .. }
+        | QueryError::CatalogQuotaProjectRequired { .. }
+        | QueryError::GoogleTokenExchange { .. }
+        | QueryError::GoogleCredentialsInvalid(_)
+        | QueryError::HostIdentityRefused { .. }
+        | QueryError::GoogleTokenHostRefused { .. }
         | QueryError::Policy(_)
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
@@ -895,9 +901,16 @@ mod tests {
             ];
             QueryError::StorageAccessDenied { .. } => true, [
                 QueryError::StorageAccessDenied {
+                    scheme: "s3",
                     bucket: s(),
                     key: s(),
                     region: None,
+                    message: s(),
+                },
+            ];
+            QueryError::StorageSchemeNotServed { .. } => true, [
+                QueryError::StorageSchemeNotServed {
+                    scheme: s(),
                     message: s(),
                 },
             ];
@@ -907,6 +920,26 @@ mod tests {
             ];
             QueryError::CatalogAccessDenied { .. } => true, [
                 QueryError::CatalogAccessDenied { table: s(), message: s() },
+            ];
+            QueryError::CatalogQuotaProjectRequired { .. } => true, [
+                QueryError::CatalogQuotaProjectRequired { table: s(), message: s() },
+            ];
+            QueryError::GoogleTokenExchange { .. } => true, [
+                QueryError::GoogleTokenExchange {
+                    stage: s(),
+                    status: Some(403),
+                    reason: None,
+                    message: s(),
+                },
+            ];
+            QueryError::GoogleCredentialsInvalid(_) => true, [
+                QueryError::GoogleCredentialsInvalid(s()),
+            ];
+            QueryError::HostIdentityRefused { .. } => true, [
+                QueryError::HostIdentityRefused { kind: s(), message: s() },
+            ];
+            QueryError::GoogleTokenHostRefused { .. } => true, [
+                QueryError::GoogleTokenHostRefused { kind: s(), host: s(), message: s() },
             ];
             QueryError::Policy(_) => true, [QueryError::Policy(s())];
             QueryError::TimeRangeNotCovered { .. } => true, [

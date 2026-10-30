@@ -6,7 +6,7 @@
 //! A table handle remembers the last version it resolved. The next unpinned
 //! read lists the log for commits past it instead of replaying the log, so it
 //! still sees every new commit; a version's file listing is kept with it (see
-//! [`crate::listing`]).
+//! `crate::listing`).
 
 use std::collections::VecDeque;
 use std::num::NonZero;
@@ -214,11 +214,21 @@ impl std::fmt::Debug for DeltaTable {
 }
 
 impl DeltaTable {
-    /// `name` labels errors; `location` is the table directory.
-    pub fn open(name: &str, location: &str, io: &DeltaIoConfig) -> Result<Self> {
+    /// `name` labels errors; `location` is the table directory. `io` must be
+    /// hydrated. The table is read with the host's credentials or the service
+    /// principal `io` names, under `identity`'s host-identity policy: ambient
+    /// AWS and Azure are host identities the operator governs (see
+    /// `fluree_db_iceberg::HostIdentityPolicy`). An embedder opens a table
+    /// under its instance's context with `Fluree::open_delta_table`.
+    pub fn open(
+        name: &str,
+        location: &str,
+        io: &DeltaIoConfig,
+        identity: &fluree_db_iceberg::auth::IdentityContext,
+    ) -> Result<Self> {
         Self::over(
             name,
-            crate::store::open(location, io, Credentials::Ambient)?,
+            crate::store::open(location, io, Credentials::Ambient, identity)?,
         )
     }
 
@@ -230,13 +240,14 @@ impl DeltaTable {
         unity: &UnityConfig,
         full_name: &str,
         io: &DeltaIoConfig,
+        identity: &fluree_db_iceberg::auth::IdentityContext,
     ) -> Result<Self> {
-        let client = Arc::new(UnityClient::new(unity)?);
+        let client = Arc::new(UnityClient::new(unity, identity)?);
         let table = client.table(full_name).await?;
         let location = table.location.clone();
         Self::over(
             name,
-            crate::store::open(&location, io, Credentials::Unity(client, table))?,
+            crate::store::open(&location, io, Credentials::Unity(client, table), identity)?,
         )
     }
 

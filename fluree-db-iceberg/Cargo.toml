@@ -26,6 +26,16 @@ aws = [
     # here — a non-`aws` build compiles neither.
     "dep:arrow",
     "parquet/arrow",
+    # Google identity: service-account JWT assertions (RS256) and the
+    # Workload Identity Federation subject token (a SigV4-signed AWS
+    # GetCallerIdentity request). The metadata server and gcloud user ADC need
+    # neither and work without this feature.
+    "dep:jsonwebtoken",
+    "dep:aws-sigv4",
+    # Google Cloud Storage reads (`io::gcs`), over the `object_store` GCS
+    # backend Delta Kernel already links; see the dependency below.
+    "dep:object_store",
+    "dep:reqwest012",
 ]
 [dependencies]
 # Core dependencies
@@ -89,6 +99,22 @@ aws-config = { workspace = true, optional = true }
 # `hyper-014` feature exposes the client builder that accepts a custom connector.
 aws-smithy-http-client = { workspace = true, features = ["hyper-014"], optional = true }
 hyper-rustls = { workspace = true, optional = true }
+# Google identity (see the `aws` feature): the version the lockfile already
+# carries through the AWS SDK.
+aws-sigv4 = { version = "1.4.2", optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+# Binds a cached Google token to the secret that minted it (a service-account
+# key, an ADC refresh token), in memory only. Unconditional: gcloud user ADC
+# works without the `aws` feature.
+sha2 = { workspace = true }
+# The GCS reader (`io::gcs`). Pinned to the exact version Delta Kernel 0.28
+# pins, whose `gcp` backend every shipped binary already links, so this adds
+# no second copy; used only behind the `io::gcs` shim.
+object_store = { version = "=0.13.2", default-features = false, features = ["gcp"], optional = true }
+# The reqwest `object_store` 0.13 is built on (0.12, already linked through it):
+# the GCS reader builds that client itself, to follow no redirects
+# (`object_store` sets no redirect policy). Adds no crate to the build.
+reqwest012 = { package = "reqwest", version = "0.12", default-features = false, optional = true }
 
 # Optional: Arrow columnar reader (the single Iceberg decode path, gated by the
 # `aws` feature). `default-features = false` drops the unused csv/json readers

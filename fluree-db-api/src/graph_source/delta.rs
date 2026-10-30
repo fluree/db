@@ -66,46 +66,20 @@ pub struct DeltaAzureFields {
 impl DeltaAzureFields {
     /// `None` when no field is set (ambient credentials). A partial set is an
     /// error: silently falling back to ambient credentials would read with an
-    /// identity the caller did not name.
+    /// identity the caller did not name. The one rule every surface uses
+    /// ([`super::surface::azure_auth`]).
     pub fn into_auth(self) -> crate::Result<Option<fluree_db_delta::AzureAuth>> {
-        use fluree_db_iceberg::ConfigValue;
-        let Self {
-            tenant_id,
-            client_id,
+        let client_secret = super::surface::secret_field(
+            "azure_client_secret",
+            self.client_secret,
+            "azure_client_secret_env",
+            self.client_secret_env,
+        )?;
+        Ok(super::surface::azure_auth(
+            self.tenant_id,
+            self.client_id,
             client_secret,
-            client_secret_env,
-        } = self;
-        if tenant_id.is_none()
-            && client_id.is_none()
-            && client_secret.is_none()
-            && client_secret_env.is_none()
-        {
-            return Ok(None);
-        }
-        let client_secret = match (client_secret, client_secret_env) {
-            (Some(literal), None) => ConfigValue::literal(literal),
-            (None, Some(var)) => ConfigValue::from_env(var),
-            _ => {
-                return Err(crate::ApiError::Config(
-                    "Azure service principal: give exactly one of the client secret and the \
-                     environment variable holding it"
-                        .to_string(),
-                ))
-            }
-        };
-        match (tenant_id, client_id) {
-            (Some(tenant_id), Some(client_id)) => {
-                Ok(Some(fluree_db_delta::AzureAuth::ClientSecret {
-                    tenant_id,
-                    client_id,
-                    client_secret,
-                }))
-            }
-            _ => Err(crate::ApiError::Config(
-                "Azure service principal: tenant id, client id and client secret are all required"
-                    .to_string(),
-            )),
-        }
+        )?)
     }
 }
 
@@ -129,52 +103,26 @@ pub struct DeltaUnityFields {
 
 impl DeltaUnityFields {
     /// `None` when no field is set. Catalog fields without a workspace, or a
-    /// workspace without exactly one way to authenticate, are errors.
+    /// workspace without exactly one way to authenticate, are errors: the
+    /// catalog-auth rule every surface uses
+    /// ([`super::surface::CatalogAuthFields`]).
     pub fn into_config(self) -> crate::Result<Option<UnityConfig>> {
-        use fluree_db_iceberg::auth::AuthConfig;
-        use fluree_db_iceberg::ConfigValue;
-        let bad = |message: &str| Err(crate::ApiError::Config(format!("Unity Catalog: {message}")));
-        let Some(uri) = self.uri else {
-            let stray = self.catalog.is_some()
-                || self.schema.is_some()
-                || self.bearer.is_some()
-                || self.oauth2_client_id.is_some()
-                || self.oauth2_client_secret.is_some()
-                || self.oauth2_token_url.is_some()
-                || self.oauth2_scope.is_some();
-            return if stray {
-                bad("catalog and auth options need the workspace URL")
-            } else {
-                Ok(None)
-            };
+        let auth = super::surface::CatalogAuthFields {
+            bearer: self.bearer.map(|token| ("auth_bearer", token)),
+            oauth2_token_url: self.oauth2_token_url,
+            oauth2_client_id: self.oauth2_client_id,
+            oauth2_client_secret: self
+                .oauth2_client_secret
+                .map(|secret| ("oauth2_client_secret", secret)),
+            oauth2_scope: self.oauth2_scope,
+            ..Default::default()
         };
-        let auth = match (
-            self.bearer,
-            self.oauth2_client_id,
-            self.oauth2_client_secret,
-        ) {
-            (Some(token), None, None) => AuthConfig::Bearer { token },
-            (None, Some(client_id), Some(client_secret)) => AuthConfig::OAuth2ClientCredentials {
-                token_url: self
-                    .oauth2_token_url
-                    .unwrap_or_else(|| format!("{}/oidc/v1/token", uri.trim_end_matches('/'))),
-                client_id: ConfigValue::literal(client_id),
-                client_secret,
-                scope: Some(self.oauth2_scope.unwrap_or_else(|| "all-apis".to_string())),
-                audience: None,
-            },
-            _ => {
-                return bad(
-                    "give a bearer token, or the client id and secret of a service principal",
-                )
-            }
-        };
-        Ok(Some(UnityConfig {
-            uri,
+        Ok(super::surface::unity_config(
+            self.uri,
+            self.catalog,
+            self.schema,
             auth,
-            catalog: self.catalog,
-            schema: self.schema,
-        }))
+        )?)
     }
 }
 
@@ -346,7 +294,14 @@ impl crate::Fluree {
             columns.sort();
             columns.dedup();
             let probed = async {
-                let table = open_placed(&gs_config, unity.as_ref(), &io, table_name).await?;
+                let table = open_placed(
+                    &gs_config,
+                    unity.as_ref(),
+                    &io,
+                    table_name,
+                    self.identity_context(),
+                )
+                .await?;
                 let snapshot = table
                     .snapshot(fluree_db_delta::VersionSelector::Latest)
                     .await?;
@@ -364,6 +319,15 @@ impl crate::Fluree {
                 // A name the config cannot place is a registration error, not a
                 // table that might appear later.
                 Err(DeltaError::Config(e)) => return Err(crate::ApiError::Config(e)),
+                // So is storage the instance's policy refuses (a host identity,
+                // a bucket off the allowlist): the configuration decides it,
+                // and no later query could read the table. The typed refusal a
+                // query would report.
+                Err(DeltaError::Identity(refusal)) if refusal.is_configuration_refusal() => {
+                    return Err(super::delta_catalog::config_error(DeltaError::Identity(
+                        refusal,
+                    )))
+                }
                 Err(e) => {
                     warn!(graph_source_id = %graph_source_id, table = %table_name, error = %e, "Delta table probe failed; registering anyway");
                     table_warnings.push(format!("table '{table_name}': {e}"));
@@ -396,21 +360,46 @@ impl crate::Fluree {
             model_warnings,
         })
     }
+
+    /// Open the Delta table at `location` the way this instance's graph
+    /// sources read one: `io`'s secret references resolved with the
+    /// instance's resolver, and the host's own AWS or Azure credentials used
+    /// only as its host-identity policy allows (`aws` and its bucket
+    /// allowlist, `azure`). An embedder that reads a table outside a graph
+    /// source opens it here rather than with [`DeltaTable::open`], which
+    /// takes the identity context explicitly.
+    ///
+    /// A host-identity refusal is the typed [`QueryError`] a query reports
+    /// for it; any other failure is a configuration error naming the table.
+    pub async fn open_delta_table(
+        &self,
+        name: &str,
+        location: &str,
+        io: &DeltaIoConfig,
+    ) -> crate::Result<DeltaTable> {
+        let io = io
+            .hydrate(self.secret_resolver())
+            .await
+            .map_err(super::delta_catalog::config_error)?;
+        DeltaTable::open(name, location, &io, self.identity_context())
+            .map_err(super::delta_catalog::config_error)
+    }
 }
 
 /// Open `table_name` where `config` places it. `unity` and `io` are the
-/// config's own, hydrated.
+/// config's own, hydrated; Unity's auth is built under `identity`.
 pub(crate) async fn open_placed(
     config: &DeltaGsConfig,
     unity: Option<&UnityConfig>,
     io: &DeltaIoConfig,
     table_name: &str,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> Result<DeltaTable, DeltaError> {
     match (config.placement(table_name)?, unity) {
         (Placement::Unity(full_name), Some(unity)) => {
-            DeltaTable::open_in_unity(table_name, unity, &full_name, io).await
+            DeltaTable::open_in_unity(table_name, unity, &full_name, io, identity).await
         }
-        (Placement::Path(location), _) => DeltaTable::open(table_name, &location, io),
+        (Placement::Path(location), _) => DeltaTable::open(table_name, &location, io, identity),
         (Placement::Unity(full_name), None) => Err(DeltaError::Config(format!(
             "table '{full_name}' is placed in a catalog the source does not have"
         ))),
@@ -530,10 +519,11 @@ impl DeltaSource {
         let table = fluree
             .r2rml_cache()
             .delta_table(
+                &self.graph_source_id,
                 table_name,
                 &placement,
                 &self.config,
-                fluree.secret_resolver(),
+                fluree.identity_context(),
             )
             .await
             .map_err(|e| self.query_error(table_name, e))?;
@@ -846,6 +836,14 @@ fn delta_query_error(graph_source_id: &str, table_name: &str, error: DeltaError)
                 message,
             ),
         },
+        // The catalog identity's own refusals: the codes an Iceberg source
+        // reports for them.
+        DeltaError::Identity(refusal) => {
+            let fallback =
+                format!("Delta graph source '{graph_source_id}', table '{table_name}': {refusal}");
+            crate::graph_source::iceberg_catalog::identity_query_error(refusal)
+                .unwrap_or(QueryError::Internal(fallback))
+        }
         other => QueryError::Internal(format!(
             "Delta graph source '{graph_source_id}', table '{table_name}': {other}"
         )),
@@ -869,6 +867,176 @@ pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Opti
 mod tests {
     use super::*;
     use fluree_db_delta::AzureAuth;
+
+    fn google_unity() -> UnityConfig {
+        UnityConfig {
+            uri: "https://workspace.invalid".to_string(),
+            auth: fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+                scopes: None,
+                metadata_url: None,
+            },
+            catalog: None,
+            schema: None,
+        }
+    }
+
+    fn denying() -> crate::Fluree {
+        crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(fluree_db_iceberg::HostIdentityPolicy::deny_all())
+    }
+
+    /// The catalog identity's refusal is typed on the query path (opening a
+    /// Unity-placed table, the step a query's first touch takes) and through
+    /// the onboarding mapping, with the codes an Iceberg source reports.
+    #[tokio::test]
+    async fn a_refused_unity_identity_is_typed_on_query_and_onboarding_paths() {
+        let fluree = denying();
+        let config = DeltaGsConfig {
+            unity: Some(google_unity()),
+            ..Default::default()
+        };
+        let opened = fluree
+            .r2rml_cache()
+            .delta_table(
+                "gs:main",
+                "orders",
+                &Placement::Unity("main.sales.orders".to_string()),
+                &config,
+                fluree.identity_context(),
+            )
+            .await;
+        let error = match opened {
+            Ok(_) => panic!("the policy refuses the metadata server"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, DeltaError::Identity(_)), "{error:?}");
+        let query = delta_query_error("gs:main", "orders", error);
+        assert!(
+            matches!(&query, QueryError::HostIdentityRefused { kind, .. } if kind == "google-metadata"),
+            "{query:?}"
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 403);
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+
+        // Onboarding validates a Unity config before building its auth (and
+        // accepts only bearer / OAuth2 there today), so the mapping is checked
+        // directly: a refusal reaching it keeps its type and code.
+        let onboarding = super::super::delta_catalog::config_error(DeltaError::Identity(
+            fluree_db_iceberg::IcebergError::HostIdentityRefused {
+                kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+            },
+        ));
+        assert_eq!(onboarding.status_code(), 403, "{onboarding:?}");
+        assert_eq!(
+            onboarding.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+    }
+
+    /// A path source read with the host's own credentials is read with a host
+    /// identity the instance's policy governs, on the query path and through
+    /// the embedder's `Fluree::open_delta_table`, before any request.
+    #[tokio::test]
+    async fn a_path_source_borrows_the_host_identity_only_as_the_policy_allows() {
+        use fluree_db_iceberg::HostIdentityPolicy;
+        let io = DeltaIoConfig {
+            s3_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let config = DeltaGsConfig {
+            io: io.clone(),
+            ..Default::default()
+        };
+        let internal = "s3://stack-internal/t";
+        let azure = "abfss://lake@account.dfs.core.windows.net/t";
+
+        // The query path: a typed 403 naming the switch.
+        let fluree = denying();
+        for (location, kind) in [(internal, "aws"), (azure, "azure")] {
+            let error = match fluree
+                .r2rml_cache()
+                .delta_table(
+                    "gs:path",
+                    "t",
+                    &Placement::Path(location.to_string()),
+                    &config,
+                    fluree.identity_context(),
+                )
+                .await
+            {
+                Ok(_) => panic!("{location}: the policy refuses the host identity"),
+                Err(error) => error,
+            };
+            let query = delta_query_error("gs:path", "t", error);
+            assert!(
+                matches!(&query, QueryError::HostIdentityRefused { kind: k, .. } if k == kind),
+                "{query:?}"
+            );
+        }
+
+        // The embedder's way in, under the instance's context.
+        for location in [internal, azure] {
+            let err = fluree
+                .open_delta_table("t", location, &io)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(err.status_code(), 403, "{err}");
+            assert_eq!(
+                err.error_type(),
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED
+            );
+        }
+        let lake_only = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(HostIdentityPolicy::parse(None, Some("lake")).unwrap());
+        assert!(lake_only
+            .open_delta_table("t", "s3://lake/t", &io)
+            .await
+            .is_ok());
+        let err = lake_only
+            .open_delta_table("t", internal, &io)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+        assert!(err.to_string().contains("stack-internal"), "{err}");
+        // An instance that allows every host identity opens both.
+        let open = crate::FlureeBuilder::memory().build_memory();
+        for location in [internal, azure] {
+            assert!(
+                open.open_delta_table("t", location, &io).await.is_ok(),
+                "{location}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_google_exchange_refusal_from_unity_keeps_its_code() {
+        let query = delta_query_error(
+            "gs:main",
+            "orders",
+            DeltaError::Identity(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Jwt,
+                status: Some(400),
+                reason: Some("invalid_grant".to_string()),
+            }),
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 401, "{api:?}");
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::GOOGLE_TOKEN_EXCHANGE
+        );
+    }
 
     /// A catalog's 401/403 reaches the client as a typed 403, not as an
     /// invalid query; any other catalog failure keeps its old mapping.

@@ -72,7 +72,9 @@ Give `--root`, one or more `--table`, or both.
 | `--azure-client-secret <SECRET>` | Literal client secret. Stored with the graph source; prefer the option above |
 
 Give the tenant, the client id and one of the two secret options together, or
-none of them to use ambient credentials. See
+none of them to use ambient credentials. With `--remote`, the server must list
+the `--azure-client-secret-env` variable in
+[`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning). See
 [Credentials](../graph-sources/delta.md#credentials).
 
 **Unity Catalog (Databricks):**
@@ -88,8 +90,9 @@ none of them to use ambient credentials. See
 | `--auth-bearer-env <VAR>` / `--auth-bearer <TOKEN>` | A Databricks personal access token in place of a service principal, by variable or literal. It does not renew |
 | `--oauth2-token-url <URL>` | OAuth2 token URL (default: the workspace's own, `<unity-uri>/oidc/v1/token`) |
 | `--oauth2-scope <SCOPE>` | OAuth2 scope (default: `all-apis`) |
+| `--oauth2-audience <AUDIENCE>` | OAuth2 audience (default: none) |
 
-Give a service principal's id and secret, or a token. On AWS also give
+These are the catalog-auth options `fluree iceberg map` and `fluree sql map` take, decided by the same rule. Give a service principal's id and secret, or a token: both at once, a partial service principal, and an auth or catalog option without `--unity-uri` are refused. On AWS also give
 `--s3-region`: Unity Catalog does not name the bucket's region. See
 [Unity Catalog](../graph-sources/delta.md#unity-catalog).
 

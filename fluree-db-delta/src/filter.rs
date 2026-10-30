@@ -1,9 +1,9 @@
 //! Column predicates pushed into a scan.
 //!
 //! They act twice. Kernel skips a file whose partition values or min/max
-//! statistics prove no row can match ([`to_predicate`]), and the rows of the
+//! statistics prove no row can match (`to_predicate`), and the rows of the
 //! files that are read are filtered before they leave the reader
-//! ([`RowFilter`]). Both only ever remove rows the predicate rejects, under one
+//! (`RowFilter`). Both only ever remove rows the predicate rejects, under one
 //! rule: a filter is used only when its value has the column's own physical
 //! type, so the comparison made here is the one the caller would make.
 

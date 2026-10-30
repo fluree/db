@@ -57,6 +57,30 @@ fn session_pairs(args: &SqlMapArgs) -> CliResult<std::collections::BTreeMap<Stri
         .collect()
 }
 
+/// The endpoint auth the flags describe, through the codec every surface uses:
+/// one mode or none, in the CLI's spelling when refused.
+#[cfg(feature = "iceberg")]
+fn endpoint_auth(args: &SqlMapArgs) -> CliResult<fluree_db_api::IcebergAuthConfig> {
+    use super::source_auth::usage;
+    let auth = args.auth.fields(Some(&args.google))?;
+    // The CLI names variables of its own process; it has no secret resolver.
+    auth.check(&fluree_db_api::SecretRules::local(false))
+        .map_err(usage)?;
+    auth.into_auth(fluree_db_api::AuthProfile::Catalog)
+        .map_err(usage)
+}
+
+/// The `sql/map` body for a remote server.
+///
+/// A bearer token or OAuth2 client credentials go as the flat fields. A
+/// server older than the structured `auth` does not refuse a field it does
+/// not know: given `auth`, it would register the source with no auth and say
+/// nothing. It reads the literal flat fields; the `_env` forms, and a Google
+/// identity (which has no flat field, so goes as the structured `auth`), are
+/// newer than it, and it still drops them. The server converts the flat
+/// fields with the codec [`endpoint_auth`] uses, so both store the same
+/// record.
+#[cfg(feature = "iceberg")]
 fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
         "name": args.name,
@@ -74,12 +98,6 @@ fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
         ("catalog", &args.catalog),
         ("schema", &args.schema),
         ("user", &args.user),
-        ("auth_bearer", &args.auth_bearer),
-        ("oauth2_token_url", &args.oauth2_token_url),
-        ("oauth2_client_id", &args.oauth2_client_id),
-        ("oauth2_client_secret", &args.oauth2_client_secret),
-        ("oauth2_scope", &args.oauth2_scope),
-        ("oauth2_audience", &args.oauth2_audience),
         ("model", &args.model),
     ] {
         if let Some(v) = value {
@@ -96,7 +114,41 @@ fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
     if args.allow_duplicate_subjects {
         obj.insert("allow_duplicate_subjects".into(), true.into());
     }
+    use fluree_db_api::IcebergAuthConfig;
+    match endpoint_auth(args)? {
+        IcebergAuthConfig::None => {}
+        IcebergAuthConfig::Bearer { .. } | IcebergAuthConfig::OAuth2ClientCredentials { .. } => {
+            let flags = &args.auth;
+            for (key, value) in [
+                ("auth_bearer", &flags.auth_bearer),
+                ("auth_bearer_env", &flags.auth_bearer_env),
+                ("oauth2_token_url", &flags.oauth2_token_url),
+                ("oauth2_client_id", &flags.oauth2_client_id),
+                ("oauth2_client_secret", &flags.oauth2_client_secret),
+                ("oauth2_client_secret_env", &flags.oauth2_client_secret_env),
+                ("oauth2_scope", &flags.oauth2_scope),
+                ("oauth2_audience", &flags.oauth2_audience),
+            ] {
+                if let Some(v) = value {
+                    body[key] = v.clone().into();
+                }
+            }
+        }
+        auth => {
+            body["auth"] =
+                serde_json::to_value(auth).map_err(|e| CliError::Input(e.to_string()))?;
+        }
+    }
     Ok(body)
+}
+
+#[cfg(not(feature = "iceberg"))]
+fn args_to_json(_args: &SqlMapArgs) -> CliResult<serde_json::Value> {
+    Err(CliError::Usage(
+        "SQL graph source support not compiled; the request a server takes is built by it. \
+         Rebuild with `--features sql`."
+            .into(),
+    ))
 }
 
 async fn run_sql_map_remote(
@@ -206,7 +258,7 @@ async fn run_sql_check_local(_name: &str, _dirs: &FlureeDir) -> CliResult<()> {
 
 #[cfg(feature = "sql")]
 async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> {
-    use fluree_db_api::{SqlAuthConfig, SqlConfigValue, SqlDialect, WireProtocol};
+    use fluree_db_api::{SqlDialect, WireProtocol};
 
     let fluree = crate::context::build_fluree(dirs).await?;
     let mapping = read_mapping(&args)?;
@@ -243,19 +295,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
             }
         };
     }
-    if let (Some(url), Some(secret)) = (&args.oauth2_token_url, &args.oauth2_client_secret) {
-        config.auth = SqlAuthConfig::OAuth2ClientCredentials {
-            token_url: url.clone(),
-            client_id: SqlConfigValue::Literal(args.oauth2_client_id.clone().unwrap_or_default()),
-            client_secret: SqlConfigValue::Literal(secret.clone()),
-            scope: args.oauth2_scope.clone(),
-            audience: args.oauth2_audience.clone(),
-        };
-    } else if let Some(token) = &args.auth_bearer {
-        config.auth = SqlAuthConfig::Bearer {
-            token: SqlConfigValue::Literal(token.clone()),
-        };
-    }
+    config.auth = endpoint_auth(&args)?;
 
     config.allow_duplicate_subjects = args.allow_duplicate_subjects;
     let result = fluree.create_sql_graph_source(config).await?;
@@ -316,4 +356,167 @@ fn print_created(
             "not validated (check mapping source)"
         }
     );
+}
+
+#[cfg(all(test, feature = "iceberg"))]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> SqlMapArgs {
+        use clap::Parser;
+        let mut argv = vec![
+            "fluree",
+            "sql",
+            "map",
+            "orders",
+            "--endpoint",
+            "https://trino.example.com",
+            "--r2rml",
+            "m.ttl",
+        ];
+        argv.extend_from_slice(args);
+        match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::Commands::Sql {
+                action: crate::cli::SqlAction::Map(args),
+            } => *args,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn sql_secrets_can_name_a_variable_and_google_reaches_the_endpoint() {
+        let auth = serde_json::to_value(
+            endpoint_auth(&parse(&["--auth-bearer-env", "TRINO_TOKEN"])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(auth["token"]["env_var"], "TRINO_TOKEN");
+        let google = endpoint_auth(&parse(&["--auth-google-adc"])).unwrap();
+        assert!(matches!(
+            google,
+            fluree_db_api::IcebergAuthConfig::Google { .. }
+        ));
+    }
+
+    /// The `sql/map` body for `flags`, and the auth a server stores from it.
+    fn remote_body(flags: &[&str]) -> (serde_json::Value, fluree_db_api::IcebergAuthConfig) {
+        let mapping = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(mapping.path(), "").unwrap();
+        let mut args = parse(flags);
+        args.r2rml = mapping.path().to_path_buf();
+        let body = args_to_json(&args).unwrap();
+        let mut fields = body.as_object().unwrap().clone();
+        for key in [
+            "name",
+            "endpoint",
+            "r2rml",
+            "r2rml_type",
+            "branch",
+            "dialect",
+            "protocol",
+            "catalog",
+            "schema",
+            "user",
+            "model",
+            "session",
+            "default_allow",
+            "allow_duplicate_subjects",
+        ] {
+            fields.remove(key);
+        }
+        let stored = fluree_db_api::sql_auth_from_json(
+            fields,
+            &fluree_db_api::SecretRules::listed("TRINO_TOKEN,TRINO_SECRET,SA_KEY", false),
+        )
+        .unwrap();
+        assert_eq!(stored, endpoint_auth(&args).unwrap(), "{flags:?}");
+        (body, stored)
+    }
+
+    #[test]
+    fn a_remote_sql_map_sends_what_has_a_flat_form_as_the_flat_fields() {
+        // A server older than the structured `auth` ignores it and registers
+        // the source with no auth; the flat fields are what it reads.
+        let oauth2 = [
+            "--oauth2-token-url",
+            "https://t.example.com/token",
+            "--oauth2-client-id",
+            "c",
+            "--oauth2-scope",
+            "s",
+            "--oauth2-audience",
+            "a",
+        ];
+        for (flags, flat) in [
+            (vec!["--auth-bearer", "t"], vec![("auth_bearer", "t")]),
+            (
+                vec!["--auth-bearer-env", "TRINO_TOKEN"],
+                vec![("auth_bearer_env", "TRINO_TOKEN")],
+            ),
+            (
+                [&oauth2[..], &["--oauth2-client-secret", "x"]].concat(),
+                vec![
+                    ("oauth2_token_url", "https://t.example.com/token"),
+                    ("oauth2_client_id", "c"),
+                    ("oauth2_client_secret", "x"),
+                    ("oauth2_scope", "s"),
+                    ("oauth2_audience", "a"),
+                ],
+            ),
+            (
+                [&oauth2[..], &["--oauth2-client-secret-env", "TRINO_SECRET"]].concat(),
+                vec![
+                    ("oauth2_token_url", "https://t.example.com/token"),
+                    ("oauth2_client_id", "c"),
+                    ("oauth2_client_secret_env", "TRINO_SECRET"),
+                    ("oauth2_scope", "s"),
+                    ("oauth2_audience", "a"),
+                ],
+            ),
+        ] {
+            let (body, _) = remote_body(&flags);
+            assert!(body.get("auth").is_none(), "{flags:?}: {body}");
+            for (key, value) in flat {
+                assert_eq!(body[key], value, "{flags:?}: {body}");
+            }
+        }
+
+        // No auth: neither form.
+        let (body, stored) = remote_body(&[]);
+        assert_eq!(stored, fluree_db_api::IcebergAuthConfig::None);
+        assert!(body.get("auth").is_none() && body.get("auth_bearer").is_none());
+
+        // A Google identity has no flat field: the structured `auth`.
+        for flags in [
+            vec!["--auth-google-adc"],
+            vec!["--auth-google-service-account-env", "SA_KEY"],
+        ] {
+            let (body, stored) = remote_body(&flags);
+            assert!(matches!(
+                stored,
+                fluree_db_api::IcebergAuthConfig::Google { .. }
+            ));
+            assert_eq!(body["auth"]["type"], "google", "{flags:?}: {body}");
+        }
+    }
+
+    #[test]
+    fn sql_auth_given_two_ways_or_half_given_is_refused() {
+        // OAuth2 used to win over a bearer silently, and a token URL alone
+        // to store no auth.
+        let e = endpoint_auth(&parse(&[
+            "--auth-bearer",
+            "t",
+            "--oauth2-token-url",
+            "https://t.example.com",
+            "--oauth2-client-secret",
+            "s",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("two ways"), "{e}");
+        let e = endpoint_auth(&parse(&["--oauth2-token-url", "https://t.example.com"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--oauth2-token-url needs"), "{e}");
+    }
 }

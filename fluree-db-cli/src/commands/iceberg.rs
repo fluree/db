@@ -377,30 +377,22 @@ pub(crate) fn model_warnings_of(result: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
+/// The `iceberg/map` body for a remote server: the source's connection as the
+/// structured `catalog` / `io` its stored config holds (built by the same
+/// conversion a local map uses, so remote and local store the same record),
+/// and the mapping's text rather than its path.
+#[cfg(feature = "iceberg")]
+pub fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
+    let stored = build_iceberg_config(args)?.to_iceberg_gs_config();
     let mut body = serde_json::json!({
         "name": args.name,
-        "mode": args.mode,
+        "catalog": stored.catalog,
+        "io": stored.io,
     });
     let obj = body.as_object_mut().unwrap();
 
-    if let Some(ref v) = args.catalog_uri {
-        obj.insert("catalog_uri".into(), v.clone().into());
-    }
     if let Some(ref v) = args.table {
         obj.insert("table".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.table_location {
-        obj.insert("table_location".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.region {
-        obj.insert("region".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.catalog_id {
-        obj.insert("catalog_id".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.table_bucket_arn {
-        obj.insert("table_bucket_arn".into(), v.clone().into());
     }
     if let Some(ref v) = args.r2rml {
         // Read file content and send it (not the path)
@@ -428,47 +420,17 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     if let Some(v) = args.default_allow {
         obj.insert("default_allow".into(), v.into());
     }
-    if let Some(ref v) = args.auth_bearer {
-        obj.insert("auth_bearer".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.auth_bearer_env {
-        obj.insert("auth_bearer_env".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.oauth2_token_url {
-        obj.insert("oauth2_token_url".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.oauth2_client_id {
-        obj.insert("oauth2_client_id".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.oauth2_client_secret {
-        obj.insert("oauth2_client_secret".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.oauth2_client_secret_env {
-        obj.insert("oauth2_client_secret_env".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.oauth2_scope {
-        obj.insert("oauth2_scope".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.oauth2_audience {
-        obj.insert("oauth2_audience".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.warehouse {
-        obj.insert("warehouse".into(), v.clone().into());
-    }
-    if args.no_vended_credentials {
-        obj.insert("no_vended_credentials".into(), true.into());
-    }
-    if let Some(ref v) = args.s3_region {
-        obj.insert("s3_region".into(), v.clone().into());
-    }
-    if let Some(ref v) = args.s3_endpoint {
-        obj.insert("s3_endpoint".into(), v.clone().into());
-    }
-    if args.s3_path_style {
-        obj.insert("s3_path_style".into(), true.into());
-    }
 
     Ok(body)
+}
+
+#[cfg(not(feature = "iceberg"))]
+pub fn args_to_json(_args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
+    Err(CliError::Usage(
+        "Iceberg support not compiled; the request a server takes is built by it. Rebuild \
+         with `--features iceberg`."
+            .into(),
+    ))
 }
 
 fn print_iceberg_list_remote(
@@ -679,58 +641,76 @@ async fn run_iceberg_map_local(_args: IcebergMapArgs, _dirs: &FlureeDir) -> CliR
 // Helpers
 // =============================================================================
 
+/// The connection `iceberg map`'s flags describe, through the codec every
+/// surface uses ([`fluree_db_api::IcebergConnectionFields`]). A REST catalog
+/// with no storage flag reads with the identity its warehouse implies (see
+/// [`fluree_db_api::default_storage_auth`]): `catalog` for `bq://`, `vended`
+/// for `bl://`. A Google catalog identity with no
+/// `--auth-google-quota-project` bills to the project a `bq://projects/<P>/…`
+/// or `bl://projects/<P>/…` warehouse names
+/// ([`fluree_db_api::default_google_quota_project`]): BigLake refuses a
+/// request that names none, whatever the identity.
 #[cfg(feature = "iceberg")]
-/// A secret given literally or as the name of an environment variable (clap
-/// refuses both).
-pub(crate) fn secret_value(
-    literal: &Option<String>,
-    env: &Option<String>,
-) -> Option<fluree_db_api::IcebergConfigValue> {
-    use fluree_db_api::IcebergConfigValue as ConfigValue;
-    match (literal, env) {
-        (Some(value), _) => Some(ConfigValue::literal(value)),
-        (None, Some(name)) => Some(ConfigValue::from_env(name)),
-        (None, None) => None,
+pub(crate) fn connection_fields(
+    args: &IcebergMapArgs,
+) -> CliResult<fluree_db_api::IcebergConnectionFields> {
+    let mut auth = args.auth.fields(Some(&args.google))?;
+    if !auth.google.is_empty() && auth.google_quota_project.is_none() {
+        auth.google_quota_project =
+            fluree_db_api::default_google_quota_project(args.warehouse.as_deref());
     }
+    let default_storage_auth = if args.storage.is_given() || args.no_vended_credentials {
+        None
+    } else {
+        fluree_db_api::default_storage_auth(args.warehouse.as_deref())
+    };
+    if default_storage_auth == Some(fluree_db_api::StorageAuth::Catalog) && auth.google.is_empty() {
+        return Err(CliError::Usage(
+            "a bq:// warehouse (BigLake federation) never vends: its files are read with the \
+             catalog's own Google identity (--storage-identity catalog, its default). \
+             Authenticate the catalog with --auth-google-metadata, --auth-google-adc, \
+             --auth-google-service-account-env or --auth-google-wif-config, or choose another \
+             --storage-identity"
+                .to_string(),
+        ));
+    }
+    Ok(fluree_db_api::IcebergConnectionFields {
+        mode: args.mode.clone(),
+        catalog_uri: args.catalog_uri.clone(),
+        table_location: args.table_location.clone(),
+        region: args.region.clone(),
+        catalog_id: args.catalog_id.clone(),
+        table_bucket_arn: args.table_bucket_arn.clone(),
+        auth,
+        warehouse: args.warehouse.clone(),
+        no_vended_credentials: args.no_vended_credentials,
+        s3_region: args.s3_region.clone(),
+        s3_endpoint: args.s3_endpoint.clone(),
+        s3_path_style: args.s3_path_style,
+        storage_auth: args.storage.fields()?,
+        default_storage_auth,
+    })
 }
 
+/// The create config `iceberg map`'s flags describe; a local map registers
+/// it and a remote one sends its stored connection.
 #[cfg(feature = "iceberg")]
-fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::IcebergCreateConfig> {
-    // One mode dispatch for every surface (the server parses its JSON the same
-    // way); errors name this surface's flags.
-    let rest_only: Vec<&'static str> = [
-        ("auth_bearer", args.auth_bearer.is_some()),
-        ("auth_bearer_env", args.auth_bearer_env.is_some()),
-        ("oauth2_token_url", args.oauth2_token_url.is_some()),
-        ("oauth2_client_id", args.oauth2_client_id.is_some()),
-        ("oauth2_client_secret", args.oauth2_client_secret.is_some()),
-        (
-            "oauth2_client_secret_env",
-            args.oauth2_client_secret_env.is_some(),
-        ),
-        ("oauth2_scope", args.oauth2_scope.is_some()),
-        ("oauth2_audience", args.oauth2_audience.is_some()),
-        ("warehouse", args.warehouse.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(name, given)| given.then_some(name))
-    .collect();
-    let mode_args = fluree_db_api::CatalogModeArgs {
-        mode: &args.mode,
-        catalog_uri: args.catalog_uri.as_deref(),
-        table_location: args.table_location.as_deref(),
-        region: args.region.as_deref(),
-        catalog_id: args.catalog_id.as_deref(),
-        table_bucket_arn: args.table_bucket_arn.as_deref(),
-        rest_only: &rest_only,
-    };
-    let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
+pub fn build_iceberg_config(
+    args: &IcebergMapArgs,
+) -> CliResult<fluree_db_api::IcebergCreateConfig> {
+    use super::source_auth::usage;
+    // The CLI names variables of its own process; it has no secret resolver.
+    let rules = fluree_db_api::SecretRules::local(false);
+    let connection = connection_fields(args)?
+        .into_connection(&rules)
+        .map_err(usage)?;
+    let mut config = fluree_db_api::IcebergCreateConfig::from_connection_for(
         &args.name,
-        mode_args,
+        connection,
         args.table.as_deref(),
         args.r2rml.is_some(),
     )
-    .map_err(|e| CliError::Usage(e.message(|field| format!("--{}", field.replace('_', "-")))))?;
+    .map_err(|e| usage(e.into()))?;
 
     if let Some(ref branch) = args.branch {
         config = config.with_branch(branch);
@@ -740,38 +720,6 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
     }
     if let Some(allow) = args.default_allow {
         config = config.with_default_allow(allow);
-    }
-    if let Some(token) = secret_value(&args.auth_bearer, &args.auth_bearer_env) {
-        config = config.with_auth_bearer_value(token);
-    }
-    // OAuth2 activates on token_url + client_secret; client_id defaults to "" so
-    // Horizon / PAT users can omit it (an empty client_id is what Snowflake
-    // Horizon's `session:role:` exchange requires).
-    let oauth2_secret = secret_value(&args.oauth2_client_secret, &args.oauth2_client_secret_env);
-    if let (Some(ref url), Some(secret)) = (&args.oauth2_token_url, oauth2_secret) {
-        let id = args.oauth2_client_id.as_deref().unwrap_or("");
-        config = config.with_auth_oauth2_secret_value(url, id, secret);
-        if let Some(ref scope) = args.oauth2_scope {
-            config = config.with_oauth2_scope(scope);
-        }
-        if let Some(ref audience) = args.oauth2_audience {
-            config = config.with_oauth2_audience(audience);
-        }
-    }
-    if let Some(ref wh) = args.warehouse {
-        config = config.with_warehouse(wh);
-    }
-    if args.no_vended_credentials {
-        config = config.with_vended_credentials(false);
-    }
-    if let Some(ref region) = args.s3_region {
-        config = config.with_s3_region(region);
-    }
-    if let Some(ref endpoint) = args.s3_endpoint {
-        config = config.with_s3_endpoint(endpoint);
-    }
-    if args.s3_path_style {
-        config = config.with_s3_path_style(true);
     }
 
     Ok(config)
@@ -807,108 +755,96 @@ fn is_iceberg_family_type_str(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn base_rest_args() -> IcebergMapArgs {
-        IcebergMapArgs {
-            name: "gs".to_string(),
-            remote: None,
-            mode: "rest".to_string(),
-            catalog_uri: Some("https://catalog.example.com".to_string()),
-            table: Some("ns.tbl".to_string()),
-            table_location: None,
-            region: None,
-            catalog_id: None,
-            table_bucket_arn: None,
-            r2rml: None,
-            r2rml_type: None,
-            branch: None,
-            model: None,
-            default_allow: None,
-            auth_bearer: None,
-            auth_bearer_env: None,
-            oauth2_token_url: None,
-            oauth2_client_id: None,
-            oauth2_client_secret: None,
-            oauth2_client_secret_env: None,
-            oauth2_scope: None,
-            oauth2_audience: None,
-            warehouse: None,
-            no_vended_credentials: false,
-            s3_region: None,
-            s3_endpoint: None,
-            s3_path_style: false,
+    /// `fluree iceberg map gs <args>`, as clap parses it.
+    fn parse(args: &[&str]) -> IcebergMapArgs {
+        use clap::Parser;
+        let mut argv = vec!["fluree", "iceberg", "map", "gs"];
+        argv.extend_from_slice(args);
+        match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::Commands::Iceberg {
+                action: crate::cli::IcebergAction::Map(args),
+            } => *args,
+            _ => unreachable!(),
         }
     }
 
+    fn rest(extra: &[&str]) -> IcebergMapArgs {
+        let mut args = vec![
+            "--catalog-uri",
+            "https://catalog.example.com",
+            "--table",
+            "ns.tbl",
+        ];
+        args.extend_from_slice(extra);
+        parse(&args)
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn stored(args: &IcebergMapArgs) -> serde_json::Value {
+        serde_json::to_value(build_iceberg_config(args).unwrap().to_iceberg_gs_config()).unwrap()
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn refusal(args: &IcebergMapArgs) -> String {
+        build_iceberg_config(args).unwrap_err().to_string()
+    }
+
+    #[cfg(feature = "iceberg")]
     #[test]
     fn args_to_json_carries_model_ledger() {
-        let mut args = base_rest_args();
-        assert!(args_to_json(&args).unwrap().get("model").is_none());
-        args.model = Some("governance:main".to_string());
-        assert_eq!(args_to_json(&args).unwrap()["model"], "governance:main");
-        assert!(args_to_json(&args).unwrap().get("default_allow").is_none());
-        args.default_allow = Some(true);
-        assert_eq!(args_to_json(&args).unwrap()["default_allow"], true);
+        let body = args_to_json(&rest(&[])).unwrap();
+        assert!(body.get("model").is_none());
+        assert!(body.get("default_allow").is_none());
+        let body = args_to_json(&rest(&[
+            "--model",
+            "governance:main",
+            "--default-allow",
+            "true",
+        ]))
+        .unwrap();
+        assert_eq!(body["model"], "governance:main");
+        assert_eq!(body["default_allow"], true);
     }
 
+    #[cfg(feature = "iceberg")]
     #[test]
-    fn args_to_json_includes_oauth2_scope_and_audience() {
-        let mut args = base_rest_args();
-        args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
-        args.oauth2_client_secret = Some("pat".to_string());
-        args.oauth2_scope = Some("session:role:ICEBERG_READER".to_string());
-        args.oauth2_audience = Some("polaris".to_string());
-
+    fn a_remote_body_is_the_structured_connection_a_local_map_stores() {
+        let args = rest(&[
+            "--oauth2-token-url",
+            "https://catalog.example.com/v1/oauth/tokens",
+            "--oauth2-client-secret-env",
+            "CATALOG_SECRET",
+            "--oauth2-scope",
+            "session:role:ICEBERG_READER",
+            "--oauth2-audience",
+            "polaris",
+            "--warehouse",
+            "wh",
+        ]);
         let body = args_to_json(&args).unwrap();
-        assert_eq!(body["oauth2_scope"], "session:role:ICEBERG_READER");
-        assert_eq!(body["oauth2_audience"], "polaris");
-        // Omitting client_id leaves it out of the remote body entirely.
-        assert!(body.get("oauth2_client_id").is_none());
-    }
-
-    #[test]
-    fn a_secret_named_by_variable_reaches_a_remote_server_as_the_name() {
-        let mut args = base_rest_args();
-        args.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
-        args.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
-
-        let body = args_to_json(&args).unwrap();
-        assert_eq!(body["auth_bearer_env"], "CATALOG_TOKEN");
-        assert_eq!(body["oauth2_client_secret_env"], "CATALOG_SECRET");
-        assert!(body.get("auth_bearer").is_none());
-        assert!(body.get("oauth2_client_secret").is_none());
+        let stored = stored(&args);
+        assert_eq!(body["catalog"], stored["catalog"]);
+        assert_eq!(body["io"], stored["io"]);
+        let auth = &body["catalog"]["auth"];
+        assert_eq!(auth["scope"], "session:role:ICEBERG_READER");
+        assert_eq!(auth["audience"], "polaris");
+        // Omitting the client id sends an empty one (Snowflake Horizon).
+        assert_eq!(auth["client_id"], "");
+        // A secret named by variable reaches the server as the name.
+        assert_eq!(auth["client_secret"]["env_var"], "CATALOG_SECRET");
+        // No flat field survives into the structured body.
+        assert!(body.get("oauth2_scope").is_none() && body.get("catalog_uri").is_none());
     }
 
     #[cfg(feature = "iceberg")]
     #[test]
     fn a_secret_named_by_variable_is_stored_as_the_name() {
-        let mut bearer = base_rest_args();
-        bearer.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
-        let stored = serde_json::to_value(
-            build_iceberg_config(&bearer)
-                .unwrap()
-                .to_iceberg_gs_config(),
-        )
-        .unwrap();
+        let stored = stored(&rest(&["--auth-bearer-env", "CATALOG_TOKEN"]));
         assert_eq!(stored["catalog"]["auth"]["type"], "bearer");
         assert_eq!(
             stored["catalog"]["auth"]["token"]["env_var"],
             "CATALOG_TOKEN"
         );
-
-        let mut oauth2 = base_rest_args();
-        oauth2.oauth2_token_url = Some("https://catalog.example.com/token".to_string());
-        oauth2.oauth2_client_id = Some("app".to_string());
-        oauth2.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
-        let stored = serde_json::to_value(
-            build_iceberg_config(&oauth2)
-                .unwrap()
-                .to_iceberg_gs_config(),
-        )
-        .unwrap();
-        let auth = &stored["catalog"]["auth"];
-        assert_eq!(auth["type"], "oauth2_client_credentials");
-        assert_eq!(auth["client_id"], "app");
-        assert_eq!(auth["client_secret"]["env_var"], "CATALOG_SECRET");
     }
 
     #[test]
@@ -935,53 +871,257 @@ mod tests {
             "S"
         ])
         .is_err());
+        // The legacy vending switch and the storage identity are one choice.
+        assert!(parse(&["--no-vended-credentials", "--storage-identity", "ambient"]).is_err());
     }
 
     #[cfg(feature = "iceberg")]
     #[test]
-    fn build_iceberg_config_activates_oauth2_without_client_id_and_threads_scope() {
-        let mut args = base_rest_args();
-        args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
-        // No client_id -> defaults to "" so OAuth2 still activates.
-        args.oauth2_client_secret = Some("pat".to_string());
-        args.oauth2_scope = Some("session:role:ICEBERG_READER".to_string());
-        args.oauth2_audience = Some("polaris".to_string());
-
-        let config = build_iceberg_config(&args).unwrap();
-        let gs = config.to_iceberg_gs_config();
-        let v = serde_json::to_value(&gs).unwrap();
-        let auth = &v["catalog"]["auth"];
-
-        assert_eq!(auth["type"], "oauth2_client_credentials");
-        assert_eq!(auth["client_id"], "");
-        assert_eq!(auth["client_secret"], "pat");
-        assert_eq!(auth["scope"], "session:role:ICEBERG_READER");
-        assert_eq!(auth["audience"], "polaris");
+    fn half_given_or_doubly_given_auth_is_refused_by_flag() {
+        // A token URL alone used to register a source with no auth.
+        let e = refusal(&rest(&[
+            "--oauth2-token-url",
+            "https://catalog.example.com/v1/oauth/tokens",
+        ]));
+        assert!(
+            e.contains("--oauth2-token-url needs --oauth2-client-secret"),
+            "{e}"
+        );
+        let e = refusal(&rest(&["--auth-bearer", "t", "--auth-google-metadata"]));
+        assert!(
+            e.contains("--auth-google-metadata and --auth-bearer are two ways"),
+            "{e}"
+        );
+        let e = refusal(&rest(&["--auth-google-metadata", "--auth-google-adc"]));
+        assert!(e.contains("two ways"), "{e}");
+        let e = refusal(&rest(&["--auth-google-quota-project", "lake"]));
+        assert!(
+            e.contains("--auth-google-quota-project needs --auth-google-metadata"),
+            "{e}"
+        );
     }
 
     #[cfg(feature = "iceberg")]
     #[test]
-    fn build_iceberg_config_no_oauth2_without_secret() {
-        let mut args = base_rest_args();
-        // token_url alone (no client_secret) must NOT activate OAuth2.
-        args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
+    fn each_google_flag_stores_its_identity() {
+        let auth = |extra: &[&str]| stored(&rest(extra))["catalog"]["auth"].clone();
+        assert_eq!(
+            auth(&["--auth-google-metadata"]),
+            serde_json::json!({"type": "google_metadata", "scopes": null, "metadata_url": null})
+        );
+        assert_eq!(
+            auth(&["--auth-google-adc", "--auth-google-quota-project", "lake"]),
+            serde_json::json!({"type": "google", "credentials": {"source": "application_default"},
+                "quota_project": "lake"})
+        );
+        let sa = auth(&[
+            "--auth-google-service-account-env",
+            "SA_KEY",
+            "--auth-google-scopes",
+            "https://www.googleapis.com/auth/bigquery",
+        ]);
+        assert_eq!(sa["credentials"]["source"], "service_account");
+        assert_eq!(sa["credentials"]["key"]["env_var"], "SA_KEY");
+        assert_eq!(sa["scopes"], "https://www.googleapis.com/auth/bigquery");
 
-        let config = build_iceberg_config(&args).unwrap();
-        let gs = config.to_iceberg_gs_config();
-        let v = serde_json::to_value(&gs).unwrap();
-        assert_eq!(v["catalog"]["auth"]["type"], "none");
+        let dir = tempfile::tempdir().unwrap();
+        let wif = dir.path().join("wif.json");
+        std::fs::write(&wif, WIF_CONFIG).unwrap();
+        let wif_auth = auth(&["--auth-google-wif-config", wif.to_str().unwrap()]);
+        assert_eq!(
+            wif_auth["credentials"]["config"]["type"],
+            "external_account"
+        );
+        std::fs::write(&wif, "[]").unwrap();
+        let e = refusal(&rest(&["--auth-google-wif-config", wif.to_str().unwrap()]));
+        assert!(e.contains("does not hold a JSON object"), "{e}");
+    }
+
+    /// What `gcloud iam workload-identity-pools create-cred-config … --aws`
+    /// writes.
+    #[cfg(feature = "iceberg")]
+    const WIF_CONFIG: &str = r#"{
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+        "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {
+            "environment_id": "aws1",
+            "region_url": "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+            "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+            "regional_cred_verification_url": "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+        }
+    }"#;
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_wif_config_flag_refuses_a_key_file_before_any_request_is_built() {
+        // The remote body carries the file as read; a service-account key
+        // there would travel to the server before the server refused it.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wif.json");
+        let path = file.to_str().unwrap();
+        for (text, refused) in [
+            (
+                r#"{"type": "service_account", "private_key": "KEY-MATERIAL"}"#,
+                "google-service-account-env instead",
+            ),
+            (r#"{"audience": "a"}"#, "must be `external_account`"),
+            // An external account the server would refuse, refused here.
+            (
+                r#"{"type": "external_account", "audience": "a"}"#,
+                "subject_token_type",
+            ),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            for args in [
+                rest(&["--auth-google-wif-config", path]),
+                parse(&[
+                    "--mode",
+                    "direct",
+                    "--table-location",
+                    "gs://b/w/ns/t",
+                    "--storage-google-wif-config",
+                    path,
+                ]),
+            ] {
+                let e = args_to_json(&args).unwrap_err().to_string();
+                assert!(e.contains(refused), "{text}: {e}");
+                assert!(!e.contains("KEY-MATERIAL"), "{e}");
+            }
+        }
+        std::fs::write(&file, WIF_CONFIG).unwrap();
+        assert!(args_to_json(&rest(&["--auth-google-wif-config", path])).is_ok());
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_biglake_warehouse_defaults_its_storage_identity() {
+        let federation = stored(&rest(&[
+            "--warehouse",
+            "bq://projects/p/locations/us/catalogs/c",
+            "--auth-google-metadata",
+        ]));
+        assert_eq!(federation["io"]["storage_auth"]["type"], "catalog");
+        assert_eq!(federation["io"]["vended_credentials"], false);
+        let runtime = stored(&rest(&["--warehouse", "bl://projects/p/catalogs/c"]));
+        assert_eq!(runtime["io"]["storage_auth"]["type"], "vended");
+        // Any other warehouse keeps what vended_credentials always meant.
+        assert!(stored(&rest(&["--warehouse", "wh"]))["io"]
+            .get("storage_auth")
+            .is_none());
+        // A choice the caller made wins.
+        let ambient = stored(&rest(&[
+            "--warehouse",
+            "bq://projects/p/locations/us/catalogs/c",
+            "--storage-identity",
+            "ambient",
+        ]));
+        assert_eq!(ambient["io"]["storage_auth"]["type"], "ambient");
+        // Federation without a Google identity cannot read its files.
+        let e = refusal(&rest(&[
+            "--warehouse",
+            "bq://projects/p/locations/us/catalogs/c",
+            "--auth-bearer",
+            "t",
+        ]));
+        assert!(e.contains("never vends"), "{e}");
+    }
+
+    /// BigLake refuses a request that names no quota project, whatever the
+    /// identity: a Google catalog identity with none bills to the project its
+    /// `bq://` or `bl://` warehouse names. The default is stored, so a remote
+    /// map sends it; the server infers none.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_biglake_warehouse_defaults_the_catalog_quota_project() {
+        let federation = rest(&[
+            "--warehouse",
+            "bq://projects/lake-project/locations/us-central1",
+            "--auth-google-metadata",
+        ]);
+        let auth = &stored(&federation)["catalog"]["auth"];
+        assert_eq!(auth["type"], "google", "{auth}");
+        assert_eq!(auth["credentials"]["source"], "metadata", "{auth}");
+        assert_eq!(auth["quota_project"], "lake-project", "{auth}");
+        assert_eq!(
+            args_to_json(&federation).unwrap()["catalog"]["auth"]["quota_project"],
+            "lake-project"
+        );
+        let runtime = stored(&rest(&[
+            "--warehouse",
+            "bl://projects/123456789012/catalogs/c",
+            "--auth-google-adc",
+        ]));
+        assert_eq!(runtime["catalog"]["auth"]["quota_project"], "123456789012");
+        // A project the caller names wins.
+        let named = stored(&rest(&[
+            "--warehouse",
+            "bq://projects/lake-project/locations/us-central1",
+            "--auth-google-metadata",
+            "--auth-google-quota-project",
+            "billing-project",
+        ]));
+        assert_eq!(named["catalog"]["auth"]["quota_project"], "billing-project");
+        // Another warehouse names no project, so none is defaulted, and an
+        // identity that is not Google's takes none.
+        let plain = stored(&rest(&["--warehouse", "wh", "--auth-google-metadata"]));
+        assert!(
+            plain["catalog"]["auth"].get("quota_project").is_none(),
+            "{}",
+            plain["catalog"]["auth"]
+        );
+        let bearer = stored(&rest(&[
+            "--warehouse",
+            "bq://projects/lake-project/locations/us-central1",
+            "--auth-bearer",
+            "t",
+            "--storage-identity",
+            "ambient",
+        ]));
+        assert!(bearer["catalog"]["auth"].get("quota_project").is_none());
+        // Storage reads never inherit it.
+        assert!(stored(&federation)["io"]["storage_auth"]
+            .get("quota_project")
+            .is_none());
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_direct_source_reads_gcs_with_its_own_google_identity() {
+        let stored = stored(&parse(&[
+            "--mode",
+            "direct",
+            "--table-location",
+            "s3://bucket/warehouse/ns/t",
+            "--storage-google-service-account-env",
+            "SA_KEY",
+            "--storage-google-quota-project",
+            "lake",
+        ]));
+        let storage = &stored["io"]["storage_auth"];
+        assert_eq!(storage["type"], "google");
+        assert_eq!(storage["credentials"]["key"]["env_var"], "SA_KEY");
+        assert_eq!(storage["quota_project"], "lake");
+        let e = refusal(&parse(&[
+            "--mode",
+            "direct",
+            "--table-location",
+            "s3://bucket/warehouse/ns/t",
+            "--storage-identity",
+            "google",
+        ]));
+        assert!(
+            e.contains("--storage-identity needs --storage-google-metadata"),
+            "{e}"
+        );
     }
 
     #[cfg(feature = "iceberg")]
     #[test]
     fn rest_only_flags_are_refused_by_other_modes() {
-        use clap::Parser;
         let glue = |extra: &[&str]| {
-            let mut argv = vec![
-                "fluree",
-                "iceberg",
-                "map",
-                "gs",
+            let mut args = vec![
                 "--mode",
                 "glue",
                 "--region",
@@ -989,13 +1129,8 @@ mod tests {
                 "--r2rml",
                 "mapping.ttl",
             ];
-            argv.extend_from_slice(extra);
-            match crate::cli::Cli::try_parse_from(argv).unwrap().command {
-                crate::cli::Commands::Iceberg {
-                    action: crate::cli::IcebergAction::Map(args),
-                } => build_iceberg_config(&args),
-                _ => unreachable!(),
-            }
+            args.extend_from_slice(extra);
+            build_iceberg_config(&parse(&args))
         };
         assert!(glue(&[]).is_ok());
 
@@ -1008,6 +1143,8 @@ mod tests {
             "--oauth2-client-secret-env",
             "--oauth2-scope",
             "--oauth2-audience",
+            "--auth-google-service-account-env",
+            "--auth-google-scopes",
             "--warehouse",
         ] {
             let err = glue(&[flag, "x"]).unwrap_err().to_string();
@@ -1016,6 +1153,11 @@ mod tests {
                 "{flag}: {err}"
             );
         }
+        let err = glue(&["--auth-google-metadata"]).unwrap_err().to_string();
+        assert!(
+            err.contains("--auth-google-metadata applies to rest mode only"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1053,30 +1195,33 @@ mod tests {
         assert_eq!(infer_mapping_media_type(Path::new("mapping")), None);
     }
 
+    #[cfg(feature = "iceberg")]
     #[test]
     fn args_to_json_infers_r2rml_type_from_ttl_extension() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("airlines.ttl");
         std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
 
-        let mut args = base_rest_args();
-        args.r2rml = Some(path);
         // No explicit --r2rml-type: inferred from the `.ttl` extension.
-        let body = args_to_json(&args).unwrap();
+        let body = args_to_json(&rest(&["--r2rml", path.to_str().unwrap()])).unwrap();
         assert_eq!(body["r2rml_type"], "text/turtle");
     }
 
+    #[cfg(feature = "iceberg")]
     #[test]
     fn args_to_json_explicit_r2rml_type_overrides_extension() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("airlines.ttl");
         std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
 
-        let mut args = base_rest_args();
-        args.r2rml = Some(path);
         // Explicit flag wins over the conflicting `.ttl` extension.
-        args.r2rml_type = Some("application/ld+json".to_string());
-        let body = args_to_json(&args).unwrap();
+        let body = args_to_json(&rest(&[
+            "--r2rml",
+            path.to_str().unwrap(),
+            "--r2rml-type",
+            "application/ld+json",
+        ]))
+        .unwrap();
         assert_eq!(body["r2rml_type"], "application/ld+json");
     }
 }

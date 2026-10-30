@@ -8,6 +8,7 @@ Trino-protocol endpoint backed by sqlite3."""
 import asyncio
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -188,6 +189,199 @@ def test_glue_and_s3_tables_mistakes_are_refused(conn):
         )
     # Turning vending off agrees with every mode.
     conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
+
+
+# A service-account key named by a variable that is never set: registration
+# cannot mint a token, so nothing connects, and the source registers with a
+# warning as an unreachable catalog does.
+UNSET_KEY = fluree.EnvVar("FLUREE_TEST_PY_SA_KEY_NEVER_SET")
+CATALOG = "http://127.0.0.1:9/catalog"
+
+
+def test_a_google_identity_authenticates_a_rest_catalog_and_reads_its_files(conn, monkeypatch):
+    monkeypatch.delenv(UNSET_KEY.name, raising=False)
+    with pytest.warns(UserWarning, match="could not reach the catalog"):
+        source = conn.map_iceberg(
+            "biglake",
+            ORDERS_MAPPING,
+            catalog_uri=CATALOG,
+            warehouse="bq://projects/lake/locations/us/catalogs/sales",
+            auth=fluree.Google(UNSET_KEY, quota_project="lake"),
+        )
+    assert source.kind == "iceberg"
+    with pytest.warns(UserWarning, match="could not reach the catalog"):
+        conn.map_iceberg(
+            "biglake-explicit",
+            ORDERS_MAPPING,
+            catalog_uri=CATALOG,
+            auth=fluree.Google(UNSET_KEY),
+            storage="catalog",
+        )
+    # A Direct source on gs:// reads with an identity of its own.
+    conn.map_iceberg(
+        "direct-gcs",
+        ORDERS_MAPPING,
+        table_location="gs://bucket/warehouse/sales/orders",
+        storage=fluree.Google(UNSET_KEY),
+    )
+    # A Google identity reads gs:// only: one on s3:// could never be read,
+    # so it does not register.
+    with pytest.raises(fluree.FlureeError, match="serves only gs://"):
+        conn.map_iceberg(
+            "direct-gcs-on-s3",
+            ORDERS_MAPPING,
+            table_location="s3://bucket/warehouse/sales/orders",
+            storage=fluree.Google(UNSET_KEY),
+        )
+
+
+# A child process with a mock of Google's metadata server and of a BigLake
+# catalog, which records the `x-goog-user-project` each catalog request names.
+# A child, because the engine reads the metadata-server and token-host
+# overrides once per process.
+QUOTA_CHILD = r"""
+import http.server, json, os, sys, threading
+
+seen = []
+
+class Mock(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/computeMetadata/"):
+            body = {"access_token": "ya29.host", "expires_in": 3600, "token_type": "Bearer"}
+        else:
+            seen.append(self.headers.get("x-goog-user-project"))
+            body = {} if self.path.startswith("/v1/config") else {
+                "metadata-location": "gs://lake/wh/orders/metadata/v1.metadata.json"
+            }
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{server.server_address[1]}"
+os.environ["FLUREE_GOOGLE_METADATA_URL"] = (
+    base + "/computeMetadata/v1/instance/service-accounts/default/token"
+)
+os.environ["FLUREE_GOOGLE_TOKEN_HOSTS"] = "127.0.0.1"
+
+import fluree
+
+mapping, warehouse, quota_project = json.loads(sys.argv[1])
+with fluree.connect(":memory:") as conn:
+    conn.map_iceberg(
+        "biglake",
+        mapping,
+        catalog_uri=base,
+        warehouse=warehouse,
+        table="sales.orders",
+        auth=fluree.Google(quota_project=quota_project),
+        storage="catalog",
+    )
+print(json.dumps(seen))
+"""
+
+
+def catalog_billed_to(warehouse, quota_project=None):
+    """The `x-goog-user-project` each of the registration's catalog requests
+    named, for a source on `warehouse`."""
+    child = subprocess.run(
+        [sys.executable, "-c", QUOTA_CHILD, json.dumps([ORDERS_MAPPING, warehouse, quota_project])],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child.returncode == 0, child.stderr
+    seen = json.loads(child.stdout.strip().splitlines()[-1])
+    assert seen, "the registration's connection test reached the catalog"
+    return set(seen)
+
+
+def test_a_biglake_warehouse_names_the_catalogs_quota_project():
+    # BigLake refuses a request naming no quota project, whatever the identity.
+    assert catalog_billed_to("bq://projects/lake-project/locations/us-central1") == {"lake-project"}
+    assert catalog_billed_to("bl://projects/123456789012/catalogs/c") == {"123456789012"}
+    # The caller's own project wins; another warehouse names none.
+    assert catalog_billed_to(
+        "bq://projects/lake-project/locations/us-central1", "billing-project"
+    ) == {"billing-project"}
+    assert catalog_billed_to("wh") == {None}
+
+
+def test_a_storage_identity_the_catalog_cannot_serve_is_refused(conn):
+    # `catalog` reads with the catalog's Google identity; a bearer has none.
+    with pytest.raises(InvalidRequestError, match="storage_auth `catalog`"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=Bearer("t"), storage="catalog")
+    # A bq:// warehouse defaults to `catalog`, so it needs a Google identity too.
+    with pytest.raises(InvalidRequestError, match="storage_auth `catalog`"):
+        conn.map_iceberg(
+            "x",
+            ORDERS_MAPPING,
+            catalog_uri=CATALOG,
+            warehouse="bq://projects/lake/locations/us/catalogs/sales",
+            auth=Bearer("t"),
+        )
+    # Only a REST catalog vends.
+    with pytest.raises(InvalidRequestError, match="REST catalog"):
+        conn.map_iceberg("x", ORDERS_MAPPING, glue=fluree.Glue(), storage="vended")
+    with pytest.raises(InvalidRequestError, match="not both"):
+        conn.map_iceberg(
+            "x", ORDERS_MAPPING, catalog_uri=CATALOG, storage="ambient", vended_credentials=False
+        )
+    with pytest.raises(InvalidRequestError, match="storage is"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, storage="hmac")
+
+
+def test_a_google_identity_is_never_a_literal_key_and_its_config_is_checked(conn, tmp_path):
+    with pytest.raises(InvalidRequestError, match="never given literally"):
+        conn.map_iceberg(
+            "x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google('{"private_key": "k"}')
+        )
+    # A WIF configuration reaches the engine, which refuses a credential
+    # source outside the accepted subset (a local file here).
+    wif = {
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+        "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {"file": "/etc/passwd"},
+    }
+    with pytest.raises(InvalidRequestError, match="credential_source"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(wif))
+    path = tmp_path / "wif.json"
+    path.write_text("[]")
+    with pytest.raises(InvalidRequestError, match="Workload Identity Federation"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(path))
+    # A path may be a plain string, and is read like a Path: the configuration
+    # reaches the engine.
+    path.write_text(json.dumps(wif))
+    for given in (path, str(path)):
+        with pytest.raises(InvalidRequestError, match="credential_source"):
+            conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(given))
+    # A missing file is a clear refusal, not a bare FileNotFoundError.
+    missing = tmp_path / "missing.json"
+    with pytest.raises(InvalidRequestError, match="cannot read the Workload Identity"):
+        conn.map_iceberg("x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(missing))
+    with pytest.raises(InvalidRequestError, match="no file is at the path given"):
+        conn.map_iceberg(
+            "x", ORDERS_MAPPING, catalog_uri=CATALOG, auth=fluree.Google(str(missing))
+        )
+    with pytest.raises(InvalidRequestError, match="storage scope"):
+        conn.map_iceberg(
+            "x",
+            ORDERS_MAPPING,
+            table_location="s3://bucket/warehouse/sales/orders",
+            storage=fluree.Google(UNSET_KEY, scopes="https://www.googleapis.com/auth/bigquery"),
+        )
+    # Unity Catalog takes a token or a service principal, not a Google identity.
+    with pytest.raises(TypeError):
+        conn.map_delta("x", ORDERS_MAPPING, unity=fluree.Unity("https://ws.example.com", auth=fluree.Google()))
 
 
 def test_a_rest_catalog_source_can_take_its_tables_from_the_mapping(conn):
