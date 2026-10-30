@@ -58,6 +58,7 @@ rust-stemmers = "1.2"
 [dev-dependencies]
 async-trait.workspace = true
 fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-test-support = { path = "../fluree-test-support" }
 tracing-subscriber.workspace = true
 
 [lints]

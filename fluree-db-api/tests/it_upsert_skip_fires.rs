@@ -9,14 +9,10 @@
 //! matters. `generate_upsert_deletions` reports `skipped_subjects` and
 //! `pattern_queries`; asserting on those is what makes it detectable.
 //!
-//! Kept as the ONLY test in its own `[[test]]` binary (not bundled into
-//! `grp_transact`), same convention as `it_cyclic_bgp_probe` and
-//! `it_minmax_fast_path_fired`. The assertions here are about instrumentation,
-//! which is process-shared in two ways a bundled parallel run exposes: tracing's
-//! callsite-interest cache is process-global, and the `set_default` capture is
-//! thread-local, so a sibling test in the same process can leave the
-//! `upsert deletion subject pre-check` callsite's cached interest disabled and
-//! the event is never delivered. See `docs/contributing/tests.md`.
+//! Its own `[[test]]` binary predates the shared capture helper: the capture
+//! goes through `fluree_test_support::scoped_default`, so a sibling test can't
+//! leave the `upsert deletion subject pre-check` callsite disabled, and the
+//! file could join a group. See `docs/contributing/tests.md`.
 #![cfg(feature = "native")]
 
 mod support;

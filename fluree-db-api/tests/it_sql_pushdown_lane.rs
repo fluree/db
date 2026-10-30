@@ -4209,8 +4209,8 @@ mod source_lookups_fail {
         async fn all_records(&self) -> Result<Vec<NsRecord>> {
             self.0.all_records().await
         }
-        async fn list_branches(&self, name: &str) -> Result<Vec<NsRecord>> {
-            self.0.list_branches(name).await
+        async fn branch_records(&self, name: &str) -> Result<Vec<NsRecord>> {
+            self.0.branch_records(name).await
         }
         async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
             self.0.heads(id).await

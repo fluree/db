@@ -204,6 +204,23 @@ pub enum TransactError {
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
 
+    /// The commit being built would retract and assert one fact at one `t`.
+    /// Staging cancels the two by fact identity, so this is an internal
+    /// error, not a property of the request: the commit is refused rather
+    /// than written with a pair (see `fluree_db_core::same_t`).
+    #[error(
+        "internal error: the commit would retract and assert one fact at one t: \
+         {fact}, retracting {retracted} and asserting {asserted}"
+    )]
+    SameTPair {
+        /// Graph, subject and predicate.
+        fact: String,
+        /// The retracted term.
+        retracted: String,
+        /// The asserted term.
+        asserted: String,
+    },
+
     /// The ledger config, which decides what checks a write gets, could not
     /// be read (a storage or read failure, not anything in the request). The
     /// write is refused rather than admitted unchecked; it can succeed on
