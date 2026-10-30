@@ -1054,18 +1054,78 @@ pub(crate) fn is_typed_storage_error(err: &fluree_db_iceberg::IcebergError) -> b
 
 /// The reason a storage or catalog denial gives a QUERY client. AWS phrases a
 /// denial as `User: arn:aws:sts::<account>:assumed-role/<role>/… is not authorized
-/// to perform: s3:GetObject on resource: … because …`, which would hand any
-/// querying client the server's role and account. The ARNs are redacted and the
-/// reason kept; the full text goes to the server log. The onboarding and verify
-/// paths (`storage_api_error`, admin-facing, and what hosts classify runbooks by)
+/// to perform: s3:GetObject on resource: … because …`, and Google as
+/// `<service account email> does not have storage.objects.get access to …`
+/// (a GCS denial also names the store's identity, `as Google (<principal>)`),
+/// which would hand any querying client the identity the server read as. The
+/// ARNs and Google principals are redacted and the reason kept; the full text
+/// goes to the server log. The onboarding and verify paths
+/// (`storage_api_error`, admin-facing, and what hosts classify runbooks by)
 /// keep the full text.
 pub(crate) fn query_safe_denial(context: &str, message: String) -> String {
-    match redact_aws_arns(&message) {
-        std::borrow::Cow::Borrowed(_) => message,
-        std::borrow::Cow::Owned(redacted) => {
-            tracing::warn!(context, denial = %message, "access denied (AWS identities redacted from the query error)");
-            redacted
+    let redacted = match redact_aws_arns(&message) {
+        std::borrow::Cow::Borrowed(text) => redact_google_principals(text).into_owned(),
+        std::borrow::Cow::Owned(text) => redact_google_principals(&text).into_owned(),
+    };
+    if redacted == message {
+        return message;
+    }
+    tracing::warn!(context, denial = %message, "access denied (cloud identities redacted from the query error)");
+    redacted
+}
+
+/// `text` with the Google principals it names replaced by `<redacted>`: the
+/// identity a GCS store names itself by (`Google (<principal>)`: a service
+/// account email, `wif:<audience>…`, `adc:<client>`, `metadata`), and every
+/// email address (a service account, or the user of user credentials, as
+/// Google's own refusal names it). Borrowed when there is none.
+pub(crate) fn redact_google_principals(text: &str) -> std::borrow::Cow<'_, str> {
+    const LABEL: &str = "Google (";
+    const REDACTED: &str = "<redacted>";
+    if !text.contains('@') && !text.contains(LABEL) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut labelled = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(LABEL) {
+        let inner = &rest[at + LABEL.len()..];
+        let Some(close) = inner.find(')') else {
+            break;
+        };
+        labelled.push_str(&rest[..at + LABEL.len()]);
+        labelled.push_str(REDACTED);
+        rest = &inner[close..];
+    }
+    labelled.push_str(rest);
+
+    let local = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    let domain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-');
+    let mut out = String::with_capacity(labelled.len());
+    let mut rest = labelled.as_str();
+    while let Some(at) = rest.find('@') {
+        let start = rest[..at]
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| local(c))
+            .last()
+            .map_or(at, |(i, _)| i);
+        let host = &rest[at + 1..];
+        let host_len = host.find(|c: char| !domain(c)).unwrap_or(host.len());
+        let host_name = host[..host_len].trim_end_matches(['.', '-']);
+        if start == at || !host_name.contains('.') {
+            out.push_str(&rest[..=at]);
+            rest = host;
+            continue;
         }
+        out.push_str(&rest[..start]);
+        out.push_str(REDACTED);
+        rest = &host[host_name.len()..];
+    }
+    out.push_str(rest);
+    if out == text {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(out)
     }
 }
 
@@ -1525,6 +1585,52 @@ mod tests {
     /// A catalog's refusal (REST 401/403, AWS Glue / S3 Tables access denied) is
     /// the same typed 403 on the query path and the onboarding path, never an
     /// internal or config error.
+    /// A GCS denial on the QUERY path names neither the store's Google
+    /// identity nor the principal Google's refusal names; the reason stays.
+    #[test]
+    fn query_denials_redact_google_principals_but_keep_the_reason() {
+        let gcs = "GCS refused the read of gs://lake/t/data/0.parquet as Google \
+                   (reader@tenant-project.iam.gserviceaccount.com): HTTP 403 AccessDenied: \
+                   reader@tenant-project.iam.gserviceaccount.com does not have \
+                   storage.objects.get access to the Google Cloud Storage object.";
+        let storage = fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            scheme: "gs",
+            bucket: "lake".to_string(),
+            key: "t/data/0.parquet".to_string(),
+            region: None,
+            message: gcs.to_string(),
+        };
+        let message = match super::storage_query_error("Failed to read data file", storage) {
+            fluree_db_query::QueryError::StorageAccessDenied { message, .. } => message,
+            other => panic!("expected StorageAccessDenied, got {other:?}"),
+        };
+        assert!(!message.contains("tenant-project"), "{message}");
+        assert!(!message.contains("reader@"), "{message}");
+        assert!(message.contains("as Google (<redacted>)"), "{message}");
+        assert!(
+            message.contains("<redacted> does not have storage.objects.get access"),
+            "{message}"
+        );
+        // A WIF principal in the label, and a user's email at a sentence's end.
+        assert_eq!(
+            super::redact_google_principals(
+                "as Google (wif://iam.googleapis.com/projects/1/x→sa@p.iam.gserviceaccount.com): \
+                 denied for dev@example.com."
+            ),
+            "as Google (<redacted>): denied for <redacted>."
+        );
+        // Text naming no principal is returned as is (no allocation); an `@`
+        // that is not an address is kept.
+        assert!(matches!(
+            super::redact_google_principals("HTTP 403 AccessDenied: not yours"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            super::redact_google_principals("at @ noon, a@b"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     /// A denial on the QUERY path does not hand the client the server's AWS
     /// identity; the reason AWS gives stays. Onboarding keeps the full text.
     #[test]
