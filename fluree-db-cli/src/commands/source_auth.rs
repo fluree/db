@@ -153,20 +153,50 @@ fn google_sources(
     Ok(sources)
 }
 
-/// A WIF credential configuration file's JSON object.
+/// A WIF credential configuration file's JSON object, checked here as a
+/// registration would check it: the file is sent to a remote server as is,
+/// and a service-account key given by mistake must not leave this machine.
 fn read_wif_config(
     field: &str,
     path: &Path,
 ) -> CliResult<serde_json::Map<String, serde_json::Value>> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?;
-    match serde_json::from_str(&text) {
-        Ok(serde_json::Value::Object(config)) => Ok(config),
-        _ => Err(CliError::Usage(format!(
-            "{} {} does not hold a JSON object (the credential configuration that `gcloud iam \
-             workload-identity-pools create-cred-config` prints)",
-            flag(field),
-            path.display()
-        ))),
+    let config = match serde_json::from_str(&text) {
+        Ok(serde_json::Value::Object(config)) => config,
+        _ => {
+            return Err(CliError::Usage(format!(
+                "{} {} does not hold a JSON object (the credential configuration that `gcloud \
+                 iam workload-identity-pools create-cred-config` prints)",
+                flag(field),
+                path.display()
+            )))
+        }
+    };
+    match config.get("type").and_then(serde_json::Value::as_str) {
+        Some("external_account") => {}
+        Some("service_account") => {
+            return Err(CliError::Usage(format!(
+                "{} {} holds a service-account key, not a WIF credential configuration. A key \
+                 is a secret: name the environment variable that holds it with {} instead",
+                flag(field),
+                path.display(),
+                flag(&field.replace("wif_config", "service_account_env"))
+            )))
+        }
+        _ => {
+            return Err(CliError::Usage(format!(
+                "{} {} is not a WIF credential configuration (its `type` must be \
+                 `external_account`)",
+                flag(field),
+                path.display()
+            )))
+        }
     }
+    GoogleCredentials::ExternalAccount {
+        config: ExternalAccountConfig::Inline(config.clone()),
+    }
+    .validate_static()
+    .map_err(|e| CliError::Usage(format!("{} {}: {e}", flag(field), path.display())))?;
+    Ok(config)
 }

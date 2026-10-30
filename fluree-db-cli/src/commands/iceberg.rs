@@ -926,11 +926,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let wif = dir.path().join("wif.json");
-        std::fs::write(
-            &wif,
-            r#"{"type": "external_account", "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws"}"#,
-        )
-        .unwrap();
+        std::fs::write(&wif, WIF_CONFIG).unwrap();
         let wif_auth = auth(&["--auth-google-wif-config", wif.to_str().unwrap()]);
         assert_eq!(
             wif_auth["credentials"]["config"]["type"],
@@ -939,6 +935,63 @@ mod tests {
         std::fs::write(&wif, "[]").unwrap();
         let e = refusal(&rest(&["--auth-google-wif-config", wif.to_str().unwrap()]));
         assert!(e.contains("does not hold a JSON object"), "{e}");
+    }
+
+    /// What `gcloud iam workload-identity-pools create-cred-config … --aws`
+    /// writes.
+    #[cfg(feature = "iceberg")]
+    const WIF_CONFIG: &str = r#"{
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+        "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {
+            "environment_id": "aws1",
+            "region_url": "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+            "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+            "regional_cred_verification_url": "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"
+        }
+    }"#;
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_wif_config_flag_refuses_a_key_file_before_any_request_is_built() {
+        // The remote body carries the file as read; a service-account key
+        // there would travel to the server before the server refused it.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wif.json");
+        let path = file.to_str().unwrap();
+        for (text, refused) in [
+            (
+                r#"{"type": "service_account", "private_key": "KEY-MATERIAL"}"#,
+                "google-service-account-env instead",
+            ),
+            (r#"{"audience": "a"}"#, "must be `external_account`"),
+            // An external account the server would refuse, refused here.
+            (
+                r#"{"type": "external_account", "audience": "a"}"#,
+                "subject_token_type",
+            ),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            for args in [
+                rest(&["--auth-google-wif-config", path]),
+                parse(&[
+                    "--mode",
+                    "direct",
+                    "--table-location",
+                    "gs://b/w/ns/t",
+                    "--storage-google-wif-config",
+                    path,
+                ]),
+            ] {
+                let e = args_to_json(&args).unwrap_err().to_string();
+                assert!(e.contains(refused), "{text}: {e}");
+                assert!(!e.contains("KEY-MATERIAL"), "{e}");
+            }
+        }
+        std::fs::write(&file, WIF_CONFIG).unwrap();
+        assert!(args_to_json(&rest(&["--auth-google-wif-config", path])).is_ok());
     }
 
     #[cfg(feature = "iceberg")]
