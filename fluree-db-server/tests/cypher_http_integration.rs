@@ -459,7 +459,7 @@ async fn cypher_http_write_with_return() {
     assert!(
         data[0]["row"][0]
             .as_str()
-            .is_some_and(|s| s.contains("cy_rel_e")),
+            .is_some_and(|s| s.ends_with("--cyre")),
         "{body}"
     );
 
