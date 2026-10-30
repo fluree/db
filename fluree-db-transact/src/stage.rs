@@ -95,7 +95,7 @@ async fn cascade_attachment_retracts(
     reverse_graph: &HashMap<Sid, GraphId>,
     new_t: i64,
     lpg_edge_lifecycle: bool,
-    relationship_deletes: Option<&[String]>,
+    relationship_edges: &HashMap<EdgeId, Vec<String>>,
 ) -> Result<Vec<Flake>> {
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
@@ -194,7 +194,7 @@ async fn cascade_attachment_retracts(
             // A Cypher `DELETE r` means one relationship, but retracting the
             // edge takes every relationship on it: refuse an edge that
             // carries others, whatever the statement's MATCH kept.
-            if let Some(rels) = relationship_deletes {
+            if let Some(rels) = relationship_edges.get(&edge_id(flake)) {
                 if reifiers.len() > 1 {
                     return Err(TransactError::UnsupportedFeature(format!(
                         "DELETE of relationship `{}` failed: parallel relationships share its \
@@ -1101,7 +1101,7 @@ pub async fn stage_with_graph_delta(
             &reverse_graph,
             new_t,
             lpg_edge_lifecycle,
-            txn.opts.relationship_deletes.as_deref(),
+            &stream_stats.relationship_edges,
         )
         .await?;
         if !cascade.is_empty() {
@@ -3068,6 +3068,88 @@ struct WhereStreamStats {
     /// DELETE intents that named no stored fact, as instantiated. Collected
     /// only under a non-root policy, for the modify-policy check.
     unmatched_intents: Vec<Flake>,
+    /// The edges only a Cypher relationship's DELETE retracts, by edge, with
+    /// the relationship variables that named it (see
+    /// [`RelationshipEdges`]). Empty unless the transaction carries
+    /// [`crate::ir::TxnOpts::relationship_deletes`].
+    relationship_edges: HashMap<EdgeId, Vec<String>>,
+}
+
+/// An edge as a retraction names it: graph, subject, predicate, object.
+type EdgeId = (Option<Sid>, Sid, Sid, FlakeValue);
+
+fn edge_id(flake: &Flake) -> EdgeId {
+    (
+        flake.g.clone(),
+        flake.s.clone(),
+        flake.p.clone(),
+        flake.o.clone(),
+    )
+}
+
+/// The edges a Cypher relationship's DELETE retracts (see
+/// [`crate::ir::TxnOpts::relationship_deletes`]), noted as the delete
+/// templates are instantiated, so the parallel-relationship check covers
+/// those edges and no others.
+///
+/// An edge another delete template retracts as well is left out: that is a
+/// `DETACH DELETE` of one of its endpoints, which takes every relationship on
+/// the node, so the edge's other relationships go as the statement asks.
+struct RelationshipEdges {
+    /// Each delete template's relationship variable, when it is a
+    /// relationship's DELETE.
+    vars: Vec<Option<String>>,
+    /// The predicates those templates retract: another template's retraction
+    /// can only name one of their edges with one of these.
+    predicates: HashSet<Sid>,
+    deleted: HashMap<EdgeId, Vec<String>>,
+    also: HashSet<EdgeId>,
+}
+
+impl RelationshipEdges {
+    fn new(txn: &Txn) -> Option<Self> {
+        let deletes = txn.opts.relationship_deletes.as_ref()?;
+        let mut vars = vec![None; txn.delete_templates.len()];
+        let mut predicates = HashSet::new();
+        for d in deletes {
+            let Some(template) = txn.delete_templates.get(d.template) else {
+                continue;
+            };
+            vars[d.template] = Some(d.var.clone());
+            if let TemplateTerm::Sid(p) = &template.predicate {
+                predicates.insert(p.clone());
+            }
+        }
+        Some(Self {
+            vars,
+            predicates,
+            deleted: HashMap::new(),
+            also: HashSet::new(),
+        })
+    }
+
+    /// Note one retraction intent, from delete template `template`.
+    fn note(&mut self, template: usize, flake: &Flake) {
+        match self.vars.get(template) {
+            Some(Some(var)) => {
+                let vars = self.deleted.entry(edge_id(flake)).or_default();
+                if !vars.contains(var) {
+                    vars.push(var.clone());
+                }
+            }
+            _ => {
+                if matches!(flake.o, FlakeValue::Ref(_)) && self.predicates.contains(&flake.p) {
+                    self.also.insert(edge_id(flake));
+                }
+            }
+        }
+    }
+
+    /// The edges only a relationship's DELETE retracts.
+    fn finish(mut self) -> HashMap<EdgeId, Vec<String>> {
+        self.deleted.retain(|edge, _| !self.also.contains(edge));
+        self.deleted
+    }
 }
 
 /// Stream the WHERE result into `acc`, projecting → materializing encoded
@@ -3508,6 +3590,7 @@ async fn stream_where_into_accumulator(
     let mut total_binding_rows: u64 = 0;
     let mut retraction_count: usize = 0;
     let mut assertion_count: usize = 0;
+    let mut relationship_edges = RelationshipEdges::new(txn);
 
     while let Some(batch) = cursor.next_batch().await.map_err(TransactError::Query)? {
         // Blank nodes in INSERT templates are fresh per WHERE solution
@@ -3531,8 +3614,17 @@ async fn stream_where_into_accumulator(
         );
         let intents = {
             let _g = delete_span.enter();
-            let mut intents =
-                generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?;
+            let mut intents = match relationship_edges.as_mut() {
+                Some(edges) => generator.generate_retract_intents_noting(
+                    &txn.delete_templates,
+                    &witnessed,
+                    &batch,
+                    |template, flake| edges.note(template, flake),
+                )?,
+                None => {
+                    generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?
+                }
+            };
             if let Some(edits) = list_edits.as_deref_mut() {
                 intents = edits.divert_intents(intents);
             }
@@ -3604,6 +3696,9 @@ async fn stream_where_into_accumulator(
         retraction_count,
         assertion_count,
         unmatched_intents,
+        relationship_edges: relationship_edges
+            .map(RelationshipEdges::finish)
+            .unwrap_or_default(),
     })
 }
 

@@ -1615,9 +1615,22 @@ async fn rel_run(
     parallel: bool,
     statement: &str,
 ) -> (Result<(), String>, (Vec<String>, Vec<String>)) {
+    rel_run_seeded(label, parallel, &[], statement).await
+}
+
+/// [`rel_run`] with the `extra` statements run on the seed first.
+async fn rel_run_seeded(
+    label: &str,
+    parallel: bool,
+    extra: &[&str],
+    statement: &str,
+) -> (Result<(), String>, (Vec<String>, Vec<String>)) {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = format!("it/cyseq-rel-{label}:main");
-    let ledger = rel_seeded(&fluree, &id, parallel).await;
+    let mut ledger = rel_seeded(&fluree, &id, parallel).await;
+    for s in extra {
+        ledger = fluree.transact_cypher(ledger, s).await.expect(s).ledger;
+    }
     let outcome = fluree
         .transact_cypher(ledger, statement)
         .await
@@ -1770,4 +1783,65 @@ async fn a_sibling_an_earlier_clause_created_refuses_the_delete() {
     let err = outcome.expect_err(statement);
     assert!(err.contains(PARALLEL_REFUSAL), "{statement}: {err}");
     assert_eq!(state, seeded, "nothing written");
+}
+
+// ---- A DELETE clause with a node and a relationship ------------------------
+//
+// The parallel-relationship check covers the edges a relationship's DELETE
+// retracts, and no others. A `DETACH DELETE` of a node beside it takes every
+// relationship on the node, as it does on its own.
+
+/// A second relationship `(a)-[:K {w: 3}]->(c)`, on an edge of its own.
+const A_TO_C: &str = r#"MATCH (a:P {id: "a"}), (c:P {id: "c"}) CREATE (a)-[:K {w: 3}]->(c)"#;
+
+/// `DETACH DELETE a, r` takes every relationship on `a`, whether or not one of
+/// `a`'s edges carries two of them, and whether or not that edge is `r`'s. The
+/// same holds for a `DETACH DELETE` of `r`'s other endpoint.
+#[tokio::test]
+async fn a_detach_delete_beside_a_relationship_takes_every_relationship_on_the_node() {
+    let mut a_gone = nodes_and(&[]);
+    a_gone.retain(|t| !t.starts_with("a "));
+    for statement in [
+        r#"MATCH (a:P {id: "a"})-[r:K]->(c:P {id: "c"}) DETACH DELETE a, r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DETACH DELETE a, r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DETACH DELETE r, a"#,
+    ] {
+        let (outcome, (rels, triples)) =
+            rel_run_seeded("detach-beside-rel", true, &[A_TO_C], statement).await;
+        assert_eq!(outcome, Ok(()), "{statement}");
+        assert!(rels.is_empty(), "{statement}: {rels:?}");
+        assert_eq!(triples, a_gone, "{statement}");
+    }
+    let statement = r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DETACH DELETE b, r"#;
+    let (outcome, (rels, triples)) =
+        rel_run_seeded("detach-other-end", true, &[A_TO_C], statement).await;
+    assert_eq!(outcome, Ok(()), "{statement}");
+    assert_eq!(rels, vec![r#"["a",3,null,"c"]"#.to_string()], "{statement}");
+    let mut want = nodes_and(&["a K c", "rel w 3"]);
+    want.retain(|t| !t.starts_with("b "));
+    assert_eq!(triples, want, "{statement}");
+}
+
+/// The check still covers a relationship's own edge when a `DETACH DELETE` in
+/// the same clause doesn't take that edge, and a `DETACH DELETE` of a
+/// relationship is its DELETE.
+#[tokio::test]
+async fn a_parallel_relationship_the_detach_delete_does_not_reach_still_refuses() {
+    let seeded = rel_run_seeded(
+        "parallel-seed-2",
+        true,
+        &[A_TO_C],
+        r#"MATCH (n:P {id: "c"}) SET n.id = "c""#,
+    )
+    .await
+    .1;
+    for statement in [
+        r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}), (c:P {id: "c"}) DETACH DELETE c, r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DETACH DELETE r"#,
+    ] {
+        let (outcome, state) = rel_run_seeded("parallel-detach", true, &[A_TO_C], statement).await;
+        let err = outcome.expect_err(statement);
+        assert!(err.contains(PARALLEL_REFUSAL), "{statement}: {err}");
+        assert_eq!(state, seeded, "{statement}: nothing written");
+    }
 }

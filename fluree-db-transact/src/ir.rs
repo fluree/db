@@ -829,6 +829,17 @@ impl InlineValues {
     }
 }
 
+/// A Cypher relationship variable's `DELETE`: the delete template that
+/// retracts the edge the relationship was matched on (see
+/// [`TxnOpts::relationship_deletes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipDelete {
+    /// The relationship variable, which a refusal names.
+    pub var: String,
+    /// The template's index in [`Txn::delete_templates`].
+    pub template: usize,
+}
+
 /// Transaction options
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TxnOpts {
@@ -885,14 +896,18 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
 
-    /// The relationship variables of a Cypher `DELETE r` (or several). When
-    /// set, an edge this transaction retracts must carry at most one
-    /// relationship: retracting the edge takes every relationship on it with
-    /// it (the `f:reifies*` cascade), so staging refuses an edge that carries
-    /// others, naming these variables. Deleting one of several parallel
-    /// relationships isn't supported.
+    /// The delete templates of a Cypher `DELETE r` (or several), each of which
+    /// retracts the edge relationship `r` was matched on. An edge one of them
+    /// retracts must carry at most one relationship: retracting the edge takes
+    /// every relationship on it with it (the `f:reifies*` cascade), so staging
+    /// refuses an edge that carries others, naming the variable. Deleting one
+    /// of several parallel relationships isn't supported.
+    ///
+    /// An edge another delete template retracts too is exempt: that is a
+    /// `DETACH DELETE` of an endpoint, which takes every relationship on the
+    /// node. Edges no relationship's DELETE retracts aren't checked.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship_deletes: Option<Vec<String>>,
+    pub relationship_deletes: Option<Vec<RelationshipDelete>>,
 
     /// Skolemization id override for blank-node minting in this transaction.
     ///

@@ -44,7 +44,7 @@ use fluree_db_cypher::ast::{
     RemoveItem, SetClause, SetItem, Statement, Update, Variable, WithClause, WriteClause,
 };
 
-use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{RelationshipDelete, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 use crate::namespace::NamespaceRegistry;
 
 /// Errors raised by Cypher → Txn lowering.
@@ -1135,14 +1135,18 @@ impl<'a> CypherLowering<'a> {
             if let Some((s_name, p_sid, o_name)) = self.rel_var_edges.get(&target.name).cloned() {
                 let s = TemplateTerm::Var(self.vars.get_or_insert(&s_name));
                 let o = TemplateTerm::Var(self.vars.get_or_insert(&o_name));
-                self.delete_templates
-                    .push(TripleTemplate::new(s, TemplateTerm::Sid(p_sid), o));
-                // Staging refuses an edge that carries another relationship,
-                // which the base-edge retraction would take too.
+                // Staging refuses an edge this template retracts when it
+                // carries another relationship, which the base-edge
+                // retraction would take too.
                 self.opts
                     .relationship_deletes
                     .get_or_insert_with(Vec::new)
-                    .push(target.name.clone());
+                    .push(RelationshipDelete {
+                        var: target.name.clone(),
+                        template: self.delete_templates.len(),
+                    });
+                self.delete_templates
+                    .push(TripleTemplate::new(s, TemplateTerm::Sid(p_sid), o));
                 continue;
             }
 

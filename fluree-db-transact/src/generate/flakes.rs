@@ -287,13 +287,26 @@ impl<'a> FlakeGenerator<'a> {
         witnessed: &[bool],
         bindings: &Batch,
     ) -> Result<Vec<RetractIntent>> {
+        self.generate_retract_intents_noting(templates, witnessed, bindings, |_, _| {})
+    }
+
+    /// [`Self::generate_retract_intents`], calling `note` with each intent and
+    /// the index of the template it came from.
+    pub(crate) fn generate_retract_intents_noting(
+        &mut self,
+        templates: &[TripleTemplate],
+        witnessed: &[bool],
+        bindings: &Batch,
+        mut note: impl FnMut(usize, &Flake),
+    ) -> Result<Vec<RetractIntent>> {
         debug_assert_eq!(templates.len(), witnessed.len());
         let mut intents = Vec::new();
         for row_idx in 0..Self::solution_rows(bindings) {
-            for (template, &witnessed) in templates.iter().zip(witnessed) {
+            for (i, (template, &witnessed)) in templates.iter().zip(witnessed).enumerate() {
                 if let Some(flake) =
                     self.materialize_template(template, bindings, row_idx, false)?
                 {
+                    note(i, &flake);
                     intents.push(RetractIntent::new(flake, witnessed));
                 }
             }
