@@ -1218,6 +1218,27 @@ fn a_read_out_masks_what_its_type_does_not_know_and_refuses_what_it_cannot_read(
     );
 }
 
+#[cfg(feature = "sql")]
+#[test]
+fn a_read_out_masks_by_key_name_what_the_type_holds_as_plain_text() {
+    // A session property is plain text to the SQL config's type; the name
+    // rule (`*_token`, `*_secret`, `*_password`, `password`) still masks it.
+    use fluree_db_nameservice::GraphSourceType;
+    let stored = json!({"endpoint": URI, "session": {
+        "x_token": "SECRET-VALUE",
+        "password": "SECRET-VALUE",
+        "db_secret": "SECRET-VALUE",
+        "query_max_run_time": "5m",
+    }});
+    let out = read_out(GraphSourceType::Sql, &stored);
+    assert_redacted(&out, &stored);
+    assert!(
+        out.contains("query_max_run_time") && out.contains("5m"),
+        "{out}"
+    );
+    assert!(out.contains("x_token"), "{out}");
+}
+
 // ---- the flat Iceberg converter's storage identity ----------------------------
 
 fn rest_fields() -> IcebergConnectionFields {

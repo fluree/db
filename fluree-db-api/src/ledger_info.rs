@@ -1211,8 +1211,9 @@ fn redact_secret_subtree(value: &mut JsonValue) -> bool {
 /// Redact a stored graph-source config for a read-out, by its type: every
 /// secret the persisted type classifies (bearer tokens, OAuth2 and Azure client
 /// secrets, service-account keys, in every auth variant) and every key the
-/// type does not know are masked. Returns `config` unchanged when nothing is,
-/// so secret-free configs stay byte-identical.
+/// type does not know are masked, and then every value under a secret key
+/// name, as [`redact_graph_source_config`] masks it. Returns `config`
+/// unchanged when nothing is, so secret-free configs stay byte-identical.
 ///
 /// FAILS CLOSED: a config that is not JSON, or that its source type's config
 /// cannot read, is replaced wholesale, since nothing in it can be classified.
@@ -1230,10 +1231,17 @@ pub fn redact_graph_source_record_config(source_type: &GraphSourceType, config: 
             return config.to_string();
         }
         match redact_stored(source_type, &mut value) {
-            Redaction::Masked(false) => return config.to_string(),
-            Redaction::Masked(true) => {
+            Redaction::Masked(typed) => {
+                // The name rule as well: it masks a value the type holds as
+                // plain text under a secret-sounding key (a SQL session
+                // property named `x_token`), and a secret field a config type
+                // gains outside its auth.
+                let named = redact_json_secrets(&mut value);
+                if !typed && !named {
+                    return config.to_string();
+                }
                 return serde_json::to_string(&value)
-                    .unwrap_or_else(|_| "\"[redacted:unserializable]\"".to_string())
+                    .unwrap_or_else(|_| "\"[redacted:unserializable]\"".to_string());
             }
             Redaction::Unreadable => return "\"[redacted:unreadable]\"".to_string(),
             Redaction::Untyped => {}
