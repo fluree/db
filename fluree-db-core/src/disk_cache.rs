@@ -434,6 +434,14 @@ fn directory_bytes(root: &Path) -> io::Result<u64> {
     Ok(walked_bytes(&scan_cache_entries(root)?))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs on each file a walk on this thread lists, before the
+    /// walk reads its size.
+    static ON_LISTED: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
     let mut stack = vec![root.to_path_buf()];
     let mut entries = Vec::new();
@@ -445,10 +453,16 @@ fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
             Err(err) => return Err(err),
         };
 
+        // An entry removed after the listing is gone, not a failed walk: the
+        // cache's own evictions and writes run while it walks.
         for child in read_dir {
             let child = child?;
             let path = child.path();
-            let file_type = child.file_type()?;
+            let file_type = match child.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
             if file_type.is_dir() {
                 stack.push(path);
                 continue;
@@ -457,7 +471,17 @@ fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
                 continue;
             }
 
-            let meta = child.metadata()?;
+            #[cfg(test)]
+            ON_LISTED.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(&path);
+                }
+            });
+            let meta = match child.metadata() {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
             entries.push(CacheEntry {
                 path,
                 bytes: meta.len(),
@@ -1578,7 +1602,10 @@ mod tests {
             cache.evict_entry(&target);
             registered.release();
         });
-        assert!(!target.exists(), "the write kept the entry from the eviction");
+        assert!(
+            !target.exists(),
+            "the write kept the entry from the eviction"
+        );
         assert_exact(&cache, &dir, 0);
     }
 
@@ -1677,6 +1704,27 @@ mod tests {
         let entries = scan_cache_entries(&dir).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].path.ends_with("real.leaf"));
+    }
+
+    /// An entry removed between the walk listing it and reading its size is
+    /// gone, not a failed walk.
+    #[test]
+    fn scan_skips_an_entry_removed_mid_walk() {
+        let dir = temp_cache_dir("scan-vanished");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("gone.leaf"), [0u8; 300]).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        ON_LISTED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|path: &Path| {
+                if path.ends_with("gone.leaf") {
+                    fs::remove_file(path).unwrap();
+                }
+            }));
+        });
+        let walked = scan_cache_entries(&dir);
+        ON_LISTED.with(|hook| hook.borrow_mut().take());
+        let entries = walked.expect("the walk failed on the removed entry");
+        assert_eq!(walked_bytes(&entries), 500);
     }
 
     #[test]
