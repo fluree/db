@@ -884,6 +884,11 @@ impl FlureeServerBuilder {
                         ),
                     ])));
                     handle.set_build_observer(housekeeping_fluree.retention_build_observer());
+                    // Maintenance holds (a reindex, a purge's erasure) wait
+                    // for this indexer's builds while its task lives.
+                    let alive = std::sync::Arc::new(());
+                    housekeeping_fluree
+                        .set_leader_indexer(handle.clone(), std::sync::Arc::downgrade(&alive));
                     // The handle owns the worker's ShutdownTrigger:
                     // dropping it fires the shutdown oneshot and `run()`
                     // exits on its FIRST select — silently, before its
@@ -893,7 +898,7 @@ impl FlureeServerBuilder {
                     // they live and die together; the leader watcher's
                     // abort on leadership loss releases both.
                     let mut tasks = vec![tokio::spawn(async move {
-                        let _keepalive = handle;
+                        let _keepalive = (handle, alive);
                         worker.run().await;
                     })];
                     // BM25 auto-sync is leader-only for the same reason

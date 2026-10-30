@@ -51,6 +51,33 @@ impl Fluree {
         settle: Duration,
         deadline: Option<Instant>,
     ) -> Result<GarbageReport> {
+        self.pass_in_cluster(collector, None, grace, settle, deadline)
+            .await
+    }
+
+    /// [`Self::collect_in_cluster`], condemning only ledger `name`'s
+    /// recorded blobs, whatever their age, and no registration chunk: as a
+    /// purge resolves the garbage of a ledger it purges. The open intents
+    /// are carried on as in any pass.
+    pub(crate) async fn collect_ledger_in_cluster(
+        &self,
+        collector: &Arc<dyn Collector>,
+        name: &str,
+        settle: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<GarbageReport> {
+        self.pass_in_cluster(collector, Some(name), Duration::ZERO, settle, deadline)
+            .await
+    }
+
+    async fn pass_in_cluster(
+        &self,
+        collector: &Arc<dyn Collector>,
+        only: Option<&str>,
+        grace: Duration,
+        settle: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<GarbageReport> {
         let mut report = GarbageReport::default();
         // One pass at a time: another would complete an intent this one
         // still deletes.
@@ -87,9 +114,9 @@ impl Fluree {
             }
         }
         let mut entries = self
-            .unreferenced_due(collector, grace, deadline, &condemned, &mut report)
+            .unreferenced_due(collector, only, grace, deadline, &condemned, &mut report)
             .await?;
-        if let Some(objects) = self.registry_objects() {
+        if let (None, Some(objects)) = (only, self.registry_objects()) {
             for address in self.unnamed_chunks(&objects, grace).await? {
                 if entries.len() < MAX_INTENT && !condemned.contains(&address) {
                     entries.push(IntentEntry {
@@ -229,6 +256,7 @@ impl Fluree {
     async fn unreferenced_due(
         &self,
         collector: &Arc<dyn Collector>,
+        only: Option<&str>,
         grace: Duration,
         deadline: Option<Instant>,
         condemned: &HashSet<String>,
@@ -240,9 +268,11 @@ impl Fluree {
         let mut entries = Vec::new();
         let from = self.root.collect_from.lock().clone();
         let mut next_from = None;
-        for (name, binding) in
-            super::collect::resume_order(self.publisher()?.list_bindings().await?, from)
-        {
+        let mut bindings = self.publisher()?.list_bindings().await?;
+        if let Some(only) = only {
+            bindings.retain(|(name, _)| name == only);
+        }
+        for (name, binding) in super::collect::resume_order(bindings, from) {
             if entries.len() >= MAX_INTENT || deadline.is_some_and(|d| Instant::now() >= d) {
                 next_from.get_or_insert(name);
                 report.ledgers_left += 1;
@@ -292,7 +322,10 @@ impl Fluree {
                 }
             }
         }
-        *self.root.collect_from.lock() = next_from;
+        // A pass over one ledger leaves where the next full one starts.
+        if only.is_none() {
+            *self.root.collect_from.lock() = next_from;
+        }
         Ok(entries)
     }
 }

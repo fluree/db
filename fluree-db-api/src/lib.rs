@@ -3595,6 +3595,8 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             secret_resolver,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(not(target_arch = "wasm32"))]
+            leader_indexer: Arc::default(),
             retention,
             content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]
@@ -3966,6 +3968,9 @@ pub struct Fluree {
     secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
     /// The key-rotation sweep running in this process, if any.
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
+    /// On a cluster member: the indexer its leader role builds with.
+    #[cfg(not(target_arch = "wasm32"))]
+    leader_indexer: Arc<admin::LeaderIndexer>,
     /// The retention worker's in-process state: the branches it knows are
     /// active, and how to wake it.
     retention: Arc<retention::RetentionRuntime>,
@@ -4038,6 +4043,8 @@ impl Fluree {
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(not(target_arch = "wasm32"))]
+            leader_indexer: Arc::default(),
             retention: Arc::default(),
             content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]

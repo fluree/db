@@ -294,11 +294,8 @@ impl Fluree {
         let (Some(runtime), Ok(ns)) = (self.retention.erasure.get(), self.publisher()) else {
             return;
         };
-        // A cluster's members do not yet exclude its deletes from their
-        // writes; see `run_purge_pass`.
-        if self.retention.replicas.get().is_some() {
-            return;
-        }
+        // On a cluster a job is purged once every member installed it.
+        let clustered = self.collected_by_cluster();
         let now = now_ms();
         let mut due = std::collections::BTreeSet::new();
         for branch in ledgers {
@@ -306,10 +303,11 @@ impl Fluree {
                 .await
                 .and_then(|(c, stored)| Ok((c, stored.map(|s| registry::shell(&s)).transpose()?)))
             {
-                let purge = registration
-                    .erasures
-                    .iter()
-                    .any(|j| j.purge_pending() && j.retry_at_ms.is_none_or(|at| at <= now));
+                let purge = registration.erasures.iter().any(|j| {
+                    j.purge_pending()
+                        && (!clustered || j.effective_ms().is_some())
+                        && j.retry_at_ms.is_none_or(|at| at <= now)
+                });
                 if let (true, Ok(id)) = (purge, LedgerId::parse(branch)) {
                     due.insert(id.ledger_name().to_string());
                 }

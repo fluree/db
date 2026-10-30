@@ -438,7 +438,8 @@ impl Fluree {
     /// branch references, as of a reconciliation started at or after
     /// `since_ms`, taking a step of one if there is none. `false` while that
     /// cannot be established: the reconciliation is not complete, the ledger
-    /// is unsettled, or a writer pins a file.
+    /// is unsettled, or a writer pins a file. On a cluster the collector's
+    /// pass condemns them, and a later one, a settle period on, deletes them.
     pub(crate) async fn resolve_garbage(&self, name: &str, since_ms: i64) -> Result<bool> {
         let Some(binding) = self.publisher()?.get_binding(name).await? else {
             return Ok(false);
@@ -453,10 +454,15 @@ impl Fluree {
                 return Ok(false);
             }
         }
-        let mut report = super::GarbageReport::default();
         let deadline = Instant::now().checked_add(RESOLVE_BUDGET);
-        self.collect_ledger(name, &binding.value, now_ms(), deadline, &mut report)
-            .await?;
+        if let Some(collector) = self.collector() {
+            self.collect_ledger_in_cluster(collector, name, super::cluster::SETTLE, deadline)
+                .await?;
+        } else {
+            let mut report = super::GarbageReport::default();
+            self.collect_ledger(name, &binding.value, now_ms(), deadline, &mut report)
+                .await?;
+        }
         Ok(self.unresolved_garbage(root).await?.is_empty())
     }
 

@@ -695,7 +695,7 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
     use fluree_db_core::commit::codec::replacement::is_replacement;
     use fluree_db_core::ContentStore;
 
-    let (integration, fluree, node, _dirs) = stand_up_with(
+    let (integration, fluree, node, dirs) = stand_up_with(
         16,
         |builder| {
             builder.with_erasure(ErasureConfig {
@@ -806,8 +806,6 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
         after.index_head_id.is_some(),
         "the source's index was copied"
     );
-    let purge = fluree.run_purge_pass(id, Duration::ZERO).await;
-    assert!(purge.is_err(), "a cluster purged: {purge:?}");
     eventually("the job's effective state", async || {
         fluree.run_erasure_pass(id).await.expect("pass");
         fluree
@@ -831,6 +829,81 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
     .await
     .expect("a transaction after the activation lands in time")
     .expect("a transaction after the activation lands");
+
+    // Then the leader purges the shared storage, the requests' garbage
+    // collected through the cluster's intents, and leaves its members' own
+    // copies to them.
+    let original = dirs.1.path().join(
+        fluree_db_core::content_address(
+            "file",
+            fluree_db_core::ContentKind::Commit,
+            &record.storage_namespace(),
+            &asserted.address_digest(),
+        )
+        .trim_start_matches("fluree:file://"),
+    );
+    assert!(original.exists(), "{}", original.display());
+    let status = async || {
+        fluree
+            .retention_status(id)
+            .await
+            .expect("status")
+            .registration
+            .expect("registered")
+            .erasures
+            .remove(0)
+    };
+    // The erasure's own control commit was keyed: until its idempotency
+    // record goes, its envelope is named, and the purge waits.
+    let waiting = fluree
+        .run_purge_pass(id, Duration::ZERO)
+        .await
+        .expect("purge pass");
+    assert!(waiting.waiting, "{waiting:?}");
+    assert!(status()
+        .await
+        .purge
+        .is_some_and(|p| p.envelopes_ms.is_none()));
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 1;
+    integration
+        .raft
+        .client_write(
+            fluree_db_consensus::raft::state_machine::Command::EvictIdempotency {
+                cutoff_millis: now,
+                marker_cutoff_millis: now,
+            },
+        )
+        .await
+        .expect("records evicted, as their time-to-live would");
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let job = loop {
+        let report = fluree
+            .run_purge_pass(id, Duration::ZERO)
+            .await
+            .expect("purge pass");
+        assert!(report.blocked.is_none(), "{report:?}");
+        let job = status().await;
+        if job.purge.as_ref().is_some_and(|p| p.storage_ms.is_some()) {
+            break job;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shared storage was not purged: {report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(
+        job.stage,
+        fluree_db_api::retention::erasure::ErasureStage::Purging
+    );
+    assert!(!original.exists(), "the original is deleted");
     node.shutdown().await;
 }
 

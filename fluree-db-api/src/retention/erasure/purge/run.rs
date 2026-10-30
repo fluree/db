@@ -85,10 +85,13 @@ impl Fluree {
         release_after: Duration,
     ) -> Result<PurgeReport> {
         let runtime = self.erasure_runtime()?;
-        // A delete here could remove what another member is writing back,
-        // and its local copies are out of reach.
-        if self.retention.replicas.get().is_some() {
-            return Err(ApiError::http(501, "a cluster cannot purge erasures yet"));
+        // On a cluster the leader purges the shared storage, for jobs every
+        // member has installed: none reads or writes back what they erase.
+        let clustered = self.collected_by_cluster();
+        if let Some(collector) = self.collector() {
+            if collector.lease().await.is_none() {
+                return Err(ApiError::http(409, "a cluster purges on its leader"));
+            }
         }
         // The holders stay those the pass planned for: a branch made from
         // one would copy an index not yet erased, and a restore would
@@ -111,6 +114,11 @@ impl Fluree {
                 .flatten()
         };
         let waiting = |rebuilt_ms: i64| now_ms() - rebuilt_ms < release_after.as_millis() as i64;
+        // Its members' own copies are left: cleaned after.
+        if progress(|p| p.storage_ms).is_some() {
+            report.waiting = true;
+            return Ok(report);
+        }
         if progress(|p| p.scanned_ms).is_none() && progress(|p| p.rebuilt_ms).is_some_and(waiting) {
             report.waiting = true;
             return Ok(report);
@@ -126,12 +134,15 @@ impl Fluree {
              cannot rebuild, keep their own copies: drop them first",
         );
         let blocked = blocked.or_else(|| {
-            self.blob_pins().is_none().then_some(
+            (self.blob_pins().is_none() && !clustered).then_some(
                 "this instance does not collect garbage: it does not hold its storage's lock",
             )
         });
         let blocked = match blocked {
             Some(why) => Some(why),
+            // Members retire their own logs after the purge, and stopped
+            // owners' logs are retired before it deletes.
+            None if clustered => None,
             None => (self.foreign_wal_segments().await? > 0).then_some(
                 "another process's write-ahead log under this storage may hold erased bytes, \
                  and an open after it stops would replay them",
@@ -199,11 +210,6 @@ impl Fluree {
                 report.waiting = true;
                 return Ok(report);
             }
-            let clock = Instant::now();
-            for branch in &plan.rebuild {
-                self.collapse_index(branch).await?;
-            }
-            report.deleted += self.release_source_leftovers(&plan).await?;
             let ledgers: BTreeSet<LedgerName> = plan
                 .rebuild
                 .iter()
@@ -211,6 +217,38 @@ impl Fluree {
                 .filter_map(|b| LedgerId::parse(b).ok())
                 .map(|id| id.ledger_name())
                 .collect();
+            // On a cluster the envelopes of the requests erased are garbage
+            // once no idempotency record from before names them.
+            let since_ms = match self.collector() {
+                None => rebuilt_ms,
+                Some(collector) => match progress(|p| p.envelopes_ms) {
+                    Some(ms) => ms.max(rebuilt_ms),
+                    None => {
+                        let effective = jobs.iter().filter_map(|(_, j)| j.effective_ms()).max();
+                        for ledger in &ledgers {
+                            if collector
+                                .requests_recorded_by(
+                                    ledger.as_str(),
+                                    effective.unwrap_or(i64::MAX),
+                                )
+                                .await
+                            {
+                                report.waiting = true;
+                                return Ok(report);
+                            }
+                        }
+                        let ms = now_ms();
+                        self.update_purge(&jobs, |p| p.envelopes_ms = Some(ms))
+                            .await?;
+                        ms.max(rebuilt_ms)
+                    }
+                },
+            };
+            let clock = Instant::now();
+            for branch in &plan.rebuild {
+                self.collapse_index(branch).await?;
+            }
+            report.deleted += self.release_source_leftovers(&plan).await?;
             for ledger in &ledgers {
                 self.sweep_index_storage(ledger.as_str()).await?;
                 let orphans = self.plan_index_sweep(ledger.as_str()).await?.orphans;
@@ -223,7 +261,7 @@ impl Fluree {
                 }
                 // Every file nothing references is garbage once the ledger
                 // is reconciled: collected, none can hold an erased value.
-                if !self.resolve_garbage(ledger.as_str(), rebuilt_ms).await? {
+                if !self.resolve_garbage(ledger.as_str(), since_ms).await? {
                     report.waiting = true;
                     return Ok(report);
                 }
@@ -251,6 +289,9 @@ impl Fluree {
                 return self.block(&jobs, report, why).await;
             }
             let clock = Instant::now();
+            if clustered {
+                self.retire_stopped_logs().await?;
+            }
             report.deleted += self
                 .rewrite_schedules(&plan, &scan.schedules, &captured)
                 .await?;
@@ -276,6 +317,10 @@ impl Fluree {
         }
 
         let clock = Instant::now();
+        // A stopped member's log could write an original back after it went.
+        if clustered {
+            self.retire_stopped_logs().await?;
+        }
         // Their folders' histories still read them: a later erasure of the
         // same commit must find them.
         self.erasure_runtime()?
@@ -298,7 +343,17 @@ impl Fluree {
                 )));
             }
         }
-        report.deleted += self.make_deletes_durable(&plan).await?;
+        // On a cluster other members write here: a staging file is a crashed
+        // write's only if untouched since every member installed the erasure.
+        let staging_age = clustered.then(|| {
+            let effective = jobs
+                .iter()
+                .filter_map(|(_, j)| j.effective_ms())
+                .min()
+                .unwrap_or_else(now_ms);
+            std::time::Duration::from_millis(u64::try_from(now_ms() - effective).unwrap_or(0))
+        });
+        report.deleted += self.make_deletes_durable(&plan, staging_age).await?;
         report.timings.delete += clock.elapsed();
         for branch in &plan.rebuild {
             if let Ok(id) = LedgerId::parse(branch) {
@@ -310,6 +365,16 @@ impl Fluree {
         self.leaflet_cache().clear();
         crate::ontology_imports::global_schema_bundle_cache().clear();
         crate::ontology_imports::global_schema_bundle_flakes_cache().clear();
+        if clustered {
+            let ms = now_ms();
+            self.update_purge(&jobs, |p| {
+                p.storage_ms = Some(ms);
+                p.deleted += deleted;
+            })
+            .await?;
+            report.waiting = true;
+            return Ok(report);
+        }
         let ms = now_ms();
         for (branch, job) in &jobs {
             self.update_job(branch, &job.request_id, |j| {
@@ -331,6 +396,7 @@ impl Fluree {
     /// whose registration holds each.
     pub(super) async fn purge_jobs(&self, name: &LedgerName) -> Result<Vec<(String, ErasureJob)>> {
         let ns = self.publisher()?;
+        let clustered = self.collected_by_cluster();
         let mut jobs = Vec::new();
         for record in self.nameservice().list_branches(name.as_str()).await? {
             if record.retracted {
@@ -345,7 +411,7 @@ impl Fluree {
                     registration
                         .erasures
                         .into_iter()
-                        .filter(ErasureJob::purge_pending)
+                        .filter(|j| j.purge_pending() && (!clustered || j.effective_ms().is_some()))
                         .map(|j| (branch.clone(), j)),
                 );
             }
@@ -484,7 +550,11 @@ impl Fluree {
     /// their bytes, then flush the directories they were in. Staging files
     /// crashed writes left in the originals' ledgers go too: one may hold an
     /// original's bytes.
-    async fn make_deletes_durable(&self, plan: &PurgePlan) -> Result<usize> {
+    async fn make_deletes_durable(
+        &self,
+        plan: &PurgePlan,
+        staging_age: Option<std::time::Duration>,
+    ) -> Result<usize> {
         let Some(root) = self.config.index_storage.path.clone() else {
             return Ok(0);
         };
@@ -535,9 +605,11 @@ impl Fluree {
             let mut swept = 0;
             let scratch = |e: std::io::Error| fluree_db_core::Error::io(format!("scratch: {e}"));
             for tree in &trees {
-                swept += fluree_db_core::FileStorage::sweep_foreign_staging(
-                    std::path::Path::new(root.as_ref()).join(tree),
-                )
+                let tree = std::path::Path::new(root.as_ref()).join(tree);
+                swept += match staging_age {
+                    None => fluree_db_core::FileStorage::sweep_foreign_staging(tree),
+                    Some(age) => fluree_db_core::FileStorage::sweep_staging_older_than(tree, age),
+                }
                 .map_err(scratch)?;
             }
             for holder in &holders {
@@ -563,6 +635,20 @@ impl Fluree {
         Ok(swept)
     }
 
+    /// Apply and retire the logs stopped members left under this storage, so
+    /// none writes back what the purge deletes.
+    async fn retire_stopped_logs(&self) -> Result<()> {
+        let Some(root) = self.config.index_storage.path.clone() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            fluree_db_core::FileStorage::retire_stopped_logs(root.as_ref())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("write-ahead log retirement: {e}")))??;
+        Ok(())
+    }
+
     /// Segments other processes' write-ahead logs keep under this storage.
     async fn foreign_wal_segments(&self) -> Result<usize> {
         let Some(root) = self.config.index_storage.path.clone() else {
@@ -586,14 +672,19 @@ impl Fluree {
         let Some(root) = record.index_head_id.as_ref() else {
             return Ok(());
         };
-        let handle = match &self.indexing_mode {
-            IndexingMode::Background(handle) => Some(handle),
-            IndexingMode::Disabled => None,
-        };
-        let guard = match handle {
-            Some(handle) => Some(handle.hold_gc(&id.ledger_name()).await),
-            None => None,
-        };
+        // This instance's indexer, and on a cluster's leader its leader
+        // role's: either's collection or builds would race the release.
+        let mut indexers = Vec::new();
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            indexers.push((handle.clone(), None));
+        }
+        if let Some((handle, alive)) = self.leader_indexer() {
+            indexers.push((handle, Some(alive)));
+        }
+        let mut guards = Vec::new();
+        for (handle, _) in &indexers {
+            guards.push(handle.hold_gc(&id.ledger_name()).await);
+        }
         let store = self.content_store(&record.storage_namespace());
         let config = CleanGarbageConfig {
             max_old_indexes: Some(0),
@@ -603,23 +694,34 @@ impl Fluree {
         let Some(plan) = plan_garbage(store.as_ref(), root, &config).await? else {
             return Ok(());
         };
-        let _window = match (handle, &guard) {
-            (Some(handle), Some(guard)) => match handle.open_release_window(guard).await {
-                Some(window) => Some(window),
+        let mut windows = Vec::new();
+        for ((handle, alive), guard) in indexers.iter().zip(&guards) {
+            let window = match alive {
+                None => handle.open_release_window(guard).await,
+                Some(alive) => {
+                    match crate::admin::while_alive(alive, handle.open_release_window(guard)).await
+                    {
+                        Some(window) => window,
+                        // Its task ended: it builds nothing more.
+                        None => continue,
+                    }
+                }
+            };
+            match window {
+                Some(window) => windows.push(window),
                 None => {
                     return Err(ApiError::internal(format!(
                         "{branch} is held for maintenance; its older indexes stay for now"
                     )))
                 }
-            },
-            _ => None,
-        };
+            }
+        }
         let records = self.nameservice().all_records().await?;
         let mut siblings: Vec<LedgerId> = siblings_of(&records, &id)
             .into_iter()
             .map(|b| b.ledger_id)
             .collect();
-        if let Some(handle) = handle {
+        for (handle, _) in &indexers {
             siblings.extend(handle.built_branches(&id.ledger_name()));
         }
         let reader = self.nameservice_mode.as_arc_reader();

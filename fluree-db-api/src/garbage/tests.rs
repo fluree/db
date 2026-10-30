@@ -515,6 +515,10 @@ pub(crate) mod cluster {
             Ok(true)
         }
 
+        async fn requests_recorded_by(&self, _ledger: &str, _ms: i64) -> bool {
+            false
+        }
+
         async fn lease(&self) -> Option<Instant> {
             let mut leases = self.leases.lock();
             match leases.as_mut() {

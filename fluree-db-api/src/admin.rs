@@ -2770,13 +2770,8 @@ impl crate::Fluree {
         // them. Cancelling and waiting for idle is not enough on its own: a
         // build can start again the moment the wait returns. The guard is
         // held until this function exits.
-        let _maintenance = match &self.indexing_mode {
-            IndexingMode::Background(handle) => {
-                info!(ledger_id = %ledger_id, "Holding ledger for reindex");
-                Some(hold_branch_quiesced(handle, &ledger_id).await?)
-            }
-            IndexingMode::Disabled => None,
-        };
+        info!(ledger_id = %ledger_id, "Holding ledger for reindex");
+        let _maintenance = self.hold_indexers(&ledger_id).await?;
 
         // Re-fetch the record after the background indexer has quiesced: a
         // background build racing this reindex may have published between
@@ -3063,6 +3058,31 @@ mod tests {
     fn test_drop_status_default() {
         assert_eq!(DropStatus::default(), DropStatus::NotFound);
     }
+
+    /// A maintenance hold reaches the indexer a cluster's leader builds
+    /// with while its task lives, and leaves it once the task is gone.
+    #[tokio::test]
+    async fn a_maintenance_hold_reaches_the_leaders_indexer_while_it_lives() {
+        use std::sync::Arc;
+        let fluree = crate::FlureeBuilder::memory().build_client().await.unwrap();
+        let ns: Arc<dyn fluree_db_nameservice::IndexingNameService> =
+            Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+        let (_worker, leader) = fluree_db_indexer::BackgroundIndexerWorker::new(
+            fluree.backend().clone(),
+            ns,
+            fluree_db_indexer::IndexerConfig::default(),
+        );
+        let alive = Arc::new(());
+        fluree.set_leader_indexer(leader.clone(), Arc::downgrade(&alive));
+        let id = LedgerId::parse("held:main").unwrap();
+        let guards = fluree.hold_indexers(&id).await.unwrap();
+        assert!(leader.hold_quiesced(&id).await.is_none(), "held");
+        drop(guards);
+
+        drop(alive);
+        let _guards = fluree.hold_indexers(&id).await.unwrap();
+        assert!(leader.hold_quiesced(&id).await.is_some(), "not held");
+    }
 }
 
 // =============================================================================
@@ -3080,6 +3100,72 @@ pub(crate) async fn hold_branch_quiesced<'a>(
             "another maintenance operation holds {ledger_id}; retry when it completes"
         ))
     })
+}
+
+/// The indexer a cluster's leader builds with, while its task lives.
+#[derive(Default)]
+pub(crate) struct LeaderIndexer(
+    parking_lot::Mutex<Option<(fluree_db_indexer::IndexerHandle, std::sync::Weak<()>)>>,
+);
+
+impl crate::Fluree {
+    /// Build with `handle` as this cluster member's leader, while `alive`
+    /// lives: a maintenance hold on a branch waits for its builds too.
+    pub fn set_leader_indexer(
+        &self,
+        handle: fluree_db_indexer::IndexerHandle,
+        alive: std::sync::Weak<()>,
+    ) {
+        *self.leader_indexer.0.lock() = Some((handle, alive));
+    }
+
+    /// The leader role's indexer, while its task lives.
+    pub(crate) fn leader_indexer(
+        &self,
+    ) -> Option<(fluree_db_indexer::IndexerHandle, std::sync::Weak<()>)> {
+        self.leader_indexer
+            .0
+            .lock()
+            .as_ref()
+            .filter(|(_, alive)| alive.strong_count() > 0)
+            .cloned()
+    }
+
+    /// Hold `ledger_id`'s indexing, quiesced, on this instance's indexer and
+    /// on the leader's while it lives.
+    pub(crate) async fn hold_indexers(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Result<Vec<MaintenanceGuard>> {
+        let mut guards = Vec::new();
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            guards.push(hold_branch_quiesced(handle, ledger_id).await?);
+        }
+        if let Some((handle, alive)) = self.leader_indexer() {
+            if let Some(guard) = while_alive(&alive, hold_branch_quiesced(&handle, ledger_id)).await
+            {
+                guards.push(guard?);
+            }
+        }
+        Ok(guards)
+    }
+}
+
+/// `work`, unless the task `alive` tracks ends first: what `work` waits for
+/// on its indexer, a build or a collection, then never reports done.
+pub(crate) async fn while_alive<T>(
+    alive: &std::sync::Weak<()>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let ended = async {
+        while alive.strong_count() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    };
+    tokio::select! {
+        out = work => Some(out),
+        () = ended => None,
+    }
 }
 
 impl crate::Fluree {
@@ -3126,10 +3212,8 @@ impl crate::Fluree {
         // external one is not covered here either way, which is the
         // single-process caveat documented on `MaintenanceGuard`.
         let mut guards = Vec::with_capacity(records.len());
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            for record in &records {
-                guards.push(hold_branch_quiesced(handle, &record.ledger_id).await?);
-            }
+        for record in &records {
+            guards.extend(self.hold_indexers(&record.ledger_id).await?);
         }
 
         // Re-read after quiescing: a build that published between the

@@ -205,6 +205,22 @@ impl Collector for RaftNameService {
         }
     }
 
+    async fn requests_recorded_by(&self, ledger: &str, ms: i64) -> bool {
+        let ms = u64::try_from(ms).unwrap_or(0);
+        self.state
+            .read()
+            .await
+            .idempotency
+            .iter()
+            .any(|(key, outcome)| {
+                split_ledger_id(&key.ledger_id).is_ok_and(|(name, _)| name == ledger)
+                    && match outcome {
+                        ApplyOutcome::Applied(record) => record.recorded_at_millis <= ms,
+                        ApplyOutcome::Failed(record) => record.recorded_at_millis <= ms,
+                    }
+            })
+    }
+
     async fn lease(&self) -> Option<Instant> {
         let started = Instant::now();
         self.raft.get_read_log_id().await.ok()?;

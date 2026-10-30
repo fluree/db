@@ -12,7 +12,7 @@ use fluree_db_nameservice::NsRecord;
 use fluree_db_query::binary_scan::encode_stored_object;
 
 use super::Captured;
-use crate::{ApiError, Fluree, IndexingMode, Result};
+use crate::{ApiError, Fluree, Result};
 
 /// What erasing leaf by leaf did.
 #[derive(Debug, PartialEq, Eq)]
@@ -45,18 +45,13 @@ impl Fluree {
     }
 
     /// Hold `ledger_id`'s indexing, as a reindex does: a build begun from a
-    /// root being erased would publish its events again over it. `None`
+    /// root being erased would publish its events again over it. None
     /// without background indexing.
     pub(crate) async fn hold_indexing(
         &self,
         ledger_id: &fluree_db_core::LedgerId,
-    ) -> Result<Option<fluree_db_indexer::MaintenanceGuard>> {
-        match &self.indexing_mode {
-            IndexingMode::Background(handle) => Ok(Some(
-                crate::admin::hold_branch_quiesced(handle, ledger_id).await?,
-            )),
-            IndexingMode::Disabled => Ok(None),
-        }
+    ) -> Result<Vec<fluree_db_indexer::MaintenanceGuard>> {
+        self.hold_indexers(ledger_id).await
     }
 
     /// [`Self::erase_from_index`], its indexing already held and its cached

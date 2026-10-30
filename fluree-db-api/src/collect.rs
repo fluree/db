@@ -85,6 +85,10 @@ pub trait Collector: Send + Sync + std::fmt::Debug {
     /// its writes: before, a member a release behind may be unable to read
     /// collection's commands.
     async fn enable(&self) -> Result<bool>;
+
+    /// Whether ledger `ledger` keeps an idempotency record made at or before
+    /// `ms`, which names its request's envelope.
+    async fn requests_recorded_by(&self, ledger: &str, ms: i64) -> bool;
 }
 
 impl Fluree {

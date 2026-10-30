@@ -404,6 +404,13 @@ impl ErasureJob {
         matches!(self.stage, ErasureStage::Published | ErasureStage::Purging)
     }
 
+    /// When a cluster's every member had installed its publication: no
+    /// member then reads or writes back what it erases. `None` until then,
+    /// and off a cluster.
+    pub fn effective_ms(&self) -> Option<i64> {
+        self.cluster.as_ref().and_then(|c| c.effective_ms)
+    }
+
     /// Purged or refused: nothing left to do.
     pub fn finished(&self) -> bool {
         matches!(self.stage, ErasureStage::Purged | ErasureStage::Failed)
@@ -422,6 +429,15 @@ pub struct PurgeProgress {
     /// deleted: a resumed purge then only deletes them and checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanned_ms: Option<i64>,
+    /// On a cluster: when no idempotency record from before the erasure was
+    /// effective was left, so the envelopes of the requests it erases were
+    /// garbage from then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelopes_ms: Option<i64>,
+    /// On a cluster: when the shared storage was purged; its members' own
+    /// copies are cleaned after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purged_ms: Option<i64>,
     /// Files deleted.
