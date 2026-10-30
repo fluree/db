@@ -1875,6 +1875,17 @@ async fn crawl_over_a_graph_source_keeps_its_query_options() {
             panic!("{label}: an override with no limit lifts the body's: {e:?}")
         });
         assert_eq!(rows(&lifted.result), 5, "{label}: {:?}", lifted.result);
+        // The crawl reports what it cost, as a tracked flat query does.
+        assert!(
+            lifted.fuel.is_some_and(|fuel| fuel > 1.0),
+            "{label}: fuel {:?}",
+            lifted.fuel
+        );
+        assert!(lifted.time.is_some(), "{label}: no time reported");
+        assert!(
+            limited.fuel.is_some(),
+            "{label}: a crawl past its limit reports the fuel it spent"
+        );
     };
     check_tracked(
         "connection",

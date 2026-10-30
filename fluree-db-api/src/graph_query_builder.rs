@@ -352,30 +352,35 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         // Intercept a virtual-dataset subgraph crawl BEFORE dispatch, exactly
         // like `execute_formatted` — otherwise the same crawl issued with
         // tracking headers falls through to native hydration and returns [].
-        // The crawl enforces the request's fuel limit but reports no
-        // fuel/policy/time stats, so it returns a 200 with empty tracking
-        // (mirrors `FromQueryBuilder::execute_tracked`).
+        // The crawl records into the request's tracker, so it reports fuel,
+        // time and policy as any tracked query does (mirrors
+        // `FromQueryBuilder::execute_tracked`).
         #[cfg(feature = "iceberg")]
-        {
+        if let Some(json) = input.as_jsonld() {
             let fc = format_config
                 .clone()
                 .unwrap_or_else(|| self.core.default_format());
+            let tracker = crate::query::helpers::tracked_query_tracker(
+                &crate::view::QueryInput::JsonLd(json),
+                &tracking,
+                None,
+            );
             match crate::graph_source::crawl::maybe_expand_crawl(
                 self.graph.fluree,
                 &db,
-                input.as_jsonld(),
+                Some(json),
                 r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
-                tracking.as_ref(),
+                Some(&tracker),
                 execution.clone(),
                 &fc,
             )
             .await
             {
                 Ok(Some(expanded)) => {
-                    return Ok(TrackedQueryResponse::success(expanded, None));
+                    return Ok(TrackedQueryResponse::success(expanded, tracker.tally()));
                 }
                 Ok(None) => {}
-                Err(e) => return Err(TrackedErrorResponse::from_api(e, None)),
+                Err(e) => return Err(TrackedErrorResponse::from_api(e, tracker.tally())),
             }
         }
 

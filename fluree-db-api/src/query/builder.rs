@@ -802,14 +802,15 @@ impl<'a> FromQueryBuilder<'a> {
     /// resolved view is not graph-source-backed (a genuinely native ledger, which
     /// `maybe_expand_crawl` filters out).
     ///
-    /// `tracking` is a tracked request's override, whose fuel limit replaces
-    /// the body's; untracked terminals pass `None`.
+    /// `tracker` is a tracked request's tracker, which the crawl records its
+    /// fuel, time and policy into under its fuel limit; untracked terminals
+    /// pass `None`.
     #[cfg(feature = "iceberg")]
     async fn try_expand_crawl(
         &self,
         json: &JsonValue,
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
-        tracking: Option<&TrackingOptions>,
+        tracker: Option<&crate::Tracker>,
         execution: &QueryExecutionOptions,
         format_config: &FormatterConfig,
     ) -> Result<Option<JsonValue>> {
@@ -852,7 +853,7 @@ impl<'a> FromQueryBuilder<'a> {
             &view,
             Some(json),
             r2rml,
-            tracking,
+            tracker,
             execution.clone(),
             format_config,
         )
@@ -1517,30 +1518,29 @@ impl<'a> FromQueryBuilder<'a> {
             .map(QueryInput::JsonLd)
             .unwrap_or(input);
         // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
-        // dispatching the tracked query. The crawl enforces the request's fuel
-        // limit but reports no fuel/policy/time stats, so it returns a 200
-        // response with empty tracking. Boxed like the
-        // dispatch futures below to keep this frame small (fluree/db#1408).
+        // dispatching the tracked query. The crawl records into the request's
+        // tracker (its fuel limit included), so it reports fuel, time and
+        // policy as any tracked query does. Boxed like the dispatch futures
+        // below to keep this frame small (fluree/db#1408).
         #[cfg(feature = "iceberg")]
         if let Some(json) = input.as_jsonld() {
             let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
             let fc = format_config
                 .clone()
                 .unwrap_or_else(|| self.core.default_format());
-            match Box::pin(self.try_expand_crawl(
-                json,
-                r2rml_pair,
-                tracking.as_ref(),
-                &execution,
-                &fc,
-            ))
-            .await
+            let tracker = crate::query::helpers::tracked_query_tracker(
+                &QueryInput::JsonLd(json),
+                &tracking,
+                None,
+            );
+            match Box::pin(self.try_expand_crawl(json, r2rml_pair, Some(&tracker), &execution, &fc))
+                .await
             {
                 Ok(Some(expanded)) => {
-                    return Ok(TrackedQueryResponse::success(expanded, None));
+                    return Ok(TrackedQueryResponse::success(expanded, tracker.tally()));
                 }
                 Ok(None) => {}
-                Err(e) => return Err(TrackedErrorResponse::from_api(e, None)),
+                Err(e) => return Err(TrackedErrorResponse::from_api(e, tracker.tally())),
             }
         }
         // SPARQL policy via connection opts (multi-query aliases) — see

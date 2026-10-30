@@ -769,6 +769,30 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
+        self.query_view_with_r2rml_tracker(
+            db,
+            q,
+            r2rml_provider,
+            r2rml_table_provider,
+            options,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::query_view_with_r2rml_options`] recording into `tracker`, a
+    /// tracked request's tracker (fuel, time and policy, with its fuel limit),
+    /// whose tally the caller reports. `None` tracks only the fuel limit the
+    /// query names, as an untracked query does.
+    pub(crate) async fn query_view_with_r2rml_tracker(
+        &self,
+        db: &GraphDb,
+        q: impl Into<QueryInput<'_>>,
+        r2rml_provider: &dyn R2rmlProvider,
+        r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
+        tracker: Option<&Tracker>,
+    ) -> Result<QueryResult> {
         let input = q.into();
 
         // #1473: parse SPARQL once. R2RML + within-ledger SPARQL FROM/FROM NAMED
@@ -789,10 +813,23 @@ impl Fluree {
             QueryInput::JsonLd(_) => None,
         };
 
-        // 0. Tracker (fuel limits only). Charge the floor up front so a
-        // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
-        let tracker = tracker_for_input_limits(&input, sparql_ast.as_ref());
-        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+        // 0. Tracker: the caller's, or one for fuel limits only. Charge the
+        // floor up front so a sub-floor `max-fuel` is rejected before
+        // parse/plan; no-op untracked.
+        let limits_only;
+        let tracker = match tracker {
+            Some(tracker) => {
+                // Whether policy governs the request, as the tracked entry
+                // points record it.
+                tracker.record_policy_enforcement(db.policy_enforcement());
+                tracker
+            }
+            None => {
+                limits_only = tracker_for_input_limits(&input, sparql_ast.as_ref());
+                &limits_only
+            }
+        };
+        charge_query_floor(tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
@@ -826,7 +863,7 @@ impl Fluree {
                 db,
                 &vars,
                 &executable,
-                &tracker,
+                tracker,
                 crate::R2rmlProviders {
                     provider: r2rml_provider,
                     table_provider: r2rml_table_provider,

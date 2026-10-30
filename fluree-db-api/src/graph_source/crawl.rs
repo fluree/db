@@ -33,7 +33,7 @@ use fluree_db_query::Binding;
 
 use crate::format::{format_node_object_binding, FormatterConfig, IriCompactor};
 use crate::view::{GraphDb, QueryInput};
-use crate::{Fluree, QueryExecutionOptions, Result, TrackingOptions};
+use crate::{Fluree, QueryExecutionOptions, Result, Tracker};
 
 /// Fresh variable names for the injected wildcard scan. The leading `?__` keeps
 /// them from colliding with any user variable.
@@ -87,9 +87,6 @@ const CRAWL_OWNED_KEYS: &[&str] = &[
 /// read on a view, they are refused as a cross-ledger `from`.
 const DATASET_KEYS: &[&str] = &["from", "ledger", "fromNamed", "from-named", "to"];
 
-/// The spellings of a fuel limit in `opts` (see `TrackingOptions::from_opts_value`).
-const MAX_FUEL_KEYS: &[&str] = &["max-fuel", "max_fuel", "maxFuel"];
-
 /// Every key of the crawl's query that the flat query carries unchanged: all
 /// of them but [`CRAWL_OWNED_KEYS`] and [`DATASET_KEYS`]. That includes the
 /// context, `opts` (the fuel limit, `meta`, the parse switches such as
@@ -113,31 +110,6 @@ fn carried_query_options(obj: &Map<String, JsonValue>) -> Map<String, JsonValue>
         opts.retain(|key, _| !DATASET_KEYS.contains(&key.as_str()));
     }
     carried
-}
-
-/// Make the flat query's fuel limit the one a tracked request's override
-/// names. The override replaces the body's `opts` fuel limit, as it does for
-/// every other tracked query (`tracked_query_tracker`), including when it
-/// names none. An untracked request passes no override and keeps the body's.
-fn apply_fuel_override(carried: &mut Map<String, JsonValue>, tracking: Option<&TrackingOptions>) {
-    let Some(tracking) = tracking else {
-        return;
-    };
-    let opts = carried
-        .entry("opts".to_string())
-        .or_insert_with(|| JsonValue::Object(Map::new()));
-    if !opts.is_object() {
-        // A malformed `opts` is the query parser's to refuse; leave it.
-        return;
-    }
-    let opts = opts.as_object_mut().expect("checked above");
-    opts.retain(|key, _| !MAX_FUEL_KEYS.contains(&key.as_str()));
-    if let Some(limit) = tracking.max_fuel {
-        opts.insert(
-            "max-fuel".to_string(),
-            json!(fluree_db_core::tracking::micro_to_fuel(limit)),
-        );
-    }
 }
 
 /// Distinct object-var name for the i-th explicit predicate of a predicate-list
@@ -257,14 +229,14 @@ pub(crate) async fn expand_wildcard_crawl(
     input: &JsonValue,
     provider: &dyn fluree_db_query::r2rml::R2rmlProvider,
     table_provider: &dyn fluree_db_query::r2rml::R2rmlTableProvider,
-    tracking: Option<&TrackingOptions>,
+    tracker: Option<&Tracker>,
     execution: QueryExecutionOptions,
     format_config: &FormatterConfig,
 ) -> Result<Option<JsonValue>> {
     let Some(DetectedCrawl {
         root,
         where_clause,
-        mut carried,
+        carried,
         limit,
         offset,
         order_by,
@@ -273,7 +245,6 @@ pub(crate) async fn expand_wildcard_crawl(
     else {
         return Ok(None);
     };
-    apply_fuel_override(&mut carried, tracking);
 
     // C1: a top-level `values` clause is NOT consumed by crawl planning
     // (`detect_wildcard_crawl` / `build_flat_query` never read it), so it would
@@ -327,6 +298,7 @@ pub(crate) async fn expand_wildcard_crawl(
                 &projection,
                 provider,
                 table_provider,
+                tracker,
                 execution,
                 format_config,
             )
@@ -382,12 +354,13 @@ pub(crate) async fn expand_wildcard_crawl(
     let execution = execution.with_trust_fk_refs(true);
 
     let result = fluree
-        .query_view_with_r2rml_options(
+        .query_view_with_r2rml_tracker(
             view,
             QueryInput::JsonLd(&flat_query),
             provider,
             table_provider,
             execution,
+            tracker,
         )
         .await?;
 
@@ -572,6 +545,7 @@ async fn expand_bound_subject_select_map(
     projection: &CrawlProjection,
     provider: &dyn fluree_db_query::r2rml::R2rmlProvider,
     table_provider: &dyn fluree_db_query::r2rml::R2rmlTableProvider,
+    tracker: Option<&Tracker>,
     execution: QueryExecutionOptions,
     format_config: &FormatterConfig,
 ) -> Result<Option<JsonValue>> {
@@ -591,12 +565,13 @@ async fn expand_bound_subject_select_map(
     let execution = execution.with_trust_fk_refs(true);
 
     let result = fluree
-        .query_view_with_r2rml_options(
+        .query_view_with_r2rml_tracker(
             view,
             QueryInput::JsonLd(&flat_query),
             provider,
             table_provider,
             execution,
+            tracker,
         )
         .await?;
 
@@ -767,8 +742,10 @@ pub(crate) fn is_wildcard_crawl(input: &JsonValue) -> bool {
 /// dataset "View Instances" screen return data instead of `[]`.
 ///
 /// The flat query the crawl runs carries the request's options (see
-/// [`carried_query_options`]); `tracking` is a tracked request's override,
-/// whose fuel limit replaces the body's, and `None` on an untracked one.
+/// [`carried_query_options`]), its fuel limit among them. `tracker` is a
+/// tracked request's tracker: the crawl's flat query records its fuel, time
+/// and policy there, under the tracker's fuel limit, and the caller reports
+/// its tally. `None` on an untracked request.
 pub(crate) async fn maybe_expand_crawl(
     fluree: &Fluree,
     view: &GraphDb,
@@ -777,7 +754,7 @@ pub(crate) async fn maybe_expand_crawl(
         &dyn fluree_db_query::r2rml::R2rmlProvider,
         &dyn fluree_db_query::r2rml::R2rmlTableProvider,
     )>,
-    tracking: Option<&TrackingOptions>,
+    tracker: Option<&Tracker>,
     execution: QueryExecutionOptions,
     format_config: &FormatterConfig,
 ) -> Result<Option<JsonValue>> {
@@ -799,7 +776,7 @@ pub(crate) async fn maybe_expand_crawl(
         json,
         provider,
         table_provider,
-        tracking,
+        tracker,
         execution,
         format_config,
     )
@@ -1236,31 +1213,6 @@ mod tests {
     }
 
     #[test]
-    fn fuel_override_replaces_the_body_limit() {
-        let body = json!({"opts": {"maxFuel": 5, "meta": true}});
-        let body = body.as_object().unwrap();
-
-        let mut untracked = body.clone();
-        apply_fuel_override(&mut untracked, None);
-        assert_eq!(&untracked, body, "no override keeps the body's limit");
-
-        let mut limited = body.clone();
-        let tracking = TrackingOptions {
-            max_fuel: Some(2_500),
-            ..TrackingOptions::default()
-        };
-        apply_fuel_override(&mut limited, Some(&tracking));
-        assert_eq!(
-            JsonValue::Object(limited),
-            json!({"opts": {"max-fuel": 2.5, "meta": true}})
-        );
-
-        let mut lifted = body.clone();
-        apply_fuel_override(&mut lifted, Some(&TrackingOptions::default()));
-        assert_eq!(JsonValue::Object(lifted), json!({"opts": {"meta": true}}));
-    }
-
-    #[test]
     fn flat_query_injects_single_wildcard_scan() {
         let context = json!({"v": "http://example/org/ns"});
         let where_clause = json!({"@id": "?s", "@type": "v:Geography"});
@@ -1399,6 +1351,7 @@ mod tests {
 #[cfg(test)]
 mod e2e {
     use super::*;
+    use crate::TrackingOptions;
     use async_trait::async_trait;
     use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
     use fluree_db_query::error::Result as QueryResult;
@@ -2741,7 +2694,7 @@ mod e2e {
         provider: &MockCrawlProvider,
         view: &GraphDb,
         crawl: &JsonValue,
-        tracking: Option<&TrackingOptions>,
+        tracker: Option<&Tracker>,
     ) -> Result<Option<JsonValue>> {
         let fluree = FlureeBuilder::memory().build_memory();
         expand_wildcard_crawl(
@@ -2750,7 +2703,7 @@ mod e2e {
             crawl,
             provider,
             provider,
-            tracking,
+            tracker,
             QueryExecutionOptions::new(),
             &FormatterConfig::default(),
         )
@@ -2829,31 +2782,64 @@ mod e2e {
         assert!(is_fuel_exceeded(&err), "want fuel exceeded, got {err:?}");
     }
 
-    // A tracked request's override replaces the body's fuel limit, as on every
-    // other tracked query: its limit holds, and an override naming none lifts
+    // A tracked request's tracker replaces the body's fuel limit, as on every
+    // other tracked query: its limit holds, and a tracker naming none lifts
     // the body's.
     #[tokio::test]
-    async fn crawl_takes_the_tracked_override_fuel_limit() {
+    async fn crawl_takes_the_tracked_fuel_limit() {
         let provider = small_and_large_provider();
         let (_ledger, view) = genesis_view();
 
-        let tight = TrackingOptions {
+        let tight = Tracker::new(TrackingOptions {
             max_fuel: Some(fluree_db_core::tracking::fuel_to_micro(1.1)),
             track_fuel: true,
             ..TrackingOptions::default()
-        };
+        });
         let err = try_crawl(&provider, &view, &order_crawl(json!({})), Some(&tight))
             .await
-            .expect_err("the override's fuel limit must hold");
+            .expect_err("the tracker's fuel limit must hold");
         assert!(is_fuel_exceeded(&err), "want fuel exceeded, got {err:?}");
 
-        let none = TrackingOptions::all_enabled();
+        let none = Tracker::new(TrackingOptions::all_enabled());
         let body_limited = order_crawl(json!({"opts": {"max-fuel": 1.1}}));
         let out = try_crawl(&provider, &view, &body_limited, Some(&none))
             .await
-            .expect("an override naming no limit replaces the body's")
+            .expect("a tracker naming no limit replaces the body's")
             .expect("crawl shape is handled");
         assert_eq!(out.as_array().unwrap().len(), 2_000);
+    }
+
+    // A tracked crawl records its fuel and time in the request's tracker, as
+    // every other tracked query does, on both the variable-subject crawl and
+    // the constant-IRI one.
+    #[tokio::test]
+    async fn a_tracked_crawl_reports_its_fuel_and_time() {
+        let provider = small_and_large_provider();
+        let (_ledger, view) = genesis_view();
+        let tracker = Tracker::new(TrackingOptions::all_enabled());
+        try_crawl(&provider, &view, &order_crawl(json!({})), Some(&tracker))
+            .await
+            .expect("crawl succeeds")
+            .expect("crawl shape is handled");
+        let tally = tracker.tally().expect("an enabled tracker tallies");
+        let fuel = tally.fuel.expect("fuel is tracked");
+        // The 1.000 floor plus one thousandth per row read.
+        assert!(fuel > 1.0, "the crawl's rows are charged: {fuel}");
+        assert!(tally.time.is_some(), "time is tracked");
+
+        let provider = two_table_provider();
+        let tracker = Tracker::new(TrackingOptions::all_enabled());
+        let detail = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"http://example.org/person/1": ["*"]},
+        });
+        try_crawl(&provider, &view, &detail, Some(&tracker))
+            .await
+            .expect("detail crawl succeeds")
+            .expect("crawl shape is handled");
+        let tally = tracker.tally().expect("an enabled tracker tallies");
+        assert!(tally.fuel.is_some_and(|f| f >= 1.0), "{tally:?}");
+        assert!(tally.time.is_some(), "{tally:?}");
     }
 
     // `depth` expands references on a native ledger; the crawl expands none,
