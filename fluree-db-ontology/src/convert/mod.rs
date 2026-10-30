@@ -1,5 +1,6 @@
 //! Ontologies from what people already have: table and column names, a CSV
-//! header, a workbook, SQL DDL.
+//! header, a workbook, SQL DDL, a warehouse's semantic layer (a Snowflake
+//! semantic view, a Databricks Genie space).
 //!
 //! Every source is read into one [`Model`] of tables and columns, and one
 //! emitter turns that into an ontology, so the rules are the same whatever
@@ -19,6 +20,7 @@
 //! - primary keys, metrics, filters and SQL are left out: they describe
 //!   tables, not things.
 
+pub mod semantic;
 pub mod sql;
 pub mod tabular;
 
@@ -27,6 +29,32 @@ use crate::vocab::*;
 use crate::words::name_words;
 use fluree_graph_ir::{Datatype, Term};
 use std::collections::{BTreeMap, HashMap};
+
+/// A YAML document read into typed fields. Fields typed `String` keep a
+/// scalar as written (`NO`, `007`, `.inf`), where an untyped value would
+/// apply YAML's implicit typing. Duplicate keys keep the last value, as
+/// PyYAML (and so dbt) does.
+pub fn from_yaml<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    let mut options = serde_saphyr::Options::default();
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::LastWins;
+    serde_saphyr::from_str_with_options(text, options).map_err(|e| e.to_string())
+}
+
+/// Whether a JSON document is JSON-LD (it has `@context`, `@graph`, `@id` or
+/// `@type` at its top), which no converter reads, whatever else it holds.
+pub fn is_jsonld(doc: &serde_json::Value) -> bool {
+    let has = |v: &serde_json::Value| {
+        v.as_object().is_some_and(|m| {
+            ["@context", "@graph", "@id", "@type"]
+                .iter()
+                .any(|k| m.contains_key(*k))
+        })
+    };
+    match doc {
+        serde_json::Value::Array(items) => items.iter().any(has),
+        other => has(other),
+    }
+}
 
 /// A table, from any source.
 #[derive(Clone, Debug, Default)]
@@ -102,7 +130,10 @@ pub fn property_label(name: &str, foreign_key: bool) -> Option<String> {
     if !foreign_key {
         return Some(words);
     }
-    let trimmed = ["id", "key", "fk", "code", "ref", "no", "num"]
+    // a key named for a code or number keeps its words (`origin_airport_code`
+    // is "origin airport"); the target's label stands in only when nothing
+    // is left
+    let trimmed = ["id", "key", "fk", "code", "ref", "no", "num", "number"]
         .iter()
         .find_map(|suffix| strip_word_suffix(&words, suffix))
         .unwrap_or(&words);
@@ -219,13 +250,61 @@ pub fn comment(description: Option<&str>, synonyms: &[String]) -> Option<String>
     (!text.is_empty()).then_some(text)
 }
 
+/// "a" or "an", by the word's first letter.
+fn article(word: &str) -> &'static str {
+    if word.starts_with(['a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U']) {
+        "an"
+    } else {
+        "a"
+    }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut c = word.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
 /// A property's label, comment, domains and range. A property is shared only
 /// by columns with the same name (and range) in different tables.
 struct PropertyParts {
     label: String,
     comment: Option<String>,
     domains: Vec<String>,
+    /// The domains' class labels, for a description written for them all.
+    domain_labels: Vec<String>,
     range: Option<String>,
+    /// For a relation with no description of its own: the class it points
+    /// at, so one can be written once every table using it is known.
+    target_label: Option<String>,
+}
+
+impl PropertyParts {
+    /// The description: the source's, else one written for a relation.
+    fn description(&self) -> Option<String> {
+        if self.comment.is_some() {
+            return self.comment.clone();
+        }
+        let target = self.target_label.as_deref()?;
+        let tables = match self.domain_labels.as_slice() {
+            [] => return None,
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+        };
+        let (of, to) = (article(&tables), article(target));
+        Some(if self.label == target {
+            format!("The {target} of {of} {tables}.")
+        } else if self.domain_labels.len() == 1 {
+            format!(
+                "{} {tables}'s {}: {to} {target}.",
+                capitalized(of),
+                self.label
+            )
+        } else {
+            format!("The {} of {of} {tables}: {to} {target}.", self.label)
+        })
+    }
 }
 
 struct Emitter<'a> {
@@ -308,8 +387,9 @@ impl Emitter<'_> {
         key: &str,
         labels: &[String],
         comment: Option<String>,
-        domain: &str,
+        (domain, domain_label): (&str, &str),
         range: Option<String>,
+        target_label: Option<&str>,
     ) {
         let iri = match self.property_iri.get(key) {
             Some(iri) => iri.clone(),
@@ -323,7 +403,9 @@ impl Emitter<'_> {
                         label,
                         comment: None,
                         domains: Vec::new(),
+                        domain_labels: Vec::new(),
                         range,
+                        target_label: target_label.map(str::to_string),
                     },
                 );
                 iri
@@ -335,6 +417,7 @@ impl Emitter<'_> {
         }
         if !entry.domains.iter().any(|d| d == domain) {
             entry.domains.push(domain.to_string());
+            entry.domain_labels.push(domain_label.to_string());
         }
     }
 }
@@ -402,23 +485,19 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
             if let Some((range, target_label)) = target {
                 let label =
                     property_label(&column.name, true).unwrap_or_else(|| target_label.clone());
-                let text =
-                    comment(column.description.as_deref(), &column.synonyms).unwrap_or_else(|| {
-                        if label == target_label {
-                            format!("The {target_label} of a {table_label}.")
-                        } else {
-                            format!("A {table_label}'s {label}: a {target_label}.")
-                        }
-                    });
+                // with no description of its own, one is written once every
+                // table using the relation is known
+                let text = comment(column.description.as_deref(), &column.synonyms);
                 let mut labels = vec![label.clone()];
                 labels.extend(words.clone().filter(|w| *w != label));
                 labels.push(format!("{table_label} {label}"));
                 e.property(
                     &format!("fk:{column_key}:{range}"),
                     &labels,
-                    Some(text),
-                    &domain,
+                    text,
+                    (&domain, &table_label),
                     Some(range),
+                    Some(&target_label),
                 );
             } else if !column.values.is_empty() {
                 let label = words.clone().unwrap_or_else(|| column.name.clone());
@@ -465,8 +544,9 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                     &format!("enum-property:{key}"),
                     &[label.clone(), format!("{table_label} {label}")],
                     text,
-                    &domain,
+                    (&domain, &table_label),
                     Some(class_iri),
+                    None,
                 );
             } else {
                 let fk = column.references.is_some();
@@ -488,7 +568,7 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                 labels.extend(words.clone().filter(|w| *w != label));
                 labels.push(format!("{table_label} {label}"));
                 let key = format!("value:{column_key}:{}", range.as_deref().unwrap_or("-"));
-                e.property(&key, &labels, text, &domain, range);
+                e.property(&key, &labels, text, (&domain, &table_label), range, None);
             }
         }
     }
@@ -512,11 +592,12 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
     }
     let properties = std::mem::take(&mut e.properties);
     for (iri, parts) in properties {
+        let text = parts.description();
         let PropertyParts {
             label,
-            comment: text,
             domains,
             range,
+            ..
         } = parts;
         e.triple(&iri, RDF_TYPE, Term::iri(RDF_PROPERTY));
         e.triple(&iri, RDFS_LABEL, Term::string(&label));
@@ -778,6 +859,85 @@ mod tests {
             out.notes.iter().any(|n| n.contains("no letters")),
             "{:?}",
             out.notes
+        );
+    }
+
+    #[test]
+    fn code_named_keys_keep_their_words() {
+        let fk = |name: &str, to: &str| Column {
+            name: name.into(),
+            references: Some(to.into()),
+            ..Default::default()
+        };
+        let model = Model {
+            tables: vec![
+                Table {
+                    name: "flights".into(),
+                    columns: vec![
+                        fk("origin_airport_code", "airports"),
+                        fk("destination_airport_code", "airports"),
+                        fk("airport_code", "airports"),
+                    ],
+                    ..Default::default()
+                },
+                Table {
+                    name: "airports".into(),
+                    ..Default::default()
+                },
+                Table {
+                    name: "contacts".into(),
+                    columns: vec![fk("account_id", "accounts")],
+                    ..Default::default()
+                },
+                Table {
+                    name: "orders".into(),
+                    columns: vec![fk("account_id", "accounts")],
+                    ..Default::default()
+                },
+                Table {
+                    name: "invoices".into(),
+                    columns: vec![fk("account_id", "accounts")],
+                    ..Default::default()
+                },
+                Table {
+                    name: "accounts".into(),
+                    ..Default::default()
+                },
+            ],
+            notes: Vec::new(),
+        };
+        let out = emit(
+            &model,
+            &EmitOptions {
+                base: "https://ex.com/".into(),
+            },
+        );
+        let properties = labels_of(&out, RDF_PROPERTY);
+        let labels: Vec<&str> = properties.iter().map(|(_, l)| l.as_str()).collect();
+        // three relations to airports, three labels; nothing merged
+        assert!(labels.contains(&"origin airport"), "{labels:?}");
+        assert!(labels.contains(&"destination airport"), "{labels:?}");
+        assert!(labels.contains(&"airport"), "{labels:?}");
+        let comment = |iri: &str| -> String {
+            out.ontology
+                .iter()
+                .find(|q| q.subject.as_iri() == Some(iri) && q.is(RDFS_COMMENT))
+                .and_then(|q| q.object.as_literal().map(|(v, ..)| v.lexical()))
+                .unwrap_or_default()
+        };
+        // one generated description for a relation every table shares, with
+        // "an" before a vowel
+        assert_eq!(
+            comment("https://ex.com/account"),
+            "The account of a contact, order or invoice."
+        );
+        assert_eq!(
+            comment("https://ex.com/originAirport"),
+            "A flight's origin airport: an airport."
+        );
+        assert_eq!(
+            comment("https://ex.com/airport"),
+            "The airport of a flight."
         );
     }
 }

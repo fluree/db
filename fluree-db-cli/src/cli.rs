@@ -2650,8 +2650,10 @@ pub enum DocsAction {
 pub enum OntologyAction {
     /// Write an ontology in the shape an extraction model reads well
     ///
-    /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), or
-    /// SQL DDL (.sql). Tables become classes and columns properties, labelled
+    /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), SQL
+    /// DDL (.sql), a Snowflake semantic view (.yaml) or a Databricks Genie space
+    /// export (.json, with --comments for Unity Catalog's descriptions).
+    /// Tables become classes and columns properties, labelled
     /// in words (`employer_id` reads "employer"); foreign keys become
     /// relations; enumerated columns become a class with a catalog record per
     /// value; primary keys are left out.
@@ -2666,6 +2668,7 @@ pub enum OntologyAction {
     ///
     /// Examples:
     ///   fluree ontology from schema.sql > ontology.ttl
+    ///   fluree ontology from sales_view.yaml > ontology.ttl
     ///   fluree ontology from accounts.csv --base https://example.com/crm/ > ontology.ttl
     ///   fluree ontology from schemaorg.jsonld --seed schema:Person,schema:Organization > ontology.ttl
     #[command(verbatim_doc_comment)]
@@ -2742,9 +2745,28 @@ pub struct OntologyFromArgs {
     #[arg(long, default_value_t = 12, value_name = "N")]
     pub enum_max: usize,
 
+    /// Unity Catalog table and column comments for a Genie export, as JSON:
+    /// {"table": {"": "table comment", "column": "column comment"}}
+    #[arg(long, value_name = "FILE")]
+    pub comments: Option<PathBuf>,
+
     /// The input's format, when its extension doesn't say
     #[arg(long, value_enum)]
-    pub input_format: Option<OntologyInputFormat>,
+    pub input_format: Option<OntologyFromFormat>,
+}
+
+/// What `fluree ontology from` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OntologyFromFormat {
+    Turtle,
+    Jsonld,
+    Csv,
+    Xlsx,
+    Sql,
+    /// A Snowflake semantic view or Cortex Analyst semantic model (YAML)
+    Snowflake,
+    /// A Databricks Genie space export (JSON)
+    Genie,
 }
 
 /// `fluree catalog` subcommands.
