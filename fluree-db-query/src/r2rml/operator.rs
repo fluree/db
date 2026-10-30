@@ -2012,6 +2012,46 @@ fn coerce_scalar_for_pushdown(
     }
 }
 
+/// A plain string ordered against `om`'s `xsd:date` or `xsd:dateTime` terms, as
+/// the typed literal it compares as, or `None` to push the value unchanged.
+///
+/// The engine orders a plain string against a temporal term by parsing it as
+/// that term's type (`cmp_with_lexical`), so `?d > "2024-01-01"` over an
+/// `xsd:date` map compares dates. Parsing with that parser, then converting the
+/// result as a typed FILTER literal is converted (`to_scan_value`), gives the
+/// provider the value the engine compares; the typed gates (a date only
+/// against a date column, a dateTime only in its column's frame) decide
+/// whether it pushes. A string
+/// that does not parse stays a string: the engine finds it incomparable and
+/// keeps no row. Only the ordering operators coerce; a plain string never
+/// equals a temporal (eq-dateTime), so `=` keeps no row and `!=` every row,
+/// and `IN` is a set of equalities.
+fn temporal_range_literal(
+    value: &crate::r2rml::ScanValue,
+    op: crate::r2rml::ScanCmpOp,
+    om: &ObjectMap,
+) -> Option<crate::r2rml::ScanValue> {
+    use crate::r2rml::{ScanCmpOp, ScanValue, TermOrder};
+    use fluree_db_core::FlakeValue;
+    let ScanValue::Str(s) = value else {
+        return None;
+    };
+    if !matches!(
+        op,
+        ScanCmpOp::Lt | ScanCmpOp::LtEq | ScanCmpOp::Gt | ScanCmpOp::GtEq
+    ) {
+        return None;
+    }
+    let typed = match term_order(om)? {
+        TermOrder::Date => FlakeValue::Date(Box::new(fluree_db_core::Date::parse(s).ok()?)),
+        TermOrder::Instant => {
+            FlakeValue::DateTime(Box::new(fluree_db_core::DateTime::parse(s).ok()?))
+        }
+        _ => return None,
+    };
+    super::rewrite::to_scan_value(&typed)
+}
+
 /// The scan filters `pattern` pushes to a scan of `triples_map`'s table: its
 /// FILTER comparisons, scalar constant objects, and a bound subject's template
 /// keys. Every one restates a condition the pattern's consumer enforces, so a
@@ -2062,7 +2102,8 @@ pub(crate) fn pattern_scan_filters(
         out.push(crate::r2rml::ScanFilter {
             column: col.to_string(),
             op: pd.op,
-            value: pd.value.clone(),
+            value: temporal_range_literal(&pd.value, pd.op, &pom.object_map)
+                .unwrap_or_else(|| pd.value.clone()),
         });
     }
 
@@ -4130,6 +4171,98 @@ mod tests {
         assert_eq!(
             pushed("http://ex/plain", ScanCmpOp::Lt, ScanValue::Int(10)),
             1
+        );
+    }
+
+    /// A plain string ordered against an `xsd:date` / `xsd:dateTime` map pushes
+    /// as the typed value the engine compares it as; equality, an un-annotated
+    /// map, and a string that does not parse push the string unchanged.
+    #[test]
+    fn a_range_string_over_a_temporal_map_pushes_as_the_temporal() {
+        use crate::r2rml::{ScanCmpOp, ScanValue};
+        use crate::seed::EmptyOperator;
+
+        let tm = TriplesMap::new("#Cell", "CELLS")
+            .with_subject_template("http://ex/cell/{ID}")
+            .with_predicate_object(pom("http://ex/plain", "DAY"))
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/day"),
+                object_map: ObjectMap::column_typed("DAY", fluree_vocab::xsd::DATE),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/at"),
+                object_map: ObjectMap::column_typed("AT", fluree_vocab::xsd::DATE_TIME),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/n"),
+                object_map: ObjectMap::column_typed("N", fluree_vocab::xsd::INTEGER),
+            });
+        let pushed = |pred: &str, op: ScanCmpOp, lit: &str| {
+            let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+            pattern.predicate_filter = Some(pred.to_string());
+            pattern.scan_filters = vec![crate::ir::adapters::ScanPushdown {
+                var: VarId(1),
+                op,
+                value: ScanValue::Str(lit.into()),
+            }];
+            R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern)
+                .build_scan_filters(&tm)
+                .into_iter()
+                .map(|f| f.value)
+                .collect::<Vec<_>>()
+        };
+        let s = |v: &str| vec![ScanValue::Str(v.into())];
+        // 2024-01-01 is day 19_723; a source offset does not move the day.
+        for op in [
+            ScanCmpOp::Lt,
+            ScanCmpOp::LtEq,
+            ScanCmpOp::Gt,
+            ScanCmpOp::GtEq,
+        ] {
+            assert_eq!(
+                pushed("http://ex/day", op, "2024-01-01"),
+                vec![ScanValue::Date(19_723)],
+                "{op:?}"
+            );
+        }
+        assert_eq!(
+            pushed("http://ex/day", ScanCmpOp::Gt, "2024-01-01+05:00"),
+            vec![ScanValue::Date(19_723)]
+        );
+        // An instant, in the UTC frame; a naive lexical reads as UTC.
+        for lit in ["2024-01-01T00:00:00Z", "2024-01-01T00:00:00"] {
+            assert_eq!(
+                pushed("http://ex/at", ScanCmpOp::Lt, lit),
+                vec![ScanValue::Timestamp {
+                    micros: 1_704_067_200_000_000,
+                    tz: true
+                }],
+                "{lit}"
+            );
+        }
+        // Equality never coerces: a string never equals a date.
+        assert_eq!(
+            pushed("http://ex/day", ScanCmpOp::Eq, "2024-01-01"),
+            s("2024-01-01")
+        );
+        // Nor `!=`, which keeps every row and so does not push at all.
+        assert!(pushed("http://ex/day", ScanCmpOp::NotEq, "2024-01-01").is_empty());
+        // Not a date, not a temporal map, or no datatype: the string as is.
+        assert_eq!(
+            pushed("http://ex/day", ScanCmpOp::Lt, "2024-13-01"),
+            s("2024-13-01")
+        );
+        assert_eq!(
+            pushed("http://ex/day", ScanCmpOp::Lt, "yesterday"),
+            s("yesterday")
+        );
+        assert_eq!(
+            pushed("http://ex/plain", ScanCmpOp::Lt, "2024-01-01"),
+            s("2024-01-01")
+        );
+        assert_eq!(
+            pushed("http://ex/n", ScanCmpOp::Lt, "2024-01-01"),
+            s("2024-01-01")
         );
     }
 

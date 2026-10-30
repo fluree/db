@@ -980,7 +980,7 @@ fn const_object(value: &FlakeValue) -> Option<ObjectConstant> {
 /// and the iceberg-side numeric widening stays inert. Anything else (refs,
 /// big-integers beyond i128, temporal beyond date, …) stays with the in-engine
 /// FILTER.
-fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
+pub(super) fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     match value {
         FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
         FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),

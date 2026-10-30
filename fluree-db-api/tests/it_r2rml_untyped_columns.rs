@@ -57,6 +57,14 @@ const TYPED_POMS: &str = "\
     rr:predicateObjectMap [ rr:predicate ex:ntextN ; rr:objectMap [ rr:column \"ntext\" ; rr:datatype xsd:integer ] ] ;
 ";
 
+/// The Iceberg source only: `xsd:date` over the date column and `xsd:dateTime`
+/// over both timestamp columns.
+const TEMPORAL_POMS: &str = "\
+    rr:predicateObjectMap [ rr:predicate ex:dayD ; rr:objectMap [ rr:column \"day\" ; rr:datatype xsd:date ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:tstzT ; rr:objectMap [ rr:column \"tstz\" ; rr:datatype xsd:dateTime ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:tsT ; rr:objectMap [ rr:column \"ts\" ; rr:datatype xsd:dateTime ] ] ;
+";
+
 /// The SQL source only: a `timestamp(9)` column, and language-tagged maps
 /// over the double and long columns.
 const SQL_POMS: &str = "\
@@ -886,6 +894,9 @@ fn iceberg_cases() -> Vec<Case> {
             .expect(&strs(&cell_v(&[(6, "\u{e9}"), (8, "z")])))
             .files_read(1),
     );
+    // A string is not ordered against a number: the comparison is a type
+    // error, which keeps no row.
+    cases.push(filter_case(src, "i32", "<", "5").expect(&[]));
     // A string never equals an integer, so `!=` keeps every row.
     cases.push(filter_case(src, "i32", "!=", "10").expect(&strs(&cell_v(&[
         (1, "2"),
@@ -945,6 +956,54 @@ fn iceberg_cases() -> Vec<Case> {
                 .files_read(files),
         );
     }
+    // A plain string ordered against a date or dateTime term reads as that
+    // type, so a range over an annotated map compares dates, and prunes by the
+    // column's bounds: the second file starts at 1970-01-01. Equality does not
+    // coerce: a string never equals a date, so `=` keeps no row and `!=` all.
+    cases.push(
+        filter_case(src, "dayD", "<", "\"1970-01-01\"")
+            .expect(&strs(&cell_v(&[(3, "1969-12-31")])))
+            .files_read(1),
+    );
+    cases.push(
+        filter_case(src, "dayD", "<=", "\"1969-12-31\"")
+            .expect(&strs(&cell_v(&[(3, "1969-12-31")])))
+            .files_read(1),
+    );
+    cases.push(
+        filter_case(src, "dayD", ">", "\"2024-01-01\"")
+            .expect(&strs(&cell_v(&[
+                (1, "2024-01-09"),
+                (2, "2024-01-10"),
+                (4, "2024-01-09"),
+                (7, "2024-01-10"),
+            ])))
+            .files_read(2),
+    );
+    cases.push(filter_case(src, "dayD", "=", "\"2024-01-09\"").expect(&[]));
+    cases.push(
+        filter_case(src, "dayD", "!=", "\"2024-01-09\"").expect(&strs(&cell_v(&[
+            (1, "2024-01-09"),
+            (2, "2024-01-10"),
+            (3, "1969-12-31"),
+            (4, "2024-01-09"),
+            (5, "2000-02-29"),
+            (6, "1970-01-01"),
+            (7, "2024-01-10"),
+        ]))),
+    );
+    cases.push(
+        filter_case(src, "tstzT", "<", "\"1970-01-01T00:00:00Z\"")
+            .expect(&strs(&cell_v(&[(3, "1969-12-31T23:59:59.999999Z")])))
+            .files_read(1),
+    );
+    // A dateTime is a UTC instant; a `timestamp` column holds wall-clock
+    // values, whose bounds the push does not read in that frame.
+    cases.push(
+        filter_case(src, "tsT", "<", "\"1970-01-01T00:00:00Z\"")
+            .expect(&strs(&cell_v(&[(3, "1969-12-31T23:59:59.999999Z")])))
+            .files_read(2),
+    );
     cases
 }
 
@@ -966,7 +1025,7 @@ async fn untyped_columns_agree_on_every_iceberg_lane() {
             R2rmlCreateConfig::new_direct(
                 "cells",
                 &location,
-                cells_mapping("silver.cells", TYPED_POMS),
+                cells_mapping("silver.cells", &format!("{TYPED_POMS}{TEMPORAL_POMS}")),
             )
             .with_mapping_media_type("text/turtle"),
         )
