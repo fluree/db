@@ -51,10 +51,6 @@ pub enum JoinKey<'a> {
     Lit {
         o_kind: u8,
         o_key: u64,
-        /// `p_id` scopes an arena handle (NUM_BIG, VECTOR_ID). [`Materializer::join_key`]
-        /// decodes arena literals, so it builds this only as `None`; for all
-        /// other literal kinds it must not affect join-key identity.
-        p_id_for_arena: Option<u32>,
         dt_id: u16,
         lang_id: u16,
     },
@@ -137,18 +133,16 @@ impl PartialEq for JoinKey<'_> {
                 JoinKey::Lit {
                     o_kind: k1,
                     o_key: ok1,
-                    p_id_for_arena: p1,
                     dt_id: d1,
                     lang_id: l1,
                 },
                 JoinKey::Lit {
                     o_kind: k2,
                     o_key: ok2,
-                    p_id_for_arena: p2,
                     dt_id: d2,
                     lang_id: l2,
                 },
-            ) => k1 == k2 && ok1 == ok2 && p1 == p2 && d1 == d2 && l1 == l2,
+            ) => k1 == k2 && ok1 == ok2 && d1 == d2 && l1 == l2,
             (JoinKey::MaterializedSid(ns1, n1), JoinKey::MaterializedSid(ns2, n2)) => {
                 ns1 == ns2 && n1 == n2
             }
@@ -183,13 +177,11 @@ impl Hash for JoinKey<'_> {
             JoinKey::Lit {
                 o_kind,
                 o_key,
-                p_id_for_arena,
                 dt_id,
                 lang_id,
             } => {
                 o_kind.hash(state);
                 o_key.hash(state);
-                p_id_for_arena.hash(state);
                 dt_id.hash(state);
                 lang_id.hash(state);
             }
@@ -391,7 +383,6 @@ impl Materializer {
             } => JoinKey::Lit {
                 o_kind: *o_kind,
                 o_key: *o_key,
-                p_id_for_arena: None,
                 dt_id: *dt_id,
                 lang_id: *lang_id,
             },
