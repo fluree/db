@@ -525,13 +525,22 @@ fn collect_and_comparisons(
 }
 
 /// One row-filter comparison prepared against its decoded column: the
-/// column's position, the operator, and the literal converted EXACTLY into the
-/// column's comparison type — `None` when no exact conversion exists, in which
-/// case the comparison keeps every row and the in-engine FILTER decides.
+/// column's position and what to check there.
 struct PreparedComparison {
     pos: usize,
-    op: ComparisonOp,
-    literal: Option<Scalar<ArrayRef>>,
+    check: Check,
+}
+
+/// What a prepared comparison does to a batch.
+enum Check {
+    /// Compare each cell with a literal of the column's comparison type.
+    Compare(ComparisonOp, Scalar<ArrayRef>),
+    /// No literal compares exactly with the column: keep every row, and the
+    /// in-engine FILTER decides.
+    KeepAll,
+    /// No cell can satisfy the comparison (an equality with a value the column
+    /// cannot hold).
+    DropAll,
 }
 
 /// Prepare `plan` against the schema of a decoded batch (see
@@ -543,11 +552,20 @@ fn prepare_comparisons(
     plan.iter()
         .map(|(pos, op, value)| {
             let target = comparison_type(schema.field(*pos).data_type());
-            let literal = column_kind(&target)
-                .filter(|&column| comparable(*op, literal_kind(value), column))
-                .and_then(|_| exact_literal(value, &target))
-                .and_then(|literal| total_order_zero(*op, literal));
-            if literal.is_none() {
+            let check = match column_kind(&target) {
+                Some(column) if comparable(*op, literal_kind(value), column) => {
+                    match decimal_check(*op, value, &target) {
+                        Some(check) => check,
+                        None => exact_literal(value, &target)
+                            .and_then(|literal| total_order_zero(*op, literal))
+                            .map_or(Check::KeepAll, |literal| {
+                                Check::Compare(*op, Scalar::new(literal))
+                            }),
+                    }
+                }
+                _ => Check::KeepAll,
+            };
+            if matches!(check, Check::KeepAll) {
                 tracing::debug!(
                     literal = ?value,
                     column_type = ?target,
@@ -555,11 +573,7 @@ fn prepare_comparisons(
                      this comparison keeps every row and the in-engine FILTER decides"
                 );
             }
-            PreparedComparison {
-                pos: *pos,
-                op: *op,
-                literal: literal.map(Scalar::new),
-            }
+            PreparedComparison { pos: *pos, check }
         })
         .collect()
 }
@@ -575,18 +589,24 @@ fn eval_conjunction(
 ) -> std::result::Result<Option<BooleanArray>, ArrowError> {
     let mut acc: Option<BooleanArray> = None;
     for comparison in plan {
-        let Some(literal) = &comparison.literal else {
-            continue;
+        let mask = match &comparison.check {
+            Check::KeepAll => continue,
+            Check::DropAll => BooleanArray::new(
+                arrow::buffer::BooleanBuffer::new_unset(batch.num_rows()),
+                None,
+            ),
+            Check::Compare(op, literal) => {
+                let column = normalize_column(batch.column(comparison.pos))?;
+                match op {
+                    ComparisonOp::Eq => cmp::eq(&column, literal),
+                    ComparisonOp::NotEq => cmp::neq(&column, literal),
+                    ComparisonOp::Lt => cmp::lt(&column, literal),
+                    ComparisonOp::LtEq => cmp::lt_eq(&column, literal),
+                    ComparisonOp::Gt => cmp::gt(&column, literal),
+                    ComparisonOp::GtEq => cmp::gt_eq(&column, literal),
+                }?
+            }
         };
-        let column = normalize_column(batch.column(comparison.pos))?;
-        let mask = match comparison.op {
-            ComparisonOp::Eq => cmp::eq(&column, literal),
-            ComparisonOp::NotEq => cmp::neq(&column, literal),
-            ComparisonOp::Lt => cmp::lt(&column, literal),
-            ComparisonOp::LtEq => cmp::lt_eq(&column, literal),
-            ComparisonOp::Gt => cmp::gt(&column, literal),
-            ComparisonOp::GtEq => cmp::gt_eq(&column, literal),
-        }?;
         acc = Some(match acc {
             Some(prev) => and(&prev, &mask)?,
             None => mask,
@@ -735,6 +755,79 @@ fn normalize_column(column: &ArrayRef) -> std::result::Result<ArrayRef, ArrowErr
         ),
         DataType::Time64(TimeUnit::Microsecond) => cast(column, &DataType::Int64),
         _ => Ok(Arc::clone(column)),
+    }
+}
+
+/// An integer or decimal literal against a `decimal128(p, s)` column, as the
+/// check on the column's grid that keeps exactly the rows the comparison
+/// holds for; `None` for any other literal or column type.
+///
+/// Computed in integer arithmetic on the column's scale, never by a cast. A
+/// literal on the grid compares as itself, even beyond the column's
+/// precision (the kernels compare the unscaled values, so `?d < 1000` on
+/// `decimal(5,2)` keeps every row and `> 1000` none). A literal between two
+/// grid points `lo < x < hi` holds for exactly the cells at or below `lo`
+/// (`<`, `<=`) or at or above `hi` (`>`, `>=`): `< 1.0500000001` on
+/// `decimal(38,9)` is `<= 1.050000000`, and `> 1.0499999999` is
+/// `>= 1.050000000`. No cell equals it, so `=` drops every row and `!=` keeps
+/// every row. A grid point beyond `i128` saturates, which can only keep a cell
+/// it should not.
+fn decimal_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> Option<Check> {
+    let DataType::Decimal128(precision, column_scale) = *target else {
+        return None;
+    };
+    let (unscaled, scale) = match *value {
+        LiteralValue::Int32(n) => (i128::from(n), 0),
+        LiteralValue::Int64(n) => (i128::from(n), 0),
+        LiteralValue::Decimal { unscaled, scale } => (unscaled, scale),
+        _ => return None,
+    };
+    let (lo, hi, exact) = grid_neighbors(unscaled, scale, column_scale);
+    let (op, units) = if exact {
+        (op, lo)
+    } else {
+        match op {
+            ComparisonOp::Lt | ComparisonOp::LtEq => (ComparisonOp::LtEq, lo),
+            ComparisonOp::Gt | ComparisonOp::GtEq => (ComparisonOp::GtEq, hi),
+            ComparisonOp::Eq => return Some(Check::DropAll),
+            ComparisonOp::NotEq => return Some(Check::KeepAll),
+        }
+    };
+    let literal = Decimal128Array::from(vec![units])
+        .with_precision_and_scale(precision, column_scale)
+        .ok()?;
+    Some(Check::Compare(op, Scalar::new(Arc::new(literal))))
+}
+
+/// `unscaled × 10^-scale` on the grid of `column_scale`, in its units: the
+/// grid points just at or below and at or above it, and whether it lies on
+/// the grid. A value beyond `i128` is off the grid, with both neighbors
+/// saturated at that end.
+fn grid_neighbors(unscaled: i128, scale: i8, column_scale: i8) -> (i128, i128, bool) {
+    let shift = i32::from(column_scale) - i32::from(scale);
+    let saturated = if unscaled < 0 { i128::MIN } else { i128::MAX };
+    if shift >= 0 {
+        let units = 10i128
+            .checked_pow(shift.unsigned_abs())
+            .and_then(|f| unscaled.checked_mul(f));
+        return match units {
+            Some(u) => (u, u, true),
+            None => (saturated, saturated, false),
+        };
+    }
+    match 10i128.checked_pow(shift.unsigned_abs()) {
+        Some(divisor) => {
+            let lo = unscaled.div_euclid(divisor);
+            let exact = unscaled.rem_euclid(divisor) == 0;
+            (lo, if exact { lo } else { lo + 1 }, exact)
+        }
+        // A divisor beyond i128 exceeds every unscaled value: the literal lies
+        // strictly between -1 and 1 grid units (or is 0).
+        None => match unscaled.signum() {
+            0 => (0, 0, true),
+            1 => (0, 1, false),
+            _ => (-1, 0, false),
+        },
     }
 }
 
@@ -1076,11 +1169,30 @@ mod row_filter_tests {
         }
     }
 
-    /// `a × 10^-sa` against `b × 10^-sb`, in exact integer arithmetic.
+    /// `a × 10^-sa` against `b × 10^-sb`, exactly: in `i128` at the common
+    /// scale, or by the digits when that overflows.
     fn decimal_ord(a: i128, sa: i8, b: i128, sb: i8) -> std::cmp::Ordering {
         let scale = sa.max(sb);
-        let up = |v: i128, s: i8| v * 10i128.pow(u32::try_from(scale - s).unwrap());
-        up(a, sa).cmp(&up(b, sb))
+        let shift = |s: i8| u32::try_from(i32::from(scale) - i32::from(s)).unwrap();
+        let up = |v: i128, s: i8| 10i128.checked_pow(shift(s)).and_then(|f| v.checked_mul(f));
+        if let (Some(x), Some(y)) = (up(a, sa), up(b, sb)) {
+            return x.cmp(&y);
+        }
+        if a.signum() != b.signum() {
+            return a.signum().cmp(&b.signum());
+        }
+        let digits = |v: i128, s: i8| {
+            let mut d = v.unsigned_abs().to_string();
+            d.extend(std::iter::repeat_n('0', shift(s) as usize));
+            d.trim_start_matches('0').to_string()
+        };
+        let (x, y) = (digits(a, sa), digits(b, sb));
+        let magnitude = x.len().cmp(&y.len()).then_with(|| x.cmp(&y));
+        if a < 0 {
+            magnitude.reverse()
+        } else {
+            magnitude
+        }
     }
 
     fn decimal_column(values: &[i128], precision: u8, scale: i8) -> ArrayRef {
@@ -1092,12 +1204,12 @@ mod row_filter_tests {
     }
 
     /// Every op over a `decimal(38,9)` column — BigQuery's `NUMERIC` — against
-    /// literals that sit on, between and beside its grid. A literal the column
-    /// can hold exactly must keep exactly the true matches; one it cannot must
-    /// keep every row (never drop a true match: the in-engine FILTER cannot
-    /// restore a row the row filter dropped).
+    /// literals that sit on, between and beside its grid keeps exactly the true
+    /// matches: one on the grid compares as itself, one between grid points as
+    /// its neighbor on the safe side (never drop a true match: the in-engine
+    /// FILTER cannot restore a row the row filter dropped).
     #[test]
-    fn decimal_literals_keep_exactly_the_true_matches_or_everything() {
+    fn decimal_literals_keep_exactly_the_true_matches() {
         // 0.049999999, 0.050000000, 0.050000001, 1.050000000, -0.050000000
         let values = [
             49_999_999,
@@ -1106,33 +1218,28 @@ mod row_filter_tests {
             1_050_000_000,
             -50_000_000,
         ];
-        let literals: [(i128, i8, bool); 7] = [
-            // (unscaled, scale, holds exactly in decimal(38,9))
-            (5, 2, true),                // 0.05: below one — panicked before
-            (-5, 2, true),               // -0.05
-            (500_000_001, 10, false),    // 0.0500000001: rounds to 0.050000000
-            (499_999_999, 10, false),    // 0.0499999999: rounds to 0.050000000
-            (10_500_000_001, 10, false), // 1.0500000001: valid precision, still rounds
-            (4, -2, true),               // 4E+2, a negative scale
-            (1, 50, false),              // 1E-50: no decimal128 holds it
+        let literals: [(i128, i8); 9] = [
+            (5, 2),               // 0.05: below one — panicked before
+            (-5, 2),              // -0.05
+            (500_000_001, 10),    // 0.0500000001: between grid points
+            (499_999_999, 10),    // 0.0499999999
+            (-500_000_001, 10),   // -0.0500000001
+            (10_500_000_001, 10), // 1.0500000001: valid precision, still off the grid
+            (4, -2),              // 4E+2, a negative scale
+            (1, 50),              // 1E-50: no decimal128 holds it
+            (-1, 50),             // -1E-50
         ];
-        for (unscaled, scale, exact) in literals {
+        for (unscaled, scale) in literals {
             for op in OPS {
                 let got = kept(
                     decimal_column(&values, 38, 9),
                     op,
                     LiteralValue::Decimal { unscaled, scale },
                 );
-                // An exact literal keeps exactly the true matches; one the column
-                // cannot hold keeps every row, whatever the truth.
-                let want: Vec<usize> = if exact {
-                    (0..values.len())
-                        .filter(|&i| holds(op, decimal_ord(values[i], 9, unscaled, scale)))
-                        .collect()
-                } else {
-                    (0..values.len()).collect()
-                };
-                assert_eq!(got, want, "{op:?} {unscaled}e-{scale} (exact: {exact})");
+                let want: Vec<usize> = (0..values.len())
+                    .filter(|&i| holds(op, decimal_ord(values[i], 9, unscaled, scale)))
+                    .collect();
+                assert_eq!(got, want, "{op:?} {unscaled}e-{scale}");
             }
         }
     }
@@ -1140,8 +1247,9 @@ mod row_filter_tests {
     /// A literal outside the column's range is not representable there. Arrow
     /// casts it to NULL rather than failing, and a NULL comparison drops the
     /// row — so before this fix `?d < 1000` on `decimal(5,2)` returned nothing.
+    /// It now compares as itself: below it every row, above it none.
     #[test]
-    fn an_out_of_range_literal_keeps_every_row() {
+    fn an_out_of_range_literal_keeps_exactly_the_true_matches() {
         let column = || decimal_column(&[99_999, 100, -99_999], 5, 2);
         for literal in [
             LiteralValue::Decimal {
@@ -1149,11 +1257,19 @@ mod row_filter_tests {
                 scale: 0,
             },
             LiteralValue::Int64(1000),
+            LiteralValue::Int32(1000),
         ] {
-            for op in OPS {
+            for (op, want) in [
+                (ComparisonOp::Eq, vec![]),
+                (ComparisonOp::NotEq, vec![0, 1, 2]),
+                (ComparisonOp::Lt, vec![0, 1, 2]),
+                (ComparisonOp::LtEq, vec![0, 1, 2]),
+                (ComparisonOp::Gt, vec![]),
+                (ComparisonOp::GtEq, vec![]),
+            ] {
                 assert_eq!(
                     kept(column(), op, literal.clone()),
-                    [0, 1, 2],
+                    want,
                     "{op:?} {literal:?}"
                 );
             }
@@ -1300,6 +1416,62 @@ mod row_filter_tests {
                 Vec::<usize>::new()
             );
         }
+    }
+
+    /// Exhaustively, every grid value of a `decimal(2,1)` column against
+    /// literals of scale -2 to 4 on, between and around its grid points, its
+    /// limits and zero, and beyond `i128`: each op keeps exactly the rows the
+    /// comparison holds for, computed in integer arithmetic.
+    #[test]
+    fn decimal_rounding_is_exact_at_every_boundary() {
+        let values: Vec<i128> = (-99..=99).collect();
+        let column = decimal_column(&values, 2, 1);
+        let mut literals: Vec<(i128, i8)> = Vec::new();
+        for scale in -2i8..=4 {
+            // One grid unit of the column (0.1) in the literal's units, when it
+            // is at least one.
+            let unit = 10i128.pow(u32::try_from((scale - 1).max(0)).unwrap());
+            let max = 99 * unit; // 9.9
+            for centre in [0, max, -max, max / 2, -max / 3] {
+                for d in -25..=25 {
+                    literals.push((centre + d, scale));
+                }
+            }
+            for k in (-120..=120).step_by(3) {
+                literals.push((k * unit, scale));
+                literals.push((k * unit + unit / 2, scale));
+            }
+        }
+        for (unscaled, scale) in [
+            (1, 50),
+            (-1, 50),
+            (i128::MAX, 0),
+            (i128::MIN + 1, 0),
+            (i128::MAX, 38),
+            (10i128.pow(30), -20),
+            (-(10i128.pow(30)), -20),
+        ] {
+            literals.push((unscaled, scale));
+        }
+        let oracle = |v: i128, unscaled: i128, scale: i8| decimal_ord(v, 1, unscaled, scale);
+        let mut checked = 0usize;
+        let mut check = |literal: LiteralValue, unscaled: i128, scale: i8| {
+            let ords: Vec<_> = values.iter().map(|&v| oracle(v, unscaled, scale)).collect();
+            for op in OPS {
+                let got = kept(Arc::clone(&column), op, literal.clone());
+                let want: Vec<usize> = (0..values.len()).filter(|&i| holds(op, ords[i])).collect();
+                assert_eq!(got, want, "{op:?} {literal:?}");
+                checked += 1;
+            }
+        };
+        for &(unscaled, scale) in &literals {
+            check(LiteralValue::Decimal { unscaled, scale }, unscaled, scale);
+        }
+        // Integer literals take the same path at scale 0.
+        for n in -120i64..=120 {
+            check(LiteralValue::Int64(n), i128::from(n), 0);
+        }
+        assert!(checked > 15_000, "{checked}");
     }
 
     /// Exact literals still narrow: the conversion is not a blanket keep-all.
