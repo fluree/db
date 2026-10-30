@@ -781,6 +781,44 @@ async fn history_transfers_wait_until_the_member_installs_its_erasures() {
     node.shutdown().await;
 }
 
+/// A cluster takes no push of history holding permanently erased commits
+/// yet: neither erasures the push carries nor those of the history it
+/// builds on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_of_erased_history_is_refused() {
+    let (_integration, fluree, node, _dirs) = stand_up(9, |config| config).await;
+    fluree.create_ledger("pushed/db").await.expect("create");
+    let push = |erasure_frames, base_erasures| fluree_db_consensus::PushRequest {
+        idempotency_key: None,
+        ledger_id: "pushed/db:main".to_string(),
+        commits: Vec::new(),
+        blobs: Default::default(),
+        merged_commits: Vec::new(),
+        commit_ids: Vec::new(),
+        merged_commit_ids: Vec::new(),
+        governance: Default::default(),
+        erasure_frames,
+        base_erasures,
+        retention: None,
+        authority: Default::default(),
+    };
+    let base = fluree_db_api::BaseErasure {
+        commit: fluree_db_core::ContentId::new(fluree_db_core::ContentKind::Commit, b"erased"),
+        digest: "0".repeat(64),
+        steps: 1,
+    };
+    for request in [
+        push(vec![b"frame".to_vec()], Vec::new()),
+        push(Vec::new(), vec![base]),
+    ] {
+        match node.committer.push(request).await {
+            Err(fluree_db_consensus::SubmissionError::Execution { status: 501, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    node.shutdown().await;
+}
+
 /// An erasure made on a cluster publishes through Raft: the leader
 /// activates a manifest of it, the member installs the manifest and reports
 /// it, reads of the erased commit return its replacement, writes resume on

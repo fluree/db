@@ -874,16 +874,19 @@ impl QueuedTransactor {
             merged_commit_ids,
             governance,
             erasure_frames,
-            // A cluster holds no erasure: it keeps what it has, and the
-            // removal journal it replicates.
-            base_erasures: _,
+            base_erasures,
+            // A cluster keeps the removal journal it replicates.
             retention: _,
             authority: _,
         } = request;
-        if !erasure_frames.is_empty() {
+        // Nor does it yet check that a pushed history's erasures are the
+        // ones it holds.
+        if !erasure_frames.is_empty() || !base_erasures.is_empty() {
             return Err(SubmissionError::Execution {
                 status: 501,
-                message: "a cluster does not hold permanently erased commits".to_string(),
+                message: "a cluster does not yet take a push of history holding permanently \
+                          erased commits"
+                    .to_string(),
             });
         }
 

@@ -313,8 +313,9 @@ The server takes the erasures as a pull does, before it validates the pushed com
 makes every ledger it holds with an original read as they do (the pushed ledger among them), and
 publishes them. An erased commit is then validated as its replacement, whose surviving operations
 are staged like any pushed commit's, and stored as nothing. The push carries the ledger's removal
-journal too; see [History retention](history-retention.md). A cluster refuses a push of erased
-commits (`501`).
+journal too; see [History retention](history-retention.md). A cluster does not yet take a push whose
+history holds erased commits, even ones it erased itself: `fluree push` stops before sending it, and the
+server refuses one with `501`.
 
 ## Object requests
 
