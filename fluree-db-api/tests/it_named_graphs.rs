@@ -5673,13 +5673,6 @@ async fn a_join_in_a_graph_written_after_the_index_probes_it_and_finds_nothing()
 
     let db = support::graphdb_from_ledger(&ledger);
     let (store, guard) = support::span_capture::init_test_tracing();
-    // The join's routing event is shared with sibling tests, which can pin its
-    // interest to "never" while the subscriber installs: run each query once,
-    // then recompute every registered callsite's interest.
-    for (_, query, _, _) in &cases {
-        let _ = fluree.query(&db, *query).await;
-    }
-    tracing::callsite::rebuild_interest_cache();
 
     let mut failures = Vec::new();
     for (label, query, rows, pinned) in cases {
