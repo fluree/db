@@ -234,6 +234,11 @@ struct Scope {
     seen: AtomicU64,
     /// What [`lower_seen`] bounds `seen` to.
     ceiling: AtomicU64,
+    /// Begun while an intent was open here: registered, so a load spares
+    /// what it stored and advances `seen`. One begun with none open keeps
+    /// the `seen` it began with, refused only if an intent loaded since
+    /// begins deleting before it publishes.
+    tracked: bool,
     stored: Mutex<Vec<String>>,
 }
 
@@ -260,6 +265,8 @@ struct Inner {
     /// Open intents' addresses.
     intents: BTreeMap<u64, Vec<String>>,
     scopes: Vec<Weak<Scope>>,
+    /// How many scopes the last pruning kept: the next prunes at twice it.
+    kept: usize,
 }
 
 impl std::fmt::Debug for Condemned {
@@ -303,13 +310,20 @@ impl Condemned {
         }
         let scope = {
             let mut inner = self.inner.lock();
+            let tracked = self.any.load(Ordering::SeqCst);
             let scope = Arc::new(Scope {
                 seen: AtomicU64::new(inner.loaded),
                 ceiling: AtomicU64::new(u64::MAX),
+                tracked,
                 stored: Mutex::default(),
             });
-            inner.scopes.retain(|s| s.strong_count() > 0);
-            inner.scopes.push(Arc::downgrade(&scope));
+            if tracked {
+                if inner.scopes.len() >= (2 * inner.kept).max(64) {
+                    inner.scopes.retain(|s| s.strong_count() > 0);
+                    inner.kept = inner.scopes.len();
+                }
+                inner.scopes.push(Arc::downgrade(&scope));
+            }
             scope
         };
         SCOPE.scope(scope, write).await
@@ -322,7 +336,11 @@ impl Condemned {
             return Ok(());
         }
         let scoped = SCOPE
-            .try_with(|scope| scope.stored.lock().push(address.to_string()))
+            .try_with(|scope| {
+                if scope.tracked {
+                    scope.stored.lock().push(address.to_string());
+                }
+            })
             .is_ok();
         // Recorded before `any` is read, so an intent loaded meanwhile
         // finds the address in the scope instead.
@@ -506,21 +524,23 @@ mod tests {
         (condemned, spares)
     }
 
-    /// A scope sees the intents loaded when it began; one that stored
-    /// nothing an intent then condemns counts as having seen it.
+    /// A scope begun while an intent is open here sees the intents loaded
+    /// when it began; one that stored nothing an intent then condemns counts
+    /// as having seen it.
     #[tokio::test]
     async fn a_scope_that_stored_nothing_condemned_sees_the_intent() {
         let (condemned, spares) = active();
+        condemned.load(0, vec!["z".into()]).await.unwrap();
         assert_eq!(seen(), None);
         let seen_after = condemned
             .scoped(async {
-                assert_eq!(seen(), Some(0));
+                assert_eq!(seen(), Some(1));
                 condemned.before_store("a").await.unwrap();
-                condemned.load(0, vec!["b".into()]).await.unwrap();
+                condemned.load(1, vec!["b".into()]).await.unwrap();
                 seen()
             })
             .await;
-        assert_eq!(seen_after, Some(1));
+        assert_eq!(seen_after, Some(2));
         assert!(spares.spared.lock().is_empty());
     }
 
@@ -530,6 +550,34 @@ mod tests {
     #[tokio::test]
     async fn what_a_scope_stored_is_spared_when_condemned() {
         let (condemned, spares) = active();
+        condemned.load(0, vec!["z".into()]).await.unwrap();
+        let seen_after = condemned
+            .scoped(async {
+                condemned.before_store("a").await.unwrap();
+                condemned.load(1, vec!["a".into()]).await.unwrap();
+                seen()
+            })
+            .await;
+        assert_eq!(seen_after, Some(2));
+        assert_eq!(*spares.spared.lock(), [(1, "a".to_string())]);
+
+        spares.refuse.store(true, Ordering::SeqCst);
+        let seen_after = condemned
+            .scoped(async {
+                condemned.before_store("b").await.unwrap();
+                condemned.load(2, vec!["b".into()]).await.unwrap();
+                seen()
+            })
+            .await;
+        assert_eq!(seen_after, Some(2), "fenced by intent 2");
+    }
+
+    /// A scope begun with no intent open here records nothing and keeps the
+    /// intents it began with: an intent loaded meanwhile fences it, until
+    /// that intent's deletion begins, at no cost while none is.
+    #[tokio::test]
+    async fn a_scope_begun_with_no_intent_open_keeps_what_it_began_with() {
+        let (condemned, spares) = active();
         let seen_after = condemned
             .scoped(async {
                 condemned.before_store("a").await.unwrap();
@@ -537,18 +585,9 @@ mod tests {
                 seen()
             })
             .await;
-        assert_eq!(seen_after, Some(1));
-        assert_eq!(*spares.spared.lock(), [(0, "a".to_string())]);
-
-        spares.refuse.store(true, Ordering::SeqCst);
-        let seen_after = condemned
-            .scoped(async {
-                condemned.before_store("b").await.unwrap();
-                condemned.load(1, vec!["b".into()]).await.unwrap();
-                seen()
-            })
-            .await;
-        assert_eq!(seen_after, Some(1), "fenced by intent 1");
+        assert_eq!(seen_after, Some(0));
+        assert!(spares.spared.lock().is_empty());
+        assert!(condemned.inner.lock().scopes.is_empty(), "not registered");
     }
 
     /// A scope publishing what another task stored presents no more than
