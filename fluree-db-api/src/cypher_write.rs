@@ -20,10 +20,9 @@
 
 use fluree_db_cypher::ast::{
     CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
-    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, RelType, ReturnClause,
-    SetClause, SetItem, Statement, Update, Variable, WriteClause,
+    Pattern, PatternPart, ProjectionItem, Query, ReadClause, ReturnClause, SetClause, SetItem,
+    Statement, Update, Variable, WriteClause,
 };
-use fluree_db_cypher::span::SourceSpan;
 use fluree_db_ledger::LedgerState;
 use fluree_db_transact::ir::Txn;
 
@@ -321,93 +320,6 @@ pub(crate) fn bound_by_mandatory_match(u: &Update, name: &str) -> bool {
             nodes.any(|n| n.var.as_ref().is_some_and(|v| v.name == name))
         })
     })
-}
-
-/// The base edge a relationship variable was matched on: its endpoints,
-/// named and ordered subject → object, and its type. A relationship's
-/// `DELETE` retracts that edge, and every relationship reifying it goes with
-/// it.
-pub(crate) struct RelEdge {
-    pub s: Variable,
-    pub o: Variable,
-    pub types: Vec<RelType>,
-}
-
-impl RelEdge {
-    /// `MATCH (s)-[rel:T]->(o)`: the edge alone, with no labels or properties
-    /// (where this is used, `s` and `o` are already bound).
-    pub(crate) fn match_clause(&self, rel: Option<Variable>, span: SourceSpan) -> ReadClause {
-        let node = |v: &Variable| NodePattern {
-            var: Some(v.clone()),
-            labels: Vec::new(),
-            props: None,
-            span,
-        };
-        ReadClause::Match(MatchClause {
-            pattern: Pattern {
-                parts: vec![PatternPart {
-                    path_var: None,
-                    path_search: None,
-                    head: node(&self.s),
-                    tail: vec![(
-                        RelPattern {
-                            var: rel,
-                            direction: Direction::Outgoing,
-                            types: self.types.clone(),
-                            length: None,
-                            props: None,
-                            span,
-                        },
-                        node(&self.o),
-                    )],
-                    span,
-                }],
-                span,
-            },
-            where_clause: None,
-            span,
-        })
-    }
-}
-
-/// The [`RelEdge`] relationship variable `rel_var` was matched on, honoring
-/// direction. `None` if the endpoints aren't both named.
-pub(crate) fn rel_edge(u: &Update, rel_var: &str) -> Option<RelEdge> {
-    for clause in &u.read_clauses {
-        let (ReadClause::Match(m) | ReadClause::OptionalMatch(m)) = clause else {
-            continue;
-        };
-        for part in &m.pattern.parts {
-            let mut prev = &part.head;
-            for (rel, next) in &part.tail {
-                if rel.var.as_ref().is_some_and(|v| v.name == rel_var) {
-                    let (s, o) = match rel.direction {
-                        Direction::Incoming => (next, prev),
-                        _ => (prev, next),
-                    };
-                    return Some(RelEdge {
-                        s: s.var.clone()?,
-                        o: o.var.clone()?,
-                        types: rel.types.clone(),
-                    });
-                }
-                prev = next;
-            }
-        }
-    }
-    None
-}
-
-/// The refusal for a `DELETE` of relationship `rel_var` whose endpoints
-/// aren't both named.
-pub(crate) fn unnamed_endpoints_error(rel_var: &str) -> crate::error::ApiError {
-    crate::error::ApiError::cypher(
-        format!(
-            "DELETE of relationship `{rel_var}` requires both endpoint nodes to be named \
-             (e.g. `(a)-[{rel_var}]->(b)`)"
-        ),
-        Vec::new(),
-    )
 }
 
 /// Build a probe that returns at most one row when a node matching the MERGE

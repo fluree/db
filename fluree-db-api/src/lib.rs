@@ -4615,19 +4615,11 @@ impl Fluree {
                 ))
             }
             ConditionalCypherWrite::DeleteRel(update) => {
-                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
-                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
-                })?;
                 // `DELETE r` retracts the relationship's base `(a)-[:T]->(b)`
                 // triple, whose `f:reifies*` cascade removes the bundle; staging
                 // refuses an edge that backs a parallel sibling too (see
-                // `TxnOpts::relationship_deletes`). The endpoints must be named.
-                for target in &delete.targets {
-                    if crate::cypher_write::rel_edge(update, &target.name).is_none() {
-                        return Err(crate::cypher_write::unnamed_endpoints_error(&target.name));
-                    }
-                }
-                // Lower the original DELETE directly.
+                // `TxnOpts::relationship_deletes`). Lower the original DELETE
+                // directly.
                 let ast = fluree_db_cypher::CypherAst {
                     statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
                     span: update.span,

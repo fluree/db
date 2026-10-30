@@ -36,9 +36,9 @@
 use std::sync::Arc;
 
 use fluree_db_cypher::ast::{
-    CypherAst, Expr, Literal, MatchClause, MergeClause, Pattern, PatternPart, ProjectionItem,
-    Query, ReadClause, RemoveItem, ReturnClause, SetClause, SetItem, Statement, Update, Variable,
-    WriteClause,
+    CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
+    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, RemoveItem, ReturnClause,
+    SetClause, SetItem, Statement, Update, Variable, WriteClause,
 };
 use fluree_db_cypher::span::SourceSpan;
 use fluree_db_ledger::IndexConfig;
@@ -62,6 +62,10 @@ const MAX_SEQUENTIAL_ROWS: usize = 100_000;
 /// engine-side reordering. `#`-prefixed so it can never collide with a user
 /// variable (Cypher identifiers cannot start with `#`).
 const ROW_IDX_VAR: &str = "#__cy_seq_row";
+
+/// Prefix of the variables the driver names a relationship's endpoints with
+/// (see [`rel_delete_edges`]); `#` keeps them clear of user variables.
+const REL_END_VAR: &str = "#__cy_seq_rel_";
 
 /// Synthetic column used when a read prefix produces rows but binds no user
 /// variables (for example `MATCH (:Person)`). Without a column, that N-row
@@ -156,8 +160,8 @@ pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
 ///
 /// Statements whose clauses can't meet keep the single `Txn`, as do shapes
 /// the driver doesn't stage ([`validate_members`]: a `CALL` before the
-/// writes, an `OPTIONAL MATCH` before a `CREATE`, a bare or relationship
-/// `DELETE`, `FOREACH`).
+/// writes, an `OPTIONAL MATCH` before a `CREATE`, a node's bare `DELETE`,
+/// `FOREACH`), which the single `Txn`'s lowering refuses in turn.
 fn interacting_writes(u: &Update) -> Option<Update> {
     // One clause meets itself only as a SET writing one key twice, and two
     // CREATEs never meet.
@@ -183,11 +187,7 @@ fn interacting_writes(u: &Update) -> Option<Update> {
     if !meet {
         return None;
     }
-    // A relationship's DELETE beside another write clause has no single-`Txn`
-    // form that sees the other clauses' writes or checks the edge for a
-    // parallel relationship, so it goes to the driver even when the driver
-    // will refuse it (unnamed endpoints, say), as a DELETE r of its own does.
-    if validate_members(u).is_err() && !deletes_a_relationship(u) {
+    if validate_members(u).is_err() {
         return None;
     }
     Some(Update {
@@ -196,33 +196,133 @@ fn interacting_writes(u: &Update) -> Option<Update> {
     })
 }
 
-/// The edges a relationship `DELETE` retracts, as `MATCH` clauses its seeded
-/// sub-statement re-matches: the lowering retracts the edge a relationship
-/// variable was matched on, in the state the clauses before it leave, and
-/// staging refuses an edge that carries another relationship (one an earlier
-/// clause created included), as for a `DELETE r` of its own.
+/// The edges a `DELETE` clause's relationship targets retract, as `MATCH`
+/// clauses its seeded sub-statement re-matches: the lowering retracts the edge
+/// a relationship variable was matched on, in the state the clauses before it
+/// leave, and staging refuses an edge that carries another relationship (one
+/// an earlier clause created included), as for a `DELETE r` of its own.
+///
+/// Each re-match is `(s)-[r:T]->(o)`. Its endpoints are the variables that
+/// hold `r`'s endpoints at the end of the read clauses ([`RelBinding::ends`],
+/// carried through any `WITH` under names of the driver's own), so with `r`
+/// and both endpoints seeded it is a point lookup of the edge, and the names
+/// the statement's `MATCH` gave the endpoints play no part. When the pattern
+/// read the edge in either direction, the re-match takes endpoint variables
+/// of its own, which the seeded `r` and its `f:reifies*` bundle pin to the
+/// edge `r` is on: slower over many rows, but it never reaches another edge.
 fn rel_delete_edges(
-    u: &Update,
-    delete: &fluree_db_cypher::ast::DeleteClause,
+    rels: &[RelBinding],
+    delete: &DeleteClause,
     span: SourceSpan,
-) -> Result<Vec<ReadClause>> {
+) -> Vec<ReadClause> {
     delete
         .targets
         .iter()
-        .map(|target| {
-            crate::cypher_write::rel_edge(u, &target.name)
-                .map(|edge| edge.match_clause(Some(target.clone()), span))
-                .ok_or_else(|| crate::cypher_write::unnamed_endpoints_error(&target.name))
+        .filter_map(|target| {
+            let rel = rels.iter().find(|r| r.name == target.name)?;
+            Some((target, rel))
+        })
+        .map(|(target, rel)| {
+            let (s, o) = rel.ends.clone().unwrap_or_else(|| {
+                (
+                    format!("{REL_END_VAR}s_{}", target.name),
+                    format!("{REL_END_VAR}o_{}", target.name),
+                )
+            });
+            let node = |name: String| NodePattern {
+                var: Some(Variable { name, span }),
+                labels: Vec::new(),
+                props: None,
+                span,
+            };
+            ReadClause::Match(MatchClause {
+                pattern: Pattern {
+                    parts: vec![PatternPart {
+                        path_var: None,
+                        path_search: None,
+                        head: node(s),
+                        tail: vec![(
+                            RelPattern {
+                                var: Some(target.clone()),
+                                direction: Direction::Outgoing,
+                                types: rel.pattern.types.clone(),
+                                length: rel.pattern.length.clone(),
+                                props: None,
+                                span,
+                            },
+                            node(o),
+                        )],
+                        span,
+                    }],
+                    span,
+                },
+                where_clause: None,
+                span,
+            })
         })
         .collect()
 }
 
-/// Whether a `DELETE` in `u` targets a relationship variable.
-fn deletes_a_relationship(u: &Update) -> bool {
-    let rel_vars = relationship_vars(&u.read_clauses);
-    u.write_clauses.iter().any(|w| {
-        matches!(w, WriteClause::Delete(d) if d.targets.iter().any(|t| rel_vars.contains(&t.name)))
-    })
+/// The endpoint variables of the relationships a `DELETE` in `u` targets that
+/// only the read prefix names ([`name_anonymous_ends`]): the read prefix
+/// returns them as row-table columns, so the DELETE's re-match is seeded with
+/// them.
+fn hidden_delete_ends(u: &Update, rels: &[RelBinding]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in &u.write_clauses {
+        let WriteClause::Delete(d) = w else {
+            continue;
+        };
+        for t in &d.targets {
+            let Some((s, o)) = rels
+                .iter()
+                .find(|r| r.name == t.name)
+                .and_then(|r| r.ends.as_ref())
+            else {
+                continue;
+            };
+            for end in [s, o] {
+                if end.starts_with(REL_END_VAR) && !out.contains(end) {
+                    out.push(end.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `clauses` with every unnamed node beside a named relationship given a
+/// name of the driver's own, so a relationship's DELETE can be seeded with its
+/// endpoints (see [`rel_delete_edges`]). Naming a node changes nothing the
+/// pattern matches.
+fn name_anonymous_ends(clauses: &[ReadClause]) -> Vec<ReadClause> {
+    let mut clauses = clauses.to_vec();
+    for (ci, c) in clauses.iter_mut().enumerate() {
+        let (ReadClause::Match(m) | ReadClause::OptionalMatch(m)) = c else {
+            continue;
+        };
+        for (pi, part) in m.pattern.parts.iter_mut().enumerate() {
+            let named_rel: Vec<bool> = part.tail.iter().map(|(rel, _)| rel.var.is_some()).collect();
+            let span = part.head.span;
+            let name = |node: &mut NodePattern, ni: usize| {
+                if node.var.is_none() {
+                    node.var = Some(Variable {
+                        name: format!("{REL_END_VAR}n{ci}_{pi}_{ni}"),
+                        span,
+                    });
+                }
+            };
+            if named_rel.first() == Some(&true) {
+                name(&mut part.head, 0);
+            }
+            for (i, (_, node)) in part.tail.iter_mut().enumerate() {
+                if named_rel[i] || named_rel.get(i + 1) == Some(&true) {
+                    name(node, i + 1);
+                }
+            }
+        }
+    }
+    clauses
 }
 
 /// Whether a SET's items write one property key twice.
@@ -239,22 +339,172 @@ fn set_repeats_a_key(s: &SetClause) -> bool {
     false
 }
 
-/// Relationship variables the read clauses bind.
-fn relationship_vars(clauses: &[ReadClause]) -> Vec<String> {
-    let mut vars = Vec::new();
-    for c in clauses {
-        if let ReadClause::Match(m) | ReadClause::OptionalMatch(m) = c {
-            for part in &m.pattern.parts {
-                vars.extend(
-                    part.tail
-                        .iter()
-                        .filter_map(|(rel, _)| rel.var.as_ref())
-                        .map(|v| v.name.clone()),
-                );
+/// A relationship variable in scope after the read clauses.
+struct RelBinding {
+    name: String,
+    /// The pattern that bound it.
+    pattern: RelPattern,
+    /// The variables holding its endpoints, subject first: `None` when one is
+    /// unnamed, when the pattern reads the edge in either direction, or (unless
+    /// the scope carries them, see [`relationship_scope`]) once a `WITH` drops
+    /// or rebinds one.
+    ends: Option<(String, String)>,
+}
+
+/// The relationship variables in scope after the read clauses. A `WITH`
+/// carries a relationship (and its endpoints) under the names it projects them
+/// as and drops what it doesn't project, so a name the `MATCH` gave a
+/// relationship can name a node afterwards, and the reverse.
+///
+/// With `carry_ends`, the clauses come back prepared for the read prefix: an
+/// unnamed endpoint beside a named relationship gets a name of its own
+/// ([`name_anonymous_ends`]), and a `WITH` that keeps a relationship but drops
+/// or rebinds an endpoint also projects that endpoint under a name of the
+/// driver's own. Neither changes what the clauses match or bind for the
+/// statement (an endpoint is a function of its relationship, so carrying it
+/// changes no grouping or `DISTINCT`), and every relationship keeps the
+/// variables holding its endpoints, which seed its DELETE's re-match.
+fn relationship_scope(
+    clauses: &[ReadClause],
+    carry_ends: bool,
+) -> (Vec<ReadClause>, Vec<RelBinding>) {
+    // A name that is bound anew holds no relationship or endpoint it held.
+    fn forget(vars: &mut Vec<RelBinding>, name: &str) {
+        vars.retain(|r| r.name != name);
+        for r in vars.iter_mut() {
+            if r.ends.as_ref().is_some_and(|(s, o)| s == name || o == name) {
+                r.ends = None;
             }
         }
     }
-    vars
+    let mut clauses = if carry_ends {
+        name_anonymous_ends(clauses)
+    } else {
+        clauses.to_vec()
+    };
+    let mut vars: Vec<RelBinding> = Vec::new();
+    for (ci, c) in clauses.iter_mut().enumerate() {
+        match c {
+            ReadClause::Match(m) | ReadClause::OptionalMatch(m) => {
+                for part in &m.pattern.parts {
+                    let mut prev = &part.head;
+                    for (rel, next) in &part.tail {
+                        if let Some(v) = &rel.var {
+                            let ends = match rel.direction {
+                                Direction::Outgoing => Some((prev, next)),
+                                Direction::Incoming => Some((next, prev)),
+                                Direction::Either => None,
+                            }
+                            .and_then(|(s, o)| Some((s.var.clone()?.name, o.var.clone()?.name)));
+                            vars.retain(|r| r.name != v.name);
+                            vars.push(RelBinding {
+                                name: v.name.clone(),
+                                pattern: rel.clone(),
+                                ends,
+                            });
+                        }
+                        prev = next;
+                    }
+                }
+            }
+            ReadClause::With(w) => {
+                let (next, carried) = with_scope(w, std::mem::take(&mut vars), carry_ends, ci);
+                vars = next;
+                w.items.extend(carried);
+            }
+            ReadClause::Unwind(u) => forget(&mut vars, &u.alias.name),
+            ReadClause::InlineRows { vars: cols, .. } => {
+                for v in cols {
+                    forget(&mut vars, &v.name);
+                }
+            }
+            ReadClause::CallSubquery(_) => {}
+        }
+    }
+    (clauses, vars)
+}
+
+/// The relationship variables in scope after `w` (clause `ci`), and, with
+/// `carry_ends`, the items `w` must also project to keep each surviving
+/// relationship's endpoints (see [`relationship_scope`]).
+fn with_scope(
+    w: &fluree_db_cypher::ast::WithClause,
+    vars: Vec<RelBinding>,
+    carry_ends: bool,
+    ci: usize,
+) -> (Vec<RelBinding>, Vec<ProjectionItem>) {
+    // Where each name this WITH projects a variable under comes from. `WITH *`
+    // carries every user variable as it is.
+    let star = w
+        .items
+        .iter()
+        .any(|i| i.alias.is_none() && matches!(&i.expr, Expr::Var(v) if v.name == "*"));
+    let renames: Vec<(&str, &str)> = w
+        .items
+        .iter()
+        .filter_map(|i| match (&i.alias, &i.expr) {
+            (None, Expr::Var(v)) if v.name == "*" => None,
+            (alias, Expr::Var(v)) => {
+                Some((v.name.as_str(), alias.as_ref().unwrap_or(v).name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let assigned = |name: &str| {
+        w.items
+            .iter()
+            .any(|i| i.alias.as_ref().is_some_and(|a| a.name == name))
+    };
+    let new_name = |old: &str| -> Option<String> {
+        if let Some((_, new)) = renames.iter().find(|(from, _)| *from == old) {
+            return Some((*new).to_string());
+        }
+        (star && !old.starts_with('#') && !assigned(old)).then(|| old.to_string())
+    };
+    let mut carried: Vec<ProjectionItem> = Vec::new();
+    let mut carry = |old: &str| -> String {
+        if let Some(i) = carried
+            .iter()
+            .find(|i| matches!(&i.expr, Expr::Var(v) if v.name == old))
+        {
+            return i
+                .alias
+                .as_ref()
+                .expect("carried items are aliased")
+                .name
+                .clone();
+        }
+        let alias = Variable {
+            name: format!("{REL_END_VAR}w{ci}_{}", carried.len()),
+            span: w.span,
+        };
+        carried.push(ProjectionItem {
+            expr: Expr::Var(Variable {
+                name: old.to_string(),
+                span: w.span,
+            }),
+            alias: Some(alias.clone()),
+            span: w.span,
+        });
+        alias.name
+    };
+    let next = vars
+        .into_iter()
+        .filter_map(|r| {
+            let name = new_name(&r.name)?;
+            let ends = r.ends.and_then(|(s, o)| {
+                let mut keep =
+                    |end: String| new_name(&end).or_else(|| carry_ends.then(|| carry(&end)));
+                Some((keep(s)?, keep(o)?))
+            });
+            Some(RelBinding {
+                name,
+                pattern: r.pattern,
+                ends,
+            })
+        })
+        .collect();
+    (next, carried)
 }
 
 /// `clauses` with each SET that writes one property key twice split into
@@ -574,11 +824,13 @@ impl Fluree {
         };
 
         // ---- 1. Read prefix → initial row table --------------------------
+        let (read_clauses, rel_vars) = relationship_scope(&update.read_clauses, true);
         let mut table = if update.read_clauses.is_empty() {
             RowTable::unit()
         } else {
             let mut cols = visible_vars(&update.read_clauses)?;
-            let ast = read_prefix_query(update, &cols, span);
+            cols.extend(hidden_delete_ends(update, &rel_vars));
+            let ast = read_prefix_query(&read_clauses, &cols, span);
             let view = self
                 .seq_probe_view(stager.state(), governance, default_context.as_ref())
                 .await?;
@@ -670,9 +922,7 @@ impl Fluree {
                     let table = bound.as_ref().unwrap_or(&table);
                     if !table.rows.is_empty() {
                         let edges = match clause {
-                            WriteClause::Delete(d) if !d.detach => {
-                                rel_delete_edges(update, d, span)?
-                            }
+                            WriteClause::Delete(d) => rel_delete_edges(&rel_vars, d, span),
                             _ => Vec::new(),
                         };
                         self.seq_stage_seeded(
@@ -1777,25 +2027,18 @@ fn validate_members(u: &Update) -> Result<()> {
             _ => {}
         }
     }
-    let rel_vars = relationship_vars(&u.read_clauses);
+    let (_, rel_vars) = relationship_scope(&u.read_clauses, false);
     for w in &u.write_clauses {
         match w {
-            // A node's DETACH DELETE stages like a SET: a seeded `Txn` whose
-            // lowering finds the node's triples in the state it stages on.
+            // A DELETE stages as a seeded `Txn`. A node's DETACH DELETE finds
+            // the node's triples in the state it stages on, and a
+            // relationship's DELETE (DETACH or not) re-matches the edge it
+            // reifies there (see `rel_delete_edges`); one clause may hold both.
             WriteClause::Delete(d)
-                if d.detach && d.targets.iter().all(|t| !rel_vars.contains(&t.name)) => {}
-            // A relationship's DELETE re-matches the edge it reifies in the
-            // state it stages on (see `rel_delete_edges`), so its endpoints
-            // must be named, as for a DELETE r of its own.
-            WriteClause::Delete(d)
-                if !d.detach && d.targets.iter().all(|t| rel_vars.contains(&t.name)) =>
-            {
-                for t in &d.targets {
-                    if crate::cypher_write::rel_edge(u, &t.name).is_none() {
-                        return Err(crate::cypher_write::unnamed_endpoints_error(&t.name));
-                    }
-                }
-            }
+                if d.detach
+                    || d.targets
+                        .iter()
+                        .all(|t| rel_vars.iter().any(|r| r.name == t.name)) => {}
             WriteClause::Delete(_) => {
                 return Err(cypher_err(
                     "a bare node DELETE in a multi-clause write statement is deferred — run \
@@ -1942,7 +2185,7 @@ fn visible_vars(clauses: &[ReadClause]) -> Result<Vec<String>> {
 }
 
 /// The read prefix as a read query projecting `cols`.
-fn read_prefix_query(update: &Update, cols: &[String], span: SourceSpan) -> CypherAst {
+fn read_prefix_query(read_clauses: &[ReadClause], cols: &[String], span: SourceSpan) -> CypherAst {
     let items = if cols.is_empty() {
         vec![ProjectionItem {
             expr: Expr::Lit(Literal::Integer(0, span)),
@@ -1957,7 +2200,7 @@ fn read_prefix_query(update: &Update, cols: &[String], span: SourceSpan) -> Cyph
     };
     CypherAst {
         statement: Statement::Query(Query {
-            clauses: update.read_clauses.clone(),
+            clauses: read_clauses.to_vec(),
             return_clause: ReturnClause {
                 items,
                 distinct: false,

@@ -1796,7 +1796,8 @@ const A_TO_C: &str = r#"MATCH (a:P {id: "a"}), (c:P {id: "c"}) CREATE (a)-[:K {w
 
 /// `DETACH DELETE a, r` takes every relationship on `a`, whether or not one of
 /// `a`'s edges carries two of them, and whether or not that edge is `r`'s. The
-/// same holds for a `DETACH DELETE` of `r`'s other endpoint.
+/// same holds for a `DETACH DELETE` of `r`'s other endpoint, and beside other
+/// clauses.
 #[tokio::test]
 async fn a_detach_delete_beside_a_relationship_takes_every_relationship_on_the_node() {
     let mut a_gone = nodes_and(&[]);
@@ -1805,6 +1806,8 @@ async fn a_detach_delete_beside_a_relationship_takes_every_relationship_on_the_n
         r#"MATCH (a:P {id: "a"})-[r:K]->(c:P {id: "c"}) DETACH DELETE a, r"#,
         r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DETACH DELETE a, r"#,
         r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DETACH DELETE r, a"#,
+        r#"MATCH (a:P {id: "a"})-[r:K]->(c:P {id: "c"}) SET a.seen = true DETACH DELETE a, r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K]->(c:P {id: "c"}) SET r.v = 5 DETACH DELETE a, r"#,
     ] {
         let (outcome, (rels, triples)) =
             rel_run_seeded("detach-beside-rel", true, &[A_TO_C], statement).await;
@@ -1838,10 +1841,121 @@ async fn a_parallel_relationship_the_detach_delete_does_not_reach_still_refuses(
     for statement in [
         r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}), (c:P {id: "c"}) DETACH DELETE c, r"#,
         r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) DETACH DELETE r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K {w: 1}]->(b:P {id: "b"}) SET r.v = 5 DETACH DELETE r"#,
     ] {
         let (outcome, state) = rel_run_seeded("parallel-detach", true, &[A_TO_C], statement).await;
         let err = outcome.expect_err(statement);
         assert!(err.contains(PARALLEL_REFUSAL), "{statement}: {err}");
         assert_eq!(state, seeded, "{statement}: nothing written");
+    }
+}
+
+/// A `DETACH DELETE` of a relationship beside other clauses stages as its
+/// DELETE does: a SET on it first leaves nothing behind.
+#[tokio::test]
+async fn a_detach_delete_of_a_relationship_beside_a_set_leaves_nothing() {
+    let statement = r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) SET r.v = 5 DETACH DELETE r"#;
+    let (outcome, (rels, triples)) = rel_run("set-detach-rel", false, statement).await;
+    assert_eq!(outcome, Ok(()), "{statement}");
+    assert!(rels.is_empty(), "{statement}: {rels:?}");
+    assert_eq!(triples, nodes_and(&[]), "{statement}");
+}
+
+// ---- Which edge a relationship's DELETE retracts ---------------------------
+//
+// Beside other clauses, a relationship's DELETE re-matches its edge in the
+// state the clauses before it leave. It finds the edge through the
+// relationship itself, so neither the names a `WITH` gives the endpoints nor
+// the pattern's direction can point it at another edge, and the endpoints need
+// no names.
+
+/// A `WITH` that rebinds an endpoint's name to another node (through a later
+/// `MATCH`), drops the endpoints, or renames the relationship: the
+/// DELETE still takes the relationship the SET wrote to.
+#[tokio::test]
+async fn a_relationship_delete_after_a_with_deletes_that_relationship() {
+    for statement in [
+        r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) WITH r MATCH (a:P {id: "c"}) SET r.v = 5 DELETE r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) WITH r SET r.v = 5 DELETE r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) WITH DISTINCT r SET r.v = 5 DELETE r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) WITH r, count(*) AS n SET r.v = n DELETE r"#,
+        r#"MATCH (:P {id: "a"})-[r:K]->(:P {id: "b"}) WITH r SET r.v = 5 DELETE r"#,
+        r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) WITH a, b, r AS q SET q.v = 5 DELETE q"#,
+    ] {
+        let (outcome, (rels, triples)) = rel_run("with-delete", false, statement).await;
+        assert_eq!(outcome, Ok(()), "{statement}");
+        assert!(rels.is_empty(), "{statement}: {rels:?}");
+        assert_eq!(triples, nodes_and(&[]), "{statement}");
+    }
+}
+
+/// Unnamed endpoints, and a pattern read against the edge's direction: the
+/// DELETE takes the relationship, on its own and beside a SET.
+#[tokio::test]
+async fn a_relationship_delete_needs_no_endpoint_names_or_direction() {
+    for (statement, extra) in [
+        (
+            r#"MATCH (:P {id: "a"})-[r:K]->(:P {id: "b"}) DELETE r"#,
+            &[][..],
+        ),
+        (
+            r#"MATCH (:P {id: "a"})-[r:K]->(:P {id: "b"}) SET r.v = 5 DELETE r"#,
+            &[][..],
+        ),
+        (
+            r#"MATCH (x:P {id: "b"})-[r:K]-(y:P {id: "a"}) SET x.seen = true DELETE r"#,
+            &["b seen true"][..],
+        ),
+    ] {
+        let (outcome, (rels, triples)) = rel_run("unnamed-delete", false, statement).await;
+        assert_eq!(outcome, Ok(()), "{statement}");
+        assert!(rels.is_empty(), "{statement}: {rels:?}");
+        assert_eq!(triples, nodes_and(extra), "{statement}");
+    }
+    let seeded = rel_run(
+        "parallel-seed-3",
+        true,
+        r#"MATCH (n:P {id: "c"}) SET n.id = "c""#,
+    )
+    .await
+    .1;
+    for statement in [
+        r#"MATCH (:P {id: "a"})-[r:K {w: 1}]->(:P {id: "b"}) DELETE r"#,
+        r#"MATCH (:P {id: "a"})-[r:K {w: 1}]->(:P {id: "b"}) SET r.v = 5 DELETE r"#,
+    ] {
+        let (outcome, state) = rel_run("unnamed-parallel", true, statement).await;
+        let err = outcome.expect_err(statement);
+        assert!(err.contains(PARALLEL_REFUSAL), "{statement}: {err}");
+        assert_eq!(state, seeded, "{statement}: nothing written");
+    }
+}
+
+// ---- A relationship's DELETE beside a clause the driver doesn't stage -----
+
+/// A statement with a clause the driver defers keeps the single `Txn`, a
+/// relationship's DELETE beside it included, and the single `Txn`'s lowering
+/// refuses it as it refuses the same statement without that DELETE.
+#[tokio::test]
+async fn a_relationship_delete_beside_a_deferred_clause_keeps_one_txn() {
+    for (statement, refusal) in [
+        (
+            r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}), (c:P {id: "c"}) SET a.seen = true DELETE r, c"#,
+            "bare DELETE n",
+        ),
+        (
+            r#"MATCH (a:P {id: "a"})-[r:K]->(b:P {id: "b"}) OPTIONAL MATCH (c:P {id: "c"}) SET a.seen = true DELETE r CREATE (c)-[:K]->(a)"#,
+            "OPTIONAL MATCH before CREATE",
+        ),
+    ] {
+        let ast = fluree_db_cypher::parse_cypher(statement)
+            .ast
+            .expect("parse");
+        assert!(
+            fluree_db_api::cypher_seq::detect_sequential(&ast).is_none(),
+            "{statement}: keeps the single Txn"
+        );
+        let (outcome, _) = rel_run("deferred-delete", false, statement).await;
+        let err = outcome.expect_err(statement);
+        assert!(err.contains(refusal), "{statement}: {err}");
     }
 }
