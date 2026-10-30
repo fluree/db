@@ -686,3 +686,57 @@ fn from_an_ossie_semantic_model_in_json() {
     );
     assert!(ttl.contains("rdfs:range sales:Customer"), "{ttl}");
 }
+
+/// `CALL apoc.meta.schema() YIELD value RETURN value`, exported as JSON, for a
+/// small movies graph.
+const NEO4J_SCHEMA: &str = r#"[{"value": {
+  "Person": {"type": "node", "count": 133, "labels": [], "properties": {
+      "name": {"type": "STRING", "indexed": true, "unique": false, "existence": false},
+      "born": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "out", "count": 172, "labels": ["Movie"],
+                   "properties": {"roles": {"type": "LIST", "array": true}}},
+      "DIRECTED": {"direction": "out", "count": 44, "labels": ["Movie"], "properties": {}},
+      "REVIEWED": {"direction": "out", "count": 9, "labels": ["Movie"],
+                   "properties": {"summary": {"type": "STRING"}, "rating": {"type": "INTEGER"}}},
+      "FOLLOWS": {"direction": "out", "count": 3, "labels": ["Person"], "properties": {}}}},
+  "Movie": {"type": "node", "count": 38, "labels": [], "properties": {
+      "title": {"type": "STRING", "indexed": true, "unique": true, "existence": false},
+      "released": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false},
+      "tagline": {"type": "STRING", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "in", "count": 172, "labels": ["Person"], "properties": {}}}},
+  "ACTED_IN": {"type": "relationship", "count": 172, "properties": {"roles": {"type": "LIST", "array": true}}}
+}}]"#;
+
+#[test]
+fn from_a_neo4j_schema() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp, "movies-schema.json", NEO4J_SCHEMA);
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "movies-schema.json",
+            "--base",
+            "https://example.com/movies/",
+            "-o",
+            "movies.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("2 classes, 9 properties"))
+        .stderr(predicate::str::contains(
+            "3 relationship propert(ies) left out",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("movies.ttl")).unwrap();
+    assert!(ttl.contains("movies:actedIn a rdf:Property"), "{ttl}");
+    assert!(
+        ttl.contains("rdfs:comment \"A person acted in a movie.\""),
+        "{ttl}"
+    );
+    assert!(ttl.contains("rdfs:label \"acted in\""), "{ttl}");
+    assert!(ttl.contains("rdfs:range movies:Movie"), "{ttl}");
+    let (report, code) = check_json(&tmp, &["movies.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+}

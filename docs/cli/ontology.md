@@ -21,7 +21,7 @@ fluree ontology <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `check` | Report what the extraction model will and won't read of an ontology (and catalog) |
-| `from` | Write an ontology in the shape the extraction model reads well: from tables (CSV, a workbook, SQL DDL), a semantic layer (Snowflake, Genie, dbt, Apache Ossie), or RDF, optionally sliced |
+| `from` | Write an ontology in the shape the extraction model reads well: from tables (CSV, a workbook, SQL DDL), a semantic layer (Snowflake, Genie, dbt, Apache Ossie), a Neo4j schema, or RDF, optionally sliced |
 
 Ontologies are read as Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-`
 reads stdin, and `--input-format turtle|jsonld` says which when the extension
@@ -29,8 +29,8 @@ doesn't. TriG is not read yet: pass the ontology as Turtle, or a saved request
 as JSON-LD. `from` also reads tables (`.csv`/`.tsv`, `.xlsx`, `.sql`) and
 semantic layers: a Snowflake semantic view (`.yaml`), a Databricks Genie
 export (`.json`), a dbt project (its `.yml` files or its directory) and an
-Apache Ossie semantic model or ontology (`.yaml`, `.json`). YAML and JSON
-are told apart by what they hold.
+Apache Ossie semantic model or ontology (`.yaml`, `.json`), and a Neo4j
+schema export (`.json`). YAML and JSON are told apart by what they hold.
 
 For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
@@ -298,6 +298,18 @@ An **Apache Ossie** document (0.2, `.yaml` or `.json`) is read by its layer:
   with a catalog record per value. `derived_by`, other `requires` and
   `identify_by` are logic, not what documents say, and are left out.
 
+A **Neo4j graph's schema** (`.json`) is close to an ontology already. Export it
+with APOC (`CALL apoc.meta.schema() YIELD value RETURN value`, saved as JSON),
+which gives labels, their typed properties and each relationship type's
+direction and end labels; or with the built-in `CALL db.schema.visualization()`,
+which gives labels and relationship types only. A label is a class (`MovieGenre`
+becomes "movie genre"); a node property is a property typed from its Neo4j type
+(a unique `id`, `uuid` or `<label>Id` is a key, and left out); an outgoing
+relationship type is a relation labelled in words (`ACTED_IN` becomes "acted
+in") and described as the sentence it reads ("A person acted in a movie."), with
+no range when it reaches several labels. Relationship properties have no place
+on an RDF property: they are left out, and the summary counts them.
+
 A foreign key named for a code or number (`HIRE_CODE` into `PRODUCTS`) takes
 its target's label ("product"), since the name says what it is, not what role
 it plays. A key used by several tables is one relation, described for them
@@ -312,7 +324,7 @@ Snowflake's; statements none of them can parse are skipped and counted.
 | `--enum-max <N>` | Most distinct values an enumerated column may have, for CSV and workbooks (default: 12; 0 never enumerates) |
 | `--catalog-out <FILE>` | Write enumerated columns' records here instead of with the ontology |
 | `--comments <FILE>` | Unity Catalog comments for a Genie export (JSON) |
-| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake`, `genie`, `dbt` or `ossie`, when the extension or contents don't say |
+| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake`, `genie`, `dbt`, `ossie` or `neo4j`, when the extension or contents don't say |
 | `--format <FORMAT>` | `turtle` (default) or `jsonld` |
 | `-o, --output <FILE>` | Write to this file instead of stdout |
 
@@ -324,6 +336,7 @@ fluree ontology from sales_view.yaml --base https://example.com/sales/ > ontolog
 fluree ontology from genie_space.json --comments uc_comments.json > ontology.ttl
 fluree ontology from ./my_dbt_project --base https://example.com/shop/ > ontology.ttl
 fluree ontology from flights.ossie.yaml > ontology.ttl
+fluree ontology from neo4j-schema.json --base https://example.com/movies/ > ontology.ttl
 ```
 
 From this DDL:
