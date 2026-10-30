@@ -1040,6 +1040,7 @@ dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
  "fluree-db-query",
+ "fluree-graph-ir",
  "fluree-graph-json-ld",
  "fluree-vocab",
  "num-bigint",

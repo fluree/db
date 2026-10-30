@@ -54,6 +54,7 @@ use fluree_db_sparql::ast::{
     TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
+use fluree_graph_ir::syntax::reserved_blank_label;
 use thiserror::Error;
 
 use crate::ir::{
@@ -117,10 +118,7 @@ impl BlankNodeCounter {
         Self { next: 0 }
     }
 
-    /// The label of a template `[]`. A label can't start with `-`, so no
-    /// hand-written `_:label` collides with it (a user's `_:b0` next to a
-    /// template `[]` used to fuse into one node). Mid-label `-` is legal, so
-    /// the skolemized `fdb-…--anon{N}` serializes as written.
+    /// The label of a template `[]`.
     fn next(&mut self) -> String {
         format!("_:{}", self.mint("anon"))
     }
@@ -132,7 +130,7 @@ impl BlankNodeCounter {
     }
 
     fn mint(&mut self, kind: &str) -> String {
-        let label = format!("-{kind}{}", self.next);
+        let label = reserved_blank_label(kind, self.next);
         self.next += 1;
         label
     }

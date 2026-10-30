@@ -301,7 +301,7 @@ fluree-db/
 - File and DynamoDB backends
 
 **Key Types:**
-- `NameService` trait (includes `list_branches`, `create_branch`, `drop_branch`)
+- `NameService` trait (includes `branch_records`, `create_branch`, `drop_branch`)
 - `Publisher` trait (commit/index publishing)
 - `NsRecord` - Nameservice record (includes `source_branch` for ancestry and `branches` child count for reference counting)
 - `FileNameService`
