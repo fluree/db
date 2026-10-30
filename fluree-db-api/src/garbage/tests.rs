@@ -463,6 +463,14 @@ pub(crate) mod cluster {
     }
 
     impl Cluster {
+        /// One that grants `leases` leases, then no more: deposed.
+        pub(crate) fn with_leases(leases: usize) -> Self {
+            Self {
+                leases: Mutex::new(Some(leases)),
+                ..Default::default()
+            }
+        }
+
         fn spare(&self, number: u64, address: &str) {
             let mut intents = self.intents.lock();
             let (_, deleting, spared) = intents.get_mut(&number).expect("open");

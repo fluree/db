@@ -4,6 +4,7 @@
 //! originals last — and check that it is gone.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fluree_db_core::{content_path, ContentId, ContentKind, ContentStore, LedgerId, LedgerName};
@@ -84,6 +85,22 @@ impl Fluree {
         ledger: &str,
         release_after: Duration,
     ) -> Result<PurgeReport> {
+        // On a cluster every delete is the leader's, within its lease: none
+        // lands once another leader may be writing an index it would remove.
+        match self.collector() {
+            Some(collector) => {
+                let lease = crate::collect::LeaderLease::new(Arc::clone(collector));
+                fluree_db_core::FileStorage::within_lease(
+                    lease,
+                    Box::pin(self.purge_pass(ledger, release_after)),
+                )
+                .await
+            }
+            None => Box::pin(self.purge_pass(ledger, release_after)).await,
+        }
+    }
+
+    async fn purge_pass(&self, ledger: &str, release_after: Duration) -> Result<PurgeReport> {
         let runtime = self.erasure_runtime()?;
         // On a cluster the leader purges the shared storage, for jobs every
         // member has installed: none reads or writes back what they erase.

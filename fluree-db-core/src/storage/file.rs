@@ -407,6 +407,42 @@ fn sweep_staging(
     sweep
 }
 
+/// What bounds the deletes of the work under way, when anything does: a
+/// cluster's leader deletes only within its lease, so none lands once
+/// another leader may have begun writing what it would remove.
+#[async_trait]
+pub trait DeleteLease: Send + Sync {
+    /// Until when a delete may still begin; `None` once the lease is lost.
+    async fn until(&self) -> Option<std::time::Instant>;
+}
+
+tokio::task_local! {
+    static DELETE_LEASE: Arc<dyn DeleteLease>;
+}
+
+/// The deadline the lease in force, if any, sets a delete beginning now.
+async fn lease_deadline() -> Result<Option<std::time::Instant>> {
+    let Ok(lease) = DELETE_LEASE.try_with(Arc::clone) else {
+        return Ok(None);
+    };
+    match lease.until().await {
+        Some(until) => Ok(Some(until)),
+        None => Err(crate::error::Error::storage(
+            "the lease bounding this delete is no longer held",
+        )),
+    }
+}
+
+/// Whether a delete bounded by `until` may no longer begin.
+fn lease_ran_out(until: Option<std::time::Instant>) -> Result<()> {
+    if until.is_some_and(|until| std::time::Instant::now() >= until) {
+        return Err(crate::error::Error::storage(
+            "the lease bounding this delete ran out before it began",
+        ));
+    }
+    Ok(())
+}
+
 /// What [`FileStorage::retire_stopped_logs`] found of other owners' logs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StoppedLogs {
@@ -1222,6 +1258,15 @@ impl FileStorage {
         wal::foreign_segments(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
     }
 
+    /// Run `work` with its deletes bounded by `lease`: one that would begin
+    /// after the lease runs out, its locks held, is refused.
+    pub async fn within_lease<F: std::future::Future>(
+        lease: Arc<dyn DeleteLease>,
+        work: F,
+    ) -> F::Output {
+        DELETE_LEASE.scope(lease, work).await
+    }
+
     /// Apply and retire the logs other owners under `root` left when they
     /// stopped, as a miss would, and name the owners still running, whose
     /// logs are theirs to retire. Blocking.
@@ -1888,14 +1933,19 @@ impl StorageWrite for FileStorage {
 
     async fn delete(&self, address: &str) -> Result<()> {
         let (key, path) = self.resolve_key(address)?;
+        let until = lease_deadline().await?;
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || storage.delete_key_blocking(&key, &path))
+        tokio::task::spawn_blocking(move || storage.delete_key_blocking(&key, &path, until))
             .await
             .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
 
     async fn delete_unlogged(&self, address: &str, until: std::time::Instant) -> Result<bool> {
         let (key, path) = self.resolve_key(address)?;
+        let until = match lease_deadline().await? {
+            Some(lease) => until.min(lease),
+            None => until,
+        };
         let storage = self.clone();
         tokio::task::spawn_blocking(move || {
             storage.delete_key_unlogged_blocking(&key, &path, until)
@@ -1916,11 +1966,23 @@ impl StorageWrite for FileStorage {
                 Err(e) => failures.push((address.clone(), e)),
             }
         }
+        let until = match lease_deadline().await {
+            Ok(until) => until,
+            Err(e) => {
+                let why = e.to_string();
+                failures.extend(
+                    resolved
+                        .into_iter()
+                        .map(|(a, _, _)| (a, crate::error::Error::storage(why.clone()))),
+                );
+                return failures;
+            }
+        };
         let storage = self.clone();
         match tokio::task::spawn_blocking(move || {
             let mut failed = Vec::new();
             for (address, key, path) in resolved {
-                if let Err(e) = storage.delete_key_blocking(&key, &path) {
+                if let Err(e) = storage.delete_key_blocking(&key, &path, until) {
                     failed.push((address, e));
                 }
             }
@@ -1972,8 +2034,14 @@ impl FileStorage {
     /// Unlink `path`, recording the delete in the WAL first when one is
     /// attached. Absence is success. Runs on the caller's thread: it takes
     /// the root gate and a key stripe, which block.
-    fn delete_key_blocking(&self, key: &str, path: &std::path::Path) -> Result<()> {
+    fn delete_key_blocking(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        until: Option<std::time::Instant>,
+    ) -> Result<()> {
         let operation = self.begin_operation(self.durability, key)?;
+        lease_ran_out(until)?;
         let (_, log) = self.write_plan(&operation, 0)?;
         let appended = match &log {
             // Ordered after the writes it undoes, so replay cannot bring
@@ -3764,6 +3832,64 @@ mod wal_tests {
         drop(exclusive);
         assert!(!delete.await.unwrap().unwrap());
         assert!(dir.path().join("a.bin").exists());
+    }
+
+    /// Deletes under a lease begin only while it is held: one is refused
+    /// once it is lost, or once it runs out while the delete waits for the
+    /// storage's locks.
+    #[tokio::test]
+    async fn a_delete_under_a_lease_begins_only_while_it_is_held() {
+        struct Lease(Option<std::time::Instant>);
+        #[async_trait]
+        impl DeleteLease for Lease {
+            async fn until(&self) -> Option<std::time::Instant> {
+                self.0
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        for name in ["a.bin", "b.bin"] {
+            storage
+                .write_bytes(&format!("fluree:file://{name}"), b"x")
+                .await
+                .unwrap();
+        }
+        let lost: Arc<dyn DeleteLease> = Arc::new(Lease(None));
+        let refused = FileStorage::within_lease(Arc::clone(&lost), async {
+            (
+                storage.delete("fluree:file://a.bin").await,
+                storage
+                    .delete_many(&["fluree:file://b.bin".to_string()])
+                    .await,
+            )
+        })
+        .await;
+        assert!(refused.0.is_err());
+        assert_eq!(refused.1.len(), 1);
+        assert!(dir.path().join("a.bin").exists() && dir.path().join("b.bin").exists());
+
+        let exclusive = storage.root_gate().unwrap().write_owned().await;
+        let delete = {
+            let storage = storage.clone();
+            let lease: Arc<dyn DeleteLease> = Arc::new(Lease(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(50),
+            )));
+            tokio::spawn(FileStorage::within_lease(lease, async move {
+                storage.delete("fluree:file://a.bin").await
+            }))
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        drop(exclusive);
+        assert!(delete.await.unwrap().is_err());
+        assert!(dir.path().join("a.bin").exists());
+
+        let held: Arc<dyn DeleteLease> = Arc::new(Lease(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )));
+        FileStorage::within_lease(held, storage.delete("fluree:file://a.bin"))
+            .await
+            .unwrap();
+        assert!(!dir.path().join("a.bin").exists());
     }
 
     /// Replay applies records in order, so a delete cannot resurrect what it

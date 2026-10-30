@@ -134,6 +134,71 @@ async fn a_document_written_back_after_the_scan_is_purged() {
     assert!(!document.exists());
 }
 
+/// On a cluster a purge deletes only within its leader's lease: deposed
+/// after it began, it deletes nothing more, a new leader's indexes among
+/// what it would have.
+#[tokio::test]
+async fn a_deposed_leaders_purge_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/deposed").await.unwrap();
+    let id = "t/deposed:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    erase(&fluree, id, email("alice", "a@secret")).await;
+    let request = fluree
+        .retention_status(id)
+        .await
+        .unwrap()
+        .registration
+        .unwrap()
+        .erasures[0]
+        .request_id
+        .clone();
+    fluree
+        .update_job(id, &request, |j| {
+            j.cluster = Some(super::super::ClusterPublication {
+                manifest: "m".into(),
+                activation: Some(0),
+                effective_ms: Some(1),
+            });
+        })
+        .await
+        .unwrap();
+    let plan = fluree.plan_purge(id).await.unwrap();
+    let original = dir
+        .path()
+        .join(plan.originals[0].strip_prefix("fluree:file://").unwrap());
+    fn index(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    index(&path)
+                } else {
+                    usize::from(path.to_string_lossy().contains("/index/"))
+                }
+            })
+            .sum()
+    }
+    let indexed = index(dir.path());
+    // Leading when it starts, deposed after.
+    fluree.set_collector(Arc::new(
+        crate::garbage::tests::cluster::Cluster::with_leases(1),
+    ));
+    let pass = fluree.run_purge_pass(id, std::time::Duration::ZERO).await;
+    assert!(pass.is_err(), "{pass:?}");
+    assert!(original.exists());
+    assert!(index(dir.path()) >= indexed, "an index file was deleted");
+}
+
 /// On a cluster a purge plans only the jobs every member has installed: a
 /// member that has not still reads the originals, and may write them back.
 #[tokio::test]

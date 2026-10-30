@@ -91,6 +91,36 @@ pub trait Collector: Send + Sync + std::fmt::Debug {
     async fn requests_recorded_by(&self, ledger: &str, ms: i64) -> bool;
 }
 
+/// A cluster leader's lease, bounding the deletes of work under way (see
+/// [`fluree_db_core::FileStorage::within_lease`]): taken again through the
+/// collector as it runs out, and lost once this member no longer leads.
+pub(crate) struct LeaderLease {
+    collector: Arc<dyn Collector>,
+    until: Mutex<Option<std::time::Instant>>,
+}
+
+impl LeaderLease {
+    pub(crate) fn new(collector: Arc<dyn Collector>) -> Arc<Self> {
+        Arc::new(Self {
+            collector,
+            until: Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait]
+impl fluree_db_core::DeleteLease for LeaderLease {
+    async fn until(&self) -> Option<std::time::Instant> {
+        let held = *self.until.lock();
+        if held.is_some_and(|until| std::time::Instant::now() < until) {
+            return held;
+        }
+        let renewed = self.collector.lease().await;
+        *self.until.lock() = renewed;
+        renewed
+    }
+}
+
 impl Fluree {
     /// Collect this cluster member's garbage through `collector`, when it
     /// leads.
