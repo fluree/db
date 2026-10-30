@@ -689,6 +689,24 @@ fn delta_connections_are_the_same_in_both_forms() {
                 "token_url": "https://ws.example.com/oidc/v1/token", "client_id": "app",
                 "client_secret": {"env_var": "SP_SECRET"}, "scope": "all-apis"}}}),
         ),
+        // The structured form gets the flat form's default scope.
+        (
+            json!({"unity_uri": "https://ws.example.com", "unity_catalog": "main",
+                "oauth2_client_id": "app", "oauth2_client_secret_env": "SP_SECRET"}),
+            json!({"unity": {"uri": "https://ws.example.com", "catalog": "main", "auth": {
+                "type": "oauth2_client_credentials",
+                "token_url": "https://ws.example.com/oidc/v1/token", "client_id": "app",
+                "client_secret": {"env_var": "SP_SECRET"}}}}),
+        ),
+        // A scope given is kept, in either form.
+        (
+            json!({"unity_uri": "https://ws.example.com", "oauth2_client_id": "app",
+                "oauth2_client_secret_env": "SP_SECRET", "oauth2_scope": "sql"}),
+            json!({"unity": {"uri": "https://ws.example.com", "auth": {
+                "type": "oauth2_client_credentials",
+                "token_url": "https://ws.example.com/oidc/v1/token", "client_id": "app",
+                "client_secret": {"env_var": "SP_SECRET"}, "scope": "sql"}}}),
+        ),
         (
             json!({"s3_region": "us-east-1", "azure_tenant_id": "t", "azure_client_id": "c",
                 "azure_client_secret_env": "SP_SECRET"}),

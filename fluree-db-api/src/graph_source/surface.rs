@@ -664,7 +664,10 @@ impl CatalogAuthFields {
                         .unwrap_or_else(|| format!("{}/oidc/v1/token", uri.trim_end_matches('/'))),
                     client_id: ConfigValue::literal(client_id),
                     client_secret,
-                    scope: Some(self.oauth2_scope.unwrap_or_else(|| "all-apis".to_string())),
+                    scope: Some(
+                        self.oauth2_scope
+                            .unwrap_or_else(|| UNITY_DEFAULT_SCOPE.to_string()),
+                    ),
                     audience: self.oauth2_audience,
                 })
             }
@@ -1217,7 +1220,7 @@ pub fn delta_connection_from_json(
     let conn = match split_forms(input, structured, &flat_keys)? {
         Form::Structured(mut parts) => DeltaConnection {
             unity: Form::take(&mut parts, "unity")
-                .map(|unity| strict("unity", unity))
+                .map(|unity| strict("unity", unity).map(with_unity_defaults))
                 .transpose()?,
             io: Form::take(&mut parts, "io")
                 .map(|io| strict("io", io))
@@ -1271,6 +1274,26 @@ fn flat_unity(
     };
     auth.check(rules)?;
     unity_config(flat.unity_uri, flat.unity_catalog, flat.unity_schema, auth)
+}
+
+/// The OAuth2 scope a Unity Catalog service principal's token is requested
+/// for when none is given, in either form.
+const UNITY_DEFAULT_SCOPE: &str = "all-apis";
+
+/// A structured `unity` with the defaults the flat fields get: OAuth2 client
+/// credentials with no `scope` ask for [`UNITY_DEFAULT_SCOPE`]. (Its
+/// `token_url` cannot be omitted in the structured form.) So both forms store
+/// the same record.
+#[cfg(feature = "delta")]
+fn with_unity_defaults(mut unity: fluree_db_delta::UnityConfig) -> fluree_db_delta::UnityConfig {
+    if let AuthConfig::OAuth2ClientCredentials {
+        scope: scope @ None,
+        ..
+    } = &mut unity.auth
+    {
+        *scope = Some(UNITY_DEFAULT_SCOPE.to_string());
+    }
+    unity
 }
 
 /// A Unity Catalog connection from its flat fields; `None` when none is
