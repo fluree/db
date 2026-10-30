@@ -1889,8 +1889,8 @@ async fn a_relationship_delete_after_a_with_deletes_that_relationship() {
     }
 }
 
-/// Unnamed endpoints, and a pattern read against the edge's direction: the
-/// DELETE takes the relationship, on its own and beside a SET.
+/// Unnamed endpoints, and a pattern read in either direction or right to
+/// left: the DELETE takes the relationship, on its own and beside a SET.
 #[tokio::test]
 async fn a_relationship_delete_needs_no_endpoint_names_or_direction() {
     for (statement, extra) in [
@@ -1904,6 +1904,10 @@ async fn a_relationship_delete_needs_no_endpoint_names_or_direction() {
         ),
         (
             r#"MATCH (x:P {id: "b"})-[r:K]-(y:P {id: "a"}) SET x.seen = true DELETE r"#,
+            &["b seen true"][..],
+        ),
+        (
+            r#"MATCH (x:P {id: "b"})<-[r:K]-(:P {id: "a"}) SET x.seen = true DELETE r"#,
             &["b seen true"][..],
         ),
     ] {
