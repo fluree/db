@@ -52,6 +52,7 @@ from fluree._sources import (
     S3Tables,
     Unity,
 )
+from fluree import doc
 from fluree._terms import IRI, BlankNode, LangString, Literal, Vector
 from fluree.errors import (
     ConflictError,
@@ -70,6 +71,7 @@ from fluree.errors import (
 __version__ = _version("fluree")
 
 __all__ = [
+    "doc",
     "AzureServicePrincipal",
     "Bearer",
     "BlankNode",

@@ -3706,12 +3706,15 @@ dependencies = [
 name = "fluree-db-python"
 version = "4.2.4"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "fluree-db-api",
  "fluree-db-core",
+ "fluree-db-doc",
  "fluree-db-nameservice",
  "fluree-db-query",
  "fluree-db-sparql",
+ "fluree-graph-ir",
  "fluree-vocab",
  "pyo3",
  "pythonize",
@@ -3719,8 +3722,10 @@ dependencies = [
  "serde_json",
  "stacker",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
