@@ -72,13 +72,14 @@ fn endpoint_auth(args: &SqlMapArgs) -> CliResult<fluree_db_api::IcebergAuthConfi
 
 /// The `sql/map` body for a remote server.
 ///
-/// A bearer token or OAuth2 client credentials go as the flat fields, which
-/// every server version reads. A server older than the structured `auth`
-/// does not refuse a field it does not know: given `auth`, it would register
-/// the source with no auth and say nothing. Only what has no flat field (a
-/// Google identity) goes as the structured `auth`, which such a server still
-/// drops. The server converts the flat fields with the codec
-/// [`endpoint_auth`] uses, so both store the same record.
+/// A bearer token or OAuth2 client credentials go as the flat fields. A
+/// server older than the structured `auth` does not refuse a field it does
+/// not know: given `auth`, it would register the source with no auth and say
+/// nothing. It reads the literal flat fields; the `_env` forms, and a Google
+/// identity (which has no flat field, so goes as the structured `auth`), are
+/// newer than it, and it still drops them. The server converts the flat
+/// fields with the codec [`endpoint_auth`] uses, so both store the same
+/// record.
 #[cfg(feature = "iceberg")]
 fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
