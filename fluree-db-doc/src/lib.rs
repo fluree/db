@@ -13,7 +13,9 @@
 //! 4. entity mentions and relations, when an ontology (`--ontology`) and
 //!    gazetteers (`--entities`) are given: a deterministic scan links every
 //!    known label to its source IRI, and a language model, grounded on the
-//!    model and told which entities are already known, extracts the rest.
+//!    model and told which entities are already known, extracts the rest;
+//!    or an HTTP reader ([`reader`]) reads the whole document against the
+//!    ontology and catalog at once.
 //!
 //! Every model call is optional and cached. With nothing configured the
 //! pipeline is deterministic and makes no network connection.
@@ -36,11 +38,12 @@ pub mod model;
 pub mod parse;
 pub mod payload_fit;
 pub mod prompt;
+pub mod reader;
 pub mod vocab;
 
 pub use cache::DocCache;
 pub use chunk::{Chunk, ChunkConfig};
-pub use config::{DocConfig, ExtractionConfig, ModelEndpoint};
+pub use config::{DocConfig, ExtractionConfig, ModelEndpoint, ReaderEndpoint};
 pub use embed::EmbeddingClient;
 pub use escalate::VlmReader;
 pub use extract::{ExtractOptions, Extractor, RelationMode, ResolvePolicy};
