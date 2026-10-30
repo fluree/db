@@ -273,6 +273,16 @@ async fn setup_extraction(
             "--cache is for a model a [doc.reader] serves (see its `models`)".into(),
         ));
     }
+    // `--model` named the ontology until it named the extraction model, so
+    // an unchanged script passes an ontology here: say so, rather than send
+    // its path to the language model as a model name.
+    if let Some(id) = &args.model {
+        if let Some(what) = ontology_like(id, target, dirs).await {
+            return Err(CliError::Usage(format!(
+                "--model {id} looks like an ontology ({what}); did you mean `--ontology {id}`? --model names the extraction model"
+            )));
+        }
+    }
     if let (Some(id), None) = (&args.model, &args.ontology) {
         return Err(CliError::Usage(format!(
             "--model {id} extracts against an ontology: pass --ontology <LEDGER|FILE> (the ontology was --model before; it is --ontology now)"
@@ -379,6 +389,30 @@ async fn setup_extraction(
         fingerprint,
         gazetteer_counts,
     }))
+}
+
+/// What makes a `--model` value look like an ontology source: an RDF
+/// file's extension, or the name of a ledger in the project. `None` for
+/// anything else, a model name included.
+async fn ontology_like(id: &str, target: Option<&Fluree>, dirs: &FlureeDir) -> Option<String> {
+    if matches!(Source::parse(id).kind, doc_sources::SourceKind::File(_)) {
+        return Some("an RDF file".to_string());
+    }
+    let ledger_id = context::to_ledger_id(id).ok()?;
+    let built;
+    let fluree = match target {
+        Some(f) => f,
+        None => {
+            built = build_fluree(dirs).await.ok()?;
+            &built
+        }
+    };
+    fluree
+        .ledger_exists(&ledger_id)
+        .await
+        .ok()
+        .filter(|exists| *exists)
+        .map(|_| format!("the ledger `{id}`"))
 }
 
 struct Extracted {

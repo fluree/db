@@ -5741,7 +5741,7 @@ fn doc_ingest_catalog_names_the_entities_and_model_is_no_longer_the_ontology() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--model ont/model.ttl extracts against an ontology",
+            "--model ont/model.ttl looks like an ontology (an RDF file); did you mean `--ontology ont/model.ttl`?",
         ));
 
     // The first run built the ledger's full-text index, `memos-text`: a
@@ -7119,6 +7119,29 @@ fn doc_ingest_model_without_a_reader_or_llm_says_what_is_missing() {
         .failure()
         .stderr(predicate::str::contains(
             "--model nobody: no [doc.reader] lists it",
+        ));
+    // A ledger's name passed to --model, as an older script passes its
+    // ontology, is caught before it reaches any model.
+    fluree_cmd(&tmp)
+        .args(["create", "people-ontology"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "people-ontology",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model people-ontology looks like an ontology (the ledger `people-ontology`); did you mean `--ontology people-ontology`?",
         ));
     fluree_cmd(&tmp)
         .args([
