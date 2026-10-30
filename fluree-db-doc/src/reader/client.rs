@@ -252,6 +252,11 @@ impl ReaderClient {
 /// body itself, shortened.
 fn error_message(body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        // Some endpoints nest the envelope: `{"error": {"error", "message"}}`.
+        let v = match v.get("error") {
+            Some(inner) if inner.is_object() => inner.clone(),
+            _ => v,
+        };
         let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
         let parts: Vec<String> = ["error", "message", "details"]
             .iter()
@@ -428,6 +433,21 @@ mod tests {
             .unwrap_err();
         assert_eq!(seen.lock().unwrap().len(), ATTEMPTS as usize);
         assert!(err.to_string().contains("503"), "{err}");
+    }
+
+    #[test]
+    fn an_error_body_says_what_went_wrong_flat_or_nested() {
+        assert_eq!(
+            error_message(r#"{"error":"busy","message":"no capacity"}"#),
+            "busy: no capacity"
+        );
+        assert_eq!(
+            error_message(
+                r#"{"error":{"message":"model is temporarily unavailable","status":503,"error":"unavailable"}}"#
+            ),
+            "unavailable: model is temporarily unavailable"
+        );
+        assert_eq!(error_message("plain text"), "plain text");
     }
 
     #[test]
