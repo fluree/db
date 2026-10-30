@@ -151,10 +151,6 @@ struct InFlight {
     counted: Option<u64>,
 }
 
-/// A scan in progress: where its window starts in
-/// [`DiskArtifactCacheState::landed`].
-struct ScanTicket(usize);
-
 /// The bytes a path holds after an operation that changed it by `delta`: a
 /// write leaves its file, an eviction nothing.
 fn size_after(delta: i64) -> u64 {
@@ -209,9 +205,10 @@ impl DiskArtifactCacheState {
         }
     }
 
-    fn begin_scan(&mut self) -> ScanTicket {
+    /// Open a scan; returns where its window starts in [`Self::landed`].
+    fn begin_scan(&mut self) -> usize {
         self.scans += 1;
-        ScanTicket(self.landed.len())
+        self.landed.len()
     }
 
     /// Close a scan without installing its total.
@@ -227,9 +224,9 @@ impl DiskArtifactCacheState {
     /// so a path one changed meanwhile holds what its last operation left,
     /// whatever the walk saw; a path one is changing now is counted as found,
     /// for that operation to correct when it lands.
-    fn land_scan(&mut self, ticket: ScanTicket, walked_total: u64, walked: &HashMap<&Path, u64>) {
+    fn land_scan(&mut self, start: usize, walked_total: u64, walked: &HashMap<&Path, u64>) {
         let mut last: HashMap<&Path, i64> = HashMap::new();
-        for (path, delta) in &self.landed[ticket.0..] {
+        for (path, delta) in &self.landed[start..] {
             last.insert(path.as_path(), *delta);
         }
         let found = |path: &Path| walked.get(path).copied().unwrap_or(0);
@@ -249,17 +246,59 @@ impl DiskArtifactCacheState {
             op.counted = Some(counted);
         }
         self.tracked_bytes = Some(u64::try_from(total).unwrap_or(0));
-        self.end_scan();
     }
 
     /// The directory's size if known. If not, and no background scan is
-    /// sizing it yet, the ticket for one ([`DiskArtifactCache::spawn_sizing`]).
-    fn known_bytes(&mut self) -> (Option<u64>, Option<ScanTicket>) {
+    /// sizing it yet, `true`: the caller starts one
+    /// ([`DiskArtifactCache::spawn_sizing`]).
+    fn known_bytes(&mut self) -> (Option<u64>, bool) {
         if self.tracked_bytes.is_some() || self.sizing {
-            return (self.tracked_bytes, None);
+            return (self.tracked_bytes, false);
         }
         self.sizing = true;
-        (None, Some(self.begin_scan()))
+        (None, true)
+    }
+}
+
+/// A scan walking the directory. Writes and evictions that land meanwhile
+/// are recorded for it until it lands ([`Self::land`]) or is dropped, which
+/// closes it without a total, so an error or a panic mid-walk can't leave
+/// it open.
+#[must_use]
+struct Scan<'a> {
+    state: &'a Mutex<DiskArtifactCacheState>,
+    /// Where its window starts in [`DiskArtifactCacheState::landed`].
+    start: usize,
+    /// The background sizing, which closing it ends.
+    sizing: bool,
+}
+
+impl<'a> Scan<'a> {
+    fn begin(state: &'a Mutex<DiskArtifactCacheState>, sizing: bool) -> Self {
+        let start = state.lock().begin_scan();
+        Self {
+            state,
+            start,
+            sizing,
+        }
+    }
+
+    /// Install the size the walk found; see
+    /// [`DiskArtifactCacheState::land_scan`].
+    fn land(self, walked_total: u64, walked: &HashMap<&Path, u64>) {
+        self.state
+            .lock()
+            .land_scan(self.start, walked_total, walked);
+    }
+}
+
+impl Drop for Scan<'_> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.end_scan();
+        if self.sizing {
+            state.sizing = false;
+        }
     }
 }
 
@@ -277,25 +316,11 @@ impl Drop for Landing<'_> {
     }
 }
 
-/// Walk `root` and land `ticket`'s scan on what it found.
-fn walk_and_land(
-    state: &Mutex<DiskArtifactCacheState>,
-    root: &Path,
-    ticket: ScanTicket,
-) -> io::Result<()> {
-    match scan_cache_entries(root) {
-        Ok(entries) => {
-            let walked = walked_paths(&entries);
-            state
-                .lock()
-                .land_scan(ticket, walked_bytes(&entries), &walked);
-            Ok(())
-        }
-        Err(err) => {
-            state.lock().end_scan();
-            Err(err)
-        }
-    }
+/// Walk `root` and land `scan` on what it found.
+fn walk_and_land(scan: Scan<'_>, root: &Path) -> io::Result<()> {
+    let entries = scan_cache_entries(root)?;
+    scan.land(walked_bytes(&entries), &walked_paths(&entries));
+    Ok(())
 }
 
 /// The bytes a walk found.
@@ -574,14 +599,10 @@ impl DiskArtifactCache {
     /// The directory's size, scanning it now if it is not yet known.
     #[cfg(test)]
     fn current_bytes(&self) -> io::Result<u64> {
-        let ticket = {
-            let mut state = self.state.lock();
-            if let Some(bytes) = state.tracked_bytes {
-                return Ok(bytes);
-            }
-            state.begin_scan()
-        };
-        walk_and_land(&self.state, &self.root, ticket)?;
+        if let Some(bytes) = self.state.lock().tracked_bytes {
+            return Ok(bytes);
+        }
+        walk_and_land(Scan::begin(&self.state, false), &self.root)?;
         Ok(self.state.lock().tracked_bytes.unwrap_or(0))
     }
 
@@ -590,34 +611,34 @@ impl DiskArtifactCache {
     /// Walking a large shared cache takes seconds; done inline, under the
     /// state lock, it stalls the async worker that writes first and every
     /// writer queued on the lock. Writes made meanwhile skip the budget check,
-    /// and the scan reconciles everything that lands while it walks.
-    fn spawn_sizing(&self, ticket: ScanTicket) {
+    /// and the scan reconciles everything that lands while it walks. The
+    /// scan opens before the walk starts, so anything that lands before it
+    /// opens is on disk for the walk to see.
+    fn spawn_sizing(&self) {
         let root = self.root.clone();
         let shared = Arc::clone(&self.state);
-        let scan = move || {
+        let size = move || {
+            let scan = Scan::begin(&shared, true);
             #[cfg(test)]
             pause_at(&shared, "size-scan");
-            if let Err(err) = walk_and_land(&shared, &root, ticket) {
+            if let Err(err) = walk_and_land(scan, &root) {
                 tracing::debug!(
                     cache_dir = %root.display(),
                     error = %err,
                     "failed to size the disk cache; the next write retries"
                 );
             }
-            shared.lock().sizing = false;
         };
         // No threads on wasm32, where the cache never writes (budget 0).
         #[cfg(target_arch = "wasm32")]
-        scan();
+        size();
         #[cfg(not(target_arch = "wasm32"))]
         if let Err(err) = std::thread::Builder::new()
             .name("fluree-cache-size".into())
-            .spawn(scan)
+            .spawn(size)
         {
             tracing::debug!(error = %err, "failed to start the disk cache size scan");
-            let mut state = self.state.lock();
-            state.sizing = false;
-            state.end_scan();
+            self.state.lock().sizing = false;
         }
     }
 
@@ -667,14 +688,8 @@ impl DiskArtifactCache {
     /// a registered eviction: entries another write or eviction is changing
     /// are passed over.
     fn evict_until(&self, target_bytes: u64) -> io::Result<()> {
-        let ticket = self.state.lock().begin_scan();
-        let mut entries = match scan_cache_entries(&self.root) {
-            Ok(entries) => entries,
-            Err(err) => {
-                self.state.lock().end_scan();
-                return Err(err);
-            }
-        };
+        let scan = Scan::begin(&self.state, false);
+        let mut entries = scan_cache_entries(&self.root)?;
         #[cfg(test)]
         pause_at(&self.state, "rescan");
         let walked_total = walked_bytes(&entries);
@@ -715,8 +730,7 @@ impl DiskArtifactCache {
                 }
             }
         }
-        let walked = walked_paths(&entries);
-        self.state.lock().land_scan(ticket, walked_total, &walked);
+        scan.land(walked_total, &walked_paths(&entries));
         Ok(())
     }
 
@@ -775,17 +789,17 @@ impl DiskArtifactCache {
         }
 
         // One lock registers the write and reads the directory's size.
-        let (id, known, sizing) = {
+        let (id, known, size) = {
             let mut state = self.state.lock();
             // Another write or an eviction of this entry is under way.
             let Some(id) = state.begin(target) else {
                 return;
             };
-            let (known, sizing) = state.known_bytes();
-            (id, known, sizing)
+            let (known, size) = state.known_bytes();
+            (id, known, size)
         };
-        if let Some(ticket) = sizing {
-            self.spawn_sizing(ticket);
+        if size {
+            self.spawn_sizing();
         }
         let mut landing = Landing {
             state: &self.state,
@@ -1305,6 +1319,11 @@ mod tests {
         fn release(&self) {
             let _ = self.go.send(true);
         }
+
+        /// Make the parked operation panic where it is.
+        fn panic(&self) {
+            let _ = self.go.send(false);
+        }
     }
 
     /// Arm the pause at `point`: the operation that reaches it parks there.
@@ -1328,8 +1347,9 @@ mod tests {
 
     /// Start the background size scan without a write.
     fn start_sizing(cache: &DiskArtifactCache) {
-        let (_, ticket) = cache.state.lock().known_bytes();
-        cache.spawn_sizing(ticket.expect("the size is not known yet"));
+        let (_, size) = cache.state.lock().known_bytes();
+        assert!(size, "the size is not known yet");
+        cache.spawn_sizing();
     }
 
     /// The accounting matches the directory.
@@ -1462,6 +1482,49 @@ mod tests {
         });
         assert!(dir.join("new.leaf").exists());
         assert_exact(&cache, &dir, 500);
+    }
+
+    /// A rescan that panics mid-walk closes: operations stop being recorded
+    /// for it.
+    #[test]
+    fn a_rescan_that_panics_is_closed() {
+        let dir = temp_cache_dir("rescan-panics");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 500);
+        let rescanned = std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
+            let evict = scope.spawn(|| cache.evict_until(0));
+            rescan.reached();
+            rescan.panic();
+            evict.join()
+        });
+        assert!(rescanned.is_err(), "the rescan should have panicked");
+        assert_eq!(cache.state.lock().scans, 0, "the rescan is still open");
+        cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+        assert!(cache.state.lock().landed.is_empty());
+    }
+
+    /// A size scan that panics ends the sizing: the next write sizes the
+    /// directory again, so the budget is enforced.
+    #[test]
+    fn a_size_scan_that_panics_is_closed() {
+        let dir = temp_cache_dir("size-scan-panics");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 300]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        let scan = arm(&cache, "size-scan");
+        start_sizing(&cache);
+        scan.reached();
+        scan.panic();
+        wait_for_sizing(&cache);
+        assert_eq!(cache.state.lock().scans, 0, "the size scan is still open");
+        assert_eq!(cache.state.lock().tracked_bytes, None);
+
+        cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+        wait_for_sizing(&cache);
+        assert_exact(&cache, &dir, 400);
     }
 
     /// Two writes of one entry at once: the second finds the first under way
