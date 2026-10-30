@@ -708,6 +708,9 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
     )
     .await;
     let id = "erasing/db:main";
+    // It proves erasures; it takes none by a transfer yet.
+    assert!(fluree.can_prove_erasures());
+    assert!(!fluree.can_hold_erasures());
     fluree.create_ledger("erasing/db").await.expect("create");
     let mut request = bulk_request(id, 1);
     request.body = TransactionBody::JsonLdInsert(serde_json::json!({

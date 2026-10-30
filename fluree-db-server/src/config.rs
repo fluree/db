@@ -1365,12 +1365,9 @@ impl ServerConfig {
             );
         }
 
-        // Permanent erasure: a single node over its own file storage.
+        // Permanent erasure: over file storage, a single node's or a cluster's
+        // shared one.
         if self.erasure_prover.is_some() {
-            #[cfg(feature = "raft")]
-            if self.raft_enabled {
-                return Err("--erasure-prover is not available in a Raft cluster".to_string());
-            }
             if self.memory || self.connection_config.is_some() || self.is_proxy_storage_mode() {
                 return Err(
                     "--erasure-prover needs file storage named by --storage-path".to_string(),
@@ -1603,6 +1600,19 @@ mod raft_validation_tests {
             raft_listen_addr: Some(SocketAddr::from(([127, 0, 0, 1], 9001))),
             ..Default::default()
         }
+    }
+
+    /// A cluster's members prove erasures over their shared file storage:
+    /// a named prover is taken; one over other storage is not.
+    #[test]
+    fn a_cluster_member_takes_a_named_prover_over_file_storage() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/srv/fluree/data"));
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/fluree/raft"));
+        cfg.erasure_prover = Some(PathBuf::from("/opt/fluree/fluree-prover"));
+        cfg.validate().expect("a named prover on a cluster member");
+        cfg.memory = true;
+        cfg.validate().expect_err("not without file storage");
     }
 
     #[test]

@@ -3144,12 +3144,14 @@ impl Fluree {
         }
     }
 
-    /// Whether this instance proves permanent erasures: a single node with
-    /// file storage and a prover.
+    /// Whether this instance proves permanent erasures: one with file
+    /// storage and a prover, a single node or a cluster's member, not a
+    /// query peer. Taking erased commits by a transfer is another matter
+    /// ([`Self::can_hold_erasures`]).
     pub fn can_prove_erasures(&self) -> bool {
         #[cfg(feature = "native")]
         {
-            self.can_hold_erasures()
+            !self.nameservice_mode().is_read_only()
                 && self
                     .retention
                     .erasure
