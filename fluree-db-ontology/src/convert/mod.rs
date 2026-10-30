@@ -57,6 +57,8 @@ pub struct Column {
 #[derive(Clone, Debug, Default)]
 pub struct Model {
     pub tables: Vec<Table>,
+    /// What the reader left out or couldn't place, for the summary.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +80,8 @@ pub struct Converted {
     pub records: usize,
     /// Primary key columns left out.
     pub keys_left_out: usize,
+    /// What the emitter left out, kept apart or qualified, for the summary.
+    pub notes: Vec<String>,
 }
 
 /// A name in words, singular: a table's class label.
@@ -91,7 +95,8 @@ pub fn class_label(name: &str) -> String {
 }
 
 /// A column's property label: its name in words, without a key suffix
-/// (`employer_id` → "employer"). `None` when nothing is left.
+/// (`employer_id` and `CustomerID` → "employer", "customer"). `None` when
+/// nothing is left.
 pub fn property_label(name: &str, foreign_key: bool) -> Option<String> {
     let words = name_words(name)?;
     if !foreign_key {
@@ -99,9 +104,16 @@ pub fn property_label(name: &str, foreign_key: bool) -> Option<String> {
     }
     let trimmed = ["id", "key", "fk", "code", "ref", "no", "num"]
         .iter()
-        .find_map(|suffix| words.strip_suffix(&format!(" {suffix}")))
+        .find_map(|suffix| strip_word_suffix(&words, suffix))
         .unwrap_or(&words);
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// `words` without a last word equal to `suffix`, ignoring case
+/// ("customer ID" without "id" is "customer").
+pub fn strip_word_suffix<'a>(words: &'a str, suffix: &str) -> Option<&'a str> {
+    let (stem, last) = words.rsplit_once(' ')?;
+    last.eq_ignore_ascii_case(suffix).then_some(stem)
 }
 
 /// An English plural made singular, by the common rules only:
@@ -207,17 +219,29 @@ pub fn comment(description: Option<&str>, synonyms: &[String]) -> Option<String>
     (!text.is_empty()).then_some(text)
 }
 
-/// A property's label, comment, domains and range, merged across tables.
-type PropertyParts = (String, Option<String>, Vec<String>, Option<String>);
+/// A property's label, comment, domains and range. A property is shared only
+/// by columns with the same name (and range) in different tables.
+struct PropertyParts {
+    label: String,
+    comment: Option<String>,
+    domains: Vec<String>,
+    range: Option<String>,
+}
 
 struct Emitter<'a> {
     base: &'a str,
     out: Converted,
     /// IRIs already minted, by local name, so two terms never share one.
     used: HashMap<String, String>,
-    /// Properties by IRI: (label, comment, domains, range), merged across
-    /// tables that share a column.
+    /// Properties by IRI, merged across tables that share a column name.
     properties: BTreeMap<String, PropertyParts>,
+    /// Which property key each property IRI was minted for.
+    property_iri: HashMap<String, String>,
+    /// Labels already given, by the key of the term that has each, so two
+    /// different terms never read the same.
+    class_labels: HashMap<String, String>,
+    property_labels: HashMap<String, String>,
+    qualified: usize,
 }
 
 impl Emitter<'_> {
@@ -249,41 +273,102 @@ impl Emitter<'_> {
         self.out.classes += 1;
     }
 
+    /// The first of `candidates` no other term has as a label (or the last,
+    /// if all are taken), recorded as `key`'s.
+    fn label(&mut self, classes: bool, key: &str, candidates: &[String]) -> String {
+        let taken = if classes {
+            &self.class_labels
+        } else {
+            &self.property_labels
+        };
+        let chosen = candidates
+            .iter()
+            .find(|c| taken.get(*c).is_none_or(|k| k == key))
+            .or(candidates.last())
+            .cloned()
+            .unwrap_or_default();
+        if candidates.first() != Some(&chosen) {
+            self.qualified += 1;
+        }
+        let taken = if classes {
+            &mut self.class_labels
+        } else {
+            &mut self.property_labels
+        };
+        taken
+            .entry(chosen.clone())
+            .or_insert_with(|| key.to_string());
+        chosen
+    }
+
+    /// Add `domain` to the property `key` names, creating it with the first
+    /// label in `labels` no other property has.
     fn property(
         &mut self,
         key: &str,
-        label: &str,
+        labels: &[String],
         comment: Option<String>,
         domain: &str,
         range: Option<String>,
     ) {
-        let iri = self.mint(&camel(label), key);
-        let entry = self
-            .properties
-            .entry(iri)
-            .or_insert_with(|| (label.to_string(), None, Vec::new(), range.clone()));
-        if entry.1.is_none() {
-            entry.1 = comment;
+        let iri = match self.property_iri.get(key) {
+            Some(iri) => iri.clone(),
+            None => {
+                let label = self.label(false, key, labels);
+                let iri = self.mint(&camel(&label), key);
+                self.property_iri.insert(key.to_string(), iri.clone());
+                self.properties.insert(
+                    iri.clone(),
+                    PropertyParts {
+                        label,
+                        comment: None,
+                        domains: Vec::new(),
+                        range,
+                    },
+                );
+                iri
+            }
+        };
+        let entry = self.properties.get_mut(&iri).expect("just inserted");
+        if entry.comment.is_none() {
+            entry.comment = comment;
         }
-        if !entry.2.iter().any(|d| d == domain) {
-            entry.2.push(domain.to_string());
+        if !entry.domains.iter().any(|d| d == domain) {
+            entry.domains.push(domain.to_string());
         }
     }
 }
 
-/// The ontology (and enumerated values' records) for a model.
+/// The ontology (and enumerated values' records) for a model. Two source
+/// names never become one term: a clashing IRI is suffixed, a clashing label
+/// is qualified (the column's full words, or its table's name in front), and
+/// everything left out is counted in `notes`.
 pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
     let mut e = Emitter {
         base: &options.base,
         out: Converted::default(),
         used: HashMap::new(),
         properties: BTreeMap::new(),
+        property_iri: HashMap::new(),
+        class_labels: HashMap::new(),
+        property_labels: HashMap::new(),
+        qualified: 0,
     };
+    e.out.notes.extend(model.notes.iter().cloned());
     // classes first, so a foreign key can name the class it points at
     let mut class_of: HashMap<String, (String, String)> = HashMap::new();
     for table in &model.tables {
+        let key = format!("table:{}", table.name.to_lowercase());
+        if class_of.contains_key(&table.name.to_lowercase()) {
+            e.out.notes.push(format!(
+                "two tables are named {:?}; the second was left out",
+                table.name
+            ));
+            continue;
+        }
         let label = class_label(&table.name);
-        let iri = e.mint(&pascal(&label), &format!("table:{}", table.name));
+        let label = e.label(true, &key, &[label.clone(), table.name.to_lowercase()]);
+        let iri = e.mint(&pascal(&label), &key);
         e.class(
             &iri,
             &label,
@@ -291,7 +376,13 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
         );
         class_of.insert(table.name.to_lowercase(), (iri, label));
     }
+    let mut no_label = Vec::new();
+    let mut unresolved = 0;
+    let mut seen_tables = std::collections::HashSet::new();
     for table in &model.tables {
+        if !seen_tables.insert(table.name.to_lowercase()) {
+            continue;
+        }
         let (domain, table_label) = class_of[&table.name.to_lowercase()].clone();
         for column in &table.columns {
             if table
@@ -302,6 +393,8 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                 e.out.keys_left_out += 1;
                 continue;
             }
+            let column_key = column.name.to_lowercase();
+            let words = property_label(&column.name, false);
             let target = column
                 .references
                 .as_ref()
@@ -317,28 +410,45 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                             format!("A {table_label}'s {label}: a {target_label}.")
                         }
                     });
+                let mut labels = vec![label.clone()];
+                labels.extend(words.clone().filter(|w| *w != label));
+                labels.push(format!("{table_label} {label}"));
                 e.property(
-                    &format!("fk:{label}:{range}"),
-                    &label,
+                    &format!("fk:{column_key}:{range}"),
+                    &labels,
                     Some(text),
                     &domain,
                     Some(range),
                 );
             } else if !column.values.is_empty() {
-                let label =
-                    property_label(&column.name, false).unwrap_or_else(|| column.name.clone());
-                let class_label = if class_of.values().any(|(_, l)| *l == label) {
-                    format!("{table_label} {label}")
-                } else {
-                    label.clone()
-                };
+                let label = words.clone().unwrap_or_else(|| column.name.clone());
                 let key = format!("enum:{}.{}", table.name, column.name);
+                let class_label = e.label(
+                    true,
+                    &key,
+                    &[label.clone(), format!("{table_label} {label}")],
+                );
                 let class_iri = e.mint(&pascal(&class_label), &key);
                 let text = comment(column.description.as_deref(), &column.synonyms);
                 e.class(&class_iri, &class_label, text.clone());
                 e.out.enum_classes += 1;
+                // one record per distinct value; values that slug alike get
+                // their own IRIs
+                let mut slugs: HashMap<String, String> = HashMap::new();
+                let mut done = std::collections::HashSet::new();
                 for value in &column.values {
-                    let record = format!("{class_iri}/{}", slug(value));
+                    if !done.insert(value.clone()) {
+                        continue;
+                    }
+                    let base_slug = slug(value);
+                    let mut s = base_slug.clone();
+                    let mut n = 2;
+                    while slugs.get(&s).is_some_and(|v| v != value) {
+                        s = format!("{base_slug}-{n}");
+                        n += 1;
+                    }
+                    slugs.insert(s.clone(), value.clone());
+                    let record = format!("{class_iri}/{s}");
                     e.out.catalog.push(Quad::new(
                         Term::iri(&record),
                         RDF_TYPE,
@@ -353,7 +463,7 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                 }
                 e.property(
                     &format!("enum-property:{key}"),
-                    &label,
+                    &[label.clone(), format!("{table_label} {label}")],
                     text,
                     &domain,
                     Some(class_iri),
@@ -361,8 +471,12 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
             } else {
                 let fk = column.references.is_some();
                 let Some(label) = property_label(&column.name, fk) else {
+                    no_label.push(format!("{}.{}", table.name, column.name));
                     continue;
                 };
+                if fk {
+                    unresolved += 1;
+                }
                 let text = comment(column.description.as_deref(), &column.synonyms);
                 // a key to a table the input doesn't have: a relation with
                 // no class to range over, not an integer-valued attribute
@@ -370,13 +484,40 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                     .datatype
                     .filter(|_| !fk)
                     .map(|dt| format!("{XSD}{dt}"));
-                let key = format!("value:{label}:{}", range.as_deref().unwrap_or("-"));
-                e.property(&key, &label, text, &domain, range);
+                let mut labels = vec![label.clone()];
+                labels.extend(words.clone().filter(|w| *w != label));
+                labels.push(format!("{table_label} {label}"));
+                let key = format!("value:{column_key}:{}", range.as_deref().unwrap_or("-"));
+                e.property(&key, &labels, text, &domain, range);
             }
         }
     }
+    if !no_label.is_empty() {
+        e.out.notes.push(format!(
+            "{} column(s) left out: no letters to make a label from ({})",
+            no_label.len(),
+            no_label.join(", ")
+        ));
+    }
+    if unresolved > 0 {
+        e.out.notes.push(format!(
+            "{unresolved} foreign key(s) reference tables the input doesn't have, so their relations have no range"
+        ));
+    }
+    if e.qualified > 0 {
+        e.out.notes.push(format!(
+            "{} term(s) labelled with more words (the column's full name, or the table's in front) because another term had the label",
+            e.qualified
+        ));
+    }
     let properties = std::mem::take(&mut e.properties);
-    for (iri, (label, text, domains, range)) in properties {
+    for (iri, parts) in properties {
+        let PropertyParts {
+            label,
+            comment: text,
+            domains,
+            range,
+        } = parts;
         e.triple(&iri, RDF_TYPE, Term::iri(RDF_PROPERTY));
         e.triple(&iri, RDFS_LABEL, Term::string(&label));
         if let Some(c) = text {
@@ -469,6 +610,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            notes: Vec::new(),
         };
         let out = emit(
             &model,
@@ -522,5 +664,120 @@ mod tests {
             .catalog
             .iter()
             .any(|q| q.subject.as_iri() == Some("https://ex.com/Tier/gold")));
+    }
+
+    fn labels_of(out: &Converted, kind: &str) -> Vec<(String, String)> {
+        let typed: std::collections::HashSet<String> = out
+            .ontology
+            .iter()
+            .filter(|q| q.is(RDF_TYPE) && q.object.as_iri() == Some(kind))
+            .filter_map(|q| q.subject.as_iri().map(str::to_string))
+            .collect();
+        let mut v: Vec<(String, String)> = out
+            .ontology
+            .iter()
+            .filter(|q| q.is(RDFS_LABEL))
+            .filter_map(|q| {
+                let s = q.subject.as_iri()?.to_string();
+                let l = q.object.as_literal()?.0.lexical();
+                typed.contains(&s).then_some((s, l))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn two_names_never_become_one_term() {
+        let col = |name: &str| Column {
+            name: name.into(),
+            ..Default::default()
+        };
+        let model = Model {
+            tables: vec![
+                Table {
+                    name: "orders".into(),
+                    columns: vec![
+                        Column {
+                            name: "status".into(),
+                            values: vec![
+                                "open".into(),
+                                "Open!".into(),
+                                "open".into(),
+                                "???".into(),
+                                "!!!".into(),
+                            ],
+                            ..Default::default()
+                        },
+                        Column {
+                            name: "employer_id".into(),
+                            references: Some("companies".into()),
+                            ..Default::default()
+                        },
+                        Column {
+                            name: "employer".into(),
+                            references: Some("companies".into()),
+                            ..Default::default()
+                        },
+                        col("123"),
+                    ],
+                    ..Default::default()
+                },
+                Table {
+                    name: "tickets".into(),
+                    columns: vec![Column {
+                        name: "status".into(),
+                        values: vec!["new".into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                Table {
+                    name: "companies".into(),
+                    columns: vec![col("name")],
+                    ..Default::default()
+                },
+            ],
+            notes: Vec::new(),
+        };
+        let out = emit(
+            &model,
+            &EmitOptions {
+                base: "https://ex.com/".into(),
+            },
+        );
+        let classes = labels_of(&out, RDFS_CLASS);
+        let class_labels: Vec<&str> = classes.iter().map(|(_, l)| l.as_str()).collect();
+        // two enumerations named status: the second reads with its table's name
+        assert!(class_labels.contains(&"status"), "{classes:?}");
+        assert!(class_labels.contains(&"ticket status"), "{classes:?}");
+        let properties = labels_of(&out, RDF_PROPERTY);
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            properties.iter().all(|(_, l)| seen.insert(l.clone())),
+            "no two properties share a label: {properties:?}"
+        );
+        // employer_id and employer are two relations, not one
+        assert_eq!(
+            properties
+                .iter()
+                .filter(|(_, l)| l.contains("employer"))
+                .count(),
+            2,
+            "{properties:?}"
+        );
+        // distinct values that slug alike keep their own records; repeats are one
+        assert_eq!(out.records, 5, "open, Open!, ???, !!! and new");
+        let record_iris: std::collections::HashSet<String> = out
+            .catalog
+            .iter()
+            .filter_map(|q| q.subject.as_iri().map(str::to_string))
+            .collect();
+        assert_eq!(record_iris.len(), 5);
+        assert!(
+            out.notes.iter().any(|n| n.contains("no letters")),
+            "{:?}",
+            out.notes
+        );
     }
 }

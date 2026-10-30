@@ -49,7 +49,10 @@ one record of `--class`:
   `--describe` columns as `industry: Lab supplies; city: Taipei`.
 
 A record's IRI is `--base` followed by its `--id` value (or its label), as a
-slug. Rows with the same IRI are one record, their names pooled.
+slug. Rows with the same id are one record, their names pooled; two different
+ids that read alike as a slug (`001A000001abcDE` and `001A000001ABCde`, or `C++`
+and `C#`) stay two records, the second with a suffixed IRI, and the summary
+counts them.
 
 The class is an IRI, or a name. With `--ontology`, a name is looked up in that
 ontology (by label, local name or prefixed name), so the records are typed with

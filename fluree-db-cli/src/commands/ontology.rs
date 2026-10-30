@@ -414,6 +414,14 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
         _ => tabular::model(&read_sheets(&args.file)?, args.enum_max),
     };
     let out = convert::emit(&model, &EmitOptions { base: base.clone() });
+    // an empty ontology is never a result: say what was found instead
+    if out.classes == 0 {
+        return Err(CliError::Input(format!(
+            "{}: no tables found to make classes from",
+            args.file.display()
+        )));
+    }
+    notes.extend(out.notes.iter().cloned());
     let declared = vec![(base_prefix(&args.file), base.clone())];
     let format = output_format(args.format);
     match &args.catalog_out {
@@ -598,6 +606,12 @@ fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
         summary.push_str(&format!(
             "; {} folded into an earlier record with the same id",
             count(out.merged, "row", "rows")
+        ));
+    }
+    if out.kept_apart > 0 {
+        summary.push_str(&format!(
+            "; {} kept apart from another whose id reads alike in an IRI (suffixed)",
+            count(out.kept_apart, "record", "records")
         ));
     }
     if out.without_label > 0 {

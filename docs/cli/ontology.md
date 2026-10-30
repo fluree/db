@@ -230,13 +230,17 @@ help an extraction model:
 - **primary keys are left out**, as are views, indexes and everything that
   describes the database rather than the things in it.
 
-Foreign keys are read from `REFERENCES` and `FOREIGN KEY` in DDL. In a CSV or a
-workbook, a column named `id`, or the table's name in the singular with `_id`
-(`company_id` in `companies`), is the primary key, and any other column ending
-in `id` is a foreign key, to the sheet it names if there is one.
+Keys and foreign keys are read from `PRIMARY KEY`, `REFERENCES` and
+`FOREIGN KEY` in `CREATE TABLE`, and from `ALTER TABLE … ADD CONSTRAINT`, which
+is where pg_dump writes them. In a CSV or a workbook, a column named `id`, or
+the table's name in the singular with `_id` (`company_id` in `companies`,
+`CustomerID` in `Customers`), is the primary key; any other column ending in
+`id` is a foreign key when it names another sheet (`customer_id` beside a
+`customers` sheet), and otherwise stays a value (`tax_id` reads "tax id").
 
-Enumerated columns come from `CHECK (col IN (...))`, a MySQL `ENUM(...)` type
-or a PostgreSQL `CREATE TYPE ... AS ENUM` in DDL. In a CSV or a workbook, a
+Enumerated columns come from `CHECK (col IN (...))` (or pg_dump's
+`(col)::text = ANY (ARRAY[...])`), a MySQL `ENUM(...)` type or a PostgreSQL
+`CREATE TYPE ... AS ENUM` in DDL. In a CSV or a workbook, a
 text column is enumerated when it has at most `--enum-max` distinct short
 values (default 12), each repeated (at least twice as many rows as values, and
 five rows). Column datatypes come from the DDL, or from the values (integers,
@@ -244,7 +248,20 @@ decimals, ISO dates and date-times, booleans; a number with a leading zero is a
 code and stays text).
 
 The DDL is parsed with a generic SQL dialect, then PostgreSQL's, MySQL's and
-Snowflake's; statements none of them can parse are skipped and counted.
+Snowflake's. When none parses the whole file (mysqldump's `DELIMITER`, say),
+each statement is tried on its own, split where the SQL tokenizer finds a
+semicolon (so one inside a string doesn't cut a statement short), and the
+statements none can parse are skipped and counted. Tables of the same name in
+two schemas (`crm.users`, `billing.users`) stay apart, named with their schema.
+
+Two source names never become one term. Two columns of the same name in
+different tables (`name`) share one property; any other clash gets a suffixed
+IRI, and a label already taken is qualified with the column's full name
+(`employer id` beside `employer`) or the table's name in front (`ticket status`
+beside `status`). Enumerated values that read alike in an IRI (`Net 30`,
+`net-30`) keep records of their own. Everything left out or qualified is
+counted in the summary on stderr, and a file that yields no classes is an error,
+not an empty ontology.
 
 | Option | Description |
 |--------|-------------|
