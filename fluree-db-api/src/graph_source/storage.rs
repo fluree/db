@@ -288,6 +288,12 @@ impl StoragePlan {
         &self.scope
     }
 
+    /// Whether this plan reads with the catalog's vended credentials: what
+    /// a `loadTable` for it asks the catalog to vend.
+    pub(crate) fn reads_vended(&self) -> bool {
+        matches!(self.identity, Planned::Vended { .. })
+    }
+
     /// The identity, as the public decision names it.
     pub(crate) fn decision(&self) -> StorageDecision {
         match &self.identity {
@@ -390,19 +396,6 @@ impl StoragePlan {
     }
 }
 
-/// The identity a source's configuration asks for: `io.storage_auth`, else
-/// what `io.vended_credentials` has always meant (vended on a REST catalog,
-/// ambient elsewhere: no other catalog vends).
-fn effective_storage_auth(catalog: &CatalogConfig, io: &IoConfig) -> StorageAuth {
-    match &io.storage_auth {
-        Some(storage_auth) => storage_auth.clone(),
-        None if io.vended_credentials && matches!(catalog, CatalogConfig::Rest { .. }) => {
-            StorageAuth::Vended
-        }
-        None => StorageAuth::Ambient,
-    }
-}
-
 /// The cache-scope rendering of `ctx`, or `None` for the default context
 /// (every host identity allowed, the host's own AWS chain), which leaves the
 /// pre-scope keys unchanged.
@@ -448,7 +441,7 @@ pub(crate) async fn plan_storage(
     ctx: &IdentityContext,
 ) -> IcebergResult<StoragePlan> {
     let scheme = LocationScheme::of(location);
-    let storage_auth = effective_storage_auth(catalog, io);
+    let storage_auth = io.effective_storage_auth(catalog).into_owned();
     let context = ctx.cache_scope();
     let plan = |identity, scope| StoragePlan {
         identity,
@@ -699,6 +692,13 @@ async fn google_plan(
         scope,
         io: io.clone(),
     })
+}
+
+/// Whether a `loadTable` for onboarding connection `conn` asks its catalog to
+/// vend storage credentials (see [`IoConfig::requests_vended_credentials`]).
+pub(crate) fn connection_requests_vended(conn: &IcebergConnectionConfig) -> bool {
+    conn.io
+        .requests_vended_credentials(&connection_catalog(conn))
 }
 
 /// An onboarding connection's catalog, as the stored config models it.

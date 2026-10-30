@@ -129,11 +129,13 @@ where
     let (catalog, _uri, _wh) = catalog_client(conn, "table sample", identity).await?;
     let table_id = table.to_catalog();
 
-    let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
-        .await
-        .map_err(|e| {
-            storage_api_error(&format!("Failed to load table {}", table.qualified()), e)
-        })?;
+    let mut load = SendCatalogClient::load_table(
+        &*catalog,
+        &table_id,
+        super::storage::connection_requests_vended(conn),
+    )
+    .await
+    .map_err(|e| storage_api_error(&format!("Failed to load table {}", table.qualified()), e))?;
 
     // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
     // S3 Tables return only the location).

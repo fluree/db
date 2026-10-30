@@ -730,8 +730,8 @@ pub struct IoConfig {
     #[serde(default)]
     pub s3_path_style: bool,
     /// Which identity reads the table's files. Absent (every record written
-    /// before this field existed) means what `vended_credentials` says; see
-    /// [`IoConfig::effective_storage_auth`].
+    /// before this field existed) means what `vended_credentials` says on the
+    /// source's catalog; see [`IoConfig::effective_storage_auth`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_auth: Option<StorageAuth>,
 }
@@ -802,15 +802,29 @@ impl Default for IoConfig {
 }
 
 impl IoConfig {
-    /// The storage identity this config asks for: `storage_auth` when set,
-    /// else what `vended_credentials` has always meant (`vended` when true,
-    /// `ambient` when false).
-    pub fn effective_storage_auth(&self) -> std::borrow::Cow<'_, StorageAuth> {
+    /// The storage identity a source of `catalog` with these settings reads
+    /// as: `storage_auth` when set, else what `vended_credentials` has always
+    /// meant — the catalog's vended credentials on a REST catalog, the host's
+    /// ambient identity on any other (no other catalog vends). The one rule:
+    /// the storage decision and the `loadTable` request both follow it.
+    pub fn effective_storage_auth(
+        &self,
+        catalog: &CatalogConfig,
+    ) -> std::borrow::Cow<'_, StorageAuth> {
         match &self.storage_auth {
             Some(storage_auth) => std::borrow::Cow::Borrowed(storage_auth),
-            None if self.vended_credentials => std::borrow::Cow::Owned(StorageAuth::Vended),
+            None if self.vended_credentials && matches!(catalog, CatalogConfig::Rest { .. }) => {
+                std::borrow::Cow::Owned(StorageAuth::Vended)
+            }
             None => std::borrow::Cow::Owned(StorageAuth::Ambient),
         }
+    }
+
+    /// Whether a `loadTable` from `catalog` asks it to vend storage
+    /// credentials (and reads the ones it returns): exactly when the source
+    /// reads with them ([`Self::effective_storage_auth`]).
+    pub fn requests_vended_credentials(&self, catalog: &CatalogConfig) -> bool {
+        matches!(*self.effective_storage_auth(catalog), StorageAuth::Vended)
     }
 
     /// These settings reading with `storage_auth`, with `vended_credentials`
@@ -1643,12 +1657,38 @@ mod tests {
 
     #[test]
     fn absent_storage_auth_is_derived_and_never_written() {
-        // Every stored record predates the field: it reads as before.
+        // Every stored record predates the field: it reads as before — the
+        // catalog's vended credentials on a REST catalog, ambient elsewhere,
+        // whatever `vended_credentials` says (it defaults to true).
+        let rest = CatalogConfig::Rest {
+            catalog_type: "rest".to_string(),
+            uri: "https://catalog.example".to_string(),
+            auth: AuthConfig::None,
+            warehouse: None,
+        };
+        let others = [
+            CatalogConfig::direct("s3://lake/t"),
+            CatalogConfig::glue(Some("us-east-1".to_string()), None),
+            CatalogConfig::s3_tables(
+                Some("us-east-1".to_string()),
+                "arn:aws:s3tables:us-east-1:000000000000:bucket/b".to_string(),
+            ),
+        ];
         let io: IoConfig = serde_json::from_str(r#"{"vended_credentials": true}"#).unwrap();
         assert_eq!(io.storage_auth, None);
-        assert_eq!(*io.effective_storage_auth(), StorageAuth::Vended);
+        assert_eq!(*io.effective_storage_auth(&rest), StorageAuth::Vended);
+        assert!(io.requests_vended_credentials(&rest));
+        for other in &others {
+            assert_eq!(*io.effective_storage_auth(other), StorageAuth::Ambient);
+            assert!(!io.requests_vended_credentials(other));
+        }
         let io: IoConfig = serde_json::from_str(r#"{"vended_credentials": false}"#).unwrap();
-        assert_eq!(*io.effective_storage_auth(), StorageAuth::Ambient);
+        assert_eq!(*io.effective_storage_auth(&rest), StorageAuth::Ambient);
+        assert!(!io.requests_vended_credentials(&rest));
+        // A stated identity is the identity, whatever the catalog.
+        let io = IoConfig::default().with_storage_auth(StorageAuth::Catalog);
+        assert_eq!(*io.effective_storage_auth(&rest), StorageAuth::Catalog);
+        assert!(!io.requests_vended_credentials(&rest));
         let json = serde_json::to_string(&IoConfig::default()).unwrap();
         assert!(!json.contains("storage_auth"), "{json}");
     }

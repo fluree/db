@@ -117,26 +117,18 @@ impl VendedCredentials {
     ///   milliseconds; required: a token without an expiry is refused)
     /// - `gcs.user-project`
     ///
-    /// When a map carries both, the S3 keys win; [`Self::from_load_table_response`]
-    /// picks by the table's location instead.
+    /// When a map carries both, the S3 keys win, whatever the table's
+    /// location: a `gs://` table vended both has always been read with its S3
+    /// keys (through the GCS interop endpoint), and keeps that store. The GCS
+    /// token is read only when no S3 keys were vended.
     pub fn from_config_map(config: &HashMap<String, serde_json::Value>) -> Result<Option<Self>> {
-        Self::parse(config, None)
-    }
-
-    /// [`Self::from_config_map`], choosing between S3 keys and a GCS token by
-    /// the scheme of `location` when the map carries both.
-    fn parse(
-        config: &HashMap<String, serde_json::Value>,
-        location: Option<&str>,
-    ) -> Result<Option<Self>> {
-        let s3 = Self::s3_from(config);
-        let wants_gcs = location.is_some_and(|l| {
-            crate::io::location::LocationScheme::of(l) == crate::io::location::LocationScheme::Gs
-        });
-        if config.contains_key(GCS_TOKEN) && (wants_gcs || s3.is_none()) {
-            return Self::gcs_from(config).map(|gcs| Some(VendedCredentials::Gcs(gcs)));
+        match Self::s3_from(config) {
+            Some(s3) => Ok(Some(VendedCredentials::S3(s3))),
+            None if config.contains_key(GCS_TOKEN) => {
+                Self::gcs_from(config).map(|gcs| Some(VendedCredentials::Gcs(gcs)))
+            }
+            None => Ok(None),
         }
-        Ok(s3.map(VendedCredentials::S3))
     }
 
     fn s3_from(config: &HashMap<String, serde_json::Value>) -> Option<S3Credentials> {
@@ -302,7 +294,7 @@ impl VendedCredentials {
                 None => return Ok(None),
             },
         };
-        Self::parse(&config, Some(metadata_location))
+        Self::from_config_map(&config)
     }
 
     /// When the credentials expire, if the catalog said.
@@ -1026,23 +1018,30 @@ mod tests {
         );
     }
 
+    /// A catalog that vends both S3 keys and a GCS token is read with the S3
+    /// keys, a `gs://` table too: the store such a table has always been read
+    /// with (through the GCS interop endpoint). The GCS fields are then not
+    /// read at all, so a malformed one does not fail the load.
     #[test]
-    fn a_map_carrying_both_kinds_is_read_by_the_tables_scheme() {
-        let both = serde_json::json!({
-            "metadata-location": GS_ML,
-            "config": {
+    fn a_map_carrying_both_kinds_keeps_its_s3_keys() {
+        let both = |gcs_expiry: Option<&str>| {
+            let mut config = serde_json::json!({
                 "s3.access-key-id": "AKIA", "s3.secret-access-key": "secret",
-                "gcs.oauth2.token": "ya29.tok", "gcs.oauth2.token-expires-at": "1893456000000",
-            },
-        });
-        assert!(matches!(
-            VendedCredentials::from_load_table_response(&both, GS_ML).unwrap(),
-            Some(VendedCredentials::Gcs(_))
-        ));
-        assert!(matches!(
-            VendedCredentials::from_load_table_response(&both, ML).unwrap(),
-            Some(VendedCredentials::S3(_))
-        ));
+                "gcs.oauth2.token": "ya29.tok", "gcs.user-project": "Not A Project",
+            });
+            if let Some(expiry) = gcs_expiry {
+                config["gcs.oauth2.token-expires-at"] = expiry.into();
+            }
+            serde_json::json!({"metadata-location": GS_ML, "config": config})
+        };
+        for response in [both(Some("1893456000000")), both(None)] {
+            for location in [GS_ML, ML] {
+                assert!(matches!(
+                    VendedCredentials::from_load_table_response(&response, location).unwrap(),
+                    Some(VendedCredentials::S3(_))
+                ));
+            }
+        }
     }
 
     #[test]

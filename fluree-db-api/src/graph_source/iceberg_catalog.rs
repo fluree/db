@@ -848,11 +848,13 @@ pub(crate) async fn preview_iceberg_table_in(
     let (catalog, _uri, _wh) = catalog_client(&conn, "table preview", identity).await?;
     let table_id = table.to_catalog();
 
-    let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
-        .await
-        .map_err(|e| {
-            storage_api_error(&format!("Failed to load table {}", table.qualified()), e)
-        })?;
+    let mut load = SendCatalogClient::load_table(
+        &*catalog,
+        &table_id,
+        super::storage::connection_requests_vended(&conn),
+    )
+    .await
+    .map_err(|e| storage_api_error(&format!("Failed to load table {}", table.qualified()), e))?;
 
     // Inline from a REST `loadTable`, else read from `metadata_location` (Glue /
     // S3 Tables return only the location).
@@ -1492,19 +1494,22 @@ pub(crate) async fn verify_storage_access_in(
     let table_id = parse_qualified_table(table);
     let catalog_table = table_id.to_catalog();
 
-    let mut load =
-        match SendCatalogClient::load_table(&*catalog, &catalog_table, conn.io.vended_credentials)
-            .await
-        {
-            Ok(load) => load,
-            Err(e) => {
-                return Ok(StorageAccessReport::unreadable(
-                    format!("Failed to load table {}: {e}", table_id.qualified()),
-                    None,
-                    None,
-                ))
-            }
-        };
+    let mut load = match SendCatalogClient::load_table(
+        &*catalog,
+        &catalog_table,
+        super::storage::connection_requests_vended(&conn),
+    )
+    .await
+    {
+        Ok(load) => load,
+        Err(e) => {
+            return Ok(StorageAccessReport::unreadable(
+                format!("Failed to load table {}: {e}", table_id.qualified()),
+                None,
+                None,
+            ))
+        }
+    };
 
     // Build storage through the SAME credential decision the scan path uses. §2
     // fail-closed fires HERE: a REST source that requires vended credentials but

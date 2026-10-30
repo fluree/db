@@ -19,7 +19,6 @@ use fluree_db_iceberg::{
     catalog::{
         LoadTableResponse, RestCatalogClient, RestCatalogConfig, SendCatalogClient, TableIdentifier,
     },
-    config::IoConfig,
     io::{
         ColumnBatch, FileIcebergStorage, IcebergStorageBackend, SendIcebergStorage,
         SendParquetReader, StorageScope,
@@ -1303,7 +1302,10 @@ impl crate::Fluree {
 
         // Attempt to load table metadata (this tests the connection)
         catalog
-            .load_table(&table_id, config.connection.io.vended_credentials)
+            .load_table(
+                &table_id,
+                super::storage::connection_requests_vended(&config.connection),
+            )
             .await
             .map_err(|e| {
                 crate::ApiError::Config(format!("Failed to load table from catalog: {e}"))
@@ -1734,7 +1736,12 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 .await?
                 .expect("a non-Direct source has a catalog client");
                 let load_response = catalog
-                    .load_table(&table_id, iceberg_config.io.vended_credentials)
+                    .load_table(
+                        &table_id,
+                        iceberg_config
+                            .io
+                            .requests_vended_credentials(&iceberg_config.catalog),
+                    )
                     .await
                     .map_err(|e| storage_query_error("Failed to load table from catalog", e))?;
                 let plan = plan_for(
@@ -3236,7 +3243,6 @@ fn deferred_storage_builder(
     cache: Arc<R2rmlCache>,
     session: Arc<super::catalog_session::IcebergCatalogSession>,
     table_id: TableIdentifier,
-    io: IoConfig,
     lt_key: String,
     xq_key: String,
     plan: StoragePlan,
@@ -3246,7 +3252,6 @@ fn deferred_storage_builder(
         let catalog = Arc::clone(&catalog);
         let cache = Arc::clone(&cache);
         let session = Arc::clone(&session);
-        let io = io.clone();
         let table_id = table_id.clone();
         let lt_key = lt_key.clone();
         let xq_key = xq_key.clone();
@@ -3255,7 +3260,7 @@ fn deferred_storage_builder(
         Box::pin(async move {
             let built = if catalog_vends {
                 resolve_catalog_load_and_storage(
-                    catalog, cache, session, table_id, io, lt_key, xq_key, plan,
+                    catalog, cache, session, table_id, lt_key, xq_key, plan,
                 )
                 .await
                 .map(|(storage, _)| storage)
@@ -3301,7 +3306,6 @@ async fn resolve_catalog_load_and_storage(
     cache: Arc<R2rmlCache>,
     session: Arc<super::catalog_session::IcebergCatalogSession>,
     table_id: TableIdentifier,
-    io: IoConfig,
     lt_key: String,
     cross_query_key: String,
     plan: StoragePlan,
@@ -3323,7 +3327,7 @@ async fn resolve_catalog_load_and_storage(
             // The cold REST/OAuth catalog round-trip — the `r2rml.load_table` span
             // the cache gate proves absent when disk-warm.
             let actual = catalog
-                .load_table(&table_id, io.vended_credentials)
+                .load_table(&table_id, plan.reads_vended())
                 .instrument(tracing::debug_span!(
                     "r2rml.load_table",
                     namespace = %table_id.namespace,
@@ -3693,7 +3697,6 @@ impl FlureeR2rmlProvider<'_> {
         let xq_key = cross_query_key(&lt_key, &record.config, self.fluree.identity_context());
         let disk = self.catalog_disk_cache();
         let source_time = self.source_time(graph_source_id);
-        let storage_io = iceberg_config.storage_io().into_owned();
         let catalog_label = iceberg_config.catalog.catalog_label().to_string();
         let catalog_vends = iceberg_config.catalog.vends_credentials();
         if !matches!(iceberg_config.catalog, CatalogConfig::Direct { .. }) {
@@ -3748,7 +3751,6 @@ impl FlureeR2rmlProvider<'_> {
                         Arc::clone(self.fluree.r2rml_cache()),
                         Arc::clone(&self.session),
                         table_id.clone(),
-                        storage_io.clone(),
                         lt_key.clone(),
                         xq_key.clone(),
                         plan.clone(),
@@ -3826,7 +3828,12 @@ impl FlureeR2rmlProvider<'_> {
                         // highest-value span for attributing a slow virtual-dataset
                         // query to cold-remote-retrieval vs. caching vs. decode.
                         let actual = catalog
-                            .load_table(&table_id, iceberg_config.io.vended_credentials)
+                            .load_table(
+                                &table_id,
+                                iceberg_config
+                                    .io
+                                    .requests_vended_credentials(&iceberg_config.catalog),
+                            )
                             .instrument(tracing::debug_span!(
                                 "r2rml.load_table",
                                 namespace = %table_id.namespace,
@@ -4845,6 +4852,7 @@ fn listing_is_single_table(listing: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_iceberg::config::IoConfig;
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
@@ -5906,7 +5914,6 @@ mod tests {
                 Arc::new(R2rmlCache::new(4, 4)),
                 Arc::new(super::super::catalog_session::IcebergCatalogSession::default()),
                 TableIdentifier::new("ns", "t"),
-                io.clone(),
                 "lt".to_string(),
                 "xq".to_string(),
                 plan.clone(),

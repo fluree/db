@@ -473,7 +473,7 @@ impl CatalogClient for RestCatalogClient {
             .await
             .map_err(|e| super::name_denied_table(e, table_id))?;
 
-        parse_load_table_response(&response)
+        parse_load_table_response(&response, request_credentials)
     }
 }
 
@@ -553,7 +553,7 @@ impl super::SendCatalogClient for RestCatalogClient {
             .await
             .map_err(|e| super::name_denied_table(e, table_id))?;
 
-        parse_load_table_response(&response)
+        parse_load_table_response(&response, request_credentials)
     }
 
     /// `GET …/tables/{table}/credentials` (the Iceberg REST `loadCredentials`
@@ -594,14 +594,26 @@ impl super::SendCatalogClient for RestCatalogClient {
 /// object (Snowflake Horizon / Polaris include it, letting preview skip an S3
 /// fetch). A present-but-unparseable inline `metadata` is logged and dropped,
 /// never fatal — the `metadata_location` fetch path still works.
-fn parse_load_table_response(response: &serde_json::Value) -> Result<LoadTableResponse> {
+///
+/// Credentials are read only when the load asked for them
+/// (`request_credentials`, true exactly when the source reads with what the
+/// catalog vends): a catalog that returns some anyway, malformed or not,
+/// never fails the load of a source that reads with another identity.
+fn parse_load_table_response(
+    response: &serde_json::Value,
+    request_credentials: bool,
+) -> Result<LoadTableResponse> {
     let metadata_location = response
         .get("metadata-location")
         .and_then(|v| v.as_str())
         .ok_or_else(|| IcebergError::Catalog("Missing metadata-location in response".to_string()))?
         .to_string();
 
-    let credentials = VendedCredentials::from_load_table_response(response, &metadata_location)?;
+    let credentials = if request_credentials {
+        VendedCredentials::from_load_table_response(response, &metadata_location)?
+    } else {
+        None
+    };
 
     let config: HashMap<String, serde_json::Value> = response
         .get("config")
@@ -822,6 +834,32 @@ mod tests {
             other => panic!("expected CatalogAccessDenied, got {other:?}"),
         }
         assert!(!err.to_string().contains("set quota_project"), "{err}");
+    }
+
+    /// Vended credentials are read only from a load that asked for them: a
+    /// catalog that returns a GCS token anyway, here one with no expiry (which
+    /// a vended read refuses), does not fail the load of a source that reads
+    /// with another identity.
+    #[tokio::test]
+    async fn credentials_a_load_did_not_ask_for_are_not_read() {
+        let server = mock_catalog().await;
+        serve_config(&server, serde_json::json!({})).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/db/tables/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": "gs://lake/db/events/metadata/v1.metadata.json",
+                "config": {"gcs.oauth2.token": "ya29.unasked", "gcs.user-project": "Not A Project"},
+            })))
+            .mount(&server)
+            .await;
+        let client = warehouse_client(&server.uri(), Some("unasked-credentials"));
+        let table = TableIdentifier::new("db", "events");
+        let unasked = super::super::SendCatalogClient::load_table(&client, &table, false)
+            .await
+            .unwrap();
+        assert!(unasked.credentials.is_none());
+        let asked = super::super::SendCatalogClient::load_table(&client, &table, true).await;
+        assert!(asked.is_err(), "a vended read refuses the token");
     }
 
     /// A provider's token exchange runs before the request takes its
