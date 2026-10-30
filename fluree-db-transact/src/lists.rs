@@ -10,10 +10,11 @@
 //! of fresh blank nodes. Both shapes are the same RDF; two compact lists on
 //! one property would merge into one.
 //!
-//! A list with the same members, in the same order, as the compact list its
-//! property already holds is that list: writing it again restates its
-//! members, at the positions they are stored at, as writing a stored fact
-//! again restates the fact.
+//! A list with the same members, in the same order, as a list its property
+//! already holds is that list: writing it again restates it as stored, the
+//! compact list's members at the positions they are stored at, a chain's
+//! triples with its cells, as writing a stored fact again restates the
+//! fact.
 
 use crate::current_facts::{CurrentFacts, ListFree, Slot};
 use crate::error::Result;
@@ -241,7 +242,7 @@ pub async fn store_lists(
     if lists.is_empty() {
         return Ok(Vec::new());
     }
-    let held = compact_lists_held(ledger, &lists, txn_id, retracted).await?;
+    let held = lists_held(ledger, &lists, txn_id, retracted).await?;
     Ok(encode(lists, held))
 }
 
@@ -249,6 +250,25 @@ pub async fn store_lists(
 /// is the first on its graph, subject and predicate, a chain otherwise.
 pub fn store_new_lists(lists: Vec<PendingList>) -> Vec<Flake> {
     encode(lists, HashMap::new())
+}
+
+/// The lists an owner holds: its compact list's members in position order,
+/// and each list it holds as a chain, as the chain's triples: the owner's
+/// edge, then each cell's `rdf:first` and `rdf:rest`.
+#[derive(Debug, Default)]
+struct Held {
+    compact: Vec<Flake>,
+    chains: Vec<Vec<Flake>>,
+}
+
+/// Whether `chain`, a chain's triples, holds `members` in order.
+fn chain_holds(chain: &[Flake], members: &[Flake]) -> bool {
+    let firsts: Vec<Flake> = chain
+        .iter()
+        .filter(|f| f.p.namespace_code == RDF && f.p.name.as_ref() == RDF_FIRST)
+        .cloned()
+        .collect();
+    same_members(&firsts, members)
 }
 
 /// [`store_new_lists`] for one part of a write whose parts are stored
@@ -275,39 +295,44 @@ pub fn store_lists_claiming(lists: Vec<PendingList>, claimed: &ClaimedOwners) ->
     out
 }
 
-/// Each list compact when its owner holds no compact list yet or it restates
-/// the one there, a chain otherwise. `compact` starts as the compact lists
-/// the ledger holds, by owner, and gains each stored here.
-fn encode(lists: Vec<PendingList>, mut compact: HashMap<Owner, Vec<Flake>>) -> Vec<Flake> {
+/// Each list compact when its owner holds no list yet, restating the one
+/// there that holds the same members, a chain otherwise. `held` starts as the
+/// lists the ledger holds, by owner, and gains each stored here.
+fn encode(lists: Vec<PendingList>, mut held: HashMap<Owner, Held>) -> Vec<Flake> {
     let mut out = Vec::new();
     for list in lists {
         let Some(owner) = list.owner() else {
             continue;
         };
-        match compact.get(&owner) {
-            // The list held is restated as stored, at its own positions:
-            // a delete can leave them apart, and the members written again
-            // name the same entries.
-            Some(held) if same_members(held, &list.members) => {
-                let (g, t) = (owner.0.clone(), list.members.first().map_or(0, |f| f.t));
-                out.extend(held.iter().map(|f| Flake {
-                    g: g.clone(),
-                    t,
-                    op: true,
-                    ..f.clone()
-                }));
-            }
-            Some(_) => out.extend(list.into_chain()),
-            None => {
-                compact.insert(owner, list.members.clone());
-                out.extend(list.into_compact());
-            }
+        let here = held.entry(owner.clone()).or_default();
+        // The list held is restated as stored: a compact list at its own
+        // positions, which a delete can leave apart, a chain with its cells.
+        let stored = if !here.compact.is_empty() && same_members(&here.compact, &list.members) {
+            Some(&here.compact)
+        } else {
+            here.chains.iter().find(|c| chain_holds(c, &list.members))
+        };
+        if let Some(stored) = stored {
+            let (g, t) = (owner.0.clone(), list.members.first().map_or(0, |f| f.t));
+            out.extend(stored.iter().map(|f| Flake {
+                g: g.clone(),
+                t,
+                op: true,
+                ..f.clone()
+            }));
+        } else if here.compact.is_empty() && here.chains.is_empty() {
+            here.compact = list.members.clone();
+            out.extend(list.into_compact());
+        } else {
+            let chain = list.into_chain();
+            here.chains.push(chain.clone());
+            out.extend(chain);
         }
     }
     out
 }
 
-/// Whether two compact lists hold the same members in the same order.
+/// Whether two lists hold the same members in the same order.
 fn same_members(a: &[Flake], b: &[Flake]) -> bool {
     let lang = |f: &Flake| f.m.as_ref().and_then(|m| m.lang.clone());
     a.len() == b.len()
@@ -316,14 +341,14 @@ fn same_members(a: &[Flake], b: &[Flake]) -> bool {
             .all(|(x, y)| x.o == y.o && x.dt == y.dt && lang(x) == lang(y))
 }
 
-/// The compact lists the ledger holds on the owners of `lists`, members the
-/// transaction retracts left out, each in position order.
-async fn compact_lists_held(
+/// The lists the ledger holds on the owners of `lists`, leaving out the
+/// members, and the chains' edges, the transaction retracts.
+async fn lists_held(
     ledger: &LedgerState,
     lists: &[PendingList],
     txn_id: &str,
     retracted: impl Fn(&Flake) -> bool,
-) -> Result<HashMap<Owner, Vec<Flake>>> {
+) -> Result<HashMap<Owner, Held>> {
     if ListFree::check(ledger).is_some() {
         return Ok(HashMap::new());
     }
@@ -345,20 +370,52 @@ async fn compact_lists_held(
     }
     let read: Vec<Slot> = slots.iter().map(|(_, slot)| slot.clone()).collect();
     let facts = CurrentFacts::new(ledger).of_slots(&read).await?;
-    Ok(slots
-        .into_iter()
-        .zip(facts)
-        .filter_map(|((owner, _), facts)| {
-            let mut members: Vec<Flake> = facts
-                .iter()
-                .map(crate::current_facts::StoredFact::flake)
-                .filter(|f| f.m.as_ref().and_then(|m| m.i).is_some() && !retracted(f))
-                .cloned()
-                .collect();
-            members.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
-            (!members.is_empty()).then_some((owner, members))
-        })
-        .collect())
+    let mut held = HashMap::new();
+    for ((owner, slot), facts) in slots.into_iter().zip(facts) {
+        let mut here = Held::default();
+        for f in facts.iter().map(crate::current_facts::StoredFact::flake) {
+            if retracted(f) {
+                continue;
+            }
+            if f.m.as_ref().and_then(|m| m.i).is_some() {
+                here.compact.push(f.clone());
+                continue;
+            }
+            let FlakeValue::Ref(head) = &f.o else {
+                continue;
+            };
+            if head.namespace_code != BLANK_NODE {
+                continue;
+            }
+            let db = ledger.as_graph_db_ref(slot.g_id);
+            let Some(firsts) = fluree_db_core::rdf_list::chain_members(db, head).await? else {
+                continue;
+            };
+            let mut chain = Vec::with_capacity(2 * firsts.len() + 1);
+            chain.push(f.clone());
+            for (k, first) in firsts.iter().enumerate() {
+                let next = firsts
+                    .get(k + 1)
+                    .map_or_else(|| Sid::new(RDF, RDF_NIL), |n| n.s.clone());
+                chain.push(first.clone());
+                chain.push(Flake::new(
+                    first.s.clone(),
+                    Sid::new(RDF, RDF_REST),
+                    FlakeValue::Ref(next),
+                    id_datatype_sid(),
+                    first.t,
+                    true,
+                    None,
+                ));
+            }
+            here.chains.push(chain);
+        }
+        here.compact.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
+        if !(here.compact.is_empty() && here.chains.is_empty()) {
+            held.insert(owner, here);
+        }
+    }
+    Ok(held)
 }
 
 #[cfg(test)]

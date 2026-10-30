@@ -631,3 +631,53 @@ async fn construct_reads_the_list_its_default_graph_holds() {
     let ttl = turtle(&fluree, &ledger, &from("FROM ex:g1 FROM ex:g2")).await;
     assert!(!ttl.contains('('), "{ttl}");
 }
+
+/// ADD again after an index build changes nothing, though the build holds
+/// the list's `-0.0` as `0.0`: the list ADD put beside another is found by
+/// its members.
+#[tokio::test]
+async fn adding_again_after_an_index_build_changes_nothing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "transfer-indexed",
+        "GRAPH ex:g1 { ex:s ex:items (-0.0e0 1.5e0) . } GRAPH ex:g2 { ex:s ex:items (3 4) . }",
+    )
+    .await;
+    update(&fluree, &id, "ADD ex:g1 TO ex:g2").await;
+    support::rebuild_and_publish_index(&fluree, &id).await;
+    let t = load(&fluree, &id).await.t();
+    update(&fluree, &id, "ADD ex:g1 TO ex:g2").await;
+    assert_eq!(load(&fluree, &id).await.t(), t);
+}
+
+/// Two lists ADDed into one destination beside its own list stay two lists,
+/// however alike their members print.
+#[tokio::test]
+async fn lists_added_beside_another_stay_apart() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let point = |lat: &str| {
+        format!("\"POINT(2 {lat})\"^^<http://www.opengis.net/ont/geosparql#wktLiteral>")
+    };
+    let data = format!(
+        "GRAPH ex:g1 {{ ex:s ex:items ({}) . }} GRAPH ex:g2 {{ ex:s ex:items ({}) . }} \
+         GRAPH ex:g3 {{ ex:s ex:items (3 4) . }}",
+        point("1.0000001"),
+        point("1.0000004"),
+    );
+    let id = create(&fluree, "transfer-apart", &data).await;
+    update(&fluree, &id, "ADD ex:g1 TO ex:g3").await;
+    update(&fluree, &id, "ADD ex:g2 TO ex:g3").await;
+    let ledger = load(&fluree, &id).await;
+    let cells = sparql(
+        &fluree,
+        &ledger,
+        &format!(
+            "{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             SELECT (COUNT(DISTINCT ?c) AS ?cells) (COUNT(*) AS ?firsts) \
+             WHERE {{ GRAPH ex:g3 {{ ?c rdf:first ?x }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(cells, [json!([2, 2])], "a cell each, a member each");
+}

@@ -1506,15 +1506,15 @@ impl<'l> DeleteResolver<'l> {
                     self.expanded.insert(key);
                 }
                 stats.matched += 1;
+                for m in facts.same_facts(&named) {
+                    out.push(facts.facts[m].clone().retract(t));
+                }
                 for n in named {
-                    for m in facts.same_fact(n) {
-                        out.push(facts.facts[m].clone().retract(t));
-                    }
                     out.push(facts.facts[n].retract_named(intent.flake.clone(), t));
                 }
             } else if let Some(n) = facts.named(&intent.flake, keys) {
                 stats.matched += 1;
-                for m in facts.same_fact(n) {
+                for m in facts.same_facts(&[n]) {
                     out.push(facts.facts[m].clone().retract(t));
                 }
                 out.push(facts.facts[n].retract_named(intent.flake, t));
@@ -1662,21 +1662,29 @@ impl SlotFacts {
         }
     }
 
-    /// The slot's other facts that are the same stored fact as fact `n`:
-    /// terms of one big integer at one list position, which novelty holds
-    /// apart until the next index build. Every other kind is one term per
-    /// fact once the read is resolved.
-    fn same_fact(&mut self, n: usize) -> Vec<usize> {
+    /// The slot's other facts that are the same stored fact as one of
+    /// `named`, which hold one value: terms of one big integer at one list
+    /// position, which novelty holds apart until the next index build. Every
+    /// other kind is one term per fact once the read is resolved. One pass
+    /// over the value's facts, however many entries hold it.
+    fn same_facts(&mut self, named: &[usize]) -> Vec<usize> {
+        let Some(&n) = named.first() else {
+            return Vec::new();
+        };
         if !self.facts[n].flake.o.index_keys_by_value() {
             return Vec::new();
         }
         self.ensure_by_value();
         let fact = &self.facts[n].flake;
-        let at = list_index_of(fact);
+        let at: HashSet<Option<i32>> = named
+            .iter()
+            .map(|&n| list_index_of(&self.facts[n].flake))
+            .collect();
+        let named: HashSet<usize> = named.iter().copied().collect();
         let sibling = |m: usize| {
-            m != n
+            !named.contains(&m)
                 && same_value(&self.facts[m].flake, fact)
-                && list_index_of(&self.facts[m].flake) == at
+                && at.contains(&list_index_of(&self.facts[m].flake))
         };
         match (&self.by_value, value_hash(fact)) {
             (Some(groups), Some(h)) => groups
@@ -3076,6 +3084,68 @@ mod tests {
                 Some("") => assert!(got.is_some(), "{what}: {got:?}"),
                 want => assert_eq!(got.as_deref(), *want, "{what}"),
             }
+        }
+    }
+
+    /// A big integer novelty holds under two subtypes, at each of three list
+    /// positions and beside the list, loses every term to one intent naming
+    /// it with no position: each entry's and the plain value's other term
+    /// are the same stored fact. On the scanned and on the indexed path.
+    #[tokio::test]
+    async fn a_value_named_once_retracts_every_term_of_every_entry() {
+        let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+        let big = |dt: &str, t: i64, i: Option<i32>| {
+            Flake::new(
+                sid("a"),
+                sid("items"),
+                FlakeValue::BigInt(Box::new(v.clone())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                t,
+                true,
+                i.map(FlakeMeta::with_index),
+            )
+        };
+        let held = |dt: &str, t: i64| {
+            vec![
+                big(dt, t, Some(0)),
+                big(dt, t, Some(1)),
+                big(dt, t, Some(2)),
+                big(dt, t, None),
+            ]
+        };
+        let ledger = ledger(
+            vec![held("nonNegativeInteger", 1), held("positiveInteger", 2)],
+            &HashMap::new(),
+        );
+        let named = RetractIntent::new(
+            Flake {
+                t: 9,
+                op: false,
+                ..big("nonNegativeInteger", 9, None)
+            },
+            false,
+        );
+        for narrow_slot in [usize::MAX, 0] {
+            let mut got = resolve_batches(&ledger, vec![vec![named.clone()]], narrow_slot).await;
+            got.sort_by_key(|(_, m)| m.as_ref().and_then(|m| m.i));
+            let positions: Vec<Option<i32>> = got
+                .iter()
+                .map(|(_, m)| m.as_ref().and_then(|m| m.i))
+                .collect();
+            assert_eq!(
+                positions,
+                [
+                    None,
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    Some(2)
+                ],
+                "narrow_slot={narrow_slot}"
+            );
         }
     }
 

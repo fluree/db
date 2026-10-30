@@ -1969,16 +1969,16 @@ async fn stage_graph_mgmt(
                             }
                             by_owner.entry(owner).or_default().push(f);
                         }
-                        // A list stored as a chain beside another is named by
-                        // what it holds, so ADDing it again names the same
-                        // cells and restates them.
+                        // A list the destination holds already, compact or as
+                        // a chain, is restated (`crate::lists`), so ADD again
+                        // changes nothing.
                         let txn_id = generate_txn_id();
                         let lists = owners
                             .into_iter()
-                            .map(|owner| {
-                                let mut members = by_owner.remove(&owner).unwrap_or_default();
-                                members.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
-                                let cells = chain_cells_for(&members);
+                            .enumerate()
+                            .map(|(i, owner)| {
+                                let members = by_owner.remove(&owner).unwrap_or_default();
+                                let cells = format!("{txn_id}--a{i}-");
                                 crate::lists::PendingList::new(members, cells)
                             })
                             .collect();
@@ -2561,31 +2561,7 @@ async fn hidden_restatements(
     Ok(hidden)
 }
 
-/// Enforce modify policies on staged flakes
-///
-/// This function handles the complete policy enforcement flow:
-/// 1. Computes per-subject write state (classes and, when write-verb
-///    policies are present, lifecycle classification)
-/// 2. Enforces modify policies on each flake with full f:query support
-///
-/// Returns `Ok(())` if all flakes pass policy, or an error if any flake is
-/// denied or a pre-state lookup fails.
 /// `all` without the facts a write stages but leaves unchanged as RDF.
-/// The cell prefix of a chain holding `members` (one list, in order): the
-/// same for the same graph, subject, predicate and members.
-fn chain_cells_for(members: &[Flake]) -> String {
-    use std::fmt::Write;
-    let mut text = String::new();
-    if let Some(first) = members.first() {
-        let _ = write!(text, "{:?}|{:?}|{:?}", first.g, first.s, first.p);
-    }
-    for f in members {
-        let lang = f.m.as_ref().and_then(|m| m.lang.as_deref());
-        let _ = write!(text, "|{:?}^{:?}@{lang:?}", f.o, f.dt);
-    }
-    format!("l{:032x}-", xxhash_rust::xxh3::xxh3_128(text.as_bytes()))
-}
-
 fn without_unjudged<'a>(
     all: &'a [Flake],
     unjudged: &HashSet<(Option<Sid>, bool, Flake)>,
