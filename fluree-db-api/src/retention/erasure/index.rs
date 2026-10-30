@@ -779,6 +779,7 @@ pub(crate) struct ErasureStorage {
     inner: Arc<dyn Storage>,
     index: Arc<ErasureIndex>,
     pins: Option<Arc<BlobPins>>,
+    condemned: Arc<crate::collect::Condemned>,
 }
 
 impl ErasureStorage {
@@ -798,8 +799,21 @@ impl ErasureStorage {
         inner: Arc<dyn Storage>,
         index: Arc<ErasureIndex>,
         pins: Option<Arc<BlobPins>>,
+        condemned: Arc<crate::collect::Condemned>,
     ) -> Self {
-        ErasureStorage { inner, index, pins }
+        ErasureStorage {
+            inner,
+            index,
+            pins,
+            condemned,
+        }
+    }
+
+    async fn before_store(&self, address: &str) -> fluree_db_core::Result<()> {
+        self.condemned
+            .before_store(address)
+            .await
+            .map_err(|e| fluree_db_core::Error::storage(e.to_string()))
     }
 
     async fn substitute(&self, address: &str) -> Option<fluree_db_core::Result<Arc<[u8]>>> {
@@ -956,6 +970,10 @@ impl StorageRead for ErasureStorage {
     fn blob_pins(&self) -> Option<Arc<BlobPins>> {
         self.pins.clone()
     }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.condemned.intents_loaded()
+    }
 }
 
 #[async_trait]
@@ -965,6 +983,7 @@ impl StorageWrite for ErasureStorage {
         if self.erased_address(address).await? {
             return self.refused(address).await;
         }
+        self.before_store(address).await?;
         self.inner.write_bytes(address, bytes).await
     }
 
@@ -1005,6 +1024,7 @@ impl ContentAddressedWrite for ErasureStorage {
                     size_bytes: bytes.len(),
                 });
             }
+            self.before_store(&address).await?;
         }
         self.inner
             .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
@@ -1165,6 +1185,7 @@ mod tests {
             gated.clone() as Arc<dyn Storage>,
             Arc::clone(&index),
             None,
+            Default::default(),
         ));
         let started = gated.started.notified();
         let read = tokio::spawn({

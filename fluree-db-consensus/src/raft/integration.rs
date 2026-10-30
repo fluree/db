@@ -347,6 +347,10 @@ impl RaftIntegration {
                 Arc::clone(&self.nameservice),
                 &self.network_config,
             ))
+            .merge(crate::raft::nameservice::collect_spare_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
             .merge(crate::raft::nameservice::read_index::read_index_router(
                 Arc::clone(&self.nameservice),
             ))

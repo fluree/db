@@ -142,6 +142,7 @@ pub struct EmbeddedRaftNode {
     leader_watcher: CancellableTaskHandle,
     release_task: Option<(JoinHandle<()>, CancellationToken)>,
     erasure_installer: (JoinHandle<()>, CancellationToken),
+    collect_loader: Option<(JoinHandle<()>, CancellationToken)>,
 }
 
 impl EmbeddedRaftNode {
@@ -229,6 +230,19 @@ impl EmbeddedRaftNode {
             ));
             (task, cancel)
         };
+        // This member's writes check what the cluster's collection
+        // condemned, sparing through the leader.
+        let collect_loader = fluree.condemned().map(|condemned| {
+            condemned.activate(Arc::clone(&nameservice) as _);
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(crate::raft::collect::run_loader(
+                Arc::clone(&fluree),
+                condemned,
+                integration.shared_state.clone(),
+                cancel.clone(),
+            ));
+            (task, cancel)
+        });
         let commits: Arc<dyn CommitPublisher> = Arc::clone(&nameservice) as _;
         // Same Arc upcast again so a follower-owned worker can ferry a
         // deterministic poison to the leader rather than spin on
@@ -277,6 +291,7 @@ impl EmbeddedRaftNode {
             leader_watcher,
             release_task,
             erasure_installer,
+            collect_loader,
         }
     }
 
@@ -292,6 +307,10 @@ impl EmbeddedRaftNode {
         let (installer, cancel) = self.erasure_installer;
         cancel.cancel();
         let _ = installer.await;
+        if let Some((loader, cancel)) = self.collect_loader {
+            cancel.cancel();
+            let _ = loader.await;
+        }
         // Then the core, so no further apply can push releases into the
         // channel the drain below is about to close. Bounded: a wedged
         // core must not hold the drain hostage.

@@ -46,6 +46,8 @@ pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
 mod branch_validation;
+#[cfg(feature = "native")]
+pub mod collect;
 mod commit_data;
 pub mod commit_transfer;
 mod config_guard;
@@ -2921,14 +2923,18 @@ impl FlureeBuilder {
             stored.clone(),
             verifier,
         ));
+        let condemned = Arc::new(collect::Condemned::default());
         let storage: Arc<dyn Storage> = Arc::new(retention::erasure::index::ErasureStorage::new(
             stored,
             index.clone(),
             pins,
+            condemned.clone(),
         ));
         (
             storage,
-            Arc::new(retention::erasure::ErasureRuntime::new(index, config)),
+            Arc::new(retention::erasure::ErasureRuntime::new(
+                index, condemned, config,
+            )),
         )
     }
 

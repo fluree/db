@@ -49,6 +49,8 @@ pub struct PendingRawTxnUpload {
     handle: Option<JoinHandle<Result<Uploaded>>>,
     /// The store pins, so a failed transaction sees the upload through.
     pinned: bool,
+    /// The store's collection intents loaded before the upload stored.
+    intents_loaded: Option<u64>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -64,6 +66,7 @@ impl PendingRawTxnUpload {
     ) -> Self {
         let pinner = content_store.blob_pinner();
         let pinned = pinner.is_some();
+        let intents_loaded = content_store.intents_loaded();
         let handle = tokio::spawn(async move {
             let bytes = serde_json::to_vec(&txn_json)?;
             let (cid, pin) = match pinner {
@@ -89,7 +92,15 @@ impl PendingRawTxnUpload {
         Self {
             handle: Some(handle),
             pinned,
+            intents_loaded,
         }
+    }
+
+    /// How many collection intents the store had loaded before the upload
+    /// stored: what a write publishing it presents, at most. See
+    /// [`ContentStore::intents_loaded`].
+    pub fn intents_loaded(&self) -> Option<u64> {
+        self.intents_loaded
     }
 
     /// Await the upload: the blob's ContentId, and its pin when the store
@@ -160,6 +171,11 @@ impl PendingRawTxnUpload {
         Self {
             deferred: Some((content_store, txn_json, alg)),
         }
+    }
+
+    /// Nothing collects here.
+    pub fn intents_loaded(&self) -> Option<u64> {
+        None
     }
 
     /// Run the upload now and return the resulting ContentId. Nothing

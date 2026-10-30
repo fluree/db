@@ -437,6 +437,18 @@ fn basis_source(basis: &WriteBasis) -> Result<Option<(RefKey, u64)>> {
         .transpose()
 }
 
+/// `command` presenting the collection intents its writer had loaded when
+/// it began, if it ran in a write scope; see [`SmCommand::Seen`].
+fn by_writer(command: SmCommand, seen: Option<u64>) -> SmCommand {
+    match seen {
+        Some(seen) => SmCommand::Seen {
+            seen,
+            command: Box::new(command),
+        },
+        None => command,
+    }
+}
+
 /// [`at_generation`] for a write to `ledger_id` presenting `basis`.
 fn at_basis(command: SmCommand, ledger_id: &str, basis: &WriteBasis) -> Result<SmCommand> {
     Ok(at_generation(
@@ -465,6 +477,9 @@ fn erasure_refusal(response: &SmResponse) -> Option<String> {
             until_millis,
         } => Some(format!(
             "{ledger_id} is held for an erasure activation until {until_millis}"
+        )),
+        SmResponse::CollectionMoved { deleting } => Some(format!(
+            "the write began before collection intent {deleting}, whose deletion has begun"
         )),
         _ => None,
     }
@@ -823,6 +838,9 @@ pub struct StagedCommit {
     /// The other branch the commit was built from, and the erasure
     /// generation of its view; see [`WriteBasis::source`].
     pub erasure_source: Option<(RefKey, u64)>,
+    /// The collection intents the staging writer had loaded when it began;
+    /// see [`SmCommand::Seen`]. `None` outside a write scope.
+    pub seen: Option<u64>,
 }
 
 mod activation;
@@ -971,6 +989,7 @@ impl RaftNameService {
             receipt,
             erasure_generation,
             erasure_source,
+            seen,
         } = args;
 
         let (tally, flake_count) = match &receipt {
@@ -995,6 +1014,7 @@ impl RaftNameService {
             erasure_generation,
             erasure_source,
         );
+        let cmd = by_writer(cmd, seen);
 
         let _guard = match self.staged_receipts.as_ref() {
             Some(stash) => match StashGuard::try_stash(stash, queue_id, ref_key.clone(), receipt) {
@@ -1320,6 +1340,102 @@ async fn handle_erasure_ready(
     }
 }
 
+/// Path under [`collect_spare_router`]'s root for a writer's spare of a
+/// condemned address, which a follower posts to the leader.
+pub const COLLECT_SPARE_PATH: &str = "/collect_spare";
+
+/// A writer's spare on its way to the leader; see
+/// [`CollectCommand::Spare`](super::state_machine::CollectCommand::Spare).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpareAddress {
+    pub number: u64,
+    pub address: String,
+}
+
+/// What a spare found; see [`fluree_db_api::collect::Spared`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpareOutcome {
+    Kept,
+    Refused,
+    Closed,
+}
+
+impl From<SpareOutcome> for fluree_db_api::collect::Spared {
+    fn from(outcome: SpareOutcome) -> Self {
+        match outcome {
+            SpareOutcome::Kept => Self::Kept,
+            SpareOutcome::Refused => Self::Refused,
+            SpareOutcome::Closed => Self::Closed,
+        }
+    }
+}
+
+/// Errors the leader returns for a [`SpareAddress`].
+#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum ApplySpareError {
+    #[error("not the leader; current leader: {leader:?}")]
+    NotLeader { leader: Option<NodeId> },
+    #[error("raft propose failed: {0}")]
+    RaftPropose(String),
+    #[error("unexpected response to a spare: {0}")]
+    Unexpected(String),
+}
+
+impl FromRaftWriteError for ApplySpareError {
+    fn not_leader(leader: Option<NodeId>) -> Self {
+        Self::NotLeader { leader }
+    }
+    fn raft_propose(msg: String) -> Self {
+        Self::RaftPropose(msg)
+    }
+}
+
+/// Axum router for [`COLLECT_SPARE_PATH`], mounted beside
+/// [`erasure_ready_router`] with the same trust posture and body cap.
+pub fn collect_spare_router(
+    ns: Arc<RaftNameService>,
+    network_config: &crate::raft::network::NetworkConfig,
+) -> Router {
+    Router::new()
+        .route(
+            COLLECT_SPARE_PATH,
+            post(handle_collect_spare).layer(DefaultBodyLimit::max(
+                network_config.apply_queue_poison_max_body_bytes,
+            )),
+        )
+        .with_state(ns)
+}
+
+async fn handle_collect_spare(
+    State(ns): State<Arc<RaftNameService>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let args: SpareAddress = match postcard::from_bytes(&body) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error on SpareAddress: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let outcome = ns.propose_spare(args).await;
+    match postcard::to_allocvec(&outcome) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("postcard encode error on collect_spare response: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Translate openraft's structured `client_write` failure into one
 /// of the cross-node RPC error enums. Both
 /// [`ApplyStagedCommitError`] and [`ApplyQueuePoisonError`] carry
@@ -1530,7 +1646,10 @@ impl RaftNameService {
                 self.staged_receipts.as_deref(),
             )?
         };
-        let cmd = at_basis(cmd, ledger_id, basis)?;
+        let cmd = by_writer(
+            at_basis(cmd, ledger_id, basis)?,
+            fluree_db_api::collect::seen(),
+        );
 
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
@@ -1630,6 +1749,7 @@ impl RaftNameService {
             commit_t,
             receipt,
             erasure_generation: basis.erasure_generation,
+            seen: fluree_db_api::collect::seen(),
             erasure_source: basis_source(basis)?,
         };
 
@@ -1870,6 +1990,56 @@ impl RaftNameService {
             .await
             .map_err(map_propose_error)?;
         Ok(())
+    }
+
+    /// Propose a [`SpareAddress`] on this node, the leader.
+    pub async fn propose_spare(
+        &self,
+        args: SpareAddress,
+    ) -> std::result::Result<SpareOutcome, ApplySpareError> {
+        let SpareAddress { number, address } = args;
+        let response = self
+            .raft
+            .client_write(SmCommand::Collect(
+                super::state_machine::CollectCommand::Spare { number, address },
+            ))
+            .await
+            .map_err(map_propose_error)?;
+        match response.data {
+            SmResponse::Spared => Ok(SpareOutcome::Kept),
+            SmResponse::SpareRefused { .. } => Ok(SpareOutcome::Refused),
+            SmResponse::IntentClosed { .. } => Ok(SpareOutcome::Closed),
+            other => Err(ApplySpareError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    async fn spare_via_leader(
+        &self,
+        args: &SpareAddress,
+        forwarding: &ForwardingConfig,
+    ) -> std::result::Result<SpareOutcome, String> {
+        let leader_url = self
+            .lookup_leader_raft_url()
+            .await
+            .ok_or_else(|| "no leader currently elected".to_string())?;
+        let target = format!("{}{}", leader_url.trim_end_matches('/'), COLLECT_SPARE_PATH);
+        let body = postcard::to_allocvec(args).map_err(|e| format!("encode SpareAddress: {e}"))?;
+        let resp = forwarding
+            .http_client
+            .post(&target)
+            .header(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)
+            .body(body)
+            .timeout(forwarding.request_timeout)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("collect_spare returned HTTP {}", resp.status()));
+        }
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let outcome: std::result::Result<SpareOutcome, ApplySpareError> =
+            postcard::from_bytes(&bytes).map_err(|e| format!("decode collect_spare: {e}"))?;
+        outcome.map_err(|e| e.to_string())
     }
 
     async fn erasure_ready_via_leader(
@@ -2482,6 +2652,32 @@ impl ConfigLookup for RaftNameService {
 }
 
 #[async_trait]
+impl fluree_db_api::collect::Spare for RaftNameService {
+    async fn spare(
+        &self,
+        number: u64,
+        address: &str,
+    ) -> std::result::Result<fluree_db_api::collect::Spared, String> {
+        let args = SpareAddress {
+            number,
+            address: address.to_string(),
+        };
+        if let Some(forwarding) = &self.forwarding {
+            if !self.is_local_leader(forwarding.id).await {
+                return self
+                    .spare_via_leader(&args, forwarding)
+                    .await
+                    .map(Into::into);
+            }
+        }
+        self.propose_spare(args)
+            .await
+            .map(Into::into)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait]
 impl ConfigPublisher for RaftNameService {
     async fn push_config_fenced(
         &self,
@@ -2501,7 +2697,9 @@ impl ConfigPublisher for RaftNameService {
             })),
             fence,
         )?;
+        let cmd = by_writer(cmd, fluree_db_api::collect::seen());
         let response = self.submit_lifecycle(cmd).await?;
+        check_erasure_response(&response)?;
         check_fence_response(&response, ledger_id)?;
         match response {
             SmResponse::ConfigUpdated => Ok(ConfigCasResult::Updated),
@@ -3102,6 +3300,7 @@ mod tests {
             receipt,
             erasure_generation: 3,
             erasure_source: Some((RefKey::new("test/db", "dev"), 2)),
+            seen: Some(5),
         }
     }
 
@@ -3479,10 +3678,12 @@ mod tests {
             receipt,
             erasure_generation,
             erasure_source,
+            seen,
         } = round_tripped;
         assert_eq!(ref_key, args.ref_key);
         assert_eq!(erasure_generation, args.erasure_generation);
         assert_eq!(erasure_source, args.erasure_source);
+        assert_eq!(seen, args.seen);
         assert_eq!(queue_id, args.queue_id);
         assert_eq!(commit_id, args.commit_id);
         assert_eq!(commit_t, args.commit_t);

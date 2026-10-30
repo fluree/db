@@ -76,6 +76,9 @@ impl ErasureConfig {
 #[derive(Debug)]
 pub(crate) struct ErasureRuntime {
     pub(crate) index: Arc<index::ErasureIndex>,
+    /// What a cluster's collection condemned, checked by this storage's
+    /// writes.
+    pub(crate) condemned: Arc<crate::collect::Condemned>,
     pub(crate) config: Option<ErasureConfig>,
     /// A step is being proved.
     in_flight: AtomicBool,
@@ -113,9 +116,14 @@ pub(crate) struct Reconciled {
 }
 
 impl ErasureRuntime {
-    pub(crate) fn new(index: Arc<index::ErasureIndex>, config: Option<ErasureConfig>) -> Self {
+    pub(crate) fn new(
+        index: Arc<index::ErasureIndex>,
+        condemned: Arc<crate::collect::Condemned>,
+        config: Option<ErasureConfig>,
+    ) -> Self {
         ErasureRuntime {
             index,
+            condemned,
             config,
             in_flight: AtomicBool::new(false),
             purge_in_flight: AtomicBool::new(false),

@@ -166,6 +166,11 @@ pub(crate) struct Objects<'a> {
     /// Held to write a registration, from its chunks to its record, and
     /// exclusively by a sweep from reading names to deleting.
     writes: Option<&'a tokio::sync::RwLock<()>>,
+    /// On a cluster member, what collection condemned: each write runs in
+    /// a scope, so its chunks are checked and its record presents what it
+    /// saw.
+    #[cfg(feature = "native")]
+    condemned: Option<&'a crate::collect::Condemned>,
 }
 
 impl<'a> Objects<'a> {
@@ -174,6 +179,8 @@ impl<'a> Objects<'a> {
             storage,
             cache,
             writes: None,
+            #[cfg(feature = "native")]
+            condemned: None,
         }
     }
 
@@ -289,6 +296,12 @@ impl crate::Fluree {
     pub(crate) fn registry_objects(&self) -> Option<Objects<'_>> {
         self.admin_storage().map(|storage| Objects {
             writes: Some(&self.retention.registry_writes),
+            #[cfg(feature = "native")]
+            condemned: self
+                .retention
+                .erasure
+                .get()
+                .map(|runtime| &*runtime.condemned),
             ..Objects::new(storage, &self.retention.chunks)
         })
     }
@@ -629,29 +642,45 @@ pub(crate) async fn update_fenced(
     mut update: impl FnMut(Option<&Registration>) -> Option<Registration>,
 ) -> Result<Option<Registration>> {
     for _ in 0..CAS_ATTEMPTS {
-        let (config, current) = read(ns, objects, ledger_id).await?;
-        let Some(mut next) = update(current.as_ref()) else {
-            return Ok(current);
+        let attempt = async {
+            let (config, current) = read(ns, objects, ledger_id).await?;
+            let Some(mut next) = update(current.as_ref()) else {
+                return Result::Ok(Some(current));
+            };
+            // No sweep deletes a chunk between this write storing or naming
+            // it and its record taking effect.
+            let _writing = match objects.and_then(|o| o.writes) {
+                Some(writes) => Some(writes.read().await),
+                None => None,
+            };
+            let value = store(&mut next, current.as_ref(), objects).await?;
+            let (v, mut payload) = match &config {
+                Some(c) => (c.v, c.payload.clone().unwrap_or_default()),
+                None => (0, ConfigPayload::default()),
+            };
+            payload.extra.insert(EXTRA_KEY.to_string(), value);
+            let new = ConfigValue::new(v + 1, Some(payload));
+            match ns
+                .push_config_fenced(ledger_id, fence, config.as_ref(), &new)
+                .await
+            {
+                Ok(ConfigCasResult::Updated) => Ok(Some(Some(next))),
+                Ok(ConfigCasResult::Conflict { .. }) => Ok(None),
+                // Its chunks were stored before collection deleted what it
+                // condemned: written again, in a new scope.
+                Err(fluree_db_nameservice::NameServiceError::ApplyLagged(_)) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
         };
-        // No sweep deletes a chunk between this write storing or naming it
-        // and its record taking effect.
-        let _writing = match objects.and_then(|o| o.writes) {
-            Some(writes) => Some(writes.read().await),
-            None => None,
+        #[cfg(feature = "native")]
+        let outcome = match objects.and_then(|o| o.condemned) {
+            Some(condemned) => condemned.scoped(attempt).await,
+            None => attempt.await,
         };
-        let value = store(&mut next, current.as_ref(), objects).await?;
-        let (v, mut payload) = match &config {
-            Some(c) => (c.v, c.payload.clone().unwrap_or_default()),
-            None => (0, ConfigPayload::default()),
-        };
-        payload.extra.insert(EXTRA_KEY.to_string(), value);
-        let new = ConfigValue::new(v + 1, Some(payload));
-        match ns
-            .push_config_fenced(ledger_id, fence, config.as_ref(), &new)
-            .await?
-        {
-            ConfigCasResult::Updated => return Ok(Some(next)),
-            ConfigCasResult::Conflict { .. } => continue,
+        #[cfg(not(feature = "native"))]
+        let outcome = attempt.await;
+        if let Some(done) = outcome? {
+            return Ok(done);
         }
     }
     Err(ApiError::internal(format!(

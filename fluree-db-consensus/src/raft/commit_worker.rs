@@ -373,7 +373,17 @@ impl Worker {
         }
     }
 
+    /// Stage `entry` and publish its head in a write scope: what staging
+    /// stores is checked against what collection condemned, and the head
+    /// presents the intents loaded when staging began.
     async fn try_advance_head(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
+        match self.staging.fluree.condemned() {
+            Some(condemned) => condemned.scoped(self.stage_and_advance(entry)).await,
+            None => self.stage_and_advance(entry).await,
+        }
+    }
+
+    async fn stage_and_advance(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
         let envelope = self.load_envelope(entry).await?;
         // The state machine doesn't introspect the envelope at enqueue
         // time, so the inline discriminator could disagree with what

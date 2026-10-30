@@ -1051,6 +1051,10 @@ impl ContentStore for CachedContentStore {
         self.inner.blob_pinner()
     }
 
+    fn intents_loaded(&self) -> Option<u64> {
+        self.inner.intents_loaded()
+    }
+
     async fn prefetch(&self, id: &ContentId) -> crate::error::Result<()> {
         let Some(path) = self.entry(id) else {
             return Ok(());

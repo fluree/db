@@ -327,6 +327,14 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// How many of a cluster's collection intents this member had loaded
+    /// when asked, where its writes are checked against them. A write that
+    /// stores outside the scope publishing it presents this, read before
+    /// it stores.
+    fn intents_loaded(&self) -> Option<u64> {
+        None
+    }
+
     /// Read a byte range from the object at the given address.
     ///
     /// The range is `[start, end)` in bytes. Returns the bytes within
@@ -625,6 +633,10 @@ impl StorageRead for Arc<dyn Storage> {
     fn blob_pins(&self) -> Option<Arc<pins::BlobPins>> {
         self.as_ref().blob_pins()
     }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.as_ref().intents_loaded()
+    }
 }
 
 #[async_trait]
@@ -726,6 +738,11 @@ pub trait ContentStore: Debug + Send + Sync {
     /// Where writes to this store are pinned against a collector, when one
     /// collects here: see [`pins`].
     fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        None
+    }
+
+    /// See [`Storage::intents_loaded`].
+    fn intents_loaded(&self) -> Option<u64> {
         None
     }
 
@@ -903,6 +920,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn blob_pinner(&self) -> Option<pins::BlobPinner> {
         self.as_ref().blob_pinner()
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.as_ref().intents_loaded()
     }
 
     fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
@@ -1257,6 +1278,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         self.storage
             .blob_pins()
             .map(|pins| pins::BlobPinner::new(pins, self.namespace.clone()))
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.storage.intents_loaded()
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -1815,6 +1840,10 @@ impl ContentStore for BranchedContentStore {
 
     fn blob_pinner(&self) -> Option<pins::BlobPinner> {
         self.branch_store.blob_pinner()
+    }
+
+    fn intents_loaded(&self) -> Option<u64> {
+        self.branch_store.intents_loaded()
     }
 
     /// Writes land in the branch's own store, so it is the one to keep them.

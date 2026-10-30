@@ -2127,6 +2127,10 @@ impl ContentStore for Substituted {
         self.inner.blob_pinner()
     }
 
+    fn intents_loaded(&self) -> Option<u64> {
+        self.inner.intents_loaded()
+    }
+
     fn get_local(
         &self,
         id: &ContentId,

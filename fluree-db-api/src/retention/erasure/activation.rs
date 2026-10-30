@@ -64,6 +64,15 @@ impl Fluree {
         }
     }
 
+    /// What this member's collection has condemned, which its writes check
+    /// once activated; `None` without managed storage.
+    pub fn condemned(&self) -> Option<Arc<crate::collect::Condemned>> {
+        self.retention
+            .erasure
+            .get()
+            .map(|runtime| runtime.condemned.clone())
+    }
+
     /// Install the erasures of the activated manifest `manifest` on this
     /// member: they read as their replacements from here on. Then the
     /// cached state of `holders` is evicted and reads of commits begun

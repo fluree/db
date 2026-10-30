@@ -183,7 +183,13 @@ impl QueuedTransactor {
     ) -> Result<SubmissionOutcome, SubmissionError> {
         let request_cid = args.request_cid.clone();
         let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
-        let cmd = SmCommand::EnqueueCommand(args);
+        let cmd = match fluree_db_api::collect::seen() {
+            Some(seen) => SmCommand::Seen {
+                seen,
+                command: Box::new(SmCommand::EnqueueCommand(args)),
+            },
+            None => SmCommand::EnqueueCommand(args),
+        };
         let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
         // Arm interest *before* proposing. The queue_id does not exist
         // yet, so the waiter is keyed by request_cid until this node
@@ -301,6 +307,17 @@ impl QueuedTransactor {
                 SmResponse::BodyHashMismatch => {
                     self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::KeyCollision);
+                }
+                // What it stored may have been collected; the envelope
+                // is left to the collector.
+                SmResponse::CollectionMoved { deleting } => {
+                    return Err(SubmissionError::Execution {
+                        status: 503,
+                        message: format!(
+                            "the submission began before collection intent {deleting}, \
+                             whose deletion has begun; retry"
+                        ),
+                    });
                 }
                 SmResponse::QueueFull { .. } => {
                     self.release_envelope(&full_ledger_id, &request_cid).await;
@@ -516,6 +533,41 @@ impl Committer for QueuedTransactor {
         &self,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
+        self.scoped(self.transact_scoped(request)).await
+    }
+
+    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+        self.scoped(self.revert_scoped(request)).await
+    }
+
+    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+        self.scoped(self.merge_scoped(request)).await
+    }
+
+    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+        self.scoped(self.rebase_scoped(request)).await
+    }
+
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+        self.scoped(self.push_scoped(request)).await
+    }
+}
+
+impl QueuedTransactor {
+    /// Run a submission in a write scope: what it stores before its enqueue
+    /// is checked against what collection condemned, and the enqueue
+    /// presents the intents loaded when it began.
+    async fn scoped<F: std::future::Future>(&self, submission: F) -> F::Output {
+        match self.fluree.condemned() {
+            Some(condemned) => condemned.scoped(submission).await,
+            None => submission.await,
+        }
+    }
+
+    async fn transact_scoped(
+        &self,
+        request: TransactionRequest,
+    ) -> Result<TransactionReceipt, SubmissionError> {
         let TransactionRequest {
             idempotency_key,
             ledger_id,
@@ -534,6 +586,10 @@ impl Committer for QueuedTransactor {
         // means the upload happens once per submission rather than
         // re-running on each worker retry.
         let raw_txn_id = if let Some(pending) = commit_opts.raw_txn_upload.take() {
+            // Stored by a task of its own, outside this submission's scope.
+            if let Some(epoch) = pending.intents_loaded() {
+                fluree_db_api::collect::lower_seen(epoch);
+            }
             let (id, _unpinned) =
                 pending
                     .finish()
@@ -613,7 +669,10 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+    async fn revert_scoped(
+        &self,
+        request: RevertRequest,
+    ) -> Result<RevertReceipt, SubmissionError> {
         let RevertRequest {
             idempotency_key,
             ledger_name,
@@ -656,7 +715,7 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+    async fn merge_scoped(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
         let MergeRequest {
             idempotency_key,
             ledger_name,
@@ -731,7 +790,10 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+    async fn rebase_scoped(
+        &self,
+        request: RebaseRequest,
+    ) -> Result<RebaseReceipt, SubmissionError> {
         let RebaseRequest {
             idempotency_key,
             ledger_name,
@@ -774,7 +836,7 @@ impl Committer for QueuedTransactor {
         }
     }
 
-    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+    async fn push_scoped(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         let PushRequest {
             idempotency_key,
             ledger_id,

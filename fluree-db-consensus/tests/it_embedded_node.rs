@@ -833,3 +833,165 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
     .expect("a transaction after the activation lands");
     node.shutdown().await;
 }
+
+/// Seed `ledger_id` with one commit through the cluster.
+async fn seed(node: &EmbeddedRaftNode, ledger_id: &str) {
+    node.committer
+        .transact(TransactionRequest {
+            idempotency_key: None,
+            ledger_id: ledger_id.into(),
+            body: TransactionBody::JsonLdInsert(serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:base", "ex:name": "base"
+            })),
+            txn_opts: Default::default(),
+            commit_opts: Default::default(),
+            tracking: None,
+            governance: Default::default(),
+        })
+        .await
+        .expect("seed");
+}
+
+/// Condemn an intent naming `addresses`, its object written now.
+async fn condemn(
+    integration: &RaftIntegration,
+    fluree: &fluree_db_api::Fluree,
+    addresses: &[String],
+) -> String {
+    use fluree_db_api::collect::{IntentEntry, IntentObject};
+    use fluree_db_consensus::raft::state_machine::{CollectCommand, Command};
+    let intent = IntentObject {
+        entries: addresses
+            .iter()
+            .map(|address| IntentEntry {
+                address: address.clone(),
+                reason: "test".into(),
+            })
+            .collect(),
+    };
+    let hash = fluree.put_intent(&intent).await.expect("intent stored");
+    integration
+        .raft
+        .client_write(Command::Collect(CollectCommand::Condemn {
+            intent: hash.clone(),
+        }))
+        .await
+        .expect("condemned");
+    hash
+}
+
+/// A submission storing an address an intent condemned spares it, so the
+/// intent's deletion leaves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_storing_a_condemned_address_spares_it() {
+    use fluree_db_api::ConflictStrategy;
+    use fluree_db_consensus::{QueuedRebase, QueuedRequest, RebaseRequest};
+    use fluree_db_core::{content_address, ContentId, ContentKind};
+
+    let (integration, fluree, node, _dirs) = stand_up(31, |config| config).await;
+    fluree.create_ledger("spare").await.expect("create ledger");
+    seed(&node, "spare:main").await;
+    fluree
+        .create_branch("spare", "dev", None, None)
+        .await
+        .expect("create branch");
+
+    // A rebase's envelope holds only its strategy, so its address is known.
+    let strategy = ConflictStrategy::default();
+    let bytes = QueuedRequest::Rebase(QueuedRebase { strategy })
+        .to_bytes()
+        .unwrap();
+    let namespace = fluree.storage_namespace("spare:dev").await.unwrap();
+    let address = content_address(
+        "file",
+        ContentKind::Txn,
+        &namespace,
+        &ContentId::new(ContentKind::Txn, &bytes).address_digest(),
+    );
+    condemn(&integration, &fluree, std::slice::from_ref(&address)).await;
+    let condemned = fluree.condemned().expect("managed storage");
+    eventually("the intent loads", async || condemned.loaded() == 1).await;
+
+    node.committer
+        .rebase(RebaseRequest {
+            idempotency_key: None,
+            ledger_name: "spare".into(),
+            branch: "dev".into(),
+            strategy,
+        })
+        .await
+        .expect("rebase");
+    let spared = integration.shared_state.read().await.collect.intents[&0]
+        .spared
+        .clone();
+    assert!(spared.contains(&address), "{spared:?}");
+    node.shutdown().await;
+}
+
+/// A write that stored an address before its node loaded the intent
+/// condemning it, refused a spare because that intent's deletion has
+/// begun, is refused when it publishes; one begun after loading the intent
+/// publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_begun_before_a_deleting_intent_is_refused() {
+    use fluree_db_api::collect::{IntentEntry, IntentObject};
+    use fluree_db_consensus::raft::state_machine::{CollectCommand, Command};
+    use fluree_db_nameservice::{ConfigLookup, ConfigPublisher, ConfigValue, NameServiceError};
+
+    let (integration, fluree, node, _dirs) = stand_up(32, |config| config).await;
+    fluree.create_ledger("fenced").await.expect("create ledger");
+    let ns = integration.nameservice();
+    let push = async || {
+        let fence = ns.lookup("fenced:main").await.unwrap().unwrap().fence;
+        let current = ns.get_config("fenced:main").await.unwrap();
+        let v = current.as_ref().map_or(0, |c| c.v);
+        ns.push_config_fenced(
+            "fenced:main",
+            fence,
+            current.as_ref(),
+            &ConfigValue::new(v + 1, None),
+        )
+        .await
+    };
+    let condemned = fluree.condemned().expect("managed storage");
+    let storage = fluree.admin_storage().unwrap();
+    let address = "fluree:file://fenced/main/txn/stray.json".to_string();
+    let intent = IntentObject {
+        entries: vec![IntentEntry {
+            address: address.clone(),
+            reason: "test".into(),
+        }],
+    };
+    let hash = fluree_db_core::sha256_hex(&serde_json::to_vec(&intent).unwrap());
+
+    let refused = condemned
+        .scoped(async {
+            storage.write_bytes(&address, b"stray").await.unwrap();
+            // Deleting before this node can load the intent: its object is
+            // written only after.
+            for command in [
+                CollectCommand::Condemn {
+                    intent: hash.clone(),
+                },
+                CollectCommand::Delete { number: 0 },
+            ] {
+                integration
+                    .raft
+                    .client_write(Command::Collect(command))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(fluree.put_intent(&intent).await.unwrap(), hash);
+            eventually("the intent loads", async || condemned.loaded() == 1).await;
+            push().await
+        })
+        .await;
+    assert!(
+        matches!(refused, Err(NameServiceError::ApplyLagged(_))),
+        "{refused:?}"
+    );
+    condemned.scoped(push()).await.expect("begun after loading");
+    push().await.expect("outside any scope");
+    node.shutdown().await;
+}
