@@ -151,19 +151,26 @@ ORDERS_MAPPING = f"""
 """
 
 
+# An AWS catalog that never answered (no credentials), or one that refused.
+GLUE_NOT_VERIFIED = r"could not (reach the catalog|load table 'sales\.orders' through the catalog) at "
+
+# The wording released for a catalog that does not answer; callers match on it.
+UNREACHABLE = "could not reach the catalog at {}; the source is registered, and queries will fail until it can be reached"
+
+
 def test_glue_and_s3_tables_sources_register(conn):
     # Registering loads each table the mapping's rr:tableName names through the
-    # catalog; when the table does not load (no reachable AWS catalog, no
-    # credentials, or no such table) it warns and still registers, so these
-    # register offline. Reading them end to end is covered by
+    # catalog; when the table does not load it warns and still registers, so
+    # these register offline. With no AWS credentials the catalog never
+    # answers; with credentials for another account it refuses the table. Reading them end to end is covered by
     # fluree-db-api's it_iceberg_glue_moto.
-    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog at 123456789012"):
+    with pytest.warns(UserWarning, match=GLUE_NOT_VERIFIED + "123456789012"):
         glue = conn.map_iceberg(
             "glue-orders", ORDERS_MAPPING, glue=fluree.Glue(region="us-east-1", catalog_id="123456789012")
         )
     assert (glue.id, glue.kind) == ("glue-orders:main", "iceberg")
     arn = "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"
-    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog at arn:aws:s3tables"):
+    with pytest.warns(UserWarning, match=GLUE_NOT_VERIFIED + "arn:aws:s3tables"):
         tables = conn.map_iceberg("s3t-orders", ORDERS_MAPPING, s3_tables=fluree.S3Tables(arn))
     assert (tables.id, tables.kind) == ("s3t-orders:main", "iceberg")
 
@@ -192,32 +199,35 @@ def test_glue_and_s3_tables_mistakes_are_refused(conn):
             auth=Bearer("t"),
         )
     # Turning vending off agrees with every mode.
-    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog"):
+    with pytest.warns(UserWarning, match=GLUE_NOT_VERIFIED):
         conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
 
 
 def test_a_rest_catalog_source_can_take_its_tables_from_the_mapping(conn):
     # No `table`: the mapping's rr:tableName names it, as on the CLI and server.
     # The catalog is unreachable (a refused loopback address), so registration
-    # warns rather than fails.
-    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog at http://127.0.0.1:9"):
+    # warns rather than fails, in the released words.
+    with pytest.warns(UserWarning) as caught:
         rest = conn.map_iceberg("rest-orders", ORDERS_MAPPING, catalog_uri="http://127.0.0.1:9/catalog")
+    assert [str(w.message) for w in caught] == [UNREACHABLE.format("http://127.0.0.1:9/catalog")]
     assert rest.kind == "iceberg"
 
 
 class SlowOrEmptyCatalog(BaseHTTPRequestHandler):
-    """An Iceberg REST catalog that has no tables; with `delay` set it takes
-    that long to say so."""
+    """An Iceberg REST catalog that answers every table with `status` (by
+    default, that it has no such table); with `delay` set it takes that long
+    to say so."""
 
     delay: float = 0.0
+    status: int = 404
 
     def do_GET(self) -> None:
         if self.path.endswith("/config"):
             status, body = 200, {}
         else:
             time.sleep(self.delay)
-            status = 404
-            body = {"error": {"message": "Table does not exist", "type": "NoSuchTableException", "code": 404}}
+            status = self.status
+            body = {"error": {"message": f"answered {status}", "code": status}}
         payload = json.dumps(body).encode()
         try:
             self.send_response(status)
@@ -232,8 +242,8 @@ class SlowOrEmptyCatalog(BaseHTTPRequestHandler):
         pass
 
 
-def _catalog(delay: float):
-    handler = type("Handler", (SlowOrEmptyCatalog,), {"delay": delay})
+def _catalog(delay: float, status: int = 404):
+    handler = type("Handler", (SlowOrEmptyCatalog,), {"delay": delay, "status": status})
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, f"http://127.0.0.1:{server.server_port}"
@@ -256,6 +266,18 @@ def test_a_table_the_catalog_does_not_have_is_named_not_an_unreachable_catalog(c
     assert "could not reach" not in message
 
 
+@pytest.mark.parametrize("status", [403, 500])
+def test_a_table_the_catalog_refuses_is_named_not_an_unreachable_catalog(conn, status):
+    server, uri = _catalog(delay=0, status=status)
+    try:
+        [message] = _registration_warnings(conn, f"rest-answered-{status}", catalog_uri=uri)
+    finally:
+        server.shutdown()
+    assert message.startswith(f"could not load table 'sales.orders' through the catalog at {uri} (")
+    assert f"answered {status}" in message
+    assert "could not reach" not in message
+
+
 def test_a_catalog_client_that_cannot_be_built_is_an_unreachable_catalog(conn, monkeypatch):
     monkeypatch.delenv("FLUREE_TEST_UNSET_CATALOG_TOKEN", raising=False)
     [message] = _registration_warnings(
@@ -264,7 +286,7 @@ def test_a_catalog_client_that_cannot_be_built_is_an_unreachable_catalog(conn, m
         catalog_uri="http://127.0.0.1:9/catalog",
         auth=Bearer(EnvVar("FLUREE_TEST_UNSET_CATALOG_TOKEN")),
     )
-    assert message.startswith("could not reach the catalog at http://127.0.0.1:9/catalog: its client could not be built (")
+    assert message == UNREACHABLE.format("http://127.0.0.1:9/catalog")
 
 
 def test_a_slow_catalog_is_not_reported_as_unreachable(conn):

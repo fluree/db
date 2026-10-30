@@ -220,9 +220,12 @@ pub(crate) fn map_iceberg<'py>(
 }
 
 /// The warning a registration whose tables were not verified raises, saying
-/// why: a check that ran out of time may have slow tables, not failing ones,
-/// and a table that did not load is named with its reason (a missing table
-/// and an unreachable catalog differ there). `None` when every table loaded.
+/// why. A catalog that did not answer (its client could not be built, or a
+/// table load failed with no answer from it) keeps the released wording,
+/// "could not reach the catalog at", which callers match on. A table the
+/// catalog answered for, as missing or refused, is named with the catalog's
+/// reason, and a check that ran out of time says the tables may only be slow.
+/// `None` when every table loaded.
 fn connection_warning(
     check: &fluree_db_api::ConnectionCheck,
     direct: bool,
@@ -240,9 +243,10 @@ fn connection_warning(
             "could not build the storage client for {location} ({error}); {REGISTERED}, \
              and queries will fail until it can be built"
         ),
-        C::ClientFailed { error } => format!(
-            "could not reach the catalog at {location}: its client could not be built \
-             ({error}); {REGISTERED}, and queries will fail until it can be reached"
+        // The released wording, unchanged.
+        C::ClientFailed { .. } | C::CatalogUnreachable { .. } => format!(
+            "could not reach the catalog at {location}; {REGISTERED}, and queries will \
+             fail until it can be reached"
         ),
         C::TableFailed { table, error } if direct => format!(
             "could not read the metadata of table '{table}' at {location} ({error}); \

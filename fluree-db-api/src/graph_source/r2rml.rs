@@ -122,6 +122,34 @@ pub(crate) const EMPTY_MAPPING: &str =
     "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
      http://www.w3.org/ns/r2rml# (with the trailing #) and each map is typed rr:TriplesMap";
 
+/// Whether a failed catalog-mode table load carries evidence that the catalog
+/// answered: a refusal (the typed catalog and storage denials), the catalog
+/// saying it has no such table, or any other HTTP status from a REST catalog.
+/// Without such evidence (a refused connection, a DNS or TLS failure, a
+/// timeout, a client error, a Glue or S3 Tables call that failed without a
+/// typed answer) the catalog is taken not to have answered. This keys on the
+/// text `IcebergError::TableNotFound` and the REST client's status message
+/// render with, because both reach registration as an untyped
+/// [`QueryError::Internal`]; `catalog_answer_classification` pins it to the
+/// errors the real conversions produce.
+pub(crate) fn catalog_answered(error: &QueryError) -> bool {
+    match error {
+        QueryError::CatalogAccessDenied { .. }
+        | QueryError::CatalogCredentialsNotVended { .. }
+        | QueryError::StorageAccessDenied { .. } => true,
+        QueryError::Internal(message) => {
+            message.contains(TABLE_NOT_FOUND_TEXT) || message.contains(CATALOG_STATUS_TEXT)
+        }
+        _ => false,
+    }
+}
+
+/// How `IcebergError::TableNotFound` renders: the REST catalog's 404, and Glue
+/// and S3 Tables' not-found codes.
+const TABLE_NOT_FOUND_TEXT: &str = "Table not found: ";
+/// How the REST catalog client renders any other non-success HTTP status.
+const CATALOG_STATUS_TEXT: &str = "Catalog request failed (";
+
 /// How long registration spends loading a new source's tables. A map request
 /// can sit behind a gateway with its own deadline (API Gateway's is 29 s), and a
 /// mapping over a warehouse can name many tables, so past this the source is
@@ -1119,7 +1147,9 @@ impl crate::Fluree {
             )
             .await?;
 
-        let connection_check = self.probe_tables(&graph_source_id, &table_names).await;
+        let connection_check = self
+            .probe_tables(&graph_source_id, &table_names, config.iceberg.is_direct())
+            .await;
         let connection_tested = connection_check.is_verified();
 
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
@@ -1143,9 +1173,19 @@ impl crate::Fluree {
     /// within [`REGISTRATION_PROBE_BUDGET`]. A failure or an expired budget is
     /// logged and returned as the outcome, never as an error, so it cannot fail
     /// registration.
-    async fn probe_tables(&self, graph_source_id: &str, table_names: &[String]) -> ConnectionCheck {
+    async fn probe_tables(
+        &self,
+        graph_source_id: &str,
+        table_names: &[String],
+        direct: bool,
+    ) -> ConnectionCheck {
         let check = self
-            .probe_tables_within(graph_source_id, table_names, REGISTRATION_PROBE_BUDGET)
+            .probe_tables_within(
+                graph_source_id,
+                table_names,
+                direct,
+                REGISTRATION_PROBE_BUDGET,
+            )
             .await;
         match &check {
             ConnectionCheck::Verified => {}
@@ -1170,6 +1210,14 @@ impl crate::Fluree {
                     "Could not load a mapped table - graph source was created but may fail at query time"
                 );
             }
+            ConnectionCheck::CatalogUnreachable { table, error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    table = %table,
+                    error = %error,
+                    "The catalog did not answer for a mapped table - graph source was created but may fail at query time"
+                );
+            }
             ConnectionCheck::TimedOut {
                 loaded,
                 total,
@@ -1192,11 +1240,14 @@ impl crate::Fluree {
     /// by resolving the table's current metadata at its location for Direct (a
     /// warehouse root's per-table directory, the local-root guard, version-hint
     /// or metadata listing). Table metadata only, never a manifest or data
-    /// file; the first failure ends it, and so does `budget`.
+    /// file; the first failure ends it, and so does `budget`. A catalog-mode
+    /// (`!direct`) table failure with no sign of a catalog answer is
+    /// [`ConnectionCheck::CatalogUnreachable`] ([`catalog_answered`]).
     pub(crate) async fn probe_tables_within(
         &self,
         graph_source_id: &str,
         table_names: &[String],
+        direct: bool,
         budget: std::time::Duration,
     ) -> ConnectionCheck {
         use futures::TryStreamExt;
@@ -1231,9 +1282,14 @@ impl crate::Fluree {
                         provider
                             .load_table_context(graph_source_id, table)
                             .await
-                            .map_err(|error| ConnectionCheck::TableFailed {
-                                table: table.clone(),
-                                error: error.to_string(),
+                            .map_err(|error| {
+                                let (table, answered) = (table.clone(), catalog_answered(&error));
+                                let error = error.to_string();
+                                if direct || answered {
+                                    ConnectionCheck::TableFailed { table, error }
+                                } else {
+                                    ConnectionCheck::CatalogUnreachable { table, error }
+                                }
                             })?;
                         loaded.fetch_add(1, Ordering::Relaxed);
                         Ok(())
@@ -4899,6 +4955,52 @@ fn listing_is_single_table(listing: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed table load counts as answered by the catalog only with
+    /// evidence of an answer, as the real conversions render it: not-found,
+    /// any other REST status, and the typed refusals. A connection-level
+    /// failure (refused, DNS, TLS, timeout) and an untyped AWS failure are
+    /// not.
+    #[test]
+    fn catalog_answer_classification() {
+        use fluree_db_iceberg::IcebergError as E;
+        let via = |e: E| storage_query_error("Failed to load table from catalog", e);
+        let answered = [
+            via(E::TableNotFound(
+                "Resource not found at v1/ns/tables/t: {}".into(),
+            )),
+            via(E::TableNotFound(
+                "Glue table ns.t not found: EntityNotFoundException".into(),
+            )),
+            via(E::Catalog(
+                "Catalog request failed (500 Internal Server Error): boom".into(),
+            )),
+            via(E::CatalogAccessDenied {
+                table: "ns.t".into(),
+                message: "Catalog request failed (403 Forbidden): no".into(),
+            }),
+            via(E::CatalogCredentialsNotVended {
+                catalog_uri: "https://c".into(),
+            }),
+        ];
+        for error in &answered {
+            assert!(catalog_answered(error), "answered: {error}");
+        }
+        let unanswered = [
+            via(E::Http(
+                "Connection error: error sending request: connection refused".into(),
+            )),
+            via(E::Http("Request timeout: operation timed out".into())),
+            via(E::Http("HTTP error: invalid peer certificate".into())),
+            via(E::Catalog(
+                "GetTable on Glue table ns.t failed: dispatch failure".into(),
+            )),
+            QueryError::Nameservice("down".into()),
+        ];
+        for error in &unanswered {
+            assert!(!catalog_answered(error), "not answered: {error}");
+        }
+    }
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
@@ -5943,7 +6045,12 @@ mod tests {
 
         let started = Instant::now();
         let probe = fluree
-            .probe_tables_within("slow-catalog:main", &tables, Duration::from_millis(100))
+            .probe_tables_within(
+                "slow-catalog:main",
+                &tables,
+                false,
+                Duration::from_millis(100),
+            )
             .await;
         assert!(
             matches!(
@@ -5963,7 +6070,7 @@ mod tests {
         );
 
         let probe = fluree
-            .probe_tables_within("slow-catalog:main", &tables, Duration::from_secs(10))
+            .probe_tables_within("slow-catalog:main", &tables, false, Duration::from_secs(10))
             .await;
         assert!(matches!(probe, ConnectionCheck::Verified), "{probe:?}");
     }

@@ -873,6 +873,16 @@ mod tests {
              location; queries that read it fail until it loads (Table not found: sales.nope)"
         );
 
+        let unreachable = ConnectionCheck::CatalogUnreachable {
+            table: "sales.orders".to_string(),
+            error: "Connection error: connection refused".to_string(),
+        };
+        assert_eq!(
+            rest(unreachable),
+            "not verified: table 'sales.orders': the catalog did not answer; queries that \
+             read it fail until it loads (Connection error: connection refused)"
+        );
+
         let client = ConnectionCheck::ClientFailed {
             error: "no secret resolver".to_string(),
         };

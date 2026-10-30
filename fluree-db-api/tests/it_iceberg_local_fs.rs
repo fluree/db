@@ -1969,6 +1969,11 @@ async fn people_catalog() -> wiremock::MockServer {
         .respond_with(ResponseTemplate::new(403).set_body_string("not yours"))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/broken"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("catalog fault"))
+        .mount(&server)
+        .await;
     server
 }
 
@@ -2046,9 +2051,9 @@ async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
         fluree_db_api::ConnectionCheck::Verified
     );
 
-    // A table the catalog answers it does not have, and a catalog that does
-    // not answer, are both a table that did not load; the reason tells them
-    // apart.
+    // A table the catalog answers it does not have, or answers for with an
+    // error status, did not load; a catalog that does not answer at all is
+    // unreachable.
     let missing = register(
         "rest-missing",
         PEOPLE_R2RML.replace("silver.people", "silver.nope"),
@@ -2058,6 +2063,21 @@ async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
         fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
             assert_eq!(table, "silver.nope");
             assert!(error.contains("not found"), "the catalog's answer: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    let broken = register(
+        "rest-broken",
+        PEOPLE_R2RML.replace("silver.people", "silver.broken"),
+    )
+    .await;
+    match &broken.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.broken");
+            assert!(
+                error.contains("catalog fault"),
+                "the catalog's answer: {error}"
+            );
         }
         other => panic!("expected TableFailed, got {other:?}"),
     }
@@ -2076,11 +2096,11 @@ async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
         .await
         .expect("an unreachable catalog still registers");
     match &unreachable.connection_check {
-        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+        fluree_db_api::ConnectionCheck::CatalogUnreachable { table, error } => {
             assert_eq!(table, "silver.people");
             assert!(!error.contains("not found"), "no catalog answered: {error}");
         }
-        other => panic!("expected TableFailed, got {other:?}"),
+        other => panic!("expected CatalogUnreachable, got {other:?}"),
     }
 
     // A catalog client that cannot be built loads no table, and is not

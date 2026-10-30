@@ -3136,7 +3136,8 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
 | `outcome` | Meaning | Other fields |
 |---|---|---|
 | `verified` | Every mapped table loaded | |
-| `table_failed` | `table` did not load. `error` is the catalog's or the storage's reason, which is where a table the catalog does not have differs from a catalog that did not answer | `table`, `error` |
+| `table_failed` | `table` did not load: the catalog answered that it has no such table, refused it, or answered with another error status; in `direct` mode, its metadata could not be read. `error` is the reason | `table`, `error` |
+| `catalog_unreachable` | The catalog did not answer for `table`: a refused connection, a timeout, a DNS or TLS failure, or a failure that carries no answer from the catalog. Catalog modes only | `table`, `error` |
 | `client_failed` | The client every load goes through could not be built (for example, a catalog credential that does not resolve), so no table was loaded | `error` |
 | `timed_out` | The check ran past `budget_secs` with `loaded` of `total` tables loaded. The tables may only be slow | `loaded`, `total`, `budget_secs` |
 | `no_tables` | The mapping could not be read, so it named no table to load | |

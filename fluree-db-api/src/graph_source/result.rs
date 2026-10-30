@@ -242,7 +242,8 @@ pub struct R2rmlCreateResult {
 /// [`Self::Verified`] means every table loaded; no outcome fails registration.
 ///
 /// Serialized with an `outcome` tag (`"verified"`, `"no_tables"`,
-/// `"client_failed"`, `"table_failed"`, `"timed_out"`) and the fields of each.
+/// `"client_failed"`, `"table_failed"`, `"catalog_unreachable"`,
+/// `"timed_out"`) and the fields of each.
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -257,13 +258,22 @@ pub enum ConnectionCheck {
         /// Why the client could not be built.
         error: String,
     },
-    /// `table` did not load. `error` is the catalog's or the storage's
-    /// reason: a missing table and an unreachable catalog are told apart by
-    /// it, not by the outcome.
+    /// `table` did not load: the catalog answered that it has no such table
+    /// or refused it, or (Direct) its metadata could not be read at its
+    /// location. `error` is the reason.
     TableFailed {
         /// The table as the mapping names it.
         table: String,
         /// Why it did not load.
+        error: String,
+    },
+    /// The catalog did not answer for `table`: the connection was refused or
+    /// timed out, a DNS or TLS failure, or a failure that carries no answer
+    /// from the catalog. Catalog modes only.
+    CatalogUnreachable {
+        /// The table as the mapping names it.
+        table: String,
+        /// Why the load failed.
         error: String,
     },
     /// The check ran past its budget with `loaded` of `total` tables loaded.
@@ -311,6 +321,10 @@ impl ConnectionCheck {
                 "not verified: table '{table}': {failed}; queries that read it fail until it \
                  loads ({error})"
             ),
+            Self::CatalogUnreachable { table, error } => format!(
+                "not verified: table '{table}': the catalog did not answer; queries that read it \
+                 fail until it loads ({error})"
+            ),
             Self::TimedOut {
                 loaded,
                 total,
@@ -350,6 +364,13 @@ mod tests {
                     error: "e".into(),
                 },
                 serde_json::json!({"outcome": "table_failed", "table": "ns.t", "error": "e"}),
+            ),
+            (
+                ConnectionCheck::CatalogUnreachable {
+                    table: "ns.t".into(),
+                    error: "e".into(),
+                },
+                serde_json::json!({"outcome": "catalog_unreachable", "table": "ns.t", "error": "e"}),
             ),
             (
                 ConnectionCheck::TimedOut {
