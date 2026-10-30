@@ -580,6 +580,11 @@ pub struct Novelty {
     /// identity, per graph, within this novelty window). Persistent map, so it
     /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
     fact_state: NoveltyFactState,
+
+    /// Planner stats this overlay's queries plan from instead of assembling
+    /// their own ([`Self::pin_planner_stats`]). Cleared by every change to
+    /// the overlay's content.
+    planner_stats_pin: Option<Arc<fluree_db_core::StatsView>>,
 }
 
 #[inline]
@@ -657,7 +662,25 @@ impl Novelty {
             config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
+            planner_stats_pin: None,
         }
+    }
+
+    /// Plan this overlay's queries from `stats` rather than from stats
+    /// assembled over its own content, until its content next changes. For
+    /// the virtual states of one sequential write, which differ from the
+    /// state it began on by its own few flakes: assembling the stats walks
+    /// the whole novelty window, once per operation otherwise. `stats` must
+    /// carry no soundness licence ([`fluree_db_core::StatsView::estimates_only`]),
+    /// since it doesn't describe this overlay exactly.
+    pub fn pin_planner_stats(&mut self, stats: Arc<fluree_db_core::StatsView>) {
+        self.planner_stats_pin = Some(stats);
+    }
+
+    /// The stats pinned by [`Self::pin_planner_stats`], if the content hasn't
+    /// changed since.
+    pub fn planner_stats_pin(&self) -> Option<&Arc<fluree_db_core::StatsView>> {
+        self.planner_stats_pin.as_ref()
     }
 
     /// Resolve a flake's graph ID from its `Flake.g` field.
@@ -681,6 +704,7 @@ impl Novelty {
         // Drawn from the process-wide allocator shared by every overlay type
         // (see `next_overlay_content_version`); `0` = empty since construction.
         self.content_version = fluree_db_core::overlay::next_overlay_content_version();
+        self.planner_stats_pin = None;
     }
 
     /// Append a freshly built segment to a graph, growing the graphs vec.

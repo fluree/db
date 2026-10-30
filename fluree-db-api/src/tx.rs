@@ -100,8 +100,8 @@ pub(crate) struct SequentialStager {
     /// That retraction was staged against the base, so it names the fact as
     /// the base stores it; a later one may name it as an earlier operation
     /// wrote it. See [`Self::drop_reversed_facts`].
-    first_retractions: HashMap<usize, fluree_db_core::Flake>,
-    fold_index: HashMap<SequentialFactKey, usize>,
+    first_retractions: FxHashMap<usize, fluree_db_core::Flake>,
+    fold_index: FxHashMap<SequentialFactKey, usize>,
     /// Simulated sequential per-op graph-id assignment, so the merged view's
     /// routing matches the ids each op's staging (and each intermediate
     /// envelope apply) used.
@@ -132,6 +132,10 @@ pub(crate) struct SequentialStager {
     /// Staged as one operation of an enclosing request, which shares this
     /// governance and runs the config guard over its own merged result.
     nested: bool,
+    /// The planner stats every virtual state plans from: those of the state
+    /// the request began on, estimates only. Built at the first operation
+    /// that advances the state (`None` until then).
+    planner_stats: Option<Option<Arc<fluree_db_core::StatsView>>>,
 }
 
 /// Fact identity for the sequential fold: `(g, s, p)` and the object as
@@ -148,8 +152,8 @@ impl SequentialStager {
             final_t,
             folded: Vec::new(),
             first_ops: Vec::new(),
-            first_retractions: HashMap::new(),
-            fold_index: HashMap::new(),
+            first_retractions: FxHashMap::default(),
+            fold_index: FxHashMap::default(),
             sim_registry: ledger.snapshot.graph_registry.clone(),
             merged_graph_iris: Vec::new(),
             seen_graph_iris: std::collections::HashSet::new(),
@@ -160,6 +164,7 @@ impl SequentialStager {
             nested: false,
             current: Some(ledger),
             scope: WriteScope::Subjects(FxHashSet::default()),
+            planner_stats: None,
         }
     }
 
@@ -188,6 +193,12 @@ impl SequentialStager {
     /// What governs the request's operations.
     pub(crate) fn governance(&self) -> &RequestGovernance {
         &self.governance
+    }
+
+    /// Whether the virtual state is built: false only after a
+    /// `stage(…, advance: false)`.
+    pub(crate) fn has_state(&self) -> bool {
+        self.current.is_some()
     }
 
     /// The current virtual state (base + every staged operation so far).
@@ -305,6 +316,23 @@ impl SequentialStager {
             )?;
             if let Some(store) = store {
                 fluree_db_transact::attach_binary_provider(&mut state_i, store);
+            }
+            // The next operation, and any probe of this state, plans from the
+            // base state's stats rather than assembling them over the whole
+            // novelty window again: the state differs from the base only by
+            // this request's own flakes. Estimates only, so a licence the
+            // stats grant the base (a property's objects all refs) can't be
+            // read for this state.
+            if staged_count > 0 {
+                let original = &self.original;
+                let pinned = self.planner_stats.get_or_insert_with(|| {
+                    let base = crate::view::GraphDb::from_ledger_state(original);
+                    fluree_db_query::planner_stats_view(base.as_graph_db_ref())
+                        .map(|view| Arc::new((*view).clone().estimates_only()))
+                });
+                if let Some(stats) = pinned {
+                    state_i.pin_planner_stats(Arc::clone(stats));
+                }
             }
             self.current = Some(state_i);
         }

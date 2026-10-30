@@ -4740,24 +4740,52 @@ async fn transact_cypher_delete_relationship_rejects_parallel_edges() {
 }
 
 #[tokio::test]
-async fn transact_cypher_delete_relationship_requires_named_endpoints() {
-    // `DELETE r` needs both endpoints named so the parallel-edge probe can
-    // group by them. An anonymous endpoint is rejected.
+async fn transact_cypher_delete_relationship_with_an_anonymous_endpoint() {
+    // `DELETE r` retracts the edge `r` was matched on, which the pattern
+    // names whether or not its endpoints have names (the parallel check runs
+    // where the edge is retracted). It deletes that relationship alone.
     let fluree = FlureeBuilder::memory().build_memory();
     let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel-anon");
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"CREATE (c:Person {name: "Cy"})"#,
         r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+        r#"MATCH (a:Person {name: "Alice"}), (c:Person {name: "Cy"}) CREATE (a)-[:KNOWS]->(c)"#,
     ] {
         l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
     }
 
-    let err = fluree
-        .transact_cypher(l, "MATCH (a)-[r:KNOWS]->() DELETE r")
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a)-[r:KNOWS]->(:Person {name: "Bob"}) DELETE r"#,
+        )
         .await
-        .expect_err("DELETE r with an anonymous endpoint must error");
-    assert!(format!("{err}").contains("endpoint"), "{err}");
+        .expect("DELETE r with an anonymous endpoint")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let rows = fluree
+        .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN a.name, b.name")
+        .await
+        .expect("relationships")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+    assert_eq!(
+        rows["results"][0]["data"],
+        json!([{"row": ["Alice", "Cy"], "meta": [null, null]}]),
+        "only the relationship to Bob is deleted"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("nodes")
+            .row_count(),
+        3,
+        "every node survives"
+    );
 }
 
 #[tokio::test]

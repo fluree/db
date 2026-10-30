@@ -4636,52 +4636,11 @@ impl Fluree {
                 ))
             }
             ConditionalCypherWrite::DeleteRel(update) => {
-                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
-                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
-                })?;
                 // `DELETE r` retracts the relationship's base `(a)-[:T]->(b)`
-                // triple, whose `f:reifies*` cascade removes the bundle. If the
-                // base edge backs a parallel sibling, that retraction would
-                // disturb the sibling — reject. The endpoints must be named so
-                // the probe can group by them.
-                for target in &delete.targets {
-                    let (a, b) = crate::cypher_write::rel_endpoint_vars(update, &target.name)
-                        .ok_or_else(|| {
-                            ApiError::cypher(
-                                format!(
-                                    "DELETE of relationship `{}` requires both endpoint \
-                                     nodes to be named (e.g. `(a)-[{}]->(b)`)",
-                                    target.name, target.name
-                                ),
-                                Vec::new(),
-                            )
-                        })?;
-                    let probe_ast = crate::cypher_write::build_parallel_probe_ast(
-                        &update.read_clauses,
-                        &a,
-                        &b,
-                        &target.name,
-                    );
-                    if self
-                        .query_cypher_ast(&probe_view, &probe_ast)
-                        .await?
-                        .row_count()
-                        > 0
-                    {
-                        return Err(ApiError::cypher(
-                            format!(
-                                "DELETE of relationship `{}` failed: parallel relationships \
-                                 share its underlying edge, so deleting one would affect the \
-                                 others. Per-occurrence DELETE of a parallel relationship is \
-                                 not yet supported.",
-                                target.name
-                            ),
-                            Vec::new(),
-                        ));
-                    }
-                }
-                // No parallel siblings → retracting each base edge removes only
-                // its own reifier bundle. Lower the original DELETE directly.
+                // triple, whose `f:reifies*` cascade removes the bundle; staging
+                // refuses an edge that backs a parallel sibling too (see
+                // `TxnOpts::relationship_deletes`). Lower the original DELETE
+                // directly.
                 let ast = fluree_db_cypher::CypherAst {
                     statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
                     span: update.span,
