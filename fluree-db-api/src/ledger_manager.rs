@@ -2445,7 +2445,7 @@ impl UpdatePlan {
 /// activations are not comparable. A side that carries neither is taken to
 /// match. Another erasure generation counts too: the history the cached
 /// state was loaded with has since been erased, and its writes are refused.
-fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
+pub(crate) fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
     let Some(cached) = cached else {
         return false;
     };
