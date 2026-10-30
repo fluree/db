@@ -44,6 +44,7 @@ use fluree_db_ledger::IndexConfig;
 use fluree_db_ledger::LedgerState;
 use fluree_db_query::parse::{UnresolvedPattern, UnresolvedValue};
 use fluree_db_query::{Binding, Materializer};
+use fluree_db_transact::lower_cypher_update::{cypher_blank_label, CypherBlank};
 
 use crate::error::ApiError;
 use crate::query::QueryResult;
@@ -529,8 +530,8 @@ impl Fluree {
             return Ok(());
         }
 
-        // Variables this CREATE introduces (label conventions mirror
-        // `lower_cypher_update::node_subject` / the rel-annotation labels).
+        // Variables this CREATE introduces, with the labels the lowering
+        // mints for them (`cypher_blank_label`).
         let mut new_cols: Vec<(String, String)> = Vec::new(); // (var, skolem label)
         for part in &create.pattern.parts {
             for node in std::iter::once(&part.head).chain(part.tail.iter().map(|(_, n)| n)) {
@@ -538,7 +539,10 @@ impl Fluree {
                     if table.col_idx(&v.name).is_none()
                         && !new_cols.iter().any(|(n, _)| n == &v.name)
                     {
-                        new_cols.push((v.name.clone(), format!("cy_{}", v.name)));
+                        new_cols.push((
+                            v.name.clone(),
+                            cypher_blank_label(CypherBlank::NodeVar(&v.name)),
+                        ));
                     }
                 }
             }
@@ -547,7 +551,10 @@ impl Fluree {
                     if table.col_idx(&v.name).is_none()
                         && !new_cols.iter().any(|(n, _)| n == &v.name)
                     {
-                        new_cols.push((v.name.clone(), format!("cy_rel_{}", v.name)));
+                        new_cols.push((
+                            v.name.clone(),
+                            cypher_blank_label(CypherBlank::RelVar(&v.name)),
+                        ));
                     }
                 }
             }
