@@ -867,6 +867,8 @@ async fn condemn(
             .map(|address| IntentEntry {
                 address: address.clone(),
                 reason: "test".into(),
+                ledger: None,
+                record: None,
             })
             .collect(),
     };
@@ -961,6 +963,8 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
         entries: vec![IntentEntry {
             address: address.clone(),
             reason: "test".into(),
+            ledger: None,
+            record: None,
         }],
     };
     let hash = fluree_db_core::sha256_hex(&serde_json::to_vec(&intent).unwrap());
@@ -993,5 +997,56 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
     );
     condemned.scoped(push()).await.expect("begun after loading");
     push().await.expect("outside any scope");
+    node.shutdown().await;
+}
+
+/// The leader collects a blob nothing references through an intent: the
+/// pass that finds it condemns it, the next deletes it and closes the
+/// intent, and writes carry on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
+    use fluree_db_core::{content_address, ContentKind, ContentStore as _};
+
+    let (integration, fluree, node, _dirs) = stand_up(33, |config| config).await;
+    fluree.create_ledger("swept").await.expect("create ledger");
+    seed(&node, "swept:main").await;
+    let namespace = fluree.storage_namespace("swept:main").await.unwrap();
+    let stray = fluree
+        .content_store(&namespace)
+        .put(ContentKind::Txn, b"{\"stray\":true}")
+        .await
+        .unwrap();
+    let address = content_address(
+        "file",
+        ContentKind::Txn,
+        &namespace,
+        &stray.address_digest(),
+    );
+    let storage = fluree.admin_storage().unwrap();
+    fluree.reconcile_garbage("swept").await.unwrap().unwrap();
+
+    let first = fluree
+        .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(first.condemned, 1, "{first:?}");
+    assert!(
+        storage.exists(&address).await.unwrap(),
+        "condemned, not deleted"
+    );
+    let second = fluree
+        .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(second.deleted, 1, "{second:?}");
+    assert!(!storage.exists(&address).await.unwrap());
+    {
+        let state = integration.shared_state.read().await;
+        assert!(state.collect.intents.is_empty(), "closed");
+        assert_eq!(state.collect.deleted_through, 1);
+    }
+    let condemned = fluree.condemned().unwrap();
+    eventually("the close is loaded", async || condemned.open().is_empty()).await;
+    seed(&node, "swept:main").await;
     node.shutdown().await;
 }

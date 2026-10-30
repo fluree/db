@@ -232,6 +232,8 @@ impl EmbeddedRaftNode {
         };
         // This member's writes check what the cluster's collection
         // condemned, sparing through the leader.
+        // Its garbage is collected through the cluster, by its leader.
+        fluree.set_collector(Arc::clone(&nameservice) as _);
         let collect_loader = fluree.condemned().map(|condemned| {
             condemned.activate(Arc::clone(&nameservice) as _);
             let cancel = CancellationToken::new();

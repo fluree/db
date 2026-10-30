@@ -442,6 +442,14 @@ pub trait StorageWrite: Debug + Send + Sync {
         failures
     }
 
+    /// Delete an object so that no write-ahead log replay can redo the
+    /// delete: a later write of the same address survives a replay of this
+    /// storage's log. Durable on return. The default is [`Self::delete`],
+    /// for backends that keep no log of their deletes.
+    async fn delete_unlogged(&self, address: &str) -> Result<()> {
+        self.delete(address).await
+    }
+
     /// Make every write this storage reported complete short of the device
     /// durable now.
     ///
@@ -651,6 +659,10 @@ impl StorageWrite for Arc<dyn Storage> {
 
     async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
         self.as_ref().delete_many(addresses).await
+    }
+
+    async fn delete_unlogged(&self, address: &str) -> Result<()> {
+        self.as_ref().delete_unlogged(address).await
     }
 
     async fn sync(&self) -> Result<()> {

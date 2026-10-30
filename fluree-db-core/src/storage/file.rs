@@ -1840,6 +1840,14 @@ impl StorageWrite for FileStorage {
             .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
 
+    async fn delete_unlogged(&self, address: &str) -> Result<()> {
+        let (key, path) = self.resolve_key(address)?;
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.delete_key_unlogged_blocking(&key, &path))
+            .await
+            .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
+    }
+
     /// One blocking task for the whole batch rather than one per address:
     /// the per-key work is an unlink, so a batch of thousands is otherwise
     /// mostly task hand-offs.
@@ -1877,6 +1885,25 @@ impl StorageWrite for FileStorage {
 }
 
 impl FileStorage {
+    /// Unlink `path` with no WAL record, then flush its directory. Ordered
+    /// with writes to the key like any delete; a replay of an earlier write
+    /// may bring the file back, never take a later one away.
+    fn delete_key_unlogged_blocking(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let _operation = self.begin_operation(self.durability, key)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(crate::error::Error::io(format!(
+                    "Failed to delete {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+        Self::sync_parent_dirs(&self.base_path, &[key.to_string()])?;
+        Ok(())
+    }
+
     /// Unlink `path`, recording the delete in the WAL first when one is
     /// attached. Absence is success. Runs on the caller's thread: it takes
     /// the root gate and a key stripe, which block.
@@ -3588,6 +3615,38 @@ mod wal_tests {
         assert_eq!(on_disk(COMMIT), b"c\x02");
         assert_eq!(on_disk(HEAD), b"h\x02");
         assert_eq!(wal_entries(dir.path()), ["LOCK"], "replay retires the log");
+    }
+
+    /// An unlogged delete leaves the log no record to replay, so a later
+    /// write of the same address by another writer survives the replay.
+    #[tokio::test]
+    async fn an_unlogged_delete_is_not_replayed_over_a_later_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        storage
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        storage
+            .delete_unlogged("fluree:file://a.bin")
+            .await
+            .unwrap();
+        assert!(!dir.path().join("a.bin").exists());
+        publish(&storage, b"h").await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        other
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        let storage = with_wal(dir.path());
+        assert_eq!(
+            storage.read_bytes("fluree:file://a.bin").await.unwrap(),
+            b"a"
+        );
     }
 
     /// Replay applies records in order, so a delete cannot resurrect what it

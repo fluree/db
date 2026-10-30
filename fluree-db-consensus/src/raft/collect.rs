@@ -31,9 +31,19 @@ pub async fn run_loader(
     }
 }
 
+/// Load whatever the replicated state condemned that this member has not
+/// loaded yet, before a write begins: one that began before an intent's
+/// load is refused once the intent deletes.
+pub async fn catch_up(fluree: &Fluree, condemned: &Condemned, state: &SharedState) {
+    if condemned.loaded() < state.read().await.collect.next_intent {
+        load_pass(fluree, condemned, state).await;
+    }
+}
+
 /// Load what was condemned since the last pass, in order (an intent closed
 /// before it was loaded is skipped), then close what completed.
 pub async fn load_pass(fluree: &Fluree, condemned: &Condemned, state: &SharedState) {
+    let _loading = condemned.loading().await;
     let (pending, next) = {
         let state = state.read().await;
         let pending: Vec<(u64, String)> = state

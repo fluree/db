@@ -559,7 +559,10 @@ impl QueuedTransactor {
     /// presents the intents loaded when it began.
     async fn scoped<F: std::future::Future>(&self, submission: F) -> F::Output {
         match self.fluree.condemned() {
-            Some(condemned) => condemned.scoped(submission).await,
+            Some(condemned) => {
+                crate::raft::collect::catch_up(&self.fluree, &condemned, &self.shared_state).await;
+                condemned.scoped(submission).await
+            }
             None => submission.await,
         }
     }

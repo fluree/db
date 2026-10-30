@@ -1033,6 +1033,17 @@ where
         }
     }
 
+    async fn delete_unlogged(
+        &self,
+        address: &str,
+    ) -> std::result::Result<(), fluree_db_core::Error> {
+        if Self::route_to_commit(address) {
+            self.commit.delete_unlogged(address).await
+        } else {
+            self.index.delete_unlogged(address).await
+        }
+    }
+
     async fn delete_many(&self, addresses: &[String]) -> Vec<(String, fluree_db_core::Error)> {
         let (commit, index): (Vec<String>, Vec<String>) = addresses
             .iter()
@@ -1264,6 +1275,13 @@ impl StorageWrite for AddressIdentifierResolverStorage {
     /// Deletes always go to the default storage
     async fn delete(&self, address: &str) -> std::result::Result<(), fluree_db_core::Error> {
         self.default.delete(address).await
+    }
+
+    async fn delete_unlogged(
+        &self,
+        address: &str,
+    ) -> std::result::Result<(), fluree_db_core::Error> {
+        self.default.delete_unlogged(address).await
     }
 
     async fn delete_many(&self, addresses: &[String]) -> Vec<(String, fluree_db_core::Error)> {
@@ -3972,6 +3990,9 @@ struct RootHold {
     /// The ledger the next garbage collection starts with: the first the
     /// last ran out of time for.
     collect_from: Arc<parking_lot::Mutex<Option<String>>>,
+    /// On a cluster's leader: when it first saw each open intent, which
+    /// begins deleting a settle period later.
+    intents_seen: Arc<parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>>,
 }
 
 impl Fluree {

@@ -378,7 +378,15 @@ impl Worker {
     /// presents the intents loaded when staging began.
     async fn try_advance_head(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
         match self.staging.fluree.condemned() {
-            Some(condemned) => condemned.scoped(self.stage_and_advance(entry)).await,
+            Some(condemned) => {
+                crate::raft::collect::catch_up(
+                    &self.staging.fluree,
+                    &condemned,
+                    &self.shared_state,
+                )
+                .await;
+                condemned.scoped(self.stage_and_advance(entry)).await
+            }
             None => self.stage_and_advance(entry).await,
         }
     }

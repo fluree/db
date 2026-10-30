@@ -12,7 +12,7 @@
 //! Loading an intent spares what scopes under way already stored of it, so
 //! their writes need not be refused.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -22,6 +22,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
+
+use fluree_db_core::ContentId;
 
 use crate::{ApiError, Fluree, Result};
 
@@ -41,10 +43,58 @@ pub struct IntentEntry {
     pub address: String,
     /// Why it is collectable.
     pub reason: String,
+    /// The ledger whose branches decide whether it is still unreferenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<String>,
+    /// The garbage record that named it, dropped once it is decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+}
+
+/// A cluster's collection, proposed on its leader; see the module docs.
+#[async_trait]
+pub trait Collector: Send + Sync + std::fmt::Debug {
+    /// Condemn what the intent object `intent` names: its number.
+    async fn condemn(&self, intent: &str) -> Result<u64>;
+
+    /// Begin intent `number`'s deletion: what writers spared; `None` once
+    /// the intent is closed.
+    async fn delete(&self, number: u64) -> Result<Option<Vec<String>>>;
+
+    /// Close intent `number`: its deletes are done.
+    async fn complete(&self, number: u64) -> Result<()>;
+
+    /// The open intents: number, object hash, and whether deleting.
+    async fn open(&self) -> Vec<(u64, String, bool)>;
+
+    /// What ledger `ledger`'s queued requests, and the requests its
+    /// idempotency records keep, name: their envelopes, and what a queued
+    /// envelope names (a raw body, pushed commits).
+    async fn queued(&self, fluree: &Fluree, ledger: &str) -> Result<HashSet<ContentId>>;
+
+    /// Until when this member, as leader, may delete: no other leader can
+    /// be elected, and complete an intent, before then. `None` when it is
+    /// not the leader.
+    async fn lease(&self) -> Option<std::time::Instant>;
 }
 
 impl Fluree {
-    fn intent_address(&self, method: &str, hash: &str) -> String {
+    /// Collect this cluster member's garbage through `collector`, when it
+    /// leads.
+    pub fn set_collector(&self, collector: Arc<dyn Collector>) {
+        if let Some(runtime) = self.retention.erasure.get() {
+            let _ = runtime.collector.set(collector);
+        }
+    }
+
+    /// The cluster's collection, on a cluster member.
+    pub(crate) fn collector(&self) -> Option<&Arc<dyn Collector>> {
+        self.retention.erasure.get()?.collector.get()
+    }
+}
+
+impl Fluree {
+    pub(crate) fn intent_address(&self, method: &str, hash: &str) -> String {
         format!("fluree:{method}://{INTENT_DIR}/{hash}.json")
     }
 
@@ -129,6 +179,8 @@ pub struct Condemned {
     inner: Mutex<Inner>,
     closed: Notify,
     spare: OnceLock<Arc<dyn Spare>>,
+    /// Held to load: by the member's loader, and by a writer catching up.
+    loading: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -163,6 +215,11 @@ impl Condemned {
     /// Intents numbered below this are loaded.
     pub fn loaded(&self) -> u64 {
         self.inner.lock().loaded
+    }
+
+    /// Held to load intents, one loader at a time.
+    pub async fn loading(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.loading.lock().await
     }
 
     /// [`Self::loaded`] where this member's writes are checked.
@@ -259,6 +316,9 @@ impl Condemned {
         let mut stored_here = Vec::new();
         {
             let mut inner = self.inner.lock();
+            if number < inner.loaded {
+                return Ok(());
+            }
             if number != inner.loaded {
                 return Err(ApiError::internal(format!(
                     "intent {number} loaded out of order; {} expected",

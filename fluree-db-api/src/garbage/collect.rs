@@ -29,6 +29,10 @@ pub struct GarbageReport {
     /// Records past their grace period left for a later pass: pinned, or
     /// their ledger unsettled.
     pub deferred: usize,
+    /// On a cluster: blobs condemned for the next pass to delete.
+    pub condemned: usize,
+    /// On a cluster: condemned blobs a writer stored again.
+    pub spared: usize,
     /// Records past their grace period the pass ran out of time for.
     pub left: usize,
     /// Ledgers the pass ran out of time before reaching.
@@ -60,6 +64,21 @@ impl Fluree {
         self.collect_garbage_within(grace, None).await
     }
 
+    /// A cluster member's collection pass with intents settling for `settle`
+    /// rather than [`SETTLE`](super::cluster::SETTLE); for tests.
+    #[cfg(feature = "testing")]
+    pub async fn collect_garbage_settled(
+        &self,
+        grace: Duration,
+        settle: Duration,
+    ) -> Result<GarbageReport> {
+        let collector = self
+            .collector()
+            .ok_or_else(|| crate::ApiError::internal("not a cluster member"))?;
+        self.collect_in_cluster(collector, grace, settle, None)
+            .await
+    }
+
     /// [`Self::collect_garbage`], starting nothing more once `budget` is
     /// spent: a soft limit, since a ledger's records are read and its
     /// branches loaded whole. The next pass starts with the first ledger
@@ -70,6 +89,11 @@ impl Fluree {
         budget: Option<Duration>,
     ) -> Result<GarbageReport> {
         let deadline = budget.and_then(|b| Instant::now().checked_add(b));
+        if let Some(collector) = self.collector() {
+            return self
+                .collect_in_cluster(collector, grace, super::cluster::SETTLE, deadline)
+                .await;
+        }
         let Some(pins) = self.blob_pins().cloned() else {
             return Ok(GarbageReport::default());
         };
@@ -207,7 +231,10 @@ impl Fluree {
 
 /// `ledgers` by name, from `from` on and then the rest, so a pass resumes
 /// with the ledger the last ran out of time for.
-fn resume_order<T>(mut ledgers: Vec<(String, T)>, from: Option<String>) -> Vec<(String, T)> {
+pub(super) fn resume_order<T>(
+    mut ledgers: Vec<(String, T)>,
+    from: Option<String>,
+) -> Vec<(String, T)> {
     ledgers.sort_by(|a, b| a.0.cmp(&b.0));
     if let Some(from) = from {
         let at = ledgers.partition_point(|(name, _)| *name < from);

@@ -8,6 +8,7 @@
 //! one process writes.
 
 mod check;
+mod cluster;
 mod collect;
 mod reconcile;
 #[cfg(test)]
@@ -134,6 +135,12 @@ impl Fluree {
         self.root.pins.as_ref()
     }
 
+    /// Whether this instance collects garbage: it holds its root's lock, or
+    /// it is a cluster member, whose leader collects.
+    pub(crate) fn collects_garbage(&self) -> bool {
+        self.blob_pins().is_some() || self.collector().is_some()
+    }
+
     /// The pins that waited for a collector to finish with their blob;
     /// `None` where this instance does not collect.
     pub fn pin_waits(&self) -> Option<PinWaits> {
@@ -163,7 +170,7 @@ impl Fluree {
     /// collected: wherever writers pin, whichever instance writes.
     pub(crate) async fn record_garbage(&self, blobs: &[Blob], reason: GarbageReason) -> Result<()> {
         let storage = self.garbage_storage()?;
-        if storage.blob_pins().is_none() || blobs.is_empty() {
+        if !self.collects_garbage() || blobs.is_empty() {
             return Ok(());
         }
         let method = storage.storage_method().to_string();

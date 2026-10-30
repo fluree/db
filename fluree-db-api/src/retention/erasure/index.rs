@@ -991,6 +991,10 @@ impl StorageWrite for ErasureStorage {
         self.inner.delete(address).await
     }
 
+    async fn delete_unlogged(&self, address: &str) -> fluree_db_core::Result<()> {
+        self.inner.delete_unlogged(address).await
+    }
+
     async fn delete_many(&self, addresses: &[String]) -> Vec<(String, fluree_db_core::Error)> {
         self.inner.delete_many(addresses).await
     }

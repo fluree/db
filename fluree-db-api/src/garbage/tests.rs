@@ -431,3 +431,167 @@ async fn a_collection_out_of_time_loads_nothing() {
     assert_eq!(report.deleted, 3, "{report:?}");
     assert_eq!(*fluree.root.collect_from.lock(), None);
 }
+
+mod cluster {
+    use std::collections::{BTreeMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+    use fluree_db_core::{content_address, ContentId, ContentKind, ContentStore as _};
+    use parking_lot::Mutex;
+    use serde_json::json;
+
+    use super::file_fluree;
+    use crate::collect::Collector;
+    use crate::{Fluree, Result};
+
+    /// An open intent: its object's hash, whether deleting, what is spared.
+    type Open = (String, bool, Vec<String>);
+
+    /// The replicated collection state, kept here.
+    #[derive(Debug, Default)]
+    struct Cluster {
+        intents: Mutex<BTreeMap<u64, Open>>,
+        next: Mutex<u64>,
+        queued: Mutex<HashSet<ContentId>>,
+        deposed: AtomicBool,
+    }
+
+    impl Cluster {
+        fn spare(&self, number: u64, address: &str) {
+            let mut intents = self.intents.lock();
+            let (_, deleting, spared) = intents.get_mut(&number).expect("open");
+            assert!(!*deleting);
+            spared.push(address.to_string());
+        }
+    }
+
+    #[async_trait]
+    impl Collector for Cluster {
+        async fn condemn(&self, intent: &str) -> Result<u64> {
+            let mut next = self.next.lock();
+            self.intents
+                .lock()
+                .insert(*next, (intent.to_string(), false, Vec::new()));
+            *next += 1;
+            Ok(*next - 1)
+        }
+
+        async fn delete(&self, number: u64) -> Result<Option<Vec<String>>> {
+            Ok(self.intents.lock().get_mut(&number).map(|intent| {
+                intent.1 = true;
+                intent.2.clone()
+            }))
+        }
+
+        async fn complete(&self, number: u64) -> Result<()> {
+            self.intents.lock().remove(&number);
+            Ok(())
+        }
+
+        async fn open(&self) -> Vec<(u64, String, bool)> {
+            self.intents
+                .lock()
+                .iter()
+                .map(|(n, (hash, deleting, _))| (*n, hash.clone(), *deleting))
+                .collect()
+        }
+
+        async fn queued(&self, _fluree: &Fluree, _ledger: &str) -> Result<HashSet<ContentId>> {
+            Ok(self.queued.lock().clone())
+        }
+
+        async fn lease(&self) -> Option<Instant> {
+            (!self.deposed.load(Ordering::SeqCst)).then(|| Instant::now() + Duration::from_secs(1))
+        }
+    }
+
+    async fn pass(fluree: &Fluree, cluster: &Arc<Cluster>) -> crate::garbage::GarbageReport {
+        let collector: Arc<dyn Collector> = cluster.clone();
+        fluree
+            .collect_in_cluster(&collector, Duration::ZERO, Duration::ZERO, None)
+            .await
+            .unwrap()
+    }
+
+    /// A pass condemns the recorded blobs nothing references, and the next
+    /// deletes those still unreferenced and not spared, then closes the
+    /// intent. A member deposed mid-deletion stops; the intent stays open
+    /// and the next leader carries it on.
+    #[tokio::test]
+    async fn a_cluster_condemns_what_is_unreferenced_and_deletes_it_on_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        fluree.create_ledger("swept").await.unwrap();
+        let ledger = fluree.ledger("swept:main").await.unwrap();
+        fluree
+            .insert(
+                ledger,
+                &json!({"@id": "http://example.org/a", "http://example.org/name": "a"}),
+            )
+            .await
+            .unwrap();
+        let namespace = fluree.storage_namespace("swept:main").await.unwrap();
+        let mut strays = Vec::new();
+        for n in 0..4 {
+            let id = fluree
+                .content_store(&namespace)
+                .put(ContentKind::Txn, format!("{{\"stray\":{n}}}").as_bytes())
+                .await
+                .unwrap();
+            let address =
+                content_address("file", ContentKind::Txn, &namespace, &id.address_digest());
+            strays.push((id, address));
+        }
+        let exists = |address: &str| {
+            let storage = fluree.admin_storage().unwrap();
+            let address = address.to_string();
+            async move { storage.exists(&address).await.unwrap() }
+        };
+        fluree.reconcile_garbage("swept").await.unwrap().unwrap();
+        let cluster = Arc::new(Cluster::default());
+        // A queued request names the last.
+        cluster.queued.lock().insert(strays[3].0.clone());
+
+        let first = pass(&fluree, &cluster).await;
+        assert_eq!(first.condemned, 3, "{first:?}");
+        assert_eq!(first.resolved, 1, "{first:?}");
+        for (_, address) in &strays {
+            assert!(exists(address).await, "condemned, not deleted");
+        }
+
+        // A writer stores the second again; a request names the third.
+        cluster.spare(0, &strays[1].1);
+        cluster.queued.lock().insert(strays[2].0.clone());
+        let second = pass(&fluree, &cluster).await;
+        assert_eq!(
+            (second.deleted, second.spared, second.resolved),
+            (1, 1, 1),
+            "{second:?}"
+        );
+        assert!(cluster.intents.lock().is_empty(), "closed");
+        assert!(!exists(&strays[0].1).await);
+        for (_, address) in &strays[1..] {
+            assert!(exists(address).await);
+        }
+
+        // The spared one's writer abandoned it: reconciliation records it
+        // again and it is condemned, but the member is deposed before it
+        // deletes anything; the next pass carries the intent on.
+        fluree.reconcile_garbage("swept").await.unwrap().unwrap();
+        let third = pass(&fluree, &cluster).await;
+        assert_eq!((third.condemned, third.resolved), (1, 2), "{third:?}");
+        cluster.deposed.store(true, Ordering::SeqCst);
+        let deposed = pass(&fluree, &cluster).await;
+        assert_eq!(deposed.deleted, 0, "{deposed:?}");
+        assert!(exists(&strays[1].1).await);
+        assert!(cluster.intents.lock()[&1].1, "left deleting");
+        cluster.deposed.store(false, Ordering::SeqCst);
+        let resumed = pass(&fluree, &cluster).await;
+        assert_eq!(resumed.deleted, 1, "{resumed:?}");
+        assert!(!exists(&strays[1].1).await);
+        assert!(cluster.intents.lock().is_empty());
+    }
+}

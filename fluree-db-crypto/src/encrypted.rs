@@ -529,6 +529,10 @@ where
         self.inner.delete(address).await
     }
 
+    async fn delete_unlogged(&self, address: &str) -> fluree_db_core::error::Result<()> {
+        self.inner.delete_unlogged(address).await
+    }
+
     async fn delete_many(
         &self,
         addresses: &[String],

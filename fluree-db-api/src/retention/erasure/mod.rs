@@ -79,6 +79,8 @@ pub(crate) struct ErasureRuntime {
     /// What a cluster's collection condemned, checked by this storage's
     /// writes.
     pub(crate) condemned: Arc<crate::collect::Condemned>,
+    /// A cluster member's collection, run when it leads.
+    pub(crate) collector: std::sync::OnceLock<Arc<dyn crate::collect::Collector>>,
     pub(crate) config: Option<ErasureConfig>,
     /// A step is being proved.
     in_flight: AtomicBool,
@@ -124,6 +126,7 @@ impl ErasureRuntime {
         ErasureRuntime {
             index,
             condemned,
+            collector: Default::default(),
             config,
             in_flight: AtomicBool::new(false),
             purge_in_flight: AtomicBool::new(false),

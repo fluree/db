@@ -206,15 +206,20 @@ impl Fluree {
         not_before: Option<i64>,
         listing: &mut Option<Listing>,
     ) -> Result<Option<ReconcileReport>> {
-        let Some(pins) = self.blob_pins() else {
+        if !self.collects_garbage() {
             return Ok(None);
-        };
+        }
         let Some(binding) = self.publisher()?.get_binding(name).await? else {
             return Ok(None);
         };
         let binding = binding.value;
-        let Some(_pass) = pins.try_collect_root(&binding.root) else {
-            return Ok(None);
+        // A cluster's reconciliation and collection run in one leader task.
+        let _pass = match self.blob_pins() {
+            Some(pins) => match pins.try_collect_root(&binding.root) {
+                Some(pass) => Some(pass),
+                None => return Ok(None),
+            },
+            None => None,
         };
         let storage = self.garbage_storage()?;
         let method = storage.storage_method().to_string();
@@ -364,7 +369,7 @@ impl Fluree {
     /// than `every` ago; one that cannot be reconciled yet is passed over.
     pub async fn reconcile_due(&self, every: Duration, budget: Duration) -> Result<ReconcilePass> {
         let mut pass = ReconcilePass::default();
-        if self.blob_pins().is_none() {
+        if !self.collects_garbage() {
             return Ok(pass);
         }
         let started = Instant::now();

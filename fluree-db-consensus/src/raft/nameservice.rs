@@ -844,6 +844,7 @@ pub struct StagedCommit {
 }
 
 mod activation;
+mod collection;
 pub mod read_index;
 mod wire;
 
