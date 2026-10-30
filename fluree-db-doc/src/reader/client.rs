@@ -76,6 +76,26 @@ impl Usage {
         };
     }
 
+    /// `1,032 tokens, cache 900 read / 0 written, 3.40 fuel`, for a
+    /// document's line or a run's total; empty when nothing was billed.
+    pub fn note(&self) -> String {
+        let mut parts = Vec::new();
+        if self.input_tokens > 0 {
+            parts.push(format!("{} tokens", thousands(self.input_tokens)));
+        }
+        if self.cache_read_tokens > 0 || self.cache_write_tokens > 0 {
+            parts.push(format!(
+                "cache {} read / {} written",
+                thousands(self.cache_read_tokens),
+                thousands(self.cache_write_tokens)
+            ));
+        }
+        if let Some(fuel) = self.fuel {
+            parts.push(format!("{fuel:.2} fuel"));
+        }
+        parts.join(", ")
+    }
+
     fn from_headers(headers: &ureq::http::HeaderMap) -> Self {
         let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let counts = |name: &str| -> Vec<u64> {
@@ -246,6 +266,18 @@ impl ReaderClient {
             }
         }
     }
+}
+
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// What an error body says: its `error` / `message` / `details`, else the
@@ -428,6 +460,28 @@ mod tests {
             .unwrap_err();
         assert_eq!(seen.lock().unwrap().len(), ATTEMPTS as usize);
         assert!(err.to_string().contains("503"), "{err}");
+    }
+
+    #[test]
+    fn usage_reads_like_a_receipt() {
+        let usage = Usage {
+            input_tokens: 1_032,
+            windows: 1,
+            ..Default::default()
+        };
+        assert_eq!(usage.note(), "1,032 tokens");
+        let usage = Usage {
+            input_tokens: 1_234_567,
+            windows: 3,
+            cache_read_tokens: 900,
+            cache_write_tokens: 12,
+            fuel: Some(3.4),
+        };
+        assert_eq!(
+            usage.note(),
+            "1,234,567 tokens, cache 900 read / 12 written, 3.40 fuel"
+        );
+        assert_eq!(Usage::default().note(), "");
     }
 
     #[test]
