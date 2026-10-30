@@ -90,6 +90,8 @@ The request is malformed or contains invalid data.
 - Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 - A `t` beyond the ledger's current head (`err:api/BadRequest`), such as syncing a search index through a commit that does not exist yet
 - A graph source's connection, auth or storage identity refused before anything is built (`err:api/InvalidGraphSourceConfig`): an unknown field, flat and structured fields mixed, auth given two ways or only partly, or an environment variable the server does not list. The message names the field, never its value. See [Iceberg connection](endpoints.md#iceberg-connection)
+- A graph source's Google credential configuration refused (`err:auth/GoogleCredentialsInvalid`): a Workload Identity Federation configuration with a field outside the accepted subset, a malformed service-account key, or a `quota_project` that is not a project id. Names the field, never its value
+- A path the source's storage identity does not serve (`err:storage/SchemeNotServed`): a `gs://` file on an AWS identity with no GCS interoperability endpoint, an `s3://` file on a Google identity, or a local path a catalog returned. The identity is chosen by the source's `io.storage_auth`, never by the path
 
 **Error typing:**
 
@@ -120,6 +122,7 @@ Authentication is required but not provided or invalid.
 - Invalid API key
 - Expired JWT token
 - Invalid signature (for signed requests)
+- Google refused the token exchange for a graph source's identity (`err:auth/GoogleTokenExchange`): the service-account key, WIF configuration or user credentials were not accepted. `403` when Google answered `PERMISSION_DENIED`, `502` when it gave no usable answer. The message carries Google's error code, never a response body
 
 **Example:**
 ```json
@@ -163,6 +166,9 @@ A query over a graph source also returns `403` when the source's catalog or obje
 - `err:catalog/AccessDenied`: the catalog refused the table to the principal the source uses. This covers Iceberg REST catalogs (a `403` from `loadTable`, or a `401` that persists after one token refresh), AWS Glue and S3 Tables (the server's AWS identity lacks the catalog permission or a Lake Formation grant), and Unity Catalog for Delta sources. `error` reads `Catalog denied access to table '<table>': …`, followed by the catalog's own reply. On a query, AWS identities in that reply (the server's role and account, as `arn:…`) are replaced with `arn:<redacted>`; the full text is in the server log.
 - `err:catalog/CredentialsNotVended`: an Iceberg REST catalog authorized the table but vended no storage credentials, and the source requires them. The read is refused rather than made with the server's own AWS identity.
 - `err:storage/AccessDenied`: the catalog answered, but the object store refused a read of the table's files (`Storage access denied for s3://…`). As above, a query's error redacts AWS identities from the store's reason and the server logs the full text.
+- `err:catalog/QuotaProjectRequired`: a Google catalog (BigLake) refused the request because it names no quota project. Set the source's `quota_project` (see [Iceberg on Google](../graph-sources/iceberg.md)); a broader grant does not help.
+- `err:auth/HostIdentityRefused`: the source asked for an identity borrowed from the host (ambient AWS, ambient Azure, the GCE/GKE metadata server, the host's application-default credentials, host-signed WIF) that the operator's `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES` does not allow; or an ambient AWS source named a bucket outside `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS`, or an `s3_endpoint` while that list is set; or a Google host identity's token would go to a host outside Google's APIs and `FLUREE_GOOGLE_TOKEN_HOSTS`. See [Configuration](../operations/configuration.md).
+- `err:auth/GoogleTokenExchange` (`403` when Google answered `PERMISSION_DENIED`): see [401](#401-unauthorized).
 
 See [Iceberg → Connection Issues](../graph-sources/iceberg.md#connection-issues) for causes and fixes.
 
@@ -442,6 +448,7 @@ Error communicating with upstream service.
 - Storage backend unavailable
 - Nameservice unavailable
 - Network error
+- Google's token endpoint or metadata server gave no usable answer for a graph source's identity (`err:auth/GoogleTokenExchange`)
 
 **Example:**
 ```json

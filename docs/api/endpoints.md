@@ -3122,7 +3122,7 @@ The structured `io`:
 | `vended_credentials` | bool | The older form of `storage_auth` (`true`: `vended`, `false`: `ambient`); default `true` for a REST catalog. Set to agree with `storage_auth` when that is given; a contradicting value is refused |
 | `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
 
-An explicit `null` is an absent field, in either form. The legacy untagged catalog a stored record may hold (`{"uri": …, "auth": …}` with no `type`, read as REST) is accepted, so a read-out of an old record can be sent back.
+An explicit `null` is an absent field, in either form. The legacy untagged catalog a stored record may hold (`{"uri": …, "auth": …}` with no `type`, read as REST) is accepted, so a read-out of an old record can be sent back. A catalog that states its `type` is read as that type only: `{"type": "direct", "uri": …}` is refused for its missing `table_location`, never read as REST.
 
 A `<secret>` is a literal (stored with the source) or `{"env_var": "NAME"}`, an environment variable of the server that the operator lists in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) (the value is not stored). A service-account key is never a literal: it would be stored with the source. `{"secret_ref": …}` is accepted only by an embedded `Fluree` with a secret resolver, and `default_val`, `java_property` and a `google_metadata` `metadata_url` never.
 
@@ -3144,6 +3144,8 @@ The flat fields:
 | `s3_region`, `s3_endpoint`, `s3_path_style` | | As in the structured `io` |
 
 Refused with `400` and `err:api/InvalidGraphSourceConfig`, the message naming the field: an unknown field (also inside `catalog` and `io`); flat and structured fields together; two ways to authenticate at once (a bearer beside OAuth2 or a Google identity, two Google sources); auth given only partly (an OAuth2 token URL without its secret, `auth_google_scopes` without `auth_google_metadata`); a literal and its `_env` together; an environment variable the operator does not list; a REST-only setting (auth, warehouse, vended credentials) in another mode. A storage identity the catalog cannot serve (`catalog` without a Google catalog identity, `vended` outside a REST catalog) and a malformed Google configuration are refused at registration with `400` (`err:system/ConfigError`, `err:auth/GoogleCredentialsInvalid`).
+
+The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) ignore the fields only `map` uses (`name`, `table`, `r2rml`, `r2rml_type`, `branch`, `model`, `default_allow`, `delete_column`, `delete_values`, `order_by`) unless the route takes the field itself, so one body can be sent to each route in turn. A field no Iceberg route knows is refused on every route.
 
 BigLake federation with a Workload Identity Federation identity, which needs no stored secret:
 
@@ -3475,12 +3477,12 @@ POST {api_base_url}/delta/map
 | `oauth2_client_id`, `oauth2_client_secret_env` / `oauth2_client_secret` | string | A Databricks service principal: its application id, and its OAuth secret as the name of a server environment variable (not stored; must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) or a literal (stored) |
 | `auth_bearer_env` / `auth_bearer` | string | A Databricks token in place of a service principal, under the same rule. It does not renew |
 | `oauth2_token_url`, `oauth2_scope`, `oauth2_audience` | string | Default to the workspace's own token endpoint, `all-apis` and none |
-
-The catalog and storage fields may instead be given structured, as the stored config spells them: `unity` (`{"uri", "catalog", "schema", "auth"}`, its `auth` a bearer or OAuth2 client credentials as on [`iceberg/map`](#iceberg-connection)) and `io` (`{"s3_region", "s3_endpoint", "s3_path_style", "azure"}`, `azure` being `{"type": "client_secret", "tenant_id", "client_id", "client_secret"}`). Not both forms at once. Every environment variable a request names, `azure_client_secret_env` included, must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. An unknown field, a catalog field without `unity_uri`, a partial Azure principal and two ways to authenticate are refused with `400` (`err:api/InvalidGraphSourceConfig`).
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
 | `delete_column`, `delete_values` | string, array | Materialization: the column and values that mark a row as deleted, as on `/iceberg/map`. With either this or `order_by`, a key's latest change replaces its subject whole; a change feed's deletes retract in either mode. See [Delta → Materialization](../graph-sources/delta.md#materialization). |
 | `order_by` | string | Materialization: an integer, date or timestamp column that orders one key's rows within a table version, and the rows the table still holds for a key a delete touched |
+
+The catalog and storage fields may instead be given structured, as the stored config spells them: `unity` (`{"uri", "catalog", "schema", "auth"}`, its `auth` a bearer or OAuth2 client credentials as on [`iceberg/map`](#iceberg-connection), an OAuth2 `auth` with no `scope` asking for `all-apis` as the flat form does) and `io` (`{"s3_region", "s3_endpoint", "s3_path_style", "azure"}`, `azure` being `{"type": "client_secret", "tenant_id", "client_id", "client_secret"}`). Not both forms at once. Every environment variable a request names, `azure_client_secret_env` included, must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. An unknown field, a catalog field without `unity_uri`, a partial Azure principal and two ways to authenticate are refused with `400` (`err:api/InvalidGraphSourceConfig`).
 
 **Response:**
 
@@ -3505,6 +3507,8 @@ See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map
 Five read-only endpoints that lead up to `delta/map` on Unity Catalog. None registers anything. All are admin-protected, since each carries a catalog credential and calls out, and are available only when the server is built with the `delta` feature. See [From a catalog to a mapping](../graph-sources/delta.md#from-a-catalog-to-a-mapping).
 
 Every body takes the Unity connection fields of `delta/map`, flat or as a structured `unity`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`, `oauth2_audience`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. `catalog/preview` and `catalog/verify` also take the S3 options (`s3_region`, `s3_endpoint`, `s3_path_style`, or a structured `io`), but no Azure principal: Unity issues the table's credentials. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
+
+So that one body can be sent to each route in turn, a read-only route ignores what only `delta/map` uses, unless it takes the field itself: `name`, `root`, `tables`, `r2rml`, `r2rml_type`, `branch`, `model`, `default_allow`, `delete_column`, `delete_values`, `order_by`, the Azure principal (`azure_*`, or `io.azure`), and, on `catalog/browse` and `r2rml/generate`, which read no table, the S3 options and `io`. A field no Delta route knows is refused on every route.
 
 | Endpoint | Further fields | Answer |
 |---|---|---|

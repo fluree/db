@@ -56,6 +56,8 @@ JSON
 
 `auth_bearer_env` names a server environment variable that the operator lists in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`; `auth_bearer` is the token itself, stored with the source. The auth may instead be given as a structured `auth`, the stored shape, which is also how a Google identity is given. A body that gives auth two ways, or only partly, is refused with `400`.
 
+A Google identity's token goes to the SQL endpoint, but a **host** identity's token (the metadata server's, the host's application-default credentials, WIF signed with the host's own AWS identity) is sent only to Google's APIs (`https` on `googleapis.com`) and the hosts the operator lists in `FLUREE_GOOGLE_TOKEN_HOSTS`. Against an ordinary Trino endpoint, then, only a service-account key (`--auth-google-service-account-env`, or `{"source": "service_account"}`) works unless the operator lists the endpoint's host; a host identity is refused with `403` (`err:auth/HostIdentityRefused`) before a token is minted.
+
 === Rust
 
 ```rust

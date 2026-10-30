@@ -445,7 +445,12 @@ Direct mode assumes `table_location` points at a **valid Iceberg table layout** 
 
 ### Google Cloud Storage (GCS)
 
-Fluree can read Iceberg tables stored in Google Cloud Storage over the GCS **S3-interoperability** endpoint. Set `s3_endpoint` to that endpoint and use path-style addressing:
+Fluree reads an Iceberg table's `gs://` files in one of two ways, chosen by the source's storage identity (`io.storage_auth`), never by the path:
+
+- **With a Google identity, through the native GCS reader.** This is the path for every Google identity: the source's own (`storage_auth: google`: a service-account key in an environment variable, Workload Identity Federation, the metadata server, application-default credentials), the REST catalog's (`storage_auth: catalog`, what [BigLake federation](#google-biglake) needs), and a GCS token the catalog vends for the table (`storage_auth: vended`). The reader sends OAuth tokens minted for read-only storage (a user's own credentials carry their `cloud-platform` scope instead; see [token scopes](#google-biglake)) to Google's storage host only (or the operator's `FLUREE_GCS_ENDPOINT`; no source can choose it), renews a token before it expires and once more on a `401`, and reports a `403` as `err:storage/AccessDenied`. It never falls back to the host's own credentials: a host identity is used only when the source names it, and its token goes only to Google's APIs and the hosts the operator lists in `FLUREE_GOOGLE_TOKEN_HOSTS`. See [Iceberg connection](../api/endpoints.md#iceberg-connection) for the `storage_auth` forms.
+- **With AWS credentials, through the GCS S3-interoperability endpoint**, signed with HMAC interoperability keys, as described below.
+
+To read over the S3-interoperability endpoint, set `s3_endpoint` to that endpoint and use path-style addressing:
 
 ```json
 {
@@ -460,9 +465,9 @@ Fluree can read Iceberg tables stored in Google Cloud Storage over the GCS **S3-
 }
 ```
 
-GCS-backed tables are read through the **same AWS S3 SDK path** as any other S3-compatible store, with one adjustment: the SDK's transport is pinned to **HTTP/1.1**. Reading byte-range requests from GCS through the SDK over HTTP/2 fails (smithy-rs mishandles the partial-content response body), and the Parquet reader is range-based, so data reads would otherwise fail even though metadata reads succeed. HTTP/1.1 handles GCS range responses correctly, and only the Parquet footer plus the column chunks a query needs are fetched — never the whole object. AWS S3 and other S3-compatible stores serve range reads over HTTP/1.1 identically, so this is transparent for every endpoint. (Response-checksum validation is also disabled for these reads, because an object-level checksum cannot validate a partial byte range.)
+Over this endpoint, GCS-backed tables are read through the **same AWS S3 SDK path** as any other S3-compatible store, with one adjustment: the SDK's transport is pinned to **HTTP/1.1**. Reading byte-range requests from GCS through the SDK over HTTP/2 fails (smithy-rs mishandles the partial-content response body), and the Parquet reader is range-based, so data reads would otherwise fail even though metadata reads succeed. HTTP/1.1 handles GCS range responses correctly, and only the Parquet footer plus the column chunks a query needs are fetched — never the whole object. AWS S3 and other S3-compatible stores serve range reads over HTTP/1.1 identically, so this is transparent for every endpoint. (Response-checksum validation is also disabled for these reads, because an object-level checksum cannot validate a partial byte range.)
 
-Because reads go through the AWS SDK, GCS inherits the SDK's correct SigV4 signing — including partition directories like `event_date=2024-01-01/` and values with spaces or non-ASCII characters — plus credential refresh and retries.
+Because these reads go through the AWS SDK, GCS inherits the SDK's correct SigV4 signing — including partition directories like `event_date=2024-01-01/` and values with spaces or non-ASCII characters — plus credential refresh and retries.
 
 **Authentication.** Requests are signed with **AWS SigV4** using GCS **HMAC interoperability keys**, resolved from the standard AWS credential chain. Set them as you would for any S3 access:
 
@@ -472,11 +477,11 @@ export AWS_SECRET_ACCESS_KEY=<gcs-hmac-secret>
 # s3_region in the config is the SigV4 signing region (the bucket location).
 ```
 
-A signing region is required and must match the bucket location — SigV4 scopes the signature to a region, and GCS interop rejects a mismatched or unsigned region. Set it via `s3_region` in the config (recommended, and what the examples use) or via the ambient `AWS_REGION` in the server environment. `s3_endpoint` must be the interop host, and `s3_path_style` must be `true`. HMAC keys do not expire; in `rest` mode, credentials vended by the catalog for a GCS-backed table are used instead (and refreshed by the SDK).
+A signing region is required and must match the bucket location — SigV4 scopes the signature to a region, and GCS interop rejects a mismatched or unsigned region. Set it via `s3_region` in the config (recommended, and what the examples use) or via the ambient `AWS_REGION` in the server environment. `s3_endpoint` must be the interop host, and `s3_path_style` must be `true`. HMAC keys do not expire. In `rest` mode with vended credentials, the catalog's credentials for the table are used instead (S3 interoperability keys through this path, a GCS token through the native reader), and are renewed by asking the catalog again before they expire.
 
 GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
 
-**BigLake REST catalog (catalog auth, distinct from the storage HMAC above; see also [Google BigLake](#google-biglake)).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token** — separate from the HMAC keys that read the `gs://` data files. A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. Off GCP, a structured `{"type": "google", "credentials": …}` catalog auth refreshes too: a service-account key held in an environment variable, Workload Identity Federation from AWS, or (locally) application-default credentials; see [Iceberg connection](../api/endpoints.md#iceberg-connection). The storage HMAC keys are unaffected — they don't expire.
+**BigLake REST catalog (catalog auth, distinct from the storage identity above; see also [Google BigLake](#google-biglake)).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token**, separately from whatever reads the `gs://` data files (the catalog's own identity with `storage_auth: catalog`, another Google identity, vended credentials, or HMAC keys). A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. Off GCP, a structured `{"type": "google", "credentials": …}` catalog auth refreshes too: a service-account key held in an environment variable, Workload Identity Federation from AWS, or (locally) application-default credentials; see [Iceberg connection](../api/endpoints.md#iceberg-connection). Storage HMAC keys, if the files are read with them, are unaffected: they don't expire.
 
 ### Google BigLake
 
@@ -486,7 +491,7 @@ Google's BigLake Iceberg REST catalog (`https://biglake.googleapis.com/iceberg/v
 
 **The catalog's quota project bills the catalog only.** With `storage_auth: catalog`, the files are read with the catalog's identity but not its quota project: sent to GCS, `x-goog-user-project` is a requester-pays billing project, which would make every read need `serviceusage.services.use` on it. A storage read names a billing project only when one is configured for storage: `storage_auth: google`'s `quota_project` (`--storage-google-quota-project`) for a requester-pays bucket, or the `gcs.user-project` a catalog vends.
 
-**Minimum roles for the catalog identity**, as validated against BigLake federation with a service-account identity and `storage_auth: catalog` (WIF impersonating the same service account reads the same way):
+**Minimum roles for the catalog identity**, for BigLake federation with a service-account identity and `storage_auth: catalog` (WIF impersonating the same service account needs the same):
 
 | Role | Granted on | For |
 |------|------------|-----|
@@ -495,7 +500,7 @@ Google's BigLake Iceberg REST catalog (`https://biglake.googleapis.com/iceberg/v
 | `roles/storage.objectViewer` | the bucket | reading the table's metadata and data files (`storage_auth: catalog`) |
 | `roles/serviceusage.serviceUsageConsumer` | the quota project, only if it is not the project that holds the tables | billing BigLake's requests to another project |
 
-None is needed when the quota project is the project that holds the tables (the default from the warehouse); if you bill a different project, the identity also needs `roles/serviceusage.serviceUsageConsumer` there. The first case was validated live; the second is Google's rule for `x-goog-user-project` and was not tested.
+None is needed when the quota project is the project that holds the tables (the default from the warehouse); if you bill a different project, the identity also needs `roles/serviceusage.serviceUsageConsumer` there (Google's rule for `x-goog-user-project`).
 
 **Token scopes.** A service account, Workload Identity Federation and the metadata server mint storage tokens for `devstorage.read_only` only. User credentials (gcloud's `application-default login`, an `authorized_user` file) cannot be narrowed that way: a refresh grant may ask only for scopes the user consented to, and gcloud's login consents to `cloud-platform`, so asking for `devstorage.read_only` is refused (`invalid_scope`). A user's token therefore carries the user's own `cloud-platform` scope, for the catalog and for storage alike (one token serves both). User credentials are for development on your own machine; on a server they are a host identity the operator can refuse (`google-adc` in `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`).
 
