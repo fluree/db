@@ -341,6 +341,43 @@ fn push_type(node: &mut Value, t: &str) {
     }
 }
 
+/// A reading (expanded JSON-LD nodes) as a graph, for printing it as
+/// Turtle or TriG.
+pub fn to_graph(nodes: &[Value]) -> Result<fluree_graph_ir::Graph> {
+    let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+    fluree_graph_json_ld::adapter::to_graph_events(&Value::Array(nodes.to_vec()), &mut sink)
+        .map_err(|e| DocError::Model(format!("reading: {e}")))?;
+    Ok(sink.into_graph())
+}
+
+/// The prefixes a printed reading is written with: this pipeline's own.
+pub fn prefixes() -> fluree_graph_format::PrefixMap {
+    fluree_graph_format::PrefixMap::from_context(&crate::vocab::context())
+}
+
+/// The reading as Turtle.
+pub fn turtle(nodes: &[Value]) -> Result<String> {
+    let graph = to_graph(nodes)?;
+    fluree_graph_format::format_turtle(&graph, &prefixes())
+        .map_err(|e| DocError::Model(format!("reading: {e}")))
+}
+
+/// The structure graph and the reading as TriG, each in its own named
+/// graph: `<doc>` and `<doc>/reading`.
+pub fn trig(doc_iri: &str, structure: &fluree_graph_ir::Graph, nodes: &[Value]) -> Result<String> {
+    let mut dataset = fluree_graph_ir::Dataset::new();
+    let doc = fluree_graph_ir::Term::iri(doc_iri);
+    for t in structure.iter() {
+        dataset.graph_mut(Some(&doc)).add(t.clone());
+    }
+    let reading = fluree_graph_ir::Term::iri(format!("{doc_iri}/reading"));
+    for t in to_graph(nodes)?.iter() {
+        dataset.graph_mut(Some(&reading)).add(t.clone());
+    }
+    fluree_graph_format::format_trig(&dataset, &prefixes())
+        .map_err(|e| DocError::Model(format!("reading: {e}")))
+}
+
 /// Offsets in a reading, for tests and for `doc read`: every `nif:beginIndex`
 /// in the nodes.
 pub fn begin_offsets(nodes: &[Value]) -> Vec<u64> {
@@ -493,6 +530,34 @@ mod tests {
             "https://ns.flur.ee/doc#LocalEntity"
         );
         assert_eq!(r.mentions, 1);
+    }
+
+    #[test]
+    fn a_reading_prints_as_turtle_and_trig() {
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let r = read_answer(&answer(), &frame, None).unwrap();
+        let ttl = turtle(&r.nodes).unwrap();
+        assert!(
+            ttl.contains("@prefix doc: <https://ns.flur.ee/doc#>"),
+            "{ttl}"
+        );
+        assert!(ttl.contains("doc:Relation"), "{ttl}");
+        let mut structure = fluree_graph_ir::Graph::new();
+        structure.add_triple(
+            fluree_graph_ir::Term::iri("urn:d-element-1"),
+            fluree_graph_ir::Term::iri(BEGIN),
+            fluree_graph_ir::Term::integer(0),
+        );
+        let trig = trig("urn:d", &structure, &r.nodes).unwrap();
+        assert!(
+            trig.contains("<urn:d> {") && trig.contains("<urn:d/reading> {"),
+            "{trig}"
+        );
     }
 
     #[test]
