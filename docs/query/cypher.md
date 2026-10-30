@@ -484,8 +484,10 @@ error listing the supported set.
   removes a node together with its relationships. `DELETE r` retracts the
   edge `r` was matched on, so it is refused when that edge carries another
   relationship too (a parallel relationship between the same endpoints, with
-  the same type), whether or not the `MATCH` filters that one out, and it
-  needs both endpoints named (`(a)-[r:T]->(b)`).
+  the same type), whether or not the `MATCH` filters that one out. A
+  `DETACH DELETE` of one of the edge's endpoints in the same clause
+  (`DETACH DELETE a, r`) takes every relationship on that node, so that edge
+  isn't refused.
 - **`FOREACH`** — unroll a write over a **constant** list (inline literal,
   constant `range()`, or a `$param` array), running a `CREATE` / `SET` /
   `REMOVE` body per element:
@@ -551,9 +553,8 @@ error listing the supported set.
 - **Multi-clause write composition** — a statement may chain multiple write
   clauses (`MERGE` chains, `CREATE`+`MERGE` mixes, interleaved `SET` /
   `REMOVE` / `DETACH DELETE` / a relationship's `DELETE`), with each clause
-  observing the writes of the
-  clauses before it and rows piping downstream — the standard Cypher loading
-  idioms:
+  observing the writes of the clauses before it and rows piping downstream —
+  the standard Cypher loading idioms:
 
   ```cypher
   UNWIND $rows AS row
@@ -585,7 +586,9 @@ error listing the supported set.
   row. A relationship's `DELETE` takes the properties earlier clauses set on
   it, and a `CREATE` of the same edge after it creates the one new
   relationship; it is refused when the edge carries another relationship in
-  the state the clauses before it leave.
+  the state the clauses before it leave. A row an `OPTIONAL MATCH` leaves
+  unbound skips a clause's writes to the unbound variable and keeps its
+  writes to the others.
 
   Deferred in a multi-clause statement (clear errors): a bare node `DELETE`
   and `FOREACH` members, `CALL { … }` in the read prefix, and
@@ -606,9 +609,11 @@ error listing the supported set.
   post-projection `WHERE` that gates which rows are written
   (`WITH p, p.age AS age WHERE age >= 30 SET p.adult = true`). `WITH` applies
   Cypher scoping — only projected names are visible to the write. Works before
-  `CREATE` / `SET` / `REMOVE`; `WITH` before `DELETE` is rejected (delete
-  resolution keys off the raw MATCH variables and can't honor a rename/horizon —
-  `DELETE` directly off the MATCH variables). Aggregation, `DISTINCT`, and
+  `CREATE` / `SET` / `REMOVE`; `WITH` before a lone `DELETE` is rejected
+  (delete resolution keys off the raw MATCH variables and can't honor a
+  rename/horizon — `DELETE` directly off the MATCH variables). A multi-clause
+  statement whose clauses meet stages a `DELETE` after a `WITH` in the
+  sequential driver, which honors the `WITH`'s scope. Aggregation, `DISTINCT`, and
   `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are deferred.
 - **`… RETURN <created>`** — a trailing `RETURN` of *created* entities:
   `CREATE (n:Person {name: "Alice"}) RETURN n`,
