@@ -465,17 +465,27 @@ Every Iceberg graph source requires an [R2RML mapping](r2rml.md) (Turtle format)
 
 ### Type Mapping
 
-Iceberg types map to XSD types:
+A generated mapping declares an `rr:datatype` on each column from its Iceberg
+type:
 
 | Iceberg Type | RDF Type |
 |--------------|----------|
 | int, long | xsd:integer |
-| float, double | xsd:decimal |
+| float | xsd:float |
+| double | xsd:double |
+| decimal(p, s) | xsd:decimal |
 | string | xsd:string |
 | boolean | xsd:boolean |
 | date | xsd:date |
-| timestamp | xsd:dateTime |
-| uuid | xsd:string |
+| timestamp, timestamptz | xsd:dateTime |
+| binary, fixed | xsd:hexBinary |
+
+Other types (`uuid`, `time`, and nested `struct`/`list`/`map` columns) are
+left out of a generated mapping, with a warning. The table is what the
+generator writes, not a conversion applied at read time: in a hand-written
+mapping, a column with no `rr:datatype` reads as the `xsd:string` of its
+rendered value whatever its Iceberg type (see
+[R2RML](r2rml.md#basic-mapping)).
 
 ## Querying Iceberg Tables
 
@@ -950,7 +960,9 @@ ORDER BY ?date
 
 ### Query Planning
 
-Fluree pushes filters to Iceberg:
+Fluree pushes filters to Iceberg. Here `ex:orderDate` maps a `date` column
+with `rr:datatype xsd:date`, as a generated mapping does, so the plain string
+compares as a date:
 
 ```text
 Query: SELECT ?id WHERE { ?order ex:orderDate ?date } FILTER (?date > "2024-01-01")
