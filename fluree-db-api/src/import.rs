@@ -698,6 +698,9 @@ pub struct ImportSummary {
 pub enum ImportError {
     /// Ledger creation / nameservice error.
     Api(ApiError),
+    /// The data holds a value the ledger refuses, refused as a transaction
+    /// of it is: an `Invalid vector`, or more datatypes than a ledger holds.
+    Invalid(fluree_db_transact::TransactError),
     /// Storage I/O error.
     Storage(String),
     /// TTL parse / commit error.
@@ -750,6 +753,7 @@ impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Api(e) => write!(f, "api: {e}"),
+            Self::Invalid(e) => write!(f, "{e}"),
             Self::Storage(msg) => write!(f, "storage: {msg}"),
             Self::Transact(msg) => write!(f, "transact: {msg}"),
             Self::RunGeneration(msg) => write!(f, "run generation: {msg}"),
@@ -776,6 +780,29 @@ impl std::error::Error for ImportError {}
 impl From<ApiError> for ImportError {
     fn from(e: ApiError) -> Self {
         Self::Api(e)
+    }
+}
+
+/// A value the ledger refuses keeps its type; any other failure is
+/// reported by its message, as before.
+impl From<fluree_db_transact::TransactError> for ImportError {
+    fn from(e: fluree_db_transact::TransactError) -> Self {
+        use fluree_db_transact::TransactError as TE;
+        match e {
+            TE::InvalidVector(_) | TE::DatatypeLimitExceeded { .. } => Self::Invalid(e),
+            e => Self::Transact(e.to_string()),
+        }
+    }
+}
+
+/// A parse worker's failure on chunk `idx`. A refusal names its property
+/// and graph, so only other failures name the chunk.
+fn chunk_failure(idx: usize, e: fluree_db_transact::TransactError) -> ImportError {
+    match ImportError::from(e) {
+        ImportError::Transact(msg) => {
+            ImportError::Transact(format!("parse chunk {idx} failed: {msg}"))
+        }
+        refused => refused,
     }
 }
 
@@ -4045,7 +4072,7 @@ where
     use fluree_db_indexer::run_index::{persist_namespaces, SortedCommitInfo};
     use fluree_db_transact::import::{
         finalize_parsed_chunk, import_trig_commit, parse_chunk, parse_chunk_with_prelude,
-        parse_jsonld_chunk, ImportState, ParsedChunk,
+        parse_jsonld_chunk, ImportState, JsonLdChunk, ParsedChunk,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -4164,7 +4191,9 @@ where
 
     #[allow(clippy::too_many_arguments)]
     async fn commit_parsed_chunks_in_order<S>(
-        result_rx: std::sync::mpsc::Receiver<std::result::Result<(usize, ParsedChunk), String>>,
+        result_rx: std::sync::mpsc::Receiver<
+            std::result::Result<(usize, ParsedChunk), ImportError>,
+        >,
         env: &CommitPipelineEnv<'_, S>,
         state: &mut ImportState,
         published_codes: &mut rustc_hash::FxHashSet<u16>,
@@ -4209,7 +4238,7 @@ where
                     })?
             };
             let (idx, parsed) = match recv_result {
-                Ok(chunk) => chunk.map_err(ImportError::Transact)?,
+                Ok(chunk) => chunk?,
                 Err(_) => break, // All parse workers dropped their senders.
             };
             pending.insert(idx, parsed);
@@ -4231,7 +4260,7 @@ where
                 let finalize_start = Instant::now();
                 let result = finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.alias)
                     .await
-                    .map_err(|e| ImportError::Transact(e.to_string()))?;
+                    .map_err(ImportError::from)?;
                 let finalize_ms = finalize_start.elapsed().as_millis();
 
                 // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake,
@@ -4450,6 +4479,7 @@ where
         // read once at root assembly (after every worker has joined) to
         // record `IndexRoot.has_list_meta` exactly.
         saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        list_owners: Default::default(),
     });
 
     // Pre-insert rdf:type so we know the predicate ID before Phase A begins.
@@ -4516,9 +4546,9 @@ where
         t: i64,
         idx: usize,
         doc: DocChunk,
-    ) -> std::result::Result<ParsedChunk, String> {
+    ) -> std::result::Result<ParsedChunk, fluree_db_transact::TransactError> {
         let base = doc.skolem_base();
-        let parsed = if let Some(prelude) = ctx.prelude {
+        if let Some(prelude) = ctx.prelude {
             parse_chunk_with_prelude(
                 ttl,
                 ctx.shared_alloc,
@@ -4543,8 +4573,7 @@ where
                 Some(ctx.spool_config),
                 idx,
             )
-        };
-        parsed.map_err(|e| e.to_string())
+        }
     }
 
     // ---- Parse all chunks in parallel, commit serially in order ----
@@ -4599,7 +4628,7 @@ where
         // in-order via a BTreeMap reorder buffer, so out-of-order arrivals
         // don't need extra channel depth — they just wait in the map.
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
-            std::result::Result<(usize, ParsedChunk), String>,
+            std::result::Result<(usize, ParsedChunk), ImportError>,
         >(num_threads);
 
         // One streamed file is one document; every chunk shares its scope.
@@ -4635,8 +4664,9 @@ where
                         let ttl = match String::from_utf8(raw_bytes) {
                             Ok(s) => s,
                             Err(e) => {
-                                let _ =
-                                    result_tx.send(Err(format!("chunk {idx} invalid UTF-8: {e}")));
+                                let _ = result_tx.send(Err(ImportError::Transact(format!(
+                                    "chunk {idx} invalid UTF-8: {e}"
+                                ))));
                                 break;
                             }
                         };
@@ -4657,8 +4687,7 @@ where
                                 }
                             }
                             Err(e) => {
-                                let _ =
-                                    result_tx.send(Err(format!("parse chunk {idx} failed: {e}")));
+                                let _ = result_tx.send(Err(chunk_failure(idx, e)));
                                 break;
                             }
                         }
@@ -4749,7 +4778,7 @@ where
             .clone()
             .expect("is_virtual implies virtual_source is set");
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
-            std::result::Result<(usize, ParsedChunk), String>,
+            std::result::Result<(usize, ParsedChunk), ImportError>,
         >(num_threads);
         let chunk_size_bytes = config.effective_chunk_size_mb() * 1024 * 1024;
         // The parallelism knob bounds the produce side's concurrent scans (O5:
@@ -4805,7 +4834,7 @@ where
                     drive_tx,
                 ));
                 if let Err(e) = outcome {
-                    let _ = result_tx.send(Err(e.to_string()));
+                    let _ = result_tx.send(Err(ImportError::Transact(e.to_string())));
                 }
                 // result_tx dropped here → the consumer sees EOF.
             })
@@ -4875,7 +4904,7 @@ where
 
         // One slot per worker is sufficient (same logic as streaming arm).
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
-            std::result::Result<(usize, ParsedChunk), String>,
+            std::result::Result<(usize, ParsedChunk), ImportError>,
         >(num_threads);
 
         let mut parse_handles = Vec::with_capacity(num_threads);
@@ -4918,8 +4947,9 @@ where
                         let ttl = match String::from_utf8(raw_bytes) {
                             Ok(s) => s,
                             Err(e) => {
-                                let _ =
-                                    result_tx.send(Err(format!("chunk {idx} invalid UTF-8: {e}")));
+                                let _ = result_tx.send(Err(ImportError::Transact(format!(
+                                    "chunk {idx} invalid UTF-8: {e}"
+                                ))));
                                 break;
                             }
                         };
@@ -4953,8 +4983,7 @@ where
                                 );
                             }
                             Err(e) => {
-                                let _ =
-                                    result_tx.send(Err(format!("parse chunk {idx} failed: {e}")));
+                                let _ = result_tx.send(Err(chunk_failure(idx, e)));
                                 break;
                             }
                         }
@@ -5065,7 +5094,7 @@ where
                 let nq_converted;
                 let trig_content: &str = if chunk_source.is_nquads(idx) {
                     nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)
-                        .map_err(|e| ImportError::Transact(e.to_string()))?;
+                        .map_err(ImportError::from)?;
                     &nq_converted
                 } else {
                     &content
@@ -5082,7 +5111,7 @@ where
                     idx,
                 )
                 .await
-                .map_err(|e| ImportError::Transact(e.to_string()))?;
+                .map_err(ImportError::from)?;
                 shared_alloc
                     .sync_from_registry(&state.ns_registry)
                     .map_err(|e| ImportError::Transact(format!("namespace sync conflict: {e}")))?;
@@ -5101,6 +5130,12 @@ where
                         Some(&spool_dir),
                         Some(&spool_config),
                         idx,
+                        alias,
+                        if chunk_source.is_jsonld_stream() {
+                            JsonLdChunk::Lines
+                        } else {
+                            JsonLdChunk::Document
+                        },
                     )
                 } else {
                     parse_chunk(
@@ -5115,12 +5150,12 @@ where
                         idx,
                     )
                 }
-                .map_err(|e| ImportError::Transact(e.to_string()))?;
+                .map_err(ImportError::from)?;
 
                 let ns_delta = compute_ns_delta(&parsed.new_codes, &mut published_codes);
                 finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, alias)
                     .await
-                    .map_err(|e| ImportError::Transact(e.to_string()))?
+                    .map_err(ImportError::from)?
             };
 
             // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake.
@@ -5205,7 +5240,7 @@ where
             // One whole file per chunk, so chunk index == document index.
             let file_doc_ids: Arc<Vec<u64>> = Arc::new(doc_ids.ids());
             let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
-                std::result::Result<(usize, ParsedChunk), String>,
+                std::result::Result<(usize, ParsedChunk), ImportError>,
             >(num_threads);
 
             let permit_rx = permit_rx.expect("permit_rx must exist for file-based path");
@@ -5251,8 +5286,9 @@ where
                                 Ok(s) => s,
                                 Err(e) => {
                                     let _ = permit_tx_ref.send(()); // release permit
-                                    let _ = result_tx
-                                        .send(Err(format!("failed to read chunk {idx}: {e}")));
+                                    let _ = result_tx.send(Err(ImportError::Transact(format!(
+                                        "failed to read chunk {idx}: {e}"
+                                    ))));
                                     break;
                                 }
                             };
@@ -5269,8 +5305,7 @@ where
                                 }
                                 Err(e) => {
                                     let _ = permit_tx_ref.send(());
-                                    let _ = result_tx
-                                        .send(Err(format!("parse chunk {idx} failed: {e}")));
+                                    let _ = result_tx.send(Err(chunk_failure(idx, e)));
                                     break;
                                 }
                             }
@@ -5318,7 +5353,7 @@ where
                     let nq_converted;
                     let trig_content: &str = if chunk_source.is_nquads(i) {
                         nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)
-                            .map_err(|e| ImportError::Transact(e.to_string()))?;
+                            .map_err(ImportError::from)?;
                         &nq_converted
                     } else {
                         &content
@@ -5335,7 +5370,7 @@ where
                         i,
                     )
                     .await
-                    .map_err(|e| ImportError::Transact(e.to_string()))?;
+                    .map_err(ImportError::from)?;
                     shared_alloc
                         .sync_from_registry(&state.ns_registry)
                         .map_err(|e| {
@@ -5358,6 +5393,8 @@ where
                             Some(&spool_dir),
                             Some(&spool_config),
                             i,
+                            alias,
+                            JsonLdChunk::Document,
                         )
                     } else {
                         parse_chunk(
@@ -5372,13 +5409,13 @@ where
                             i,
                         )
                     }
-                    .map_err(|e| ImportError::Transact(e.to_string()))?;
+                    .map_err(ImportError::from)?;
 
                     let ns_delta = compute_ns_delta(&parsed.new_codes, &mut published_codes);
 
                     finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, alias)
                         .await
-                        .map_err(|e| ImportError::Transact(e.to_string()))?
+                        .map_err(ImportError::from)?
                 };
 
                 // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake.
@@ -7336,7 +7373,7 @@ mod logging_tests {
             .with_max_level(tracing::Level::DEBUG)
             .with_writer(std::io::sink)
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        fluree_test_support::with_scoped_default(subscriber, || {
             assert!(tracing::enabled!(tracing::Level::DEBUG));
             for character in ['±', '界', '🦀'] {
                 let start = "<http://example.org/s> <http://example.org/p> \"";

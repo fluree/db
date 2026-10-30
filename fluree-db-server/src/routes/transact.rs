@@ -212,6 +212,9 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
         SubmissionError::CommitContention { message } => {
             return ServerError::CommitContention(message.clone());
         }
+        SubmissionError::IndexNotLoaded { message } => {
+            return ServerError::IndexNotLoaded(message.clone());
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -2635,6 +2638,9 @@ mod tests {
             SubmissionError::CommitContention {
                 message: "Commit contention: 16 commit attempts lost".into(),
             },
+            SubmissionError::IndexNotLoaded {
+                message: "Index not loaded: the ledger's index (t=1) is not loaded".into(),
+            },
         ];
         for variant in variants {
             // (status, @type) each variant must surface as. No wildcard:
@@ -2657,6 +2663,7 @@ mod tests {
                 SubmissionError::CommitNotFound { .. } => (404, errors::COMMIT_NOT_FOUND),
                 SubmissionError::ConfigUnavailable { .. } => (500, errors::STORAGE_READ),
                 SubmissionError::CommitContention { .. } => (503, errors::COMMIT_CONTENTION),
+                SubmissionError::IndexNotLoaded { .. } => (503, errors::INDEX_NOT_LOADED),
             };
             let se = submission_error_to_server_error(variant);
             assert_eq!(se.status_code().as_u16(), expected_status, "{se}");

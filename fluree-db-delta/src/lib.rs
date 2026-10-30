@@ -26,4 +26,7 @@ pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig, Placement, UnityConfig
 pub use datafile::rows_decoded;
 pub use error::{DeltaError, Result};
 pub use filter::{ColumnFilter, FilterOp, FilterValue};
-pub use table::{DeltaBatchStream, DeltaSnapshot, DeltaTable, VersionSelector};
+pub use table::{
+    DeltaBatchStream, DeltaChanges, DeltaSnapshot, DeltaTable, VersionSelector, CHANGE_TYPE_COLUMN,
+    COMMIT_VERSION_COLUMN,
+};

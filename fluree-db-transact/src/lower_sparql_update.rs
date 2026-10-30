@@ -913,6 +913,7 @@ pub fn lower_sparql_update(
     // persisted namespace map omits them, and post-commit SELECT can't resolve
     // the predicate IRI back to the same Sid.
     txn.namespace_delta = ns.delta().clone();
+    txn.rdf_list_view = true;
     Ok(txn)
 }
 
@@ -1078,6 +1079,7 @@ fn lower_insert_data(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
+        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1133,6 +1135,7 @@ fn lower_delete_data(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
+        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1237,6 +1240,7 @@ fn lower_delete_where(
         txn_meta: Vec::new(),
         write_graphs: BTreeSet::new(),
         namespace_delta: std::collections::HashMap::new(),
+        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1302,6 +1306,7 @@ fn lower_delete_where_with_graphs(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
+        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1555,6 +1560,7 @@ fn lower_modify(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
+        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1634,6 +1640,7 @@ fn lower_triple_to_template(
         object,
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
+        list_id: None,
         graph: TemplateGraph::Default,
     })
 }
@@ -1824,6 +1831,7 @@ fn lower_triple_to_delete_template_delete_where(
         object,
         dtc,
         list_index: None,
+        list_id: None,
         graph: TemplateGraph::Default,
     })
 }

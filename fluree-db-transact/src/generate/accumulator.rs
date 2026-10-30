@@ -41,7 +41,8 @@
 //! terms is one fact per key and list position. A DELETE retracts the term
 //! the index stores, and an INSERT of the same value as written may carry
 //! more than that (a big integer's XSD subtype); told apart by term, both
-//! would commit at one `t`, which storage resolves as the retraction.
+//! would commit at one `t`, which a commit may not hold (`build_commit`
+//! refuses it).
 //! Without an identity
 //! ([`FlakeAccumulator::with_identity`]) facts are told apart by term.
 
@@ -194,6 +195,27 @@ impl<'l> FlakeAccumulator<'l> {
                     let graph = mixed_graph(graphs, self.identity.as_ref(), hint, &f.g);
                     push_into_mixed(self.identity.as_ref(), graph, f);
                 }
+            }
+        }
+    }
+
+    /// Whether a retraction of `fact`, a stored fact, has been pushed.
+    pub fn retracts(&self, fact: &Flake) -> bool {
+        match &self.inner {
+            AccInner::PureRetract(graphs) => graphs.get(&fact.g).is_some_and(|f| f.contains(fact)),
+            AccInner::Mixed(graphs) => {
+                let Some(graph) = graphs.get(&fact.g) else {
+                    return false;
+                };
+                let key = self
+                    .identity
+                    .as_ref()
+                    .and_then(|ids| ids.key(graph.g_id, fact));
+                let bucket = match key {
+                    Some(key) => graph.by_key.get(&(fact.s.clone(), fact.p.clone(), key)),
+                    None => graph.by_term.get(fact),
+                };
+                bucket.is_some_and(|b| b.retraction.is_some())
             }
         }
     }

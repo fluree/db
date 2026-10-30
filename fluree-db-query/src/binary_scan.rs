@@ -19,6 +19,7 @@ use fluree_db_binary_index::{
     LeafletCache, OverlayOp,
 };
 use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::ObjKey;
 use fluree_db_core::DatatypeConstraint;
@@ -202,6 +203,11 @@ pub struct BinaryScanOperator {
     /// `f:reifies*` skip in `flakes_to_bindings`) become no-ops so
     /// debug/inspection callers can see Fluree-system facts directly.
     include_system_facts: bool,
+    /// Skip rows that are members of a compactly stored RDF list — rows with
+    /// a list position. In SPARQL's view of lists (see
+    /// [`crate::list_view`]) a member is not a value of its predicate; the
+    /// list's owner edge and cells come from [`crate::list_view`] instead.
+    hide_list_members: bool,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -739,6 +745,7 @@ impl BinaryScanOperator {
             p_sids_ephemeral: HashMap::new(),
             p_is_var,
             include_system_facts: false,
+            hide_list_members: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -753,6 +760,12 @@ impl BinaryScanOperator {
             unresolved_bound_subject_iri: None,
             mode,
         }
+    }
+
+    /// Skip list members (see [`Self::hide_list_members`]).
+    pub fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -820,6 +833,9 @@ impl BinaryScanOperator {
                 && !self.include_system_facts
                 && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
             {
+                continue;
+            }
+            if self.hide_list_members && flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
                 continue;
             }
 
@@ -1394,6 +1410,14 @@ impl BinaryScanOperator {
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // Decided per batch: a leaflet holding no list rows loads its
+        // position column as the constant "none".
+        let hide_members = self.hide_list_members
+            && !matches!(
+                batch.o_i,
+                fluree_db_binary_index::ColumnData::Const(u32::MAX)
+                    | fluree_db_binary_index::ColumnData::AbsentDefault
+            );
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
@@ -1409,6 +1433,9 @@ impl BinaryScanOperator {
 
             // Skip internal db: predicates on wildcard scans.
             if self.is_internal_predicate(p_id) {
+                continue;
+            }
+            if hide_members && o_i != u32::MAX {
                 continue;
             }
 
@@ -1806,7 +1833,6 @@ impl BinaryScanOperator {
 
         let to_t = ctx.to_t;
         let from_t = ctx.from_t;
-        let cmp = self.index.comparator();
 
         // Collect overlay flakes for this graph+index, applying the bound-term
         // equality match INSIDE the walk.
@@ -1821,7 +1847,7 @@ impl BinaryScanOperator {
         // allocation for the (overwhelmingly common) non-matching flakes.
         //
         // Equivalent to the previous filter-after-resolve order:
-        // `resolve_overlay_retractions` decides each distinct fact
+        // `resolve_current_flakes` decides each distinct fact
         // `(s, p, o, dt, m)` independently, and an (s, p, o) equality filter
         // either keeps or drops a fact's entries as a whole — so it can never
         // separate an assertion from the retraction that cancels it.
@@ -1877,8 +1903,7 @@ impl BinaryScanOperator {
             },
         );
 
-        flakes.sort_by(cmp);
-        flakes = resolve_overlay_retractions(flakes);
+        flakes = resolve_current_flakes(flakes, self.index);
 
         // Apply object bounds (post-filter) when present.
         if let Some(bounds) = self.object_bounds.as_ref() {
@@ -1891,57 +1916,6 @@ impl BinaryScanOperator {
         self.state = OperatorState::Open;
         Ok(())
     }
-}
-
-/// Resolve assert/retract pairs in overlay flakes.
-///
-/// For each distinct fact `(s, p, o, dt, m)`, the latest entry (highest `t`)
-/// determines the current state: if it's an assertion, the fact is kept;
-/// if it's a retraction, the fact is excluded from query results.
-///
-/// Novelty enforces RDF set semantics at write time (`apply_commit`), so
-/// duplicate assertions for the same fact cannot exist. This function only
-/// needs to resolve assert/retract lifecycles, not deduplicate.
-fn resolve_overlay_retractions(flakes: Vec<Flake>) -> Vec<Flake> {
-    use std::collections::HashSet;
-
-    // Full fact identity includes metadata (lang tags, list indices).
-    // Two flakes with same (s, p, o, dt) but different `m` are distinct facts.
-    #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-    struct FactKeyRef<'a> {
-        s: &'a Sid,
-        p: &'a Sid,
-        o: &'a FlakeValue,
-        dt: &'a Sid,
-        m: &'a Option<FlakeMeta>,
-    }
-
-    let mut seen: HashSet<FactKeyRef<'_>> = HashSet::new();
-    let mut keep = vec![false; flakes.len()];
-
-    // Walk in reverse (highest t first). First occurrence per fact key is
-    // the latest state. Keep it only if it's an assertion.
-    for (idx, f) in flakes.iter().enumerate().rev() {
-        let key = FactKeyRef {
-            s: &f.s,
-            p: &f.p,
-            o: &f.o,
-            dt: &f.dt,
-            m: &f.m,
-        };
-        if !seen.insert(key) {
-            continue;
-        }
-        if f.op {
-            keep[idx] = true;
-        }
-    }
-
-    flakes
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(f, k)| k.then_some(f))
-        .collect()
 }
 
 fn build_match_val_for_snapshot(
@@ -2043,6 +2017,9 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // Over a dataset spanning ledgers the list view is not applied, and a
+        // member is a value of its predicate.
+        self.hide_list_members &= !ctx.is_multi_ledger();
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
         // hiding it would defeat the point of inspecting a history
@@ -2740,8 +2717,7 @@ impl Operator for BinaryScanOperator {
                 };
                 resolve_overlay_ops(&mut ops);
                 if !untranslated.is_empty() {
-                    untranslated.sort_by(self.index.comparator());
-                    untranslated = resolve_overlay_retractions(untranslated);
+                    untranslated = resolve_current_flakes(untranslated, self.index);
                 }
                 let entry = Arc::new(TranslatedOverlayOps {
                     ops: ops.into(),
@@ -2839,8 +2815,7 @@ impl Operator for BinaryScanOperator {
                     sort_overlay_ops(&mut ops, order);
                     resolve_overlay_ops(&mut ops);
                     if !untranslated.is_empty() {
-                        untranslated.sort_by(self.index.comparator());
-                        untranslated = resolve_overlay_retractions(untranslated);
+                        untranslated = resolve_current_flakes(untranslated, self.index);
                     }
                     Arc::new(TranslatedOverlayOps {
                         ops: ops.into(),
@@ -3055,7 +3030,8 @@ impl Operator for BinaryScanOperator {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
-        if !self.count_only_eligible() {
+        // Counting rows undecoded would count the list members it hides.
+        if !self.count_only_eligible() || self.hide_list_members {
             return Ok(None);
         }
 

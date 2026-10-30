@@ -371,6 +371,7 @@ pub fn build_stamp_chunk(
         prefix_map,
         spool_result,
         txn_meta,
+        named_graphs: Vec::new(),
     })
 }
 
@@ -798,9 +799,9 @@ fn merge_stats(acc: &mut MaterializeStats, other: MaterializeStats) {
     }
 }
 
-/// One completed chunk's `(idx, ParsedChunk)` or a stringified build error — the
-/// item type of the producer→consumer result channel (Send + Clone sender).
-type ChunkResult = std::result::Result<(usize, ParsedChunk), String>;
+/// One completed chunk's `(idx, ParsedChunk)` or a build error — the item type
+/// of the producer→consumer result channel (Send + Clone sender).
+type ChunkResult = std::result::Result<(usize, ParsedChunk), crate::import::ImportError>;
 
 /// One unit of produce work handed to a worker: `(TriplesMap IRI, scanned batch)`.
 type WorkItem = (String, fluree_db_tabular::ColumnBatch);
@@ -935,6 +936,7 @@ fn spawn_produce_workers(
                             prefix_map,
                             spool_result,
                             txn_meta: Vec::new(),
+                            named_graphs: Vec::new(),
                         };
                         encode_ms += enc.elapsed().as_millis();
                         // Err => the consumer dropped the receiver; stop early.
