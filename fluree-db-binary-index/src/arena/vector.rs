@@ -1026,7 +1026,7 @@ impl LazyVectorArena {
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1238,7 +1238,7 @@ mod tests {
     // ========================================================================
 
     /// Helper: write a VAS1 shard file and return a ShardSource for it.
-    fn write_test_shard(
+    pub(crate) fn write_test_shard(
         dir: &Path,
         name: &str,
         dims: u16,
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     /// Helper: create a LazyVectorArena from test shards.
-    fn make_lazy_arena(
+    pub(crate) fn make_lazy_arena(
         manifest: VectorManifest,
         shard_sources: Vec<ShardSource>,
     ) -> LazyVectorArena {

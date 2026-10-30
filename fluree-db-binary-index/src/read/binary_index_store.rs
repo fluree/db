@@ -4424,6 +4424,98 @@ impl ContentStoreRangeFetcher {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A lazy arena of `shards`, each a shard of capacity `capacity`, over
+    /// files in `dir`.
+    fn vector_arena_of(
+        dir: &std::path::Path,
+        capacity: u32,
+        dims: u16,
+        shards: &[Vec<Vec<f32>>],
+    ) -> crate::arena::vector::LazyVectorArena {
+        use crate::arena::vector::tests::{make_lazy_arena, write_test_shard};
+        use crate::arena::vector::{ShardInfo, VectorManifest};
+        let mut sources = Vec::new();
+        let mut infos = Vec::new();
+        for (i, vectors) in shards.iter().enumerate() {
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let (_, source) = write_test_shard(dir, &format!("s{i}.vas"), dims, &refs);
+            sources.push(source);
+            infos.push(ShardInfo {
+                cas: format!("s{i}"),
+                count: vectors.len() as u32,
+            });
+        }
+        let manifest = VectorManifest {
+            version: 1,
+            dims,
+            dtype: "f32".to_string(),
+            normalized: false,
+            shard_capacity: capacity,
+            total_count: shards.iter().map(|v| v.len() as u32).sum(),
+            shards: infos,
+        };
+        make_lazy_arena(manifest, sources)
+    }
+
+    /// The memo reads through one shard at a time: once a lookup moves on,
+    /// it holds only the shard it moved to, and the shared cache alone holds
+    /// the rest.
+    #[test]
+    fn vector_memo_holds_only_the_shard_it_read_last() {
+        let dir = std::env::temp_dir().join("fluree_vector_memo_last_shard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards: Vec<Vec<Vec<f32>>> = (0..3)
+            .map(|s| (0..2).map(|i| vec![s as f32, i as f32]).collect())
+            .collect();
+        let arena = vector_arena_of(&dir, 2, 2, &shards);
+        let memo = VectorMemo::new();
+        assert_eq!(&*memo.get(7, &arena, 0).unwrap().unwrap(), &[0.0, 0.0]);
+        assert_eq!(&*memo.get(7, &arena, 3).unwrap().unwrap(), &[1.0, 1.0]);
+        assert_eq!(&*memo.get(7, &arena, 4).unwrap().unwrap(), &[2.0, 0.0]);
+        assert!(
+            matches!(memo.lock().last_shard, Some((7, 2, _))),
+            "the memo holds the shard it read last, and only that one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repeated values share one allocation; once a window of lookups finds
+    /// mostly new values, the memo stops probing and decodes each one.
+    #[test]
+    fn vector_memo_shares_repeats_and_stops_probing_new_values() {
+        let dir = std::env::temp_dir().join("fluree_vector_memo_bypass");
+        std::fs::create_dir_all(&dir).unwrap();
+        let window = VectorMemo::WINDOW as usize;
+        // Shard 0: 64 values, each four times. Shard 1: a window and more of
+        // values seen once.
+        let repeats: Vec<Vec<f32>> = (0..256).map(|i| vec![(i % 64) as f32]).collect();
+        let fresh: Vec<Vec<f32>> = (0..window + 8).map(|i| vec![1000.0 + i as f32]).collect();
+        let capacity = (window + 8) as u32;
+        let mut first = repeats.clone();
+        first.resize(capacity as usize, vec![-1.0]);
+        let arena = vector_arena_of(&dir, capacity, 1, &[first, fresh]);
+        let memo = VectorMemo::new();
+
+        let a = memo.get(7, &arena, 0).unwrap().unwrap();
+        let b = memo.get(7, &arena, 64).unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "a repeated value shares its allocation"
+        );
+
+        for i in 0..window + 8 {
+            memo.get(7, &arena, capacity + i as u32).unwrap().unwrap();
+        }
+        let c = memo.get(7, &arena, 1).unwrap().unwrap();
+        let d = memo.get(7, &arena, 65).unwrap().unwrap();
+        assert_eq!(c, d);
+        assert!(
+            !Arc::ptr_eq(&c, &d),
+            "after a window of new values the memo decodes without probing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
     use fluree_db_core::o_type::OType;
