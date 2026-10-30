@@ -1,8 +1,8 @@
 //! `fluree ontology` and `fluree catalog` — ontology and catalog tools for
 //! document extraction.
 //!
-//! `ontology check` reports what an extraction model will and won't read of
-//! an ontology (and catalog), applying the model's input policy locally;
+//! `ontology check` reports what an HTTP reader will and won't read of an
+//! ontology (and catalog), applying its input policy locally;
 //! `ontology from` writes an ontology in the shape the model reads well, from
 //! RDF or from tables (CSV, a workbook, SQL DDL); `catalog from` writes SKOS
 //! records from rows. All read files only: no project, no ledger, nothing
@@ -221,13 +221,13 @@ fn print_report(file: &Path, report: &Report, names: &Names) {
         }
     }
     print_counts(
-        "Read another way by the extraction model",
+        "Read another way by the reader",
         &report.adapted,
         &report.examples.adapted,
         names,
     );
     print_counts(
-        "Not read by the extraction model",
+        "Not read by the reader",
         &report.not_shown,
         &report.examples.not_shown,
         names,
@@ -476,9 +476,7 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
     if args.base.is_none() {
         eprintln!("IRIs minted under {base}; set --base to your own namespace");
     }
-    eprintln!(
-        "run `fluree ontology check` on the result to see what the extraction model will read"
-    );
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
     Ok(())
 }
 
@@ -525,9 +523,7 @@ fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
             .collect();
         eprintln!("rewritten: {}", changes.join("; "));
     }
-    eprintln!(
-        "run `fluree ontology check` on the result to see what the extraction model will read"
-    );
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
     Ok(())
 }
 

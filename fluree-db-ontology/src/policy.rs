@@ -1,4 +1,11 @@
-//! The extraction model's ontology input policy, `ontology-adapter-v1`.
+//! The ontology input policy of an HTTP reader, `ontology-adapter-v1`.
+//!
+//! An HTTP reader is an extraction model reached over HTTP that reads a whole
+//! document against the caller's ontology (`fluree doc ingest`'s
+//! `[doc.reader]`). This is the policy such a reader applies to the ontology
+//! it is sent; `fluree doc ingest`'s language-model extractor reads more of an
+//! ontology (domains, ranges, every parent class), so none of this describes
+//! it.
 //!
 //! Ontology input the model has no place for is read another way, or dropped
 //! and counted, rather than refused. In order:

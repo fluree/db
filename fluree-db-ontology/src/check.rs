@@ -1,4 +1,4 @@
-//! What an extraction model will and won't read of an ontology and catalog.
+//! What an HTTP reader will and won't read of an ontology and catalog.
 //!
 //! A [`Report`] has four parts:
 //!
@@ -198,7 +198,31 @@ fn check_parts(
         ));
     }
 
-    let records = records(catalog);
+    // OWL axioms and annotation property declarations are not records, but
+    // a reader reads them as records and refuses them; say so in their terms
+    let (machinery, machinery_roots) = crate::read::owl_machinery(catalog);
+    let (machine_quads, record_quads): (Vec<Quad>, Vec<Quad>) = catalog
+        .iter()
+        .cloned()
+        .partition(|q| machinery.contains(&q.subject));
+    let refused = records(&machine_quads)
+        .iter()
+        .any(|r| r.subject.is_none() || r.labels.is_empty());
+    if refused {
+        let examples: Vec<String> = machinery_roots
+            .iter()
+            .map(|(s, t)| {
+                s.as_iri()
+                    .map_or_else(|| format!("[] a {}", short(t)), str::to_string)
+            })
+            .collect();
+        will_fail.push(Finding::new(
+            "owl-machinery",
+            "OWL axioms (owl:AllDisjointClasses and the like) and declarations of annotation properties or datatypes are neither classes nor properties, so a reader reads them as catalog records, and refuses them (records need IRIs and SKOS labels). `fluree ontology from` drops them.",
+            &examples,
+        ));
+    }
+    let records = records(&record_quads);
     catalog_findings(&records, &shown, &mut will_fail, &mut advice);
     ontology_advice(&shown, &not_shown, &mut advice);
 
@@ -327,7 +351,7 @@ fn catalog_findings(
         let unknown: Vec<String> = unknown.into_iter().map(str::to_string).collect();
         advice.push(Finding::new(
             "catalog-class-not-in-ontology",
-            "Catalog records are typed with classes the ontology doesn't declare; the extraction model won't see those types.",
+            "Catalog records are typed with classes the ontology doesn't declare; the reader won't see those types.",
             &unknown,
         ));
     }
@@ -340,7 +364,7 @@ fn catalog_findings(
         advice.push(Finding::new(
             "catalog-long-definition",
             format!(
-                "The extraction model reads the first {} characters of a record's skos:definition; these are longer, and are cut.",
+                "The reader reads the first {} characters of a record's skos:definition; these are longer, and are cut.",
                 estimate::DEFINITION_CHARS
             ),
             &long,
@@ -366,7 +390,7 @@ fn ontology_advice(shown: &Shown, not_shown: &BTreeMap<String, usize>, advice: &
         advice.push(Finding::new(
             "no-description",
             format!(
-                "{} of {} classes and properties have no description (rdfs:comment or skos:definition). After labels, descriptions help the extraction model most: say what counts and what doesn't, and name the words people use for it.",
+                "{} of {} classes and properties have no description (rdfs:comment or skos:definition). After labels, descriptions help the reader most: say what counts and what doesn't, and name the words people use for it.",
                 thousands(undescribed.len()),
                 thousands(terms.len())
             ),
@@ -398,7 +422,7 @@ fn ontology_advice(shown: &Shown, not_shown: &BTreeMap<String, usize>, advice: &
     if !misleading.is_empty() {
         advice.push(Finding::new(
             "local-name-not-words",
-            "The extraction model reads an IRI's local name beside its label, and a local name like \"employer_id\" reads as a key column even when the label says \"employer\". Mint these IRIs from their labels.",
+            "The reader reads an IRI's local name beside its label, and a local name like \"employer_id\" reads as a key column even when the label says \"employer\". Mint these IRIs from their labels.",
             &misleading,
         ));
     }
@@ -410,7 +434,7 @@ fn ontology_advice(shown: &Shown, not_shown: &BTreeMap<String, usize>, advice: &
     if !opaque.is_empty() {
         advice.push(Finding::new(
             "opaque-local-name",
-            "These terms have codes for local names and no description, so their labels are all the extraction model has to go on. Add descriptions.",
+            "These terms have codes for local names and no description, so their labels are all the reader has to go on. Add descriptions.",
             &opaque,
         ));
     }
@@ -439,7 +463,7 @@ fn ontology_advice(shown: &Shown, not_shown: &BTreeMap<String, usize>, advice: &
     if hidden_axes > 0 {
         advice.push(Finding {
             code: "domain-range-not-shown",
-            message: "The extraction model doesn't see rdfs:domain or rdfs:range (nor schema.org's domainIncludes and rangeIncludes). Say in each property's description what it connects (\"the organization that employs the person\"), or restate it as a SHACL property shape on the class.".into(),
+            message: "An HTTP reader doesn't see rdfs:domain or rdfs:range (nor schema.org's domainIncludes and rangeIncludes). Say in each property's description what it connects (\"the organization that employs the person\"), or restate it as a SHACL property shape on the class.".into(),
             count: hidden_axes,
             examples: Vec::new(),
         });
