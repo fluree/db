@@ -15,9 +15,10 @@ derived search indexes and scratch files.
 
 ## Scope
 
-- **Deployments:** a single node with file storage (`--storage-path`). On memory or S3 storage, in a
-  Raft cluster, on a query peer, or without a prover of the server's release, a request is refused
-  with `501`.
+- **Deployments:** a single node with file storage (`--storage-path`), or a Raft cluster whose members
+  share file storage, once every member runs this release (see [On a cluster](#on-a-cluster)). On
+  memory or S3 storage, on a query peer, or without a prover of the server's release, a request is
+  refused with `501`.
 - **Commits:** v4 commits with SHA2-256 CIDs, signed or unsigned. A request touching anything else is
   refused with `422`.
 - **What can be erased:** a commit's operations (assertions and retractions). Transaction metadata and
@@ -150,12 +151,43 @@ A pass that cannot go on records why in the job and tries again an hour later. T
 - another process's write-ahead log under the storage;
 - a scan that finds something it cannot account for.
 
+On a cluster, a job also waits, without the hour's delay, for members that have not yet cleaned their
+own copies (see [On a cluster](#on-a-cluster)).
+
 A purged job lists, under `purge.unverified`, what this node cannot check. That is the memory of other
 processes reading the same storage, such as query peers. Publication and the purge each announce a
 refresh of the ledgers they change (`ns-refresh` on [`/events`](../operations/query-peers.md)): a query
 peer following the server evicts what it cached of them, and one that missed the event while
 disconnected evicts everything it cached when it reconnects. Restart any other process, and peers of
 earlier releases.
+
+## On a cluster
+
+A Raft cluster accepts a request on its leader once every member, voter or learner, runs this
+release; until then it refuses with `501`. What differs from a single node:
+
+- **Publication.** The leader writes the prepared erasure as an immutable manifest and activates it
+  through Raft. The activation is refused, and the erasure prepared again, if a branch holding the
+  erased commits changed meanwhile. Each member installs activations in order. Until it has, its
+  writes to the affected branches are refused and staged again, and its history reads of them wait.
+  The job records the activation, and when every member had installed it (`cluster.effectiveMs`):
+  from then no member serves the erased history.
+- **Purge.** Only the leader purges, and only jobs every member has installed. Its deletes stay within
+  its leader lease, so a leader deposed mid-pass deletes nothing once another may be writing. Before
+  it releases anything, it waits until no idempotency record from before the erasure took effect
+  remains (an hour, the idempotency cache's lifetime): a record keeps its request's envelope, which
+  holds the transaction's body. The cluster's garbage collection then deletes those envelopes with
+  the rest. The write-ahead logs that stopped members left under the storage are applied and retired
+  before anything is deleted, so none writes an original back.
+- **Members.** Once the leader has purged the shared storage (`purge.storageMs`), every member retires
+  its own write-ahead log, whose segments may hold what was deleted, clears its caches, and reports.
+  The job is `purged` once every member has, after the leader retires stopped members' logs again and
+  deletes whatever one wrote back. Until then `purge.blocked` names the members it waits for; an
+  offline member holds it.
+- **Not covered:** the Raft log and its snapshots carry ids, not ledger data. A value reaches them
+  only quoted in free text, such as a failed transaction's error message; they are compacted as
+  usual, not purged. Query peers' memory is `unverified`, as on a single node.
+- **Received erasures:** an archive, pull or push carrying erased history is still refused (`501`).
 
 ## Archives
 
@@ -300,7 +332,8 @@ erasure brings the journal, and makes the clone a holder that later erasures rea
 | `commits[].proved` | Per commit, once this request proved it: the slots it removed, the replacement it redacted further (`base`, absent for the original), the replacement, the receipt hash, input and replacement sizes, cycles, segments, proving time. Absent when an earlier request's erasure already removes the commit's requested occurrences. |
 | `retries`, `retryAtMs`, `lastError` | Failed steps and when the next try runs |
 | `acceptedMs`, `publishedMs` | When the request was accepted and published |
-| `purge` | The purge's progress: `rebuiltMs`, `scannedMs`, `purgedMs`, files `deleted`, values left `inUse` by a surviving occurrence, `blocked` (why it cannot go on), `unverified` (what to restart) |
+| `purge` | The purge's progress: `rebuiltMs`, `scannedMs`, `purgedMs`, files `deleted`, values left `inUse` by a surviving occurrence, `blocked` (why it cannot go on), `unverified` (what to restart). On a cluster also `envelopesMs` (no idempotency record from before the erasure was left) and `storageMs` (the shared storage was purged; members clean their own copies next) |
+| `cluster` | On a cluster: the erasure's `manifest`, its `activation` once applied, and `effectiveMs`, when every member had installed it |
 
 ## Server configuration
 

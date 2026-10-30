@@ -748,13 +748,33 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
         }],
         ..Default::default()
     };
-    // Refused, as long as a cluster cannot purge what it publishes.
+    // Refused while a member does not run this release.
+    integration
+        .raft
+        .add_learner(
+            18,
+            fluree_db_consensus::raft::ClusterNode::new(
+                "http://127.0.0.1:9/raft/nameservice",
+                "http://127.0.0.1:9",
+            ),
+            false,
+        )
+        .await
+        .expect("learner added");
     let refused = fluree
         .erase_occurrences_with(&writer, id, erasure.clone(), None)
         .await;
     assert!(refused.is_err(), "{refused:?}");
+    integration
+        .raft
+        .change_membership(
+            openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([18])),
+            false,
+        )
+        .await
+        .expect("learner removed");
     fluree
-        .erase_occurrences_in_cluster(&writer, id, erasure, None)
+        .erase_occurrences_with(&writer, id, erasure, None)
         .await
         .expect("accepted");
     fluree.run_erasure_pass(id).await.expect("proved");

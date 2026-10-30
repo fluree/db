@@ -104,25 +104,17 @@ impl Fluree {
         request: ErasureRequest,
         requester: Option<String>,
     ) -> Result<ErasureReceipt> {
-        // Published, a cluster's erasures could not yet be purged.
-        if self.retention.replicas.get().is_some() {
-            return Err(unsupported("a cluster cannot erase permanently yet"));
+        // A cluster erases once every member runs a release that reads
+        // erasure's commands and checks its writes against collection, which
+        // purges what it publishes.
+        if let Some(collector) = self.collector() {
+            if !collector.enable().await? {
+                return Err(unsupported(
+                    "every member of the cluster must run this release before it accepts \
+                     erasures",
+                ));
+            }
         }
-        self.accept_erasure(writer, ledger_id, request, requester)
-            .await
-    }
-
-    /// [`Self::erase_occurrences_with`] on a cluster member, which refuses
-    /// it: for tests of a cluster's publication.
-    #[cfg(feature = "testing")]
-    #[doc(hidden)]
-    pub async fn erase_occurrences_in_cluster(
-        &self,
-        writer: &dyn RetentionWriter,
-        ledger_id: &str,
-        request: ErasureRequest,
-        requester: Option<String>,
-    ) -> Result<ErasureReceipt> {
         self.accept_erasure(writer, ledger_id, request, requester)
             .await
     }

@@ -254,9 +254,33 @@ The Raft log and snapshot encodings (postcard for `Command`, `Response`, and `Na
 
 Skipping versions is not supported. The safe path is N → N+1; for larger jumps, do them sequentially.
 
+Garbage collection and permanent erasure begin once every member runs a release that supports them;
+after that, a member of an earlier release cannot rejoin. See
+[Garbage collection and permanent erasure](#garbage-collection-and-permanent-erasure).
+
 v4.3 binds every ledger to its name (see [Upgrading from 4.2 and earlier](upgrading-from-4.2.md)). A cluster moving from an earlier release does this once, on the first leader elected after the upgrade, through commands an older node cannot read — one more reason to finish the upgrade before a newly upgraded node leads.
 
 The Raft log's on-disk layout changed in v4.3 from one file per entry to append-only segments. A node folds its existing entry files into a segment the first time the new binary opens `--raft-storage-path`; the fold keeps the contiguous run above the purge cutoff, exactly what the old layout reported, and needs no operator action. It is per node, so it rolls with the upgrade above. An older binary cannot read segments; downgrading a node means restoring its `--raft-storage-path` from before the upgrade, or letting it rejoin as a fresh node and take a snapshot from the leader.
+
+## Garbage collection and permanent erasure
+
+The leader collects the commit and transaction files nothing references: writes a request abandoned,
+request envelopes once released, what a rebase replaced, and the retention registration's superseded
+chunks. It condemns them through Raft and deletes them a settle period later. Every member checks its
+writes against what is condemned: a write that stores a condemned file again keeps it, and one that
+began before its member knew of the condemnation is refused and staged again. Deletes stay within the
+leader's lease, so a leader deposed mid-pass deletes nothing once another may be writing.
+
+The cluster begins collecting, and accepting [permanent erasures](../transactions/permanent-erasure.md#on-a-cluster),
+only once every member, voter or learner, runs a release that checks its writes: a member of an
+earlier release cannot read the commands involved. From then on, do not add or restart a member on an
+earlier release.
+
+While the cluster collects, a write that names commits it did not store in the same request is
+refused, since nothing checked them: the nameservice ref endpoint's commit-head push
+(`POST /v1/fluree/nameservice/refs/:alias/commit`, used by ref-based sync), and transfers through the
+library API on a member. Writes through the cluster's transaction, push, merge, rebase and revert
+endpoints, archive restores and named-graph drops are checked and accepted.
 
 ## Admin HTTP surface
 
