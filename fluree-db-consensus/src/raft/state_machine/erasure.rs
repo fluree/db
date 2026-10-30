@@ -40,6 +40,26 @@ pub struct ErasureState {
     pub installed: BTreeMap<NodeId, Installed>,
 }
 
+/// What the cluster's members have cleaned after the leader purged the
+/// shared storage: their own copies (write-ahead log segments, caches).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupState {
+    /// Activations whose shared storage the leader has purged, by the log
+    /// index of [`ErasureCommand::Purged`]: a member's cleanup after
+    /// applying it covers them.
+    pub purged: BTreeMap<u64, u64>,
+    /// What each member last reported cleaned: every purge recorded at or
+    /// before `applied`, by the run it reported from.
+    pub cleaned: BTreeMap<NodeId, Cleaned>,
+}
+
+/// A member's [`ErasureCommand::Cleaned`] report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cleaned {
+    pub applied: u64,
+    pub incarnation: Incarnation,
+}
+
 /// A member's [`ErasureCommand::Ready`] report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Installed {
@@ -114,6 +134,16 @@ pub enum ErasureCommand {
     /// Start counting holder additions. Proposed before the first
     /// preparation finds its holders.
     Track,
+    /// The leader purged activation `activation`'s shared storage: its
+    /// members clean their own copies next.
+    Purged { activation: u64 },
+    /// `node`, in the run `incarnation` names, cleaned its own copies after
+    /// applying every [`Self::Purged`] at or before log index `applied`.
+    Cleaned {
+        applied: u64,
+        node: NodeId,
+        incarnation: Incarnation,
+    },
 }
 
 /// Why [`Response::ErasureActivationRefused`] fired. The leader prepares
@@ -371,6 +401,31 @@ pub(super) fn apply(
         ErasureCommand::Track => {
             state.erasure.tracking = true;
             Response::ErasureTracking
+        }
+        ErasureCommand::Purged { activation } => {
+            if activation >= state.erasure.next_activation {
+                return Response::ErasureActivationUnknown { activation };
+            }
+            let index = *state
+                .erasure_cleanup
+                .purged
+                .entry(activation)
+                .or_insert(log_index);
+            Response::ErasurePurgeRecorded { index }
+        }
+        ErasureCommand::Cleaned {
+            applied,
+            node,
+            incarnation,
+        } => {
+            state.erasure_cleanup.cleaned.insert(
+                node,
+                Cleaned {
+                    applied,
+                    incarnation,
+                },
+            );
+            Response::ErasureCleanedRecorded
         }
     }
 }
@@ -1079,11 +1134,98 @@ mod tests {
         ));
     }
 
+    /// A purge is recorded once, at the index of its first record, and only
+    /// for an activation applied; a member's report replaces its last.
+    #[test]
+    fn purges_and_cleanup_reports_are_recorded() {
+        let mut state = NameServiceState::new();
+        state.erasure.next_activation = 1;
+        let purged = |state: &mut NameServiceState, activation, index| {
+            apply(
+                state,
+                Command::Erasure(ErasureCommand::Purged { activation }),
+                index,
+            )
+        };
+        assert_eq!(
+            purged(&mut state, 1, 5),
+            Response::ErasureActivationUnknown { activation: 1 }
+        );
+        assert_eq!(
+            purged(&mut state, 0, 6),
+            Response::ErasurePurgeRecorded { index: 6 }
+        );
+        assert_eq!(
+            purged(&mut state, 0, 9),
+            Response::ErasurePurgeRecorded { index: 6 }
+        );
+        let incarnation = Incarnation {
+            process: 1,
+            storage: 2,
+        };
+        for applied in [6, 4] {
+            assert_eq!(
+                apply(
+                    &mut state,
+                    Command::Erasure(ErasureCommand::Cleaned {
+                        applied,
+                        node: 3,
+                        incarnation,
+                    }),
+                    10,
+                ),
+                Response::ErasureCleanedRecorded
+            );
+        }
+        assert_eq!(state.erasure_cleanup.cleaned[&3].applied, 4);
+    }
+
+    /// Snapshots taken before cleanup state restore with their collection
+    /// state; one taken now keeps it.
+    #[test]
+    fn snapshots_from_before_cleanup_state_restore() {
+        let mut state = ledger_with_queued_request();
+        state.collect.next_intent = 2;
+        let v4 = super::super::NameServiceStateV4 {
+            refs: state.refs.clone(),
+            ledgers: state.ledgers.clone(),
+            retracted: state.retracted.clone(),
+            idempotency: state.idempotency.clone(),
+            queues: state.queues.clone(),
+            next_queue_id: state.next_queue_id,
+            recently_cleared: state.recently_cleared.clone(),
+            evicted_idempotency_count: state.evicted_idempotency_count,
+            queue_config: state.queue_config,
+            status: state.status.clone(),
+            config: state.config.clone(),
+            graph_sources: state.graph_sources.clone(),
+            worker_eligible_voters: state.worker_eligible_voters.clone(),
+            configured_voters: state.configured_voters.clone(),
+            bindings: state.bindings.clone(),
+            dropped: state.dropped.clone(),
+            fences: state.fences.clone(),
+            erasure: state.erasure.clone(),
+            collect: state.collect.clone(),
+        };
+        let restored =
+            NameServiceState::from_snapshot(&postcard::to_allocvec(&v4).unwrap()).unwrap();
+        assert_eq!(restored, state);
+
+        state.erasure_cleanup.purged.insert(0, 12);
+        let bytes = state.to_snapshot().unwrap();
+        assert_eq!(NameServiceState::from_snapshot(&bytes).unwrap(), state);
+        assert!(NameServiceState::from_snapshot(&bytes[..bytes.len() - 1]).is_err());
+    }
+
     /// Log entries are positional: these variants can only be appended.
     #[test]
     fn erasure_commands_keep_their_log_positions() {
         let bytes = |command: &Command| postcard::to_allocvec(command).unwrap();
         assert_eq!(bytes(&Command::Erasure(ErasureCommand::Track)), vec![30, 4]);
+        assert_eq!(
+            bytes(&Command::Erasure(ErasureCommand::Purged { activation: 1 })),
+            vec![30, 5, 1]
+        );
         let wrapped = Command::AtGeneration {
             generations: Vec::new(),
             command: Box::new(Command::ReleaseContent { id: cid(1) }),

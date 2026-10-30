@@ -18,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fluree_db_nameservice::NsRecord;
 
-use crate::{Fluree, Result};
+use crate::{ApiError, Fluree, Result};
 
 /// How long a hold keeps the holders' heads while their erasure is prepared
 /// again. It lapses by itself if the preparation stops.
@@ -54,6 +54,13 @@ pub trait ErasureActivator: Send + Sync + std::fmt::Debug {
 
     /// Whether every member has installed activation `number`.
     async fn installed_everywhere(&self, number: u64) -> bool;
+    /// Record that the shared storage activation `number` reached is
+    /// purged: the log index of the record (the first, for one recorded
+    /// again), which members' cleanup reports must reach.
+    async fn record_purged(&self, number: u64) -> Result<u64>;
+    /// The members, voters and learners, that have not reported cleaning
+    /// their own copies after log index `index`.
+    async fn not_cleaned(&self, index: u64) -> Vec<u64>;
 }
 
 impl Fluree {
@@ -71,6 +78,22 @@ impl Fluree {
             .erasure
             .get()
             .map(|runtime| runtime.condemned.clone())
+    }
+
+    /// Clean this cluster member's own copies once the shared storage is
+    /// purged: retire its write-ahead log, whose segments may hold what the
+    /// purge deleted and would write it back on a replay, and drop what this
+    /// process decoded from the released indexes.
+    pub async fn clean_after_purge(&self) -> Result<()> {
+        if let Some(root) = self.config.index_storage.path.clone() {
+            tokio::task::spawn_blocking(move || {
+                fluree_db_core::FileStorage::checkpoint_wal(root.as_ref())
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("write-ahead log checkpoint: {e}")))??;
+        }
+        self.clear_decoded_caches();
+        Ok(())
     }
 
     /// Install the erasures of the activated manifest `manifest` on this

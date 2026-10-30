@@ -34,7 +34,7 @@ mod erasure;
 pub use collect::{CollectCommand, CollectState, Intent};
 pub use erasure::{
     generation, holder_state, view_generation, ActivateErasure, Activation, ActivationRefusal,
-    ErasureCommand, ErasureState, HolderState, Incarnation, Installed,
+    Cleaned, CleanupState, ErasureCommand, ErasureState, HolderState, Incarnation, Installed,
 };
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -558,6 +558,8 @@ pub struct NameServiceState {
     /// every field above, so a snapshot taken before it still decodes
     /// through [`NameServiceStateV3`].
     pub collect: CollectState,
+    /// What members cleaned after a purge; see [`CleanupState`].
+    pub erasure_cleanup: CleanupState,
 }
 
 /// A name binding or dropped-ledger entry: its version, and the value as
@@ -654,6 +656,7 @@ impl From<NameServiceStateV1> for NameServiceState {
             fences: HashMap::new(),
             erasure: ErasureState::default(),
             collect: CollectState::default(),
+            erasure_cleanup: CleanupState::default(),
         }
     }
 }
@@ -703,6 +706,7 @@ impl From<NameServiceStateV2> for NameServiceState {
             fences: v2.fences,
             erasure: ErasureState::default(),
             collect: CollectState::default(),
+            erasure_cleanup: CleanupState::default(),
         }
     }
 }
@@ -753,6 +757,59 @@ impl From<NameServiceStateV3> for NameServiceState {
             fences: v3.fences,
             erasure: v3.erasure,
             collect: CollectState::default(),
+            erasure_cleanup: CleanupState::default(),
+        }
+    }
+}
+
+/// [`NameServiceState`] as snapshotted before cleanup state.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct NameServiceStateV4 {
+    refs: HashMap<RefKey, RefEntry>,
+    ledgers: HashMap<String, LedgerRecord>,
+    retracted: HashSet<RefKey>,
+    idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
+    queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    next_queue_id: u64,
+    recently_cleared: HashMap<RefKey, ClearMarker>,
+    evicted_idempotency_count: u64,
+    queue_config: QueueConfig,
+    status: HashMap<String, StoredStatus>,
+    config: HashMap<String, StoredConfig>,
+    graph_sources: HashMap<String, GraphSourceRecord>,
+    worker_eligible_voters: BTreeSet<NodeId>,
+    configured_voters: BTreeSet<NodeId>,
+    bindings: HashMap<String, VersionedJson>,
+    dropped: HashMap<String, VersionedJson>,
+    fences: HashMap<RefKey, FenceState>,
+    erasure: ErasureState,
+    collect: CollectState,
+}
+
+impl From<NameServiceStateV4> for NameServiceState {
+    fn from(v4: NameServiceStateV4) -> Self {
+        Self {
+            refs: v4.refs,
+            ledgers: v4.ledgers,
+            retracted: v4.retracted,
+            idempotency: v4.idempotency,
+            queues: v4.queues,
+            next_queue_id: v4.next_queue_id,
+            recently_cleared: v4.recently_cleared,
+            evicted_idempotency_count: v4.evicted_idempotency_count,
+            queue_config: v4.queue_config,
+            status: v4.status,
+            config: v4.config,
+            graph_sources: v4.graph_sources,
+            worker_eligible_voters: v4.worker_eligible_voters,
+            configured_voters: v4.configured_voters,
+            bindings: v4.bindings,
+            dropped: v4.dropped,
+            fences: v4.fences,
+            erasure: v4.erasure,
+            collect: v4.collect,
+            erasure_cleanup: CleanupState::default(),
         }
     }
 }
@@ -1685,6 +1742,11 @@ pub enum Response {
     /// [`Command::ClearFrozenIndex`]: whether the branch was frozen, and
     /// its index head cleared.
     FrozenIndexCleared { cleared: bool },
+    /// [`ErasureCommand::Purged`] recorded, at log index `index` (the first
+    /// such record, for one proposed again).
+    ErasurePurgeRecorded { index: u64 },
+    /// [`ErasureCommand::Cleaned`] recorded.
+    ErasureCleanedRecorded,
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1768,8 +1830,9 @@ impl NameServiceState {
         }
         match postcard::from_bytes(bytes) {
             Ok(state) => Ok(state),
-            Err(e) => whole::<NameServiceStateV3>(bytes)
+            Err(e) => whole::<NameServiceStateV4>(bytes)
                 .map(Self::from)
+                .or_else(|| whole::<NameServiceStateV3>(bytes).map(Self::from))
                 .or_else(|| whole::<NameServiceStateV2>(bytes).map(Self::from))
                 .or_else(|| whole::<NameServiceStateV1>(bytes).map(Self::from))
                 .ok_or(e.into()),

@@ -42,6 +42,10 @@ pub trait ErasureInstall: Send + Sync {
     /// what the holders' cached state was loaded with replaced. An error is
     /// retried.
     async fn install(&self, number: u64, activation: &Activation) -> Result<(), String>;
+
+    /// Clean this node's own copies of what the leader purged from the
+    /// shared storage. An error is retried.
+    async fn clean(&self) -> Result<(), String>;
 }
 
 /// This node's erasure installation state.
@@ -50,6 +54,8 @@ pub struct ErasureNode {
     incarnation: Incarnation,
     /// Every activation numbered below this is installed.
     installed: watch::Sender<u64>,
+    /// The log index of the last purge whose copies this run cleaned.
+    cleaned: std::sync::atomic::AtomicU64,
 }
 
 impl ErasureNode {
@@ -85,6 +91,7 @@ impl ErasureNode {
                 storage,
             },
             installed: watch::Sender::new(0),
+            cleaned: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -168,6 +175,7 @@ pub async fn run_installer(
             }
         }
         report(&node, &state, &nameservice).await;
+        clean(&node, &state, install.as_ref(), &nameservice).await;
         tokio::select! {
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(POLL) => {}
@@ -193,10 +201,61 @@ async fn report(node: &ErasureNode, state: &SharedState, nameservice: &RaftNameS
         return;
     }
     if let Err(error) = nameservice
-        .report_erasure_ready(through, node.id, node.incarnation)
+        .report_erasure(crate::raft::nameservice::ErasureReport::Ready {
+            through,
+            node: node.id,
+            incarnation: node.incarnation,
+        })
         .await
     {
         tracing::debug!(%error, through, "erasure readiness report deferred");
+    }
+}
+
+/// Once the leader has purged the shared storage of an activation this
+/// node has installed, clean this node's own copies, once for each purge
+/// recorded since, and report it under this run.
+async fn clean(
+    node: &ErasureNode,
+    state: &SharedState,
+    install: &dyn ErasureInstall,
+    nameservice: &RaftNameService,
+) {
+    use std::sync::atomic::Ordering;
+    let (purged, reported) = {
+        let state = state.read().await;
+        let installed = node.installed_through();
+        let purged = state
+            .erasure_cleanup
+            .purged
+            .iter()
+            .filter(|(activation, _)| **activation < installed)
+            .map(|(_, index)| *index)
+            .max();
+        (purged, state.erasure_cleanup.cleaned.get(&node.id).copied())
+    };
+    let Some(purged) = purged else {
+        return;
+    };
+    if node.cleaned.load(Ordering::Acquire) < purged {
+        if let Err(error) = install.clean().await {
+            tracing::warn!(%error, purged, "cleaning after an erasure purge failed; retrying");
+            return;
+        }
+        node.cleaned.store(purged, Ordering::Release);
+    }
+    if reported.is_some_and(|r| r.applied >= purged && r.incarnation == node.incarnation) {
+        return;
+    }
+    if let Err(error) = nameservice
+        .report_erasure(crate::raft::nameservice::ErasureReport::Cleaned {
+            applied: purged,
+            node: node.id,
+            incarnation: node.incarnation,
+        })
+        .await
+    {
+        tracing::debug!(%error, purged, "erasure cleanup report deferred");
     }
 }
 

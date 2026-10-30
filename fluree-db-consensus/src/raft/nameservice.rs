@@ -1311,29 +1311,63 @@ async fn handle_apply_queue_poison(
     }
 }
 
-/// Path under [`erasure_ready_router`]'s root for a member's erasure
-/// readiness report, which a follower posts to the leader.
-pub const ERASURE_READY_PATH: &str = "/erasure_ready";
+/// Path under [`erasure_report_router`]'s root for a member's erasure
+/// report, which a follower posts to the leader.
+pub const ERASURE_REPORT_PATH: &str = "/erasure_report";
 
-/// A member's erasure readiness report on its way to the leader; see
-/// [`ErasureCommand::Ready`](super::state_machine::ErasureCommand::Ready).
+/// A member's erasure report on its way to the leader.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ErasureReady {
-    pub through: u64,
-    pub node: NodeId,
-    pub incarnation: super::state_machine::Incarnation,
+pub enum ErasureReport {
+    /// See [`ErasureCommand::Ready`](super::state_machine::ErasureCommand::Ready).
+    Ready {
+        through: u64,
+        node: NodeId,
+        incarnation: super::state_machine::Incarnation,
+    },
+    /// See [`ErasureCommand::Cleaned`](super::state_machine::ErasureCommand::Cleaned).
+    Cleaned {
+        applied: u64,
+        node: NodeId,
+        incarnation: super::state_machine::Incarnation,
+    },
 }
 
-/// Errors the leader returns for an [`ErasureReady`] report.
+impl ErasureReport {
+    fn command(self) -> super::state_machine::ErasureCommand {
+        use super::state_machine::ErasureCommand;
+        match self {
+            ErasureReport::Ready {
+                through,
+                node,
+                incarnation,
+            } => ErasureCommand::Ready {
+                through,
+                node,
+                incarnation,
+            },
+            ErasureReport::Cleaned {
+                applied,
+                node,
+                incarnation,
+            } => ErasureCommand::Cleaned {
+                applied,
+                node,
+                incarnation,
+            },
+        }
+    }
+}
+
+/// Errors the leader returns for an [`ErasureReport`].
 #[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
-pub enum ApplyErasureReadyError {
+pub enum ApplyErasureReportError {
     #[error("not the leader; current leader: {leader:?}")]
     NotLeader { leader: Option<NodeId> },
     #[error("raft propose failed: {0}")]
     RaftPropose(String),
 }
 
-impl FromRaftWriteError for ApplyErasureReadyError {
+impl FromRaftWriteError for ApplyErasureReportError {
     fn not_leader(leader: Option<NodeId>) -> Self {
         Self::NotLeader { leader }
     }
@@ -1342,38 +1376,38 @@ impl FromRaftWriteError for ApplyErasureReadyError {
     }
 }
 
-/// Axum router for [`ERASURE_READY_PATH`], mounted beside
+/// Axum router for [`ERASURE_REPORT_PATH`], mounted beside
 /// [`apply_queue_poison_router`] with the same trust posture. The report
 /// is as small as a poison, so it takes the same body cap.
-pub fn erasure_ready_router(
+pub fn erasure_report_router(
     ns: Arc<RaftNameService>,
     network_config: &crate::raft::network::NetworkConfig,
 ) -> Router {
     Router::new()
         .route(
-            ERASURE_READY_PATH,
-            post(handle_erasure_ready).layer(DefaultBodyLimit::max(
+            ERASURE_REPORT_PATH,
+            post(handle_erasure_report).layer(DefaultBodyLimit::max(
                 network_config.apply_queue_poison_max_body_bytes,
             )),
         )
         .with_state(ns)
 }
 
-async fn handle_erasure_ready(
+async fn handle_erasure_report(
     State(ns): State<Arc<RaftNameService>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let args: ErasureReady = match postcard::from_bytes(&body) {
-        Ok(args) => args,
+    let report: ErasureReport = match postcard::from_bytes(&body) {
+        Ok(report) => report,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("postcard decode error on ErasureReady: {e}"),
+                format!("postcard decode error on ErasureReport: {e}"),
             )
                 .into_response();
         }
     };
-    let outcome = ns.propose_erasure_ready(args).await;
+    let outcome = ns.propose_erasure_report(report).await;
     match postcard::to_allocvec(&outcome) {
         Ok(bytes) => (
             StatusCode::OK,
@@ -1383,7 +1417,7 @@ async fn handle_erasure_ready(
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("postcard encode error on erasure_ready response: {e}"),
+            format!("postcard encode error on erasure_report response: {e}"),
         )
             .into_response(),
     }
@@ -1446,7 +1480,7 @@ impl FromRaftWriteError for ApplySpareError {
 }
 
 /// Axum router for [`COLLECT_SPARE_PATH`], mounted beside
-/// [`erasure_ready_router`] with the same trust posture and body cap.
+/// [`erasure_report_router`] with the same trust posture and body cap.
 pub fn collect_spare_router(
     ns: Arc<RaftNameService>,
     network_config: &crate::raft::network::NetworkConfig,
@@ -2023,45 +2057,24 @@ impl RaftNameService {
     /// Report that `node`, in run `incarnation`, has installed every
     /// erasure activation numbered below `through`: proposed here on the
     /// leader, posted to the leader elsewhere.
-    pub async fn report_erasure_ready(
-        &self,
-        through: u64,
-        node: NodeId,
-        incarnation: super::state_machine::Incarnation,
-    ) -> std::result::Result<(), String> {
-        let args = ErasureReady {
-            through,
-            node,
-            incarnation,
-        };
+    pub async fn report_erasure(&self, report: ErasureReport) -> std::result::Result<(), String> {
         if let Some(forwarding) = &self.forwarding {
             if !self.is_local_leader(forwarding.id).await {
-                return self.erasure_ready_via_leader(&args, forwarding).await;
+                return self.erasure_report_via_leader(&report, forwarding).await;
             }
         }
-        self.propose_erasure_ready(args)
+        self.propose_erasure_report(report)
             .await
             .map_err(|e| e.to_string())
     }
 
-    /// Propose an [`ErasureReady`] report on this node, the leader.
-    pub async fn propose_erasure_ready(
+    /// Propose an [`ErasureReport`] on this node, the leader.
+    pub async fn propose_erasure_report(
         &self,
-        args: ErasureReady,
-    ) -> std::result::Result<(), ApplyErasureReadyError> {
-        let ErasureReady {
-            through,
-            node,
-            incarnation,
-        } = args;
+        report: ErasureReport,
+    ) -> std::result::Result<(), ApplyErasureReportError> {
         self.raft
-            .client_write(SmCommand::Erasure(
-                super::state_machine::ErasureCommand::Ready {
-                    through,
-                    node,
-                    incarnation,
-                },
-            ))
+            .client_write(SmCommand::Erasure(report.command()))
             .await
             .map_err(map_propose_error)?;
         Ok(())
@@ -2117,17 +2130,22 @@ impl RaftNameService {
         outcome.map_err(|e| e.to_string())
     }
 
-    async fn erasure_ready_via_leader(
+    async fn erasure_report_via_leader(
         &self,
-        args: &ErasureReady,
+        report: &ErasureReport,
         forwarding: &ForwardingConfig,
     ) -> std::result::Result<(), String> {
         let leader_url = self
             .lookup_leader_raft_url()
             .await
             .ok_or_else(|| "no leader currently elected".to_string())?;
-        let target = format!("{}{}", leader_url.trim_end_matches('/'), ERASURE_READY_PATH);
-        let body = postcard::to_allocvec(args).map_err(|e| format!("encode ErasureReady: {e}"))?;
+        let target = format!(
+            "{}{}",
+            leader_url.trim_end_matches('/'),
+            ERASURE_REPORT_PATH
+        );
+        let body =
+            postcard::to_allocvec(report).map_err(|e| format!("encode ErasureReport: {e}"))?;
         let resp = forwarding
             .http_client
             .post(&target)
@@ -2138,11 +2156,11 @@ impl RaftNameService {
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!("erasure_ready returned HTTP {}", resp.status()));
+            return Err(format!("erasure_report returned HTTP {}", resp.status()));
         }
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        let outcome: std::result::Result<(), ApplyErasureReadyError> =
-            postcard::from_bytes(&bytes).map_err(|e| format!("decode erasure_ready: {e}"))?;
+        let outcome: std::result::Result<(), ApplyErasureReportError> =
+            postcard::from_bytes(&bytes).map_err(|e| format!("decode erasure_report: {e}"))?;
         outcome.map_err(|e| e.to_string())
     }
 

@@ -904,6 +904,67 @@ async fn an_erasure_publishes_through_an_activation_every_member_installs() {
         fluree_db_api::retention::erasure::ErasureStage::Purging
     );
     assert!(!original.exists(), "the original is deleted");
+
+    // Its members clean their own copies, then it is purged: a member that
+    // has not reported holds it, named.
+    integration
+        .raft
+        .add_learner(
+            17,
+            fluree_db_consensus::raft::ClusterNode::new(
+                "http://127.0.0.1:9/raft/nameservice",
+                "http://127.0.0.1:9",
+            ),
+            false,
+        )
+        .await
+        .expect("learner added");
+    let held = fluree
+        .run_purge_pass(id, Duration::ZERO)
+        .await
+        .expect("purge pass");
+    assert!(held.waiting, "{held:?}");
+    let blocked = status().await.purge.and_then(|p| p.blocked);
+    assert!(
+        blocked.as_deref().is_some_and(|why| why.contains("17")),
+        "{blocked:?}"
+    );
+    integration
+        .raft
+        .change_membership(
+            openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([17])),
+            false,
+        )
+        .await
+        .expect("learner removed");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let job = loop {
+        fluree
+            .run_purge_pass(id, Duration::ZERO)
+            .await
+            .expect("purge pass");
+        let job = status().await;
+        if job.stage == fluree_db_api::retention::erasure::ErasureStage::Purged {
+            break job;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not purged: {:?}",
+            job.purge
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(job
+        .purge
+        .is_some_and(|p| p.purged_ms.is_some() && p.blocked.is_none()));
+    assert!(integration
+        .shared_state
+        .read()
+        .await
+        .erasure_cleanup
+        .cleaned
+        .contains_key(&16));
+    assert!(!original.exists());
     node.shutdown().await;
 }
 

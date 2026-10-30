@@ -549,6 +549,14 @@ impl crate::retention::erasure::ErasureActivator for Cluster {
     async fn installed_everywhere(&self, _: u64) -> bool {
         true
     }
+
+    async fn record_purged(&self, _: u64) -> crate::Result<u64> {
+        Ok(0)
+    }
+
+    async fn not_cleaned(&self, _: u64) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// A requested erasure, proved and indexed, ready to publish.

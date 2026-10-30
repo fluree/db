@@ -9,6 +9,7 @@ use fluree_db_nameservice::NsRecord;
 
 use super::{ref_key_of, RaftNameService, SmCommand, SmResponse};
 use crate::raft::state_machine::{ActivateErasure, ErasureCommand, HolderState, RefKey};
+use crate::raft::NodeId;
 
 fn key(record: &NsRecord) -> Result<RefKey> {
     ref_key_of(record.ledger_id.as_str()).map_err(|e| ApiError::internal(e.to_string()))
@@ -125,14 +126,58 @@ impl ErasureActivator for RaftNameService {
     }
 
     async fn installed_everywhere(&self, number: u64) -> bool {
+        let members = self.members().await;
         let state = self.state.read().await;
-        !state.configured_voters.is_empty()
-            && state.configured_voters.iter().all(|member| {
+        !members.is_empty()
+            && members.iter().all(|member| {
                 state
                     .erasure
                     .installed
                     .get(member)
                     .is_some_and(|installed| installed.through > number)
             })
+    }
+
+    async fn record_purged(&self, number: u64) -> Result<u64> {
+        match self
+            .propose_erasure(ErasureCommand::Purged { activation: number })
+            .await?
+        {
+            SmResponse::ErasurePurgeRecorded { index } => Ok(index),
+            other => Err(unexpected("Purged", other)),
+        }
+    }
+
+    async fn not_cleaned(&self, index: u64) -> Vec<u64> {
+        let members = self.members().await;
+        let state = self.state.read().await;
+        members
+            .into_iter()
+            .filter(|member| {
+                !state
+                    .erasure_cleanup
+                    .cleaned
+                    .get(member)
+                    .is_some_and(|cleaned| cleaned.applied >= index)
+            })
+            .collect()
+    }
+}
+
+impl RaftNameService {
+    /// The cluster's members, each holding the log and what it names: the
+    /// voters the replicated state knows, and every voter and learner of the
+    /// membership in force.
+    async fn members(&self) -> Vec<NodeId> {
+        let mut members: std::collections::BTreeSet<NodeId> = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        members.extend(self.state.read().await.configured_voters.iter().copied());
+        members.into_iter().collect()
     }
 }

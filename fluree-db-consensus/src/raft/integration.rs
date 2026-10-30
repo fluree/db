@@ -343,7 +343,7 @@ impl RaftIntegration {
                 Arc::clone(&self.nameservice),
                 &self.network_config,
             ))
-            .merge(crate::raft::nameservice::erasure_ready_router(
+            .merge(crate::raft::nameservice::erasure_report_router(
                 Arc::clone(&self.nameservice),
                 &self.network_config,
             ))

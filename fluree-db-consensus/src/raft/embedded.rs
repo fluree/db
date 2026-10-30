@@ -355,6 +355,10 @@ impl crate::raft::erasure::ErasureInstall for EngineInstall {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn clean(&self) -> Result<(), String> {
+        self.0.clean_after_purge().await.map_err(|e| e.to_string())
+    }
 }
 
 fn spawn_release_task(

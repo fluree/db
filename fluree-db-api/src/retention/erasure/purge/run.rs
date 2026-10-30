@@ -114,10 +114,9 @@ impl Fluree {
                 .flatten()
         };
         let waiting = |rebuilt_ms: i64| now_ms() - rebuilt_ms < release_after.as_millis() as i64;
-        // Its members' own copies are left: cleaned after.
+        // The shared storage is purged: what is left is its members'.
         if progress(|p| p.storage_ms).is_some() {
-            report.waiting = true;
-            return Ok(report);
+            return self.complete_in_cluster(ledger, &jobs, report).await;
         }
         if progress(|p| p.scanned_ms).is_none() && progress(|p| p.rebuilt_ms).is_some_and(waiting) {
             report.waiting = true;
@@ -362,9 +361,7 @@ impl Fluree {
         }
         // What this process decoded from the released indexes. Other
         // processes' memory is beyond it: reported as unverified.
-        self.leaflet_cache().clear();
-        crate::ontology_imports::global_schema_bundle_cache().clear();
-        crate::ontology_imports::global_schema_bundle_flakes_cache().clear();
+        self.clear_decoded_caches();
         if clustered {
             let ms = now_ms();
             self.update_purge(&jobs, |p| {
@@ -375,8 +372,63 @@ impl Fluree {
             report.waiting = true;
             return Ok(report);
         }
+        self.mark_purged(&jobs, deleted).await?;
+        report.purged = jobs.len();
+        Ok(report)
+    }
+
+    /// Finish `jobs` on a cluster, their shared storage purged: once every
+    /// member has cleaned its own copies, retire the logs stopped members
+    /// left and delete again whatever a replay of one wrote back, then mark
+    /// them purged.
+    async fn complete_in_cluster(
+        &self,
+        ledger: &str,
+        jobs: &[(String, ErasureJob)],
+        mut report: PurgeReport,
+    ) -> Result<PurgeReport> {
+        let runtime = self.erasure_runtime()?;
+        let activator = runtime
+            .activator
+            .get()
+            .ok_or_else(|| ApiError::internal("a cluster purge needs its activator"))?;
+        let mut index = 0;
+        for (_, job) in jobs {
+            if let Some(activation) = job.cluster.as_ref().and_then(|c| c.activation) {
+                index = index.max(activator.record_purged(activation).await?);
+            }
+        }
+        let pending = activator.not_cleaned(index).await;
+        if !pending.is_empty() {
+            let why = format!("members {pending:?} have not cleaned their own copies yet");
+            self.update_purge(jobs, |p| p.blocked = Some(why.clone()))
+                .await?;
+            report.waiting = true;
+            return Ok(report);
+        }
+        self.retire_stopped_logs().await?;
+        let plan = self.plan_purge(ledger).await?;
+        let mut deleted = 0;
+        for address in plan
+            .originals
+            .iter()
+            .chain(&plan.transactions)
+            .chain(&plan.superseded)
+        {
+            if runtime.index.delete_raw(address).await? {
+                deleted += 1;
+            }
+        }
+        self.mark_purged(jobs, deleted).await?;
+        report.deleted = deleted;
+        report.purged = jobs.len();
+        Ok(report)
+    }
+
+    /// Mark `jobs` purged, `deleted` more files deleted.
+    async fn mark_purged(&self, jobs: &[(String, ErasureJob)], deleted: usize) -> Result<()> {
         let ms = now_ms();
-        for (branch, job) in &jobs {
+        for (branch, job) in jobs {
             self.update_job(branch, &job.request_id, |j| {
                 j.stage = ErasureStage::Purged;
                 j.retry_at_ms = None;
@@ -388,8 +440,14 @@ impl Fluree {
             })
             .await?;
         }
-        report.purged = jobs.len();
-        Ok(report)
+        Ok(())
+    }
+
+    /// Drop what this process decoded from indexes a purge released.
+    pub(crate) fn clear_decoded_caches(&self) {
+        self.leaflet_cache().clear();
+        crate::ontology_imports::global_schema_bundle_cache().clear();
+        crate::ontology_imports::global_schema_bundle_flakes_cache().clear();
     }
 
     /// The published, unpurged jobs of `name`'s branches, with the branch
