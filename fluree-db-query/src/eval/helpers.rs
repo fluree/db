@@ -8,8 +8,9 @@ use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
 use crate::ir::{CompareOp, Expression, Function};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::temporal::CalendarField;
-use fluree_db_core::{FlakeValue, ObjKind};
+use fluree_db_core::{DictNovelty, FlakeValue, ObjKind};
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use std::cell::RefCell;
@@ -49,6 +50,40 @@ enum EncodedBindingCacheKey {
     Pid {
         p_id: u32,
     },
+}
+
+impl EncodedBindingCacheKey {
+    /// Whether every dictionary id in the key names a term the store itself
+    /// persisted, by the watermarks the decoder routes on: a string or
+    /// subject id above them resolves from the view's dictionary novelty, and
+    /// a predicate id at or past the store's count was allocated for one
+    /// scan. A layered view (a staged preview, a SHACL or post-state policy
+    /// check) gives its new terms ids of its own, so one id can name
+    /// different terms in two views over the same store, and a verdict keyed
+    /// by it is not remembered. Language and datatype ids and big-number
+    /// handles only ever come from the persisted dictionaries.
+    fn names_persisted_terms(&self, novelty: Option<&DictNovelty>, predicate_count: u32) -> bool {
+        let novelty = novelty.filter(|dn| dn.is_initialized());
+        match *self {
+            Self::Lit { o_kind, o_key, .. } => {
+                let kind = ObjKind::from_u8(o_kind);
+                if kind == ObjKind::LEX_ID || kind == ObjKind::JSON_ID {
+                    novelty.is_none_or(|dn| o_key <= u64::from(dn.strings.watermark()))
+                } else if kind == ObjKind::REF_ID {
+                    novelty.is_none_or(|dn| subject_is_persisted(dn, o_key))
+                } else {
+                    true
+                }
+            }
+            Self::Sid { s_id } => novelty.is_none_or(|dn| subject_is_persisted(dn, s_id)),
+            Self::Pid { p_id } => p_id < predicate_count,
+        }
+    }
+}
+
+fn subject_is_persisted(novelty: &DictNovelty, s_id: u64) -> bool {
+    let s_id = SubjectId::from_u64(s_id);
+    s_id.local_id() <= novelty.subjects.watermark_for_ns(s_id.ns_code())
 }
 
 /// (store instance id, graph, expression hash, encoded binding).
@@ -252,6 +287,9 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
     let Some(binding_key) = encoded_binding_cache_key(binding) else {
         return Ok(None);
     };
+    if !binding_key.names_persisted_terms(ctx.dict_novelty.as_deref(), store.predicate_count()) {
+        return Ok(None);
+    }
 
     // The store's instance id, not its address: a dropped store's address can
     // be reused by the next one built, and its verdicts would then answer for
@@ -1016,5 +1054,57 @@ mod tests {
             let lenient = analyze_cacheable_bool_predicate(&is_empty(false)).expect("cacheable");
             assert_ne!(strict.expr_hash, lenient.expr_hash, "{:?}", func(true));
         }
+    }
+    /// A verdict is remembered only for ids the store persisted: a string or
+    /// subject id up to its watermark and a predicate id below the store's
+    /// count. One past them is a view's own and is not.
+    #[test]
+    fn only_ids_the_store_persisted_are_remembered() {
+        let novelty = DictNovelty::with_watermarks(vec![0, 10], 100);
+        let lit = |o_kind: ObjKind, o_key| EncodedBindingCacheKey::Lit {
+            o_kind: o_kind.as_u8(),
+            o_key,
+            p_id: 0,
+            dt_id: 1,
+            lang_id: 0,
+        };
+        let sid = |local_id| EncodedBindingCacheKey::Sid {
+            s_id: SubjectId::new(1, local_id).as_u64(),
+        };
+        let pid = |p_id| EncodedBindingCacheKey::Pid { p_id };
+        let persisted = |key: EncodedBindingCacheKey| key.names_persisted_terms(Some(&novelty), 5);
+
+        for kind in [ObjKind::LEX_ID, ObjKind::JSON_ID] {
+            assert!(persisted(lit(kind, 100)), "{kind:?} at the watermark");
+            assert!(!persisted(lit(kind, 101)), "{kind:?} above the watermark");
+        }
+        assert!(persisted(lit(
+            ObjKind::REF_ID,
+            SubjectId::new(1, 10).as_u64()
+        )));
+        assert!(!persisted(lit(
+            ObjKind::REF_ID,
+            SubjectId::new(1, 11).as_u64()
+        )));
+        assert!(
+            persisted(lit(ObjKind::NUM_INT, u64::MAX)),
+            "an inline value is no id"
+        );
+        assert!(persisted(sid(10)));
+        assert!(!persisted(sid(11)));
+        assert!(
+            !persisted(EncodedBindingCacheKey::Sid {
+                s_id: SubjectId::new(7, 1).as_u64()
+            }),
+            "a namespace with no persisted subjects"
+        );
+        assert!(persisted(pid(4)));
+        assert!(!persisted(pid(5)));
+
+        // With no novelty layer, or one not yet given its watermarks, the
+        // decoder reads every id from the store, so every id is the store's.
+        assert!(lit(ObjKind::LEX_ID, 101).names_persisted_terms(None, 5));
+        assert!(sid(11).names_persisted_terms(Some(&DictNovelty::new_uninitialized()), 5));
+        assert!(!pid(5).names_persisted_terms(None, 5));
     }
 }
