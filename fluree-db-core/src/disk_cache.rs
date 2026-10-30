@@ -137,7 +137,7 @@ struct DiskArtifactCacheState {
     next_op: u64,
     /// Test hook: named points where an operation waits; see `pause_at`.
     #[cfg(test)]
-    pauses: HashMap<&'static str, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    pauses: HashMap<&'static str, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<bool>)>,
 }
 
 /// A write or eviction between its registration and its accounting.
@@ -308,13 +308,24 @@ fn walked_sizes(entries: &[CacheEntry]) -> (u64, HashMap<&Path, u64>) {
     (total, walked)
 }
 
+/// How long a test pause waits on either side before failing the test.
+#[cfg(test)]
+const PAUSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Test hook: wait at `point` if a test armed it, after telling the test.
+/// The test lets the operation go on, or makes it panic here. A test that
+/// fails first does neither, and the operation panics rather than wait for
+/// good, so the test reports its failure instead of hanging on the join.
 #[cfg(test)]
 fn pause_at(state: &Mutex<DiskArtifactCacheState>, point: &'static str) {
     let armed = state.lock().pauses.remove(point);
     if let Some((reached, go)) = armed {
         let _ = reached.send(());
-        let _ = go.recv();
+        match go.recv_timeout(PAUSE_LIMIT) {
+            Ok(true) => {}
+            Ok(false) => panic!("the test panicked `{point}`"),
+            Err(_) => panic!("the test never released `{point}`"),
+        }
     }
 }
 
@@ -1260,29 +1271,47 @@ mod tests {
         let dir = temp_cache_dir("background-scan");
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
         fs::write(dir.join("existing.leaf"), [0u8; 300]).unwrap();
-        let (_, release) = arm(&cache, "size-scan");
+        let scan = arm(&cache, "size-scan");
 
         // Returns with the scan still held: the size is not known yet.
         cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
         assert!(dir.join("new.leaf").exists());
         assert_eq!(cache.state.lock().tracked_bytes, None);
 
-        release.send(()).unwrap();
+        scan.release();
         wait_for_sizing(&cache);
         // The walk saw the new entry too; it is counted once.
         assert_eq!(cache.state.lock().tracked_bytes, Some(400));
     }
 
-    /// Arm the pause at `point`: the operation that reaches it signals on the
-    /// receiver, then waits until the sender fires.
-    fn arm(
-        cache: &DiskArtifactCache,
-        point: &'static str,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    /// A pause armed at a named point; see `pause_at`. Arm it inside the
+    /// `thread::scope` whose thread it parks: if the test fails, dropping it
+    /// fails that thread too, and the scope reports the failure.
+    struct Pause {
+        reached: std::sync::mpsc::Receiver<()>,
+        go: std::sync::mpsc::Sender<bool>,
+    }
+
+    impl Pause {
+        /// Wait for an operation to park here.
+        fn reached(&self) {
+            self.reached
+                .recv_timeout(PAUSE_LIMIT)
+                .expect("no operation reached the pause");
+        }
+
+        /// Let the parked operation go on.
+        fn release(&self) {
+            let _ = self.go.send(true);
+        }
+    }
+
+    /// Arm the pause at `point`: the operation that reaches it parks there.
+    fn arm(cache: &DiskArtifactCache, point: &'static str) -> Pause {
         let (reached, at) = std::sync::mpsc::channel();
         let (go, wait) = std::sync::mpsc::channel();
         cache.state.lock().pauses.insert(point, (reached, wait));
-        (at, go)
+        Pause { reached: at, go }
     }
 
     fn wait_for_sizing(cache: &DiskArtifactCache) {
@@ -1318,15 +1347,15 @@ mod tests {
     fn a_size_scan_landing_inside_a_write_counts_it_once() {
         let dir = temp_cache_dir("size-scan-in-write");
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
-        let (scan_waits, scan_go) = arm(&cache, "size-scan");
-        let (written, write_go) = arm(&cache, "written");
         std::thread::scope(|scope| {
+            let scan = arm(&cache, "size-scan");
+            let written = arm(&cache, "written");
             scope.spawn(|| cache.best_effort_write(&dir.join("a.leaf"), &[0u8; 100]));
-            scan_waits.recv().unwrap();
-            written.recv().unwrap();
-            scan_go.send(()).unwrap();
+            scan.reached();
+            written.reached();
+            scan.release();
             wait_for_sizing(&cache);
-            write_go.send(()).unwrap();
+            written.release();
         });
         assert_exact(&cache, &dir, 100);
     }
@@ -1340,16 +1369,16 @@ mod tests {
         fs::write(dir.join("gone.leaf"), [0u8; 300]).unwrap();
         fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
-        let (scan_waits, scan_go) = arm(&cache, "size-scan");
-        let (evicted, evict_go) = arm(&cache, "evicted");
-        start_sizing(&cache);
         std::thread::scope(|scope| {
+            let scan = arm(&cache, "size-scan");
+            let evicted = arm(&cache, "evicted");
+            start_sizing(&cache);
             scope.spawn(|| cache.evict_entry(&dir.join("gone.leaf")));
-            scan_waits.recv().unwrap();
-            evicted.recv().unwrap();
-            scan_go.send(()).unwrap();
+            scan.reached();
+            evicted.reached();
+            scan.release();
             wait_for_sizing(&cache);
-            evict_go.send(()).unwrap();
+            evicted.release();
         });
         assert_exact(&cache, &dir, 500);
     }
@@ -1363,12 +1392,12 @@ mod tests {
         fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
         assert_eq!(cache.current_bytes().unwrap(), 500);
-        let (rescanned, rescan_go) = arm(&cache, "rescan");
         std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
             scope.spawn(|| cache.evict_until(10_000).unwrap());
-            rescanned.recv().unwrap();
+            rescan.reached();
             cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
-            rescan_go.send(()).unwrap();
+            rescan.release();
         });
         assert_exact(&cache, &dir, 600);
     }
@@ -1382,12 +1411,12 @@ mod tests {
         fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
         assert_eq!(cache.current_bytes().unwrap(), 500);
-        let (written, write_go) = arm(&cache, "written");
         std::thread::scope(|scope| {
+            let written = arm(&cache, "written");
             scope.spawn(|| cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]));
-            written.recv().unwrap();
+            written.reached();
             cache.evict_until(10_000).unwrap();
-            write_go.send(()).unwrap();
+            written.release();
         });
         assert_exact(&cache, &dir, 600);
     }
@@ -1402,12 +1431,12 @@ mod tests {
         fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
         assert_eq!(cache.current_bytes().unwrap(), 800);
-        let (rescanned, rescan_go) = arm(&cache, "rescan");
         std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
             scope.spawn(|| cache.evict_until(10_000).unwrap());
-            rescanned.recv().unwrap();
+            rescan.reached();
             cache.evict_entry(&dir.join("gone.leaf"));
-            rescan_go.send(()).unwrap();
+            rescan.release();
         });
         assert_exact(&cache, &dir, 500);
     }
@@ -1423,12 +1452,12 @@ mod tests {
         fs::write(dir.join("new.leaf"), [0u8; 500]).unwrap();
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
         assert_eq!(cache.current_bytes().unwrap(), 800);
-        let (rescanned, rescan_go) = arm(&cache, "rescan");
         std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
             scope.spawn(|| cache.evict_until(600).unwrap());
-            rescanned.recv().unwrap();
+            rescan.reached();
             fs::remove_file(dir.join("old.leaf")).unwrap();
-            rescan_go.send(()).unwrap();
+            rescan.release();
         });
         assert!(dir.join("new.leaf").exists());
         assert_exact(&cache, &dir, 500);
@@ -1442,12 +1471,12 @@ mod tests {
         let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
         assert_eq!(cache.current_bytes().unwrap(), 0);
         let target = dir.join("same.leaf");
-        let (checked, check_go) = arm(&cache, "checked");
         std::thread::scope(|scope| {
+            let checked = arm(&cache, "checked");
             scope.spawn(|| cache.best_effort_write(&target, &[0u8; 100]));
-            checked.recv().unwrap();
+            checked.reached();
             cache.best_effort_write(&target, &[0u8; 100]);
-            check_go.send(()).unwrap();
+            checked.release();
         });
         assert_exact(&cache, &dir, 100);
     }
