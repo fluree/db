@@ -8,7 +8,9 @@
 //! `LANG(?v) != "en"` kept only the `en` rows (the complement of its answer)
 //! and `langMatches(LANG(?v), "en")` and `STRSTARTS(LANG(?v), "en")` lost
 //! `en-gb`. Novelty never reached the rewrite, so the W3C suite, which loads
-//! its data by transaction, never saw it.
+//! its data by transaction, never saw it. The `COUNT` fast path for
+//! `LANG(?o) = "tag"` read `""` as a tag no literal has and counted 0, though
+//! `LANG(?v) = ""` holds for every literal without one.
 //!
 //! The cases cover LANG, DATATYPE, isIRI/isLiteral and STR under `=`, `!=`,
 //! `<`, `>`, `langMatches` and `STRSTARTS`, against hand-written answers: with
@@ -42,6 +44,7 @@ const CASES: &[(&str, &[&str])] = &[
     (r#"STRSTARTS(LANG(?v), "en")"#, &["a", "b"]),
     (r#"LANG(?v) < "en""#, &["d", "e", "f", "h"]),
     (r#"LANG(?v) > "en""#, &["b", "c"]),
+    (r#"LANG(?v) = """#, &["d", "e", "f", "h"]),
     (r#"DATATYPE(?v) = xsd:string"#, &["d", "e"]),
     (r#"DATATYPE(?v) != xsd:string"#, &["a", "b", "c", "f", "h"]),
     (r#"isIRI(?v)"#, &["g"]),
