@@ -574,6 +574,19 @@ impl Worker {
         let Ok(namespace) = self.storage_namespace().await else {
             return;
         };
+        match self
+            .staging
+            .fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(commit_id))
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(commit_id = %commit_id, error = %err, "could not record an orphaned commit blob");
+                return;
+            }
+        }
         let content_store = self.staging.fluree.content_store(&namespace);
         if let Err(err) = content_store.release(commit_id).await {
             warn!(

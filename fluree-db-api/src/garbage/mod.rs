@@ -166,6 +166,32 @@ impl Fluree {
             .ok_or_else(|| ApiError::internal("garbage collection needs managed storage"))
     }
 
+    /// Whether a cluster collects this member's garbage: then nothing but
+    /// the leader's collection deletes a commit or transaction blob.
+    pub fn collected_by_cluster(&self) -> bool {
+        self.collector().is_some()
+    }
+
+    /// Leave `ids`, stored under `namespace` and named by nothing, to the
+    /// cluster's collection instead of deleting them: another writer may
+    /// have stored the same content. `false` where no cluster collects.
+    pub async fn leave_for_collection(
+        &self,
+        namespace: &StorageNamespace,
+        ids: &[ContentId],
+    ) -> Result<bool> {
+        if !self.collected_by_cluster() {
+            return Ok(false);
+        }
+        let blobs: Vec<Blob> = ids
+            .iter()
+            .map(|id| Blob::new(namespace.clone(), id.clone()))
+            .collect();
+        self.record_garbage(&blobs, GarbageReason::Abandoned)
+            .await?;
+        Ok(true)
+    }
+
     /// Record `blobs` as garbage candidates, where their storage is
     /// collected: wherever writers pin, whichever instance writes.
     pub(crate) async fn record_garbage(&self, blobs: &[Blob], reason: GarbageReason) -> Result<()> {

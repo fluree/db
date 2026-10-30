@@ -174,6 +174,10 @@ impl EmbeddedRaftNode {
         if let Some(manager) = fluree.ledger_manager() {
             integration.attach_ledger_manager(Arc::clone(manager));
         }
+        // Its garbage is collected through the cluster, by its leader: set
+        // before releases replayed at startup reach the release task, which
+        // then deletes nothing.
+        fluree.set_collector(integration.nameservice() as _);
 
         // `QueuedTransactor` routes all five `Committer` methods
         // through `EnqueueCommand` plus the per-process waiter and
@@ -232,8 +236,6 @@ impl EmbeddedRaftNode {
         };
         // This member's writes check what the cluster's collection
         // condemned, sparing through the leader.
-        // Its garbage is collected through the cluster, by its leader.
-        fluree.set_collector(Arc::clone(&nameservice) as _);
         let collect_loader = fluree.condemned().map(|condemned| {
             condemned.activate(Arc::clone(&nameservice) as _);
             let cancel = CancellationToken::new();
@@ -386,7 +388,16 @@ fn spawn_release_task(
 /// idempotent, so retrying a transient failure is safe — and without
 /// it a single blip leaks the blob permanently, since nothing
 /// re-proposes a release.
+///
+/// Where the cluster collects, the envelope is left to its collection:
+/// another queued request may share its address (a merge's, rebase's or
+/// revert's envelope holds only stable fields), and this node may apply
+/// the release late, or again when it replays its log. Reconciliation
+/// finds it once nothing names it.
 pub async fn release_one(fluree: &Fluree, ledger_id: &str, cid: &ContentId) {
+    if fluree.collected_by_cluster() {
+        return;
+    }
     const ATTEMPTS: u32 = 3;
     const BASE_BACKOFF: Duration = Duration::from_millis(100);
 

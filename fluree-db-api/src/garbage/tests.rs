@@ -508,6 +508,45 @@ mod cluster {
         }
     }
 
+    /// A cluster member leaves a blob nothing names to the collection, as a
+    /// record, instead of deleting it; elsewhere it is the caller's.
+    #[tokio::test]
+    async fn a_member_leaves_what_nothing_names_to_the_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        fluree.create_ledger("left").await.unwrap();
+        let namespace = fluree.storage_namespace("left:main").await.unwrap();
+        let id = fluree
+            .content_store(&namespace)
+            .put(ContentKind::Txn, b"{\"orphan\":true}")
+            .await
+            .unwrap();
+        assert!(!fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(&id))
+            .await
+            .unwrap());
+        fluree.set_collector(Arc::new(Cluster::default()));
+        assert!(fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(&id))
+            .await
+            .unwrap());
+        let binding = fluree
+            .publisher()
+            .unwrap()
+            .get_binding("left")
+            .await
+            .unwrap()
+            .unwrap();
+        let recorded: Vec<_> = fluree
+            .garbage_records(&binding.value.root)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.blob.id)
+            .collect();
+        assert_eq!(recorded, [id]);
+    }
+
     async fn pass(fluree: &Fluree, cluster: &Arc<Cluster>) -> crate::garbage::GarbageReport {
         let collector: Arc<dyn Collector> = cluster.clone();
         fluree

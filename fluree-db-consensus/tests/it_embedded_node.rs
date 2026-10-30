@@ -1000,9 +1000,10 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
     node.shutdown().await;
 }
 
-/// The leader collects a blob nothing references through an intent: the
-/// pass that finds it condemns it, the next deletes it and closes the
-/// intent, and writes carry on.
+/// The leader collects blobs nothing references through an intent: the
+/// pass that finds them condemns them, the next deletes them and closes the
+/// intent, and writes carry on. The seed's envelope, released when it
+/// applied, is among them: no node deletes it at apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
     use fluree_db_core::{content_address, ContentKind, ContentStore as _};
@@ -1029,7 +1030,7 @@ async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
         .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!(first.condemned, 1, "{first:?}");
+    assert_eq!(first.condemned, 2, "{first:?}");
     assert!(
         storage.exists(&address).await.unwrap(),
         "condemned, not deleted"
@@ -1038,7 +1039,7 @@ async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
         .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!(second.deleted, 1, "{second:?}");
+    assert_eq!(second.deleted, 2, "{second:?}");
     assert!(!storage.exists(&address).await.unwrap());
     {
         let state = integration.shared_state.read().await;
@@ -1048,5 +1049,94 @@ async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
     let condemned = fluree.condemned().unwrap();
     eventually("the close is loaded", async || condemned.open().is_empty()).await;
     seed(&node, "swept:main").await;
+    node.shutdown().await;
+}
+
+/// Identical requests share one envelope address: a merge's envelope holds
+/// only its branches and strategy. A second submission stored its envelope
+/// before the first applied, and is enqueued after: the first's release
+/// must not take the envelope from it, or the second fails reading it.
+/// (Enqueued directly here, keyed so its outcome is kept: two identical
+/// submissions through one committer also share a waiter, a separate
+/// matter.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identical_request_keeps_the_envelope_the_first_released() {
+    use fluree_db_api::ConflictStrategy;
+    use fluree_db_consensus::raft::state_machine::{
+        ApplyOutcome, BodyKind, Command, QueueSubmission,
+    };
+    use fluree_db_consensus::{
+        IdempotencyCacheKey, IdempotencyKey, MergeRequest, QueuedMerge, QueuedRequest,
+    };
+    use fluree_db_core::{content_address, ContentId, ContentKind};
+
+    let (integration, fluree, node, _dirs) = stand_up(34, |config| config).await;
+    fluree.create_ledger("twice").await.expect("create ledger");
+    seed(&node, "twice:main").await;
+    fluree
+        .create_branch("twice", "dev", None, None)
+        .await
+        .expect("create branch");
+    seed(&node, "twice:dev").await;
+
+    let strategy = ConflictStrategy::default();
+    let envelope = QueuedRequest::Merge(QueuedMerge {
+        source_branch: "dev".into(),
+        target_branch: Some("main".into()),
+        strategy,
+    });
+    let request_cid = ContentId::new(ContentKind::Txn, &envelope.to_bytes().unwrap());
+    let body_cid = ContentId::new(ContentKind::Txn, &envelope.canonical_body_bytes().unwrap());
+    let namespace = fluree.storage_namespace("twice:main").await.unwrap();
+    let address = content_address(
+        "file",
+        ContentKind::Txn,
+        &namespace,
+        &request_cid.address_digest(),
+    );
+    let storage = fluree.admin_storage().unwrap();
+
+    node.committer
+        .merge(MergeRequest {
+            idempotency_key: None,
+            ledger_name: "twice".into(),
+            source_branch: "dev".into(),
+            target_branch: Some("main".into()),
+            strategy,
+        })
+        .await
+        .expect("the first lands");
+    // Given the release time to land, if it deletes.
+    for _ in 0..50 {
+        if !storage.exists(&address).await.unwrap() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let key = IdempotencyCacheKey::new("twice:main", IdempotencyKey::new("second").unwrap());
+    integration
+        .raft
+        .client_write(Command::EnqueueCommand(QueueSubmission {
+            ledger_id: "twice".into(),
+            branch: "main".into(),
+            idempotency: Some(key.clone()),
+            request_cid,
+            body_cid,
+            body_kind: BodyKind::Merge,
+            applied_at_millis: 0,
+        }))
+        .await
+        .unwrap();
+    eventually("the second's outcome", async || {
+        integration
+            .shared_state
+            .read()
+            .await
+            .idempotency
+            .contains_key(&key)
+    })
+    .await;
+    let outcome = integration.shared_state.read().await.idempotency[&key].clone();
+    assert!(matches!(outcome, ApplyOutcome::Applied(_)), "{outcome:?}");
     node.shutdown().await;
 }

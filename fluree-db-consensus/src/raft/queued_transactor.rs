@@ -424,6 +424,20 @@ impl QueuedTransactor {
         let Ok(namespace) = self.namespace_of(ledger_id).await else {
             return;
         };
+        // Another queued request may share the address; the cluster's
+        // collection deletes it once nothing names it.
+        match self
+            .fluree
+            .leave_for_collection(&namespace, std::slice::from_ref(request_cid))
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(%ledger_id, cid = %request_cid, error = %err, "could not record an orphaned envelope");
+                return;
+            }
+        }
         if let Err(err) = self
             .fluree
             .content_store(&namespace)
