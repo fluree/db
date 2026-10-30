@@ -268,10 +268,6 @@ async fn run_iceberg_map_remote(
         .get("catalog_uri")
         .and_then(|v| v.as_str())
         .unwrap_or("-");
-    let connection = result
-        .get("connection_tested")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
 
     let mapping = result
         .get("mapping_source")
@@ -308,7 +304,7 @@ async fn run_iceberg_map_remote(
     }
     println!(
         "  Connection:  {}",
-        connection_summary(connection, &args.mode)
+        remote_connection_summary(&result, &args.mode)
     );
     let validated = result
         .get("mapping_validated")
@@ -329,17 +325,29 @@ async fn run_iceberg_map_remote(
 
 /// The `Connection:` line of a `map` report: whether every mapped table loaded
 /// the way a query will load it, through the catalog or, in Direct mode, at the
-/// table's location, within the registration check's time budget. Neither
-/// outcome fails `map`.
-fn connection_summary(tested: bool, mode: &str) -> &'static str {
-    match (tested, mode.eq_ignore_ascii_case("direct")) {
-        (true, _) => "verified",
-        (false, true) => {
-            "not verified (not every mapped table's metadata was read; queries fail on a table that cannot be)"
-        }
-        (false, false) => {
-            "not verified (not every mapped table loaded through the catalog; queries fail on a table that cannot)"
-        }
+/// table's location, within the registration check's time budget, and if not,
+/// why. No outcome fails `map`.
+fn connection_summary(check: &fluree_db_api::ConnectionCheck, mode: &str) -> String {
+    check.summary(mode.eq_ignore_ascii_case("direct"))
+}
+
+/// [`connection_summary`] for a server's map response. A server that predates
+/// `connection_check` sends only `connection_tested`, which cannot say why.
+fn remote_connection_summary(result: &serde_json::Value, mode: &str) -> String {
+    if let Some(check) = result
+        .get("connection_check")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        return connection_summary(&check, mode);
+    }
+    let tested = result
+        .get("connection_tested")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if tested {
+        "verified".to_string()
+    } else {
+        "not verified: the server did not say why".to_string()
     }
 }
 
@@ -638,7 +646,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
     );
     println!(
         "  Connection:  {}",
-        connection_summary(result.connection_tested, &args.mode)
+        connection_summary(&result.connection_check, &args.mode)
     );
     println!(
         "  Mapping:     {}",
@@ -825,6 +833,87 @@ mod tests {
             s3_path_style: false,
         };
         (dir, args)
+    }
+
+    /// The `Connection:` line says why a source is not verified, and a slow
+    /// check reads as slow, not as a failure.
+    #[test]
+    fn connection_line_names_each_outcome() {
+        use fluree_db_api::ConnectionCheck;
+        let rest = |check: ConnectionCheck| connection_summary(&check, "rest");
+        let direct = |check: ConnectionCheck| connection_summary(&check, "DIRECT");
+
+        assert_eq!(rest(ConnectionCheck::Verified), "verified");
+        assert_eq!(direct(ConnectionCheck::Verified), "verified");
+
+        let timed_out = ConnectionCheck::TimedOut {
+            loaded: 2,
+            total: 5,
+            budget_secs: 10,
+        };
+        assert_eq!(
+            rest(timed_out.clone()),
+            "not verified: the check ran past 10 s (2 of 5 tables loaded); \
+             the tables may only be slow"
+        );
+        assert_eq!(rest(timed_out.clone()), direct(timed_out));
+
+        let missing = ConnectionCheck::TableFailed {
+            table: "sales.nope".to_string(),
+            error: "Table not found: sales.nope".to_string(),
+        };
+        assert_eq!(
+            rest(missing.clone()),
+            "not verified: table 'sales.nope': it did not load through the catalog; \
+             queries that read it fail until it loads (Table not found: sales.nope)"
+        );
+        assert_eq!(
+            direct(missing),
+            "not verified: table 'sales.nope': its metadata could not be read at its \
+             location; queries that read it fail until it loads (Table not found: sales.nope)"
+        );
+
+        let client = ConnectionCheck::ClientFailed {
+            error: "no secret resolver".to_string(),
+        };
+        assert_eq!(
+            rest(client),
+            "not verified: the catalog client could not be built, so no table was loaded \
+             (no secret resolver)"
+        );
+        assert_eq!(
+            rest(ConnectionCheck::NoTables),
+            "not verified: the mapping could not be read, so no table was loaded"
+        );
+    }
+
+    /// A server's `connection_check` reaches the line; one that sends only
+    /// `connection_tested` (an older server) still gets an answer.
+    #[test]
+    fn remote_connection_line_reads_the_servers_outcome() {
+        let timed_out = serde_json::json!({
+            "connection_tested": false,
+            "connection_check": {"outcome": "timed_out", "loaded": 0, "total": 3, "budget_secs": 10},
+        });
+        assert_eq!(
+            remote_connection_summary(&timed_out, "glue"),
+            "not verified: the check ran past 10 s (0 of 3 tables loaded); \
+             the tables may only be slow"
+        );
+        let verified = serde_json::json!({
+            "connection_tested": true,
+            "connection_check": {"outcome": "verified"},
+        });
+        assert_eq!(remote_connection_summary(&verified, "rest"), "verified");
+        let older = serde_json::json!({"connection_tested": false});
+        assert_eq!(
+            remote_connection_summary(&older, "rest"),
+            "not verified: the server did not say why"
+        );
+        assert_eq!(
+            remote_connection_summary(&serde_json::json!({"connection_tested": true}), "rest"),
+            "verified"
+        );
     }
 
     #[test]

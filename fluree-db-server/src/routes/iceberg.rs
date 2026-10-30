@@ -110,6 +110,9 @@ pub struct IcebergMapResponse {
     pub table_identifier: String,
     pub catalog_uri: String,
     pub connection_tested: bool,
+    /// What the registration's table check found; `connection_tested` is
+    /// `true` exactly when its `outcome` is `verified`.
+    pub connection_check: fluree_db_api::ConnectionCheck,
     pub mapping_source: String,
     pub triples_map_count: usize,
     pub table_count: usize,
@@ -186,6 +189,7 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
             table_identifier: result.table_identifier,
             catalog_uri: result.catalog_uri,
             connection_tested: result.connection_tested,
+            connection_check: result.connection_check,
             mapping_source: result.mapping_source,
             triples_map_count: result.triples_map_count,
             table_count: result.table_count,

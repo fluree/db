@@ -2477,6 +2477,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `table_identifier` | string | Always | Table identifier or derived from location |
 | `catalog_uri` | string | Always | REST catalog URI, Direct table location, Glue catalog id (`aws-glue` for the caller's own account), or S3 Tables bucket ARN |
 | `connection_tested` | boolean | Always | Whether every table the mapping names loaded at registration, the way a query loads it: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata (Direct) |
+| `connection_check` | object | Always | What that check found: an `outcome` (`verified`, `table_failed`, `client_failed`, `timed_out`, `no_tables`) and its fields; see [`POST /iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) |
 | `mapping_source` | string | Always | Content address of the stored R2RML mapping |
 | `triples_map_count` | integer | Always | Number of TriplesMap definitions found |
 | `table_count` | integer | Always | Number of distinct tables the mapping reads |

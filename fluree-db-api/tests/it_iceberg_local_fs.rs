@@ -1898,6 +1898,18 @@ async fn a_direct_registration_reports_whether_its_tables_resolve() {
         "a table that cannot be read is not verified"
     );
     assert!(
+        matches!(
+            &unread.connection_check,
+            fluree_db_api::ConnectionCheck::TableFailed { table, .. } if table == "silver.people"
+        ),
+        "the outcome names the table: {:?}",
+        unread.connection_check
+    );
+    assert_eq!(
+        table.connection_check,
+        fluree_db_api::ConnectionCheck::Verified
+    );
+    assert!(
         fluree
             .nameservice()
             .lookup_graph_source("probe-missing:main")
@@ -2021,6 +2033,82 @@ async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
     assert!(
         !refused.connection_tested,
         "a table the catalog refuses is not verified"
+    );
+    match &refused.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.refused");
+            assert!(error.contains("not yours"), "the catalog's reason: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    assert_eq!(
+        mapped.connection_check,
+        fluree_db_api::ConnectionCheck::Verified
+    );
+
+    // A table the catalog answers it does not have, and a catalog that does
+    // not answer, are both a table that did not load; the reason tells them
+    // apart.
+    let missing = register(
+        "rest-missing",
+        PEOPLE_R2RML.replace("silver.people", "silver.nope"),
+    )
+    .await;
+    match &missing.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.nope");
+            assert!(error.contains("not found"), "the catalog's answer: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    let unreachable = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "rest-unreachable",
+                "http://127.0.0.1:9/catalog",
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                PEOPLE_R2RML.to_string(),
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1"),
+        )
+        .await
+        .expect("an unreachable catalog still registers");
+    match &unreachable.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.people");
+            assert!(!error.contains("not found"), "no catalog answered: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+
+    // A catalog client that cannot be built loads no table, and is not
+    // reported as a table: its catalog credential names a secret that no
+    // resolver holds.
+    let unbuilt = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "rest-unbuilt",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                PEOPLE_R2RML.to_string(),
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .with_auth_bearer_token_ref("catalog/no-such-token"),
+        )
+        .await
+        .expect("a source whose client cannot be built still registers");
+    assert!(!unbuilt.connection_tested);
+    assert!(
+        matches!(
+            unbuilt.connection_check,
+            fluree_db_api::ConnectionCheck::ClientFailed { .. }
+        ),
+        "{:?}",
+        unbuilt.connection_check
     );
     assert!(
         fluree
@@ -2218,6 +2306,10 @@ async fn a_registration_whose_mapping_cannot_be_read_loads_no_table() {
         .expect("an unreadable mapping address registers unvalidated");
     assert!(!created.mapping_validated);
     assert!(!created.connection_tested, "nothing was loaded");
+    assert_eq!(
+        created.connection_check,
+        fluree_db_api::ConnectionCheck::NoTables
+    );
     let asked: Vec<String> = catalog
         .received_requests()
         .await

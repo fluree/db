@@ -11,7 +11,7 @@ use crate::graph_source::config::R2rmlCreateConfig;
 use crate::graph_source::iceberg_catalog::{
     decide_credential_source, storage_query_error, CredentialSource,
 };
-use crate::graph_source::result::R2rmlCreateResult;
+use crate::graph_source::result::{ConnectionCheck, R2rmlCreateResult};
 use crate::Result;
 use async_trait::async_trait;
 use fluree_db_core::ContentStore;
@@ -128,19 +128,6 @@ pub(crate) const EMPTY_MAPPING: &str =
 /// registered unverified rather than the request held open.
 pub(crate) const REGISTRATION_PROBE_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(10);
-
-/// What loading a new source's tables at registration found.
-#[derive(Debug)]
-pub(crate) enum TableProbe {
-    /// Every table loaded.
-    Loaded,
-    /// The mapping named no table to load.
-    NoTables,
-    /// `table` did not load (empty when the catalog client could not be built).
-    Failed { table: String, error: QueryError },
-    /// The budget ran out with `loaded` of `total` tables loaded.
-    TimedOut { loaded: usize, total: usize },
-}
 
 /// The R2RML mapping reference carried by a mapped graph-source record, per
 /// source family. `None` for a non-mapped type, an unparseable config, or a
@@ -1132,7 +1119,8 @@ impl crate::Fluree {
             )
             .await?;
 
-        let connection_tested = self.probe_tables(&graph_source_id, &table_names).await;
+        let connection_check = self.probe_tables(&graph_source_id, &table_names).await;
+        let connection_tested = connection_check.is_verified();
 
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
 
@@ -1146,47 +1134,57 @@ impl crate::Fluree {
             table_count,
             table_names,
             connection_tested,
+            connection_check,
             mapping_validated,
         })
     }
 
     /// Load each table a just-published source reads, the way its queries do,
-    /// within [`REGISTRATION_PROBE_BUDGET`]. `true` when every table loads. A
-    /// failure or an expired budget is logged and never returned, so it cannot
-    /// fail registration.
-    async fn probe_tables(&self, graph_source_id: &str, table_names: &[String]) -> bool {
-        match self
+    /// within [`REGISTRATION_PROBE_BUDGET`]. A failure or an expired budget is
+    /// logged and returned as the outcome, never as an error, so it cannot fail
+    /// registration.
+    async fn probe_tables(&self, graph_source_id: &str, table_names: &[String]) -> ConnectionCheck {
+        let check = self
             .probe_tables_within(graph_source_id, table_names, REGISTRATION_PROBE_BUDGET)
-            .await
-        {
-            TableProbe::Loaded => true,
-            TableProbe::NoTables => {
+            .await;
+        match &check {
+            ConnectionCheck::Verified => {}
+            ConnectionCheck::NoTables => {
                 debug!(
                     graph_source_id = %graph_source_id,
                     "No mapped table to load: the mapping could not be read"
                 );
-                false
             }
-            TableProbe::Failed { table, error } => {
+            ConnectionCheck::ClientFailed { error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    error = %error,
+                    "Could not build the catalog client - graph source was created but may fail at query time"
+                );
+            }
+            ConnectionCheck::TableFailed { table, error } => {
                 warn!(
                     graph_source_id = %graph_source_id,
                     table = %table,
                     error = %error,
                     "Could not load a mapped table - graph source was created but may fail at query time"
                 );
-                false
             }
-            TableProbe::TimedOut { loaded, total } => {
+            ConnectionCheck::TimedOut {
+                loaded,
+                total,
+                budget_secs,
+            } => {
                 warn!(
                     graph_source_id = %graph_source_id,
                     loaded,
                     total,
-                    budget_secs = REGISTRATION_PROBE_BUDGET.as_secs(),
+                    budget_secs,
                     "Loading the mapped tables ran past the registration budget ({loaded} of {total} loaded) - graph source was created but is not verified"
                 );
-                false
             }
         }
+        check
     }
 
     /// Load each named table the way its queries do (`load_table_context`):
@@ -1200,7 +1198,7 @@ impl crate::Fluree {
         graph_source_id: &str,
         table_names: &[String],
         budget: std::time::Duration,
-    ) -> TableProbe {
+    ) -> ConnectionCheck {
         use futures::TryStreamExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
         /// Catalog round trips in flight at once: a mapping over a warehouse
@@ -1211,7 +1209,7 @@ impl crate::Fluree {
         // names one: a catalog source's own `table` is the placeholder that
         // only satisfies the identifier shape, never a table to load.
         if table_names.is_empty() {
-            return TableProbe::NoTables;
+            return ConnectionCheck::NoTables;
         }
         let provider = FlureeR2rmlProvider::new(self);
         let loaded = AtomicUsize::new(0);
@@ -1223,7 +1221,9 @@ impl crate::Fluree {
             provider
                 .warm_catalog_client(graph_source_id)
                 .await
-                .map_err(|error| (String::new(), error))?;
+                .map_err(|error| ConnectionCheck::ClientFailed {
+                    error: error.to_string(),
+                })?;
             futures::stream::iter(table_names.iter().map(Ok))
                 .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
                     let (provider, loaded) = (&provider, &loaded);
@@ -1231,7 +1231,10 @@ impl crate::Fluree {
                         provider
                             .load_table_context(graph_source_id, table)
                             .await
-                            .map_err(|error| (table.clone(), error))?;
+                            .map_err(|error| ConnectionCheck::TableFailed {
+                                table: table.clone(),
+                                error: error.to_string(),
+                            })?;
                         loaded.fetch_add(1, Ordering::Relaxed);
                         Ok(())
                     }
@@ -1239,11 +1242,12 @@ impl crate::Fluree {
                 .await
         };
         match tokio::time::timeout(budget, probe).await {
-            Ok(Ok(())) => TableProbe::Loaded,
-            Ok(Err((table, error))) => TableProbe::Failed { table, error },
-            Err(_elapsed) => TableProbe::TimedOut {
+            Ok(Ok(())) => ConnectionCheck::Verified,
+            Ok(Err(failed)) => failed,
+            Err(_elapsed) => ConnectionCheck::TimedOut {
                 loaded: loaded.load(Ordering::Relaxed),
                 total: table_names.len(),
+                budget_secs: budget.as_secs(),
             },
         }
     }
@@ -5944,9 +5948,10 @@ mod tests {
         assert!(
             matches!(
                 probe,
-                TableProbe::TimedOut {
+                ConnectionCheck::TimedOut {
                     loaded: 0,
-                    total: 1
+                    total: 1,
+                    ..
                 }
             ),
             "{probe:?}"
@@ -5960,7 +5965,7 @@ mod tests {
         let probe = fluree
             .probe_tables_within("slow-catalog:main", &tables, Duration::from_secs(10))
             .await;
-        assert!(matches!(probe, TableProbe::Loaded), "{probe:?}");
+        assert!(matches!(probe, ConnectionCheck::Verified), "{probe:?}");
     }
 
     // ── ORDERING-TRAP GUARD: catalog_client_cache_key must fingerprint the RAW,

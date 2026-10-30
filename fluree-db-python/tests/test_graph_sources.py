@@ -10,6 +10,7 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -152,16 +153,17 @@ ORDERS_MAPPING = f"""
 
 def test_glue_and_s3_tables_sources_register(conn):
     # Registering loads each table the mapping's rr:tableName names through the
-    # catalog; with no reachable AWS catalog it warns and still registers, so
-    # these register offline. Reading them end to end is covered by
+    # catalog; when the table does not load (no reachable AWS catalog, no
+    # credentials, or no such table) it warns and still registers, so these
+    # register offline. Reading them end to end is covered by
     # fluree-db-api's it_iceberg_glue_moto.
-    with pytest.warns(UserWarning, match="could not reach the catalog at 123456789012"):
+    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog at 123456789012"):
         glue = conn.map_iceberg(
             "glue-orders", ORDERS_MAPPING, glue=fluree.Glue(region="us-east-1", catalog_id="123456789012")
         )
     assert (glue.id, glue.kind) == ("glue-orders:main", "iceberg")
     arn = "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"
-    with pytest.warns(UserWarning, match="could not reach the catalog at arn:aws:s3tables"):
+    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog at arn:aws:s3tables"):
         tables = conn.map_iceberg("s3t-orders", ORDERS_MAPPING, s3_tables=fluree.S3Tables(arn))
     assert (tables.id, tables.kind) == ("s3t-orders:main", "iceberg")
 
@@ -190,7 +192,7 @@ def test_glue_and_s3_tables_mistakes_are_refused(conn):
             auth=Bearer("t"),
         )
     # Turning vending off agrees with every mode.
-    with pytest.warns(UserWarning, match="could not reach the catalog"):
+    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog"):
         conn.map_iceberg("glue-no-vend", ORDERS_MAPPING, glue=fluree.Glue(), vended_credentials=False)
 
 
@@ -198,9 +200,86 @@ def test_a_rest_catalog_source_can_take_its_tables_from_the_mapping(conn):
     # No `table`: the mapping's rr:tableName names it, as on the CLI and server.
     # The catalog is unreachable (a refused loopback address), so registration
     # warns rather than fails.
-    with pytest.warns(UserWarning, match="could not reach the catalog"):
+    with pytest.warns(UserWarning, match="could not load table 'sales.orders' through the catalog at http://127.0.0.1:9"):
         rest = conn.map_iceberg("rest-orders", ORDERS_MAPPING, catalog_uri="http://127.0.0.1:9/catalog")
     assert rest.kind == "iceberg"
+
+
+class SlowOrEmptyCatalog(BaseHTTPRequestHandler):
+    """An Iceberg REST catalog that has no tables; with `delay` set it takes
+    that long to say so."""
+
+    delay: float = 0.0
+
+    def do_GET(self) -> None:
+        if self.path.endswith("/config"):
+            status, body = 200, {}
+        else:
+            time.sleep(self.delay)
+            status = 404
+            body = {"error": {"message": "Table does not exist", "type": "NoSuchTableException", "code": 404}}
+        payload = json.dumps(body).encode()
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except OSError:
+            pass  # registration stopped waiting
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+def _catalog(delay: float):
+    handler = type("Handler", (SlowOrEmptyCatalog,), {"delay": delay})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}"
+
+
+def _registration_warnings(conn, name, **where) -> list[str]:
+    with pytest.warns(UserWarning) as caught:
+        conn.map_iceberg(name, ORDERS_MAPPING, **where)
+    return [str(w.message) for w in caught]
+
+
+def test_a_table_the_catalog_does_not_have_is_named_not_an_unreachable_catalog(conn):
+    server, uri = _catalog(delay=0)
+    try:
+        [message] = _registration_warnings(conn, "rest-missing", catalog_uri=uri)
+    finally:
+        server.shutdown()
+    assert message.startswith(f"could not load table 'sales.orders' through the catalog at {uri} (")
+    assert "not found" in message.lower()
+    assert "could not reach" not in message
+
+
+def test_a_catalog_client_that_cannot_be_built_is_an_unreachable_catalog(conn, monkeypatch):
+    monkeypatch.delenv("FLUREE_TEST_UNSET_CATALOG_TOKEN", raising=False)
+    [message] = _registration_warnings(
+        conn,
+        "rest-unbuilt",
+        catalog_uri="http://127.0.0.1:9/catalog",
+        auth=Bearer(EnvVar("FLUREE_TEST_UNSET_CATALOG_TOKEN")),
+    )
+    assert message.startswith("could not reach the catalog at http://127.0.0.1:9/catalog: its client could not be built (")
+
+
+def test_a_slow_catalog_is_not_reported_as_unreachable(conn):
+    # The registration check stops after 10 s; past that the tables may only be slow.
+    server, uri = _catalog(delay=15)
+    try:
+        started = time.monotonic()
+        [message] = _registration_warnings(conn, "rest-slow", catalog_uri=uri)
+        assert time.monotonic() - started < 14, "registration waited past its budget"
+    finally:
+        server.shutdown()
+    assert message == (
+        f"the check of the tables at {uri} ran past 10 s (0 of 1 loaded), so they are not verified; "
+        "the source is registered, and the tables may only be slow"
+    )
 
 
 @local_tables

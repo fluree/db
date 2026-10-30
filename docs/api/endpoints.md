@@ -3114,6 +3114,7 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
   "table_identifier": "sales.orders",
   "catalog_uri": "https://polaris.example.com/api/catalog",
   "connection_tested": true,
+  "connection_check": {"outcome": "verified"},
   "mapping_source": "r2rml-inline",
   "triples_map_count": 3,
   "table_count": 1,
@@ -3129,6 +3130,16 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
 - `500 Internal Server Error` — the graph source could not be published
 
 `connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
+
+`connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
+
+| `outcome` | Meaning | Other fields |
+|---|---|---|
+| `verified` | Every mapped table loaded | |
+| `table_failed` | `table` did not load. `error` is the catalog's or the storage's reason, which is where a table the catalog does not have differs from a catalog that did not answer | `table`, `error` |
+| `client_failed` | The client every load goes through could not be built (for example, a catalog credential that does not resolve), so no table was loaded | `error` |
+| `timed_out` | The check ran past `budget_secs` with `loaded` of `total` tables loaded. The tables may only be slow | `loaded`, `total`, `budget_secs` |
+| `no_tables` | The mapping could not be read, so it named no table to load | |
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 

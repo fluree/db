@@ -222,8 +222,13 @@ pub struct R2rmlCreateResult {
     /// Whether every table the mapping reads loaded at registration, the way
     /// a query loads it: through the catalog for REST, AWS Glue and S3 Tables,
     /// and by resolving its current metadata for Direct. A `false` never fails
-    /// registration.
+    /// registration. `true` exactly when `connection_check` is
+    /// [`ConnectionCheck::Verified`].
     pub connection_tested: bool,
+
+    /// What that check found, kept apart so a caller can tell a slow check
+    /// from a table that did not load.
+    pub connection_check: ConnectionCheck,
 
     /// Whether the mapping was validated successfully
     pub mapping_validated: bool,
@@ -231,4 +236,136 @@ pub struct R2rmlCreateResult {
     /// Warnings about the `model` reference (policies a virtual source cannot
     /// evaluate). Empty when no model is set or nothing is amiss.
     pub model_warnings: Vec<String>,
+}
+
+/// What loading a new Iceberg source's tables at registration found. Only
+/// [`Self::Verified`] means every table loaded; no outcome fails registration.
+///
+/// Serialized with an `outcome` tag (`"verified"`, `"no_tables"`,
+/// `"client_failed"`, `"table_failed"`, `"timed_out"`) and the fields of each.
+#[cfg(feature = "iceberg")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ConnectionCheck {
+    /// Every table the mapping names loaded.
+    Verified,
+    /// The mapping could not be read, so it named no table to load.
+    NoTables,
+    /// The client every load goes through could not be built (for example, a
+    /// catalog credential that does not resolve), so no table was loaded.
+    ClientFailed {
+        /// Why the client could not be built.
+        error: String,
+    },
+    /// `table` did not load. `error` is the catalog's or the storage's
+    /// reason: a missing table and an unreachable catalog are told apart by
+    /// it, not by the outcome.
+    TableFailed {
+        /// The table as the mapping names it.
+        table: String,
+        /// Why it did not load.
+        error: String,
+    },
+    /// The check ran past its budget with `loaded` of `total` tables loaded.
+    /// The tables may only be slow.
+    TimedOut {
+        /// Tables loaded before the budget ran out.
+        loaded: usize,
+        /// Tables the mapping names.
+        total: usize,
+        /// The check's budget, in seconds.
+        budget_secs: u64,
+    },
+}
+
+#[cfg(feature = "iceberg")]
+impl ConnectionCheck {
+    /// Whether every mapped table loaded.
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified)
+    }
+
+    /// One line saying what the check found, for a person reading a
+    /// registration report. `direct` is a source read at its table location
+    /// rather than through a catalog. `"verified"`, or text starting
+    /// `"not verified: "` that says why.
+    pub fn summary(&self, direct: bool) -> String {
+        let failed = if direct {
+            "its metadata could not be read at its location"
+        } else {
+            "it did not load through the catalog"
+        };
+        match self {
+            Self::Verified => "verified".to_string(),
+            Self::NoTables => {
+                "not verified: the mapping could not be read, so no table was loaded".to_string()
+            }
+            Self::ClientFailed { error } => {
+                let client = if direct { "storage" } else { "catalog" };
+                format!(
+                    "not verified: the {client} client could not be built, so no table was \
+                     loaded ({error})"
+                )
+            }
+            Self::TableFailed { table, error } => format!(
+                "not verified: table '{table}': {failed}; queries that read it fail until it \
+                 loads ({error})"
+            ),
+            Self::TimedOut {
+                loaded,
+                total,
+                budget_secs,
+            } => format!(
+                "not verified: the check ran past {budget_secs} s ({loaded} of {total} tables \
+                 loaded); the tables may only be slow"
+            ),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "iceberg"))]
+mod tests {
+    use super::ConnectionCheck;
+
+    /// The server sends the outcome as JSON and the CLI reads it back: the
+    /// tag and field names are the wire contract.
+    #[test]
+    fn connection_check_wire_shape() {
+        let cases = [
+            (
+                ConnectionCheck::Verified,
+                serde_json::json!({"outcome": "verified"}),
+            ),
+            (
+                ConnectionCheck::NoTables,
+                serde_json::json!({"outcome": "no_tables"}),
+            ),
+            (
+                ConnectionCheck::ClientFailed { error: "e".into() },
+                serde_json::json!({"outcome": "client_failed", "error": "e"}),
+            ),
+            (
+                ConnectionCheck::TableFailed {
+                    table: "ns.t".into(),
+                    error: "e".into(),
+                },
+                serde_json::json!({"outcome": "table_failed", "table": "ns.t", "error": "e"}),
+            ),
+            (
+                ConnectionCheck::TimedOut {
+                    loaded: 1,
+                    total: 2,
+                    budget_secs: 10,
+                },
+                serde_json::json!({"outcome": "timed_out", "loaded": 1, "total": 2, "budget_secs": 10}),
+            ),
+        ];
+        for (check, json) in cases {
+            assert_eq!(serde_json::to_value(&check).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<ConnectionCheck>(json).unwrap(),
+                check
+            );
+        }
+    }
 }

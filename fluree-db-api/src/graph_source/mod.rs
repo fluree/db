@@ -420,7 +420,7 @@ pub use result::VectorStalenessCheck;
 pub use result::VectorSyncResult;
 
 #[cfg(feature = "iceberg")]
-pub use result::R2rmlCreateResult;
+pub use result::{ConnectionCheck, R2rmlCreateResult};
 
 // Re-export cache types
 pub use cache::R2rmlCache;

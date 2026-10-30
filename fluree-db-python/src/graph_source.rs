@@ -211,23 +211,57 @@ pub(crate) fn map_iceberg<'py>(
     let direct = config.iceberg.is_direct();
     let created = block_on(py, fluree.create_r2rml_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.model_warnings;
-    if !created.connection_tested {
-        // The catalog wording predates Direct's check; callers match on it.
-        warnings.push(if direct {
-            format!(
-                "could not read a mapped table's metadata at {}; the source is registered, \
-                 and queries will fail until it can be read",
-                created.catalog_uri
-            )
-        } else {
-            format!(
-                "could not reach the catalog at {}; the source is registered, and queries \
-                 will fail until it can be reached",
-                created.catalog_uri
-            )
-        });
-    }
+    warnings.extend(connection_warning(
+        &created.connection_check,
+        direct,
+        &created.catalog_uri,
+    ));
     registered(py, &created.graph_source_id, &created.table_names, warnings)
+}
+
+/// The warning a registration whose tables were not verified raises, saying
+/// why: a check that ran out of time may have slow tables, not failing ones,
+/// and a table that did not load is named with its reason (a missing table
+/// and an unreachable catalog differ there). `None` when every table loaded.
+fn connection_warning(
+    check: &fluree_db_api::ConnectionCheck,
+    direct: bool,
+    location: &str,
+) -> Option<String> {
+    use fluree_db_api::ConnectionCheck as C;
+    const REGISTERED: &str = "the source is registered";
+    Some(match check {
+        C::Verified => return None,
+        C::NoTables => format!(
+            "the mapping could not be read, so no table at {location} was loaded; \
+             {REGISTERED}, and its tables are not verified"
+        ),
+        C::ClientFailed { error } if direct => format!(
+            "could not build the storage client for {location} ({error}); {REGISTERED}, \
+             and queries will fail until it can be built"
+        ),
+        C::ClientFailed { error } => format!(
+            "could not reach the catalog at {location}: its client could not be built \
+             ({error}); {REGISTERED}, and queries will fail until it can be reached"
+        ),
+        C::TableFailed { table, error } if direct => format!(
+            "could not read the metadata of table '{table}' at {location} ({error}); \
+             {REGISTERED}, and queries that read it will fail until it can be read"
+        ),
+        C::TableFailed { table, error } => format!(
+            "could not load table '{table}' through the catalog at {location} ({error}); \
+             {REGISTERED}, and queries that read it will fail until it loads"
+        ),
+        C::TimedOut {
+            loaded,
+            total,
+            budget_secs,
+        } => format!(
+            "the check of the tables at {location} ran past {budget_secs} s ({loaded} of \
+             {total} loaded), so they are not verified; {REGISTERED}, and the tables may \
+             only be slow"
+        ),
+    })
 }
 
 pub(crate) fn map_delta<'py>(
