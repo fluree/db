@@ -8,12 +8,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
 
 use chrono::Utc;
 
 use crate::auth::token::CachedToken;
 use crate::error::Result;
+use crate::renew::{Renewing, Standing};
 
 /// What a cached token is for. Every part is needed for two holders to share it:
 ///
@@ -35,24 +37,20 @@ pub(super) struct TokenKey {
     pub(super) scopes: Vec<String>,
 }
 
-/// One key's token. The async lock is held across a refresh, so concurrent
-/// callers wait for the one exchange in flight instead of starting their own.
+/// One key's token, renewed single-flight (see [`crate::renew`]): while one
+/// exchange is in flight, callers holding a still-valid token read on with it
+/// and callers with none wait for that exchange; a failed exchange is not
+/// retried for [`RENEWAL_BACKOFF`](crate::renew::RENEWAL_BACKOFF).
 #[derive(Default)]
 pub(super) struct TokenSlot {
-    held: tokio::sync::Mutex<Held>,
-}
-
-/// A slot's token, and when a server's refusal last forced a new one.
-#[derive(Default)]
-struct Held {
-    token: Option<CachedToken>,
-    last_forced: Option<Instant>,
+    token: Renewing<CachedToken>,
 }
 
 /// How often a server's refusal may force a slot to mint a new token. A slot
 /// can be shared by many sources (a host identity is one slot for the whole
 /// process), so without this any one of them could make every 401 re-mint it.
-pub(super) const FORCED_REFETCH_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub(super) const FORCED_REFETCH_INTERVAL: Duration = crate::renew::FORCED_RENEWAL_INTERVAL;
 
 /// Prune slots nobody holds and whose token has expired once the map grows
 /// past this, so a long-lived process that has seen many sources stays small.
@@ -75,14 +73,22 @@ pub(super) fn slot(key: &TokenKey) -> Arc<TokenSlot> {
     if slots.len() >= PRUNE_ABOVE {
         slots.retain(|_, slot| {
             Arc::strong_count(slot) > 1
-                || slot.held.try_lock().map_or(true, |held| {
-                    held.token
-                        .as_ref()
-                        .is_some_and(|t| Utc::now() < t.expires_at)
-                })
+                || slot.token.held().is_some_and(|t| Utc::now() < t.expires_at)
         });
     }
     Arc::clone(slots.entry(key.clone()).or_default())
+}
+
+/// How a held token stands: fresh outside its refresh margin, usable until
+/// it actually expires.
+fn standing(token: &CachedToken) -> Standing {
+    if !token.is_expired() {
+        Standing::Fresh
+    } else if Utc::now() < token.expires_at {
+        Standing::Usable
+    } else {
+        Standing::Expired
+    }
 }
 
 impl TokenSlot {
@@ -95,48 +101,20 @@ impl TokenSlot {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<CachedToken>>,
     {
-        let mut held = self.held.lock().await;
-        if let Some(token) = held.token.as_ref().filter(|t| !t.is_expired()) {
-            return Ok(token.clone());
-        }
-        match fetch().await {
-            Ok(token) => {
-                held.token = Some(token.clone());
-                Ok(token)
-            }
-            Err(e) => match held.token.as_ref().filter(|t| Utc::now() < t.expires_at) {
-                Some(still_valid) => {
-                    tracing::warn!(error = %e, "Google token refresh failed; reading on with the held token");
-                    Ok(still_valid.clone())
-                }
-                None => Err(e),
-            },
-        }
+        self.token.get_or_renew(standing, fetch).await
     }
 
     /// Replace the held token with a fresh one after a server refused it, at
-    /// most once per [`FORCED_REFETCH_INTERVAL`]: within that window of the
-    /// last forced one the held token is kept (it was itself just re-minted
-    /// for a refusal), and the caller's retry reports the server's refusal.
-    /// Returns whether a new token was minted.
+    /// most once per [`FORCED_RENEWAL_INTERVAL`](crate::renew::FORCED_RENEWAL_INTERVAL):
+    /// within that window of the last forced one the held token is kept (it
+    /// was itself just re-minted for a refusal), and the caller's retry
+    /// reports the server's refusal. Returns whether a new token was minted.
     pub(super) async fn refetch<F, Fut>(&self, fetch: F) -> Result<bool>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<CachedToken>>,
     {
-        let mut held = self.held.lock().await;
-        let recently_forced = held
-            .last_forced
-            .is_some_and(|at| at.elapsed() < FORCED_REFETCH_INTERVAL);
-        if held.token.is_some() && recently_forced {
-            tracing::debug!(
-                "a Google token was re-minted for a refusal moments ago; not minting another"
-            );
-            return Ok(false);
-        }
-        held.token = Some(fetch().await?);
-        held.last_forced = Some(Instant::now());
-        Ok(true)
+        self.token.force(fetch).await
     }
 }
 
@@ -174,8 +152,8 @@ mod tests {
         }
         assert_eq!(mints.load(Ordering::SeqCst), 2);
 
-        slot.held.lock().await.last_forced =
-            Instant::now().checked_sub(FORCED_REFETCH_INTERVAL + Duration::from_secs(1));
+        slot.token
+            .rewind(FORCED_REFETCH_INTERVAL + Duration::from_secs(1));
         assert!(slot.refetch(mint).await.unwrap(), "past the window");
         assert!(!slot.refetch(mint).await.unwrap(), "and a window again");
         assert_eq!(mints.load(Ordering::SeqCst), 3);

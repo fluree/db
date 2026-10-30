@@ -4,11 +4,12 @@
 //! expire (an hour, typically). A scan or materialize that outlives them would
 //! fail mid-read, so the store holds a [`RenewingVendedCredentials`]: every
 //! request asks it for the current credential, and inside a margin before
-//! expiry it asks the catalog again (single-flight: one re-vend in flight,
-//! concurrent readers wait for it). A still-valid credential is kept when a
-//! re-vend fails; one the store has refused is not.
+//! expiry it asks the catalog again (single-flight: one re-vend in flight;
+//! readers holding a still-valid credential read on with it, the rest wait
+//! for it). A still-valid credential is kept when a re-vend fails, and a
+//! failed re-vend is not retried for a short backoff; a credential the store
+//! has refused is never served again.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,6 +19,7 @@ use rand::Rng;
 use crate::catalog::{SendCatalogClient, TableIdentifier};
 use crate::credential::VendedCredentials;
 use crate::error::{IcebergError, Result};
+use crate::renew::{Renewing, Standing};
 
 /// How long before expiry a held credential is renewed, before jitter: long
 /// enough that a request which takes it has time to complete.
@@ -70,12 +72,20 @@ impl VendedCredentialSource for CatalogVendedSource {
     }
 }
 
-/// A table's vended credential, renewed from its catalog before it expires.
+/// A table's vended credential, renewed from its catalog before it expires,
+/// single-flight (see [`crate::renew`]): while one re-vend is in flight,
+/// readers holding a still-valid credential read on with it; a failed re-vend
+/// is not retried for [`RENEWAL_BACKOFF`](crate::renew::RENEWAL_BACKOFF); a
+/// credential the store refused is never served again.
 pub struct RenewingVendedCredentials {
-    held: tokio::sync::Mutex<VendedCredentials>,
-    /// Set when the store refused the held credential: renew on next use, and
-    /// never fall back to it.
-    refused: AtomicBool,
+    held: Renewing<VendedCredentials>,
+    /// The kind the store was built for (and its name); a renewal of another
+    /// is refused.
+    kind: (std::mem::Discriminant<VendedCredentials>, &'static str),
+    /// Set once the catalog renewed with another kind: the store was built
+    /// for a credential the catalog no longer vends, so every request is
+    /// refused from then on, even while the held credential is still valid.
+    mismatch: std::sync::OnceLock<IcebergError>,
     source: Option<Arc<dyn VendedCredentialSource>>,
     margin: std::time::Duration,
 }
@@ -99,8 +109,9 @@ impl RenewingVendedCredentials {
         source: Option<Arc<dyn VendedCredentialSource>>,
     ) -> Self {
         Self {
-            held: tokio::sync::Mutex::new(initial),
-            refused: AtomicBool::new(false),
+            kind: (std::mem::discriminant(&initial), initial.kind()),
+            mismatch: std::sync::OnceLock::new(),
+            held: Renewing::new(Some(initial)),
             source,
             margin: DEFAULT_RENEWAL_MARGIN,
         }
@@ -115,53 +126,62 @@ impl RenewingVendedCredentials {
     /// The credential to sign the next request with: the held one while it is
     /// outside the renewal margin, else a fresh one from the catalog.
     pub async fn current(&self) -> Result<VendedCredentials> {
-        let mut held = self.held.lock().await;
-        let refused = self.refused.load(Ordering::Acquire);
-        if !refused && !self.renewal_due(&held) {
-            return Ok(held.clone());
-        }
-        let Some(source) = &self.source else {
-            return if !refused && still_valid(&held) {
-                Ok(held.clone())
+        let standing = |held: &VendedCredentials| {
+            if !self.renewal_due(held) {
+                Standing::Fresh
+            } else if still_valid(held) {
+                Standing::Usable
             } else {
-                Err(IcebergError::Credential(
+                Standing::Expired
+            }
+        };
+        let Some(source) = &self.source else {
+            return match self.held.held() {
+                Some(held) if standing(&held) != Standing::Expired => Ok(held),
+                _ => Err(IcebergError::Credential(
                     "the table's vended storage credentials expired and this read has no way \
                      to renew them"
                         .to_string(),
-                ))
+                )),
             };
         };
-        match source.revend().await {
-            Ok(fresh) => {
-                if std::mem::discriminant(&fresh) != std::mem::discriminant(&*held) {
-                    return Err(IcebergError::Credential(format!(
-                        "the catalog renewed the table's {} with {}; refusing a credential of a \
-                         different kind than the store was built for",
-                        held.kind(),
+        if let Some(mismatch) = self.mismatch.get() {
+            return Err(mismatch.clone());
+        }
+        let (kind, held_kind) = self.kind;
+        let renewed = self
+            .held
+            .get_or_renew(standing, || async move {
+                let fresh = source.revend().await?;
+                if std::mem::discriminant(&fresh) != kind {
+                    let err = IcebergError::Credential(format!(
+                        "the catalog renewed the table's {held_kind} with {}; refusing a \
+                         credential of a different kind than the store was built for",
                         fresh.kind()
-                    )));
+                    ));
+                    return Err(self.mismatch.get_or_init(|| err).clone());
                 }
                 tracing::debug!(
                     kind = fresh.kind(),
                     valid_for_s = fresh.seconds_until_expiry(),
                     "vended storage credentials renewed"
                 );
-                *held = fresh;
-                self.refused.store(false, Ordering::Release);
-                Ok(held.clone())
-            }
-            Err(e) if !refused && still_valid(&held) => {
-                tracing::warn!(error = %e, "vended credential renewal failed; reading on with the held credential");
-                Ok(held.clone())
-            }
-            Err(e) => Err(e),
+                Ok(fresh)
+            })
+            .await;
+        match self.mismatch.get() {
+            Some(mismatch) => Err(mismatch.clone()),
+            None => renewed,
         }
     }
 
     /// The store refused the held credential (a 401): renew before the next
-    /// request, and do not fall back to it if that fails.
+    /// request, and do not fall back to it if that fails. At most once per
+    /// [`FORCED_RENEWAL_INTERVAL`](crate::renew::FORCED_RENEWAL_INTERVAL):
+    /// within that window of a renewal a refusal forced, the held credential
+    /// (itself just renewed) is kept and the retry reports the refusal.
     pub fn invalidate(&self) {
-        self.refused.store(true, Ordering::Release);
+        self.held.refuse();
     }
 
     fn renewal_due(&self, held: &VendedCredentials) -> bool {
@@ -205,7 +225,8 @@ impl crate::credential::SendCredentialResolver for RenewingVendedCredentials {
 mod tests {
     use super::*;
     use crate::credential::GcsCredentials;
-    use std::sync::atomic::AtomicUsize;
+    use crate::renew::{FORCED_RENEWAL_INTERVAL, RENEWAL_BACKOFF};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn token(name: &str, expires_in: chrono::Duration) -> VendedCredentials {
         VendedCredentials::Gcs(GcsCredentials {
@@ -252,23 +273,34 @@ mod tests {
         assert_eq!(catalog.calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Inside the margin one re-vend runs; readers that arrive while it does
+    /// read on with the still-valid held credential rather than wait.
+    /// Readers of an expired one wait for that re-vend and share it.
     #[tokio::test]
     async fn inside_the_margin_concurrent_readers_share_one_revend() {
-        let catalog = Arc::new(Catalog::default());
-        let renewing = Arc::new(RenewingVendedCredentials::new(
-            token("t0", chrono::Duration::seconds(30)),
-            Some(catalog.clone()),
-        ));
-        let readers: Vec<_> = (0..8)
-            .map(|_| {
-                let renewing = Arc::clone(&renewing);
-                tokio::spawn(async move { renewing.current().await.unwrap() })
-            })
-            .collect();
-        for reader in readers {
-            assert_eq!(bearer(&reader.await.unwrap()), "t1");
+        for (held_for, may_read_on) in [(30, true), (-1, false)] {
+            let catalog = Arc::new(Catalog::default());
+            let renewing = Arc::new(RenewingVendedCredentials::new(
+                token("t0", chrono::Duration::seconds(held_for)),
+                Some(catalog.clone()),
+            ));
+            let readers: Vec<_> = (0..8)
+                .map(|_| {
+                    let renewing = Arc::clone(&renewing);
+                    tokio::spawn(async move { renewing.current().await.unwrap() })
+                })
+                .collect();
+            for reader in readers {
+                let served = reader.await.unwrap();
+                match bearer(&served) {
+                    "t1" => {}
+                    "t0" if may_read_on => {}
+                    other => panic!("held for {held_for}s: served {other}"),
+                }
+            }
+            assert_eq!(catalog.calls.load(Ordering::SeqCst), 1, "single-flight");
+            assert_eq!(bearer(&renewing.current().await.unwrap()), "t1");
         }
-        assert_eq!(catalog.calls.load(Ordering::SeqCst), 1, "single-flight");
     }
 
     #[tokio::test]
@@ -286,7 +318,52 @@ mod tests {
             "refused, so never reused"
         );
         catalog.fail.store(false, Ordering::SeqCst);
+        renewing.held.rewind(RENEWAL_BACKOFF);
         assert_ne!(bearer(&renewing.current().await.unwrap()), "t0");
+    }
+
+    /// A failed re-vend is not retried until the backoff passes: a held
+    /// credential that is still valid is served meanwhile, an expired one is
+    /// refused at once, and neither asks the catalog again.
+    #[tokio::test]
+    async fn a_failed_revend_is_not_retried_within_the_backoff() {
+        for (held_for, reads_on) in [(30, true), (-1, false)] {
+            let catalog = Arc::new(Catalog::default());
+            catalog.fail.store(true, Ordering::SeqCst);
+            let renewing = RenewingVendedCredentials::new(
+                token("t0", chrono::Duration::seconds(held_for)),
+                Some(catalog.clone()),
+            );
+            for _ in 0..5 {
+                let served = renewing.current().await;
+                assert_eq!(served.is_ok(), reads_on, "held for {held_for}s");
+            }
+            assert_eq!(catalog.calls.load(Ordering::SeqCst), 1);
+            catalog.fail.store(false, Ordering::SeqCst);
+            renewing.held.rewind(RENEWAL_BACKOFF);
+            assert_eq!(bearer(&renewing.current().await.unwrap()), "t2");
+        }
+    }
+
+    /// A refusal forces a re-vend at most once per interval: within it of
+    /// the last forced re-vend, the renewed credential is kept.
+    #[tokio::test]
+    async fn a_refusal_forces_a_revend_at_most_once_per_interval() {
+        let catalog = Arc::new(Catalog::default());
+        let renewing = RenewingVendedCredentials::new(
+            token("t0", chrono::Duration::hours(1)),
+            Some(catalog.clone()),
+        );
+        renewing.invalidate();
+        assert_eq!(bearer(&renewing.current().await.unwrap()), "t1");
+        for _ in 0..3 {
+            renewing.invalidate();
+            assert_eq!(bearer(&renewing.current().await.unwrap()), "t1");
+        }
+        assert_eq!(catalog.calls.load(Ordering::SeqCst), 1);
+        renewing.held.rewind(FORCED_RENEWAL_INTERVAL);
+        renewing.invalidate();
+        assert_eq!(bearer(&renewing.current().await.unwrap()), "t2");
     }
 
     #[tokio::test]

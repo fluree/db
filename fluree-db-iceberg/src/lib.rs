@@ -66,6 +66,7 @@ pub mod manifest;
 pub mod metadata;
 pub mod mor_guard;
 pub mod net;
+pub(crate) mod renew;
 pub mod scan;
 pub mod stats;
 

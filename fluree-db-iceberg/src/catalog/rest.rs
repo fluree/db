@@ -193,6 +193,15 @@ impl RestCatalogClient {
         Box::pin(async move {
             let url = format!("{}{}", self.config.uri, path);
 
+            // The provider's headers: Authorization, plus any it adds
+            // (Google's x-goog-user-project). Taken before the permit below: a
+            // token exchange can wait on its issuer (up to its own timeout,
+            // and longer in an outage), and holding a catalog slot through it
+            // would let one identity's issuer stall every source's catalog
+            // requests. Reused across the 429/503 retries; a token that
+            // expires during them is a 401, renewed below.
+            let auth_headers = self.auth.request_headers(&url).await?;
+
             // Bound concurrent catalog requests process-wide so a fan-out — the
             // slice-1 prefetch, a wildcard crawl, or a raised scan concurrency —
             // can't storm Horizon. The permit is held across the 429/503 backoff
@@ -206,11 +215,8 @@ impl RestCatalogClient {
                 let mut request = self
                     .http_client
                     .get(&url)
-                    .header("Accept", "application/json");
-
-                // The provider's headers: Authorization, plus any it adds
-                // (Google's x-goog-user-project).
-                request = request.headers(self.auth.request_headers(&url).await?);
+                    .header("Accept", "application/json")
+                    .headers(auth_headers.clone());
 
                 // Add custom headers
                 for (name, value) in headers {
@@ -748,6 +754,57 @@ mod tests {
             matches!(err, IcebergError::CatalogQuotaProjectRequired { .. }),
             "{err:?}"
         );
+    }
+
+    /// A provider's token exchange runs before the request takes its
+    /// catalog slot: an issuer that hangs holds no slot, so other sources'
+    /// requests on the same process-wide pool go ahead.
+    #[tokio::test]
+    async fn a_slow_token_exchange_holds_no_catalog_slot() {
+        /// Hangs in its first exchange until released.
+        #[derive(Debug, Default)]
+        struct HangingAuth {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            hung: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl SendCatalogAuth for HangingAuth {
+            async fn request_headers(&self, _url: &str) -> Result<reqwest::header::HeaderMap> {
+                if !self.hung.swap(true, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(reqwest::header::HeaderMap::new())
+            }
+            async fn refresh(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let server = mock_catalog().await;
+        serve_config(&server, serde_json::json!({})).await;
+        serve_table(&server, "/v1/namespaces/db/tables/events").await;
+        let one_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        let hanging = Arc::new(HangingAuth::default());
+        let mut stalled = wiremock_client(&server.uri(), Arc::clone(&one_slot));
+        stalled.config.warehouse = Some("slot-stalled".to_string());
+        stalled.auth = hanging.clone();
+        let stalled = tokio::spawn(async move { loads(&stalled, "db").await.map(|_| ()) });
+        hanging.entered.notified().await;
+
+        let mut other = wiremock_client(&server.uri(), one_slot);
+        other.config.warehouse = Some("slot-other".to_string());
+        tokio::time::timeout(std::time::Duration::from_secs(10), loads(&other, "db"))
+            .await
+            .expect("another source's request waited on the stalled exchange")
+            .unwrap();
+
+        hanging.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), stalled)
+            .await
+            .expect("the released exchange completes")
+            .unwrap()
+            .unwrap();
     }
 
     /// BigLake refuses a service account's (and WIF's) request that names no
