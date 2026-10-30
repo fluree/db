@@ -4676,10 +4676,39 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
 {
-    let list = snapshot.manifest_list_location()?;
-    if let Some(hit) = cache.and_then(|c| c.get_manifest_list_totals(list)) {
+    if let Some(hit) = cached_manifest_list_totals_hit(cache, snapshot) {
         return Some(hit);
     }
+    read_manifest_list_totals(cache, table, snapshot, open_storage).await
+}
+
+/// The cache half of [`cached_manifest_list_totals`]: the totals `cache`
+/// holds for the snapshot's manifest list, with no I/O. A caller that bounds
+/// only the read (virtual `/info`) looks here first and times only
+/// [`read_manifest_list_totals`].
+pub(crate) fn cached_manifest_list_totals_hit(
+    cache: Option<&R2rmlCache>,
+    snapshot: &fluree_db_iceberg::metadata::Snapshot,
+) -> Option<fluree_db_iceberg::ManifestListTotals> {
+    cache?.get_manifest_list_totals(snapshot.manifest_list_location()?)
+}
+
+/// The read half of [`cached_manifest_list_totals`]: build the storage, read
+/// the snapshot's manifest list once and cache the totals. Does not consult
+/// the cache first.
+pub(crate) async fn read_manifest_list_totals<S, E, F, Fut>(
+    cache: Option<&R2rmlCache>,
+    table: &str,
+    snapshot: &fluree_db_iceberg::metadata::Snapshot,
+    open_storage: F,
+) -> Option<fluree_db_iceberg::ManifestListTotals>
+where
+    S: SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    let list = snapshot.manifest_list_location()?;
     let storage = match open_storage().await {
         Ok(storage) => storage,
         Err(e) => {

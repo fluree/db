@@ -1851,11 +1851,10 @@ async fn fetch_virtual_table_row_counts(
 /// `open_storage` runs only on a cache miss, so a warm `/info` builds no
 /// storage and reads nothing. A failed read caches nothing and omits the count.
 ///
-/// Only the manifest-list step is bounded by `deadline`, and an overrun omits
-/// only this table's count. A count from the summary never waits on anything,
-/// and a cache hit is served even past the deadline: `timeout_at` polls the
-/// lookup before it checks the deadline, and the lookup completes on its first
-/// poll.
+/// Only the manifest-list read (building its storage and reading the list) is
+/// bounded by `deadline`, and an overrun omits only this table's count. A count
+/// from the summary never waits on anything, and a cache hit is served even
+/// past the deadline: the cache is looked up before the timer starts.
 ///
 /// MoR rider (F-AUD-1): neither source subtracts position/equality deletes,
 /// which Fluree recognizes but does not yet apply, so both over-count a
@@ -1887,12 +1886,16 @@ where
     let Some(snapshot) = metadata.current_snapshot() else {
         return (None, summary_mor);
     };
-    let read = crate::graph_source::cached_manifest_list_totals(
-        Some(cache),
-        table,
-        snapshot,
-        open_storage,
-    );
+    if let Some(totals) =
+        crate::graph_source::cached_manifest_list_totals_hit(Some(cache), snapshot)
+    {
+        return (
+            totals.row_count,
+            summary_mor || totals.has_delete_manifests(),
+        );
+    }
+    let read =
+        crate::graph_source::read_manifest_list_totals(Some(cache), table, snapshot, open_storage);
     match tokio::time::timeout_at(deadline, read).await {
         Ok(Some(totals)) => (
             totals.row_count,
@@ -3080,9 +3083,9 @@ mod tests {
         assert_eq!(out, (Some(1234), false), "a summary count never waits");
     }
 
-    /// A warm `/info` is never cut by the budget: a cache hit completes on the
-    /// lookup's first poll, which `timeout_at` makes before it checks the
-    /// deadline, so it is served with the deadline already past.
+    /// A warm `/info` is never cut by the budget: the cache is looked up before
+    /// the deadline is consulted, so a hit is served with the deadline already
+    /// past.
     #[cfg(feature = "iceberg")]
     #[tokio::test]
     async fn virtual_count_cache_hit_is_served_past_the_deadline() {
