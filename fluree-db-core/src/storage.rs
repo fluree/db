@@ -133,7 +133,7 @@ pub use content_bytes::ContentBytes;
 #[cfg(not(target_arch = "wasm32"))]
 pub use content_bytes::DEFAULT_MMAP_MIN_BYTES;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use file::{FileStorage, STORAGE_METHOD_FILE};
+pub use file::{FileStorage, StoppedLogs, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
 pub use pins::{
     Abandoned, BlobClaim, BlobPin, BlobPinner, BlobPins, PinWaits, RootCollection, RootHold,

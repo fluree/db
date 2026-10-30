@@ -598,7 +598,8 @@ pub(super) fn operation_gate(base: &Path) -> io::Result<Arc<tokio::sync::RwLock<
 /// Flush and retire every segment of every log this process holds under
 /// `base`, the root's own and any owned ones. The shutdown hook: a handle
 /// that is still referenced by some background task would otherwise keep
-/// its log until that task ends. Returns whether there was a live log.
+/// its log until that task ends. Returns whether there was a live log; an
+/// error when a segment is still in use after the checkpoint's wait.
 pub(super) fn checkpoint_root(base: &Path) -> io::Result<bool> {
     let base = match std::fs::canonicalize(base) {
         Ok(base) => base,
@@ -614,12 +615,19 @@ pub(super) fn checkpoint_root(base: &Path) -> io::Result<bool> {
         .filter_map(|(_, log)| log.upgrade())
         .collect();
     let mut any = false;
+    let mut waiting = 0;
     for log in logs {
         if log.crashed.load(Ordering::Acquire) || log.hold_segments.load(Ordering::Acquire) {
             continue;
         }
-        log.checkpoint()?;
+        waiting += log.checkpoint()?;
         any = true;
+    }
+    if waiting > 0 {
+        return Err(io::Error::other(format!(
+            "{waiting} WAL segments under {} are still in use; the next open replays them",
+            base.display()
+        )));
     }
     Ok(any)
 }
@@ -667,18 +675,24 @@ pub(super) fn foreign_segments(base: &Path) -> io::Result<usize> {
 /// Logs this process holds, or another live process holds, are skipped.
 /// Returns how many records were applied.
 pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
+    replay_stopped(base).map(|(applied, _)| applied)
+}
+
+/// [`replay_unowned`], also naming the other owners still running.
+pub(super) fn replay_stopped(base: &Path) -> io::Result<(usize, Vec<String>)> {
     let base = match std::fs::canonicalize(base) {
         Ok(base) => base,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, Vec::new())),
         Err(e) => return Err(e),
     };
     let owners = base.join(WAL_DIR).join(OWNERS_DIR);
     let entries = match std::fs::read_dir(&owners) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, Vec::new())),
         Err(e) => return Err(e),
     };
     let mut applied = 0;
+    let mut running = Vec::new();
     for entry in entries {
         let dir = entry?.path();
         if !dir.is_dir() {
@@ -707,7 +721,12 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
         };
         match lock.try_lock_exclusive() {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(owner) = dir.file_name() {
+                    running.push(owner.to_string_lossy().into_owned());
+                }
+                continue;
+            }
             Err(e) => {
                 skip_unavailable_owner(&dir, e)?;
                 continue;
@@ -725,7 +744,7 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
         // The lock drops here, so the owner can come back and reopen an
         // already retired log.
     }
-    Ok(applied)
+    Ok((applied, running))
 }
 
 /// A failed first acquisition can leave an empty owner directory. It is
@@ -1986,6 +2005,29 @@ mod tests {
             Acquire::Log(log) => log,
             _ => panic!("log unavailable"),
         }
+    }
+
+    /// A root's checkpoint fails while a segment is still in use, rather
+    /// than reporting it retired.
+    #[test]
+    fn a_root_checkpoint_fails_on_a_segment_still_in_use() {
+        use crate::FileStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        let appended = log
+            .append(
+                Op::Write {
+                    key: "payload",
+                    bytes: b"acknowledged",
+                },
+                true,
+            )
+            .unwrap();
+        assert!(FileStorage::checkpoint_wal(dir.path()).is_err());
+        write_page_cache(&dir.path().join("payload"), b"acknowledged").unwrap();
+        drop(appended);
+        assert!(FileStorage::checkpoint_wal(dir.path()).unwrap());
+        assert!(segment_paths(&log.dir).unwrap().is_empty());
     }
 
     /// A record's segment cannot be retired while the file it describes is

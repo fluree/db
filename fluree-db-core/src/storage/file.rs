@@ -192,6 +192,16 @@ fn staging_token(name: &str) -> Option<&str> {
     }
 }
 
+/// The pid a write-ahead log replay names its temporary file with
+/// (`<name>.wal-replay.<pid>.tmp`): a crash mid-replay leaves it, holding a
+/// full copy of the record's bytes.
+fn replay_temp_pid(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix(TMP_SUFFIX)?;
+    let (head, pid) = rest.rsplit_once('.')?;
+    let prefix = head.strip_suffix(".wal-replay")?;
+    (!prefix.is_empty() && is_plain_decimal(pid)).then_some(pid)
+}
+
 /// How long a staging file must have gone untouched before a sweep may
 /// reclaim it.
 ///
@@ -300,6 +310,7 @@ fn sweep_staging(
 ) -> StagingSweep {
     let mut sweep = StagingSweep::default();
     let own_token = format!("{:016x}", process_token());
+    let own_pid = std::process::id().to_string();
     let now = std::time::SystemTime::now();
     let mut budget = budget;
     let mut dirs = vec![base.to_path_buf()];
@@ -349,11 +360,15 @@ fn sweep_staging(
             // staging file and an unlink — including the indexer's vocab-merge
             // temporaries, which are exactly the long-running shape
             // `STALE_STAGING_AGE` argues an age threshold must not judge.
-            let Some(token) = staging_token(&name) else {
-                continue;
+            // A replay's temporary file is the replay's own to clean up, the
+            // same rules otherwise: a replay writes it and renames it at once.
+            let own = match (staging_token(&name), replay_temp_pid(&name)) {
+                (Some(token), _) => token == own_token.as_str(),
+                (None, Some(pid)) => pid == own_pid.as_str(),
+                (None, None) => continue,
             };
             // Rule 1: ours, whatever its age.
-            if token == own_token.as_str() {
+            if own {
                 sweep.kept += 1;
                 continue;
             }
@@ -389,6 +404,16 @@ fn sweep_staging(
         }
     }
     sweep
+}
+
+/// What [`FileStorage::retire_stopped_logs`] found of other owners' logs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoppedLogs {
+    /// Records applied from the logs of owners that had stopped; those logs
+    /// are retired.
+    pub applied: usize,
+    /// Owners still running.
+    pub running: Vec<String>,
 }
 
 /// Base paths this process has already swept.
@@ -844,6 +869,25 @@ impl FileStorage {
         Ok(sweep.reclaimed)
     }
 
+    /// [`Self::sweep_foreign_staging`], taking only files untouched for
+    /// `older_than`: for a root other live processes write, whose own staging
+    /// files are in flight for milliseconds.
+    pub fn sweep_staging_older_than(
+        dir: impl AsRef<Path>,
+        older_than: std::time::Duration,
+    ) -> std::io::Result<usize> {
+        let dir = dir.as_ref();
+        let sweep = sweep_staging(dir, Some(older_than), usize::MAX);
+        if sweep.refused > 0 {
+            return Err(std::io::Error::other(format!(
+                "{} staging files or directories under {} could not be removed or read",
+                sweep.refused,
+                dir.display()
+            )));
+        }
+        Ok(sweep.reclaimed)
+    }
+
     /// The walk itself, plus what it reports.
     fn run_sweep(base_path: &Path, budget: usize) {
         let sweep = sweep_orphaned_staging_files(base_path, STALE_STAGING_AGE, budget);
@@ -1175,6 +1219,15 @@ impl FileStorage {
     /// their owner dies replays them.
     pub fn foreign_wal_segments(root: impl AsRef<Path>) -> Result<usize> {
         wal::foreign_segments(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
+    }
+
+    /// Apply and retire the logs other owners under `root` left when they
+    /// stopped, as a miss would, and name the owners still running, whose
+    /// logs are theirs to retire. Blocking.
+    pub fn retire_stopped_logs(root: impl AsRef<Path>) -> Result<StoppedLogs> {
+        let (applied, running) = wal::replay_stopped(root.as_ref())
+            .map_err(|e| Self::recovery_error(root.as_ref(), e))?;
+        Ok(StoppedLogs { applied, running })
     }
 
     /// Flush the directories under `root` that held the files at `keys`, so
@@ -3188,6 +3241,29 @@ mod tests {
         assert_eq!((sweep.reclaimed, sweep.kept), (0, 1));
     }
 
+    /// A replay's temporary file left by another process is a crash's, and
+    /// swept once old enough; this process's own stays.
+    #[test]
+    fn a_crashed_replays_temporary_file_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("a.bin.wal-replay.1.tmp");
+        let ours = dir
+            .path()
+            .join(format!("b.bin.wal-replay.{}.tmp", std::process::id()));
+        std::fs::write(&theirs, b"bytes").unwrap();
+        std::fs::write(&ours, b"bytes").unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        assert_eq!(
+            FileStorage::sweep_staging_older_than(dir.path(), day).unwrap(),
+            0
+        );
+        assert!(theirs.exists(), "too young");
+        let swept = FileStorage::sweep_staging_older_than(dir.path(), std::time::Duration::ZERO);
+        assert_eq!(swept.unwrap(), 1);
+        assert!(!theirs.exists());
+        assert!(ours.exists());
+    }
+
     /// The purge's sweep takes every other process's staging file, a
     /// future-dated one too, and reports one it could not remove.
     #[cfg(unix)]
@@ -3843,6 +3919,36 @@ mod wal_tests {
                 .count(),
             1,
             "the stopped owner's log was retired, leaving its lock file"
+        );
+    }
+
+    /// Retiring stopped owners' logs applies and removes them, and names the
+    /// owners still running, whose logs stay theirs.
+    #[tokio::test]
+    async fn retiring_stopped_logs_names_the_owners_still_running() {
+        use fs2::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        a.hold_wal_segments_for_test().unwrap();
+        a.write_bytes(COMMIT, b"c").await.unwrap();
+        a.simulate_crash_for_test();
+        drop(a);
+        std::fs::remove_file(dir.path().join("ledger/commit/bbbb.bin")).unwrap();
+        let running = dir.path().join(WAL_DIR).join("owners").join("node-3");
+        std::fs::create_dir_all(&running).unwrap();
+        let lock = std::fs::File::create(running.join("LOCK")).unwrap();
+        lock.try_lock_exclusive().unwrap();
+
+        let stopped = FileStorage::retire_stopped_logs(dir.path()).unwrap();
+        assert!(stopped.applied > 0, "{stopped:?}");
+        assert_eq!(stopped.running, ["node-3"]);
+        assert!(dir.path().join("ledger/commit/bbbb.bin").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(WAL_DIR).join("owners").join("node-1"))
+                .unwrap()
+                .count(),
+            1,
+            "only the lock file is left"
         );
     }
 

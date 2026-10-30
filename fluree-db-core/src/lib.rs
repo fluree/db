@@ -240,7 +240,7 @@ pub use storage::{
 };
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use storage::{
-    FileStorage, RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE,
+    FileStorage, RootLock, RootLockError, StoppedLogs, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE,
     STORAGE_METHOD_FILE,
 };
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
