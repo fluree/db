@@ -433,16 +433,6 @@ async fn lease_deadline() -> Result<Option<std::time::Instant>> {
     }
 }
 
-/// Whether a delete bounded by `until` may no longer begin.
-fn lease_ran_out(until: Option<std::time::Instant>) -> Result<()> {
-    if until.is_some_and(|until| std::time::Instant::now() >= until) {
-        return Err(crate::error::Error::storage(
-            "the lease bounding this delete ran out before it began",
-        ));
-    }
-    Ok(())
-}
-
 /// What [`FileStorage::retire_stopped_logs`] found of other owners' logs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StoppedLogs {
@@ -1935,7 +1925,7 @@ impl StorageWrite for FileStorage {
         let (key, path) = self.resolve_key(address)?;
         let until = lease_deadline().await?;
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || storage.delete_key_blocking(&key, &path, until))
+        tokio::task::spawn_blocking(move || storage.delete_key_within(&key, &path, until))
             .await
             .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
@@ -1982,7 +1972,7 @@ impl StorageWrite for FileStorage {
         match tokio::task::spawn_blocking(move || {
             let mut failed = Vec::new();
             for (address, key, path) in resolved {
-                if let Err(e) = storage.delete_key_blocking(&key, &path, until) {
+                if let Err(e) = storage.delete_key_within(&key, &path, until) {
                     failed.push((address, e));
                 }
             }
@@ -2034,14 +2024,29 @@ impl FileStorage {
     /// Unlink `path`, recording the delete in the WAL first when one is
     /// attached. Absence is success. Runs on the caller's thread: it takes
     /// the root gate and a key stripe, which block.
-    fn delete_key_blocking(
+    /// Delete `key`, within the lease bounding it if one does: then
+    /// unlogged, so no replay of this log redoes it over a later write, and
+    /// begun only if the lease still holds once the locks are, just before
+    /// the unlink.
+    fn delete_key_within(
         &self,
         key: &str,
         path: &std::path::Path,
         until: Option<std::time::Instant>,
     ) -> Result<()> {
+        match until {
+            None => self.delete_key_blocking(key, path),
+            Some(until) => match self.delete_key_unlogged_blocking(key, path, until)? {
+                true => Ok(()),
+                false => Err(crate::error::Error::storage(
+                    "the lease bounding this delete ran out before it began",
+                )),
+            },
+        }
+    }
+
+    fn delete_key_blocking(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let operation = self.begin_operation(self.durability, key)?;
-        lease_ran_out(until)?;
         let (_, log) = self.write_plan(&operation, 0)?;
         let appended = match &log {
             // Ordered after the writes it undoes, so replay cannot bring
@@ -3848,6 +3853,7 @@ mod wal_tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
         for name in ["a.bin", "b.bin"] {
             storage
                 .write_bytes(&format!("fluree:file://{name}"), b"x")
@@ -3890,6 +3896,21 @@ mod wal_tests {
             .await
             .unwrap();
         assert!(!dir.path().join("a.bin").exists());
+
+        // Unlogged: a replay of this log does not delete what another writer
+        // stores there again since.
+        storage.simulate_crash_for_test();
+        drop(storage);
+        FileStorage::new(dir.path())
+            .with_durability(Durability::Sync)
+            .write_bytes("fluree:file://a.bin", b"x")
+            .await
+            .unwrap();
+        let reopened = with_wal(dir.path());
+        assert_eq!(
+            reopened.read_bytes("fluree:file://a.bin").await.unwrap(),
+            b"x"
+        );
     }
 
     /// Replay applies records in order, so a delete cannot resurrect what it
