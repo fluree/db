@@ -54,6 +54,12 @@ pub(crate) struct RetentionRuntime {
     pub(crate) replicas: std::sync::OnceLock<Arc<dyn super::replicas::ReplicaSync>>,
     /// Registration chunks read.
     pub(crate) chunks: super::registry::ChunkCache,
+    /// Registration chunks a sweep found no registration naming, since when.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) unnamed_chunks: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+    /// When registration chunks were last swept (epoch ms).
+    #[cfg(not(target_arch = "wasm32"))]
+    chunks_swept_ms: AtomicI64,
     /// Set on a file-backed instance.
     #[cfg(feature = "native")]
     pub(crate) erasure: std::sync::OnceLock<Arc<super::erasure::ErasureRuntime>>,
@@ -394,6 +400,18 @@ impl Fluree {
             let ledgers: Vec<String> = self.retention.active.lock().iter().cloned().collect();
             self.erasure_sweep(&worker.fluree, &ledgers, worker.options.purge_grace)
                 .await;
+        }
+        // Each chunk a write superseded is unnamed for at least the grace
+        // before a sweep deletes it.
+        let swept = self.retention.chunks_swept_ms.load(Ordering::Relaxed);
+        let every = registry::CHUNK_GRACE.as_millis() as i64 / 2;
+        if now_ms() - swept >= every {
+            self.retention
+                .chunks_swept_ms
+                .store(now_ms(), Ordering::Relaxed);
+            if let Err(e) = self.sweep_registration_chunks(registry::CHUNK_GRACE).await {
+                tracing::warn!(error = %e, "retention: registration chunks not swept");
+            }
         }
         self.retention
             .last_sweep_ms

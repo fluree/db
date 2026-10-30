@@ -240,12 +240,112 @@ impl<'a> Objects<'a> {
     }
 }
 
+/// How long a chunk no registration names is kept at least. One written for
+/// a write not yet applied is named by then, and a replica reading a record
+/// that named a superseded one has caught up.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const CHUNK_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Every chunk `stored` names, into `out`.
+#[cfg(not(target_arch = "wasm32"))]
+fn named_in(stored: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
+    match stored {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                match value.as_array() {
+                    Some(hashes) if key.ends_with("Chunks") => {
+                        out.extend(hashes.iter().filter_map(|h| h.as_str().map(str::to_string)));
+                    }
+                    _ => named_in(value, out),
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                named_in(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl crate::Fluree {
     /// Where this instance keeps registrations' chunks; `None` without
     /// managed storage, which keeps them inline.
     pub(crate) fn registry_objects(&self) -> Option<Objects<'_>> {
         self.admin_storage()
             .map(|storage| Objects::new(storage, &self.retention.chunks))
+    }
+
+    /// Every chunk a registration names: a branch's, or one a dropped
+    /// ledger keeps for its restore.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn named_chunks(&self) -> Result<std::collections::HashSet<String>> {
+        let ns = self.publisher()?;
+        let mut named = std::collections::HashSet::new();
+        for record in self.nameservice().all_records().await? {
+            if let (_, Some(stored)) = read_stored(ns, record.ledger_id.as_str()).await? {
+                named_in(&stored, &mut named);
+            }
+        }
+        for dropped in ns.list_dropped().await? {
+            for config in dropped.value.configs.iter().flat_map(|c| c.values()) {
+                if let Some(stored) = config.payload.as_ref().and_then(|p| p.extra.get(EXTRA_KEY)) {
+                    named_in(stored, &mut named);
+                }
+            }
+        }
+        Ok(named)
+    }
+
+    /// Delete the chunks no registration names that a sweep at least
+    /// `grace` earlier also found unnamed. Listed before the names are read,
+    /// so a chunk written meanwhile waits for a later sweep. Whether
+    /// anything was deleted is the count returned.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn sweep_registration_chunks(
+        &self,
+        grace: std::time::Duration,
+    ) -> Result<usize> {
+        let Some(objects) = self.registry_objects() else {
+            return Ok(0);
+        };
+        let prefix = format!(
+            "fluree:{}://{OBJECTS_DIR}/",
+            objects.storage.storage_method()
+        );
+        let listed = objects.storage.list_prefix(&prefix).await?;
+        let named = self.named_chunks().await?;
+        let now = std::time::Instant::now();
+        let mut doomed = Vec::new();
+        {
+            let mut unnamed = self.retention.unnamed_chunks.lock();
+            let mut still = std::collections::HashMap::new();
+            for address in listed {
+                let Some(hash) = address
+                    .strip_prefix(&prefix)
+                    .and_then(|file| file.strip_suffix(".json"))
+                else {
+                    continue;
+                };
+                if named.contains(hash) {
+                    continue;
+                }
+                let since = unnamed.get(hash).copied().unwrap_or(now);
+                if now.duration_since(since) >= grace {
+                    doomed.push(address.clone());
+                } else {
+                    still.insert(hash.to_string(), since);
+                }
+            }
+            *unnamed = still;
+        }
+        let mut deleted = doomed.len();
+        for (address, e) in objects.storage.delete_many(&doomed).await {
+            deleted -= 1;
+            tracing::warn!(%address, error = %e, "retention: registration chunk not deleted");
+        }
+        Ok(deleted)
     }
 }
 
@@ -340,9 +440,12 @@ pub(crate) async fn resolve(
 }
 
 /// `registration`'s stored form: inline without `objects`, else with its
-/// lists as chunks, those unchanged since it was read named again.
-pub(crate) async fn store(
+/// lists as chunks, those equal to what `current`, the record it replaces,
+/// names named again. Only that record's names are reused: it is the one the
+/// write's compare-and-set expects, so its chunks are not yet swept.
+async fn store(
     registration: &mut Registration,
+    current: Option<&Registration>,
     objects: Option<Objects<'_>>,
 ) -> Result<serde_json::Value> {
     let to_value = |r: &Registration| {
@@ -352,7 +455,7 @@ pub(crate) async fn store(
     let Some(objects) = objects else {
         return to_value(registration);
     };
-    let named = registration.named.0.clone().unwrap_or_default();
+    let named = current.and_then(|c| c.named.0.clone()).unwrap_or_default();
     let removals = std::mem::take(&mut registration.journal.removals);
     #[cfg(feature = "native")]
     let lists: Vec<Option<(Vec<super::erasure::CommitErasure>, Vec<OccurrenceRef>)>> = registration
@@ -491,7 +594,7 @@ pub(crate) async fn update_fenced(
         let Some(mut next) = update(current.as_ref()) else {
             return Ok(current);
         };
-        let value = store(&mut next, objects).await?;
+        let value = store(&mut next, current.as_ref(), objects).await?;
         let (v, mut payload) = match &config {
             Some(c) => (c.v, c.payload.clone().unwrap_or_default()),
             None => (0, ConfigPayload::default()),
@@ -868,5 +971,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.len(), 1, "{stored:?}");
+    }
+
+    /// A chunk no registration names is deleted by a sweep at least the
+    /// grace after the first that found it unnamed. Those a branch's or a
+    /// dropped ledger's registration names stay.
+    #[tokio::test]
+    async fn superseded_chunks_are_swept_after_the_grace() {
+        let (_dir, fluree, id) = ledger("t/swept").await;
+        let (ns, objects) = (fluree.publisher().unwrap(), fluree.registry_objects());
+        let registered = |removals: Vec<Removal>| Registration {
+            active_since_t: 1,
+            journal: Journal {
+                generation: 1,
+                history_rules: Vec::new(),
+                removals,
+            },
+            ..Default::default()
+        };
+        fluree.create_ledger("t/kept").await.unwrap();
+        let kept_id = "t/kept:main";
+        update(ns, objects, kept_id, |_| Some(registered(vec![removal(1)])))
+            .await
+            .unwrap();
+        let kept = read_stored(ns, kept_id).await.unwrap().1.unwrap();
+        let kept_chunk = kept["journal"]["removalChunks"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fluree
+            .drop_ledger("t/kept", crate::DropMode::Soft)
+            .await
+            .unwrap();
+        update(ns, objects, &id, |_| Some(registered(vec![removal(0)])))
+            .await
+            .unwrap();
+        update(ns, objects, &id, |current| {
+            let mut next = current.unwrap().clone();
+            next.journal.removals.push(removal(2));
+            Some(next)
+        })
+        .await
+        .unwrap();
+        assert_eq!(chunk_objects(&fluree).await.len(), 3);
+
+        let grace = std::time::Duration::from_millis(50);
+        assert_eq!(fluree.sweep_registration_chunks(grace).await.unwrap(), 0);
+        tokio::time::sleep(grace).await;
+        assert_eq!(fluree.sweep_registration_chunks(grace).await.unwrap(), 1);
+        let left = chunk_objects(&fluree).await;
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().any(|a| a.contains(&kept_chunk)), "{left:?}");
+        let read_back = read(ns, objects, &id).await.unwrap().1.unwrap();
+        assert_eq!(read_back.journal.removals, vec![removal(0), removal(2)]);
+    }
+
+    /// A registration read before its chunks were superseded and swept, then
+    /// written back, stores them again: a write names again only the chunks
+    /// of the record it replaces.
+    #[tokio::test]
+    async fn a_registration_written_back_after_a_sweep_stores_its_chunks_again() {
+        let (_dir, fluree, id) = ledger("t/stale").await;
+        let (ns, objects) = (fluree.publisher().unwrap(), fluree.registry_objects());
+        update(ns, objects, &id, |_| {
+            Some(Registration {
+                active_since_t: 1,
+                journal: Journal {
+                    generation: 1,
+                    history_rules: Vec::new(),
+                    removals: vec![removal(0)],
+                },
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap();
+        let stale = read(ns, objects, &id).await.unwrap().1.unwrap();
+        update(ns, objects, &id, |current| {
+            let mut next = current.unwrap().clone();
+            next.journal.removals = vec![removal(1)];
+            Some(next)
+        })
+        .await
+        .unwrap();
+        let grace = std::time::Duration::from_millis(20);
+        fluree.sweep_registration_chunks(grace).await.unwrap();
+        tokio::time::sleep(grace).await;
+        assert_eq!(fluree.sweep_registration_chunks(grace).await.unwrap(), 1);
+
+        update(ns, objects, &id, |_| Some(stale.clone()))
+            .await
+            .unwrap();
+        // Read as another process would, without the chunks this one holds.
+        let fresh = ChunkCache::default();
+        let elsewhere = Some(Objects::new(fluree.admin_storage().unwrap(), &fresh));
+        let read_back = read(ns, elsewhere, &id).await.unwrap().1.unwrap();
+        assert_eq!(read_back.journal, stale.journal);
     }
 }
