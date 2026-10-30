@@ -154,8 +154,8 @@ pub(crate) fn mapping_source_of(
 }
 
 /// The mapping a live graph-source record answers queries from: `Ok(None)`
-/// when it is not a mapped source this build reads (a BM25, vector or geo
-/// index), which no R2RML probe serves.
+/// for a record of no mapped family that is not refused below, which no
+/// R2RML probe serves.
 ///
 /// A mapped record without a mapping (an Iceberg source stored before
 /// registration required one) is [`QueryError::GraphSourceUnmapped`], one of a
