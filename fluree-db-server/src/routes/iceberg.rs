@@ -592,7 +592,7 @@ fn build_iceberg_config(
         &req.name,
         req.table.as_deref(),
         req.r2rml.is_some(),
-        req.connection.clone(),
+        connection_fields(req.connection.clone()),
         rules,
     )
     .map_err(input_error)?;
@@ -635,12 +635,16 @@ pub(crate) fn input_error(e: fluree_db_api::GraphSourceInputError) -> ServerErro
 // body, so these are POSTs, but they mutate nothing.
 // =============================================================================
 
-/// The fields `iceberg/map` takes beside the connection. A read-only route
-/// ignores them rather than refusing them, so a client can send one payload
-/// to browse, preview, verify and map. A route's own field of the same name
-/// (`table` on verify, `r2rml` on validate) is read by the route before this
-/// applies; a key no Iceberg route knows is still refused.
-const MAP_ONLY_FIELDS: &[&str] = &[
+/// Every field an Iceberg route takes beside the connection: `map`'s, and
+/// those of the read-only routes (browse's `depth`, preview's `namespace` and
+/// `tier`, generate's `tables`, `base_namespace`, `per_table_overrides`,
+/// `options` and `target_model_ledger_id`, validate's `snapshot`). Each route
+/// ignores the ones it does not take itself, rather than refusing them, so a
+/// client can send one payload to browse, preview, verify and map. A route
+/// reads its own fields before this applies; a key no Iceberg route knows is
+/// still refused.
+const ROUTE_FIELDS: &[&str] = &[
+    // iceberg/map
     "name",
     "table",
     "r2rml",
@@ -651,7 +655,29 @@ const MAP_ONLY_FIELDS: &[&str] = &[
     "order_by",
     "model",
     "default_allow",
+    // catalog/browse
+    "depth",
+    // catalog/preview (`name` above)
+    "namespace",
+    "tier",
+    // r2rml/generate
+    "tables",
+    "base_namespace",
+    "per_table_overrides",
+    "options",
+    "target_model_ledger_id",
+    // r2rml/validate (`r2rml` above)
+    "snapshot",
 ];
+
+/// A request's connection fields, without the other routes' own fields
+/// (see [`ROUTE_FIELDS`]).
+fn connection_fields(mut fields: ConnectionFields) -> ConnectionFields {
+    for key in ROUTE_FIELDS {
+        fields.remove(*key);
+    }
+    fields
+}
 
 /// A read-only route's connection: through the one codec, then the SSRF
 /// guard on the URLs it names.
@@ -663,13 +689,11 @@ fn build_connection(
 }
 
 fn build_connection_with(
-    mut fields: ConnectionFields,
+    fields: ConnectionFields,
     rules: &SecretRules,
 ) -> Result<fluree_db_api::IcebergConnectionConfig> {
-    for key in MAP_ONLY_FIELDS {
-        fields.remove(*key);
-    }
-    let conn = fluree_db_api::iceberg_connection_from_json(fields, rules).map_err(input_error)?;
+    let conn = fluree_db_api::iceberg_connection_from_json(connection_fields(fields), rules)
+        .map_err(input_error)?;
     guard_connection(&conn)?;
     Ok(conn)
 }
@@ -1286,8 +1310,9 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_route_ignores_what_only_map_takes() {
-        // One payload, sent to browse, preview, verify, validate and map.
+    fn every_route_ignores_the_other_routes_fields() {
+        // One payload, carrying every route's own fields, sent to browse,
+        // preview, verify, generate, validate and map.
         for connection in [
             serde_json::json!({"mode": "rest", "catalog_uri": "https://catalog.example.com",
                 "auth_bearer": "t"}),
@@ -1296,32 +1321,51 @@ mod tests {
         ] {
             let mut body = connection.clone();
             for (key, value) in serde_json::json!({
+                // map
                 "name": "gs", "table": "ns.t", "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
                 "r2rml_type": "text/turtle", "branch": "main", "delete_column": "op",
                 "delete_values": ["d"], "order_by": "ts", "model": "m:main", "default_allow": true,
+                // browse
+                "depth": "tables",
+                // preview
+                "namespace": "ns", "tier": "schema",
+                // generate
+                "tables": [{"namespace": "ns", "name": "t"}],
+                "base_namespace": "https://example.org/", "per_table_overrides": [],
+                "options": {}, "target_model_ledger_id": "m:main",
+                // validate
+                "snapshot": 1,
             })
             .as_object()
             .unwrap()
             {
                 body[key] = value.clone();
             }
-            let browse: IcebergBrowseRequest = serde_json::from_value(body.clone()).unwrap();
-            let mut preview = body.clone();
-            preview["namespace"] = "ns".into();
-            let preview: IcebergPreviewRequest = serde_json::from_value(preview).unwrap();
-            let verify: IcebergVerifyRequest = serde_json::from_value(body.clone()).unwrap();
-            let validate: IcebergValidateRequest = serde_json::from_value(body.clone()).unwrap();
             let bare = stored(fluree_db_api::IcebergCreateConfig::from_connection(
                 "gs",
                 build_connection_with(connection.as_object().unwrap().clone(), &rules("")).unwrap(),
                 "ns.t",
             ));
-            for fields in [
-                browse.connection,
-                preview.connection,
-                verify.connection,
-                validate.connection,
-            ] {
+            let read_only = |body: &serde_json::Value| {
+                [
+                    serde_json::from_value::<IcebergBrowseRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergPreviewRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergVerifyRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergGenerateRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergValidateRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                ]
+            };
+            for fields in read_only(&body) {
                 let conn = build_connection_with(fields, &rules("")).unwrap();
                 let read = stored(fluree_db_api::IcebergCreateConfig::from_connection(
                     "gs", conn, "ns.t",
@@ -1329,13 +1373,18 @@ mod tests {
                 assert_eq!(read, bare, "{body}");
             }
             let map: IcebergMapRequest = serde_json::from_value(body.clone()).unwrap();
-            assert!(build_iceberg_config(&map, &rules("")).is_ok(), "{body}");
+            let map = build_iceberg_config(&map, &rules("")).unwrap();
+            assert_eq!(stored(map)["catalog"], bare["catalog"], "{body}");
 
-            // A key no Iceberg route knows is still refused.
+            // A key no Iceberg route knows is still refused, on every route.
             let mut unknown = body.clone();
             unknown["tabel"] = "ns.t".into();
-            let browse: IcebergBrowseRequest = serde_json::from_value(unknown).unwrap();
-            let e = input(build_connection_with(browse.connection, &rules("")).unwrap_err());
+            for fields in read_only(&unknown) {
+                let e = input(build_connection_with(fields, &rules("")).unwrap_err());
+                assert_eq!(e.field, "tabel");
+            }
+            let map: IcebergMapRequest = serde_json::from_value(unknown).unwrap();
+            let e = input(build_iceberg_config(&map, &rules("")).unwrap_err());
             assert_eq!(e.field, "tabel");
         }
     }
