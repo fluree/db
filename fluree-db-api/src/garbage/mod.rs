@@ -196,7 +196,9 @@ impl Fluree {
     /// collected: wherever writers pin, whichever instance writes.
     pub(crate) async fn record_garbage(&self, blobs: &[Blob], reason: GarbageReason) -> Result<()> {
         let storage = self.garbage_storage()?;
-        if !self.collects_garbage() || blobs.is_empty() {
+        // Recorded wherever the storage is collected: by whichever instance
+        // holds its root, not only this one, or through the cluster.
+        if (storage.blob_pins().is_none() && self.collector().is_none()) || blobs.is_empty() {
             return Ok(());
         }
         let method = storage.storage_method().to_string();
