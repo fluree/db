@@ -272,10 +272,11 @@ pub(super) fn adds_holders(command: &Command) -> bool {
         | Command::FreezeBranch { .. }
         | Command::DeleteBranch { .. }
         | Command::ResetGraphSourceIndex { .. }
-        | Command::Erasure(_) => false,
-        Command::Fenced { command, .. } | Command::AtGeneration { command, .. } => {
-            adds_holders(command)
-        }
+        | Command::Erasure(_)
+        | Command::Collect(_) => false,
+        Command::Fenced { command, .. }
+        | Command::AtGeneration { command, .. }
+        | Command::Seen { command, .. } => adds_holders(command),
     }
 }
 

@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
+mod collect;
 mod erasure;
+pub use collect::{CollectCommand, CollectState, Intent};
 pub use erasure::{
     generation, holder_state, view_generation, ActivateErasure, Activation, ActivationRefusal,
     ErasureCommand, ErasureState, HolderState, Incarnation, Installed,
@@ -552,6 +554,10 @@ pub struct NameServiceState {
     /// after every field above, so a snapshot taken before it still
     /// decodes through [`NameServiceStateV2`].
     pub erasure: ErasureState,
+    /// Collection's open intents. Appended after
+    /// every field above, so a snapshot taken before it still decodes
+    /// through [`NameServiceStateV3`].
+    pub collect: CollectState,
 }
 
 /// A name binding or dropped-ledger entry: its version, and the value as
@@ -647,6 +653,7 @@ impl From<NameServiceStateV1> for NameServiceState {
             dropped: HashMap::new(),
             fences: HashMap::new(),
             erasure: ErasureState::default(),
+            collect: CollectState::default(),
         }
     }
 }
@@ -695,6 +702,57 @@ impl From<NameServiceStateV2> for NameServiceState {
             dropped: v2.dropped,
             fences: v2.fences,
             erasure: ErasureState::default(),
+            collect: CollectState::default(),
+        }
+    }
+}
+
+/// [`NameServiceState`] as snapshotted before collection state.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct NameServiceStateV3 {
+    refs: HashMap<RefKey, RefEntry>,
+    ledgers: HashMap<String, LedgerRecord>,
+    retracted: HashSet<RefKey>,
+    idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
+    queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    next_queue_id: u64,
+    recently_cleared: HashMap<RefKey, ClearMarker>,
+    evicted_idempotency_count: u64,
+    queue_config: QueueConfig,
+    status: HashMap<String, StoredStatus>,
+    config: HashMap<String, StoredConfig>,
+    graph_sources: HashMap<String, GraphSourceRecord>,
+    worker_eligible_voters: BTreeSet<NodeId>,
+    configured_voters: BTreeSet<NodeId>,
+    bindings: HashMap<String, VersionedJson>,
+    dropped: HashMap<String, VersionedJson>,
+    fences: HashMap<RefKey, FenceState>,
+    erasure: ErasureState,
+}
+
+impl From<NameServiceStateV3> for NameServiceState {
+    fn from(v3: NameServiceStateV3) -> Self {
+        Self {
+            refs: v3.refs,
+            ledgers: v3.ledgers,
+            retracted: v3.retracted,
+            idempotency: v3.idempotency,
+            queues: v3.queues,
+            next_queue_id: v3.next_queue_id,
+            recently_cleared: v3.recently_cleared,
+            evicted_idempotency_count: v3.evicted_idempotency_count,
+            queue_config: v3.queue_config,
+            status: v3.status,
+            config: v3.config,
+            graph_sources: v3.graph_sources,
+            worker_eligible_voters: v3.worker_eligible_voters,
+            configured_voters: v3.configured_voters,
+            bindings: v3.bindings,
+            dropped: v3.dropped,
+            fences: v3.fences,
+            erasure: v3.erasure,
+            collect: CollectState::default(),
         }
     }
 }
@@ -933,15 +991,22 @@ pub enum Command {
     },
     /// Permanent erasure; see [`ErasureCommand`].
     Erasure(ErasureCommand),
+    /// Collection; see [`CollectCommand`].
+    Collect(CollectCommand),
+    /// `command` from a writer that began having loaded every intent
+    /// numbered below `seen`: refused once an intent from `seen` on is
+    /// deleting, since the writer may have stored one of its addresses
+    /// unchecked. Outermost: it may wrap [`Self::AtGeneration`].
+    Seen { seen: u64, command: Box<Command> },
 }
 
 impl Command {
     /// The write a wrapper carries, once the state machine has admitted it.
     pub fn admitted(&self) -> &Command {
         match self {
-            Command::AtGeneration { command, .. } | Command::Fenced { command, .. } => {
-                command.admitted()
-            }
+            Command::Seen { command, .. }
+            | Command::AtGeneration { command, .. }
+            | Command::Fenced { command, .. } => command.admitted(),
             command => command,
         }
     }
@@ -1587,6 +1652,22 @@ pub enum Response {
     ErasureActivationUnknown { activation: u64 },
     /// [`ErasureCommand::Track`] applied.
     ErasureTracking,
+    /// [`CollectCommand::Condemn`] applied, or found the intent open, as
+    /// intent `number`.
+    Condemned { number: u64 },
+    /// [`CollectCommand::Spare`]: the address stays.
+    Spared,
+    /// [`CollectCommand::Spare`] after deletion began; the writer waits for
+    /// the intent to close.
+    SpareRefused { number: u64 },
+    /// Intent `number` is not open: completed, so nothing of it remains to
+    /// be deleted.
+    IntentClosed { number: u64 },
+    /// [`CollectCommand::Delete`] began deletion; `spared` stays.
+    Deleting { spared: Vec<String> },
+    /// A [`Command::Seen`] write began before loading intent `deleting`,
+    /// whose deletion has begun. Nothing applied; the writer stages again.
+    CollectionMoved { deleting: u64 },
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1670,8 +1751,9 @@ impl NameServiceState {
         }
         match postcard::from_bytes(bytes) {
             Ok(state) => Ok(state),
-            Err(e) => whole::<NameServiceStateV2>(bytes)
+            Err(e) => whole::<NameServiceStateV3>(bytes)
                 .map(Self::from)
+                .or_else(|| whole::<NameServiceStateV2>(bytes).map(Self::from))
                 .or_else(|| whole::<NameServiceStateV1>(bytes).map(Self::from))
                 .ok_or(e.into()),
         }
@@ -1683,6 +1765,13 @@ impl NameServiceState {
 /// this command, used as a deterministic alternative to wall-clock
 /// time for any state-machine bookkeeping that needs it.
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
+    let command = match command {
+        Command::Seen { seen, command } => match collect::refused_by(state, seen) {
+            Some(deleting) => return Response::CollectionMoved { deleting },
+            None => *command,
+        },
+        command => command,
+    };
     let (command, generations) = match command {
         Command::AtGeneration {
             generations,
@@ -1876,8 +1965,11 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             }
         }
         Command::Erasure(command) => erasure::apply(state, command, log_index),
+        Command::Collect(command) => collect::apply(state, command, log_index),
         // A wrapper nested in a wrapper covers no single branch write.
-        Command::Fenced { .. } | Command::AtGeneration { .. } => Response::FenceMismatch,
+        Command::Fenced { .. } | Command::AtGeneration { .. } | Command::Seen { .. } => {
+            Response::FenceMismatch
+        }
     }
 }
 
