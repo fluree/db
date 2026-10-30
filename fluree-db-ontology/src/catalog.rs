@@ -21,7 +21,7 @@ use crate::read::Quad;
 use crate::vocab::*;
 use crate::words::name_words;
 use fluree_graph_ir::Term;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Debug, Default)]
 pub struct CatalogOptions {
@@ -52,8 +52,10 @@ pub struct Catalog {
     pub records: usize,
     /// Rows with no label, left out.
     pub without_label: usize,
-    /// Rows folded into an earlier record with the same IRI.
+    /// Rows folded into an earlier record with the same key.
     pub merged: usize,
+    /// Records whose key slugged like another's, given a suffixed IRI.
+    pub kept_apart: usize,
     pub estimate: Estimate,
 }
 
@@ -111,6 +113,10 @@ pub fn from_sheet(sheet: &Sheet, options: &CatalogOptions) -> Result<Catalog, Mi
 
     let mut out = Catalog::default();
     let mut records: BTreeMap<String, Record> = BTreeMap::new();
+    // rows fold on their exact key; two keys that slug alike (`001A…abcDE`
+    // and `001A…ABCde`, `C++` and `C#`) get IRIs of their own
+    let mut iri_of: HashMap<String, String> = HashMap::new();
+    let mut slug_taken: HashMap<String, String> = HashMap::new();
     for row in &sheet.rows {
         let cell = |i: usize| row.get(i).map(|v| v.trim()).unwrap_or_default();
         let name = cell(label);
@@ -119,11 +125,28 @@ pub fn from_sheet(sheet: &Sheet, options: &CatalogOptions) -> Result<Catalog, Mi
             continue;
         }
         let key = id.map(cell).filter(|v| !v.is_empty()).unwrap_or(name);
-        let iri = format!("{}{}", options.base, slug(key));
-        let fresh = !records.contains_key(&iri);
-        if !fresh {
-            out.merged += 1;
-        }
+        let iri = match iri_of.get(key) {
+            Some(iri) => {
+                out.merged += 1;
+                iri.clone()
+            }
+            None => {
+                let base_slug = slug(key);
+                let mut s = base_slug.clone();
+                let mut n = 2;
+                while slug_taken.get(&s).is_some_and(|k| k != key) {
+                    s = format!("{base_slug}-{n}");
+                    n += 1;
+                }
+                if s != base_slug {
+                    out.kept_apart += 1;
+                }
+                slug_taken.insert(s.clone(), key.to_string());
+                let iri = format!("{}{s}", options.base);
+                iri_of.insert(key.to_string(), iri.clone());
+                iri
+            }
+        };
         let record = records.entry(iri).or_default();
         match &record.pref {
             None => record.pref = Some(name.to_string()),
@@ -256,5 +279,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("name, city"), "{err}");
+    }
+
+    #[test]
+    fn keys_that_slug_alike_stay_apart() {
+        let sheet = read_csv(
+            "id,name\n001A000001abcDE,Acme\n001A000001ABCde,Globex\n001A000001abcDE,Acme Corp\n",
+            "accounts",
+        )
+        .unwrap();
+        let c = from_sheet(
+            &sheet,
+            &CatalogOptions {
+                class: "https://ex.com/Org".into(),
+                label: "name".into(),
+                id: Some("id".into()),
+                base: "https://ex.com/a/".into(),
+                ..CatalogOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.records, 2, "Acme and Globex");
+        assert_eq!(c.merged, 1, "the second Acme row");
+        assert_eq!(c.kept_apart, 1);
+        let pref = |iri: &str| -> Vec<String> {
+            c.quads
+                .iter()
+                .filter(|q| q.subject.as_iri() == Some(iri) && q.is(SKOS_PREF_LABEL))
+                .filter_map(|q| q.object.as_literal().map(|(v, ..)| v.lexical()))
+                .collect()
+        };
+        assert_eq!(pref("https://ex.com/a/001a000001abcde"), ["Acme"]);
+        assert_eq!(pref("https://ex.com/a/001a000001abcde-2"), ["Globex"]);
+
+        // without an id column, names that slug alike stay apart too
+        let sheet = read_csv("name\nC\nC++\nC#\n???\n!!!\n", "langs").unwrap();
+        let c = from_sheet(
+            &sheet,
+            &CatalogOptions {
+                class: "https://ex.com/Lang".into(),
+                label: "name".into(),
+                base: "https://ex.com/l/".into(),
+                ..CatalogOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.records, 5);
+        assert_eq!(c.merged, 0);
     }
 }

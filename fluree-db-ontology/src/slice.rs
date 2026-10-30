@@ -155,10 +155,19 @@ pub fn resolve_seed(
 ) -> Result<String, UnknownSeed> {
     let name = name.trim();
     let unknown = || UnknownSeed::Unknown(name.to_string());
-    if let Some(iri) = name.strip_prefix('<').and_then(|n| n.strip_suffix('>')) {
-        return Ok(iri.to_string());
-    }
     let vocabulary = Vocabulary::new(quads);
+    // an IRI or a prefixed name must name a class the file declares, or the
+    // slice would be empty
+    let declared = |iri: String| -> Result<String, UnknownSeed> {
+        if vocabulary.classes.contains(iri.as_str()) {
+            Ok(iri)
+        } else {
+            Err(unknown())
+        }
+    };
+    if let Some(iri) = name.strip_prefix('<').and_then(|n| n.strip_suffix('>')) {
+        return declared(iri.to_string());
+    }
     if let Some((prefix, local)) = name.split_once(':') {
         if !local.starts_with("//") {
             let ns = prefixes
@@ -169,11 +178,11 @@ pub fn resolve_seed(
                 .find(|(p, _)| *p == prefix)
                 .map(|(_, ns)| ns);
             if let Some(ns) = ns {
-                return Ok(format!("{ns}{local}"));
+                return declared(format!("{ns}{local}"));
             }
         }
         if vocabulary.classes.contains(name) || name.contains("://") {
-            return Ok(name.to_string());
+            return declared(name.to_string());
         }
     }
     let wanted = name.to_lowercase();
@@ -217,8 +226,10 @@ pub fn slice(ontology: &[Quad], seeds: &[String], depth: usize) -> Slice {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let mut frontier = Vec::new();
     for seed in seeds {
-        // a seed the file doesn't declare as a class is kept as asked
-        let seed: &str = v.classes.get(seed.as_str()).copied().unwrap_or(seed);
+        // seeds are resolved against the file's classes (`resolve_seed`)
+        let Some(seed) = v.classes.get(seed.as_str()).copied() else {
+            continue;
+        };
         frontier.extend(v.add_with_ancestors(seed, &mut keep));
     }
     let with_domain: Vec<(&str, Vec<&str>)> = v
@@ -372,5 +383,13 @@ mod tests {
             );
         }
         assert!(resolve_seed("Spaceship", &quads, &prefixes).is_err());
+        // a prefixed name or IRI that names no declared class is refused too
+        assert!(resolve_seed("ex:Persn", &quads, &prefixes).is_err());
+        assert!(resolve_seed("<https://ex.com/Persn>", &quads, &prefixes).is_err());
+        assert!(resolve_seed("https://ex.com/Persn", &quads, &prefixes).is_err());
+        assert!(
+            resolve_seed("ex:name", &quads, &prefixes).is_err(),
+            "a property is not a class"
+        );
     }
 }

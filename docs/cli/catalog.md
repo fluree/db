@@ -7,7 +7,7 @@ in an email becomes a link to your account record for Daxin Scientific Supply
 Co., not just a mention of some organization. On linking, the catalog does most
 of the work, more than how the ontology is written.
 
-The extraction model reads catalog records by their SKOS text: their names
+An HTTP reader reads catalog records by their SKOS text: their names
 (`skos:prefLabel`, `altLabel`, `hiddenLabel`) and a short description
 (`skos:definition`, the first 300 characters). The whole catalog goes into
 every extraction window, so its size matters: about 58 serialized tokens a
@@ -49,11 +49,14 @@ one record of `--class`:
   `--describe` columns as `industry: Lab supplies; city: Taipei`.
 
 A record's IRI is `--base` followed by its `--id` value (or its label), as a
-slug. Rows with the same IRI are one record, their names pooled.
+slug. Rows with the same id are one record, their names pooled; two different
+ids that read alike as a slug (`001A000001abcDE` and `001A000001ABCde`, or `C++`
+and `C#`) stay two records, the second with a suffixed IRI, and the summary
+counts them.
 
 The class is an IRI, or a name. With `--ontology`, a name is looked up in that
 ontology (by label, local name or prefixed name), so the records are typed with
-the class the extraction model will read. Without it, a name is minted under
+the class the reader will read. Without it, a name is minted under
 `--base`.
 
 The catalog goes to stdout, or to the file `-o` names. A summary goes to
@@ -107,4 +110,4 @@ column: aliases are how a catalog resolves nicknames and short forms.
 
 ## See also
 
-- [`ontology`](ontology.md): check what the extraction model reads of an ontology and catalog, and make an ontology from tables
+- [`ontology`](ontology.md): check what an HTTP reader reads of an ontology and catalog, and make an ontology from tables

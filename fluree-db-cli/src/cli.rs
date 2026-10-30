@@ -1407,7 +1407,7 @@ pub enum Commands {
         action: ModelAction,
     },
 
-    /// Ontology tools for document extraction: what an extraction model reads, conversion, slicing
+    /// Ontology tools for document extraction: what an HTTP reader reads, conversion, slicing
     Ontology {
         #[command(subcommand)]
         action: OntologyAction,
@@ -2662,9 +2662,11 @@ pub enum OntologyAction {
     /// value; primary keys are left out.
     ///
     /// From RDF (Turtle or JSON-LD): the ontology with what the model reads
-    /// made explicit: SKOS labels and definitions copied into rdfs:label and
+    /// made explicit: SKOS labels and definitions moved into rdfs:label and
     /// rdfs:comment, identifier-style labels in words, OWL restrictions and
-    /// other blank-node constructs dropped. With --seed, a large vocabulary is
+    /// other blank-node constructs dropped, and OWL axioms and annotation
+    /// property declarations (which a reader would read as catalog records)
+    /// dropped. With --seed, a large vocabulary is
     /// sliced to the classes the seeds reach first.
     ///
     /// Examples:
@@ -2676,12 +2678,15 @@ pub enum OntologyAction {
     #[command(verbatim_doc_comment)]
     From(OntologyFromArgs),
 
-    /// Report what an extraction model will and won't read of an ontology
+    /// Report what an HTTP reader will and won't read of an ontology
     ///
-    /// Applies the model's ontology input policy locally and reports what a
-    /// request carrying this ontology (and catalog) would fail for, what the
-    /// model reads another way, what it never sees, and advice. Nothing is
-    /// sent anywhere. Exits 1 when a request would be refused.
+    /// Applies the ontology input policy of an HTTP reader (an extraction
+    /// model reached over HTTP, `fluree doc ingest`'s [doc.reader]) locally,
+    /// and reports what a request carrying this ontology (and catalog) would
+    /// fail for, what the reader reads another way, what it never sees, and
+    /// advice. Nothing is sent anywhere. Exits 1 when a request would be
+    /// refused. The language-model extractor of `fluree doc ingest` reads more
+    /// of an ontology (domains, ranges, every parent class).
     ///
     /// Examples:
     ///   fluree ontology check ontology.ttl
