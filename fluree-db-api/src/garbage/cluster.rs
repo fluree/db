@@ -56,7 +56,7 @@ impl Fluree {
         // still deletes.
         let _pass = self.root.cluster_pass.lock().await;
         // A member that does not lead writes no intent it cannot condemn.
-        if collector.lease().await.is_none() {
+        if collector.lease().await.is_none() || !collector.enable().await? {
             return Ok(report);
         }
         let mut condemned = HashSet::new();

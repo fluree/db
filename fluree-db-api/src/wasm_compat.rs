@@ -45,8 +45,8 @@ where
 /// returns, and dropping the returned future abandons only the *wait*, never
 /// the work.
 ///
-/// Native: `tokio::spawn`, exactly as the shield sites called it directly; the
-/// error string is the `JoinError` rendering, so panic/cancel detail survives.
+/// Native: `tokio::spawn`, in the caller's collection write scope; the error
+/// string is the `JoinError` rendering, so panic/cancel detail survives.
 ///
 /// [`Fluree::commit_shielded`]: crate::Fluree
 /// [`Fluree::apply_staged_detached`]: crate::Fluree
@@ -58,6 +58,8 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    #[cfg(feature = "native")]
+    let fut = crate::collect::carry(fut);
     let handle = tokio::spawn(fut);
     async move { handle.await.map_err(|e| e.to_string()) }
 }

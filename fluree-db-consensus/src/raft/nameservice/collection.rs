@@ -8,8 +8,9 @@ use fluree_db_api::collect::Collector;
 use fluree_db_api::{ApiError, ContentId, Fluree, Result};
 use fluree_db_core::ledger_id::split_ledger_id;
 
-use super::{RaftNameService, SmCommand, SmResponse};
+use super::{RaftNameService, SmCommand, SmResponse, COLLECT_READY_PATH};
 use crate::raft::state_machine::{ApplyOutcome, CollectCommand};
+use crate::raft::{ClusterNode, NodeId};
 use crate::QueuedRequest;
 
 /// What a lease keeps of the window followers refuse votes for after
@@ -21,6 +22,38 @@ impl RaftNameService {
         self.submit_lifecycle(SmCommand::Collect(command))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))
+    }
+
+    /// Whether member `id`, at `node`, answers that it checks its writes.
+    async fn member_checks_writes(&self, id: NodeId, node: &ClusterNode, loopback: bool) -> bool {
+        let Some(forwarding) = &self.forwarding else {
+            return false;
+        };
+        if !crate::raft::forward::is_valid_leader_url(&node.raft_addr, loopback) {
+            return false;
+        }
+        let target = format!(
+            "{}{}",
+            node.raft_addr.trim_end_matches('/'),
+            COLLECT_READY_PATH
+        );
+        let Ok(resp) = forwarding
+            .http_client
+            .post(&target)
+            .timeout(forwarding.request_timeout)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !resp.status().is_success() {
+            return false;
+        }
+        resp.bytes()
+            .await
+            .ok()
+            .and_then(|bytes| postcard::from_bytes::<NodeId>(&bytes).ok())
+            == Some(id)
     }
 }
 
@@ -127,6 +160,49 @@ impl Collector for RaftNameService {
             }
         }
         Ok(named)
+    }
+
+    async fn enable(&self) -> Result<bool> {
+        if self.state.read().await.collect.enabled {
+            return Ok(true);
+        }
+        let (me, members): (NodeId, Vec<(NodeId, ClusterNode)>) = {
+            let metrics = self.raft.metrics();
+            let metrics = metrics.borrow();
+            (
+                metrics.id,
+                metrics
+                    .membership_config
+                    .nodes()
+                    .map(|(id, node)| (*id, node.clone()))
+                    .collect(),
+            )
+        };
+        let loopback = members
+            .iter()
+            .find(|(id, _)| *id == me)
+            .is_some_and(|(_, node)| crate::raft::forward::self_addr_is_loopback(&node.raft_addr));
+        for (id, node) in &members {
+            let checks = if *id == me {
+                self.checks_writes()
+            } else {
+                self.member_checks_writes(*id, node, loopback).await
+            };
+            if !checks {
+                tracing::debug!(
+                    member = id,
+                    "collection waits for a member to check its writes"
+                );
+                return Ok(false);
+            }
+        }
+        match self.propose_collect(CollectCommand::Enable).await? {
+            SmResponse::CollectionEnabled => {
+                tracing::info!("every member checks its writes: the cluster collects garbage");
+                Ok(true)
+            }
+            other => Err(unexpected("Enable", other)),
+        }
     }
 
     async fn lease(&self) -> Option<Instant> {

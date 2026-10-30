@@ -183,12 +183,17 @@ impl QueuedTransactor {
     ) -> Result<SubmissionOutcome, SubmissionError> {
         let request_cid = args.request_cid.clone();
         let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
-        let cmd = match fluree_db_api::collect::seen() {
-            Some(seen) => SmCommand::Seen {
-                seen,
-                command: Box::new(SmCommand::EnqueueCommand(args)),
-            },
-            None => SmCommand::EnqueueCommand(args),
+        let collecting = self.shared_state.read().await.collect.enabled;
+        let Some(cmd) = crate::raft::nameservice::by_writer(
+            collecting,
+            SmCommand::EnqueueCommand(args),
+            fluree_db_api::collect::seen(),
+        ) else {
+            return Err(SubmissionError::Execution {
+                status: 500,
+                message: "the submission ran outside a write scope while the cluster collects"
+                    .to_string(),
+            });
         };
         let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
         // Arm interest *before* proposing. The queue_id does not exist
@@ -313,10 +318,15 @@ impl QueuedTransactor {
                 SmResponse::CollectionMoved { deleting } => {
                     return Err(SubmissionError::Execution {
                         status: 503,
-                        message: format!(
-                            "the submission began before collection intent {deleting}, \
-                             whose deletion has begun; retry"
-                        ),
+                        message: match deleting {
+                            Some(deleting) => format!(
+                                "the submission began before collection intent {deleting}, \
+                                 whose deletion has begun; retry"
+                            ),
+                            None => "the submission was built before the cluster began \
+                                     collecting; retry"
+                                .to_string(),
+                        },
                     });
                 }
                 SmResponse::QueueFull { .. } => {

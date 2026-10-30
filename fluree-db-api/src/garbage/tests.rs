@@ -511,6 +511,10 @@ pub(crate) mod cluster {
             Ok(self.queued.lock().clone())
         }
 
+        async fn enable(&self) -> Result<bool> {
+            Ok(true)
+        }
+
         async fn lease(&self) -> Option<Instant> {
             let mut leases = self.leases.lock();
             match leases.as_mut() {

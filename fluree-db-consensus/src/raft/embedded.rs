@@ -238,6 +238,7 @@ impl EmbeddedRaftNode {
         // condemned, sparing through the leader.
         let collect_loader = fluree.condemned().map(|condemned| {
             condemned.activate(Arc::clone(&nameservice) as _);
+            nameservice.checks_writes_from_now();
             let cancel = CancellationToken::new();
             let task = tokio::spawn(crate::raft::collect::run_loader(
                 Arc::clone(&fluree),

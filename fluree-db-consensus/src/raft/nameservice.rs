@@ -110,6 +110,8 @@ pub struct RaftNameService {
     /// records report each branch at the generation installed here.
     /// Unset, they report the replicated generation.
     erasure: Option<Arc<crate::raft::erasure::ErasureNode>>,
+    /// Set once this node checks its writes against collection intents.
+    checks_writes: std::sync::atomic::AtomicBool,
 }
 
 /// Per-node forwarding configuration for [`RaftNameService`]. Held as
@@ -139,7 +141,19 @@ impl RaftNameService {
             staged_receipts: None,
             forwarding: None,
             erasure: None,
+            checks_writes: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// This node checks its writes against collection intents from now:
+    /// it answers [`COLLECT_READY_PATH`] so.
+    pub fn checks_writes_from_now(&self) {
+        self.checks_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn checks_writes(&self) -> bool {
+        self.checks_writes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Report records at the erasure generation `node` has installed.
@@ -438,15 +452,30 @@ fn basis_source(basis: &WriteBasis) -> Result<Option<(RefKey, u64)>> {
 }
 
 /// `command` presenting the collection intents its writer had loaded when
-/// it began, if it ran in a write scope; see [`SmCommand::Seen`].
-fn by_writer(command: SmCommand, seen: Option<u64>) -> SmCommand {
-    match seen {
-        Some(seen) => SmCommand::Seen {
+/// it began ([`SmCommand::Seen`]), once the cluster collects; before, a
+/// member a release behind may not decode it. `None` for a write in no
+/// scope once the cluster collects: nothing it stored was checked.
+pub(crate) fn by_writer(
+    collecting: bool,
+    command: SmCommand,
+    seen: Option<u64>,
+) -> Option<SmCommand> {
+    match (collecting, seen) {
+        (false, _) => Some(command),
+        (true, Some(seen)) => Some(SmCommand::Seen {
             seen,
             command: Box::new(command),
-        },
-        None => command,
+        }),
+        (true, None) => None,
     }
+}
+
+/// Why a write in no scope is refused once the cluster collects.
+fn unchecked(what: &str) -> NameServiceError {
+    NameServiceError::ApplyRejected(format!(
+        "{what} ran outside a write scope, so what it names was not checked against the \
+         cluster's garbage collection"
+    ))
 }
 
 /// [`at_generation`] for a write to `ledger_id` presenting `basis`.
@@ -478,9 +507,14 @@ fn erasure_refusal(response: &SmResponse) -> Option<String> {
         } => Some(format!(
             "{ledger_id} is held for an erasure activation until {until_millis}"
         )),
-        SmResponse::CollectionMoved { deleting } => Some(format!(
+        SmResponse::CollectionMoved {
+            deleting: Some(deleting),
+        } => Some(format!(
             "the write began before collection intent {deleting}, whose deletion has begun"
         )),
+        SmResponse::CollectionMoved { deleting: None } => {
+            Some("the write was built before the cluster began collecting".to_string())
+        }
         _ => None,
     }
 }
@@ -1015,7 +1049,9 @@ impl RaftNameService {
             erasure_generation,
             erasure_source,
         );
-        let cmd = by_writer(cmd, seen);
+        // A follower whose worker checked nothing presents no intent.
+        let collecting = self.state.read().await.collect.enabled;
+        let cmd = by_writer(collecting, cmd, seen.or(Some(0))).expect("presents a fence");
 
         let _guard = match self.staged_receipts.as_ref() {
             Some(stash) => match StashGuard::try_stash(stash, queue_id, ref_key.clone(), receipt) {
@@ -1345,6 +1381,12 @@ async fn handle_erasure_ready(
 /// condemned address, which a follower posts to the leader.
 pub const COLLECT_SPARE_PATH: &str = "/collect_spare";
 
+/// Path under [`collect_spare_router`]'s root the leader asks, before the
+/// cluster collects, whether a member checks its writes. Answered with
+/// the member's node id once it does; a member a release behind has no
+/// such route.
+pub const COLLECT_READY_PATH: &str = "/collect_ready";
+
 /// A writer's spare on its way to the leader; see
 /// [`CollectCommand::Spare`](super::state_machine::CollectCommand::Spare).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1404,7 +1446,24 @@ pub fn collect_spare_router(
                 network_config.apply_queue_poison_max_body_bytes,
             )),
         )
+        .route(COLLECT_READY_PATH, post(handle_collect_ready))
         .with_state(ns)
+}
+
+async fn handle_collect_ready(State(ns): State<Arc<RaftNameService>>) -> Response {
+    if !ns.checks_writes() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let id = ns.raft.metrics().borrow().id;
+    match postcard::to_allocvec(&id) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 async fn handle_collect_spare(
@@ -1637,20 +1696,23 @@ impl RaftNameService {
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
-        let cmd = {
+        let (cmd, collecting) = {
             let state = self.state.read().await;
-            build_apply_head_command(
+            let cmd = build_apply_head_command(
                 &state,
                 ledger_id,
                 commit_t,
                 commit_id,
                 self.staged_receipts.as_deref(),
-            )?
+            )?;
+            (cmd, state.collect.enabled)
         };
         let cmd = by_writer(
+            collecting,
             at_basis(cmd, ledger_id, basis)?,
             fluree_db_api::collect::seen(),
-        );
+        )
+        .ok_or_else(|| unchecked("publishing a commit"))?;
 
         match self.raft.client_write(cmd).await {
             Ok(resp) => {
@@ -2417,6 +2479,16 @@ impl RefPublisher for RaftNameService {
             fence,
         )?;
         let cmd = at_basis(cmd, ledger_id, &basis)?;
+        // A commit head names commits and transactions collection may
+        // condemn; an index head names nothing it does.
+        let cmd = match kind {
+            RefKind::CommitHead => {
+                let collecting = self.state.read().await.collect.enabled;
+                by_writer(collecting, cmd, fluree_db_api::collect::seen())
+                    .ok_or_else(|| unchecked("setting a commit head"))?
+            }
+            RefKind::IndexHead => cmd,
+        };
         let response = self.submit_lifecycle(cmd).await?;
         check_fence_response(&response, ledger_id)?;
         check_erasure_response(&response)?;
@@ -2698,7 +2770,10 @@ impl ConfigPublisher for RaftNameService {
             })),
             fence,
         )?;
-        let cmd = by_writer(cmd, fluree_db_api::collect::seen());
+        // Of what a configuration names, collection condemns only
+        // registration chunks, whose updates run in scopes.
+        let collecting = self.state.read().await.collect.enabled;
+        let cmd = by_writer(collecting, cmd.clone(), fluree_db_api::collect::seen()).unwrap_or(cmd);
         let response = self.submit_lifecycle(cmd).await?;
         check_erasure_response(&response)?;
         check_fence_response(&response, ledger_id)?;
@@ -2930,6 +3005,27 @@ mod tests {
     // ----------------------------------------------------------------
     // Pure publish-helper tests
     // ----------------------------------------------------------------
+
+    /// Before the cluster collects, no write is wrapped, scoped or not: a
+    /// member a release behind could not decode the wrapper. Once it does,
+    /// a scoped write is, and one in no scope is refused.
+    #[test]
+    fn writes_carry_their_fence_only_once_the_cluster_collects() {
+        let release = || SmCommand::ReleaseContent {
+            id: ContentId::new(ContentKind::Commit, b"c"),
+        };
+        for seen in [None, Some(3)] {
+            assert!(matches!(
+                by_writer(false, release(), seen),
+                Some(SmCommand::ReleaseContent { .. })
+            ));
+        }
+        assert!(matches!(
+            by_writer(true, release(), Some(3)),
+            Some(SmCommand::Seen { seen: 3, .. })
+        ));
+        assert!(by_writer(true, release(), None).is_none());
+    }
 
     #[test]
     fn build_advance_index_command_splits_ledger_id_into_name_and_branch() {

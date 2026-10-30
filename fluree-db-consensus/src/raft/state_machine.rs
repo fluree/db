@@ -1666,8 +1666,11 @@ pub enum Response {
     /// [`CollectCommand::Delete`] began deletion; `spared` stays.
     Deleting { spared: Vec<String> },
     /// A [`Command::Seen`] write began before loading intent `deleting`,
-    /// whose deletion has begun. Nothing applied; the writer stages again.
-    CollectionMoved { deleting: u64 },
+    /// whose deletion has begun; or, with `None`, a write carried no `Seen`
+    /// once the cluster collects. Nothing applied; the writer stages again.
+    CollectionMoved { deleting: Option<u64> },
+    /// [`CollectCommand::Enable`] applied.
+    CollectionEnabled,
 }
 
 /// Which cap [`Response::QueueFull`] tripped — useful so clients
@@ -1767,9 +1770,16 @@ impl NameServiceState {
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
     let command = match command {
         Command::Seen { seen, command } => match collect::refused_by(state, seen) {
-            Some(deleting) => return Response::CollectionMoved { deleting },
+            Some(deleting) => {
+                return Response::CollectionMoved {
+                    deleting: Some(deleting),
+                }
+            }
             None => *command,
         },
+        command if collect::unfenced(state, &command) => {
+            return Response::CollectionMoved { deleting: None }
+        }
         command => command,
     };
     let (command, generations) = match command {

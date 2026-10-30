@@ -2380,6 +2380,21 @@ impl Fluree {
     where
         R: tokio::io::AsyncRead + Unpin + Send,
     {
+        // Boxed: moved by value through the scope, it would sit on the
+        // stack once per layer.
+        self.write_scope(Box::pin(self.restore_ledger_scoped(new_ledger_id, reader)))
+            .await
+    }
+
+    /// [`Self::restore_ledger`], in its write scope.
+    async fn restore_ledger_scoped<R>(
+        &self,
+        new_ledger_id: &str,
+        reader: &mut R,
+    ) -> Result<RestoreResult>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
         // Normalize to canonical `name:branch` form up front so the ingest,
         // content-store namespace, head finalization, and rollback all agree —
         // callers may pass a bare `name` (the CLI does), which `create_ledger`

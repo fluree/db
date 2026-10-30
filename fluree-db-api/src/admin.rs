@@ -1429,6 +1429,17 @@ impl crate::Fluree {
         ledger_id: &str,
         graph_iri: &str,
     ) -> Result<DropNamedGraphReport> {
+        // Boxed, as `restore_ledger` is.
+        self.write_scope(Box::pin(self.drop_named_graph_scoped(ledger_id, graph_iri)))
+            .await
+    }
+
+    /// [`Self::drop_named_graph`], in its write scope.
+    async fn drop_named_graph_scoped(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+    ) -> Result<DropNamedGraphReport> {
         use fluree_db_core::graph_registry::{
             config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
             TXN_META_GRAPH_ID,

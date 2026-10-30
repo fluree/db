@@ -80,6 +80,11 @@ pub trait Collector: Send + Sync + std::fmt::Debug {
     /// be elected, and complete an intent, before then. `None` when it is
     /// not the leader.
     async fn lease(&self) -> Option<std::time::Instant>;
+
+    /// Whether the cluster collects, enabling it once every member checks
+    /// its writes: before, a member a release behind may be unable to read
+    /// collection's commands.
+    async fn enable(&self) -> Result<bool>;
 }
 
 impl Fluree {
@@ -176,6 +181,18 @@ pub fn seen() -> Option<u64> {
 /// member had loaded `epoch` intents, which no load finds in the scope.
 pub fn lower_seen(epoch: u64) {
     let _ = SCOPE.try_with(|scope| scope.ceiling.fetch_min(epoch, Ordering::SeqCst));
+}
+
+/// `work`, in the write scope under way here, if any: for a task a write
+/// spawns, which the scope, task-local, would not otherwise reach.
+pub(crate) fn carry<F: Future>(work: F) -> impl Future<Output = F::Output> {
+    let scope = SCOPE.try_with(Arc::clone).ok();
+    async move {
+        match scope {
+            Some(scope) => SCOPE.scope(scope, work).await,
+            None => work.await,
+        }
+    }
 }
 
 /// One write under way.

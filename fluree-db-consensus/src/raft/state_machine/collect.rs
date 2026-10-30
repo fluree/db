@@ -11,14 +11,21 @@
 //! has begun ([`CollectCommand::Delete`]) a write that began before loading
 //! it is refused and staged again. So the references the leader finds once
 //! deletion has begun are final.
+//!
+//! None of this is proposed before [`CollectCommand::Enable`], which the
+//! leader proposes once every member checks its writes: a member a release
+//! behind cannot decode these commands.
 
-use super::{NameServiceState, Response};
+use super::{Command, NameServiceState, RefKind, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The collection part of [`NameServiceState`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectState {
+    /// Set by [`CollectCommand::Enable`]: writes are fenced and intents
+    /// condemned from then on.
+    pub enabled: bool,
     /// Intents condemned and not yet completed, by number.
     pub intents: BTreeMap<u64, Intent>,
     pub next_intent: u64,
@@ -54,6 +61,8 @@ pub enum CollectCommand {
     Delete { number: u64 },
     /// Intent `number`'s deletes are done.
     Complete { number: u64 },
+    /// Every member checks its writes against intents: collect from now.
+    Enable,
 }
 
 /// The intent whose deletion has begun that a write presenting `seen`
@@ -62,6 +71,19 @@ pub enum CollectCommand {
 pub(super) fn refused_by(state: &NameServiceState, seen: u64) -> Option<u64> {
     let through = state.collect.deleted_through;
     (seen < through).then(|| through - 1)
+}
+
+/// Whether `command`, carrying no [`Command::Seen`], is refused: once the
+/// cluster collects, a command publishing what a writer stored must say
+/// what its writer had loaded. One built before its leader applied
+/// [`CollectCommand::Enable`] is made again.
+pub(super) fn unfenced(state: &NameServiceState, command: &Command) -> bool {
+    state.collect.enabled
+        && match command.admitted() {
+            Command::ApplyHead(_) | Command::EnqueueCommand(_) => true,
+            Command::CompareAndSetRef(cas) => cas.kind == RefKind::CommitHead,
+            _ => false,
+        }
 }
 
 pub(super) fn apply(
@@ -110,6 +132,10 @@ pub(super) fn apply(
         CollectCommand::Complete { number } => {
             collect.intents.remove(&number);
             Response::IntentClosed { number }
+        }
+        CollectCommand::Enable => {
+            collect.enabled = true;
+            Response::CollectionEnabled
         }
     }
 }
@@ -218,15 +244,60 @@ mod tests {
         for seen in [0, 1] {
             assert_eq!(
                 apply_command(&mut state, release(seen), 10),
-                Response::CollectionMoved { deleting: 1 }
+                Response::CollectionMoved { deleting: Some(1) }
             );
         }
         collect(&mut state, CollectCommand::Complete { number: 1 });
         assert_eq!(
             apply_command(&mut state, release(1), 11),
-            Response::CollectionMoved { deleting: 1 }
+            Response::CollectionMoved { deleting: Some(1) }
         );
         assert_eq!(apply_command(&mut state, release(2), 12), Response::NoOp);
+    }
+
+    /// Once the cluster collects, a commit-head write must say what its
+    /// writer had loaded, whatever else wraps it; before, none need. An
+    /// index-head write names nothing collection condemns.
+    #[test]
+    fn a_write_without_a_fence_is_refused_once_the_cluster_collects() {
+        use fluree_db_nameservice::{RefKind, RefValue};
+        let mut state = NameServiceState::new();
+        let cas = |kind| Command::Fenced {
+            fence: 1,
+            command: Box::new(Command::CompareAndSetRef(super::super::RefCas {
+                ledger_id: "l".into(),
+                branch: "main".into(),
+                kind,
+                expected: None,
+                new: RefValue {
+                    id: Some(ContentId::new(ContentKind::Commit, b"c")),
+                    t: 1,
+                },
+                applied_at_millis: 0,
+            })),
+        };
+        let refused = Response::CollectionMoved { deleting: None };
+        assert_ne!(
+            apply_command(&mut state, cas(RefKind::CommitHead), 8),
+            refused
+        );
+        assert_eq!(
+            collect(&mut state, CollectCommand::Enable),
+            Response::CollectionEnabled
+        );
+        assert_eq!(
+            apply_command(&mut state, cas(RefKind::CommitHead), 9),
+            refused
+        );
+        assert_ne!(
+            apply_command(&mut state, cas(RefKind::IndexHead), 10),
+            refused
+        );
+        let fenced = Command::Seen {
+            seen: 0,
+            command: Box::new(cas(RefKind::CommitHead)),
+        };
+        assert_ne!(apply_command(&mut state, fenced, 11), refused);
     }
 
     #[test]
@@ -235,6 +306,10 @@ mod tests {
         assert_eq!(
             bytes(&Command::Collect(CollectCommand::Complete { number: 1 })),
             vec![31, 3, 1]
+        );
+        assert_eq!(
+            bytes(&Command::Collect(CollectCommand::Enable)),
+            vec![31, 4]
         );
         let seen = Command::Seen {
             seen: 2,

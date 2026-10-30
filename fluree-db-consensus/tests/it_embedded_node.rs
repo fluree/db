@@ -871,13 +871,18 @@ async fn condemn(
         })
         .collect();
     let hash = fluree.put_intent(entries).await.expect("intent stored");
-    integration
-        .raft
-        .client_write(Command::Collect(CollectCommand::Condemn {
+    for command in [
+        CollectCommand::Enable,
+        CollectCommand::Condemn {
             intent: hash.clone(),
-        }))
-        .await
-        .expect("condemned");
+        },
+    ] {
+        integration
+            .raft
+            .client_write(Command::Collect(command))
+            .await
+            .expect("condemned");
+    }
     hash
 }
 
@@ -975,6 +980,7 @@ async fn a_write_begun_before_a_deleting_intent_is_refused() {
             // Deleting before this node can load the intent: its object is
             // written only after.
             for command in [
+                CollectCommand::Enable,
                 CollectCommand::Condemn {
                     intent: hash.clone(),
                 },
@@ -1055,6 +1061,130 @@ async fn a_leader_collects_unreferenced_blobs_through_an_intent() {
     let condemned = fluree.condemned().unwrap();
     eventually("the close is loaded", async || condemned.open().is_empty()).await;
     seed(&node, "swept:main").await;
+    node.shutdown().await;
+}
+
+/// The cluster collects only once every member checks its writes: a
+/// member a release behind could not decode collection's commands. Until a
+/// learner answers that it checks, the leader condemns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collection_waits_until_every_member_checks_its_writes() {
+    use fluree_db_consensus::raft::nameservice::COLLECT_READY_PATH;
+    use fluree_db_core::{ContentKind, ContentStore as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (integration, fluree, node, _dirs) = stand_up(35, |config| config).await;
+    fluree.create_ledger("gated").await.expect("create ledger");
+    seed(&node, "gated:main").await;
+    let namespace = fluree.storage_namespace("gated:main").await.unwrap();
+    fluree
+        .content_store(&namespace)
+        .put(ContentKind::Txn, b"{\"stray\":true}")
+        .await
+        .unwrap();
+    fluree.reconcile_garbage("gated").await.unwrap().unwrap();
+
+    // A learner that does not check its writes until told to.
+    let checks = Arc::new(AtomicBool::new(false));
+    let app = axum::Router::new().route(
+        &format!("/raft/nameservice{COLLECT_READY_PATH}"),
+        axum::routing::post({
+            let checks = Arc::clone(&checks);
+            move || async move {
+                if checks.load(Ordering::SeqCst) {
+                    Ok(postcard::to_allocvec(&36u64).unwrap())
+                } else {
+                    Err(axum::http::StatusCode::NOT_FOUND)
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    integration
+        .raft
+        .add_learner(
+            36,
+            fluree_db_consensus::raft::ClusterNode::new(
+                format!("http://127.0.0.1:{port}/raft/nameservice"),
+                format!("http://127.0.0.1:{port}"),
+            ),
+            false,
+        )
+        .await
+        .expect("learner added");
+
+    let waiting = fluree
+        .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(waiting.condemned, 0, "{waiting:?}");
+    assert!(!integration.shared_state.read().await.collect.enabled);
+
+    checks.store(true, Ordering::SeqCst);
+    let enabled = fluree
+        .collect_garbage_settled(Duration::ZERO, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(enabled.condemned > 0, "{enabled:?}");
+    assert!(integration.shared_state.read().await.collect.enabled);
+
+    // From now on a commit head set outside a write scope is refused: what
+    // it names was not checked. A drop of a named graph, which stores its
+    // commit and sets the head in one scope, lands.
+    use fluree_db_nameservice::{NameServiceError, RefKind, RefPublisher, RefValue};
+    let ns = integration.nameservice();
+    let record = ns.lookup("gated:main").await.unwrap().unwrap();
+    let unscoped = ns
+        .compare_and_set_ref_fenced(
+            "gated:main",
+            record.write_basis(),
+            RefKind::CommitHead,
+            None,
+            &RefValue {
+                id: record.commit_head_id.clone(),
+                t: record.commit_t + 1,
+            },
+        )
+        .await;
+    assert!(
+        matches!(unscoped, Err(NameServiceError::ApplyRejected(_))),
+        "{unscoped:?}"
+    );
+    node.committer
+        .transact(TransactionRequest {
+            idempotency_key: None,
+            ledger_id: "gated:main".into(),
+            body: TransactionBody::TrigUpsert(
+                "GRAPH <http://example.org/graphs/alpha> { \
+                 <http://example.org/a> <http://example.org/p> \"v\" . }"
+                    .into(),
+            ),
+            txn_opts: Default::default(),
+            commit_opts: Default::default(),
+            tracking: None,
+            governance: Default::default(),
+        })
+        .await
+        .expect("named graph written");
+    fluree
+        .drop_named_graph("gated:main", "http://example.org/graphs/alpha")
+        .await
+        .expect("a scoped drop lands");
+    // As does a restore, which stores the archive's commits and sets the
+    // heads naming them.
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger("gated", false, &mut archive)
+        .await
+        .expect("archived");
+    fluree
+        .restore_ledger("restored", &mut archive.as_slice())
+        .await
+        .expect("a scoped restore lands");
     node.shutdown().await;
 }
 

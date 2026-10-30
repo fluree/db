@@ -4356,6 +4356,17 @@ impl Fluree {
         &self.governance_cache
     }
 
+    /// Run `write`, which stores what it then publishes, in a write scope:
+    /// on a cluster member what it stores is checked against what the
+    /// cluster's collection condemned; elsewhere it runs as is.
+    pub(crate) async fn write_scope<F: std::future::Future>(&self, write: F) -> F::Output {
+        #[cfg(feature = "native")]
+        if let Some(condemned) = self.condemned() {
+            return condemned.scoped(write).await;
+        }
+        write.await
+    }
+
     /// Get the raw address-based storage for admin/GC operations.
     ///
     /// Returns `None` for `Permanent` (IPFS) backends, which do not
