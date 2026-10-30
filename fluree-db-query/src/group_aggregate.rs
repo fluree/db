@@ -442,18 +442,33 @@ pub(crate) enum GroupKeyOwned {
 }
 
 /// A vector's components as a hash key: equal iff `FlakeValue`'s vector
-/// equality holds (same length, bitwise-equal components).
+/// equality holds (same length, bitwise-equal components). Carries its hash,
+/// computed once, so a table that rehashes as it grows doesn't read the
+/// components again, and unequal keys rarely compare them.
 #[derive(Debug, Clone)]
-pub(crate) struct VectorKey(Arc<[f64]>);
+pub(crate) struct VectorKey {
+    hash: u64,
+    value: Arc<[f64]>,
+}
+
+impl VectorKey {
+    fn new(value: &Arc<[f64]>) -> Self {
+        Self {
+            hash: fluree_db_core::value::vector_bits_hash(value),
+            value: Arc::clone(value),
+        }
+    }
+}
 
 impl PartialEq for VectorKey {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-            || self.0.len() == other.0.len()
+        Arc::ptr_eq(&self.value, &other.value)
+            || self.hash == other.hash
+                && self.value.len() == other.value.len()
                 && self
-                    .0
+                    .value
                     .iter()
-                    .zip(other.0.iter())
+                    .zip(other.value.iter())
                     .all(|(a, b)| a.to_bits() == b.to_bits())
     }
 }
@@ -462,8 +477,7 @@ impl Eq for VectorKey {}
 
 impl Hash for VectorKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.len().hash(state);
-        fluree_db_core::value::vector_bits_hash(self.0.iter().map(|x| x.to_bits())).hash(state);
+        self.hash.hash(state);
     }
 }
 
@@ -567,7 +581,7 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             val: FlakeValue::Vector(v),
             dtc,
             ..
-        } => GroupKeyOwned::MaterializedVector(VectorKey(Arc::clone(v)), dtc.clone()),
+        } => GroupKeyOwned::MaterializedVector(VectorKey::new(v), dtc.clone()),
         Binding::Lit { val, dtc, .. } => {
             GroupKeyOwned::MaterializedLit(flake_value_to_key(val, dtc))
         }

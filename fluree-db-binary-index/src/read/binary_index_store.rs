@@ -3309,6 +3309,7 @@ pub struct BinaryGraphView {
 /// Per-view memo of decoded vectors keyed by value, bounded by clearing
 /// rather than evicting. A probe hashes and compares the arena's `f32`
 /// components in place, so a handle whose value was seen allocates nothing.
+/// When values rarely repeat, probing stops (`bypass`).
 struct VectorMemo(std::sync::Mutex<VectorMemoInner>);
 
 #[derive(Default)]
@@ -3317,23 +3318,38 @@ struct VectorMemoInner {
     by_hash: rustc_hash::FxHashMap<u64, Vec<Arc<[f64]>>>,
     /// Components held, the bound the memo clears at.
     components: usize,
-    /// Arena shards read so far, by `(p_id, shard index)`, so a lookup skips
-    /// the shared shard cache's probe.
-    shards: rustc_hash::FxHashMap<(u32, usize), Arc<crate::arena::vector::VectorShard>>,
+    /// Probes that found their value, and that didn't, since the last
+    /// [`VectorMemo::WINDOW`] misses.
+    window_hits: u32,
+    window_misses: u32,
+    /// Set once a window's probes mostly missed (values that rarely repeat,
+    /// such as one embedding per subject): the view then decodes each vector
+    /// without probing.
+    bypass: bool,
+    /// The arena shard read last, by `(p_id, shard index)`: a scan reads
+    /// handles mostly in order, so a lookup usually skips the shared shard
+    /// cache's probe. One shard only, so the memo never holds more of an
+    /// arena than that cache's eviction allows.
+    last_shard: Option<(u32, usize, Arc<crate::arena::vector::VectorShard>)>,
 }
 
 impl VectorMemo {
     const MAX_COMPONENTS: usize = 1 << 22;
+    /// Misses per hit-rate check.
+    const WINDOW: u32 = 1024;
 
     fn new() -> Self {
         Self(std::sync::Mutex::new(VectorMemoInner::default()))
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, VectorMemoInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn hash(components: &[f32]) -> u64 {
-        fluree_db_core::value::vector_bits_hash(
-            std::iter::once(components.len() as u64)
-                .chain(components.iter().map(|x| u64::from(x.to_bits()))),
-        )
+        fluree_db_core::value::vector_f32_bits_hash(components)
     }
 
     /// The shared value of `handle` in `p_id`'s `arena`, allocating it on the
@@ -3347,15 +3363,20 @@ impl VectorMemo {
         let Some((shard_idx, offset)) = arena.shard_of(handle) else {
             return Ok(None);
         };
-        let mut memo = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let shard = match memo.shards.get(&(p_id, shard_idx)) {
-            Some(shard) => Arc::clone(shard),
+        let mut memo = self.lock();
+        let last = memo
+            .last_shard
+            .as_ref()
+            .filter(|(p, i, _)| *p == p_id && *i == shard_idx)
+            .map(|(_, _, shard)| Arc::clone(shard));
+        let shard = match last {
+            Some(shard) => shard,
             None => {
+                // The load can read from disk; don't hold the memo meanwhile.
+                drop(memo);
                 let shard = arena.shard(shard_idx)?;
-                memo.shards.insert((p_id, shard_idx), Arc::clone(&shard));
+                memo = self.lock();
+                memo.last_shard = Some((p_id, shard_idx, Arc::clone(&shard)));
                 shard
             }
         };
@@ -3367,6 +3388,10 @@ impl VectorMemo {
     /// The shared value equal to `components` (widened exactly to `f64`),
     /// allocating it on the first sight of that value.
     fn get_or_insert(memo: &mut VectorMemoInner, components: &[f32]) -> Arc<[f64]> {
+        let widen = || -> Arc<[f64]> { components.iter().map(|&x| f64::from(x)).collect() };
+        if memo.bypass {
+            return widen();
+        }
         let same = |v: &[f64]| {
             v.len() == components.len()
                 && v.iter()
@@ -3379,13 +3404,27 @@ impl VectorMemo {
             .get(&hash)
             .and_then(|bucket| bucket.iter().find(|v| same(v)))
         {
-            return Arc::clone(found);
+            let found = Arc::clone(found);
+            memo.window_hits += 1;
+            return found;
+        }
+        memo.window_misses += 1;
+        if memo.window_misses >= Self::WINDOW {
+            // Mostly new values: the probe is all cost, so stop probing.
+            if memo.window_hits < memo.window_misses / 4 {
+                memo.bypass = true;
+                memo.by_hash = rustc_hash::FxHashMap::default();
+                memo.components = 0;
+                return widen();
+            }
+            memo.window_hits = 0;
+            memo.window_misses = 0;
         }
         if memo.components >= Self::MAX_COMPONENTS {
             memo.by_hash.clear();
             memo.components = 0;
         }
-        let value: Arc<[f64]> = components.iter().map(|&x| f64::from(x)).collect();
+        let value = widen();
         memo.components += components.len();
         memo.by_hash
             .entry(hash)

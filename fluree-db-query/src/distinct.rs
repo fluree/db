@@ -10,8 +10,8 @@ use crate::object_binding::{equality_norm, normalize_for_key_cow, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use hashbrown::HashMap;
-use rustc_hash::{FxBuildHasher, FxHasher};
+use hashbrown::hash_table::{Entry, HashTable};
+use rustc_hash::FxHasher;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -30,8 +30,10 @@ type RowSignature = Vec<Binding>;
 pub struct DistinctOperator {
     /// Child operator
     child: BoxedOperator,
-    /// Set of seen row signatures
-    seen: HashMap<RowSignature, (), FxBuildHasher>,
+    /// Seen row signatures, each with its hash: a row's hash reads every
+    /// binding (a vector's every component), so growing the table reuses it
+    /// rather than hashing each row again.
+    seen: HashTable<(u64, RowSignature)>,
     /// Output schema (same as child)
     schema: Arc<[VarId]>,
     /// Operator state
@@ -52,7 +54,7 @@ impl DistinctOperator {
         let schema = Arc::from(child.schema().to_vec().into_boxed_slice());
         Self {
             child,
-            seen: HashMap::with_hasher(FxBuildHasher),
+            seen: HashTable::new(),
             schema,
             state: OperatorState::Created,
             norm: None,
@@ -186,7 +188,8 @@ impl Operator for DistinctOperator {
                     continue;
                 }
                 if self.seen.is_empty() {
-                    self.seen.insert(RowSignature::new(), ());
+                    self.seen
+                        .insert_unique(0, (0, RowSignature::new()), |(hash, _)| *hash);
                     return Ok(Some(Batch::empty_schema_with_len(1)));
                 }
                 continue;
@@ -207,19 +210,22 @@ impl Operator for DistinctOperator {
                     scratch.extend((0..num_cols).map(|col| {
                         normalize_for_key_cow(batch.get_by_col(row_idx, col), dicts, gv)
                     }));
-                    // `Cow` hashes as the binding it wraps, so this equals the
-                    // stored `Vec<Binding>` hash the map recomputes on rehash.
                     let mut h = FxHasher::default();
                     scratch.hash(&mut h);
                     let hash = h.finish();
-                    let entry = self.seen.raw_entry_mut().from_hash(hash, |sig| {
-                        sig.len() == scratch.len()
-                            && sig.iter().zip(&scratch).all(|(a, b)| a == b.as_ref())
-                    });
-                    if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
+                    let entry = self.seen.entry(
+                        hash,
+                        |(h, sig)| {
+                            *h == hash
+                                && sig.len() == scratch.len()
+                                && sig.iter().zip(&scratch).all(|(a, b)| a == b.as_ref())
+                        },
+                        |(h, _)| *h,
+                    );
+                    if let Entry::Vacant(v) = entry {
                         let signature: RowSignature =
                             scratch.iter().map(|b| b.as_ref().clone()).collect();
-                        v.insert_hashed_nocheck(hash, signature, ());
+                        v.insert((hash, signature));
                         for (col_idx, col) in columns.iter_mut().enumerate() {
                             col.push(batch.get_by_col(row_idx, col_idx).clone());
                         }
@@ -228,24 +234,28 @@ impl Operator for DistinctOperator {
                 }
 
                 let hash = Self::row_hash_with_len(&batch, row_idx, num_cols);
-                let entry = self.seen.raw_entry_mut().from_hash(hash, |sig| {
-                    if sig.len() != num_cols {
-                        return false;
-                    }
-                    for col in 0..num_cols {
-                        let Some(b) = sig.get(col) else {
-                            return false;
-                        };
-                        if b != batch.get_by_col(row_idx, col) {
+                let entry = self.seen.entry(
+                    hash,
+                    |(h, sig)| {
+                        if *h != hash || sig.len() != num_cols {
                             return false;
                         }
-                    }
-                    true
-                });
+                        for col in 0..num_cols {
+                            let Some(b) = sig.get(col) else {
+                                return false;
+                            };
+                            if b != batch.get_by_col(row_idx, col) {
+                                return false;
+                            }
+                        }
+                        true
+                    },
+                    |(h, _)| *h,
+                );
 
-                if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
+                if let Entry::Vacant(v) = entry {
                     let signature = Self::extract_signature_with_len(&batch, row_idx, num_cols);
-                    v.insert_hashed_nocheck(hash, signature, ());
+                    v.insert((hash, signature));
 
                     for (col_idx, col) in columns.iter_mut().enumerate() {
                         col.push(batch.get_by_col(row_idx, col_idx).clone());

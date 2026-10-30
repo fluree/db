@@ -998,22 +998,39 @@ fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
     }
 }
 
-/// A vector's components folded into one well-mixed `u64`, for hash keys.
+/// A vector's components folded into one well-mixed `u64`, for hash keys:
+/// equal under bitwise component equality, as `FlakeValue`'s vector equality
+/// is. In-memory only: it reads the components' native-endian bytes.
 ///
-/// Hashing the components' bits through an add-and-multiply hasher (such as
-/// `FxHasher`) leaves the result's low bits independent of the data whenever
-/// the components' low bits are zero, which they are for every vector held as
-/// `f32` (widening fills the low 29 bits with zeros): a hash table then sees
-/// the same tag for every vector and compares a probe with most of its
-/// neighbors. Each step here folds the product's high bits back down.
-#[inline]
-pub fn vector_bits_hash(bits: impl IntoIterator<Item = u64>) -> u64 {
-    let mut acc: u64 = 0;
-    for b in bits {
-        acc = (acc ^ b).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        acc ^= acc >> 29;
-    }
-    acc
+/// It is `xxh3` over those bytes. A per-component multiply chain is
+/// latency-bound (one dependent multiply per component), and an
+/// add-and-multiply hasher such as `FxHasher` is also weak here: a vector
+/// held as `f32` widens with its low 29 bits zero, which leaves such a hash's
+/// low bits independent of the data, so a hash table sees one tag for every
+/// vector.
+pub fn vector_bits_hash(components: &[f64]) -> u64 {
+    // SAFETY: `f64` has no padding and any byte is a valid `u8`; the byte
+    // slice covers exactly `components`' memory and borrows it.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            components.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(components),
+        )
+    };
+    xxhash_rust::xxh3::xxh3_64(bytes)
+}
+
+/// [`vector_bits_hash`] for components held as `f32`, as a vector arena
+/// holds them. Not equal to the hash of the same vector widened.
+pub fn vector_f32_bits_hash(components: &[f32]) -> u64 {
+    // SAFETY: as in `vector_bits_hash`, for `f32`.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            components.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(components),
+        )
+    };
+    xxhash_rust::xxh3::xxh3_64(bytes)
 }
 
 impl std::hash::Hash for FlakeValue {
@@ -1135,7 +1152,7 @@ impl std::hash::Hash for FlakeValue {
             FlakeValue::Vector(v) => {
                 self.type_discriminant().hash(state);
                 v.len().hash(state);
-                vector_bits_hash(v.iter().map(|f| f.to_bits())).hash(state);
+                vector_bits_hash(v).hash(state);
             }
             FlakeValue::GeoPoint(bits) => {
                 self.type_discriminant().hash(state);
