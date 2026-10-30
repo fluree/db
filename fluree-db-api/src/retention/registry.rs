@@ -310,7 +310,7 @@ impl crate::Fluree {
     /// create or restore under way, or stopped, has written), or one a
     /// dropped ledger keeps for its restore.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn named_chunks(&self) -> Result<std::collections::HashSet<String>> {
+    pub(crate) async fn named_chunks(&self) -> Result<std::collections::HashSet<String>> {
         let ns = self.publisher()?;
         let mut named = std::collections::HashSet::new();
         for record in ns.all_raw_records().await? {
@@ -328,12 +328,47 @@ impl crate::Fluree {
         Ok(named)
     }
 
+    /// The addresses of the chunks no registration names, in this listing
+    /// and in one at least `grace` before; the others unnamed now are kept
+    /// for a later call.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn unnamed_chunks(
+        &self,
+        objects: &Objects<'_>,
+        grace: std::time::Duration,
+    ) -> Result<Vec<String>> {
+        let prefix = chunk_prefix(objects.storage.storage_method());
+        let listed = objects.storage.list_prefix(&prefix).await?;
+        let named = self.named_chunks().await?;
+        let now = std::time::Instant::now();
+        let mut doomed = Vec::new();
+        let mut unnamed = self.retention.unnamed_chunks.lock();
+        let mut still = std::collections::HashMap::new();
+        for address in listed {
+            let Some(hash) = chunk_hash(&prefix, &address) else {
+                continue;
+            };
+            if named.contains(hash) {
+                continue;
+            }
+            let since = unnamed.get(hash).copied().unwrap_or(now);
+            if now.duration_since(since) >= grace {
+                doomed.push(address.clone());
+            } else {
+                still.insert(hash.to_string(), since);
+            }
+        }
+        *unnamed = still;
+        Ok(doomed)
+    }
+
     /// Delete the chunks no registration names that a sweep at least
     /// `grace` earlier also found unnamed; the count deleted. No
     /// registration is written meanwhile. Only an instance that holds its
     /// storage's lock, and is no cluster member, sweeps: another process's
     /// write, or a member's, could name a chunk again between the names
-    /// being read and the delete.
+    /// being read and the delete. A cluster's leader collects its chunks
+    /// through intents instead (`garbage::cluster`).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn sweep_registration_chunks(
         &self,
@@ -346,36 +381,7 @@ impl crate::Fluree {
             return Ok(0);
         };
         let _sweeping = self.retention.registry_writes.write().await;
-        let prefix = format!(
-            "fluree:{}://{OBJECTS_DIR}/",
-            objects.storage.storage_method()
-        );
-        let listed = objects.storage.list_prefix(&prefix).await?;
-        let named = self.named_chunks().await?;
-        let now = std::time::Instant::now();
-        let mut doomed = Vec::new();
-        {
-            let mut unnamed = self.retention.unnamed_chunks.lock();
-            let mut still = std::collections::HashMap::new();
-            for address in listed {
-                let Some(hash) = address
-                    .strip_prefix(&prefix)
-                    .and_then(|file| file.strip_suffix(".json"))
-                else {
-                    continue;
-                };
-                if named.contains(hash) {
-                    continue;
-                }
-                let since = unnamed.get(hash).copied().unwrap_or(now);
-                if now.duration_since(since) >= grace {
-                    doomed.push(address.clone());
-                } else {
-                    still.insert(hash.to_string(), since);
-                }
-            }
-            *unnamed = still;
-        }
+        let doomed = self.unnamed_chunks(&objects, grace).await?;
         #[cfg(test)]
         {
             let hold = self.retention.sweep_hold.lock().clone();
@@ -391,6 +397,20 @@ impl crate::Fluree {
         }
         Ok(deleted)
     }
+}
+
+/// Where registration chunks live, for a storage method.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn chunk_prefix(method: &str) -> String {
+    format!("fluree:{method}://{OBJECTS_DIR}/")
+}
+
+/// The hash a chunk's address under `prefix` names.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn chunk_hash<'a>(prefix: &str, address: &'a str) -> Option<&'a str> {
+    address
+        .strip_prefix(prefix)
+        .and_then(|file| file.strip_suffix(".json"))
 }
 
 fn unreadable() -> ApiError {
@@ -1098,6 +1118,57 @@ mod tests {
         assert!(left.iter().any(|a| a.contains(&kept_chunk)), "{left:?}");
         let read_back = read(ns, objects, &id).await.unwrap().1.unwrap();
         assert_eq!(read_back.journal.removals, vec![removal(0), removal(2)]);
+    }
+
+    /// On a cluster the leader's collection condemns a chunk no registration
+    /// has named across the grace, and deletes it a pass later unless a
+    /// registration names it again meanwhile.
+    #[tokio::test]
+    async fn a_cluster_collects_superseded_chunks_through_intents() {
+        use crate::garbage::tests::cluster::{pass, Cluster};
+
+        let (_dir, fluree, id) = ledger("t/clustered").await;
+        let cluster = Arc::new(Cluster::default());
+        fluree.set_collector(cluster.clone());
+        let (ns, objects) = (fluree.publisher().unwrap(), fluree.registry_objects());
+        let registered = |removals: Vec<Removal>| Registration {
+            active_since_t: 1,
+            journal: Journal {
+                generation: 1,
+                history_rules: Vec::new(),
+                removals,
+            },
+            ..Default::default()
+        };
+        update(ns, objects, &id, |_| Some(registered(vec![removal(0)])))
+            .await
+            .unwrap();
+        update(ns, objects, &id, |current| {
+            let mut next = current.unwrap().clone();
+            next.journal.removals.push(removal(2));
+            Some(next)
+        })
+        .await
+        .unwrap();
+        assert_eq!(chunk_objects(&fluree).await.len(), 2);
+
+        let first = pass(&fluree, &cluster).await;
+        assert_eq!(first.condemned, 1, "{first:?}");
+        // Named again before deletion begins: kept.
+        update(ns, objects, &id, |_| Some(registered(vec![removal(0)])))
+            .await
+            .unwrap();
+        let second = pass(&fluree, &cluster).await;
+        assert_eq!((second.deleted, second.resolved), (0, 1), "{second:?}");
+        assert_eq!(chunk_objects(&fluree).await.len(), 2);
+        let read_back = read(ns, objects, &id).await.unwrap().1.unwrap();
+        assert_eq!(read_back.journal.removals, vec![removal(0)]);
+
+        // The longer one, superseded in turn, was condemned by that pass.
+        assert_eq!(second.condemned, 1, "{second:?}");
+        let third = pass(&fluree, &cluster).await;
+        assert_eq!(third.deleted, 1, "{third:?}");
+        assert_eq!(chunk_objects(&fluree).await.len(), 1);
     }
 
     /// A registration read before its chunks were superseded and swept, then

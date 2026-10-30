@@ -12,7 +12,7 @@ mod cluster;
 mod collect;
 mod reconcile;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use collect::{CollectTimings, GarbageReport};
 pub use reconcile::{ReconcilePass, ReconcileReport, ReconcileTimings};

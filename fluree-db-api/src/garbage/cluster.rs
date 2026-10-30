@@ -7,8 +7,9 @@
 //! checked against the ledger's branches and its queued requests once more,
 //! a check no later write can invalidate, and what is still unreferenced is
 //! deleted, each unlink within the leader's lease. Then the pass condemns
-//! the recorded blobs past their grace that nothing references, as one new
-//! intent, which the next pass deletes.
+//! the recorded blobs past their grace that nothing references, and the
+//! retention registration chunks no registration has named across a grace,
+//! as one new intent, which the next pass deletes.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -27,6 +28,9 @@ const MAX_INTENT: usize = 10_000;
 
 /// Deletes between pauses, in a pass with a budget.
 const DELETE_BATCH: usize = 32;
+
+/// Why a registration chunk is condemned: no registration names it.
+const UNNAMED_CHUNK: &str = "registration";
 
 impl GarbageReason {
     fn as_str(self) -> &'static str {
@@ -75,9 +79,21 @@ impl Fluree {
                 );
             }
         }
-        let entries = self
+        let mut entries = self
             .unreferenced_due(collector, grace, deadline, &condemned, &mut report)
             .await?;
+        if let Some(objects) = self.registry_objects() {
+            for address in self.unnamed_chunks(&objects, grace).await? {
+                if entries.len() < MAX_INTENT && !condemned.contains(&address) {
+                    entries.push(IntentEntry {
+                        address,
+                        reason: UNNAMED_CHUNK.to_string(),
+                        ledger: None,
+                        record: None,
+                    });
+                }
+            }
+        }
         if !entries.is_empty() {
             report.condemned = entries.len();
             let hash = self.put_intent(&IntentObject { entries }).await?;
@@ -110,6 +126,7 @@ impl Fluree {
         let storage = self.garbage_storage()?;
         let method = storage.storage_method().to_string();
         let mut by_ledger: BTreeMap<String, Vec<IntentEntry>> = BTreeMap::new();
+        let mut chunks = Vec::new();
         for entry in self.intent(hash).await?.entries {
             if spared.contains(&entry.address) {
                 // Its writer names it or abandons it; reconciliation finds
@@ -120,9 +137,33 @@ impl Fluree {
                 report.spared += 1;
             } else if let Some(ledger) = entry.ledger.clone() {
                 by_ledger.entry(ledger).or_default().push(entry);
+            } else if entry.reason == UNNAMED_CHUNK {
+                chunks.push(entry.address);
             }
         }
         let mut lease = None;
+        if !chunks.is_empty() {
+            // Named again by a registration written before deletion began,
+            // or not at all: no later write can name these.
+            let named = self.named_chunks().await?;
+            let prefix = crate::retention::registry::chunk_prefix(&method);
+            for address in chunks {
+                if crate::retention::registry::chunk_hash(&prefix, &address)
+                    .is_none_or(|hash| named.contains(hash))
+                {
+                    report.resolved += 1;
+                    continue;
+                }
+                if !lease.is_some_and(|until| Instant::now() < until) {
+                    lease = collector.lease().await;
+                    if lease.is_none() {
+                        return Ok(false);
+                    }
+                }
+                storage.delete_unlogged(&address).await?;
+                report.deleted += 1;
+            }
+        }
         for (ledger, entries) in by_ledger {
             // Decided against the ledger's branches as they are now that
             // deletion has begun: no write begun before can name these.

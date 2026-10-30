@@ -432,7 +432,7 @@ async fn a_collection_out_of_time_loads_nothing() {
     assert_eq!(*fluree.root.collect_from.lock(), None);
 }
 
-mod cluster {
+pub(crate) mod cluster {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -452,7 +452,7 @@ mod cluster {
 
     /// The replicated collection state, kept here.
     #[derive(Debug, Default)]
-    struct Cluster {
+    pub(crate) struct Cluster {
         intents: Mutex<BTreeMap<u64, Open>>,
         next: Mutex<u64>,
         queued: Mutex<HashSet<ContentId>>,
@@ -547,7 +547,10 @@ mod cluster {
         assert_eq!(recorded, [id]);
     }
 
-    async fn pass(fluree: &Fluree, cluster: &Arc<Cluster>) -> crate::garbage::GarbageReport {
+    pub(crate) async fn pass(
+        fluree: &Fluree,
+        cluster: &Arc<Cluster>,
+    ) -> crate::garbage::GarbageReport {
         let collector: Arc<dyn Collector> = cluster.clone();
         fluree
             .collect_in_cluster(&collector, Duration::ZERO, Duration::ZERO, None)
