@@ -469,7 +469,7 @@ impl Fluree {
                     registration
                         .erasures
                         .into_iter()
-                        .filter(|j| j.purge_pending() && (!clustered || j.effective_ms().is_some()))
+                        .filter(|j| j.purge_ready(clustered))
                         .map(|j| (branch.clone(), j)),
                 );
             }

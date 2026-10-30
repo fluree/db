@@ -303,11 +303,10 @@ impl Fluree {
                 .await
                 .and_then(|(c, stored)| Ok((c, stored.map(|s| registry::shell(&s)).transpose()?)))
             {
-                let purge = registration.erasures.iter().any(|j| {
-                    j.purge_pending()
-                        && (!clustered || j.effective_ms().is_some())
-                        && j.retry_at_ms.is_none_or(|at| at <= now)
-                });
+                let purge = registration
+                    .erasures
+                    .iter()
+                    .any(|j| j.purge_ready(clustered) && j.retry_at_ms.is_none_or(|at| at <= now));
                 if let (true, Ok(id)) = (purge, LedgerId::parse(branch)) {
                     due.insert(id.ledger_name().to_string());
                 }

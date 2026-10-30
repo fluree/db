@@ -65,6 +65,61 @@ fn holds(captured: &[super::Captured], value: &str) -> bool {
         .any(|c| matches!(&c.flake.o, FlakeValue::String(s) if s == value))
 }
 
+/// On a cluster a purge plans only the jobs every member has installed: a
+/// member that has not still reads the originals, and may write them back.
+#[tokio::test]
+async fn a_cluster_plans_only_the_jobs_every_member_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/gated").await.unwrap();
+    let id = "t/gated:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/bob", "http://example.org/email": "b@secret"}),
+    )
+    .await;
+    erase(&fluree, id, email("alice", "a@secret")).await;
+    erase(&fluree, id, email("bob", "b@secret")).await;
+    fluree.set_collector(Arc::new(crate::garbage::tests::cluster::Cluster::default()));
+    let jobs = fluree
+        .retention_status(id)
+        .await
+        .unwrap()
+        .registration
+        .unwrap()
+        .erasures;
+    assert_eq!(jobs.len(), 2);
+    for (n, job) in jobs.iter().enumerate() {
+        fluree
+            .update_job(id, &job.request_id, |j| {
+                j.cluster = Some(super::super::ClusterPublication {
+                    manifest: format!("m{n}"),
+                    activation: Some(n as u64),
+                    effective_ms: (n == 0).then_some(1),
+                });
+            })
+            .await
+            .unwrap();
+    }
+    let plan = fluree.plan_purge(id).await.unwrap();
+    assert_eq!(plan.requests, [jobs[0].request_id.clone()]);
+    assert_eq!(
+        plan.commits,
+        jobs[0]
+            .commits
+            .iter()
+            .map(|c| c.commit.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Capture reads the erased facts from the originals, which reads no longer
 /// return; once the originals are gone, from the earliest replacement a
 /// later erasure superseded, which still holds what that erasure removed.

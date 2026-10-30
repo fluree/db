@@ -60,6 +60,9 @@ impl Fluree {
         let runtime = self.erasure_runtime()?;
         let name = LedgerId::parse(ledger)?;
         let ns = self.publisher()?;
+        // On a cluster, only what every member has installed: a member that
+        // has not still reads the originals, and may write them back.
+        let clustered = self.collected_by_cluster();
         let mut plan = PurgePlan::default();
         let mut erased = BTreeSet::new();
         let mut rebuild = BTreeSet::new();
@@ -76,7 +79,11 @@ impl Fluree {
                 continue;
             };
             jobs.extend(registration.erasures.iter().cloned());
-            for job in registration.erasures.iter().filter(|j| j.purge_pending()) {
+            for job in registration
+                .erasures
+                .iter()
+                .filter(|j| j.purge_ready(clustered))
+            {
                 plan.requests.push(job.request_id.clone());
                 erased.extend(job.commits.iter().map(|c| c.commit.clone()));
                 if let Some(holders) = self.holders(&branch, job).await? {
@@ -169,7 +176,7 @@ impl Fluree {
             .retracted_holders(&name, &plan.rebuild, &txn_of)
             .await?;
         let holders: BTreeSet<&String> = plan.rebuild.iter().chain(&plan.release).collect();
-        let pending: Vec<&ErasureJob> = jobs.iter().filter(|j| j.purge_pending()).collect();
+        let pending: Vec<&ErasureJob> = jobs.iter().filter(|j| j.purge_ready(clustered)).collect();
         for source in self
             .sources_over(&holders, erased_properties(&pending).as_ref())
             .await?

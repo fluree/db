@@ -411,6 +411,12 @@ impl ErasureJob {
         self.cluster.as_ref().and_then(|c| c.effective_ms)
     }
 
+    /// Published and still to be purged, and on a cluster (`clustered`)
+    /// effective: a purge plans only these.
+    pub fn purge_ready(&self, clustered: bool) -> bool {
+        self.purge_pending() && (!clustered || self.effective_ms().is_some())
+    }
+
     /// Purged or refused: nothing left to do.
     pub fn finished(&self) -> bool {
         matches!(self.stage, ErasureStage::Purged | ErasureStage::Failed)
