@@ -285,8 +285,10 @@ fn walk_and_land(
 ) -> io::Result<()> {
     match scan_cache_entries(root) {
         Ok(entries) => {
-            let (total, walked) = walked_sizes(&entries);
-            state.lock().land_scan(ticket, total, &walked);
+            let walked = walked_paths(&entries);
+            state
+                .lock()
+                .land_scan(ticket, walked_bytes(&entries), &walked);
             Ok(())
         }
         Err(err) => {
@@ -296,16 +298,19 @@ fn walk_and_land(
     }
 }
 
-/// The walk's total and each entry's size, by path.
-fn walked_sizes(entries: &[CacheEntry]) -> (u64, HashMap<&Path, u64>) {
-    let walked: HashMap<&Path, u64> = entries
+/// The bytes a walk found.
+fn walked_bytes(entries: &[CacheEntry]) -> u64 {
+    entries
+        .iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes))
+}
+
+/// Each entry a walk found, with its size, by path.
+fn walked_paths(entries: &[CacheEntry]) -> HashMap<&Path, u64> {
+    entries
         .iter()
         .map(|entry| (entry.path.as_path(), entry.bytes))
-        .collect();
-    let total = entries
-        .iter()
-        .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes));
-    (total, walked)
+        .collect()
 }
 
 /// How long a test pause waits on either side before failing the test.
@@ -401,9 +406,7 @@ fn create_dir_result_as_cache_outcome(res: io::Result<()>) -> io::Result<()> {
 
 #[cfg(test)]
 fn directory_bytes(root: &Path) -> io::Result<u64> {
-    Ok(scan_cache_entries(root)?
-        .into_iter()
-        .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes)))
+    Ok(walked_bytes(&scan_cache_entries(root)?))
 }
 
 fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
@@ -674,9 +677,7 @@ impl DiskArtifactCache {
         };
         #[cfg(test)]
         pause_at(&self.state, "rescan");
-        let walked_total = entries
-            .iter()
-            .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes));
+        let walked_total = walked_bytes(&entries);
         let mut current = walked_total;
         if current > target_bytes {
             entries.sort_by_key(|entry| entry.modified);
@@ -714,7 +715,7 @@ impl DiskArtifactCache {
                 }
             }
         }
-        let (_, walked) = walked_sizes(&entries);
+        let walked = walked_paths(&entries);
         self.state.lock().land_scan(ticket, walked_total, &walked);
         Ok(())
     }
