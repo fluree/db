@@ -769,3 +769,41 @@ fn debug_shows_the_principal_not_the_token() {
     let store = GcsIcebergStorage::at_endpoint(TokenSource::Vended(renewing), None, "http://x");
     assert!(!format!("{store:?}").contains("ya29.secret"));
 }
+
+/// A redirect is not followed: a read goes to the endpoint it names or fails,
+/// so neither the token nor the billing project is sent where a response
+/// points. The redirect's target here would serve the object.
+#[tokio::test]
+async fn a_redirected_read_is_refused_not_followed() {
+    let (google, gcs) = (MockServer::start().await, MockServer::start().await);
+    let store = store_as(
+        identity(&google, "ya29.storage").await,
+        &gcs,
+        Some("lake-billing"),
+    );
+    Mock::given(method("GET"))
+        .and(object_at("/lake/data/f.parquet"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/elsewhere/f.parquet", gcs.uri()).as_str(),
+        ))
+        .mount(&gcs)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/elsewhere/f.parquet"))
+        .respond_with(object(BODY))
+        .expect(0)
+        .mount(&gcs)
+        .await;
+    let err = SendIcebergStorage::read(&store, "gs://lake/data/f.parquet")
+        .await
+        .expect_err("a redirect is not a read");
+    assert!(err.to_string().contains("302"), "{err}");
+    let followed = gcs
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path() == "/elsewhere/f.parquet");
+    assert!(!followed, "the redirect was followed");
+}

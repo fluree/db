@@ -119,6 +119,45 @@ impl TokenSource {
     }
 }
 
+/// Builds each bucket's HTTP client the way `object_store`'s own connector
+/// does for these options (timeouts, the user-project header, http only for
+/// an operator's endpoint, no transparent decompression), but follows **no**
+/// redirects: a read goes to the endpoint it names or fails, and neither the
+/// token nor `x-goog-user-project` is sent anywhere a response points.
+/// `object_store` sets no redirect policy of its own, so its client would
+/// follow reqwest's default of ten.
+#[derive(Debug)]
+struct NoRedirects {
+    headers: object_store::HeaderMap,
+    allow_http: bool,
+}
+
+impl object_store::client::HttpConnector for NoRedirects {
+    fn connect(
+        &self,
+        _options: &ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        let client = reqwest012::Client::builder()
+            .redirect(reqwest012::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .default_headers(self.headers.clone())
+            // As `object_store` does: compression would break the
+            // Content-Length it sizes objects by.
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
+            .https_only(!self.allow_http)
+            .build()
+            .map_err(|e| object_store::Error::Generic {
+                store: "GCS",
+                source: Box::new(e),
+            })?;
+        Ok(object_store::client::HttpClient::new(client))
+    }
+}
+
 /// `object_store`'s view of a [`TokenSource`]: asked for a credential on every
 /// request, which is when a token inside its refresh margin is renewed.
 #[derive(Debug)]
@@ -261,30 +300,33 @@ impl GcsIcebergStorage {
         if let Some(store) = stores.get(bucket) {
             return Ok(Arc::clone(store));
         }
-        let mut options = ClientOptions::new()
-            .with_timeout(REQUEST_TIMEOUT)
-            .with_connect_timeout(CONNECT_TIMEOUT);
+        let mut headers = object_store::HeaderMap::new();
         if let Some(project) = &self.inner.user_project {
-            let mut headers = object_store::HeaderMap::new();
             let value = object_store::HeaderValue::from_str(project).map_err(|_| {
                 IcebergError::GoogleCredentialsInvalid(
                     "the storage user project is not a Google Cloud project id".to_string(),
                 )
             })?;
             headers.insert(QUOTA_PROJECT_HEADER, value);
-            options = options.with_default_headers(headers);
         }
+        // Only the operator's override (or a test mock) may be plain http.
+        let allow_http = self.inner.endpoint.starts_with("http://")
+            && self.inner.endpoint != GCS_DEFAULT_ENDPOINT;
+        let options = ClientOptions::new()
+            .with_timeout(REQUEST_TIMEOUT)
+            .with_connect_timeout(CONNECT_TIMEOUT)
+            .with_default_headers(headers.clone())
+            .with_allow_http(allow_http);
         let mut builder = GoogleCloudStorageBuilder::new()
             .with_bucket_name(bucket)
             .with_credentials(Arc::new(BearerProvider {
                 source: self.inner.source.clone(),
-            }));
+            }))
+            .with_http_connector(NoRedirects {
+                headers,
+                allow_http,
+            });
         if self.inner.endpoint != GCS_DEFAULT_ENDPOINT {
-            // Only the operator's override (or a test mock) gets here; plain
-            // http is allowed for it alone.
-            if self.inner.endpoint.starts_with("http://") {
-                options = options.with_allow_http(true);
-            }
             builder = builder.with_base_url(&self.inner.endpoint);
         }
         let store =
