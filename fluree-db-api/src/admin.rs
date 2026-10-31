@@ -2056,7 +2056,7 @@ impl crate::Fluree {
         };
 
         // Enumerate explicit subprefixes. `TieredStorage` routes by substring
-        // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so
+        // (`/commit/`, `/txn/` → commit tier; a ledger's other paths → index tier), so
         // each lists one tier. `index/` covers index roots, garbage,
         // and all object subkinds (branches, leaves, dicts when per-branch);
         // `config/` covers the LedgerConfig blob and the default-context blob,

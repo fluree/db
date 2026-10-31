@@ -816,6 +816,7 @@ impl fluree_db_nameservice::RefLookup for NameServiceMode {
 ///
 /// This routes writes/reads based on the address path:
 /// - `.../commit/...` and `.../txn/...` -> commit storage
+/// - `@retention/...` -> commit storage
 /// - everything else -> index storage
 #[derive(Clone, Debug)]
 pub struct TieredStorage<S> {
@@ -837,8 +838,9 @@ fn tier_routes_to_commit(address: &str) -> bool {
     // Extract the path portion after :// if present (fluree:*://path)
     let path = address.split("://").nth(1).unwrap_or(address);
 
-    // Commit blobs + txn blobs go to commit storage.
-    path.contains("/commit/") || path.contains("/txn/")
+    // Commit blobs + txn blobs go to commit storage, as do retention
+    // records: index storage holds only what commits rebuild.
+    path.contains("/commit/") || path.contains("/txn/") || path.starts_with("@retention/")
 }
 
 /// Encryption admin for a [`TieredStorage`] whose tiers both encrypt: each
@@ -6017,6 +6019,23 @@ mod tests {
         commit.insert(index_addr, b"misplaced".to_vec());
         index.remove(index_addr);
         assert!(tiered.get_local(index_addr).unwrap().is_none());
+    }
+
+    /// Retention records go with the commits: nothing rebuilds them.
+    #[tokio::test]
+    async fn tiered_storage_keeps_retention_records_with_the_commits() {
+        let commit = MemoryStorage::new();
+        let index = MemoryStorage::new();
+        let tiered = TieredStorage::new(commit.clone(), index.clone());
+        let record = "fluree:memory://@retention/journal/abc/def.json";
+        tiered.write_bytes(record, b"journal").await.unwrap();
+
+        assert_eq!(commit.read_bytes(record).await.unwrap(), b"journal");
+        assert!(!index.exists(record).await.unwrap());
+        assert_eq!(
+            tiered.list_prefix("fluree:memory://").await.unwrap(),
+            [record]
+        );
     }
 
     /// Every constructor that takes a storage fronts a remote one with the
