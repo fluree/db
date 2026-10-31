@@ -305,6 +305,59 @@ async fn construct_writes_a_list_as_a_collection() {
     );
 }
 
+/// Lists on one property are apart in the view, from novelty and from the
+/// index: each its own head and cells, a collection pattern matched within
+/// one list, and CONSTRUCT writing each as its own collection.
+#[tokio::test]
+async fn lists_on_one_property_are_apart() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ttl = "ex:s ex:items (1 2), (3 1) .";
+    for ledger in [
+        ledger_with(&fluree, "apart", ttl).await,
+        indexed_ledger_with(&fluree, "apart-indexed", ttl).await,
+    ] {
+        let heads = rows(&fluree, &ledger, "SELECT ?h WHERE { ex:s ex:items ?h }").await;
+        assert_eq!(heads.len(), 2, "{heads:?}");
+        assert!(heads.iter().all(is_blank), "{heads:?}");
+        let pairs = rows(
+            &fluree,
+            &ledger,
+            "SELECT ?x ?y WHERE { ex:s ex:items (?x ?y) }",
+        )
+        .await;
+        assert_eq!(pairs, [json!([1, 2]), json!([3, 1])]);
+        let triples = rows(
+            &fluree,
+            &ledger,
+            "SELECT ?x WHERE { ex:s ex:items (?x ?y ?z) }",
+        )
+        .await;
+        assert!(triples.is_empty(), "no list has three members: {triples:?}");
+        let seconds = rows(
+            &fluree,
+            &ledger,
+            "SELECT ?x WHERE { ex:s ex:items/rdf:rest/rdf:first ?x }",
+        )
+        .await;
+        assert_eq!(seconds, [json!([1]), json!([2])]);
+
+        let query = format!("{PREFIXES}CONSTRUCT {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o }}");
+        let result = rdf_query(&fluree, &ledger, &query)
+            .await
+            .expect("construct");
+        let ttl = format_results_string(
+            &result,
+            &result.context,
+            &ledger.snapshot,
+            &FormatterConfig::turtle(),
+        )
+        .expect("turtle");
+        assert!(ttl.contains("( 1 2 )") && ttl.contains("( 3 1 )"), "{ttl}");
+    }
+}
+
 /// The fuel of `rdf:rest*/rdf:first` grows with the list, not with its
 /// square or cube: the walk starts at the owner, though statistics count no
 /// `rdf:first` for a compact list, and reads the list once.
@@ -487,8 +540,8 @@ async fn a_chain_written_out_is_stored_as_a_list() {
     );
 }
 
-/// A `( … )` an update writes is stored compactly when it is the first list
-/// on its property, and as triples beside one.
+/// A `( … )` an update writes is stored compactly, beside a list its
+/// property holds as well.
 #[tokio::test]
 async fn insert_data_writes_a_list() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -501,6 +554,11 @@ async fn insert_data_writes_a_list() {
     );
     let ledger = update(&fluree, ledger, "INSERT DATA { ex:t ex:items (3 4) }").await;
     assert_eq!(lists(&ledger, "t").await, [vec![1, 2], vec![3, 4]]);
+    assert_eq!(
+        values(&fluree, &ledger, "ex:t").await,
+        [json!(1), json!(2), json!(3), json!(4)],
+        "compact"
+    );
     let all = rows(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
     assert_eq!(all.len(), 1 + 2 * (1 + 2 * 2), "{all:?}");
 }
@@ -700,7 +758,7 @@ async fn allowing_all_but(
     .expect("policy")
 }
 
-/// A second list on one subject and property is stored as its triples, and a
+/// A list whose cell carries another triple is stored as its triples, and a
 /// change to its cells, wherever along the list, is judged as a change to the
 /// owner's property.
 #[tokio::test]
@@ -715,7 +773,11 @@ async fn a_change_to_a_stored_cell_is_judged_as_its_owners() {
     let ledger = update(
         &fluree,
         ledger,
-        "INSERT DATA { ex:s ex:items (3 4) . ex:t ex:tags (7 8) }",
+        "INSERT DATA { \
+         ex:s ex:items _:a . _:a rdf:first 3 ; rdf:rest _:b ; ex:note 0 . \
+         _:b rdf:first 4 ; rdf:rest rdf:nil . \
+         ex:t ex:tags _:c . _:c rdf:first 7 ; rdf:rest _:d ; ex:note 0 . \
+         _:d rdf:first 8 ; rdf:rest rdf:nil }",
     )
     .await;
     let policy = allowing_all_but(

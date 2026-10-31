@@ -27,7 +27,10 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 /// Flake metadata - contains language tags, list indices, etc.
-#[derive(Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Identity is the language tag and the list place ([`Self::place`]): a
+/// `list` beside no position is no place, and is ignored.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct FlakeMeta {
     /// Language tag for langString values (e.g., "en", "fr")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,6 +47,21 @@ pub struct FlakeMeta {
 
 fn is_first_list(list: &u32) -> bool {
     *list == 0
+}
+
+impl PartialEq for FlakeMeta {
+    fn eq(&self, other: &Self) -> bool {
+        self.lang == other.lang && self.place() == other.place()
+    }
+}
+
+impl Eq for FlakeMeta {}
+
+impl Hash for FlakeMeta {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.lang.hash(state);
+        self.place().hash(state);
+    }
 }
 
 impl fmt::Debug for FlakeMeta {
@@ -664,6 +682,27 @@ impl fmt::Display for Flake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `list` beside no position is no place: identity, hash and order
+    /// all ignore it, however the metadata was built.
+    #[test]
+    fn a_list_without_a_position_is_not_identity() {
+        let stray: FlakeMeta = serde_json::from_str(r#"{"lang":"en","list":1}"#).unwrap();
+        let plain = FlakeMeta::with_lang("en");
+        assert_eq!(stray, plain);
+        assert_eq!(stray.cmp(&plain), std::cmp::Ordering::Equal);
+        let hash = |m: &FlakeMeta| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            m.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&stray), hash(&plain));
+        let (zero, one) = (
+            FlakeMeta::from_place(None, Some((0, 0))),
+            FlakeMeta::from_place(None, Some((1, 0))),
+        );
+        assert_ne!(zero, one, "a list item's list is identity");
+    }
 
     #[test]
     fn test_flake_creation() {

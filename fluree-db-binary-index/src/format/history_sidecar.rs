@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! magic:  [u8; 4]   "FHS1"
-//! version: u8       1
+//! version: u8       3
 //! padding: [u8; 3]  reserved
 //! [HistorySegment for leaflet 0]
 //! [HistorySegment for leaflet 1]

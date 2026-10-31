@@ -39,8 +39,9 @@ use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-/// A list, named by the graph, subject and predicate that own it.
-pub type Owner = (GraphId, Sid, Sid);
+/// A list, named by the graph, subject and predicate that own it and which
+/// of their lists it is.
+pub type Owner = (GraphId, Sid, Sid, u32);
 
 /// A list and its members in position order.
 type List = (Owner, Vec<Flake>);
@@ -745,6 +746,7 @@ async fn list_triples(
         };
         for (owner, members) in lists.iter() {
             let positions = match &cell {
+                Some((at, _)) if at != owner => continue,
                 Some((_, k)) => *k..members.len().min(k + 1),
                 None => 0..members.len(),
             };
@@ -1190,7 +1192,8 @@ async fn read_lists_in(
         )
         .await?;
         for member in members {
-            let owner = (graph.g_id, member.s.clone(), member.p.clone());
+            let list = member.m.as_ref().map_or(0, |m| m.list);
+            let owner = (graph.g_id, member.s.clone(), member.p.clone(), list);
             let n = *slot.entry(owner.clone()).or_insert_with(|| {
                 by_owner.push((owner, Vec::new()));
                 by_owner.len() - 1

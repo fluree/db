@@ -374,7 +374,8 @@ async fn a_list_added_or_copied_stays_in_its_source() {
 }
 
 /// ADD into a graph that holds another list on the same subject and
-/// property keeps that list, and adds the source's beside it.
+/// property keeps that list, and adds the source's beside it, as a list of
+/// its own.
 #[tokio::test]
 async fn adding_beside_another_list_keeps_both() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -393,31 +394,30 @@ async fn adding_beside_another_list_keeps_both() {
     )
     .await;
     assert_eq!(source, [json!([1]), json!([2])], "the source");
-    let firsts = sparql(
-        &fluree,
-        &ledger,
-        &format!(
-            "{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-             SELECT ?x WHERE {{ GRAPH ex:g2 {{ ?c rdf:first ?x }} }}"
-        ),
-    )
-    .await;
-    assert_eq!(
-        firsts,
-        [json!([1]), json!([2])],
-        "the added list, as its triples"
-    );
     let members = sparql(
         &fluree,
         &ledger,
-        &format!("{PREFIX}SELECT ?o WHERE {{ GRAPH ex:g2 {{ ex:s ex:items ?o FILTER(isLiteral(?o)) }} }}"),
+        &format!("{PREFIX}SELECT ?o WHERE {{ GRAPH ex:g2 {{ ex:s ex:items ?o }} }}"),
     )
     .await;
     assert_eq!(
         members,
-        [json!([3]), json!([4])],
-        "the destination's own list"
+        [json!([1]), json!([2]), json!([3]), json!([4])],
+        "both lists' members"
     );
+    let g2 = ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri("http://example.org/g2")
+        .expect("g2");
+    let held = support::stored_int_lists_in(
+        &ledger,
+        g2,
+        "http://example.org/s",
+        "http://example.org/items",
+    )
+    .await;
+    assert_eq!(held, [[1, 2], [3, 4]], "two lists");
 
     let t = ledger.t();
     update(&fluree, &id, "ADD ex:g1 TO ex:g2").await;
@@ -510,6 +510,55 @@ async fn construct_writes_the_lists_it_reads() {
         assert!(
             ttl.contains("ex:nums ( 3 1 3 )"),
             "indexed {indexed}: {ttl}"
+        );
+    }
+}
+
+/// Each list on one property is written as its own collection, and reads
+/// back as the lists it came from.
+#[tokio::test]
+async fn construct_writes_each_list_on_a_property() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "construct-several",
+        "ex:s ex:items (3 1) , (1 2) .",
+    )
+    .await;
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        let ledger = load(&fluree, &id).await;
+        let everything = format!("{PREFIX}CONSTRUCT {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o }}");
+        let ttl = turtle(&fluree, &ledger, &everything).await;
+        assert!(
+            ttl.contains("( 3 1 )") && ttl.contains("( 1 2 )"),
+            "indexed {indexed}: {ttl}"
+        );
+        let filtered = format!(
+            "{PREFIX}CONSTRUCT {{ ?s ex:items ?o }} WHERE {{ ?s ex:items ?o FILTER(?o != 2) }}"
+        );
+        let ttl = turtle(&fluree, &ledger, &filtered).await;
+        assert!(
+            ttl.contains("( 3 1 )") && ttl.contains("( 1 )"),
+            "indexed {indexed}: {ttl}"
+        );
+
+        let copy = format!("it/sparql-list-members/construct-several-copy-{indexed}:main");
+        fluree.create_ledger(&copy).await.expect("create");
+        let ttl = turtle(&fluree, &ledger, &everything).await;
+        fluree
+            .graph(&copy)
+            .transact()
+            .insert_turtle(&ttl)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("insert: {e}\n{ttl}"));
+        assert_eq!(
+            lists(&load(&fluree, &copy).await, "s").await,
+            [[1, 2], [3, 1]],
+            "{ttl}"
         );
     }
 }
@@ -724,15 +773,18 @@ async fn lists_added_beside_another_stay_apart() {
     update(&fluree, &id, "ADD ex:g1 TO ex:g3").await;
     update(&fluree, &id, "ADD ex:g2 TO ex:g3").await;
     let ledger = load(&fluree, &id).await;
-    let cells = sparql(
+    let members = sparql(
         &fluree,
         &ledger,
         &format!(
-            "{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-             SELECT (COUNT(DISTINCT ?c) AS ?cells) (COUNT(*) AS ?firsts) \
-             WHERE {{ GRAPH ex:g3 {{ ?c rdf:first ?x }} }}"
+            "{PREFIX}SELECT (COUNT(*) AS ?members) \
+             WHERE {{ GRAPH ex:g3 {{ ex:s ex:items ?x }} }}"
         ),
     )
     .await;
-    assert_eq!(cells, [json!([2, 2])], "a cell each, a member each");
+    assert_eq!(
+        members,
+        [json!([4])],
+        "a member each, beside the list there"
+    );
 }

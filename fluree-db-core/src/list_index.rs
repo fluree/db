@@ -10,6 +10,9 @@
 /// The packed place of a value that is no list member.
 pub const NONE: u64 = u64::MAX;
 
+/// A list member's place, unpacked: its list, then its position.
+pub type ListPlace = (u32, i32);
+
 /// `list` and `position` as one `u64`. `position` must not be negative.
 #[inline]
 pub const fn pack(list: u32, position: i32) -> u64 {

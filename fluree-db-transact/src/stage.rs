@@ -1520,17 +1520,18 @@ async fn stage_graph_mgmt(
 
                     // The source keeps its lists as they are. COPY and MOVE
                     // replace the destination, so each list lands there
-                    // compact; ADD keeps it, so a list lands as an ordinary
-                    // write's does, compact unless the destination already
-                    // holds another list on the same subject and property.
+                    // compact, in its own list; ADD keeps it, so each list
+                    // lands as an ordinary write's does, under the next list
+                    // id the destination's subject and property have free.
                     let is_member = |f: &Flake| f.m.as_ref().is_some_and(|m| m.i.is_some());
                     if !*clear_dest && rehomed.iter().any(is_member) {
                         let (members, mut kept): (Vec<Flake>, Vec<Flake>) =
                             rehomed.into_iter().partition(|f| is_member(f));
-                        let mut owners: Vec<(Sid, Sid)> = Vec::new();
-                        let mut by_owner: HashMap<(Sid, Sid), Vec<Flake>> = HashMap::new();
+                        let mut owners: Vec<(Sid, Sid, u32)> = Vec::new();
+                        let mut by_owner: HashMap<(Sid, Sid, u32), Vec<Flake>> = HashMap::new();
                         for f in members {
-                            let owner = (f.s.clone(), f.p.clone());
+                            let list = f.m.as_ref().map_or(0, |m| m.list);
+                            let owner = (f.s.clone(), f.p.clone(), list);
                             if !by_owner.contains_key(&owner) {
                                 owners.push(owner.clone());
                             }

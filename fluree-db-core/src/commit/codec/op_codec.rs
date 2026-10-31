@@ -430,7 +430,9 @@ fn decode_object(
 
 /// The list and position a commit's list place `raw` packs
 /// (`crate::list_index`): a commit written before lists had identities
-/// holds the position alone, list 0.
+/// holds the position alone, list 0. The reverse does not hold: a reader from
+/// before lists had identities takes a place past list 0 for a position past
+/// `i32::MAX` and refuses the commit.
 pub(crate) fn decode_place(raw: u64) -> Result<(u32, i32), CommitCodecError> {
     crate::list_index::unpack(raw).ok_or_else(|| {
         CommitCodecError::InvalidOp(format!("list place {raw} holds a position past i32::MAX"))

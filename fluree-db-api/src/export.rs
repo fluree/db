@@ -245,10 +245,10 @@ fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
     // The key is the whole of `Flake`'s fact identity — `s, p, o, dt, m` per
     // its hand-written `Eq` — so it is total over the map's own key and no
     // two surviving rows can tie into an unspecified order.
-    fn meta_key(f: &Flake) -> (Option<&str>, Option<i32>) {
+    fn meta_key(f: &Flake) -> (Option<&str>, Option<fluree_db_core::list_index::ListPlace>) {
         (
             f.m.as_ref().and_then(|m| m.lang.as_deref()),
-            f.m.as_ref().and_then(|m| m.i),
+            f.m.as_ref().and_then(fluree_db_core::FlakeMeta::place),
         )
     }
     out.sort_unstable_by(|a, b| {
@@ -663,17 +663,25 @@ impl<T> SubjectLists<T> {
         }
     }
 
-    /// Each list, in the order its predicate was first seen, with its items
-    /// in index order. One predicate holds one list: items that share an
-    /// index keep scan order.
+    /// Each list, in the order its predicate was first seen and then by
+    /// list, with its items in position order. Items that share a place keep
+    /// scan order.
     fn take(&mut self) -> Vec<(String, Vec<T>)> {
-        std::mem::take(&mut self.lists)
-            .into_iter()
-            .map(|(p_iri, mut items)| {
-                items.sort_by_key(|(index, _)| *index);
-                (p_iri, items.into_iter().map(|(_, item)| item).collect())
-            })
-            .collect()
+        let mut out: Vec<(String, Vec<T>)> = Vec::new();
+        for (p_iri, mut items) in std::mem::take(&mut self.lists) {
+            items.sort_by_key(|(index, _)| *index);
+            // The list is the packed place's high half.
+            let mut list = None;
+            for (index, item) in items {
+                let here = Some(index >> 32);
+                match out.last_mut() {
+                    Some((_, members)) if here == list => members.push(item),
+                    _ => out.push((p_iri.clone(), vec![item])),
+                }
+                list = here;
+            }
+        }
+        out
     }
 }
 

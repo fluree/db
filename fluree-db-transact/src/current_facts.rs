@@ -45,6 +45,7 @@
 
 use crate::error::{Result, TransactError};
 use fluree_db_core::comparator::{cmp_object, IndexType};
+use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
@@ -306,8 +307,9 @@ fn lang_of(f: &Flake) -> Option<&str> {
     f.m.as_ref().and_then(|m| m.lang.as_deref())
 }
 
-fn list_index_of(f: &Flake) -> Option<i32> {
-    f.m.as_ref().and_then(|m| m.i)
+/// The list and position of a list entry.
+fn place_of(f: &Flake) -> Option<ListPlace> {
+    f.m.as_ref().and_then(FlakeMeta::place)
 }
 
 /// The same RDF term: value, datatype and language tag.
@@ -438,7 +440,7 @@ impl<'l> IndexKeys<'l> {
         }
         let dropped = {
             let mut p_ids: HashMap<&Sid, Option<u32>> = HashMap::new();
-            let mut winner: HashMap<(&Sid, IndexKey, Option<i32>), usize> = HashMap::new();
+            let mut winner: HashMap<(&Sid, IndexKey, Option<ListPlace>), usize> = HashMap::new();
             let mut dropped = vec![false; flakes.len()];
             for (n, f) in flakes.iter().enumerate() {
                 if !f.o.index_key_may_merge_terms() {
@@ -448,7 +450,7 @@ impl<'l> IndexKeys<'l> {
                 let Some(key) = self.key(g_id, p_id, f) else {
                     continue;
                 };
-                match winner.entry((&f.p, key, list_index_of(f))) {
+                match winner.entry((&f.p, key, place_of(f))) {
                     Entry::Vacant(e) => {
                         e.insert(n);
                     }
@@ -489,8 +491,8 @@ impl<'l> IndexKeys<'l> {
 pub enum FactTerm {
     /// The term of a value storage tells by term.
     Term(FlakeValue, Sid, Option<FlakeMeta>),
-    /// The key and list position of a value storage tells by key.
-    Key(FactKey, Option<i32>),
+    /// The key and list place of a value storage tells by key.
+    Key(FactKey, Option<ListPlace>),
 }
 
 /// The key storage merges the ops of a value by, for the kinds of value
@@ -507,10 +509,10 @@ pub enum FactKey {
     Index((u16, u64)),
 }
 
-/// A [`FactKey`] and list position: how storage tells apart the facts of one
+/// A [`FactKey`] and list place: how storage tells apart the facts of one
 /// `(graph, subject, predicate)` whose kind of value can merge terms
 /// ([`FactTerm::Key`]).
-pub type MergeKey = (FactKey, Option<i32>);
+pub type MergeKey = (FactKey, Option<ListPlace>);
 
 /// The identity storage gives each fact of one ledger state ([`FactTerm`]).
 ///
@@ -565,7 +567,7 @@ impl<'l> FactIdentity<'l> {
             FlakeValue::BigInt(v) if flake.o.index_keys_by_value() => FactKey::BigInt(v.clone()),
             _ => FactKey::Index(self.keys.key(g_id()?, p_id(), flake)?),
         };
-        Some((key, list_index_of(flake)))
+        Some((key, place_of(flake)))
     }
 
     /// `flake`'s identity in its own graph (`flake.g`). The graph is resolved
@@ -1455,7 +1457,7 @@ impl<'l> DeleteResolver<'l> {
             let t = intent.flake.t;
             if intent.witnessed {
                 // A row that carries its list position names it already.
-                let matched = if list_index_of(&intent.flake).is_none() {
+                let matched = if place_of(&intent.flake).is_none() {
                     let taken = &mut self.taken;
                     facts.witnessed(&intent.flake, keys, |first| {
                         let seen = taken.entry((slot.clone(), first)).or_insert(0);
@@ -1480,7 +1482,7 @@ impl<'l> DeleteResolver<'l> {
                     }
                     None => out.push(Retraction(intent.flake)),
                 }
-            } else if facts.has_entries && list_index_of(&intent.flake).is_none() {
+            } else if facts.has_entries && place_of(&intent.flake).is_none() {
                 // A value without a position is every list entry holding it
                 // (see `named_all`), unless an identical intent named them.
                 let key = (slot.clone(), intent.flake.clone());
@@ -1498,7 +1500,7 @@ impl<'l> DeleteResolver<'l> {
                 }
                 if named
                     .iter()
-                    .any(|&n| list_index_of(&facts.facts[n].flake).is_some())
+                    .any(|&n| place_of(&facts.facts[n].flake).is_some())
                 {
                     self.expanded.insert(key);
                 }
@@ -1558,8 +1560,8 @@ struct SlotFacts {
     hash: fn(&Flake) -> u64,
     /// A wide slot's facts by term.
     terms: Option<Groups<u64>>,
-    /// A wide slot's list entries, by `(position, fact)`.
-    positions: Vec<(i32, u32)>,
+    /// A wide slot's list entries, by `(place, fact)`.
+    positions: Vec<(ListPlace, u32)>,
     /// Whether any fact is a list entry.
     has_entries: bool,
     /// Each fact's index key, computed when an intent first needs one.
@@ -1586,13 +1588,13 @@ impl SlotFacts {
     ) -> Self {
         let wide = facts.len() > narrow_slot;
         let terms = wide.then(|| Groups::build(&facts, |_, f| Some(hash(&f.flake)), same_term));
-        let has_entries = facts.iter().any(|f| list_index_of(&f.flake).is_some());
+        let has_entries = facts.iter().any(|f| place_of(&f.flake).is_some());
         let mut positions = Vec::new();
         if wide {
             positions = facts
                 .iter()
                 .enumerate()
-                .filter_map(|(n, f)| Some((list_index_of(&f.flake)?, n as u32)))
+                .filter_map(|(n, f)| Some((place_of(&f.flake)?, n as u32)))
                 .collect();
             positions.sort_unstable();
         }
@@ -1673,15 +1675,15 @@ impl SlotFacts {
         }
         self.ensure_by_value();
         let fact = &self.facts[n].flake;
-        let at: HashSet<Option<i32>> = named
+        let at: HashSet<Option<ListPlace>> = named
             .iter()
-            .map(|&n| list_index_of(&self.facts[n].flake))
+            .map(|&n| place_of(&self.facts[n].flake))
             .collect();
         let named: HashSet<usize> = named.iter().copied().collect();
         let sibling = |m: usize| {
             !named.contains(&m)
                 && same_value(&self.facts[m].flake, fact)
-                && at.contains(&list_index_of(&self.facts[m].flake))
+                && at.contains(&place_of(&self.facts[m].flake))
         };
         match (&self.by_value, value_hash(fact)) {
             (Some(groups), Some(h)) => groups
@@ -1698,7 +1700,7 @@ impl SlotFacts {
 
     /// The stored fact a DELETE intent names (see [`DeleteResolver`]).
     fn named(&mut self, intent: &Flake, keys: &IndexKeys) -> Option<usize> {
-        let position = list_index_of(intent);
+        let position = place_of(intent);
         let by_term = |_: usize, f: &StoredFact| same_term(&f.flake, intent);
         let hit = match &self.terms {
             Some(terms) => self.first_in(terms.get((self.hash)(intent)), terms, position, by_term),
@@ -1772,7 +1774,7 @@ impl SlotFacts {
                 None => self.all(by_key),
             }
         };
-        let is_entry = |n: usize| list_index_of(&self.facts[n].flake).is_some();
+        let is_entry = |n: usize| place_of(&self.facts[n].flake).is_some();
         let plain = hits.iter().copied().find(|&n| !is_entry(n));
         hits.into_iter()
             .filter(|&n| is_entry(n))
@@ -1833,14 +1835,14 @@ impl SlotFacts {
     /// first list entry, else the first plain value, in slot order.
     fn first(
         &self,
-        position: Option<i32>,
+        position: Option<ListPlace>,
         pred: impl Fn(usize, &StoredFact) -> bool,
     ) -> Option<usize> {
-        let at = |admits: &dyn Fn(Option<i32>) -> bool| {
+        let at = |admits: &dyn Fn(Option<ListPlace>) -> bool| {
             self.facts
                 .iter()
                 .enumerate()
-                .position(|(n, f)| admits(list_index_of(&f.flake)) && pred(n, f))
+                .position(|(n, f)| admits(place_of(&f.flake)) && pred(n, f))
         };
         match position {
             Some(i) => at(&|p| p == Some(i)),
@@ -1854,7 +1856,7 @@ impl SlotFacts {
         &self,
         group: Option<Group>,
         groups: &Groups<K>,
-        position: Option<i32>,
+        position: Option<ListPlace>,
         pred: impl Fn(usize, &StoredFact) -> bool,
     ) -> Option<usize> {
         match position {
@@ -1915,7 +1917,7 @@ impl SlotFacts {
                 )
             }
             None => {
-                let is_entry = move |n: usize| list_index_of(&facts[n].flake).is_some();
+                let is_entry = move |n: usize| place_of(&facts[n].flake).is_some();
                 pick(
                     || {
                         let candidate = move |entry: bool| {
@@ -1984,7 +1986,7 @@ impl<K: Copy + Eq + Hash + Ord> Groups<K> {
         let mut keyed: Vec<(K, bool, u32)> = facts
             .iter()
             .enumerate()
-            .filter_map(|(n, f)| Some((key(n, f)?, list_index_of(&f.flake).is_none(), n as u32)))
+            .filter_map(|(n, f)| Some((key(n, f)?, place_of(&f.flake).is_none(), n as u32)))
             .collect();
         keyed.sort_unstable();
         let mut order = Vec::with_capacity(keyed.len());

@@ -124,9 +124,9 @@ mod inner {
         ///
         /// Only ever set to `true`; the caller starts it `false` per import.
         pub saw_list_meta: Arc<std::sync::atomic::AtomicBool>,
-        /// The owners whose list some chunk has stored compactly, so a
-        /// second list on one property, in any chunk, is stored as a chain
-        /// (see [`crate::lists`]).
+        /// The next list id of each owner some chunk has stored a list on,
+        /// so a second list on one property, in any chunk, takes an id of
+        /// its own (see [`crate::lists`]).
         pub list_owners: crate::lists::ClaimedOwners,
     }
 

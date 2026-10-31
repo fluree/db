@@ -320,8 +320,8 @@ mod inner {
         /// Accumulated turtle @prefix short names: IRI → short prefix.
         /// Captured from `on_prefix()` calls across all chunks.
         pub prefix_map: HashMap<String, String>,
-        /// The owners whose list a chunk has stored compactly, for chunks
-        /// that do not spool (a spooled chunk shares
+        /// The next list id of each owner a chunk has stored a list on, for
+        /// chunks that do not spool (a spooled chunk shares
         /// `SpoolConfig::list_owners`).
         pub list_owners: crate::lists::ClaimedOwners,
     }

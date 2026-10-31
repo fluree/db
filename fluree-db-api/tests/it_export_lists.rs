@@ -327,6 +327,63 @@ async fn named_graph_lists_keep_their_graph() {
     assert_eq!(cells.len(), 4, "two cells a list: {nq}");
 }
 
+/// Several lists on one property export as lists of their own, each in its
+/// order, and a crawl reads them one after another: from novelty, from the
+/// index, and with a list novelty adds over the index.
+#[tokio::test]
+async fn lists_on_one_property_export_apart() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let source = "it/export-lists/several:main";
+    fluree.create_ledger(source).await.expect("create");
+    insert_text(
+        &fluree,
+        source,
+        "@prefix ex: <http://example.org/> .
+         ex:s ex:items ( \"a\" \"b\" ) , ( \"c\" \"a\" ) .",
+    )
+    .await;
+    let mut held = vec![r#"( "a" "b" )"#, r#"( "c" "a" )"#];
+    let mut crawled = vec!["a", "b", "c", "a"];
+    for lane in ["novelty", "index", "overlay"] {
+        match lane {
+            "index" => support::rebuild_and_publish_index(&fluree, source).await,
+            "overlay" => {
+                insert_text(
+                    &fluree,
+                    source,
+                    "@prefix ex: <http://example.org/> .
+                     ex:s ex:items ( \"b\" ) .",
+                )
+                .await;
+                held.push(r#"( "b" )"#);
+                crawled.push("b");
+            }
+            _ => {}
+        }
+        let ttl = export(&fluree, source, ExportFormat::Turtle).await;
+        for list in &held {
+            assert_eq!(ttl.matches(list).count(), 1, "{lane}: {list} in {ttl}");
+        }
+        let jsonld = export(&fluree, source, ExportFormat::JsonLd).await;
+        assert_eq!(
+            jsonld.matches("@list").count(),
+            held.len(),
+            "{lane}: {jsonld}"
+        );
+        let nt = export(&fluree, source, ExportFormat::NTriples).await;
+        assert_eq!(
+            nt.matches(RDF_NIL).count(),
+            held.len(),
+            "{lane}: a spine per list: {nt}"
+        );
+        assert_eq!(
+            crawl(&fluree, source, "ex:s").await["ex:items"],
+            json!(crawled),
+            "{lane}"
+        );
+    }
+}
+
 /// A predicate can hold a list and plain values side by side, and an
 /// annotation names the plain edge, never the list item with the same object:
 /// the list index is part of the edge. Every format writes both, the marker

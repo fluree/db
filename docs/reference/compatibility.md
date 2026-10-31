@@ -170,6 +170,8 @@ Differences from the specification:
 - A list is written and deleted through its members: deleting a value deletes
   every entry of a list that holds it, and a list's cells cannot be edited one
   by one ([Writing lists](../query/sparql.md#writing-lists))
+- Inserting a list a subject and property already hold, the same members in
+  the same order, restates it rather than adding a second list there
 - `ADD` of a list the destination already holds restates it, and so does
   `ADD` of the same list again beside another list there
 

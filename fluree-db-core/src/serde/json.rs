@@ -218,6 +218,11 @@ pub fn deserialize_object(value: &serde_json::Value, dt: &Sid) -> Result<FlakeVa
     }
 }
 
+/// A list position from JSON metadata.
+fn meta_position(v: i64) -> Result<i32> {
+    i32::try_from(v).map_err(|_| Error::other(format!("list position {v} is out of range")))
+}
+
 /// Deserialize flake metadata from JSON
 pub fn deserialize_meta(value: &serde_json::Value) -> Result<Option<FlakeMeta>> {
     match value {
@@ -227,12 +232,13 @@ pub fn deserialize_meta(value: &serde_json::Value) -> Result<Option<FlakeMeta>> 
             let i = map
                 .get("i")
                 .and_then(serde_json::Value::as_i64)
-                .map(|v| v as i32);
-            let list = map
-                .get("list")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|_| i.is_some())
-                .map_or(0, |v| v as u32);
+                .map(meta_position)
+                .transpose()?;
+            let list = match map.get("list").and_then(serde_json::Value::as_u64) {
+                Some(v) if i.is_some() => u32::try_from(v)
+                    .map_err(|_| Error::other(format!("list {v} exceeds u32::MAX")))?,
+                _ => 0,
+            };
             if lang.is_none() && i.is_none() {
                 Ok(None)
             } else {
@@ -241,7 +247,7 @@ pub fn deserialize_meta(value: &serde_json::Value) -> Result<Option<FlakeMeta>> 
         }
         // Integer metadata (hash for comparison)
         serde_json::Value::Number(n) => {
-            let i = n.as_i64().map(|v| v as i32);
+            let i = n.as_i64().map(meta_position).transpose()?;
             Ok(Some(FlakeMeta {
                 lang: None,
                 i,
@@ -260,6 +266,23 @@ pub fn deserialize_meta(value: &serde_json::Value) -> Result<Option<FlakeMeta>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_rejects_a_list_or_position_out_of_range() {
+        let meta = |v: serde_json::Value| deserialize_meta(&v);
+        assert!(meta(serde_json::json!({"i": 0, "list": 4_294_967_296_u64})).is_err());
+        assert!(meta(serde_json::json!({"i": 2_147_483_648_i64})).is_err());
+        assert!(meta(serde_json::json!(2_147_483_648_i64)).is_err());
+        assert_eq!(
+            meta(serde_json::json!({"i": 3, "list": 4_294_967_295_u64})).unwrap(),
+            FlakeMeta::from_place(None, Some((u32::MAX, 3)))
+        );
+        assert_eq!(
+            meta(serde_json::json!({"lang": "en", "list": 7})).unwrap(),
+            Some(FlakeMeta::with_lang("en")),
+            "a list beside no position is dropped"
+        );
+    }
 
     #[test]
     fn test_deserialize_sid() {

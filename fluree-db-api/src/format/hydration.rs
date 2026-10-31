@@ -49,7 +49,7 @@ use fluree_db_core::comparator::IndexType;
 use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{Flake, GraphDbRef, LedgerSnapshot, Sid, Tracker};
+use fluree_db_core::{Flake, FlakeMeta, GraphDbRef, LedgerSnapshot, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{
@@ -1332,16 +1332,21 @@ impl<'a> HydrationFormatter<'a> {
                 };
 
                 // If these flakes represent an ordered list (`@list`), preserve transaction order
-                // by sorting by the list index stored in FlakeMeta.i.
+                // by sorting by the list place stored in FlakeMeta: each list's members together,
+                // in position order, lists in list order.
                 //
                 // NOTE: Even when the caller did not explicitly define @container @list in context,
-                // list assertions carry list indices. Sorting by meta index is the correct behavior
+                // list assertions carry list places. Sorting by them is the correct behavior
                 // for ordered lists.
                 if pred_flakes
                     .iter()
                     .any(|f| f.m.as_ref().and_then(|m| m.i).is_some())
                 {
-                    pred_flakes.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i).unwrap_or(i32::MAX));
+                    pred_flakes.sort_by_key(|f| {
+                        f.m.as_ref()
+                            .and_then(FlakeMeta::place)
+                            .unwrap_or((u32::MAX, i32::MAX))
+                    });
                 }
 
                 // A list stored as an `rdf:first`/`rdf:rest` chain, not

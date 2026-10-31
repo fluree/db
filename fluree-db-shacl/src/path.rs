@@ -16,8 +16,10 @@
 
 use crate::error::{Result, ShaclError};
 use crate::predicates;
+use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::{
-    id_datatype_sid, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, SchemaHierarchy, Sid,
+    id_datatype_sid, FlakeMeta, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest,
+    SchemaHierarchy, Sid,
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF, SHACL};
 use fluree_vocab::rdf_names;
@@ -339,15 +341,15 @@ async fn ordered_objects(
             RangeMatch::subject_predicate(subject.clone(), predicate.clone()),
         )
         .await?;
-    // Order by the JSON-LD list index when present; unindexed flakes keep their
+    // Order by the JSON-LD list place when present; unindexed flakes keep their
     // scan order and sort after indexed ones (never interleaved). JSON-LD `@list`
     // always stamps `m.i`, so in practice all-or-none carry an index.
-    let mut items: Vec<(Option<i32>, usize, FlakeValue)> = flakes
+    let mut items: Vec<(Option<ListPlace>, usize, FlakeValue)> = flakes
         .iter()
         .enumerate()
-        .map(|(pos, f)| (f.m.as_ref().and_then(|m| m.i), pos, f.o.clone()))
+        .map(|(pos, f)| (f.m.as_ref().and_then(FlakeMeta::place), pos, f.o.clone()))
         .collect();
-    items.sort_by_key(|(idx, pos, _)| (idx.is_none(), idx.unwrap_or(0), *pos));
+    items.sort_by_key(|(idx, pos, _)| (idx.is_none(), idx.unwrap_or((0, 0)), *pos));
     let all_indexed = items.iter().all(|(idx, _, _)| idx.is_some());
     Ok((items.into_iter().map(|(_, _, v)| v).collect(), all_indexed))
 }

@@ -1369,7 +1369,8 @@ INSERT { ex:t ex:copy ?x } WHERE { ex:s ex:items ?x }  # ex:t ex:copy 2, 3
 - Deleting a value deletes every entry of a list that holds it, and the value where it is also stored beside the list, however the delete is written.
 - To replace a list, or change one entry of it, upsert the list from JSON-LD or Turtle.
 - `ADD` and `COPY` copy a graph's lists into the destination and leave the source's as they were. `MOVE` moves them.
-- A list whose cells something else names, or that carries other triples, is stored as its triples, and so is a second list on one subject and property, including one `ADD` brings into a graph that holds a list there.
+- A subject can hold several lists on one property, each in order and apart from the others, including one `ADD` brings into a graph that holds a list there. Writing a list the subject and property already hold, the same members in the same order, restates that list rather than adding another.
+- A list whose cells something else names, or that carries other triples, is stored as its triples.
 - Under a policy, a change to the cells of a list stored as its triples is judged as a change to its owner's property.
 
 ### Typed Literals

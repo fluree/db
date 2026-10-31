@@ -293,30 +293,36 @@ pub(super) fn instantiate_construct_graph(
     Ok(dataset)
 }
 
-/// The lists a CONSTRUCT writes: each owner's entries by position, owners in
+/// The lists a CONSTRUCT writes: each list's entries by position, lists in
 /// the order the solutions first name them.
 #[derive(Default)]
 struct Lists {
-    owners: Vec<((IrTerm, IrTerm), BTreeMap<i64, IrTerm>)>,
-    index: HashMap<(IrTerm, IrTerm), usize>,
+    lists: Vec<((IrTerm, IrTerm), BTreeMap<i32, IrTerm>)>,
+    index: HashMap<(IrTerm, IrTerm, u32), usize>,
 }
 
 impl Lists {
-    /// `o` as the entries of `s`'s list under `p` at the positions `at`.
+    /// `o` as the entries of `s`'s lists under `p` at the packed places `at`.
     fn add(&mut self, s: &IrTerm, p: &IrTerm, at: &[Binding], o: &IrTerm) {
-        let owner = (s.clone(), p.clone());
-        let n = *self.index.entry(owner.clone()).or_insert_with(|| {
-            self.owners.push((owner, BTreeMap::new()));
-            self.owners.len() - 1
-        });
-        for position in at {
-            if let Binding::Lit {
-                val: FlakeValue::Long(i),
+        for place in at {
+            let Binding::Lit {
+                val: FlakeValue::Long(packed),
                 ..
-            } = position
-            {
-                self.owners[n].1.insert(*i, o.clone());
-            }
+            } = place
+            else {
+                continue;
+            };
+            let Some((list, i)) = fluree_db_core::list_index::unpack(*packed as u64) else {
+                continue;
+            };
+            let n = *self
+                .index
+                .entry((s.clone(), p.clone(), list))
+                .or_insert_with(|| {
+                    self.lists.push(((s.clone(), p.clone()), BTreeMap::new()));
+                    self.lists.len() - 1
+                });
+            self.lists[n].1.insert(i, o.clone());
         }
     }
 
@@ -324,7 +330,7 @@ impl Lists {
     /// cells, which the writers spell as `( … )` and `@list`.
     fn write(self, graph: &mut fluree_graph_ir::Graph) {
         let iri = |iri: &str| IrTerm::Iri(Arc::from(iri));
-        for (n, ((s, p), entries)) in self.owners.into_iter().enumerate() {
+        for (n, ((s, p), entries)) in self.lists.into_iter().enumerate() {
             let cell = |k: usize| IrTerm::BlankNode(BlankId::new(format!("l{n}-{k}")));
             graph.add(Triple::new(s, p, cell(0)));
             let len = entries.len();

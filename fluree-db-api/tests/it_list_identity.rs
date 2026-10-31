@@ -1,13 +1,12 @@
 //! Two lists on one property stay two lists.
 //!
-//! A list is stored compactly as its members' positions on the owning
-//! subject and predicate, and a position names no list: two lists stored that
-//! way on one property merge their members into one list. Every list but one
-//! on a property is therefore stored as an explicit `rdf:first`/`rdf:rest`
-//! chain. A list with the same members, in order, as the compact list a
-//! property holds is that list, restated. These tests read lists back through
-//! the shared reader, which reads either shape, so they check the RDF a ledger
-//! holds, not its encoding.
+//! A list is stored compactly as its members' places on the owning subject
+//! and predicate: which of the owner's lists each is in, and its position
+//! there. A second list on a property takes the next list id. A list with the
+//! same members, in order, as a list a property holds is that list, restated.
+//! Most of these tests read lists back through the shared reader, which reads
+//! either stored shape, so they check the RDF a ledger holds;
+//! [`a_second_list_is_compact_under_its_own_id`] checks the encoding.
 
 use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
@@ -30,6 +29,64 @@ async fn turtle(fluree: &fluree_db_api::Fluree, ledger: LedgerState, ttl: &str) 
 
 fn ctx() -> serde_json::Value {
     json!({"ex": EX})
+}
+
+/// The places `ex:{s} ex:{p}`'s values are stored at, sorted; a value
+/// stored as no list member (a chain's head) has none.
+async fn places(ledger: &LedgerState, s: &str, p: &str) -> Vec<Option<(u32, i32)>> {
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+    let snapshot = &ledger.snapshot;
+    let s = snapshot.encode_iri(&format!("{EX}{s}")).expect("subject");
+    let p = snapshot.encode_iri(&format!("{EX}{p}")).expect("predicate");
+    let mut places: Vec<_> = ledger
+        .as_graph_db_ref(0)
+        .range(
+            fluree_db_core::comparator::IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s),
+                p: Some(p),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("range")
+        .iter()
+        .map(|f| f.m.as_ref().and_then(fluree_db_core::FlakeMeta::place))
+        .collect();
+    places.sort_unstable();
+    places
+}
+
+/// A second list on a property is stored compactly, under its own list id,
+/// in novelty and in the index; a member deleted by value leaves every list.
+#[tokio::test]
+async fn a_second_list_is_compact_under_its_own_id() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/list-identity/compact:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    let ledger = turtle(&fluree, ledger, "ex:s ex:p (1 2), (3 1) .").await;
+    let both = [Some((0, 0)), Some((0, 1)), Some((1, 0)), Some((1, 1))];
+    assert_eq!(places(&ledger, "s", "p").await, both);
+    support::rebuild_and_publish_index(&fluree, id).await;
+    let ledger = fluree.ledger(id).await.expect("load");
+    assert_eq!(places(&ledger, "s", "p").await, both, "indexed");
+    assert_eq!(lists(&ledger, "s", "p").await, [[1, 2], [3, 1]]);
+
+    let ledger = turtle(&fluree, ledger, "ex:s ex:p (4) .").await;
+    assert_eq!(places(&ledger, "s", "p").await.last(), Some(&Some((2, 0))));
+    fluree
+        .graph(id)
+        .transact()
+        .sparql_update(&format!("DELETE DATA {{ <{EX}s> <{EX}p> 1 }}"))
+        .commit()
+        .await
+        .expect("delete");
+    let ledger = fluree.ledger(id).await.expect("load");
+    assert_eq!(
+        lists(&ledger, "s", "p").await,
+        vec![vec![2], vec![3], vec![4]]
+    );
 }
 
 #[tokio::test]
