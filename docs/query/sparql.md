@@ -290,7 +290,8 @@ SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
 - A solution carries no position. A JSON-LD crawl, [export](../cli/export.md) and the Graph Store `GET` return each list in order.
 - A CONSTRUCT template triple that repeats a triple pattern of its WHERE (including one inside an OPTIONAL) writes the list entries it reads as the list, in order: `( … )` in Turtle, `{"@list": [...]}` in JSON-LD. DESCRIBE does too. A value stands for every entry holding it, so over the data above, `CONSTRUCT { ex:s ex:items ?x } WHERE { ex:s ex:items ?x FILTER(?x != ex:b) }` writes `ex:s ex:items ( ex:a ex:a )`, and a `LIMIT` keeping one `ex:a` writes both. A value the owner also holds outside the list is written beside it as well, so the output reads back as the data it came from.
 - A template that writes the values under another subject or property, or into a named graph, writes them as values. So does a default graph in which more than one graph holds a list on that subject and property.
-- A list's `rdf:first`/`rdf:rest` cells are not triples SPARQL can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it.
+- `ex:items/rdf:rest*/rdf:first` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would, in a query and in an update's WHERE. A plain value of `ex:items` is not a member, and the query's other patterns still read members as values. Its solutions carry no order; use `ORDER BY` for one.
+- No other pattern matches a list's `rdf:first`/`rdf:rest` cells: another path through them, or a `( ?x ?y )` pattern, finds nothing for a list stored this way.
 - A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
 
 ## Query Modifiers

@@ -813,7 +813,11 @@ fn lower_path_to_patterns<E: IriEncoder>(
 
         // Sequence: compile to chain of triple patterns with join variables
         UnresolvedPathExpr::Sequence(steps) => {
-            lower_sequence_chain(&s, steps, &o, encoder, vars, pp_counter)
+            let mut chain = lower_sequence_chain(&s, steps, &o, encoder, vars, pp_counter)?;
+            if is_list_member_walk(steps) {
+                crate::list_view::mark_list_walk(&mut chain);
+            }
+            Ok(chain)
         }
 
         // Unsupported operators
@@ -822,6 +826,21 @@ fn lower_path_to_patterns<E: IriEncoder>(
              use a regular predicate or add + or *"
                 .to_string(),
         )),
+    }
+}
+
+/// Whether `steps` are `p/rdf:rest*/rdf:first`, for a `p` other than
+/// `rdf:first` and `rdf:rest`: the walk from an owner to its lists' members.
+fn is_list_member_walk(steps: &[UnresolvedPathExpr]) -> bool {
+    use fluree_vocab::rdf::{FIRST, REST};
+    match steps {
+        [UnresolvedPathExpr::Iri(owner), UnresolvedPathExpr::ZeroOrMore(rest), UnresolvedPathExpr::Iri(first)] => {
+            matches!(rest.as_ref(), UnresolvedPathExpr::Iri(rest) if &**rest == REST)
+                && &**first == FIRST
+                && &**owner != FIRST
+                && &**owner != REST
+        }
+        _ => false,
     }
 }
 

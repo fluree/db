@@ -529,15 +529,23 @@ pub async fn prepare_execution_with_config(
             );
 
             // SPARQL's view of RDF lists (`crate::list_view`), for a ledger
-            // that may hold list members. History reads keep the stored rows.
-            let list_view = if query.query.rdf_list_view && !planning.is_history() {
+            // that may hold list members: the whole query in it, or only its
+            // `p/rdf:rest*/rdf:first` walks. History reads keep the stored rows.
+            let whole_view = query.query.rdf_list_view;
+            let walks = !whole_view && crate::list_view::query_has_list_walk(&query.query);
+            let list_view = if (whole_view || walks) && !planning.is_history() {
                 crate::list_view::view_for(db.snapshot, db.overlay, binary_store)?
             } else {
                 None
             };
             let encode = |iri: &str| db.snapshot.encode_iri(iri);
             let rewritten_patterns = match &list_view {
-                Some(view) => crate::list_view::rewrite_patterns(rewritten_patterns, view, &encode),
+                Some(view) if whole_view => {
+                    crate::list_view::rewrite_patterns(rewritten_patterns, view, &encode)
+                }
+                Some(view) => {
+                    crate::list_view::rewrite_list_walks(rewritten_patterns, view, &encode)
+                }
                 None => rewritten_patterns,
             };
 
@@ -565,7 +573,15 @@ pub async fn prepare_execution_with_config(
             if let Some(view) = &list_view {
                 // The WHERE is rewritten above; this reaches the `EXISTS` of
                 // the grouping and ordering expressions.
-                crate::list_view::rewrite_modifiers_of(&mut rewritten, view, &encode);
+                if whole_view {
+                    crate::list_view::rewrite_modifiers_of(&mut rewritten, view, &encode);
+                } else {
+                    crate::list_view::rewrite_list_walks_of_modifiers(
+                        &mut rewritten,
+                        view,
+                        &encode,
+                    );
+                }
             }
             rewritten
         };

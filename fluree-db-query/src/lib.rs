@@ -371,6 +371,21 @@ pub async fn execute_where_streaming<'a>(
     // pattern-form deletes (`DELETE WHERE { <s> ?p ?o }`). A single compound
     // pattern (UNION/OPTIONAL/subquery) still carries interior join
     // decisions and keeps the stats-driven planning.
+    // A `p/rdf:rest*/rdf:first` walk reads lists as RDF cells, as a query's
+    // does (`crate::list_view::rewrite_list_walks`).
+    let walked;
+    let patterns = match list_view::has_list_walk(patterns) {
+        true => match list_view::view_for(db.snapshot, db.overlay, None)? {
+            Some(view) => {
+                walked = list_view::rewrite_list_walks(patterns.to_vec(), &view, &|iri| {
+                    db.snapshot.encode_iri(iri)
+                });
+                &walked[..]
+            }
+            None => patterns,
+        },
+        false => patterns,
+    };
     let single_triple = patterns.len() == 1 && matches!(patterns[0], Pattern::Triple(_));
     let stats = if single_triple {
         None

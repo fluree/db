@@ -1112,7 +1112,9 @@ Array form:
 
 Multiple alternative steps are supported: `"(ex:a|ex:b)/(ex:c|ex:d)"` expands to 4 chains. A safety limit of 64 expanded chains is enforced to prevent combinatorial explosion.
 
-Each step must be a simple predicate (`ex:p`), inverse simple predicate (`^ex:p`), or an alternative of simple predicates (`(ex:a|ex:b)`). Transitive (`+`/`*`) and nested sequence modifiers are not allowed inside sequence steps.
+Each step may be a simple predicate (`ex:p`), an inverse simple predicate (`^ex:p`), an alternative of simple predicates (`(ex:a|ex:b)`), or a modifier applied to a simple predicate (`ex:p+`, `ex:p*`, `ex:p?`). Nested sequences are not allowed inside sequence steps.
+
+`"ex:items/rdf:rest*/rdf:first"` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would. A plain value of `ex:items` is not a member. No other path reaches into a list's `rdf:first`/`rdf:rest` cells.
 
 **Rules:**
 

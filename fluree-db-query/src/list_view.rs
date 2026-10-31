@@ -352,17 +352,31 @@ pub(crate) fn modifiers_have_list_view(
     grouping: &Option<crate::ir::Grouping>,
     order_binds: &[(VarId, crate::ir::Expression)],
 ) -> bool {
+    modifiers_hold(grouping, order_binds, &is_list_view)
+}
+
+fn is_list_view(pattern: &Pattern) -> bool {
+    matches!(pattern, Pattern::ListView(_))
+}
+
+/// Whether an `EXISTS` of `grouping` or `order_binds` holds a pattern `is`
+/// accepts.
+fn modifiers_hold(
+    grouping: &Option<crate::ir::Grouping>,
+    order_binds: &[(VarId, crate::ir::Expression)],
+    is: &dyn Fn(&Pattern) -> bool,
+) -> bool {
     let mut exprs: Vec<&crate::ir::Expression> = order_binds.iter().map(|(_, e)| e).collect();
     if let Some(grouping) = grouping {
         exprs.extend(grouping.having());
         exprs.extend(grouping.binds().map(|(_, e)| e));
     }
-    exprs.into_iter().any(expression_has_list_view)
+    exprs.into_iter().any(|expr| expression_holds(expr, is))
 }
 
-fn expression_has_list_view(expr: &crate::ir::Expression) -> bool {
+fn expression_holds(expr: &crate::ir::Expression, is: &dyn Fn(&Pattern) -> bool) -> bool {
     let mut found = false;
-    expr.for_each_embedded_patterns(&mut |patterns| found |= has_list_view(patterns));
+    expr.for_each_embedded_patterns(&mut |patterns| found |= holds(patterns, is));
     found
 }
 
@@ -436,6 +450,129 @@ fn rewrite_pattern(
     }
 }
 
+/// Mark the `rdf:rest*` of a lowered `p/rdf:rest*/rdf:first` (its owner
+/// edge, the walk and the `rdf:first` step) as a list walk.
+pub fn mark_list_walk(chain: &mut [Pattern]) {
+    for pattern in chain {
+        if let Pattern::PropertyPath(pp) = pattern {
+            pp.list_walk = true;
+        }
+    }
+}
+
+/// Whether `query` holds a list walk ([`crate::ir::PropertyPathPattern::list_walk`]).
+pub fn query_has_list_walk(query: &crate::ir::Query) -> bool {
+    has_list_walk(&query.patterns)
+        || modifiers_hold(&query.grouping, &query.order_binds, &is_list_walk)
+}
+
+/// Whether `patterns` hold a list walk anywhere.
+pub fn has_list_walk(patterns: &[Pattern]) -> bool {
+    holds(patterns, &is_list_walk)
+}
+
+fn is_list_walk(pattern: &Pattern) -> bool {
+    matches!(pattern, Pattern::PropertyPath(pp) if pp.list_walk)
+}
+
+/// Read each list walk of `patterns`, with the owner edge that binds its
+/// start and the `rdf:first` step that reads its end, in SPARQL's view of
+/// lists: `p/rdf:rest*/rdf:first` reaches a list's members through its cells
+/// and a stored chain through its triples. Every other pattern keeps reading
+/// members as values.
+pub fn rewrite_list_walks(
+    patterns: Vec<Pattern>,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) -> Vec<Pattern> {
+    // A walk's endpoints are fresh variables only its two triples share.
+    let ends: Vec<(VarId, VarId)> = patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::PropertyPath(pp) if pp.list_walk => {
+                Some((pp.subject.as_var()?, pp.object.as_var()?))
+            }
+            _ => None,
+        })
+        .collect();
+    patterns
+        .into_iter()
+        .map(|pattern| {
+            let in_walk = match &pattern {
+                Pattern::PropertyPath(pp) => pp.list_walk,
+                Pattern::Triple(tp) => ends.iter().any(|&(head, cell)| {
+                    tp.o.as_var() == Some(head) || tp.s.as_var() == Some(cell)
+                }),
+                _ => false,
+            };
+            if in_walk {
+                rewrite_pattern(pattern, view, encode)
+            } else {
+                rewrite_walks_within(pattern, view, encode)
+            }
+        })
+        .collect()
+}
+
+/// [`rewrite_list_walks`] for the `EXISTS` of `query`'s grouping and
+/// ordering expressions.
+pub fn rewrite_list_walks_of_modifiers(
+    query: &mut crate::ir::Query,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    if let Some(grouping) = &mut query.grouping {
+        grouping.for_each_expression_mut(&mut |expr| walks_in_expression(expr, view, encode));
+    }
+    for (_, expr) in &mut query.order_binds {
+        walks_in_expression(expr, view, encode);
+    }
+}
+
+fn rewrite_walks_within(
+    pattern: Pattern,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) -> Pattern {
+    match pattern {
+        Pattern::Filter(mut expr) => {
+            walks_in_expression(&mut expr, view, encode);
+            Pattern::Filter(expr)
+        }
+        Pattern::Bind { var, mut expr } => {
+            walks_in_expression(&mut expr, view, encode);
+            Pattern::Bind { var, expr }
+        }
+        Pattern::Unwind { var, mut list } => {
+            walks_in_expression(&mut list, view, encode);
+            Pattern::Unwind { var, list }
+        }
+        Pattern::Subquery(mut sq) => {
+            sq.patterns = rewrite_list_walks(std::mem::take(&mut sq.patterns), view, encode);
+            if let Some(grouping) = &mut sq.grouping {
+                grouping
+                    .for_each_expression_mut(&mut |expr| walks_in_expression(expr, view, encode));
+            }
+            for (_, expr) in &mut sq.order_binds {
+                walks_in_expression(expr, view, encode);
+            }
+            Pattern::Subquery(sq)
+        }
+        Pattern::Service(_) => pattern,
+        other => other.map_subpatterns(&mut |xs| rewrite_list_walks(xs, view, encode)),
+    }
+}
+
+fn walks_in_expression(
+    expr: &mut crate::ir::Expression,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    expr.for_each_embedded_patterns_mut(&mut |patterns| {
+        *patterns = rewrite_list_walks(std::mem::take(patterns), view, encode);
+    });
+}
+
 /// `patterns` with each list-view pattern its triple again, for a graph that
 /// holds no RDF lists, such as an R2RML graph source.
 pub fn without_list_view(patterns: &[Pattern]) -> Vec<Pattern> {
@@ -475,23 +612,31 @@ fn rewrite_expression(
 
 /// Whether `patterns` hold a [`ListViewPattern`] anywhere.
 pub fn has_list_view(patterns: &[Pattern]) -> bool {
-    patterns.iter().any(|p| match p {
-        Pattern::ListView(_) => true,
-        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
-            expression_has_list_view(expr)
-        }
-        Pattern::Optional(xs)
-        | Pattern::Minus(xs)
-        | Pattern::Exists(xs)
-        | Pattern::NotExists(xs)
-        | Pattern::Graph { patterns: xs, .. }
-        | Pattern::DefaultGraphSource { patterns: xs } => has_list_view(xs),
-        Pattern::Union(branches) => branches.iter().any(|b| has_list_view(b)),
-        Pattern::Subquery(sq) => {
-            has_list_view(&sq.patterns) || modifiers_have_list_view(&sq.grouping, &sq.order_binds)
-        }
-        Pattern::EdgeAnnotation { body, .. } => has_list_view(body),
-        _ => false,
+    holds(patterns, &is_list_view)
+}
+
+/// Whether `patterns` hold a pattern `is` accepts anywhere, an `EXISTS`
+/// included.
+fn holds(patterns: &[Pattern], is: &dyn Fn(&Pattern) -> bool) -> bool {
+    patterns.iter().any(|p| {
+        is(p)
+            || match p {
+                Pattern::Filter(expr)
+                | Pattern::Bind { expr, .. }
+                | Pattern::Unwind { list: expr, .. } => expression_holds(expr, is),
+                Pattern::Optional(xs)
+                | Pattern::Minus(xs)
+                | Pattern::Exists(xs)
+                | Pattern::NotExists(xs)
+                | Pattern::Graph { patterns: xs, .. }
+                | Pattern::DefaultGraphSource { patterns: xs } => holds(xs, is),
+                Pattern::Union(branches) => branches.iter().any(|b| holds(b, is)),
+                Pattern::Subquery(sq) => {
+                    holds(&sq.patterns, is) || modifiers_hold(&sq.grouping, &sq.order_binds, is)
+                }
+                Pattern::EdgeAnnotation { body, .. } => holds(body, is),
+                _ => false,
+            }
     })
 }
 

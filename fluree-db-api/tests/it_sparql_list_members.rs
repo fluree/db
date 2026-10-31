@@ -841,3 +841,99 @@ async fn lists_added_beside_another_stay_apart() {
         "a member each, beside the list there"
     );
 }
+
+/// `p/rdf:rest*/rdf:first` reaches each member of every list `p` holds, once
+/// per entry, as the lists' RDF would: not a plain value of `p`, and a list
+/// stored as its triples, complete or not, through those triples. The query's
+/// other patterns read members as values. From novelty and from an index.
+#[tokio::test]
+async fn a_list_walk_reads_each_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "list-walk",
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+         ex:s ex:items (1 1 2), (3), 9 .
+         ex:t ex:items _:c . _:c rdf:first 7 ; rdf:rest _:d ; ex:note 0 .
+         _:d rdf:first 8 ; rdf:rest rdf:nil .
+         ex:u ex:items _:e . _:e rdf:first 5 .",
+    )
+    .await;
+    let rdf = format!("{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n");
+    let walk = |subject: &str| {
+        format!("{rdf}SELECT ?x WHERE {{ {subject} ex:items/rdf:rest*/rdf:first ?x }}")
+    };
+    let values = |vs: &[i64]| vs.iter().map(|v| json!([v])).collect::<Vec<_>>();
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        let ledger = load(&fluree, &id).await;
+        let lane = format!("indexed {indexed}");
+        assert_eq!(
+            sparql(&fluree, &ledger, &walk("ex:s")).await,
+            values(&[1, 1, 2, 3]),
+            "{lane}"
+        );
+        assert_eq!(
+            sparql(&fluree, &ledger, &walk("ex:t")).await,
+            values(&[7, 8]),
+            "{lane}"
+        );
+        assert_eq!(
+            sparql(&fluree, &ledger, &walk("ex:u")).await,
+            values(&[5]),
+            "{lane}"
+        );
+        let all = sparql(&fluree, &ledger, &walk("?s")).await;
+        assert_eq!(all, values(&[1, 1, 2, 3, 5, 7, 8]), "{lane}");
+        let holders = sparql(
+            &fluree,
+            &ledger,
+            &format!("{rdf}SELECT ?s WHERE {{ ?s ex:items/rdf:rest*/rdf:first 2 }}"),
+        )
+        .await;
+        assert_eq!(holders, [json!(["ex:s"])], "{lane}");
+        let beside = sparql(
+            &fluree,
+            &ledger,
+            &format!(
+                "{rdf}SELECT (COUNT(?x) AS ?n) WHERE {{ ex:s ex:items ?x \
+                 FILTER EXISTS {{ ex:s ex:items/rdf:rest*/rdf:first ?x }} }}"
+            ),
+        )
+        .await;
+        assert_eq!(beside, [json!([4])], "the plain 9 is no member; {lane}");
+        let twin = jsonld(
+            &fluree,
+            &ledger,
+            json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                    "members": {"@path": "ex:items/rdf:rest*/rdf:first"}
+                },
+                "select": ["?x"],
+                "where": {"@id": "ex:s", "members": "?x"}
+            }),
+        )
+        .await;
+        assert_eq!(twin, values(&[1, 1, 2, 3]), "{lane}");
+    }
+    // An update's WHERE reads the walk as a query's does.
+    update(
+        &fluree,
+        &id,
+        "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+         INSERT { ?s ex:member ?x } WHERE { ?s ex:items/rdf:rest*/rdf:first ?x }",
+    )
+    .await;
+    let ledger = load(&fluree, &id).await;
+    let members = sparql(
+        &fluree,
+        &ledger,
+        &format!("{PREFIX}SELECT ?x WHERE {{ ex:s ex:member ?x }}"),
+    )
+    .await;
+    assert_eq!(members, values(&[1, 2, 3]));
+}
