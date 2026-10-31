@@ -9,7 +9,9 @@ use std::sync::Weak;
 use std::time::Instant;
 
 use fluree_db_core::commit::codec::read_commit_envelope;
-use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, LedgerId};
+use fluree_db_core::{
+    collect_first_parent_cids, load_commit_envelope_by_id, ContentId, ContentKind, LedgerId,
+};
 use fluree_db_erasure::{ProveRequest, ProverError};
 use fluree_db_nameservice::NsRecord;
 use futures::FutureExt;
@@ -1162,10 +1164,10 @@ impl Fluree {
         }
     }
 
-    /// The branches that may hold `job`'s commits, as they are now: its
-    /// ledger's, including any made after the request, and those of copies
-    /// holding an original. `None` when `branch`'s ledger is dropped, which
-    /// hides its branches.
+    /// The branches holding `job`'s commits, as they are now: those of its
+    /// ledger, including any made after the request, and of copies holding
+    /// an original, whose history reaches one of them. `None` when
+    /// `branch`'s ledger is dropped, which hides its branches.
     pub(super) async fn holders(
         &self,
         branch: &str,
@@ -1184,7 +1186,56 @@ impl Fluree {
         }
         let commits: Vec<&str> = job.commits.iter().map(|c| c.commit.as_str()).collect();
         records.extend(self.copies_holding(&name, &commits).await?);
-        Ok(Some(records))
+        let erased: HashSet<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
+        let from = job.commits.iter().map(|c| c.t).min().unwrap_or(0);
+        let mut unreached = HashSet::new();
+        let mut holders = Vec::with_capacity(records.len());
+        for record in records {
+            if self.reaches(&record, &erased, from, &mut unreached).await? {
+                holders.push(record);
+            }
+        }
+        Ok(Some(holders))
+    }
+
+    /// Whether `record`'s history reaches one of `erased`, none older than
+    /// `from_t`, through every parent: a transfer of a branch that merged
+    /// one carries it. Commits whose history reaches none are kept in
+    /// `unreached`, since branches share theirs below where they forked.
+    async fn reaches(
+        &self,
+        record: &NsRecord,
+        erased: &HashSet<ContentId>,
+        from_t: i64,
+        unreached: &mut HashSet<ContentId>,
+    ) -> Result<bool> {
+        let Some(head) = record.commit_head_id.clone() else {
+            return Ok(false);
+        };
+        if record.commit_t < from_t {
+            return Ok(false);
+        }
+        let store = self
+            .content_store_for_record_or_id(Some(record), &record.storage_namespace())
+            .await?;
+        let mut seen = HashSet::new();
+        let mut next = vec![head];
+        while let Some(cid) = next.pop() {
+            if erased.contains(&cid) {
+                return Ok(true);
+            }
+            if unreached.contains(&cid) || !seen.insert(cid.clone()) {
+                continue;
+            }
+            let envelope = load_commit_envelope_by_id(store.as_ref(), &cid).await?;
+            // A parent is older than its child, so none past this one is
+            // erased.
+            if envelope.t > from_t {
+                next.extend(envelope.parent_ids().cloned());
+            }
+        }
+        unreached.extend(seen);
+        Ok(false)
     }
 
     /// The `holders` whose history holds one of `job`'s commits above their

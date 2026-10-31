@@ -175,8 +175,10 @@ release; until then it refuses with `501`. What differs from a single node:
   by the next one and not proved again.
 - **Publication.** The leader writes the prepared erasure as an immutable manifest and activates it
   through Raft. The activation is refused, and the erasure prepared again, if a branch holding the
-  erased commits changed meanwhile. Each member installs activations in order. Until it has, its
-  writes to the affected branches are refused and staged again, and its history reads of them wait.
+  erased commits changed meanwhile. A branch whose history does not reach an erased commit, one made
+  before it and never merging it, is not affected. Each member installs activations in order. Until it
+  has, its writes to the affected branches are refused and staged again, and its history reads of them
+  wait.
   The job records the activation, and when every member had installed it (`cluster.effectiveMs`):
   from then no member serves the erased history.
 - **Purge.** Only the leader purges, and only jobs every member has installed. Its deletes stay within

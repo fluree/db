@@ -1029,6 +1029,176 @@ async fn a_step_proved_for_an_earlier_leader_is_not_proved_again() {
     pair.shutdown().await;
 }
 
+/// An erasure reaches only the branches whose history holds its commits:
+/// a branch made before the erased commit keeps its generation, and its
+/// writes go on from the views they began with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_erasure_reaches_only_the_branches_holding_its_commits() {
+    use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
+    use fluree_db_api::retention::FactSelector;
+    use fluree_db_consensus::raft::state_machine::{generation, RefKey};
+
+    let (integration, fluree, node, _dirs) = stand_up_with(
+        71,
+        |builder| {
+            builder.with_erasure(ErasureConfig {
+                prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+        },
+        |config| config,
+    )
+    .await;
+    let id = "reached/db:main";
+    fluree.create_ledger("reached/db").await.expect("create");
+    node.committer
+        .transact(bulk_request_round(id, 1, 0))
+        .await
+        .expect("first transaction");
+    fluree
+        .create_branch("reached/db", "before", None, None)
+        .await
+        .expect("branch before");
+    let mut request = bulk_request(id, 1);
+    request.body = TransactionBody::JsonLdInsert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/email": "a@secret"
+    }));
+    node.committer.transact(request).await.expect("insert");
+    fluree
+        .create_branch("reached/db", "after", None, None)
+        .await
+        .expect("branch after");
+
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::new(
+        std::sync::OnceLock::from(Arc::clone(&node.committer)),
+    ));
+    let erasure = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(serde_json::json!("a@secret")),
+        }],
+        ..Default::default()
+    };
+    fluree
+        .erase_occurrences_with(&writer, id, erasure, None)
+        .await
+        .expect("accepted");
+    fluree.run_erasure_pass(id).await.expect("proved");
+    for branch in [id, "reached/db:after"] {
+        fluree
+            .reindex(branch, fluree_db_api::ReindexOptions::default())
+            .await
+            .expect("indexed");
+    }
+    let report = fluree.run_erasure_pass(id).await.expect("published");
+    assert_eq!(report.published, 1, "{report:?}");
+    {
+        let state = integration.shared_state.read().await;
+        assert_eq!(generation(&state, &RefKey::new("reached/db", "main")), 1);
+        assert_eq!(generation(&state, &RefKey::new("reached/db", "after")), 1);
+        assert_eq!(generation(&state, &RefKey::new("reached/db", "before")), 0);
+    }
+    node.shutdown().await;
+}
+
+/// A branch made before the erased commits that merged them since holds
+/// them: the erasure reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_erasure_reaches_a_branch_that_merged_its_commits() {
+    use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
+    use fluree_db_api::retention::FactSelector;
+    use fluree_db_api::ConflictStrategy;
+    use fluree_db_consensus::raft::state_machine::{generation, RefKey};
+    use fluree_db_consensus::MergeRequest;
+
+    let (integration, fluree, node, _dirs) = stand_up_with(
+        72,
+        |builder| {
+            builder.with_erasure(ErasureConfig {
+                prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+        },
+        |config| config,
+    )
+    .await;
+    let id = "merged/db:main";
+    fluree.create_ledger("merged/db").await.expect("create");
+    node.committer
+        .transact(bulk_request_round(id, 1, 0))
+        .await
+        .expect("first transaction");
+    fluree
+        .create_branch("merged/db", "side", None, None)
+        .await
+        .expect("branch");
+    node.committer
+        .transact(bulk_request_round("merged/db:side", 1, 1))
+        .await
+        .expect("the side's own change");
+    let mut request = bulk_request(id, 1);
+    request.body = TransactionBody::JsonLdInsert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/email": "a@secret"
+    }));
+    node.committer.transact(request).await.expect("insert");
+    let mut request = bulk_request(id, 1);
+    request.body = TransactionBody::Sparql(
+        "DELETE DATA { <http://example.org/alice> <http://example.org/email> \"a@secret\" }"
+            .to_string(),
+    );
+    node.committer.transact(request).await.expect("retract");
+    let merged = node
+        .committer
+        .merge(MergeRequest {
+            idempotency_key: None,
+            ledger_name: "merged/db".into(),
+            source_branch: "main".into(),
+            target_branch: Some("side".into()),
+            strategy: ConflictStrategy::default(),
+        })
+        .await
+        .expect("merged");
+    assert!(!merged.fast_forward, "{merged:?}");
+
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::new(
+        std::sync::OnceLock::from(Arc::clone(&node.committer)),
+    ));
+    let erasure = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(serde_json::json!("a@secret")),
+        }],
+        ..Default::default()
+    };
+    fluree
+        .erase_occurrences_with(&writer, id, erasure, None)
+        .await
+        .expect("accepted");
+    fluree.run_erasure_pass(id).await.expect("proved");
+    for branch in [id, "merged/db:side"] {
+        fluree
+            .reindex(branch, fluree_db_api::ReindexOptions::default())
+            .await
+            .expect("indexed");
+    }
+    let report = fluree.run_erasure_pass(id).await.expect("published");
+    assert_eq!(report.published, 1, "{report:?}");
+    {
+        let state = integration.shared_state.read().await;
+        assert_eq!(generation(&state, &RefKey::new("merged/db", "main")), 1);
+        assert_eq!(generation(&state, &RefKey::new("merged/db", "side")), 1);
+    }
+    node.shutdown().await;
+}
+
 /// An erasure made on a cluster publishes through Raft: the leader
 /// activates a manifest of it, the member installs the manifest and reports
 /// it, reads of the erased commit return its replacement, writes resume on
