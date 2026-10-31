@@ -298,8 +298,12 @@ and its purge runs again. With only soft-dropped ledgers holding the originals, 
 ledger's purge deletes them; if a restore fails after publishing the erasures, that purge stays owed
 until the same ledger is restored again, or until no soft-dropped ledger holds an original.
 
-A clone or pull that stops partway completes at the next clone or pull from the CLI, or when a
-server on this storage next runs its retention worker. Without a ledger cache, as the CLI runs, a
+A server's retention worker then purges the receiving ledger. A CLI runs no worker: a pull purges
+before it exits, without the wait a server keeps for readers of the older indexes, since the CLI holds
+the storage and reads none of them. A purge that cannot finish there carries on at the next pull, and
+local `fluree info` lists each erasure whose files the storage still holds. A clone or pull that stops
+partway completes at the next clone or pull from the CLI, or when a server on this storage next runs
+its retention worker. Without a ledger cache, as the CLI runs, a
 transaction committed on a holder during the activation fails it, and it resumes the same way.
 
 An origin is no named remote: `fluree clone --origin` and a pull from a ledger's origins take erased

@@ -27,6 +27,7 @@ Downloads new commits from the configured upstream and applies them to the local
 5. Stores all commit and transaction blobs to local CAS
 6. When index data is requested and transferred, advances the local index head to match the remote
 7. Advances the local commit head to the remote head
+8. Deletes from local storage what the ledger's permanent erasures still leave there (see [Erased history](#erased-history))
 
 ### Index transfer
 
@@ -44,8 +45,13 @@ authority (`fluree remote erasure-authority <name> true`). The request lists the
 storage already holds; the remote sends every other erasure of the history, including those of
 commits this ledger already has. Before the local head moves, the ledger (and any other ledger here
 holding the originals) reads as the erasures do: the values leave its index and history, with nothing
-committed to it, and its purge later deletes the originals. A pull that stops partway completes at the
-next clone or pull, or when a server on this storage next runs its retention worker. An erasure
+committed to it. Before it exits, the pull then deletes from local storage what the ledger's erasures
+leave there: the originals, the indexes built from them, and their transaction documents, and checks
+that the values are gone. It holds the storage, which no other process then reads, so it does not wait
+first, as a server does, for readers of the older indexes. When the deletion cannot finish, the pull
+says why, and the next pull carries on; `fluree info` lists each erasure whose files are still there.
+A pull that stops partway completes at the next clone or pull, or when a server on this storage next
+runs its retention worker. An erasure
 published after the ledger has every commit arrives with the next pull all the same, since a pull with
 no new commits still asks for one. The paginated export and an origin-based pull refuse erased
 history. The ledger's removal journal arrives with any pack, an origin's included; the object-by-object

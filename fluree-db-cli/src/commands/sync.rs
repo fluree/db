@@ -387,6 +387,68 @@ async fn resume_erasures(fluree: &fluree_db_api::Fluree) {
     }
 }
 
+/// Passes one pull runs on its erasures' files before leaving the rest to
+/// the next.
+const PURGE_PASSES: usize = 8;
+
+/// What deleting a ledger's erased values from this copy's storage came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Purge {
+    /// No erasure of the ledger had files left to delete.
+    Nothing,
+    /// This many erasures' files are deleted.
+    Done(usize),
+    /// Some are still there, for this reason.
+    Pending(String),
+}
+
+impl Purge {
+    fn print(&self) {
+        match self {
+            Purge::Nothing => {}
+            Purge::Done(requests) => println!(
+                "{} {requests} erasure(s) purged: the erased values are deleted from this copy's \
+                 storage",
+                "✓".green()
+            ),
+            Purge::Pending(why) => eprintln!(
+                "  {} erased values are still in this copy's storage ({why}); the next \
+                 `fluree pull` carries on",
+                "warning:".yellow().bold()
+            ),
+        }
+    }
+}
+
+/// Delete from this copy's storage what `ledger_id`'s erasures still leave
+/// there: the originals of the erased commits, the indexes built from them,
+/// and their transactions. A server first waits for readers of the older
+/// indexes to finish; this process holds the storage and reads none of
+/// them, so it does not.
+async fn purge_received(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Purge {
+    let mut requests = std::collections::BTreeSet::new();
+    for _ in 0..PURGE_PASSES {
+        let report = match fluree
+            .run_purge_pass(ledger_id, std::time::Duration::ZERO)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => return Purge::Pending(e.to_string()),
+        };
+        requests.extend(report.requests);
+        if let Some(why) = report.blocked {
+            return Purge::Pending(why);
+        }
+        if !report.waiting {
+            return match requests.len() {
+                0 => Purge::Nothing,
+                requests => Purge::Done(requests),
+            };
+        }
+    }
+    Purge::Pending(format!("not finished in {PURGE_PASSES} passes"))
+}
+
 /// `count` erased commits, as a summary's suffix.
 fn erased_note(count: usize) -> String {
     match count {
@@ -632,7 +694,19 @@ pub async fn run_pull(
 ) -> CliResult<()> {
     let ledger_id = context::resolve_ledger(ledger, dirs)?;
     let ledger_id = context::to_ledger_id(&ledger_id)?;
+    let fluree = pull(ledger_id.clone(), no_indexes, erasure_authority, dirs).await?;
+    purge_received(&fluree, &ledger_id).await.print();
+    Ok(())
+}
 
+/// Pull `ledger_id` from its upstream, or else its origins. Returns the
+/// instance it pulled into, its hold on the ledger's garbage released.
+async fn pull(
+    ledger_id: fluree_db_core::LedgerId,
+    no_indexes: bool,
+    erasure_authority: bool,
+    dirs: &FlureeDir,
+) -> CliResult<fluree_db_api::Fluree> {
     let config_store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let upstream = config_store
         .get_upstream(&ledger_id)
@@ -726,7 +800,7 @@ pub async fn run_pull(
             erased_note(erased)
         );
         context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
-        return Ok(());
+        return Ok(fluree);
     }
 
     println!(
@@ -931,7 +1005,7 @@ pub async fn run_pull(
                                             dirs,
                                         )
                                         .await;
-                                        return Ok(());
+                                        return Ok(fluree);
                                     }
                                     Err(e) => {
                                         let msg = e.to_string();
@@ -1025,7 +1099,7 @@ pub async fn run_pull(
     if to_import.is_empty() {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
         context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
-        return Ok(());
+        return Ok(fluree);
     }
 
     let count = to_import.len();
@@ -1059,7 +1133,7 @@ pub async fn run_pull(
 
     // Persist refreshed token if auto-refresh happened.
     context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
-    Ok(())
+    Ok(fluree)
 }
 
 /// The commits a paginated pull imports: the line oldest first, and the
@@ -2384,7 +2458,7 @@ async fn run_pull_via_origins(
     no_indexes: bool,
     erasure_authority: bool,
     dirs: &FlureeDir,
-) -> CliResult<()> {
+) -> CliResult<fluree_db_api::Fluree> {
     let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
@@ -2479,7 +2553,7 @@ async fn run_pull_via_origins(
             reception.accept(ledger_id, &remote_head_cid).await?;
         }
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
-        return Ok(());
+        return Ok(fluree);
     }
 
     println!(
@@ -2619,7 +2693,7 @@ async fn run_pull_via_origins(
                                     remote_t
                                 );
                             }
-                            return Ok(());
+                            return Ok(fluree);
                         }
                         Err(e) => {
                             if reception.refused {
@@ -2723,7 +2797,7 @@ async fn run_pull_via_origins(
 
     if fetched.is_empty() {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
-        return Ok(());
+        return Ok(fluree);
     }
 
     // Reverse to oldest→newest, store blobs.
@@ -2773,7 +2847,7 @@ async fn run_pull_via_origins(
         remote_t
     );
 
-    Ok(())
+    Ok(fluree)
 }
 
 #[cfg(test)]
@@ -3153,5 +3227,117 @@ mod tests {
                 .is_some_and(|r| !r.journal.removals.is_empty()),
             "the journal arrives with the erasures"
         );
+    }
+
+    /// The files under `root` holding `needle`.
+    fn files_holding(root: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut next = vec![root.to_path_buf()];
+        while let Some(dir) = next.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    next.push(path);
+                } else if std::fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// A copy holding a commit an erasure it received erases deletes the
+    /// original from its storage before the pull returns, without waiting as
+    /// a server does for readers of the older indexes; a second pull finds
+    /// nothing left.
+    #[tokio::test]
+    async fn a_pull_deletes_what_a_received_erasure_erases() {
+        use fluree_db_api::retention::erasure::{
+            ErasureConfig, ErasureRequest, ErasureStage, Verifier,
+        };
+        use fluree_db_api::retention::FactSelector;
+        use fluree_db_api::{FlureeBuilder, ReindexOptions};
+        use serde_json::json;
+
+        let there = tempfile::tempdir().unwrap();
+        let origin = FlureeBuilder::file(there.path().to_string_lossy().to_string())
+            .without_indexing()
+            .with_erasure(ErasureConfig {
+                prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+            .build()
+            .unwrap();
+        origin.create_ledger("t/purge").await.unwrap();
+        let id = "t/purge:main";
+        origin
+            .graph(id)
+            .transact()
+            .insert(
+                &json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+                    {"@id": "ex:alice", "ex:email": "a@secret"},
+                    {"@id": "ex:bob", "ex:email": "b@kept"}
+                ]}),
+            )
+            .commit()
+            .await
+            .unwrap();
+        let mut before = Vec::new();
+        origin.archive_ledger(id, false, &mut before).await.unwrap();
+        let request = ErasureRequest {
+            matching: vec![FactSelector {
+                subject: "http://example.org/alice".into(),
+                predicate: "http://example.org/email".into(),
+                graph: None,
+                object: Some(json!("a@secret")),
+            }],
+            ..Default::default()
+        };
+        origin.erase_occurrences(id, request, None).await.unwrap();
+        origin.reindex(id, ReindexOptions::default()).await.unwrap();
+        assert_eq!(origin.run_erasure_pass(id).await.unwrap().published, 1);
+        let mut after = Vec::new();
+        origin.archive_ledger(id, true, &mut after).await.unwrap();
+
+        let here = tempfile::tempdir().unwrap();
+        let copy = FlureeBuilder::file(here.path().to_string_lossy().to_string())
+            .without_indexing()
+            .without_ledger_caching()
+            .with_erasure_verifier(Arc::new(Verifier::accepting_dev_receipts()))
+            .build()
+            .unwrap();
+        let held = copy
+            .restore_ledger("t/purge-copy", &mut before.as_slice())
+            .await
+            .unwrap()
+            .ledger_id;
+        copy.reindex(&held, ReindexOptions::default())
+            .await
+            .unwrap();
+        copy.restore_ledger("t/purge-again", &mut after.as_slice())
+            .await
+            .unwrap();
+        assert!(!files_holding(here.path(), "a@secret").is_empty());
+
+        let purge = purge_received(&copy, &held).await;
+        assert_eq!(purge, Purge::Done(1));
+        assert_eq!(
+            files_holding(here.path(), "a@secret"),
+            Vec::<std::path::PathBuf>::new()
+        );
+        let jobs = copy
+            .retention_status(&held)
+            .await
+            .unwrap()
+            .registration
+            .unwrap()
+            .erasures;
+        assert_eq!(jobs[0].stage, ErasureStage::Purged);
+        assert_eq!(purge_received(&copy, &held).await, Purge::Nothing);
     }
 }
