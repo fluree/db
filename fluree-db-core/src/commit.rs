@@ -506,11 +506,7 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
         store
             .get(id)
             .await
-            .map_err(|e| {
-                Error::storage(format!(
-                    "Failed to read oversized commit envelope {id}: {e}"
-                ))
-            })?
+            .map_err(|e| envelope_read_error(id, e))?
             .into_vec()
     };
 
@@ -1803,6 +1799,52 @@ mod tests {
         let store = MemoryContentStore::new();
         let missing = ContentId::new(ContentKind::Commit, b"never stored");
         let read = load_commit_envelope_by_id(&store, &missing).await;
+        assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
+    }
+
+    /// A commit deleted between the header read and the full fetch of its
+    /// oversized envelope is not found either.
+    #[tokio::test]
+    async fn a_commit_gone_before_its_oversized_envelope_is_read_is_not_found() {
+        #[derive(Debug)]
+        struct Deleted;
+        #[async_trait::async_trait]
+        impl ContentStore for Deleted {
+            async fn has(&self, _id: &ContentId) -> Result<bool> {
+                Ok(false)
+            }
+            async fn get(&self, id: &ContentId) -> Result<crate::ContentBytes> {
+                Err(Error::not_found(id.to_string()))
+            }
+            async fn get_range(
+                &self,
+                _id: &ContentId,
+                _range: std::ops::Range<u64>,
+            ) -> Result<Vec<u8>> {
+                let mut header = vec![0; codec::format::HEADER_LEN];
+                codec::format::CommitHeader {
+                    version: codec::format::VERSION,
+                    flags: 0,
+                    t: 1,
+                    op_count: 0,
+                    envelope_len: ENVELOPE_PROBE_LEN as u32,
+                    sig_block_len: 0,
+                }
+                .write_to(&mut header);
+                Ok(header)
+            }
+            async fn put(&self, _kind: ContentKind, _bytes: &[u8]) -> Result<ContentId> {
+                unimplemented!()
+            }
+            async fn put_with_id(&self, _id: &ContentId, _bytes: &[u8]) -> Result<()> {
+                unimplemented!()
+            }
+            async fn release(&self, _id: &ContentId) -> Result<()> {
+                unimplemented!()
+            }
+        }
+        let id = ContentId::new(ContentKind::Commit, b"deleted");
+        let read = load_commit_envelope_by_id(&Deleted, &id).await;
         assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
     }
 
