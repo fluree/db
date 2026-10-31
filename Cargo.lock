@@ -3022,6 +3022,7 @@ dependencies = [
 name = "fluree-db-api"
 version = "4.2.4"
 dependencies = [
+ "apache-avro",
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",

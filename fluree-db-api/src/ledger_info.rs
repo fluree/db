@@ -321,7 +321,10 @@ pub struct Source {
     /// Catalog descriptor (REST or Direct-mode). Omitted when neither is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<Catalog>,
-    /// Per-table row counts (Iceberg snapshot-summary `total-records`). Authoritative
+    /// Per-table row counts: the Iceberg snapshot summary's `total-records`, or,
+    /// when the summary has none (BigQuery writes only `operation`), the sum of
+    /// the snapshot manifest list's `added_rows_count + existing_rows_count` over
+    /// its data manifests. A table whose count is unknown is absent. Authoritative
     /// for append-only / copy-on-write tables; for any table listed in
     /// [`Self::mor_approximate_tables`] the count is an **upper bound** (it sums live
     /// data-file records without subtracting merge-on-read position/equality deletes,
@@ -330,7 +333,8 @@ pub struct Source {
     pub table_row_counts: BTreeMap<String, i64>,
     /// Tables whose [`Self::table_row_counts`] entry is an **approximate upper bound**
     /// because the current Iceberg snapshot carries merge-on-read delete files
-    /// (`total-delete-files`/`-position-deletes`/`-equality-deletes` > 0). Empty (and
+    /// (`total-delete-files`/`-position-deletes`/`-equality-deletes` > 0, or, for a
+    /// count read from the manifest list, a delete manifest in it). Empty (and
     /// omitted) for the common append-only case. Consumers that ignore unknown keys
     /// (the `/data-model` + MCP readers, all null-safe) are unaffected.
     #[serde(
@@ -1620,8 +1624,9 @@ pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue 
 /// For `Iceberg`/`R2RML` sources this returns the SAME JSON shape a native
 /// ledger's `info` returns — `classes`, `properties`, per-class counts — derived
 /// entirely from the compiled R2RML mapping and Iceberg table **metadata**
-/// (`loadTable` snapshot summary row counts: metadata-only, NEVER a Parquet/data
-/// scan) — and NEVER includes auth/credentials. Other graph-source types get the
+/// (row counts from the `loadTable` snapshot summary, else the snapshot's
+/// manifest list: metadata-only, NEVER a manifest or Parquet/data scan) — and
+/// NEVER includes auth/credentials. Other graph-source types get the
 /// thin (redacted) record view.
 ///
 /// This is the single shared builder behind the db-server `/info` route, the
@@ -1655,9 +1660,10 @@ const INFO_COUNT_FETCH_CONCURRENCY: usize = 8;
 
 /// Default wall-clock budget (ms) for the whole virtual `/info` row-count fetch.
 /// The structure (classes/properties) is derived from the mapping and needs no
-/// counts, so if the catalog is slow the fetch is abandoned and counts degrade to
-/// empty rather than blowing the caller's (lambda / gateway) deadline. Override
-/// with `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` (`0` disables the row-count fetch
+/// counts, so a step still running at the deadline is abandoned and its table's
+/// count is omitted, rather than blowing the caller's (lambda / gateway)
+/// deadline; the tables that finished keep theirs. Override with
+/// `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` (`0` disables the row-count fetch
 /// entirely, returning structure-only).
 #[cfg(feature = "iceberg")]
 const DEFAULT_INFO_COUNT_BUDGET_MS: u64 = 10_000;
@@ -1669,6 +1675,11 @@ fn info_count_budget_ms() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_INFO_COUNT_BUDGET_MS)
 }
+
+/// One table's `loadTable` outcome for the virtual-info fan-out:
+/// `(table name, row count if known, snapshot id, MoR-approximate?)`.
+#[cfg(feature = "iceberg")]
+type VirtualTableCount = (String, Option<i64>, i64, bool);
 
 /// Fetch best-effort per-table row counts (and the first table's snapshot id) for
 /// a virtual Iceberg dataset, sharing ONE catalog client (REST, AWS Glue, or AWS S3
@@ -1682,24 +1693,29 @@ fn info_count_budget_ms() -> u64 {
 /// (keyed by the SAME config fingerprint), and the per-table `loadTable`s run with
 /// bounded concurrency.
 ///
-/// Metadata-only: the count is the snapshot summary of the table metadata — inline
-/// in a REST `loadTable`, else from the query path's caches, else one read of the
-/// metadata file (AWS Glue / S3 Tables return only its location); no
-/// manifest-list, manifest, or Parquet/data file is read. Every step is
-/// best-effort — a parse / auth / load / metadata failure drops only that table's
-/// count (logged at debug), never the whole response. A Direct-catalog source (no
-/// catalog) returns no counts.
-/// One table's `loadTable` outcome for the virtual-info fan-out:
-/// `(table name, summary row count if present, snapshot id, MoR-approximate?)`.
-#[cfg(feature = "iceberg")]
-type VirtualTableCount = (String, Option<i64>, i64, bool);
-
+/// Time-boxed by `deadline`, applied to each step rather than to the whole
+/// fan-out: building the catalog client, each table's `loadTable` and metadata,
+/// and each table's manifest-list read (inside [`virtual_table_row_count`]). A
+/// step that overruns loses only its own table's count, so a slow manifest-list
+/// read never costs a table whose summary had its total. Every step ends by the
+/// deadline, so the whole fetch does too.
+///
+/// Metadata-only: the table metadata comes inline in a REST `loadTable`, else
+/// from the query path's caches, else from one read of the metadata file (AWS
+/// Glue / S3 Tables return only its location). The count is its snapshot
+/// summary's `total-records`, or, for a writer that leaves that out (BigQuery),
+/// the snapshot's manifest list, read once per snapshot and cached (see
+/// [`virtual_table_row_count`]). No manifest or Parquet/data file is read. Every
+/// step is best-effort: a parse / auth / load / metadata failure drops only that
+/// table's count (logged at debug), never the whole response. A Direct-catalog
+/// source (no catalog) returns no counts.
 #[cfg(feature = "iceberg")]
 async fn fetch_virtual_table_row_counts(
     fluree: &crate::Fluree,
     record: &GraphSourceRecord,
     cfg: &fluree_db_iceberg::IcebergGsConfig,
     tables: &[String],
+    deadline: tokio::time::Instant,
 ) -> (HashMap<String, i64>, Option<i64>, Vec<String>) {
     use fluree_db_iceberg::catalog::{parse_table_identifier, SendCatalogClient};
     use futures::StreamExt;
@@ -1712,18 +1728,25 @@ async fn fetch_virtual_table_row_counts(
     // pool, warmed by whichever runs first. A Direct (table-location) source has no
     // catalog to ask. Best-effort: a client that cannot be built just omits counts,
     // like every other failure in this display-only path.
-    let catalog = match crate::graph_source::shared_catalog_client(
-        fluree,
-        &record.graph_source_id,
-        &record.config,
-        cfg,
+    let catalog = match tokio::time::timeout_at(
+        deadline,
+        crate::graph_source::shared_catalog_client(
+            fluree,
+            &record.graph_source_id,
+            &record.config,
+            cfg,
+        ),
     )
     .await
     {
-        Ok(Some(catalog)) => catalog,
-        Ok(None) => return (HashMap::new(), None, Vec::new()),
-        Err(e) => {
+        Ok(Ok(Some(catalog))) => catalog,
+        Ok(Ok(None)) => return (HashMap::new(), None, Vec::new()),
+        Ok(Err(e)) => {
             tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
+            return (HashMap::new(), None, Vec::new());
+        }
+        Err(_) => {
+            tracing::debug!(graph_source = %record.graph_source_id, "virtual ledger-info: catalog client build exceeded the count budget; counts omitted");
             return (HashMap::new(), None, Vec::new());
         }
     };
@@ -1742,42 +1765,53 @@ async fn fetch_virtual_table_row_counts(
                     let id = parse_table_identifier(&table).ok()?;
                     let api_id = crate::graph_source::TableIdentifier::new(id.namespace, id.table);
                     let catalog_table_id = api_id.to_catalog();
-                    let mut load = match SendCatalogClient::load_table(
-                        &*catalog,
-                        &catalog_table_id,
-                        vended,
-                    )
-                    .await
-                    {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::debug!(table = %table, error = %e, "virtual ledger-info: loadTable failed; count omitted");
-                            return None;
+                    let loaded = tokio::time::timeout_at(deadline, async {
+                        let mut load = match SendCatalogClient::load_table(
+                            &*catalog,
+                            &catalog_table_id,
+                            vended,
+                        )
+                        .await
+                        {
+                            Ok(l) => l,
+                            Err(e) => {
+                                tracing::debug!(table = %table, error = %e, "virtual ledger-info: loadTable failed; count omitted");
+                                return None;
+                            }
+                        };
+                        // Inline (REST), else the caches a query filled, else one read
+                        // of the metadata file (Glue / S3 Tables return a location only).
+                        match crate::graph_source::catalog_table_metadata(fluree, cfg, &mut load)
+                            .await
+                        {
+                            Ok(metadata) => Some((load, metadata)),
+                            Err(e) => {
+                                tracing::debug!(table = %table, error = %e, "virtual ledger-info: table metadata unreadable; count omitted");
+                                None
+                            }
                         }
-                    };
-                    // Inline (REST), else the caches a query filled, else one read of
-                    // the metadata file (Glue / S3 Tables return a location only).
-                    let metadata = match crate::graph_source::catalog_table_metadata(
-                        fluree, cfg, &mut load,
-                    )
-                    .await
-                    {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::debug!(table = %table, error = %e, "virtual ledger-info: table metadata unreadable; count omitted");
+                    })
+                    .await;
+                    let (load, metadata) = match loaded {
+                        Ok(loaded) => loaded?,
+                        Err(_) => {
+                            tracing::debug!(table = %table, "virtual ledger-info: loadTable exceeded the count budget; count omitted");
                             return None;
                         }
                     };
                     let metadata = metadata.as_ref();
-                    // MoR rider (F-AUD-1): the snapshot-summary `total-records` this
-                    // count derives from OVER-COUNTS a merge-on-read table (it does not
-                    // subtract position/equality deletes, which Fluree recognizes but
-                    // does not yet apply). Flag such a table so its count is reported
-                    // as an upper bound. Zero-I/O — reads only the in-memory summary.
-                    let has_deletes = metadata_indicates_mor_approximate_count(metadata);
                     let schema =
                         crate::graph_source::table_schema_from_metadata(&api_id, metadata).ok()?;
-                    Some((table, schema.row_count, schema.snapshot.id, has_deletes))
+                    let (row_count, has_deletes) = virtual_table_row_count(
+                        fluree.r2rml_cache(),
+                        &table,
+                        metadata,
+                        schema.row_count,
+                        deadline,
+                        || crate::graph_source::catalog_read_storage(cfg, &load),
+                    )
+                    .await;
+                    Some((table, row_count, schema.snapshot.id, has_deletes))
                 }
             })
             .buffered(INFO_COUNT_FETCH_CONCURRENCY)
@@ -1800,6 +1834,82 @@ async fn fetch_virtual_table_row_counts(
     }
     mor_approximate_tables.sort();
     (counts, snapshot_id, mor_approximate_tables)
+}
+
+/// One virtual table's `/info` row count, and whether it is a merge-on-read
+/// upper bound (the table belongs in [`Source::mor_approximate_tables`]).
+///
+/// The count comes from the first of these that has it:
+/// 1. `summary_rows`, the snapshot summary's `total-records` as
+///    `table_schema_from_metadata` read it. Zero-I/O, and most writers set it.
+/// 2. The manifest-list totals cache, keyed by the snapshot's manifest-list
+///    location.
+/// 3. One read of that manifest list ([`ManifestListTotals`]), cached for the
+///    next call. `total-records` is optional in the Iceberg spec, and BigQuery
+///    writes a summary of only `operation`.
+///
+/// `open_storage` runs only on a cache miss, so a warm `/info` builds no
+/// storage and reads nothing. A failed read caches nothing and omits the count.
+///
+/// Only the manifest-list read (building its storage and reading the list) is
+/// bounded by `deadline`, and an overrun omits only this table's count. A count
+/// from the summary never waits on anything, and a cache hit is served even
+/// past the deadline: the cache is looked up before the timer starts.
+///
+/// MoR rider (F-AUD-1): neither source subtracts position/equality deletes,
+/// which Fluree recognizes but does not yet apply, so both over-count a
+/// merge-on-read table. The table is flagged when the summary's delete
+/// counters say so (fail-closed: see
+/// [`metadata_indicates_mor_approximate_count`]) or, when the manifest list
+/// was the source, when it lists any delete manifest.
+///
+/// [`ManifestListTotals`]: fluree_db_iceberg::ManifestListTotals
+#[cfg(feature = "iceberg")]
+async fn virtual_table_row_count<S, E, F, Fut>(
+    cache: &crate::graph_source::R2rmlCache,
+    table: &str,
+    metadata: &fluree_db_iceberg::metadata::TableMetadata,
+    summary_rows: Option<i64>,
+    deadline: tokio::time::Instant,
+    open_storage: F,
+) -> (Option<i64>, bool)
+where
+    S: fluree_db_iceberg::SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    let summary_mor = metadata_indicates_mor_approximate_count(metadata);
+    if summary_rows.is_some() {
+        return (summary_rows, summary_mor);
+    }
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return (None, summary_mor);
+    };
+    if let Some(totals) =
+        crate::graph_source::cached_manifest_list_totals_hit(Some(cache), snapshot)
+    {
+        return (
+            totals.row_count,
+            summary_mor || totals.has_delete_manifests(),
+        );
+    }
+    let read =
+        crate::graph_source::read_manifest_list_totals(Some(cache), table, snapshot, open_storage);
+    match tokio::time::timeout_at(deadline, read).await {
+        Ok(Some(totals)) => (
+            totals.row_count,
+            summary_mor || totals.has_delete_manifests(),
+        ),
+        Ok(None) => (None, summary_mor),
+        Err(_) => {
+            tracing::debug!(
+                table,
+                "virtual ledger-info: manifest-list read exceeded the count budget; count omitted"
+            );
+            (None, summary_mor)
+        }
+    }
 }
 
 /// Whether a virtual (Iceberg) table's snapshot-summary row count must be treated
@@ -1892,11 +2002,14 @@ async fn build_iceberg_virtual_info(
     meta.tables = tables.clone();
 
     // Best-effort per-table row counts + snapshot id via Iceberg metadata only
-    // (loadTable snapshot summary — reads no manifest/Parquet data). A single
+    // (loadTable snapshot summary, else the cached manifest-list totals — reads
+    // no manifest/Parquet data). A single
     // shared catalog client + bounded concurrency replaces the old serial,
-    // client-per-table loop; the whole fetch is time-boxed so a slow / offline
+    // client-per-table loop; the fetch is time-boxed so a slow / offline
     // catalog degrades counts to empty (and snapshot to `None`) while the schema
-    // (classes/properties, derived from the mapping) still renders on time.
+    // (classes/properties, derived from the mapping) still renders on time. The
+    // box is one deadline applied to each step, not to the whole fetch, so a
+    // step that overruns loses only its own table's count.
     let budget_ms = info_count_budget_ms();
     let (counts, fetched_snapshot, mor_approximate_tables): (
         HashMap<String, i64>,
@@ -1904,22 +2017,9 @@ async fn build_iceberg_virtual_info(
         Vec<String>,
     ) = match cfg.as_ref() {
         Some(cfg) if budget_ms > 0 => {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(budget_ms),
-                fetch_virtual_table_row_counts(fluree, record, cfg, &tables),
-            )
-            .await
-            {
-                Ok(res) => res,
-                Err(_) => {
-                    tracing::debug!(
-                        graph_source = %record.graph_source_id,
-                        budget_ms,
-                        "virtual ledger-info: row-count fetch exceeded budget; counts omitted"
-                    );
-                    (HashMap::new(), None, Vec::new())
-                }
-            }
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+            fetch_virtual_table_row_counts(fluree, record, cfg, &tables, deadline).await
         }
         _ => (HashMap::new(), None, Vec::new()),
     };
@@ -2831,6 +2931,318 @@ mod tests {
         assert!(!metadata_indicates_mor_approximate_count(&clean));
     }
 
+    // ------------------------------------------------------------------
+    // virtual_table_row_count: summary first, else the manifest list, cached.
+    // ------------------------------------------------------------------
+
+    /// A BigQuery-written table: its snapshot summary is only
+    /// `{"operation": "overwrite"}`; its manifest list states 2,000,000 rows.
+    #[cfg(feature = "iceberg")]
+    const BQ_METADATA: &[u8] =
+        include_bytes!("../../fluree-db-iceberg/tests/fixtures/bigquery/big.metadata.json");
+    #[cfg(feature = "iceberg")]
+    const BQ_MANIFEST_LIST: &[u8] =
+        include_bytes!("../../fluree-db-iceberg/tests/fixtures/bigquery/big.manifest-list.avro");
+    #[cfg(feature = "iceberg")]
+    const BQ_ROWS: i64 = 2_000_000;
+
+    /// In-memory storage that counts every read.
+    #[cfg(feature = "iceberg")]
+    #[derive(Debug, Default)]
+    struct CountingStorage {
+        files: HashMap<String, bytes::Bytes>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "iceberg")]
+    impl CountingStorage {
+        fn with_file(path: &str, data: &'static [u8]) -> Arc<Self> {
+            let mut files = HashMap::new();
+            files.insert(path.to_string(), bytes::Bytes::from_static(data));
+            Arc::new(Self {
+                files,
+                ..Default::default()
+            })
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[async_trait]
+    impl fluree_db_iceberg::SendIcebergStorage for CountingStorage {
+        async fn read(&self, path: &str) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| fluree_db_iceberg::IcebergError::storage(format!("no {path}")))
+        }
+        async fn read_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            let data = self.read(path).await?;
+            Ok(data.slice(range.start as usize..range.end as usize))
+        }
+        async fn file_size(&self, path: &str) -> fluree_db_iceberg::Result<u64> {
+            Ok(self.read(path).await?.len() as u64)
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn bq_metadata() -> fluree_db_iceberg::metadata::TableMetadata {
+        fluree_db_iceberg::metadata::TableMetadata::from_json(BQ_METADATA).unwrap()
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn bq_manifest_list_path(metadata: &fluree_db_iceberg::metadata::TableMetadata) -> String {
+        metadata
+            .current_snapshot()
+            .and_then(|s| s.manifest_list_location())
+            .unwrap()
+            .to_string()
+    }
+
+    /// The count `/info` reports for a table, opening `storage` only when the
+    /// resolver asks for it; also returns how many times it asked.
+    #[cfg(feature = "iceberg")]
+    async fn count_with(
+        cache: &crate::graph_source::R2rmlCache,
+        metadata: &fluree_db_iceberg::metadata::TableMetadata,
+        storage: &Arc<CountingStorage>,
+    ) -> ((Option<i64>, bool), usize) {
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let summary_rows = crate::graph_source::table_schema_from_metadata(
+            &TableIdentifier::new("ns", "t"),
+            metadata,
+        )
+        .unwrap()
+        .row_count;
+        let out = virtual_table_row_count(
+            cache,
+            "ns.t",
+            metadata,
+            summary_rows,
+            far_deadline(),
+            || {
+                opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok::<_, String>(Arc::clone(storage)))
+            },
+        )
+        .await;
+        (out, opened.into_inner())
+    }
+
+    /// A count budget no test reaches.
+    #[cfg(feature = "iceberg")]
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
+    /// Storage that never comes: its open never completes.
+    #[cfg(feature = "iceberg")]
+    fn never_opens(
+    ) -> impl std::future::Future<Output = std::result::Result<Arc<CountingStorage>, String>> {
+        std::future::pending()
+    }
+
+    /// The count budget bounds the manifest-list read and nothing else: a read
+    /// that never finishes costs only this table's count, and returns by the
+    /// deadline; a count from the summary is kept with the deadline long past.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_budget_bounds_only_the_manifest_list_read() {
+        let metadata = bq_metadata();
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let budget = std::time::Duration::from_millis(50);
+
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + budget;
+        // Bounded here too, so an unbounded read fails this test instead of
+        // hanging it.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            virtual_table_row_count(&cache, "ns.t", &metadata, None, deadline, never_opens),
+        )
+        .await
+        .expect("the manifest-list read is bounded by the deadline");
+        assert_eq!(out, (None, false), "the overrun omits this table's count");
+        let took = started.elapsed();
+        assert!(
+            took >= budget && took < std::time::Duration::from_secs(5),
+            "returned at the deadline, not before it and not long after: {took:?}"
+        );
+
+        let passed = tokio::time::Instant::now();
+        let out =
+            virtual_table_row_count(&cache, "ns.t", &metadata, Some(1234), passed, never_opens)
+                .await;
+        assert_eq!(out, (Some(1234), false), "a summary count never waits");
+    }
+
+    /// A warm `/info` is never cut by the budget: the cache is looked up before
+    /// the deadline is consulted, so a hit is served with the deadline already
+    /// past.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_cache_hit_is_served_past_the_deadline() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let _ = count_with(&cache, &metadata, &storage).await;
+        assert_eq!(storage.reads(), 1, "warmed");
+
+        let passed = tokio::time::Instant::now();
+        let out =
+            virtual_table_row_count(&cache, "ns.t", &metadata, None, passed, never_opens).await;
+        assert_eq!(out, (Some(BQ_ROWS), false));
+        assert_eq!(storage.reads(), 1, "no read");
+    }
+
+    #[cfg(feature = "iceberg")]
+    use crate::graph_source::TableIdentifier;
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_falls_back_to_the_manifest_list_when_the_summary_has_no_total() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let ((rows, approximate), opened) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(rows, Some(BQ_ROWS));
+        assert!(
+            !approximate,
+            "no delete manifest, no summary delete counter"
+        );
+        assert_eq!(opened, 1);
+        assert_eq!(storage.reads(), 1, "one read: the manifest list");
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_second_call_is_served_from_the_cache_without_io() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let (first, _) = count_with(&cache, &metadata, &storage).await;
+        let (second, opened) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(second, first);
+        assert_eq!(second.0, Some(BQ_ROWS));
+        assert_eq!(opened, 0, "a warm call builds no storage");
+        assert_eq!(
+            storage.reads(),
+            1,
+            "the manifest list was read once, by the first call"
+        );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_prefers_the_summary_and_reads_nothing() {
+        let mut metadata = bq_metadata();
+        let snapshot = metadata.snapshots.last_mut().unwrap();
+        snapshot
+            .summary
+            .insert("total-records".to_string(), "1234".to_string());
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let ((rows, approximate), opened) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(
+            rows,
+            Some(1234),
+            "the summary's count, not the manifest list's"
+        );
+        assert!(!approximate);
+        assert_eq!(opened, 0);
+        assert_eq!(storage.reads(), 0);
+    }
+
+    /// The MoR rule on the manifest-list rung: totals that list a delete
+    /// manifest make the count an upper bound, though the summary has no
+    /// delete counter to say so. (That a `content = 1` entry is counted as a
+    /// delete manifest, and its rows left out, is pinned in fluree-db-iceberg.)
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_from_a_manifest_list_with_delete_manifests_is_approximate() {
+        let metadata = bq_metadata();
+        let list = bq_manifest_list_path(&metadata);
+        let storage = CountingStorage::with_file(&list, BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        cache.put_manifest_list_totals(
+            list,
+            fluree_db_iceberg::ManifestListTotals {
+                row_count: Some(1000),
+                data_file_count: Some(1),
+                delete_manifests: 1,
+            },
+        );
+
+        let ((rows, approximate), _) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(rows, Some(1000));
+        assert!(
+            approximate,
+            "a delete manifest makes the count an upper bound"
+        );
+        assert!(
+            !metadata_indicates_mor_approximate_count(&metadata),
+            "precondition"
+        );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_failed_read_omits_the_count_and_caches_nothing() {
+        let metadata = bq_metadata();
+        let empty = Arc::new(CountingStorage::default());
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let ((rows, _), _) = count_with(&cache, &metadata, &empty).await;
+        assert_eq!(rows, None);
+
+        // The failure was not cached: once the file is readable, it is read.
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let ((rows, _), _) = count_with(&cache, &metadata, &storage).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+    }
+
+    /// A writer that records both (pyiceberg): the manifest list's live totals
+    /// equal the summary's `total-records` / `total-data-files`, so the
+    /// fallback reports what the summary would have.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn manifest_list_totals_agree_with_a_summary_that_has_them() {
+        let metadata = fluree_db_iceberg::metadata::TableMetadata::from_json(include_bytes!(
+            "../tests/fixtures/iceberg/silver/people/metadata/00002-0cd2711a-f4be-4249-b237-67c0d02c3c5a.metadata.json"
+        ))
+        .unwrap();
+        let snapshot = metadata.current_snapshot().unwrap();
+        let totals = fluree_db_iceberg::ManifestListTotals::from_manifest_list(
+            &bytes::Bytes::from_static(include_bytes!(
+                "../tests/fixtures/iceberg/silver/people/metadata/snap-6806124999863420423-0-c2852ed8-7594-407b-9b93-20238dcdfef2.avro"
+            )),
+        )
+        .unwrap();
+        assert_eq!(snapshot.total_records(), Some(5));
+        assert_eq!(totals.row_count, snapshot.total_records());
+        assert_eq!(totals.data_file_count, snapshot.total_data_files());
+        assert_eq!(totals.delete_manifests, 0);
+    }
+
     #[test]
     fn test_compute_selectivity() {
         assert_eq!(compute_selectivity(100, 50), 2);
@@ -3285,7 +3697,10 @@ mod tests {
     }
 
     /// Golden: same mapping with NO row counts — schema still renders, every
-    /// count is an explicit `null`, `table-row-counts` is `{}`.
+    /// count is an explicit `null`, `table-row-counts` is `{}`. This is the
+    /// shape for counts that are genuinely unknown (catalog unreachable, budget
+    /// spent, or neither the summary nor the manifest list states them), not
+    /// for a table whose writer merely omits the summary's `total-records`.
     #[test]
     fn test_virtual_ledger_info_golden_null_counts() {
         let record = virtual_record("{}");

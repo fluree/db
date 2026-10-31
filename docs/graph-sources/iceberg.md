@@ -76,6 +76,8 @@ fluree iceberg map orders \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
+For a catalog-backed source, `info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. The count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`, and its class and property counts are `null`.
+
 #### Warehouse-root `--table-location` (multi-table, catalog-less)
 
 `--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name (the namespace prefix stripped). Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
@@ -1232,7 +1234,7 @@ triples map a scan skipped because its predicates were hidden.
 | --- | --- | --- |
 | `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
-| `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch; `0` returns structure only. |
+| `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch. A table whose count is not read by then has none; the others keep theirs. `0` returns structure only. |
 
 ## Troubleshooting
 

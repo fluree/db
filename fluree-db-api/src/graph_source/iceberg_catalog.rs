@@ -4,8 +4,9 @@
 //! feeds the deterministic R2RML generator (PR-1 item (c), a separate lane) and
 //! the solo onboarding flow (PR-2). Everything here is **metadata-only**: browse
 //! lists namespaces/tables via the REST catalog, Tier-A preview reads the inline
-//! `metadata` object the REST `loadTable` response already carries (no S3), and
-//! Tier-B preview aggregates per-column statistics from the snapshot's
+//! `metadata` object the REST `loadTable` response already carries (no S3, but
+//! for one cached manifest-list read when the snapshot summary omits the row
+//! and file totals), and Tier-B preview aggregates per-column statistics from the snapshot's
 //! manifest-list + manifest Avro files (never a Parquet/data file).
 //!
 //! All entry points accept an inline [`IcebergConnectionConfig`] so onboarding
@@ -358,10 +359,17 @@ const MOR_UPPER_BOUND_WARNING: &str =
 #[serde(rename_all = "lowercase")]
 pub enum StatsTier {
     /// Tier-A: schema only (columns/types/partition/sort/snapshot), from the
-    /// inline REST `loadTable` metadata. No S3 reads.
+    /// inline REST `loadTable` metadata. Manifest-free: the one storage read is
+    /// of the snapshot's manifest list, cached, and only when the snapshot
+    /// summary omits the row or data-file total. Display-only, so it never
+    /// refuses a merge-on-read snapshot: delete files its summary or its
+    /// manifest list reports make its counts upper bounds, flagged by
+    /// `has_delete_files` and a warning.
     Schema,
     /// Tier-A + Tier-B: additionally aggregate per-column statistics from the
-    /// snapshot's manifest-list + manifest Avro files (never a data file).
+    /// snapshot's manifest-list + manifest Avro files (never a data file). A
+    /// merge-on-read snapshot is refused (409) unless
+    /// `FLUREE_ICEBERG_ALLOW_MOR_DELETES` is set.
     Stats,
 }
 
@@ -466,11 +474,14 @@ pub struct TableSchema {
     pub current_schema_id: i32,
     /// The current snapshot.
     pub snapshot: SnapshotRef,
-    /// Authoritative row count from the snapshot summary.
+    /// Authoritative row count: the snapshot summary's `total-records`, else
+    /// the manifest list's live-row total (Schema tier) or the manifests' sum
+    /// (Stats tier).
     pub row_count: Option<i64>,
-    /// Authoritative data-file count from the snapshot summary.
+    /// Authoritative data-file count, from the same sources as `row_count`.
     pub data_file_count: Option<i64>,
-    /// Authoritative on-disk byte count from the snapshot summary.
+    /// Authoritative on-disk byte count: the summary's `total-files-size`, else
+    /// the manifests' sum (Stats tier only; the manifest list does not carry it).
     pub total_bytes: Option<i64>,
     /// Iceberg row-identity hint (equality-delete identity) — the primary PK signal.
     pub identifier_field_ids: Vec<i32>,
@@ -496,8 +507,11 @@ pub struct StatsCompleteness {
     pub manifests_read: usize,
     /// Whether any column carried lower/upper bounds in the manifests read.
     pub had_column_bounds: bool,
-    /// Whether the snapshot carries **merge-on-read delete files**. When `true`,
-    /// the aggregated `row_count` / value / null counts are **upper bounds**:
+    /// Whether the snapshot carries **merge-on-read delete files**: on the Stats
+    /// tier, as its manifest list shows; on the Schema tier, as its summary's
+    /// delete counters or (when it fills counts from the list) its manifest
+    /// list show. The Schema tier reports these rather than refusing them. When
+    /// `true`, the `row_count` / value / null counts are **upper bounds**:
     /// they sum live data-file records without subtracting position/equality
     /// deletes, so they are not exact.
     #[serde(default)]
@@ -695,18 +709,22 @@ pub(crate) fn table_schema_from_metadata(
     })
 }
 
-/// Run the zero-I/O snapshot-summary MoR guard (audit F-AUD-1) that BOTH preview
-/// tiers share, BEFORE any summary-derived count is surfaced. The Schema tier
-/// fills `row_count` from `total-records` and the Stats tier aggregates over the
-/// live data files; neither subtracts merge-on-read deletes, so both over-count a
-/// MoR snapshot. Mirrors the two scan planners (which run the same zero-I/O
-/// summary guard), so the preview can no longer return silent over-counts the
-/// planners would refuse.
+/// Run the zero-I/O snapshot-summary MoR guard (audit F-AUD-1) for the Stats
+/// tier, BEFORE any summary-derived count is surfaced. The Stats tier aggregates
+/// over the live data files without subtracting merge-on-read deletes, so it
+/// over-counts a MoR snapshot. Mirrors the two scan planners (which run the same
+/// zero-I/O summary guard), so the Stats tier cannot return silent over-counts
+/// the planners would refuse.
+///
+/// The Schema tier does not run it: it is display-only, so a snapshot whose
+/// summary reports deletes previews with its counts flagged as upper bounds
+/// (`has_delete_files` and the warning), as one whose manifest list shows
+/// delete manifests does. See [`preview_summary_guard_for`].
 ///
 /// Returns the operator override flag (`FLUREE_ICEBERG_ALLOW_MOR_DELETES`) so the
 /// Stats-tier manifest-list backstop reuses it and the env is read exactly once.
 /// `table_display` is the W2 "qualified (location)" identifier. Extracted so the
-/// two-tier guard is unit-testable without a live catalog.
+/// guard is unit-testable without a live catalog.
 fn preview_summary_guard(metadata: &TableMetadata, table_display: &str) -> Result<bool> {
     match metadata.current_snapshot() {
         Some(snapshot) => {
@@ -721,6 +739,21 @@ fn preview_summary_guard(metadata: &TableMetadata, table_display: &str) -> Resul
         // No current snapshot ⇒ no counts to over-count; still surface the
         // override flag for the (delete-free) Stats manifest path.
         None => Ok(fluree_db_iceberg::mor_deletes_allowed()),
+    }
+}
+
+/// The summary guard as `tier` applies it: the Stats tier refuses a snapshot
+/// whose summary reports deletes (unless overridden); the Schema tier is
+/// display-only and never refuses, so it reads the override as off (it reports
+/// deletes as upper bounds whether or not reads are allowed to proceed).
+fn preview_summary_guard_for(
+    tier: StatsTier,
+    metadata: &TableMetadata,
+    table_display: &str,
+) -> Result<bool> {
+    match tier {
+        StatsTier::Stats => preview_summary_guard(metadata, table_display),
+        StatsTier::Schema => Ok(false),
     }
 }
 
@@ -743,12 +776,29 @@ fn preview_counts_are_upper_bounds(
 /// **Metadata-only**: Tier-A reads the table metadata JSON — inline from the
 /// REST `loadTable` response, or (for the AWS SDK catalogs, which return only a
 /// `metadata_location`) fetched + parsed from S3 — never a Parquet/data file.
+/// Tier-A is manifest-free: when the snapshot summary omits the totals
+/// (BigQuery writes only `operation`), it makes one read of the snapshot's
+/// manifest list for them (see [`schema_counts_from_manifest_list`]).
 /// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files.
 /// Direct catalog mode returns a clear typed error (there is no catalog to load).
+///
+/// This free function has no process cache, so Tier-A's manifest-list read
+/// repeats on every call; [`crate::Fluree::preview_iceberg_table`] caches it.
 pub async fn preview_iceberg_table(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     tier: StatsTier,
+) -> Result<TablePreview> {
+    preview_iceberg_table_in(conn, table, tier, None).await
+}
+
+/// [`preview_iceberg_table`], with the cache Tier-A's manifest-list totals go
+/// through (the one virtual `/info` uses).
+async fn preview_iceberg_table_in(
+    conn: IcebergConnectionConfig,
+    table: TableIdentifier,
+    tier: StatsTier,
+    cache: Option<&super::R2rmlCache>,
 ) -> Result<TablePreview> {
     let (catalog, _uri, _wh) = catalog_client(&conn, "table preview").await?;
     let table_id = table.to_catalog();
@@ -768,23 +818,34 @@ pub async fn preview_iceberg_table(
     // (they pass the location) plus the friendlier qualified name.
     let table_display = format!("{} ({})", table.qualified(), metadata.location);
 
-    // D1 (audit F-AUD-1): run the summary MoR guard for EVERY tier before any
-    // summary-derived count is surfaced. Returns the override flag reused by the
-    // Stats-tier manifest backstop below.
-    let allow_mor = preview_summary_guard(metadata, &table_display)?;
+    // D1 (audit F-AUD-1): run the summary MoR guard before any summary-derived
+    // count is surfaced. The Stats tier refuses a snapshot whose summary reports
+    // deletes; the display-only Schema tier flags it as upper bounds instead
+    // (below). Returns the override flag reused by the Stats-tier manifest
+    // backstop.
+    let allow_mor = preview_summary_guard_for(tier, metadata, &table_display)?;
 
     let mut schema = table_schema_from_metadata(&table, metadata)?;
 
     match tier {
         StatsTier::Schema => {
-            // Schema tier reads no manifests (`has_delete_files` stays false), but
-            // its `row_count` comes from `total-records`, which over-counts a MoR
-            // snapshot. Under the override the guard proceeded, so caveat the count.
+            // Schema tier reads no manifests, but its `row_count` comes from
+            // `total-records`, else the manifest list; both over-count a MoR
+            // snapshot. It is display-only, so it never refuses: deletes either
+            // signal reports make the counts upper bounds, flagged as such.
             let mut warnings = Vec::new();
+            let list_deletes =
+                schema_counts_from_manifest_list(cache, &mut schema, metadata, || async {
+                    build_preview_storage(&conn, load.credentials.as_ref())
+                        .await
+                        .map(Arc::new)
+                })
+                .await;
             let summary_deletes = metadata
                 .current_snapshot()
                 .is_some_and(fluree_db_iceberg::summary_indicates_deletes);
-            if preview_counts_are_upper_bounds(allow_mor, false, summary_deletes) {
+            let has_delete_files = schema_counts_are_upper_bounds(list_deletes, summary_deletes);
+            if has_delete_files {
                 warnings.push(MOR_UPPER_BOUND_WARNING.to_string());
             }
             Ok(TablePreview {
@@ -793,7 +854,7 @@ pub async fn preview_iceberg_table(
                     tier: "schema".to_string(),
                     manifests_read: 0,
                     had_column_bounds: false,
-                    has_delete_files: false,
+                    has_delete_files,
                 },
                 warnings,
             })
@@ -895,6 +956,53 @@ pub async fn preview_iceberg_table(
             })
         }
     }
+}
+
+/// Schema tier: fill the row and data-file totals the snapshot summary omits
+/// from the snapshot's manifest list, one read cached by its location (through
+/// [`super::cached_manifest_list_totals`], as virtual `/info` does), never a
+/// manifest. A summary with both totals reads nothing.
+///
+/// Best-effort: when the list cannot be read the fields stay `None` and the
+/// preview proceeds. A list that shows delete manifests is a merge-on-read
+/// snapshot: the totals are still filled, as the upper bounds they are, and
+/// the return is `true` so the preview flags them (`has_delete_files` and the
+/// upper-bound warning). This tier is display-only, so it does not refuse; a
+/// query of the same snapshot is refused by the scan planner, which reads the
+/// same list.
+async fn schema_counts_from_manifest_list<S, E, F, Fut>(
+    cache: Option<&super::R2rmlCache>,
+    schema: &mut TableSchema,
+    metadata: &TableMetadata,
+    open_storage: F,
+) -> bool
+where
+    S: SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    if schema.row_count.is_some() && schema.data_file_count.is_some() {
+        return false;
+    }
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return false;
+    };
+    let Some(totals) =
+        super::cached_manifest_list_totals(cache, &schema.table, snapshot, open_storage).await
+    else {
+        return false;
+    };
+    schema.row_count = schema.row_count.or(totals.row_count);
+    schema.data_file_count = schema.data_file_count.or(totals.data_file_count);
+    totals.has_delete_manifests()
+}
+
+/// Whether a Schema-tier preview's counts are upper bounds: the manifest list
+/// it filled them from shows delete manifests, or the summary reports deletes.
+/// The tier reports either rather than refusing it, override or not.
+fn schema_counts_are_upper_bounds(list_deletes: bool, summary_deletes: bool) -> bool {
+    list_deletes || summary_deletes
 }
 
 /// Lift an [`IcebergError`](fluree_db_iceberg::IcebergError) raised at a
@@ -1140,8 +1248,10 @@ fn to_api_column_stats(a: &AggregatedColumnStats) -> ColumnStats {
 
 impl crate::Fluree {
     /// Preview an Iceberg table's schema (Tier-A) and optionally its per-column
-    /// statistics (Tier-B). Convenience wrapper over the stateless
-    /// [`preview_iceberg_table`] free function.
+    /// statistics (Tier-B). Wraps the [`preview_iceberg_table`] free function,
+    /// with Tier-A's manifest-list totals cached in this instance's
+    /// [`R2rmlCache`](super::R2rmlCache), so a repeat preview of the same
+    /// snapshot reads nothing.
     pub async fn preview_iceberg_table(
         &self,
         conn: IcebergConnectionConfig,
@@ -1149,7 +1259,7 @@ impl crate::Fluree {
         tier: StatsTier,
     ) -> Result<TablePreview> {
         let conn = self.hydrate_conn(conn).await?;
-        preview_iceberg_table(conn, table, tier).await
+        preview_iceberg_table_in(conn, table, tier, Some(self.r2rml_cache())).await
     }
 }
 
@@ -1837,13 +1947,21 @@ mod tests {
     }
 
     #[test]
-    fn preview_summary_guard_refuses_mor_deletes_for_both_tiers() {
-        // D1: the summary guard runs BEFORE the tier split, so a single refusal
-        // covers Schema AND Stats (the tier arms are unreachable once it errors).
+    fn preview_summary_guard_refuses_mor_deletes_on_the_stats_tier_only() {
+        // D1: the summary guard runs BEFORE any summary-derived count, and the
+        // Stats tier refuses on it. The display-only Schema tier does not: it
+        // reports the deletes as upper bounds (see
+        // `summary_reported_deletes_preview_as_upper_bounds_on_the_schema_tier_only`).
         // Guard active: FLUREE_ICEBERG_ALLOW_MOR_DELETES is unset in the test env.
         let metadata = metadata_with_summary_deletes();
-        let err = preview_summary_guard(&metadata, "DW.SALES (s3://bucket/dw/sales)")
-            .expect_err("summary-reported deletes must refuse");
+        let display = "DW.SALES (s3://bucket/dw/sales)";
+        assert!(
+            !preview_summary_guard_for(StatsTier::Schema, &metadata, display)
+                .expect("the Schema tier is not refused"),
+            "and reads the override as off"
+        );
+        let err = preview_summary_guard_for(StatsTier::Stats, &metadata, display)
+            .expect_err("summary-reported deletes must refuse the Stats tier");
         // W3: typed error → 409 Conflict, not a 400 config error.
         assert_eq!(
             err.status_code(),
@@ -2259,5 +2377,237 @@ mod tests {
             err.to_string().contains("Direct catalog mode"),
             "error should explain Direct mode is unsupported, got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Schema tier: totals from the manifest list when the summary omits them.
+    // ------------------------------------------------------------------
+
+    /// A BigQuery-written table: its snapshot summary is only
+    /// `{"operation": "overwrite"}`; its manifest list states 2,000,000 rows in
+    /// 4 data files.
+    const BQ_METADATA: &[u8] =
+        include_bytes!("../../../fluree-db-iceberg/tests/fixtures/bigquery/big.metadata.json");
+    const BQ_MANIFEST_LIST: &[u8] =
+        include_bytes!("../../../fluree-db-iceberg/tests/fixtures/bigquery/big.manifest-list.avro");
+
+    /// One readable file (or none), and a count of reads.
+    #[derive(Debug, Default)]
+    struct ListStorage {
+        file: Option<(String, bytes::Bytes)>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ListStorage {
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for ListStorage {
+        async fn read(&self, path: &str) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &self.file {
+                Some((p, data)) if p == path => Ok(data.clone()),
+                _ => Err(fluree_db_iceberg::IcebergError::storage(format!(
+                    "no {path}"
+                ))),
+            }
+        }
+        async fn read_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            Ok(self
+                .read(path)
+                .await?
+                .slice(range.start as usize..range.end as usize))
+        }
+        async fn file_size(&self, path: &str) -> fluree_db_iceberg::Result<u64> {
+            Ok(self.read(path).await?.len() as u64)
+        }
+    }
+
+    fn bq_metadata() -> TableMetadata {
+        TableMetadata::from_json(BQ_METADATA).unwrap()
+    }
+
+    fn bq_list_storage(metadata: &TableMetadata) -> Arc<ListStorage> {
+        let path = metadata
+            .current_snapshot()
+            .and_then(|s| s.manifest_list_location())
+            .unwrap()
+            .to_string();
+        Arc::new(ListStorage {
+            file: Some((path, bytes::Bytes::from_static(BQ_MANIFEST_LIST))),
+            ..Default::default()
+        })
+    }
+
+    /// Run the Schema-tier fill over `metadata`; returns the schema, the
+    /// outcome, and how many times storage was asked for.
+    async fn schema_fill(
+        cache: Option<&super::super::R2rmlCache>,
+        metadata: &TableMetadata,
+        storage: &Arc<ListStorage>,
+    ) -> (TableSchema, bool, usize) {
+        let mut schema =
+            table_schema_from_metadata(&TableIdentifier::new("ns", "big"), metadata).unwrap();
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let out = schema_counts_from_manifest_list(cache, &mut schema, metadata, || {
+            opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok::<_, String>(Arc::clone(storage)))
+        })
+        .await;
+        (schema, out, opened.into_inner())
+    }
+
+    #[tokio::test]
+    async fn schema_tier_takes_totals_the_summary_omits_from_the_manifest_list() {
+        let metadata = bq_metadata();
+        let storage = bq_list_storage(&metadata);
+        let cache = super::super::R2rmlCache::with_defaults();
+
+        let (schema, out, opened) = schema_fill(Some(&cache), &metadata, &storage).await;
+        assert!(!out, "no delete manifest");
+        assert_eq!(schema.row_count, Some(2_000_000));
+        assert_eq!(schema.data_file_count, Some(4));
+        assert_eq!(
+            schema.total_bytes, None,
+            "the manifest list has no byte total"
+        );
+        assert_eq!((opened, storage.reads()), (1, 1));
+
+        // A repeat preview of the same snapshot reads nothing.
+        let (schema, _, opened) = schema_fill(Some(&cache), &metadata, &storage).await;
+        assert_eq!(schema.row_count, Some(2_000_000));
+        assert_eq!((opened, storage.reads()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn schema_tier_with_summary_totals_reads_no_manifest_list() {
+        let mut metadata = bq_metadata();
+        let summary = &mut metadata.snapshots.last_mut().unwrap().summary;
+        summary.insert("total-records".to_string(), "10".to_string());
+        summary.insert("total-data-files".to_string(), "1".to_string());
+        let storage = bq_list_storage(&metadata);
+
+        let (schema, out, opened) = schema_fill(None, &metadata, &storage).await;
+        assert!(!out);
+        assert_eq!(schema.row_count, Some(10), "the summary's, not the list's");
+        assert_eq!(schema.data_file_count, Some(1));
+        assert_eq!((opened, storage.reads()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn schema_tier_failed_manifest_list_read_leaves_counts_unknown() {
+        let metadata = bq_metadata();
+        let unreadable = Arc::new(ListStorage::default());
+
+        let (schema, out, _) = schema_fill(None, &metadata, &unreadable).await;
+        assert!(!out, "a failed read does not fail the preview");
+        assert_eq!(schema.row_count, None);
+        assert_eq!(schema.data_file_count, None);
+        assert_eq!(unreadable.reads(), 1);
+    }
+
+    /// A list with a delete manifest does not refuse this display-only tier:
+    /// the totals are filled and flagged as the upper bounds they are, with or
+    /// without the override. (A query of the snapshot is refused by the scan
+    /// planner, which reads the same list.)
+    #[tokio::test]
+    async fn schema_tier_reports_a_delete_bearing_list_as_upper_bounds() {
+        let metadata = bq_metadata();
+        let storage = bq_list_storage(&metadata);
+        let cache = super::super::R2rmlCache::with_defaults();
+        cache.put_manifest_list_totals(
+            metadata
+                .current_snapshot()
+                .and_then(|s| s.manifest_list_location())
+                .unwrap()
+                .to_string(),
+            fluree_db_iceberg::ManifestListTotals {
+                row_count: Some(1000),
+                data_file_count: Some(1),
+                delete_manifests: 1,
+            },
+        );
+
+        let (schema, list_deletes, _) = schema_fill(Some(&cache), &metadata, &storage).await;
+        assert!(list_deletes, "flagged");
+        assert_eq!(schema.row_count, Some(1000));
+        assert_eq!(schema.data_file_count, Some(1));
+        assert!(
+            schema_counts_are_upper_bounds(list_deletes, false),
+            "caveated"
+        );
+    }
+
+    #[test]
+    fn schema_counts_are_upper_bounds_only_when_a_delete_signal_fired() {
+        // Neither signal: exact.
+        assert!(!schema_counts_are_upper_bounds(false, false));
+        // Either signal is an upper bound; this tier refuses neither.
+        assert!(schema_counts_are_upper_bounds(true, false));
+        assert!(schema_counts_are_upper_bounds(false, true));
+        assert!(schema_counts_are_upper_bounds(true, true));
+    }
+
+    /// The Schema tier is display-only: a snapshot whose summary reports
+    /// deletes previews (no refusal), its counts flagged as upper bounds, as a
+    /// delete-bearing manifest list's are. The Stats tier still refuses it with
+    /// the typed 409. Through a REST catalog that returns the metadata inline;
+    /// the summary has both totals, so neither tier reaches storage first.
+    #[tokio::test]
+    async fn summary_reported_deletes_preview_as_upper_bounds_on_the_schema_tier_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut metadata: serde_json::Value = serde_json::from_str(SAMPLE_METADATA).unwrap();
+        let current = metadata["current-snapshot-id"].clone();
+        let snapshot = metadata["snapshots"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["snapshot-id"] == current)
+            .unwrap();
+        snapshot["summary"]["total-position-deletes"] = serde_json::json!("3");
+        let catalog = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&catalog)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/dw/tables/sales"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": "s3://bucket/dw/sales/metadata/v1.metadata.json",
+                "metadata": metadata,
+            })))
+            .mount(&catalog)
+            .await;
+        let conn = || IcebergConnectionConfig::rest(catalog.uri());
+        let table = || TableIdentifier::new("dw", "sales");
+
+        let preview = preview_iceberg_table(conn(), table(), StatsTier::Schema)
+            .await
+            .expect("the Schema tier previews a snapshot whose summary reports deletes");
+        assert!(preview.stats_completeness.has_delete_files, "flagged");
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w == MOR_UPPER_BOUND_WARNING),
+            "{:?}",
+            preview.warnings
+        );
+        assert_eq!(preview.schema.row_count, Some(1000), "the summary's count");
+
+        let err = preview_iceberg_table(conn(), table(), StatsTier::Stats)
+            .await
+            .expect_err("the Stats tier still refuses it");
+        assert_eq!(err.status_code(), 409, "{err}");
     }
 }

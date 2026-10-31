@@ -132,11 +132,8 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Replay the fixture into moto: the bucket and its objects, then the Glue
-/// database and tables. Idempotent, so a moto that already holds them is fine.
-async fn seed(endpoint: &str, fixture: &Fixture) {
-    use aws_sdk_glue::error::ProvideErrorMetadata;
-
+/// S3 and Glue clients for moto, with its dummy credentials.
+fn moto_clients(endpoint: &str) -> (aws_sdk_s3::Client, aws_sdk_glue::Client) {
     let credentials = aws_sdk_s3::config::Credentials::new("test", "test", None, None, "moto");
     let s3 = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::Config::builder()
@@ -155,6 +152,15 @@ async fn seed(endpoint: &str, fixture: &Fixture) {
             .endpoint_url(endpoint)
             .build(),
     );
+    (s3, glue)
+}
+
+/// Replay the fixture into moto: the bucket and its objects, then the Glue
+/// database and tables. Idempotent, so a moto that already holds them is fine.
+async fn seed(endpoint: &str, fixture: &Fixture) {
+    use aws_sdk_glue::error::ProvideErrorMetadata;
+
+    let (s3, glue) = moto_clients(endpoint);
 
     // moto may still be starting (a CI service container): wait for it.
     let mut ready = false;
@@ -232,6 +238,97 @@ async fn seed(endpoint: &str, fixture: &Fixture) {
             );
         }
     }
+}
+
+/// Register `copy` in Glue as `table` written by a writer that leaves the
+/// snapshot summary's totals out, as BigQuery does: a copy of `table`'s current
+/// metadata file with every summary reduced to `{"operation": "overwrite"}`,
+/// over the same manifest list and data files. Returns the totals the original
+/// summary recorded, `(total-records, total-data-files)`, as the oracle for
+/// what the manifest list must state. Idempotent, like `seed`.
+async fn seed_summaryless_copy(
+    endpoint: &str,
+    fixture: &Fixture,
+    table: &str,
+    copy: &str,
+) -> (i64, i64) {
+    use aws_sdk_glue::error::ProvideErrorMetadata;
+
+    let (s3, glue) = moto_clients(endpoint);
+    let (_, table_type, location, parameters) = fixture
+        .tables
+        .iter()
+        .find(|(name, ..)| name == table)
+        .expect("fixture table");
+    let key = parameters["metadata_location"]
+        .strip_prefix(&format!("s3://{}/", fixture.bucket))
+        .expect("metadata in the fixture bucket");
+    let mut metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture_dir().join("objects").join(key)).expect("read fixture metadata"),
+    )
+    .expect("parse fixture metadata");
+    let current = metadata["current-snapshot-id"].clone();
+    let summary = metadata["snapshots"]
+        .as_array()
+        .expect("snapshots")
+        .iter()
+        .find(|s| s["snapshot-id"] == current)
+        .expect("current snapshot")["summary"]
+        .clone();
+    let total = |k: &str| {
+        summary[k]
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("the fixture summary records {k}"))
+    };
+    let totals = (total("total-records"), total("total-data-files"));
+    for snapshot in metadata["snapshots"].as_array_mut().expect("snapshots") {
+        snapshot["summary"] = serde_json::json!({"operation": "overwrite"});
+    }
+
+    let copy_key = format!(
+        "warehouse/{}.db/{copy}/metadata/00000-summaryless.metadata.json",
+        fixture.database
+    );
+    s3.put_object()
+        .bucket(&fixture.bucket)
+        .key(&copy_key)
+        .body(serde_json::to_vec(&metadata).expect("metadata json").into())
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("put {copy_key}: {e:?}"));
+    let parameters = HashMap::from([
+        (
+            "metadata_location".to_string(),
+            format!("s3://{}/{copy_key}", fixture.bucket),
+        ),
+        ("table_type".to_string(), "ICEBERG".to_string()),
+    ]);
+    let input = aws_sdk_glue::types::TableInput::builder()
+        .name(copy)
+        .table_type(table_type)
+        .set_parameters(Some(parameters))
+        .storage_descriptor(
+            aws_sdk_glue::types::StorageDescriptor::builder()
+                .location(location)
+                .build(),
+        )
+        .build()
+        .expect("table input");
+    if let Err(e) = glue
+        .create_table()
+        .database_name(&fixture.database)
+        .table_input(input)
+        .send()
+        .await
+    {
+        assert_eq!(
+            e.code(),
+            Some("AlreadyExistsException"),
+            "create {copy}: {e:?}"
+        );
+    }
+    totals
 }
 
 /// An S3 Tables table bucket in moto holding `customers` from the fixture, and
@@ -689,6 +786,75 @@ async fn glue_catalog_mode_reads_tables_resolved_through_glue() {
             }
         }
         Err(e) => failures.push(format!("info: {e}")),
+    }
+
+    // A writer that leaves the summary's totals out (BigQuery writes only
+    // `operation`): `/info` and the Schema-tier preview take the count from the
+    // snapshot's manifest list, read through the source's own storage, built
+    // by the real builders and read from moto's S3. The original summary's
+    // totals are what the list must state.
+    let copy = "customers_summaryless";
+    let (records, data_files) = seed_summaryless_copy(&endpoint, &fixture, "customers", copy).await;
+    let read = rows(
+        &fluree,
+        glue_connection(&endpoint),
+        "customers-summaryless",
+        mapping(
+            db,
+            &CUSTOMERS.replace(".customers\"", &format!(".{copy}\"")),
+        ),
+        "?s",
+        ty("ex:Customer"),
+    )
+    .await;
+    eprintln!(
+        "{} a summary without totals: the table reads: {read:?}",
+        if read == Ok(50) { "pass" } else { "FAIL" }
+    );
+    if read != Ok(50) {
+        failures.push(format!(
+            "a summary without totals: the table reads: {read:?}"
+        ));
+    }
+    match fluree
+        .ledger_info("customers-summaryless:main")
+        .execute()
+        .await
+    {
+        Ok(info) => {
+            let count = info["source"]["table-row-counts"][format!("{db}.{copy}")].as_i64();
+            let ok = count == Some(records) && records == 50;
+            eprintln!(
+                "{} info, summary without totals: {copy}={count:?}",
+                if ok { "pass" } else { "FAIL" }
+            );
+            if !ok {
+                failures.push(format!("info, summary without totals: {}", info["source"]));
+            }
+        }
+        Err(e) => failures.push(format!("info, summary without totals: {e}")),
+    }
+    let summaryless = TableIdentifier {
+        namespace: db.to_string(),
+        name: copy.to_string(),
+    };
+    match preview_iceberg_table(glue_connection(&endpoint), summaryless, StatsTier::Schema).await {
+        Ok(preview) => {
+            let got = (preview.schema.row_count, preview.schema.data_file_count);
+            let ok = got == (Some(records), Some(data_files))
+                && !preview.stats_completeness.has_delete_files;
+            eprintln!(
+                "{} schema preview, summary without totals: rows, files = {got:?}",
+                if ok { "pass" } else { "FAIL" }
+            );
+            if !ok {
+                failures.push(format!(
+                    "schema preview, summary without totals: {got:?}, want {:?}",
+                    (records, data_files)
+                ));
+            }
+        }
+        Err(e) => failures.push(format!("schema preview, summary without totals: {e}")),
     }
 
     // Onboarding: browse lists the database and only its Iceberg tables.
