@@ -5,7 +5,9 @@
 //! template triple restates a triple of the WHERE, it writes the lists that
 //! triple read (`fluree-db-query`'s `list_entries`), which looks at each
 //! row's predicate on any ledger that has held a list. A ledger that has
-//! never held one skips that entirely.
+//! never held one skips that entirely. A JSON-LD crawl reads a blank-node
+//! value that heads a list stored as its triples as that list's members, and
+//! asks only on a graph holding an `rdf:first`, which a compact list is not.
 //!
 //! Each scenario runs against two ledgers that differ in one unrelated
 //! two-member list (`ex:config ex:order (ex:a ex:b)`). The `listed / plain`
@@ -27,6 +29,8 @@
 //!    { ?s ex:name ?o }`, on a predicate no list is held on.
 //! 9. **construct/var_predicate**: `CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }`,
 //!    whose every row is asked whether its predicate holds a list.
+//! 10. **crawl/blank_nodes**: a JSON-LD crawl of every subject's properties,
+//!     one of them the blank node `ex:addr`.
 //!
 //! ## Acceptance
 //!
@@ -37,7 +41,8 @@
 //! ## Matrix
 //!
 //!   inputs:    BenchScale → n subjects (Tiny=1k, Small=10k, Medium=100k,
-//!              Large=1M), each with `ex:name` and one `ex:knows`
+//!              Large=1M), each with `ex:name`, one `ex:knows` and an
+//!              `ex:addr` blank node with an `ex:city`
 //!   metric:    ns/query (criterion default)
 //!
 //! ## Running
@@ -91,12 +96,20 @@ const SCENARIOS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `n` subjects in a ring of `ex:knows`, each with an `ex:name`.
+/// A JSON-LD crawl of every subject's properties.
+const CRAWL: &str = r#"{
+  "@context": {"ex": "http://example.org/"},
+  "select": {"?s": ["*"]},
+  "where": {"@id": "?s", "ex:name": "?n"}
+}"#;
+
+/// `n` subjects in a ring of `ex:knows`, each with an `ex:name` and an
+/// `ex:addr` blank node.
 fn ring_turtle(n: usize) -> String {
     let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
     for i in 0..n {
         ttl.push_str(&format!(
-            "ex:n{i} ex:name \"n{i}\" ; ex:knows ex:n{} .\n",
+            "ex:n{i} ex:name \"n{i}\" ; ex:knows ex:n{} ; ex:addr [ ex:city \"c{i}\" ] .\n",
             (i + 1) % n
         ));
     }
@@ -149,12 +162,12 @@ async fn sanity_check(fluree: &Fluree, plain: &GraphDb, listed: &GraphDb, n: usi
     let whole = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }";
     assert_eq!(
         count(fluree, plain, whole).await,
-        serde_json::json!([[2 * n]])
+        serde_json::json!([[4 * n]])
     );
     // The list's two members, as values of `ex:order`.
     assert_eq!(
         count(fluree, listed, whole).await,
-        serde_json::json!([[2 * n + 2]])
+        serde_json::json!([[4 * n + 2]])
     );
     let written = listed
         .query(fluree)
@@ -219,6 +232,26 @@ fn bench_query_hot_list_view(c: &mut Criterion) {
                 },
             );
         }
+    }
+    let crawl: serde_json::Value = serde_json::from_str(CRAWL).expect("crawl query");
+    for (ledger, db) in [("plain", &plain), ("listed", &listed)] {
+        group.bench_with_input(
+            BenchmarkId::new(format!("crawl/blank_nodes/{ledger}"), scale.as_str()),
+            &crawl,
+            |b, q| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let result = db
+                            .query(&fluree)
+                            .jsonld(q)
+                            .execute_formatted()
+                            .await
+                            .unwrap_or_else(|e| panic!("crawl {ledger}: {e}"));
+                        black_box(result);
+                    });
+                });
+            },
+        );
     }
     group.finish();
 }

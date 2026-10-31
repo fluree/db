@@ -881,6 +881,65 @@ async fn jsonld_reads_a_list_stored_as_triples_as_its_members() {
     );
 }
 
+/// A crawl asks whether a blank-node value heads a list only of a graph
+/// holding an `rdf:first`, which it reads from the index and from novelty.
+#[tokio::test]
+async fn a_crawl_reads_a_list_stored_as_triples_from_the_index_or_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let crawl = |ledger: LedgerState, s: &'static str| {
+        let fluree = &fluree;
+        async move {
+            support::query_jsonld(
+                fluree,
+                &ledger,
+                &json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "selectOne": {s: ["*"]}
+                }),
+            )
+            .await
+            .expect("crawl")
+            .to_jsonld_async(ledger.as_graph_db_ref(0))
+            .await
+            .expect("to_jsonld")
+        }
+    };
+    let chain = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        ex:c ex:items _:h .
+        _:h rdf:first ex:A ; rdf:rest _:t ; ex:note \"x\" .
+        _:t rdf:first ex:B ; rdf:rest rdf:nil .";
+
+    let indexed = indexed_ledger_with(&fluree, "crawl-indexed-chain", chain).await;
+    assert_eq!(
+        crawl(indexed, "ex:c").await["ex:items"],
+        json!([{"@id": "ex:A"}, {"@id": "ex:B"}])
+    );
+
+    let ledger = indexed_ledger_with(
+        &fluree,
+        "crawl-novel-chain",
+        "ex:d ex:addr [ ex:city \"x\" ] .",
+    )
+    .await;
+    let addr = crawl(ledger.clone(), "ex:d").await["ex:addr"].clone();
+    assert!(
+        addr["@id"].as_str().is_some_and(|id| id.starts_with("_:")),
+        "a blank node, not a list: {addr}"
+    );
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            &format!("@prefix ex: <http://example.org/> .\n{chain}"),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    assert_eq!(
+        crawl(ledger, "ex:c").await["ex:items"],
+        json!([{"@id": "ex:A"}, {"@id": "ex:B"}])
+    );
+}
+
 /// A FILTER or BIND in the group of a list-view pattern applies to its list
 /// triples too, and its stored triples still hide the members: the block is
 /// planned with the FILTER, not as a plain triple. From novelty and the index.
