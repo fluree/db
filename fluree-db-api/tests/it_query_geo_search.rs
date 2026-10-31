@@ -530,6 +530,157 @@ async fn geo_search_respects_named_graph_boundaries() {
         .await;
 }
 
+/// Geo search over a graph the index has no branch for reads the graph's
+/// novelty: a named graph first written after the last index, and the
+/// default graph of a ledger whose indexed facts are all in named graphs.
+/// `ex:location` is known to the index from germany. `ex:position` is held
+/// only by novelty, in spain (no branch, next to another novelty-only
+/// predicate) and in germany (which has a branch): the search finds its
+/// points under the id their overlay ops carry. Germany's indexed points are
+/// the control.
+#[tokio::test(flavor = "current_thread")]
+async fn geo_search_reads_novelty_in_a_graph_the_index_has_no_branch_for() {
+    let alias = "it/geo-branchless-graph:main";
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let ledger = fluree.create_ledger(alias).await.expect("create");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+               GRAPH <http://example.org/graphs/germany> {
+                   ex:berlin ex:name "Berlin" ;
+                       ex:location "POINT(13.4050 52.5200)"^^geo:wktLiteral .
+                   ex:munich ex:name "Munich" ;
+                       ex:location "POINT(11.5820 48.1351)"^^geo:wktLiteral .
+               }"#,
+        )
+        .execute()
+        .await
+        .expect("germany");
+    fluree
+        .reindex(alias, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
+    let ledger = fluree.ledger(alias).await.expect("load");
+    assert!(
+        ledger.snapshot.range_provider.is_some(),
+        "the index is loaded"
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+               GRAPH <http://example.org/graphs/germany> {
+                   ex:hamburg ex:name "Hamburg" ;
+                       ex:position "POINT(9.9937 53.5511)"^^geo:wktLiteral .
+               }
+               ex:paris ex:name "Paris" ;
+                   ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+               ex:lyon ex:name "Lyon" ;
+                   ex:location "POINT(4.8357 45.7640)"^^geo:wktLiteral .
+               GRAPH <http://example.org/graphs/italy> {
+                   ex:rome ex:name "Rome" ;
+                       ex:location "POINT(12.4964 41.9028)"^^geo:wktLiteral .
+                   ex:milan ex:name "Milan" ;
+                       ex:location "POINT(9.1900 45.4642)"^^geo:wktLiteral .
+               }
+               GRAPH <http://example.org/graphs/spain> {
+                   ex:madrid ex:name "Madrid" ; ex:label "capital" ;
+                       ex:position "POINT(-3.7038 40.4168)"^^geo:wktLiteral .
+                   ex:barcelona ex:name "Barcelona" ; ex:label "port" ;
+                       ex:position "POINT(2.1734 41.3851)"^^geo:wktLiteral .
+               }"#,
+        )
+        .execute()
+        .await
+        .expect("written after the index")
+        .ledger;
+
+    // Every city is within 1,500 km of Paris, of Munich and of Madrid.
+    let sparql = |graph: Option<&str>, predicate: &str, center: &str| {
+        let shape = format!(
+            r#"?place <http://example.org/{predicate}> ?loc ;
+                      <http://example.org/name> ?name .
+               BIND(geof:distance(?loc, "{center}"^^geo:wktLiteral) AS ?dist)
+               FILTER(?dist <= 1500000)"#
+        );
+        let pattern = match graph {
+            Some(iri) => format!("GRAPH <{iri}> {{ {shape} }}"),
+            None => shape,
+        };
+        format!(
+            "PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+             SELECT ?name WHERE {{ {pattern} }} ORDER BY ?name"
+        )
+    };
+    let jsonld_italy = json!({
+        "@context": geo_search_context(),
+        "select": "?name",
+        "where": [["graph", "http://example.org/graphs/italy",
+            { "@id": "?place", "ex:location": "?loc", "ex:name": "?name" },
+            ["bind", "?dist", "(geof:distance ?loc \"POINT(11.5820 48.1351)\")"],
+            ["filter", "(<= ?dist 1500000)"]
+        ]],
+        "orderBy": "?name"
+    });
+    let germany = "http://example.org/graphs/germany";
+    let italy = "http://example.org/graphs/italy";
+    let spain = "http://example.org/graphs/spain";
+    let cases = [
+        (
+            "default graph",
+            sparql(None, "location", "POINT(2.3522 48.8566)"),
+            json!([["Lyon"], ["Paris"]]),
+        ),
+        (
+            "GRAPH italy",
+            sparql(Some(italy), "location", "POINT(11.5820 48.1351)"),
+            json!([["Milan"], ["Rome"]]),
+        ),
+        (
+            "GRAPH spain, novelty-only predicate",
+            sparql(Some(spain), "position", "POINT(-3.7038 40.4168)"),
+            json!([["Barcelona"], ["Madrid"]]),
+        ),
+        (
+            "GRAPH germany, indexed",
+            sparql(Some(germany), "location", "POINT(11.5820 48.1351)"),
+            json!([["Berlin"], ["Munich"]]),
+        ),
+        (
+            "GRAPH germany, novelty-only predicate",
+            sparql(Some(germany), "position", "POINT(11.5820 48.1351)"),
+            json!([["Hamburg"]]),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (label, query, expected) in cases {
+        match support::query_sparql(&fluree, &ledger, &query).await {
+            Ok(result) => {
+                let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+                if rows != expected {
+                    failures.push(format!("{label}: expected {expected}, got {rows}"));
+                }
+            }
+            Err(err) => failures.push(format!("{label}: {err}")),
+        }
+    }
+    match support::query_jsonld(&fluree, &ledger, &jsonld_italy).await {
+        Ok(result) => {
+            let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+            if rows != json!(["Milan", "Rome"]) {
+                failures.push(format!("JSON-LD graph italy: got {rows}"));
+            }
+        }
+        Err(err) => failures.push(format!("JSON-LD graph italy: {err}")),
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // =============================================================================
 // SPARQL geof:distance rewrite tests
 // =============================================================================
