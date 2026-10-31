@@ -85,6 +85,35 @@ Specifies what to return in results. The shape of `select` determines the shape 
 
 The array value is the selection spec — `"*"` for all forward properties, `"@id"` for the subject IRI, `"@type"` (equivalently `"rdf:type"`) for the subject's types, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
 
+**Lists inside an expansion.** Stored lists retain their boundaries and member
+order, including repeated members. A single list is an `@list` object, even
+when it has only one member or is empty. Several lists on one property are
+separate objects:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:colors": [{"@list": ["red", "blue"]}, {"@list": ["green"]}],
+  "ex:steps": {"@list": ["start"]},
+  "ex:empty": {"@list": []},
+  "ex:mixed": [{"@list": [1, 2]}, 3]
+}
+```
+
+Nested selections expand references inside each list. Ordinary multivalued
+properties keep their usual array representation. This applies to subject
+expansions in `select` and `selectOne`; selecting a variable bound to a
+list-valued property still returns its individual members.
+
+If the query context explicitly defines the property's term with
+`"@container": "@list"`, a sole list compacts to its member array, including
+`[]` and single-member arrays. When that property holds several lists, or a
+list alongside plain values, the result uses the full predicate IRI and
+explicit `@list` objects to avoid interpreting them as one list. An `@set`
+container or `normalizeArrays` keeps the outer property array without
+removing the list wrappers. A list-valued `rdf:type` uses the full predicate
+IRI, since the `@type` keyword accepts IRI strings rather than list objects.
+
 **Ordering and paging inside an expansion.** A nested selection's value may be an object instead of an array, adding `orderBy`, `limit` and `offset` around its `select`:
 
 ```json
@@ -121,6 +150,12 @@ A key with several values sorts by its first. Values missing the sort key sort l
 ```
 
 Reverse selections (`@reverse`) do not accept these yet.
+
+For a list-valued property, these modifiers apply to the members of each
+list independently, before its `@list` wrapper is added. Plain values beside
+lists are ordered and paged together separately. Without modifiers, each
+list keeps its stored order; the outer collection of lists has no defined
+order.
 
 **Mixed array** — combine flat variables and subject expansions in one row, in any order. Each object is an independent expansion with its own root and selection spec:
 

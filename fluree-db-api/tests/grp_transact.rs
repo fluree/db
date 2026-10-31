@@ -25,6 +25,8 @@ mod it_jsonld_empty_list;
 mod it_list_identity;
 #[path = "it_overflow_iri_delete_index.rs"]
 mod it_overflow_iri_delete_index;
+#[path = "it_projection_lists.rs"]
+mod it_projection_lists;
 #[path = "it_raw_txn_parallel_upload.rs"]
 mod it_raw_txn_parallel_upload;
 #[path = "it_rdf_text_parity.rs"]

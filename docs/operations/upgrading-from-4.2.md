@@ -21,6 +21,21 @@ old release fail, and on DynamoDB you can deny it write access with IAM (see
 
 ## What changes
 
+### For query clients
+
+**Subject projections now preserve list boundaries.** JSON-LD `select` and
+`selectOne` subject expansions return `{"@list": [1, 2]}` for a stored list,
+where 4.2 returned `[1, 2]`. A singleton is `{"@list": [1]}` rather than `1`,
+and an empty list is `{"@list": []}`. Several lists on one property return an
+array of separate `@list` objects instead of one flattened array.
+
+Update clients that read these properties to access each object's `@list`
+array. A query context with `"@container": "@list"` still compacts a sole
+list to a bare array. Multiple lists or mixed list/plain values use the full
+predicate IRI and explicit wrappers when that context term cannot represent
+them. Ordinary variable selections still return individual list members.
+See [lists inside subject expansions](../query/jsonld-query.md#select).
+
 ### For operators
 
 - **One ledger per name.** A name holds one ledger, with the branches created

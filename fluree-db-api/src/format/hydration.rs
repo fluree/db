@@ -154,6 +154,8 @@ struct PredicateContext<'a> {
     flakes: &'a [&'a Flake],
     /// Explicit nested selection spec for this predicate (if any).
     explicit_sub_spec: Option<&'a NestedSelectSpec>,
+    /// Only ordinary rdf:type values use the @type keyword's string form.
+    type_strings: bool,
 }
 
 /// Build the forward-predicate allow-list for one hydration level.
@@ -609,7 +611,9 @@ fn merge_values(a: JsonValue, b: JsonValue) -> JsonValue {
     collect_values(b, &mut items);
     let mut out: Vec<JsonValue> = Vec::with_capacity(items.len());
     for it in items {
-        if !out.contains(&it) {
+        // Distinct lists can have identical contents. Their anonymous heads
+        // in different graphs remain distinct even when their JSON matches.
+        if it.get("@list").is_some() || !out.contains(&it) {
             out.push(it);
         }
     }
@@ -695,6 +699,41 @@ async fn format_hydration_column(
                 cache,
             )
             .await
+    }
+}
+
+/// Compact only a sole list under an explicit list-container term. Several
+/// lists need an uncoerced property key; using the term would imply a list of
+/// lists. Return a replacement key when the expanded predicate is needed.
+fn compact_list_property(
+    key: &str,
+    value: &mut JsonValue,
+    compactor: &IriCompactor,
+) -> Option<String> {
+    let entry = compactor.context().get(key)?;
+    if !entry
+        .container
+        .as_ref()
+        .is_some_and(|c| c.contains(&fluree_graph_json_ld::Container::List))
+    {
+        return None;
+    }
+    let sole = match &mut *value {
+        JsonValue::Array(values) if values.len() == 1 => &mut values[0],
+        value => value,
+    };
+    if let Some(members) = sole.as_object_mut().and_then(|o| o.remove("@list")) {
+        *value = members;
+        None
+    } else if value
+        .as_array()
+        .is_some_and(|values| values.iter().any(|v| v.get("@list").is_some()))
+    {
+        entry.id.clone()
+    } else {
+        // Preserve the existing array presentation for ordinary values when
+        // the query context requests a list container.
+        None
     }
 }
 
@@ -828,6 +867,7 @@ impl<'a> DatasetCtx<'a> {
         let mut views: Vec<LedgerView<'a>> = Vec::with_capacity(graph_views.len());
         let mut by_ledger: HashMap<Arc<str>, usize> = HashMap::new();
         let mut default_indices: Vec<usize> = Vec::with_capacity(default_count);
+        let mut unrestricted_default_graphs = HashSet::new();
         for (i, g) in graph_views.iter().enumerate() {
             let mut view_db = g.as_graph_db_ref();
             if let Some(t) = tracker {
@@ -840,7 +880,18 @@ impl<'a> DatasetCtx<'a> {
             });
             // First occurrence wins (a ledger may appear as both default and named).
             by_ledger.entry(Arc::clone(&g.ledger_id)).or_insert(i);
-            if i < default_count {
+            // Repeating a dataset member does not introduce another graph or
+            // another copy of its anonymous lists. Deduplicate unrestricted
+            // views once, keeping different graphs/times and policy-filtered
+            // views (which may expose different facts from the same graph).
+            if i < default_count
+                && (g.policy().is_some_and(|p| !p.wrapper().is_root())
+                    || unrestricted_default_graphs.insert((
+                        Arc::clone(&g.ledger_id),
+                        view_db.g_id,
+                        view_db.t,
+                    )))
+            {
                 default_indices.push(i);
             }
         }
@@ -1331,68 +1382,101 @@ impl<'a> HydrationFormatter<'a> {
                     continue;
                 };
 
-                // If these flakes represent an ordered list (`@list`), preserve transaction order
-                // by sorting by the list place stored in FlakeMeta: each list's members together,
-                // in position order, lists in list order.
-                //
-                // NOTE: Even when the caller did not explicitly define @container @list in context,
-                // list assertions carry list places. Sorting by them is the correct behavior
-                // for ordered lists.
-                if pred_flakes
+                // SPOT orders by object, so collect each compact list in
+                // position order. Graph is part of a list's identity.
+                let has_compact = pred_flakes
                     .iter()
-                    .any(|f| f.m.as_ref().and_then(|m| m.i).is_some())
-                {
+                    .any(|f| f.m.as_ref().and_then(FlakeMeta::place).is_some());
+                if has_compact {
                     pred_flakes.sort_by_key(|f| {
-                        f.m.as_ref()
-                            .and_then(FlakeMeta::place)
-                            .unwrap_or((u32::MAX, i32::MAX))
+                        (
+                            &f.g,
+                            f.m.as_ref()
+                                .and_then(FlakeMeta::place)
+                                .unwrap_or((u32::MAX, i32::MAX)),
+                        )
                     });
                 }
-
-                // A list stored as an `rdf:first`/`rdf:rest` chain, not
-                // compactly, reads as its members, as a compact list does.
                 let chains = self.stored_list_members(&pred_flakes).await?;
-                let pred_flakes: Vec<&Flake> = if chains.is_empty() {
+                let has_lists = has_compact || !chains.is_empty();
+                let mut chains = chains.iter().peekable();
+                let mut groups: Vec<(bool, Vec<&Flake>)> = Vec::new();
+                let plain = if !has_lists {
+                    // Reuse the predicate buffer for the common non-list case.
                     pred_flakes
                 } else {
-                    pred_flakes
-                        .into_iter()
-                        .enumerate()
-                        .flat_map(|(k, f)| match chains.iter().find(|(at, _)| *at == k) {
-                            Some((_, members)) => members.iter().collect(),
-                            None => vec![f],
-                        })
-                        .collect()
+                    let mut plain = Vec::new();
+                    let mut previous_list = None;
+                    for (k, flake) in pred_flakes.iter().enumerate() {
+                        if let Some((list, _)) = flake.m.as_ref().and_then(FlakeMeta::place) {
+                            let identity = (&flake.g, list);
+                            if previous_list != Some(identity) {
+                                groups.push((true, Vec::new()));
+                                previous_list = Some(identity);
+                            }
+                            groups.last_mut().expect("compact list group").1.push(flake);
+                        } else if chains.peek().is_some_and(|(at, _)| *at == k) {
+                            let (_, members) = chains.next().expect("stored chain");
+                            groups.push((true, members.iter().collect()));
+                        } else {
+                            plain.push(*flake);
+                        }
+                    }
+                    plain
                 };
-
-                let pred_ctx = PredicateContext {
-                    pred: &pred,
-                    flakes: &pred_flakes,
-                    explicit_sub_spec,
-                };
-                let mut values = self
-                    .format_predicate_values(pred_ctx, level, depth, visited, cache)
-                    .await?;
-
-                // Per-value ordering and paging, if this level asked for any.
-                // Applied here, after materialization, because the values are
-                // what they act on — a nested `limit` bounds how many of *this
-                // subject's* values are shown, which the WHERE clause (which
-                // bounds solutions, not values) cannot express.
-                if let Some(modifiers) = level_modifiers {
-                    apply_nested_modifiers(&mut values, modifiers, self.compactor)?;
+                // A list-valued rdf:type cannot use the @type keyword, whose
+                // values must be IRI strings. Its members are ordinary refs.
+                let type_strings = !has_lists;
+                let mut values = Vec::new();
+                for (is_list, members) in groups
+                    .into_iter()
+                    .chain((!plain.is_empty()).then_some((false, plain)))
+                {
+                    let pred_ctx = PredicateContext {
+                        pred: &pred,
+                        flakes: &members,
+                        explicit_sub_spec,
+                        type_strings,
+                    };
+                    let mut members = self
+                        .format_predicate_values(pred_ctx, level, depth, visited, cache)
+                        .await?;
+                    // Preserve member-level paging/ordering, independently
+                    // inside each list, and across the ordinary values.
+                    if let Some(modifiers) = level_modifiers {
+                        apply_nested_modifiers(&mut members, modifiers, self.compactor)?;
+                    }
+                    if is_list {
+                        values.push(json!({"@list": members}));
+                    } else if values.is_empty() {
+                        values = members;
+                    } else {
+                        values.extend(members);
+                    }
                 }
 
                 if !values.is_empty() {
-                    let key = self.format_predicate_key(&pred)?;
-                    if values.len() == 1
+                    let mut key = self.format_predicate_key(&pred)?;
+                    if has_lists && key == "@type" {
+                        key = self.compactor.decode_sid(&pred)?;
+                    }
+                    let mut value = if values.len() == 1
                         && !self.normalize_arrays
                         && !self.force_array_for_key(&key)
                     {
-                        obj.insert(key, values.into_iter().next().unwrap());
+                        values.pop().unwrap()
                     } else {
-                        obj.insert(key, JsonValue::Array(values));
+                        JsonValue::Array(values)
+                    };
+                    // Dataset values stay wrapped until the union is complete.
+                    if self.dataset.is_none() {
+                        if let Some(expanded) =
+                            compact_list_property(&key, &mut value, self.compactor)
+                        {
+                            key = expanded;
+                        }
                     }
+                    obj.insert(key, value);
                 }
             }
 
@@ -1558,6 +1642,19 @@ impl<'a> HydrationFormatter<'a> {
 
         // No view could resolve the subject → bare canonical @id.
         match merged {
+            Some(JsonValue::Object(mut obj)) => {
+                let mut renamed = Vec::new();
+                for (key, value) in &mut obj {
+                    if let Some(expanded) = compact_list_property(key, value, self.compactor) {
+                        renamed.push((key.clone(), expanded));
+                    }
+                }
+                for (key, expanded) in renamed {
+                    let value = obj.remove(&key).expect("existing property");
+                    obj.insert(expanded, value);
+                }
+                Ok(JsonValue::Object(obj))
+            }
             Some(v) => Ok(v),
             None => Ok(json!({ "@id": self.compactor.compact_id_iri(&iri) })),
         }
@@ -1627,7 +1724,7 @@ impl<'a> HydrationFormatter<'a> {
         cache: &'b mut HydrationCaches,
     ) -> Result<Vec<JsonValue>> {
         let expanded = self.compactor.decode_sid(pred_ctx.pred)?;
-        let is_rdf_type = expanded == RDF_TYPE_IRI;
+        let is_rdf_type = pred_ctx.type_strings && expanded == RDF_TYPE_IRI;
 
         let mut values = Vec::new();
         for flake in pred_ctx.flakes {
@@ -2403,14 +2500,23 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// The members of each of `flakes` that names a list stored as an
-    /// `rdf:first`/`rdf:rest` chain, with the flake's position. A list any of
+    /// `rdf:first`/`rdf:rest` chain (or rdf:nil), with the flake's position. A list any of
     /// whose members the view policy hides is left as its head.
     async fn stored_list_members(&self, flakes: &[&Flake]) -> Result<Vec<(usize, Vec<Flake>)>> {
         let mut out = Vec::new();
         for (k, flake) in flakes.iter().enumerate() {
+            // A compact member that happens to reference a chain is still
+            // one member, not another owner edge to splice into this property.
+            if flake.m.as_ref().and_then(FlakeMeta::place).is_some() {
+                continue;
+            }
             let FlakeValue::Ref(head) = &flake.o else {
                 continue;
             };
+            if *head == Sid::new(RDF, fluree_vocab::predicates::RDF_NIL) {
+                out.push((k, Vec::new()));
+                continue;
+            }
             if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
                 continue;
             }

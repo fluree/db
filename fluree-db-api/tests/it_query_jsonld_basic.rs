@@ -963,7 +963,7 @@ async fn jsonld_list_order_preservation_explicit_list() {
         .expect("to_jsonld_async");
     assert_eq!(
         json_result,
-        json!({"@id": "list-test2", "ex:list": [42, 2, 88, 1]})
+        json!({"@id": "list-test2", "ex:list": {"@list": [42, 2, 88, 1]}})
     );
 }
 

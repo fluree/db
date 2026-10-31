@@ -199,7 +199,7 @@ async fn lists_export_in_order_and_reinsert_as_the_same_lists() {
         }
         assert_eq!(
             crawl(&fluree, source, "ex:s").await["ex:items"],
-            json!(["c", "a", "b", "a"]),
+            json!({"@list": ["c", "a", "b", "a"]}),
             "{lane}: the source holds the list in order"
         );
 
@@ -272,7 +272,7 @@ async fn lists_export_in_order_and_reinsert_as_the_same_lists() {
         insert_text(&fluree, &copy, &nt).await;
         assert_eq!(
             crawl(&fluree, &copy, "ex:s").await["ex:items"],
-            json!(["c", "a", "b", "a"]),
+            json!({"@list": ["c", "a", "b", "a"]}),
             "{lane} nt"
         );
     }
@@ -343,7 +343,7 @@ async fn lists_on_one_property_export_apart() {
     )
     .await;
     let mut held = vec![r#"( "a" "b" )"#, r#"( "c" "a" )"#];
-    let mut crawled = vec!["a", "b", "c", "a"];
+    let mut crawled = vec![json!({"@list": ["a", "b"]}), json!({"@list": ["c", "a"]})];
     for lane in ["novelty", "index", "overlay"] {
         match lane {
             "index" => support::rebuild_and_publish_index(&fluree, source).await,
@@ -356,7 +356,7 @@ async fn lists_on_one_property_export_apart() {
                 )
                 .await;
                 held.push(r#"( "b" )"#);
-                crawled.push("b");
+                crawled.push(json!({"@list": ["b"]}));
             }
             _ => {}
         }

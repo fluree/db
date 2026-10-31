@@ -944,11 +944,11 @@ async fn whole_graph_counts_add_the_list_triples() {
     assert_eq!(grouped, by_predicate(3, 2, 1, 6));
 }
 
-/// A JSON-LD crawl reads a list stored as `rdf:first`/`rdf:rest` triples as
-/// its members, as it reads a compact list: one whose head carries another
-/// property, and a second list on the property.
+/// A JSON-LD crawl wraps a list stored as `rdf:first`/`rdf:rest` triples
+/// separately from a compact list on the same property. The chain's head
+/// carries another property so ingest must retain its triples.
 #[tokio::test]
-async fn jsonld_reads_a_list_stored_as_triples_as_its_members() {
+async fn jsonld_preserves_lists_stored_as_triples() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = "it/sparql-lists/stored-as-triples:main";
     let ctx = json!({"ex": "http://example.org/"});
@@ -973,7 +973,8 @@ async fn jsonld_reads_a_list_stored_as_triples_as_its_members() {
                 .clone()
         }
     };
-    let ids = |ids: &[&str]| json!(ids.iter().map(|i| json!({"@id": i})).collect::<Vec<_>>());
+    let ids =
+        |ids: &[&str]| json!({"@list": ids.iter().map(|i| json!({"@id": i})).collect::<Vec<_>>()});
     let ledger = fluree.create_ledger(id).await.expect("create");
     let ledger = fluree
         .insert_turtle(
@@ -998,8 +999,8 @@ async fn jsonld_reads_a_list_stored_as_triples_as_its_members() {
         .ledger;
     let got = items(ledger).await;
     assert!(
-        got == ids(&["ex:A", "ex:B", "ex:C", "ex:X", "ex:Y"])
-            || got == ids(&["ex:X", "ex:Y", "ex:A", "ex:B", "ex:C"]),
+        got == json!([ids(&["ex:A", "ex:B", "ex:C"]), ids(&["ex:X", "ex:Y"])])
+            || got == json!([ids(&["ex:X", "ex:Y"]), ids(&["ex:A", "ex:B", "ex:C"])]),
         "{got}"
     );
 }
@@ -1035,7 +1036,7 @@ async fn a_crawl_reads_a_list_stored_as_triples_from_the_index_or_novelty() {
     let indexed = indexed_ledger_with(&fluree, "crawl-indexed-chain", chain).await;
     assert_eq!(
         crawl(indexed, "ex:c").await["ex:items"],
-        json!([{"@id": "ex:A"}, {"@id": "ex:B"}])
+        json!({"@list": [{"@id": "ex:A"}, {"@id": "ex:B"}]})
     );
 
     let ledger = indexed_ledger_with(
@@ -1059,7 +1060,7 @@ async fn a_crawl_reads_a_list_stored_as_triples_from_the_index_or_novelty() {
         .ledger;
     assert_eq!(
         crawl(ledger, "ex:c").await["ex:items"],
-        json!([{"@id": "ex:A"}, {"@id": "ex:B"}])
+        json!({"@list": [{"@id": "ex:A"}, {"@id": "ex:B"}]})
     );
 }
 
