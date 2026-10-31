@@ -132,6 +132,59 @@ async fn a_repeated_member_is_a_value_each_time() {
     assert_eq!(jsonld_items(&fluree, &ledger, "ex:s").await, members);
 }
 
+/// A value read over an index keeps each member, a repeated value as many:
+/// at the head; at an earlier `t`, where the leaflet's history replays and
+/// undoing the two `1`s of the lists written later leaves the first list's;
+/// and with novelty merged over the index.
+#[tokio::test]
+async fn indexed_reads_keep_each_member_at_an_earlier_t() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "indexed-at-t", "ex:s ex:items (1 2) .").await;
+    update(&fluree, &id, "INSERT DATA { ex:s ex:items (1), (1 3) }").await;
+    support::rebuild_and_publish_index(&fluree, &id).await;
+    let ledger = load(&fluree, &id).await;
+    assert_eq!(lists(&ledger, "s").await.len(), 3);
+    let before = fluree.db_at_t(&id, 1).await.expect("at t 1");
+    for pattern in ["ex:s ex:items ?o", "?s ex:items ?o"] {
+        let text = format!("{PREFIX}SELECT ?o WHERE {{ {pattern} }}");
+        let now = sparql(&fluree, &ledger, &text).await;
+        let five = [json!([1]), json!([1]), json!([1]), json!([2]), json!([3])];
+        assert_eq!(now, five, "{pattern}");
+        let rows = fluree
+            .query(&before, text.as_str())
+            .await
+            .unwrap_or_else(|e| panic!("query: {e}\n{text}"))
+            .to_jsonld(&before.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(
+            support::normalize_rows(&rows),
+            [json!([1]), json!([2])],
+            "{pattern} at t 1"
+        );
+    }
+    let twin = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?o"],
+        "where": {"@id": "ex:s", "ex:items": "?o"}
+    });
+    let rows = fluree
+        .query(&before, &twin)
+        .await
+        .expect("query")
+        .to_jsonld(&before.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(support::normalize_rows(&rows), [json!([1]), json!([2])]);
+
+    update(&fluree, &id, "DELETE DATA { ex:s ex:items 2 }").await;
+    update(&fluree, &id, "INSERT DATA { ex:s ex:items (1 4) }").await;
+    let ledger = load(&fluree, &id).await;
+    let merged = [1, 1, 1, 1, 3, 4].map(|v| json!([v]));
+    for pattern in ["ex:s ex:items ?o", "?s ex:items ?o"] {
+        let text = format!("{PREFIX}SELECT ?o WHERE {{ {pattern} }}");
+        assert_eq!(sparql(&fluree, &ledger, &text).await, merged, "{pattern}");
+    }
+}
+
 /// Counts read the stored rows, a member each, from novelty and from an
 /// index.
 #[tokio::test]
