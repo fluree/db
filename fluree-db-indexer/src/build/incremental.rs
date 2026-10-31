@@ -338,24 +338,26 @@ async fn run_update_branch(
         let cache_dir = &cache_dir;
         let warm_cache = warm_cache.as_ref();
         // The stream owns `rx`, so a failed put drops it (see the join below).
-        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|blob| (blob, rx)) })
-            .map(move |blob| {
-                upload_one_leaf_blob(
-                    content_store,
-                    tracker,
-                    upload_budget_ref,
-                    cache_dir,
-                    blob,
-                    warm_cache,
-                )
-            })
-            .buffer_unordered(upload_buffer.max(1))
-            .try_fold(LeafUploadCounts::default(), |mut totals, c| async move {
-                totals.leaf_bytes += c.leaf_bytes;
-                totals.sidecar_bytes += c.sidecar_bytes;
-                totals.sidecar_count += c.sidecar_count;
-                Ok(totals)
-            })
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|blob| (blob, rx))
+        })
+        .map(move |blob| {
+            upload_one_leaf_blob(
+                content_store,
+                tracker,
+                upload_budget_ref,
+                cache_dir,
+                blob,
+                warm_cache,
+            )
+        })
+        .buffer_unordered(upload_buffer.max(1))
+        .try_fold(LeafUploadCounts::default(), |mut totals, c| async move {
+            totals.leaf_bytes += c.leaf_bytes;
+            totals.sidecar_bytes += c.sidecar_bytes;
+            totals.sidecar_count += c.sidecar_count;
+            Ok(totals)
+        })
     };
 
     // Drive both to completion. If the uploader fails it drops `rx`, so the
@@ -376,6 +378,40 @@ async fn run_update_branch(
     );
 
     Ok((meta, stats.snapshot()))
+}
+
+/// Run a batched base-index lookup over `ids` on the rayon pool.
+///
+/// The batched lookups answer per requested id, and each slice here is a
+/// contiguous run of the sorted ids, so slices scan disjoint key ranges and
+/// their answers union without overlap. Scattered ids (hash-named subjects)
+/// make each lookup sweep most of a predicate's or order's leaflets, which
+/// one thread did serially for every build.
+fn par_batched_lookup<V: Send>(
+    ids: &[u64],
+    lookup: impl Fn(&[u64]) -> std::io::Result<HashMap<u64, V>> + Sync,
+) -> std::io::Result<HashMap<u64, V>> {
+    use rayon::prelude::*;
+
+    // Below this a slice's cursor descents cost more than they save.
+    const MIN_SLICE: usize = 512;
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let slices = (sorted.len() / MIN_SLICE).clamp(1, rayon::current_num_threads() * 4);
+    if slices == 1 {
+        return lookup(&sorted);
+    }
+    sorted
+        .par_chunks(sorted.len().div_ceil(slices))
+        .map(&lookup)
+        .try_reduce(HashMap::new, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            a.extend(b);
+            Ok(a)
+        })
 }
 
 enum Phase2TaskKind {
@@ -2582,13 +2618,15 @@ pub async fn incremental_index(
                             "Phase 3b: starting batched PSOT rdf:type lookup"
                         );
                         let started = Instant::now();
-                        match fluree_db_binary_index::batched_lookup_predicate_refs(
-                            store,
-                            scan_g_id,
-                            rdf_type_p_id,
-                            scan_sids,
-                            base_root.index_t,
-                        ) {
+                        match par_batched_lookup(scan_sids, |part| {
+                            fluree_db_binary_index::batched_lookup_predicate_refs(
+                                store,
+                                scan_g_id,
+                                rdf_type_p_id,
+                                part,
+                                base_root.index_t,
+                            )
+                        }) {
                             Ok(base_map) => {
                                 tracing::debug!(
                                     g_id = scan_g_id,
@@ -2854,30 +2892,31 @@ pub async fn incremental_index(
                             changed_by_graph.entry(g_id).or_default().push(s_id);
                         }
                         for (&g_id, sids) in &changed_by_graph {
-                            let base_props =
-                                match fluree_db_binary_index::batched_lookup_subject_properties(
+                            let base_props = match par_batched_lookup(sids, |part| {
+                                fluree_db_binary_index::batched_lookup_subject_properties(
                                     store,
                                     g_id,
-                                    sids,
+                                    part,
                                     base_root.index_t,
-                                ) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        // This scan drives the datatype/language
-                                        // re-attribution that makes the now-ungated
-                                        // class-stat folds current-state-exact. A
-                                        // warn-and-continue here would silently leave
-                                        // re-typed subjects with stale per-(class,
-                                        // property) stats, so abort to a full rebuild
-                                        // (which recomputes class stats from the SPOT
-                                        // pass). Caught in lib.rs and routed to rebuild.
-                                        return Err(IndexerError::IncrementalAbort(format!(
-                                            "Phase 3b base subject-property scan failed \
+                                )
+                            }) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    // This scan drives the datatype/language
+                                    // re-attribution that makes the now-ungated
+                                    // class-stat folds current-state-exact. A
+                                    // warn-and-continue here would silently leave
+                                    // re-typed subjects with stale per-(class,
+                                    // property) stats, so abort to a full rebuild
+                                    // (which recomputes class stats from the SPOT
+                                    // pass). Caught in lib.rs and routed to rebuild.
+                                    return Err(IndexerError::IncrementalAbort(format!(
+                                        "Phase 3b base subject-property scan failed \
                                              for graph {g_id}: {e} (deferring class-stat \
                                              recompute to full rebuild)"
-                                        )));
-                                    }
-                                };
+                                    )));
+                                }
+                            };
                             for &s_id in sids {
                                 let base_cls = base_subject_classes
                                     .get(&(g_id, s_id))
@@ -3042,12 +3081,14 @@ pub async fn incremental_index(
                             }
                             // Case B: inbound edges of re-typed objects (reverse OPST). Skip
                             // edges whose subject also changed — Case A already owns those.
-                            match fluree_db_binary_index::batched_lookup_inbound_refs(
-                                store,
-                                g_id,
-                                sids,
-                                base_root.index_t,
-                            ) {
+                            match par_batched_lookup(sids, |part| {
+                                fluree_db_binary_index::batched_lookup_inbound_refs(
+                                    store,
+                                    g_id,
+                                    part,
+                                    base_root.index_t,
+                                )
+                            }) {
                                 Ok(inbound) => {
                                     for (&obj, ins) in &inbound {
                                         for &(p, subj) in ins {
@@ -3109,13 +3150,15 @@ pub async fn incremental_index(
                                 // would mis-attribute (or drop) ref-class edges; abort to a
                                 // full rebuild rather than `unwrap_or_default()` (which would
                                 // silently treat every endpoint as class-less).
-                                match fluree_db_binary_index::batched_lookup_predicate_refs(
-                                    store,
-                                    g_id,
-                                    rdf_type_p_id,
-                                    &external_sids,
-                                    base_root.index_t,
-                                ) {
+                                match par_batched_lookup(&external_sids, |part| {
+                                    fluree_db_binary_index::batched_lookup_predicate_refs(
+                                        store,
+                                        g_id,
+                                        rdf_type_p_id,
+                                        part,
+                                        base_root.index_t,
+                                    )
+                                }) {
                                     Ok(m) => m,
                                     Err(e) => {
                                         return Err(IndexerError::IncrementalAbort(format!(
@@ -5613,5 +5656,64 @@ mod warm_tests {
                 "leaflet {idx} holds the new leaf's rows"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod par_batched_lookup_tests {
+    use super::par_batched_lookup;
+    use std::collections::HashMap;
+
+    /// Answers like a batched lookup: every even id it is asked about, with
+    /// the slice it was asked in recorded, so a test can see slices formed.
+    fn lookup(part: &[u64]) -> std::io::Result<HashMap<u64, Vec<u64>>> {
+        assert!(
+            part.windows(2).all(|w| w[0] < w[1]),
+            "slices are sorted, deduped runs"
+        );
+        Ok(part
+            .iter()
+            .filter(|id| *id % 2 == 0)
+            .map(|&id| (id, vec![id * 3, part[0]]))
+            .collect())
+    }
+
+    #[test]
+    fn parallel_slices_answer_as_one_lookup_does() {
+        // Scattered, shuffled, with duplicates: as Phase 3b hands them over.
+        let mut ids: Vec<u64> = (0..50_000u64)
+            .map(|i| i.wrapping_mul(2_654_435_761) % 1_000_003)
+            .collect();
+        ids.extend_from_within(..1_000);
+
+        let got = par_batched_lookup(&ids, lookup).unwrap();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let want = lookup(&sorted).unwrap();
+
+        assert_eq!(got.len(), want.len());
+        for (id, classes) in &want {
+            assert_eq!(got[id][0], classes[0], "answer for {id}");
+        }
+        let slice_starts: std::collections::HashSet<u64> = got.values().map(|v| v[1]).collect();
+        assert!(
+            slice_starts.len() > 1,
+            "the lookup ran in more than one slice"
+        );
+    }
+
+    #[test]
+    fn a_failed_slice_fails_the_lookup() {
+        let ids: Vec<u64> = (0..10_000).collect();
+        let err = par_batched_lookup(&ids, |part| {
+            if part.contains(&7_777) {
+                Err(std::io::Error::other("leaf unreadable"))
+            } else {
+                lookup(part)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "leaf unreadable");
     }
 }
