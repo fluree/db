@@ -280,3 +280,60 @@ async fn add_merges_a_second_list_copy_replaces() {
     assert_eq!(in_graph(&ledger, "g3").await, [[1, 2]]);
     assert_eq!(in_graph(&ledger, "g1").await, [[1, 2]]);
 }
+
+/// Two lists on a SHACL path term are two values, not one path: a shape whose
+/// `sh:path`, `sh:alternativePath`, or path operator holds two lists is
+/// malformed, as one with two `sh:path` values is, in novelty and in the
+/// index. One list on `sh:path` is still a sequence.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn two_lists_on_a_shacl_path_term_are_two_values() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/list-identity/shacl-path:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    let ledger = support::enable_shacl(&fluree, ledger).await;
+    // Every focus written below heads the chain `ex:a/ex:b/ex:c/ex:d`, which
+    // reaches a value under any one path the two lists could be merged into.
+    turtle(
+        &fluree,
+        ledger,
+        r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+        ex:Seq sh:targetClass ex:SeqThing ;
+            sh:property [ sh:path (ex:a ex:b) ; sh:minCount 1 ] .
+        ex:Path sh:targetClass ex:PathThing ;
+            sh:property [ sh:path (ex:a ex:b), (ex:c ex:d) ; sh:minCount 1 ] .
+        ex:Alt sh:targetClass ex:AltThing ; sh:property [
+            sh:path [ sh:alternativePath (ex:a ex:b), (ex:c ex:d) ] ; sh:minCount 1 ] .
+        ex:Op sh:targetClass ex:OpThing ; sh:property [
+            sh:path [ sh:oneOrMorePath (ex:a ex:b), (ex:c ex:d) ] ; sh:minCount 1 ] .
+        ex:n1 ex:b ex:n2 . ex:n2 ex:c ex:n3 . ex:n3 ex:d "end" ."#,
+    )
+    .await;
+    let write = |focus: String, class: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let ledger = fluree.ledger(id).await.expect("load");
+            let ttl = format!("@prefix ex: <{EX}> .\nex:{focus} a ex:{class} ; ex:a ex:n1 .");
+            fluree
+                .insert_turtle(ledger, &ttl)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    };
+
+    for lane in ["novelty", "indexed"] {
+        if lane == "indexed" {
+            support::rebuild_and_publish_index(&fluree, id).await;
+        }
+        write(format!("seq-{lane}"), "SeqThing")
+            .await
+            .unwrap_or_else(|e| panic!("{lane}: one list is a sequence: {e}"));
+        for class in ["PathThing", "AltThing", "OpThing"] {
+            let err = write(format!("{class}-{lane}"), class)
+                .await
+                .expect_err(&format!("{lane}: {class}'s two lists made one path"));
+            assert!(err.contains("multiple"), "{lane} {class}: {err}");
+        }
+    }
+}
