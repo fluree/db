@@ -443,6 +443,15 @@ pub async fn load_commit_envelope_by_id<C: ContentStore + ?Sized>(
     Ok(envelope)
 }
 
+/// A failed read of commit `id`'s envelope. A missing commit stays
+/// [`Error::NotFound`], which callers take as nothing stored.
+fn envelope_read_error(id: &ContentId, e: Error) -> Error {
+    match e {
+        Error::NotFound(what) => Error::NotFound(format!("commit envelope {id}: {what}")),
+        other => Error::storage(format!("Failed to read commit envelope {id}: {other}")),
+    }
+}
+
 /// Internal sibling of [`load_commit_envelope_by_id`] that also reports the
 /// commit-blob version byte read from the header.
 ///
@@ -459,7 +468,7 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
     let probe = store
         .get_range(id, 0..ENVELOPE_PROBE_LEN)
         .await
-        .map_err(|e| Error::storage(format!("Failed to read commit envelope {id}: {e}")))?;
+        .map_err(|e| envelope_read_error(id, e))?;
 
     if probe.len() < HEADER_LEN {
         return Err(Error::invalid_commit(format!(
@@ -475,7 +484,7 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
         let data = store
             .get(id)
             .await
-            .map_err(|e| Error::storage(format!("Failed to read commit envelope {id}: {e}")))?;
+            .map_err(|e| envelope_read_error(id, e))?;
         let envelope =
             codec::read_commit_envelope(&data).map_err(|e| Error::invalid_commit(e.to_string()))?;
         return Ok((envelope, codec::format::VERSION));
@@ -1785,6 +1794,16 @@ mod tests {
     async fn store_commit(store: &MemoryContentStore, commit: &Commit) -> ContentId {
         let result = codec::write_commit(commit, false, None).unwrap();
         store.put(ContentKind::Commit, &result.bytes).await.unwrap()
+    }
+
+    /// A commit that is not stored reads as not found, so a caller can tell
+    /// it from a failed read.
+    #[tokio::test]
+    async fn a_missing_commits_envelope_is_not_found() {
+        let store = MemoryContentStore::new();
+        let missing = ContentId::new(ContentKind::Commit, b"never stored");
+        let read = load_commit_envelope_by_id(&store, &missing).await;
+        assert!(matches!(read, Err(Error::NotFound(_))), "{read:?}");
     }
 
     #[cfg(feature = "credential")]

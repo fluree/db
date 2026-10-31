@@ -697,6 +697,78 @@ pub(crate) mod cluster {
         content_address("file", ContentKind::Txn, &namespace, &id.address_digest())
     }
 
+    /// A pass carrying on an intent another stopped short of finishing finds
+    /// commits it deleted already: nothing is left of those to check, and it
+    /// deletes the rest and closes the intent.
+    #[tokio::test]
+    async fn a_pass_carries_on_past_commits_an_earlier_one_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = file_fluree(&dir).await;
+        fluree.create_ledger("donor").await.unwrap();
+        for name in ["a", "b"] {
+            let ledger = fluree.ledger("donor:main").await.unwrap();
+            fluree
+                .insert(
+                    ledger,
+                    &json!({"@id": format!("http://example.org/{name}"), "http://example.org/name": name}),
+                )
+                .await
+                .unwrap();
+        }
+        let donor = fluree.storage_namespace("donor:main").await.unwrap();
+        let record = fluree
+            .nameservice()
+            .lookup("donor:main")
+            .await
+            .unwrap()
+            .unwrap();
+        let commits = fluree_db_core::collect_first_parent_cids(
+            fluree.content_store(&donor).as_ref(),
+            record.commit_head_id.as_ref().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        // The donor's commits copied where nothing references them.
+        fluree.create_ledger("stray").await.unwrap();
+        let ledger = fluree.ledger("stray:main").await.unwrap();
+        fluree
+            .insert(
+                ledger,
+                &json!({"@id": "http://example.org/s", "http://example.org/name": "s"}),
+            )
+            .await
+            .unwrap();
+        let namespace = fluree.storage_namespace("stray:main").await.unwrap();
+        let mut strays = Vec::new();
+        for (_, id) in &commits {
+            let bytes = fluree.content_store(&donor).get(id).await.unwrap();
+            fluree
+                .content_store(&namespace)
+                .put(ContentKind::Commit, &bytes)
+                .await
+                .unwrap();
+            strays.push(content_address(
+                "file",
+                ContentKind::Commit,
+                &namespace,
+                &id.address_digest(),
+            ));
+        }
+        fluree.reconcile_garbage("stray").await.unwrap().unwrap();
+        let cluster = Arc::new(Cluster::default());
+        assert_eq!(pass(&fluree, &cluster).await.condemned, strays.len());
+
+        let storage = fluree.admin_storage().unwrap();
+        storage.delete(&strays[0]).await.unwrap();
+        pass(&fluree, &cluster).await;
+        for stray in &strays {
+            assert!(!storage.exists(stray).await.unwrap(), "{stray}");
+        }
+        let after = pass(&fluree, &cluster).await;
+        assert_eq!((after.condemned, after.deleted), (0, 0), "{after:?}");
+    }
+
     /// A pass waits for one under way: neither closes an intent the other
     /// still deletes.
     #[tokio::test]
