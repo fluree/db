@@ -465,13 +465,14 @@ mod tests {
     }
 }
 
-/// Compute the current RDFS hierarchy from full ledger state — indexed
-/// snapshot plus overlay (novelty) — by scanning `rdfs:subClassOf` and
-/// `rdfs:subPropertyOf` and merging with the indexed [`IndexSchema`].
+/// Compute the default graph's RDFS hierarchy at `to_t` from full ledger
+/// state — indexed snapshot plus overlay (novelty) — by scanning
+/// `rdfs:subClassOf` and `rdfs:subPropertyOf`.
 ///
 /// This is the overlay-aware counterpart of
 /// [`crate::LedgerSnapshot::schema_hierarchy`] (which reflects only the last
-/// index build). Cost is proportional to the number of hierarchy edges (two
+/// index build), and the scan alone decides: an edge retracted since that
+/// build is gone. Cost is proportional to the number of hierarchy edges (two
 /// bound-predicate scans + transitive closure), not to data size.
 pub async fn compute_schema_hierarchy_with_overlay(
     snapshot: &crate::LedgerSnapshot,
@@ -519,17 +520,11 @@ pub async fn compute_schema_hierarchy_with_overlay(
         }
     }
 
-    // Merge scanned edges into the indexed schema (if any): memory-backed and
-    // novelty-only states often carry relationships the indexed root doesn't.
-    let mut schema: IndexSchema = snapshot.schema.clone().unwrap_or_default();
-    schema.t = to_t;
-
-    let mut by_id: HashMap<Sid, SchemaPredicateInfo> = schema
-        .pred
-        .vals
-        .into_iter()
-        .map(|spi| (spi.id.clone(), spi))
-        .collect();
+    let mut schema = IndexSchema {
+        t: to_t,
+        ..Default::default()
+    };
+    let mut by_id: HashMap<Sid, SchemaPredicateInfo> = HashMap::new();
 
     for (id, mut parents) in subclass_of {
         parents.sort();
