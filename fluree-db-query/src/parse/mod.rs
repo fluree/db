@@ -1675,6 +1675,9 @@ pub fn parse_query_in_dataset<E: IriEncoder>(
     query
         .output
         .set_ungrouped_projection(crate::ir::UngroupedProjection::PerGroupList);
+    if let crate::ir::QueryOutput::Construct(template) = &mut query.output {
+        template.mark_list_entries(&query.patterns, vars);
+    }
     Ok(query)
 }
 

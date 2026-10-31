@@ -8,15 +8,20 @@
 //! answers agree either way, so only the `delete_witnessed` routing stamp
 //! can tell which lane ran. Both directions are asserted on the same ledger:
 //! `MustFire` while it is list-free, `MustNotFire` after one `@list` lands.
+//! A WHERE scoped to one named graph takes the lane too, and its rows are
+//! decoded and retracted in that graph.
 //!
-//! Its own `[[test]]` binary, like `it_upsert_skip_fires`: tracing's
-//! callsite-interest cache is process-global, so a sibling test in a bundled
-//! binary can leave the stamp's callsite disabled.
+//! Its own `[[test]]` binary, like `it_upsert_skip_fires`, which predates the
+//! shared capture helper; with the capture going through
+//! `fluree_test_support::scoped_default`, a sibling can no longer leave the
+//! stamp's callsite disabled.
 
-#[path = "support/span_capture.rs"]
-mod span_capture;
+mod support;
 
+use crate::support::span_capture;
 use fluree_db_api::{Fluree, FlureeBuilder, LedgerState, TransactResult};
+use fluree_db_core::comparator::IndexType;
+use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest};
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -280,4 +285,271 @@ async fn optional_and_union_rows_take_the_witnessed_lane() {
         );
         ledger = r.ledger;
     }
+}
+
+/// An integer too large for 64 bits.
+const BIG: &str = "123456789012345678901234567890";
+/// Another one, in the default graph under the same predicate.
+const OTHER_BIG: &str = "987654321098765432109876543210";
+const G: &str = "http://example.org/ns/g";
+
+/// The current `ex:v` values of `ex:{subject}` in `graph` (None: the default
+/// graph), as `value^^datatype`, read at the flake level.
+async fn v_values(ledger: &LedgerState, graph: Option<&str>, subject: &str) -> Vec<String> {
+    let g_id = match graph {
+        None => 0,
+        Some(iri) => ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .expect("graph registered"),
+    };
+    let s = ledger
+        .snapshot
+        .encode_iri(&format!("http://example.org/ns/{subject}"))
+        .expect("subject");
+    let flakes = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::new().with_subject(s),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("range");
+    flakes
+        .iter()
+        .filter(|f| f.op && &*f.p.name == "v")
+        .map(|f| {
+            let o = match &f.o {
+                FlakeValue::BigInt(n) => n.to_string(),
+                other => format!("{other:?}"),
+            };
+            format!("{o}^^{}", f.dt.name)
+        })
+        .collect()
+}
+
+/// A WHERE scoped to one named graph (`WITH`, `USING`, JSON-LD `graph` and
+/// `from`) takes the witnessed lane, decodes its rows through that graph and
+/// retracts them there. Both graphs hold an integer too large for 64 bits
+/// under `ex:v`, each the first of its graph's values, so a row decoded
+/// through the default graph would name the other number.
+///
+/// The first delete reads `<g>`'s value from the index alone, so the WHERE
+/// decodes it. Then `ex:b` gets the same value in `<g>` as a novelty term
+/// with an XSD subtype, which the WHERE reads through the index's key as
+/// `xsd:integer`: the second delete's row reads the slot and must find the
+/// stored term by its key in `<g>`. Retracted as decoded instead, the value
+/// reads as gone and the upsert that writes it again is dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn a_where_scoped_to_one_graph_deletes_and_rewrites_its_big_integer() {
+    let (store, _guard) = span_capture::init_test_tracing();
+    let site = fluree_db_transact::DELETE_WITNESSED_SITE;
+    let outcomes = |from: usize| -> Vec<String> {
+        store.find_events("fast-path outcome")[from..]
+            .iter()
+            .filter(|e| e.fields.get("site").map(String::as_str) == Some(site))
+            .filter_map(|e| e.fields.get("outcome").cloned())
+            .collect()
+    };
+    let prefixes = "@prefix ex: <http://example.org/ns/> .\n\
+                    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
+    let seed =
+        format!("{prefixes}ex:a ex:v {OTHER_BIG} .\nGRAPH <{G}> {{ ex:other ex:v {BIG} . }}\n");
+    let subtyped =
+        format!("{prefixes}GRAPH <{G}> {{ ex:b ex:v \"{BIG}\"^^xsd:nonNegativeInteger . }}\n");
+    let default_graph = vec![format!("{OTHER_BIG}^^integer")];
+
+    let cases = [
+        (
+            "SPARQL WITH",
+            "WITH <http://example.org/ns/g> DELETE { ?s ex:v ?o } WHERE { ?s ex:v ?o }",
+            None,
+        ),
+        (
+            "SPARQL USING",
+            "DELETE { GRAPH <http://example.org/ns/g> { ?s ex:v ?o } } \
+             USING <http://example.org/ns/g> WHERE { ?s ex:v ?o }",
+            None,
+        ),
+        (
+            "JSON-LD graph",
+            "",
+            Some(json!({
+                "@context": ctx(),
+                "graph": G,
+                "where": {"@id": "?s", "ex:v": "?o"},
+                "delete": {"@id": "?s", "ex:v": "?o"}
+            })),
+        ),
+        (
+            "JSON-LD from",
+            "",
+            Some(json!({
+                "@context": ctx(),
+                "from": G,
+                "where": {"@id": "?s", "ex:v": "?o"},
+                "delete": {"@id": "?s", "@graph": G, "ex:v": "?o"}
+            })),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (i, (what, sparql, jsonld)) in cases.into_iter().enumerate() {
+        let update = || match &jsonld {
+            Some(txn) => Update::JsonLd(txn.clone()),
+            None => Update::Sparql(sparql),
+        };
+        let fluree = FlureeBuilder::memory().build_memory();
+        let id = format!("it/delete-witness-scoped-{i}:main");
+        let ledger = fluree.create_ledger(&id).await.expect("create");
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&seed)
+            .execute()
+            .await
+            .expect("seed");
+        support::rebuild_and_publish_index(&fluree, &id).await;
+        let ledger = fluree.ledger(&id).await.expect("reload");
+        assert!(ledger.snapshot.range_provider.is_some(), "{what}: indexed");
+
+        // The indexed value, decoded by the WHERE.
+        let before = store.find_events("fast-path outcome").len();
+        let r = apply(&fluree, ledger, update()).await;
+        let stamps = outcomes(before);
+        let left = v_values(&r.ledger, Some(G), "other").await;
+        if r.receipt.retract_count != 1 || stamps != ["proceed"] || !left.is_empty() {
+            failures.push(format!(
+                "{what}, indexed: retracted {}, stamps {stamps:?}, <g> left {left:?}",
+                r.receipt.retract_count
+            ));
+        }
+        let kept = v_values(&r.ledger, None, "a").await;
+        if kept != default_graph {
+            failures.push(format!("{what}: the default graph holds {kept:?}"));
+        }
+
+        // The subtyped novelty term, read through the index's key.
+        let ledger = fluree
+            .stage_owned(r.ledger)
+            .upsert_turtle(&subtyped)
+            .execute()
+            .await
+            .expect("subtyped value")
+            .ledger;
+        assert!(ledger.novelty.has_lossy_index_terms, "{what}");
+        assert_eq!(v_values(&ledger, Some(G), "b").await.len(), 1, "{what}");
+        let before = store.find_events("fast-path outcome").len();
+        let r = apply(&fluree, ledger, update()).await;
+        let stamps = outcomes(before);
+        let left = v_values(&r.ledger, Some(G), "b").await;
+        if r.receipt.retract_count != 1 || stamps != ["proceed"] || !left.is_empty() {
+            failures.push(format!(
+                "{what}, novelty: retracted {}, stamps {stamps:?}, <g> left {left:?}",
+                r.receipt.retract_count
+            ));
+        }
+        let up = fluree
+            .stage_owned(r.ledger)
+            .upsert_turtle(&subtyped)
+            .execute()
+            .await
+            .expect("upsert");
+        let rewritten = v_values(&up.ledger, Some(G), "b").await;
+        let asserted = up.receipt.assert_count;
+        drop(up);
+        support::rebuild_and_publish_index(&fluree, &id).await;
+        let reindexed = fluree.ledger(&id).await.expect("reload");
+        let reindexed = v_values(&reindexed, Some(G), "b").await;
+        if asserted != 1 || rewritten.len() != 1 || reindexed.len() != 1 {
+            failures.push(format!(
+                "{what}: the upsert asserted {asserted} and left {rewritten:?}, \
+                 after the index build {reindexed:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A DELETE naming a few plain values of a slot the index's statistics call
+/// wide reads just those values (`delete_point_read` proceeds). More values
+/// than the slot's width pays for, a tagged value, or a slot of a predicate
+/// with one value per subject read the slot (it falls back). All on one
+/// indexed ledger, each delete retracting what it names.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_reads_by_value_only_a_wide_slot_named_a_few_times() {
+    let (store, _guard) = span_capture::init_test_tracing();
+    let site = fluree_db_transact::DELETE_POINT_READ_SITE;
+    let outcomes = |from: usize| -> Vec<String> {
+        store.find_events("fast-path outcome")[from..]
+            .iter()
+            .filter(|e| e.fields.get("site").map(String::as_str) == Some(site))
+            .filter_map(|e| e.fields.get("outcome").cloned())
+            .collect()
+    };
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/delete-point-routing:main";
+    let mut tags: Vec<JsonValue> = (0..40).map(|i| json!(format!("t{i}"))).collect();
+    tags.push(json!({"@value": "t2", "@language": "en"}));
+    let mut graph = vec![json!({"@id": "ex:s", "ex:tag": tags})];
+    graph.extend((0..40).map(|i| json!({"@id": format!("ex:i{i}"), "ex:one": format!("v{i}")})));
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed");
+    support::rebuild_and_publish_index(&fluree, id).await;
+    let mut ledger = fluree.ledger(id).await.expect("reload");
+
+    let cases = [
+        (
+            "one value of the wide slot",
+            json!({"@id": "ex:s", "ex:tag": "t3"}),
+            1,
+            "proceed",
+        ),
+        (
+            "five values of the wide slot",
+            json!({"@id": "ex:s", "ex:tag": ["t4", "t5", "t6", "t7", "t8"]}),
+            5,
+            "fallback:gate_declined",
+        ),
+        (
+            "a tagged value",
+            json!({"@id": "ex:s", "ex:tag": {"@value": "t2", "@language": "en"}}),
+            1,
+            "fallback:gate_declined",
+        ),
+        (
+            "the value of a narrow slot",
+            json!({"@id": "ex:i0", "ex:one": "v0"}),
+            1,
+            "fallback:gate_declined",
+        ),
+        (
+            "another value of the wide slot",
+            json!({"@id": "ex:s", "ex:tag": "t9"}),
+            1,
+            "proceed",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (what, delete, retracted, outcome) in cases {
+        let before = store.find_events("fast-path outcome").len();
+        let r = fluree
+            .update(ledger, &json!({"@context": ctx(), "delete": delete}))
+            .await
+            .expect("delete");
+        let stamps = outcomes(before);
+        if r.receipt.retract_count != retracted || stamps != [outcome] {
+            failures.push(format!(
+                "{what}: retracted {}, stamps {stamps:?}",
+                r.receipt.retract_count
+            ));
+        }
+        ledger = r.ledger;
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

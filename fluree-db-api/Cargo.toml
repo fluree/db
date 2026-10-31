@@ -167,6 +167,9 @@ wiremock = { workspace = true }
 # builds keep the feature off and compile the pre-residency read path.
 fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
 fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+# WAL background-thread hooks for the flush-count tests (it_wal): dev-only,
+# so production builds do not compile them.
+fluree-db-core = { path = "../fluree-db-core", features = ["test-hooks"] }
 
 [[test]]
 name = "it_residency_retry"
@@ -633,6 +636,10 @@ name = "glue_onboarding"
 required-features = ["iceberg"]
 
 [[bench]]
+name = "query_hot_list_view"
+harness = false
+
+[[bench]]
 name = "vector_query"
 harness = false
 
@@ -663,6 +670,10 @@ harness = false
 
 [[bench]]
 name = "transact_filtered_delete"
+harness = false
+
+[[bench]]
+name = "transact_delete_wide_slot"
 harness = false
 
 [[bench]]
@@ -715,6 +726,10 @@ harness = false
 
 [[bench]]
 name = "query_hot_bsbm_bi"
+harness = false
+
+[[bench]]
+name = "dataset_build"
 harness = false
 
 [[bench]]

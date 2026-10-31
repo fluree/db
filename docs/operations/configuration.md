@@ -499,13 +499,13 @@ Enable background indexing and configure novelty backpressure thresholds:
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
 
-Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)):
+Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)). The age guard (`--gc-min-time-mins`) decides, the ceiling (`--gc-hard-max-old-indexes`) backs it up for ledgers that publish fast, and the floor (`--gc-max-old-indexes`) is optional. These settings apply only on a server that runs the indexer; a peer, or a server with indexing disabled, collects nothing:
 
 | Flag                         | Env Var                           | Default | Description                                     |
 | ---------------------------- | --------------------------------- | ------- | ----------------------------------------------- |
-| `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `5`     | Old index versions to retain before GC |
-| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `15`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version, so keep it above your longest query: `query_timeout_ms` defaults to 15 minutes, and with it set to `0` nothing bounds a query. ANDed with the count, so the slower of the two wins |
-| `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | unset   | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so set it well above the versions published during your longest query |
+| `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `0`     | Old index versions always kept, whatever their age |
+| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `15`    | Minutes a superseded index version is kept, so a query that started on it can finish. Keep it above your longest query: `query_timeout_ms` defaults to 15 minutes, and with it set to `0` nothing bounds a query. Decides retention, up to `--gc-hard-max-old-indexes` |
+| `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | `10`    | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so raise it above the versions published during your longest query |
 
 Config file equivalent:
 
@@ -514,9 +514,9 @@ Config file equivalent:
 enabled = true
 reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
-# gc_max_old_indexes = 5
+# gc_max_old_indexes = 0
 # gc_min_time_mins = 15
-# gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
+# gc_hard_max_old_indexes = 10     # past 10 old versions, collect even inside the age guard
 ```
 
 ## Server Role Configuration
@@ -1010,9 +1010,9 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100`                                                                   |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
-| `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions to retain before GC          | `5`                                                                     |
-| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `15`                              |
-| `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | Unset (no ceiling) |
+| `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions always kept, whatever their age | `0`                                                                  |
+| `FLUREE_GC_MIN_TIME_MINS`               | Minutes a superseded index version is kept, so a query that started on it can finish | `15`                              |
+| `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | `10` |
 | `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
@@ -1224,7 +1224,7 @@ environment-only.
 | `FLUREE_DELTA_FOOTER_CACHE_MB` | `128` | Memory (MB), across all Delta tables, for the Parquet footers and page indexes of data files kept between queries. Data files are immutable, so a kept footer is never stale. `0` keeps none: every query re-reads the footer of every file it opens. |
 | `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` | `1024` | Memory budget (MB) for one materialize pass's subject accumulator — the pass's dominant memory term (one retained node per distinct subject in the window). A window whose **estimated** accumulator exceeds the budget fails with a typed error *before any commit* (nothing partially applied, watermark un-advanced) instead of the process being OOM-killed. The failure is deterministic and recurs every poll until the budget or the window changes: shorten the poll interval so incremental windows stay small, or raise the budget for a large full read. `0` disables the gate. |
 | `FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS` | `30` | How old a materialize window may grow before an *empty* poll still persists its watermark. Skipping watermark writes on no-data polls keeps the state ledger from taking ~1,200 empty commits/hour, but never refreshing lets the stored snapshot age out of the source's snapshot retention — after which every poll degrades to a full table read. This bound is the compromise: quiet tables refresh their watermark at most once per interval. |
-| `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` | derived | Rows one materialize pass may take before checkpointing, on both the full-read and the incremental path. Unset, it is derived from the configured novelty ceiling (`reindex_max_bytes`, however it was set): a quarter of the ceiling divided by `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, floored at 1,000 rows, so that a bounded pass can actually commit. A **full read** stops at a commit boundary and records where it got to — as a snapshot checkpoint when a retained snapshot names it, otherwise as a commit-sequence cursor, which survives snapshot expiry. An **incremental window** whose snapshots (sized from their `added-records` summaries) exceed the budget stops at the last snapshot the budget covers and advances the watermark to it, so a backlog drains in bounded steps instead of re-reading a growing window on every poll until the watermark expires. Either way the next poll resumes from where this one stopped. `0` disables the bound and reads the whole window in one pass. |
+| `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` | derived | Rows one materialize pass may take before checkpointing, on both the full-read and the incremental path. Unset, it is derived from the configured novelty ceiling (`reindex_max_bytes`, however it was set): a quarter of the ceiling divided by `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, floored at 1,000 rows, so that a bounded pass can actually commit. A **full read** stops at a commit boundary and records where it got to — as a snapshot checkpoint when a retained snapshot names it, otherwise as a commit-sequence cursor, which survives snapshot expiry. An **incremental window** whose snapshots (sized from their `added-records` summaries) exceed the budget stops at the last snapshot the budget covers and advances the watermark to it, so a backlog drains in bounded steps instead of re-reading a growing window on every poll until the watermark expires. Either way the next poll resumes from where this one stopped. A read pinned to a snapshot is never bounded: a pinned full read returns that snapshot whole, and a pinned window returns the whole window. A Delta source's change data feed window stops at the commit boundary past the budget and the watermark advances to that version. `0` disables the bound and reads the whole window in one pass. |
 | `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` | `108` | Estimated bytes of novelty one materialized row costs; used only to convert the novelty ceiling into the row budget above. Set this, rather than the row budget, when rows are much wider or narrower, so the budget keeps tracking the ceiling. |
 
 **Caching model.** Catalog access is cached at two scopes. Within a single query,

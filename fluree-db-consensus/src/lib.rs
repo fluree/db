@@ -943,6 +943,13 @@ pub enum SubmissionError {
     #[error("{message}")]
     CommitContention { message: String },
 
+    /// This node has not loaded the ledger's index, so the submission was
+    /// refused before it read or committed anything (HTTP 503,
+    /// `err:db/IndexNotLoaded`, `Retry-After`). Retryable once the index
+    /// loads. Typed because a 503 `Execution` status reads as unsettled.
+    #[error("{message}")]
+    IndexNotLoaded { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -990,6 +997,8 @@ impl SubmissionError {
             // committed; settled, like the novelty refusals, so a keyed retry
             // re-executes.
             Self::CommitContention { .. } => true,
+            // Refused before staging read anything, like the novelty refusals.
+            Self::IndexNotLoaded { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }

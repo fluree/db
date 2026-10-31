@@ -46,6 +46,7 @@ members = [
     "fluree-db-memory",
     "fluree-db-docs",
     "fluree-db-doc",
+    "fluree-db-ontology",
     "fluree-db-mcp",
     "fluree-bench-support",
     "fluree-bench-alloc",

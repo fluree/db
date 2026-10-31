@@ -268,6 +268,7 @@ async fn read_graph(state: Arc<AppState>, ledger: String, request: Request) -> R
         parts.clone(),
         probe,
         "application/sparql-results+json",
+        false,
     )
     .await?;
     if !response.status().is_success() {
@@ -329,17 +330,22 @@ async fn construct_graph(
         }
         GraphSel::Default => format!("CONSTRUCT {{ {template} }} WHERE {{ {pattern} }}"),
     };
-    query_as_caller(state, ledger, parts, sparql, format.media_type()).await
+    // A list is read as its RDF cells, which the writer folds back into the
+    // list, so a graph read and put back is unchanged.
+    query_as_caller(state, ledger, parts, sparql, format.media_type(), true).await
 }
 
 /// Run `sparql` through the query route as the caller would: same auth
-/// headers and credential, so the same read policy.
+/// headers and credential, so the same read policy. With `rdf_list_view`,
+/// lists read as their RDF cells
+/// ([`FlureeHeaders::rdf_list_view`](crate::extract::FlureeHeaders)).
 async fn query_as_caller(
     state: &Arc<AppState>,
     ledger: &str,
     mut parts: axum::http::request::Parts,
     sparql: String,
     accept: &'static str,
+    rdf_list_view: bool,
 ) -> Result<Response> {
     parts.method = Method::POST;
     parts.uri = axum::http::Uri::from_static("/");
@@ -352,7 +358,8 @@ async fn query_as_caller(
         .insert(header::ACCEPT, HeaderValue::from_static(accept));
     parts.headers.remove(header::CONTENT_LENGTH);
     let params = SparqlParams::from_request_parts(&mut parts, state).await?;
-    let headers = FlureeHeaders::from_request_parts(&mut parts, state).await?;
+    let mut headers = FlureeHeaders::from_request_parts(&mut parts, state).await?;
+    headers.rdf_list_view = rdf_list_view;
     let bearer = MaybeDataBearer::from_request_parts(&mut parts, state).await?;
     let credential =
         MaybeCredential::extract(Request::from_parts(parts, Body::from(sparql))).await?;

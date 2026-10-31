@@ -11,6 +11,7 @@ use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryGraphView, BinaryIndexStore, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
     flake_matches_range_eq, overlay_eq_bounds, range_provider::RangeQuery, Flake, FlakeValue,
@@ -327,15 +328,34 @@ impl BinaryRangeProvider {
     /// it.
     ///
     /// The index keeps less than some values carry — a big integer keeps no
-    /// XSD subtype, a `dateTime` or `time` keeps microseconds — so distinct
-    /// terms can share a key. Terms that share one are one stored fact.
+    /// XSD subtype — so distinct terms can share a key. Terms that share one
+    /// are one stored fact.
     ///
     /// `None` when no persisted row can hold the object: its predicate,
     /// string, subject, language tag, datatype or big number is not in the
     /// persisted dictionaries, or it is a vector (keyed by fact, not by
     /// value).
     pub fn persisted_object_key(&self, g_id: GraphId, flake: &Flake) -> Option<(u16, u64)> {
-        let p_id = self.store.sid_to_p_id(&flake.p)?;
+        let p_id = self.persisted_p_id(&flake.p)?;
+        self.persisted_object_key_in(g_id, Some(p_id), flake)
+    }
+
+    /// The persisted id of predicate `p`: `None` when no persisted row has it.
+    pub fn persisted_p_id(&self, p: &Sid) -> Option<u32> {
+        self.store.sid_to_p_id(p)
+    }
+
+    /// [`Self::persisted_object_key`] for a flake whose predicate has the
+    /// persisted id `p_id`, so a caller keying many objects of one predicate
+    /// resolves it once. With no persisted predicate (`None`) only a big
+    /// number has no key: the others' keys do not depend on the predicate,
+    /// and queries over novelty key them under a runtime predicate id.
+    pub fn persisted_object_key_in(
+        &self,
+        g_id: GraphId,
+        p_id: Option<u32>,
+        flake: &Flake,
+    ) -> Option<(u16, u64)> {
         let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
         crate::binary_scan::value_to_otype_okey(
             &flake.o,
@@ -343,7 +363,7 @@ impl BinaryRangeProvider {
             lang,
             &self.store,
             None,
-            Some((g_id, p_id)),
+            p_id.map(|p_id| (g_id, p_id)),
         )
         .ok()
         .map(|(o_type, o_key)| (o_type.as_u16(), o_key))
@@ -1205,15 +1225,13 @@ fn apply_raw_overlay_deltas_to_batched_refs(
             None => {
                 subj_entry.insert(class_sid, (flake.t, flake.op));
             }
-            Some(&(t0, op0)) => {
-                // Newest op wins; at equal `t` the retraction does. Taking
-                // `>` alone let whichever flake the walk happened to yield
-                // first win the tie — and on this lane, which decides
-                // class-based policy grants, the direction it failed was
-                // open: a same-`t` assert+retract of a class left the class
-                // granted. Same rule as `resolve_current_flakes` and
-                // `resolve_overlay_ops`.
-                if flake.t > t0 || (flake.t == t0 && !flake.op && op0) {
+            Some(&cur) => {
+                // Newest op wins; at equal `t` the assertion
+                // (`fluree_db_core::same_t`). Decided by rule, not by which
+                // flake the walk yields first, so this lane answers as
+                // `resolve_current_flakes`, `resolve_overlay_ops` and every
+                // index build do.
+                if supersedes((flake.t, flake.op), cur) {
                     subj_entry.insert(class_sid, (flake.t, flake.op));
                 }
             }
@@ -1828,12 +1846,12 @@ mod tests {
         );
     }
 
-    /// The equal-`t` tie on the policy lane, and the map-shape contract.
+    /// The equal-`t` tie, and the map-shape contract.
     ///
-    /// `t > t0` alone let whichever flake the walk yielded first win a tie,
-    /// and the direction it failed was open: a same-`t` assert+retract left
-    /// the class granted. And a subject whose overlay flakes are all
-    /// retractions must be ABSENT from the map, not present with an empty
+    /// A same-`t` assert+retract of a class resolves by rule, not by which
+    /// flake the walk yields first: the assert holds, as on every other
+    /// lane and in every index build. And a subject whose overlay flakes are
+    /// all retractions must be ABSENT from the map, not present with an empty
     /// vector — `lookup_subject_classes` documents that, and its per-subject
     /// fallback enforces it.
     #[test]
@@ -1862,9 +1880,10 @@ mod tests {
             }
             let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
             apply_raw_overlay_deltas_to_batched_refs(&mut out, &raw, &rdf_type, 10);
-            assert!(
-                !out.contains_key(&s("carol")),
-                "same-t assert+retract must revoke, and leave no empty entry (flip={flip})"
+            assert_eq!(
+                out.get(&s("carol")),
+                Some(&vec![s("Admin")]),
+                "same-t assert+retract holds the class (flip={flip})"
             );
         }
 

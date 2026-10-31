@@ -17,12 +17,13 @@
 //! requested validation mode, identity, inline shapes, or authoring context)
 //! and run the ledger's configured posture.
 
+use crate::commit_data::NetChange;
 use crate::error::{ApiError, Result};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_transact::TransactError;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Outcome of validating a branch operation's staged view.
 ///
@@ -131,6 +132,117 @@ fn unregistered_graphs(
         .collect())
 }
 
+/// A merge's or revert's net change, named as `state` stores each fact, for
+/// the kinds of value whose index key two terms can share
+/// ([`FlakeValue::index_key_may_merge_terms`]). The net change was folded
+/// from commits written against other states, so it can name such a fact
+/// under a term `state` does not hold it under. An assertion of a fact
+/// `state` holds is dropped, as a restatement; a retraction retracts the
+/// fact under every term `state` holds it by (novelty holds the subtypes of
+/// one big integer apart until the next index build), or is dropped when
+/// `state` holds none. Otherwise the commit could hold a retraction and an
+/// assertion of one fact at one `t`, which a commit may not hold
+/// (`build_commit` refuses it), or keep a term the change meant to remove.
+///
+/// Only those kinds are read, one read per slot they touch
+/// ([`CurrentFacts::all_named_by`]); any other change is returned as is.
+///
+/// [`FlakeValue::index_key_may_merge_terms`]: fluree_db_core::FlakeValue::index_key_may_merge_terms
+/// [`CurrentFacts::all_named_by`]: fluree_db_transact::CurrentFacts::all_named_by
+async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>> {
+    use fluree_db_transact::{CurrentFacts, Slot};
+    let asked: Vec<(usize, Slot)> = flakes
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.o.index_key_may_merge_terms())
+        .filter_map(|(n, f)| Slot::in_ledger(state, &f.g, &f.s, &f.p).map(|slot| (n, slot)))
+        .collect();
+    if asked.is_empty() {
+        return Ok(flakes);
+    }
+    let items: Vec<(Slot, &Flake)> = asked
+        .iter()
+        .map(|(n, slot)| (slot.clone(), &flakes[*n]))
+        .collect();
+    let named = CurrentFacts::new(state).all_named_by(&items).await?;
+    let mut keep = vec![true; flakes.len()];
+    let mut renamed = Vec::new();
+    let mut more = Vec::new();
+    for ((n, _), held) in asked.iter().zip(named) {
+        let flake = &flakes[*n];
+        match (flake.op, held.is_empty()) {
+            (true, false) | (false, true) => keep[*n] = false,
+            (false, false) => {
+                let mut retractions = held
+                    .into_iter()
+                    .map(|fact| fact.retract(flake.t).into_flake());
+                if let Some(first) = retractions.next() {
+                    renamed.push((*n, first));
+                }
+                more.extend(retractions);
+            }
+            (true, true) => {}
+        }
+    }
+    let mut flakes = flakes;
+    for (n, retraction) in renamed {
+        flakes[n] = retraction;
+    }
+    let mut keep = keep.into_iter();
+    flakes.retain(|_| keep.next().unwrap_or(true));
+    flakes.extend(more);
+    Ok(flakes)
+}
+
+/// An undo's net change with each fact its deciding commit held as a
+/// same-`t` pair (`NetChange::same_t_pairs`) resolved by the fact's
+/// presence just before that commit. The pair left the fact present
+/// whatever it was before, and the commit alone can't say which, so the
+/// undo writes the state before it: the fact asserted if it was present,
+/// retracted if it wasn't. Like any undo, that is a restatement when the
+/// head already agrees, and a change when a later commit in the range
+/// changed the fact again (a revert of the pair's commit and a later
+/// delete restores the value). One read per pair, at the deciding commit's
+/// `t - 1`; only commits written before the staging fix hold pairs.
+async fn undo_same_t_pairs(state: &LedgerState, undo: NetChange) -> Result<Vec<Flake>> {
+    use fluree_db_transact::{CurrentFacts, Slot};
+    let NetChange {
+        flakes: mut inverted,
+        same_t_pairs,
+    } = undo;
+    if same_t_pairs.is_empty() {
+        return Ok(inverted);
+    }
+    let mut by_t: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for &n in &same_t_pairs {
+        by_t.entry(inverted[n].t).or_default().push(n);
+    }
+    let mut present_before: Vec<(usize, bool)> = Vec::with_capacity(same_t_pairs.len());
+    for (t, positions) in by_t {
+        let mut asked: Vec<(usize, Slot)> = Vec::with_capacity(positions.len());
+        for n in positions {
+            let f = &inverted[n];
+            match Slot::in_ledger(state, &f.g, &f.s, &f.p) {
+                Some(slot) => asked.push((n, slot)),
+                // A graph the state doesn't have held nothing.
+                None => present_before.push((n, false)),
+            }
+        }
+        let items: Vec<(Slot, &Flake)> = asked
+            .iter()
+            .map(|(n, slot)| (slot.clone(), &inverted[*n]))
+            .collect();
+        let held = CurrentFacts::at(state, t - 1).named_by(&items).await?;
+        for ((n, _), held) in asked.iter().zip(held) {
+            present_before.push((*n, held.is_some()));
+        }
+    }
+    for (n, present) in present_before {
+        inverted[n].op = present;
+    }
+    Ok(inverted)
+}
+
 impl crate::Fluree {
     /// Stage `flakes` onto `state` and validate the result against the
     /// ledger's SHACL configuration and shapes.
@@ -205,6 +317,7 @@ impl crate::Fluree {
         let resolved = self
             .apply_two_way_strategy(source_flakes, conflicts, strategy, &target_state)
             .await?;
+        let resolved = as_stored(&target_state, resolved).await?;
         self.stage_validated(target_state, resolved, namespace_delta, graph_iris, "merge")
             .await
     }
@@ -219,15 +332,17 @@ impl crate::Fluree {
     pub(crate) async fn stage_revert(
         &self,
         target_state: LedgerState,
-        inverted: Vec<Flake>,
+        undo: NetChange,
         conflicts: &[ConflictKey],
         strategy: &ConflictStrategy,
         namespace_delta: &HashMap<u16, String>,
         graph_iris: &BTreeSet<String>,
     ) -> Result<Option<(StagedLedger, BranchOpValidation)>> {
+        let inverted = undo_same_t_pairs(&target_state, undo).await?;
         let staged = self
             .apply_two_way_strategy(inverted, conflicts, strategy, &target_state)
             .await?;
+        let staged = as_stored(&target_state, staged).await?;
         if staged.is_empty() {
             return Ok(None);
         }
@@ -296,7 +411,7 @@ impl crate::Fluree {
         let (_view, outcome) = self
             .stage_validated_with(
                 base.state,
-                data.flakes,
+                data.net.flakes,
                 &data.namespace_delta,
                 &data.graph_iris,
                 "merge",
@@ -431,9 +546,9 @@ impl crate::Fluree {
                 .find(|g_id| matches!(*g_id, CONFIG_GRAPH_ID | TXN_META_GRAPH_ID));
             if let Some(g_id) = own {
                 let role = if g_id == CONFIG_GRAPH_ID {
-                    "config"
+                    fluree_db_core::GraphSel::Config
                 } else {
-                    "txn-meta"
+                    fluree_db_core::GraphSel::TxnMeta
                 };
                 return Ok(Some(format!(
                     "the merge would change this branch's {role} graph <{}> with what the \
@@ -537,7 +652,7 @@ fn carries_config_settings(
     .collect();
     let ledger_id = target.snapshot.ledger_id.to_string();
     let mut graphs_seen: std::collections::HashSet<&Sid> = std::collections::HashSet::new();
-    data.flakes.iter().any(|flake| {
+    data.net.flakes.iter().any(|flake| {
         crate::config_vocab::is_config_field(&flake.p)
             || flake.g.as_ref().is_some_and(|g| {
                 own_system_graphs.contains(g)

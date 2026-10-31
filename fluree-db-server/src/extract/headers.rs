@@ -250,6 +250,12 @@ pub struct FlureeHeaders {
 
     /// Accept header value (for content negotiation)
     pub accept: Option<String>,
+
+    /// Read lists as their RDF cells, so a CONSTRUCT writes each back as the
+    /// list. Never populated by HTTP header parsing: set only by the Graph
+    /// Store `GET` ([`crate::routes::graph_store`]), whose output must round
+    /// trip. Every query a client sends reads a list's members as values.
+    pub rdf_list_view: bool,
 }
 
 impl Default for FlureeHeaders {
@@ -272,6 +278,7 @@ impl Default for FlureeHeaders {
             min_t: None,
             content_type: None,
             accept: None,
+            rdf_list_view: false,
         }
     }
 }

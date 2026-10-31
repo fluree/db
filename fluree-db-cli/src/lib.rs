@@ -779,6 +779,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::model::run(&action, &fluree_dir, direct).await
         }
 
+        // Reads files only: no project, no ledger.
+        Commands::Ontology { action } => commands::ontology::run(action),
+
         Commands::Memory { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::memory::run(action, &fluree_dir).await

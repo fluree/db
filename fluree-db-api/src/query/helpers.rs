@@ -5,8 +5,8 @@ use serde_json::Value as JsonValue;
 
 use crate::view::{DataSetDb, QueryInput};
 use crate::{
-    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider, Result,
-    Tracker, TrackingOptions, VarRegistry,
+    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider,
+    QueryExecutionOptions, Result, Tracker, TrackingOptions, VarRegistry,
 };
 
 use fluree_db_binary_index::BinaryGraphView;
@@ -97,9 +97,10 @@ pub(crate) fn parse_sparql_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_sparql::ParamMap>,
+    rdf_list_view: bool,
 ) -> Result<(VarRegistry, Query)> {
     let ast = parse_and_validate_sparql(sparql, params)?;
-    lower_sparql_ast(ast, snapshot, default_context, sparql)
+    lower_sparql_ast(ast, snapshot, default_context, sparql, rdf_list_view)
 }
 
 /// Inject default prefixes from the ledger's stored `@context`, but only when
@@ -132,17 +133,23 @@ pub(crate) fn inject_default_prefixes(
 /// resolve a `FROM` clause) reuse it here instead of re-parsing the string —
 /// see #1473. Behaviour matches [`parse_sparql_to_ir`], which is now a thin
 /// parse-then-lower wrapper over this.
+///
+/// `rdf_list_view` reads lists as their RDF cells, for the Graph Store `GET`
+/// ([`crate::QueryExecutionOptions::with_rdf_list_view`]); SPARQL itself
+/// reads a list's members as values.
 pub(crate) fn lower_sparql_ast(
     mut ast: fluree_db_sparql::SparqlAst,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     sparql: &str,
+    rdf_list_view: bool,
 ) -> Result<(VarRegistry, Query)> {
     inject_default_prefixes(&mut ast, default_context);
 
     let mut vars = VarRegistry::new();
-    let parsed =
+    let mut parsed =
         fluree_db_sparql::lower_sparql_with_source(&ast, snapshot, &mut vars, Some(sparql))?;
+    parsed.rdf_list_view = rdf_list_view;
     Ok((vars, parsed))
 }
 
@@ -472,6 +479,7 @@ pub(crate) fn build_query_result(
         // (`query_view_with_r2rml_options`) overrides this to true so the
         // sparql_json formatter CURIE-compacts graph-source IRIs (F9).
         from_graph_source: false,
+        advisories: Vec::new(),
     }
 }
 
@@ -759,23 +767,40 @@ pub(crate) fn parse_dataset_spec_as(
     Ok((spec, qc_opts))
 }
 
-/// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED).
+/// The dataset a JSON-LD connection query reads, and its connection options:
+/// [`parse_dataset_spec_as`] for the caller `options` carries, with each
+/// member read at the ledger time `options` fixes for it, if any
+/// ([`QueryExecutionOptions::ledger_times`]).
+pub(crate) fn connection_dataset_spec(
+    query_json: &JsonValue,
+    options: &QueryExecutionOptions,
+) -> Result<(DatasetSpec, GovernanceOptions)> {
+    let (mut spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok((spec, qc_opts))
+}
+
+/// The dataset a SPARQL connection query reads: [`extract_sparql_dataset_spec`],
+/// with each member read at the ledger time `options` fixes for it, if any.
+pub(crate) fn connection_sparql_dataset_spec(
+    ast: &fluree_db_sparql::SparqlAst,
+    options: &QueryExecutionOptions,
+) -> Result<DatasetSpec> {
+    let mut spec = extract_sparql_dataset_spec(ast)?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok(spec)
+}
+
+/// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED),
+/// its IRIs expanded against the prologue (prefixes applied, BASE resolved).
 pub(crate) fn extract_sparql_dataset_spec(
     ast: &fluree_db_sparql::SparqlAst,
 ) -> Result<DatasetSpec> {
-    let dataset_clause = match &ast.body {
-        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-        fluree_db_sparql::ast::QueryBody::Update(_) => None,
-    };
-
-    match dataset_clause {
-        Some(clause) => DatasetSpec::from_sparql_clause(clause)
-            .map_err(|e| ApiError::invalid_query(e.to_string())),
-        None => Ok(DatasetSpec::default()),
-    }
+    DatasetSpec::from_sparql_ast(ast).map_err(|e| ApiError::invalid_query(e.to_string()))
 }
 
 #[cfg(test)]
@@ -845,7 +870,7 @@ mod tests {
         assert_eq!(sparql_parse_count(), 1, "exactly one parse so far");
 
         let snapshot = LedgerSnapshot::genesis("test:main");
-        let _ = lower_sparql_ast(ast, &snapshot, None, sparql).expect("lower");
+        let _ = lower_sparql_ast(ast, &snapshot, None, sparql, false).expect("lower");
 
         assert_eq!(
             sparql_parse_count(),
@@ -860,7 +885,7 @@ mod tests {
     fn parse_sparql_to_ir_parses_once() {
         reset_sparql_parse_count();
         let snapshot = LedgerSnapshot::genesis("test:main");
-        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None, None)
+        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None, None, false)
             .expect("lower");
         assert_eq!(sparql_parse_count(), 1);
     }

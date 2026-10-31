@@ -16,14 +16,14 @@
 //! one.
 //!
 //! On an indexed ledger an intent also names a fact by its index key, which
-//! keeps less than some terms carry: a big integer's XSD subtype, a
-//! `dateTime`'s digits past the microsecond.
+//! keeps less than some terms carry: a big integer's XSD subtype. (A
+//! `dateTime` or `time` is read to the microsecond its key keeps.)
 
 use crate::support;
 use fluree_db_api::policy_builder::build_policy_context_from_opts;
 use fluree_db_api::{
     CommitRef, ConflictStrategy, Fluree, FlureeBuilder, GovernanceOptions, LedgerState,
-    PolicyContext, TransactResult,
+    PolicyContext, ReindexOptions, SyncGraphOpts, TransactResult,
 };
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest};
@@ -112,6 +112,29 @@ async fn seeded(
     let mut doc = seed;
     doc["@context"] = ctx();
     let ledger = fluree.insert(ledger, &doc).await.expect("seed").ledger;
+    if !indexed {
+        return (dir, fluree, ledger);
+    }
+    drop(ledger);
+    support::rebuild_and_publish_index(&fluree, &id).await;
+    let ledger = fluree.ledger(&id).await.expect("reload");
+    assert!(ledger.snapshot.range_provider.is_some());
+    (dir, fluree, ledger)
+}
+
+/// [`seeded`], with the seed written by a SPARQL update.
+async fn seeded_with(
+    name: &str,
+    update: &str,
+    indexed: bool,
+) -> (tempfile::TempDir, Fluree, LedgerState) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("file fluree");
+    let id = format!("it/delete-stored-{name}-{indexed}:main");
+    let ledger = fluree.create_ledger(&id).await.expect("create");
+    let ledger = sparql_update(&fluree, ledger, update).await.ledger;
     if !indexed {
         return (dir, fluree, ledger);
     }
@@ -518,6 +541,150 @@ async fn witnessed_delete_of_an_indexed_big_integer_in_a_named_graph() {
 }
 
 // =============================================================================
+// A fact the update both deletes and inserts is kept, whatever the rows
+// =============================================================================
+
+/// `ex:s ex:p "v"`, in `graph` when one is given, and three items: a WHERE
+/// over the items has three rows, and only `ex:i1`'s binds `?keep`.
+fn kept_seed(graph: Option<&str>) -> JsonValue {
+    let mut fact = json!({"@id": "ex:s", "ex:p": "v"});
+    if let Some(g) = graph {
+        fact["@graph"] = json!(g);
+    }
+    json!({"@graph": [
+        fact,
+        {"@id": "ex:i1", "ex:kind": "item", "ex:keeps": {"@id": "ex:s"}},
+        {"@id": "ex:i2", "ex:kind": "item"},
+        {"@id": "ex:i3", "ex:kind": "item"}
+    ]})
+}
+
+/// The constant DELETE names the fact on all three rows, the INSERT on the
+/// one row that binds `?keep`. The fact is in the update's insert set, so
+/// under `(DS − D) ∪ I` it stays. Netting each fact by how many rows named
+/// it on each side kept the surplus retraction and deleted it.
+#[tokio::test]
+async fn a_fact_deleted_on_more_rows_than_it_is_inserted_on_is_kept() {
+    for indexed in [false, true] {
+        for graph in [None, Some(G1)] {
+            let wrap = |body: &str| match graph {
+                None => body.to_string(),
+                Some(g) => format!("GRAPH <{g}> {{ {body} }}"),
+            };
+            let sparql = [
+                format!(
+                    "DELETE {{ {} }} INSERT {{ {} }} \
+                     WHERE {{ ?i ex:kind \"item\" OPTIONAL {{ ?i ex:keeps ?keep }} }}",
+                    wrap("ex:s ex:p \"v\""),
+                    wrap("?keep ex:p \"v\""),
+                ),
+                format!(
+                    "DELETE {{ {} }} INSERT {{ {} }} \
+                     WHERE {{ VALUES (?x ?keep) {{ (1 ex:s) (2 UNDEF) (3 UNDEF) }} }}",
+                    wrap("ex:s ex:p \"v\""),
+                    wrap("?keep ex:p \"v\""),
+                ),
+            ];
+            for body in sparql {
+                let (_d, fluree, ledger) = seeded("kept-sparql", kept_seed(graph), indexed).await;
+                let t = ledger.t();
+                let r = sparql_update(&fluree, ledger, &body).await;
+                let what = format!("{body} (indexed={indexed})");
+                no_commit(&r, t, &what);
+                assert_eq!(graph_objects(&r.ledger, graph).await, ["v"], "{what}");
+            }
+
+            let template = |node: JsonValue| match graph {
+                None => node,
+                Some(g) => json!([["graph", g, node]]),
+            };
+            let (_d, fluree, ledger) = seeded("kept-jsonld", kept_seed(graph), indexed).await;
+            let t = ledger.t();
+            let r = jsonld_update(
+                &fluree,
+                ledger,
+                json!({
+                    "where": [
+                        {"@id": "?i", "ex:kind": "item"},
+                        ["optional", {"@id": "?i", "ex:keeps": "?keep"}]
+                    ],
+                    "delete": template(json!({"@id": "ex:s", "ex:p": "v"})),
+                    "insert": template(json!({"@id": "?keep", "ex:p": "v"}))
+                }),
+            )
+            .await;
+            let what = format!("JSON-LD, graph={graph:?}, indexed={indexed}");
+            no_commit(&r, t, &what);
+            assert_eq!(graph_objects(&r.ledger, graph).await, ["v"], "{what}");
+        }
+    }
+}
+
+/// `ex:a ex:v 1 . ex:b ex:v 2`.
+fn restated_seed() -> JsonValue {
+    json!({"@graph": [{"@id": "ex:a", "ex:v": 1}, {"@id": "ex:b", "ex:v": 2}]})
+}
+
+/// Every `?s ex:v ?o`, as `s=o`, sorted.
+async fn v_values(fluree: &Fluree, ledger: &LedgerState) -> Vec<String> {
+    let q = format!("SELECT ?s ?o WHERE {{ ?s <{EX}v> ?o }}");
+    let result = support::query_sparql(fluree, ledger, &q)
+        .await
+        .expect("query");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let mut rows: Vec<String> = json
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            let s = r[0].as_str().expect("subject");
+            format!("{}={}", s.rsplit([':', '/']).next().unwrap_or(s), r[1])
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Replaces every `ex:v` with `ex:a ex:v 1 . ex:b ex:v 3`: the constant
+/// INSERT is instantiated on every WHERE row.
+async fn replace_v(fluree: &Fluree, ledger: LedgerState, sparql: bool) -> TransactResult {
+    if sparql {
+        let body =
+            "DELETE { ?s ex:v ?o } INSERT { ex:a ex:v 1 . ex:b ex:v 3 } WHERE { ?s ex:v ?o }";
+        sparql_update(fluree, ledger, body).await
+    } else {
+        let txn = json!({
+            "where": {"@id": "?s", "ex:v": "?o"},
+            "delete": {"@id": "?s", "ex:v": "?o"},
+            "insert": [{"@id": "ex:a", "ex:v": 1}, {"@id": "ex:b", "ex:v": 3}]
+        });
+        jsonld_update(fluree, ledger, txn).await
+    }
+}
+
+/// Over two rows the INSERT names the unchanged `ex:a ex:v 1` twice while
+/// the DELETE retracts it once. The commit holds only the change to `ex:b`,
+/// and restating both facts as they are commits nothing.
+#[tokio::test]
+async fn a_fact_inserted_on_more_rows_than_it_is_deleted_on_is_not_asserted_again() {
+    for indexed in [false, true] {
+        for sparql in [true, false] {
+            let (_d, fluree, ledger) =
+                seeded(&format!("restated-{sparql}"), restated_seed(), indexed).await;
+            let what = format!("sparql={sparql}, indexed={indexed}");
+            let r = replace_v(&fluree, ledger, sparql).await;
+            assert_eq!(r.receipt.flake_count, 2, "{what}: retract b=2, assert b=3");
+            assert_eq!(v_values(&fluree, &r.ledger).await, ["a=1", "b=3"], "{what}");
+
+            let t = r.ledger.t();
+            let r = replace_v(&fluree, r.ledger, sparql).await;
+            no_commit(&r, t, &format!("{what}, restating both"));
+            assert_eq!(v_values(&fluree, &r.ledger).await, ["a=1", "b=3"], "{what}");
+        }
+    }
+}
+
+// =============================================================================
 // Indexed facts are named by their index key
 // =============================================================================
 
@@ -745,7 +912,7 @@ async fn cypher_set_and_detach_delete_reach_big_integers() {
 }
 
 /// A `dateTime` or `time` written past the microsecond is deleted by the
-/// same literal on both lanes; the index keeps microseconds.
+/// same literal on both lanes: both are read to the microsecond.
 #[tokio::test]
 async fn delete_data_names_sub_microsecond_temporals() {
     let seed = json!({
@@ -836,6 +1003,56 @@ async fn a_delete_names_a_big_integer_in_a_named_graph() {
             0,
             "indexed={indexed}"
         );
+    }
+}
+
+// =============================================================================
+// A WHERE-matched DELETE over a value stored more than once in a slot
+// =============================================================================
+
+/// A WHERE-matched DELETE removes every stored entry its WHERE matched: a list
+/// holding `"v"` twice empties, as does `"v"` stored both plain and in a list.
+/// The WHERE yields one row per stored entry, and identical rows take
+/// successive entries; they used to take the first one each, leaving a `"v"`.
+#[tokio::test]
+async fn a_where_matched_delete_removes_each_entry_of_a_repeated_value() {
+    let shapes = [
+        (
+            "repeated in a list",
+            json!({"@id": "ex:s", "ex:items": {"@list": ["v", "v", "w"]}}),
+            3,
+        ),
+        (
+            "plain and in a list",
+            json!({"@graph": [
+                {"@id": "ex:s", "ex:items": "v"},
+                {"@id": "ex:s", "ex:items": {"@list": ["v"]}}
+            ]}),
+            2,
+        ),
+    ];
+    for indexed in [false, true] {
+        for (shape, seed, stored) in &shapes {
+            for surface in ["SPARQL", "JSON-LD"] {
+                let (_d, fluree, ledger) = seeded("repeated-value", seed.clone(), indexed).await;
+                let r = if surface == "SPARQL" {
+                    sparql_update(&fluree, ledger, "DELETE WHERE { ex:s ex:items ?o }").await
+                } else {
+                    jsonld_update(
+                        &fluree,
+                        ledger,
+                        json!({
+                            "where": {"@id": "ex:s", "ex:items": "?o"},
+                            "delete": {"@id": "ex:s", "ex:items": "?o"}
+                        }),
+                    )
+                    .await
+                };
+                let what = format!("{shape}, {surface}, indexed={indexed}");
+                assert_eq!(r.receipt.retract_count, *stored, "{what}");
+                assert!(facts(&fluree, &r.ledger).await.is_empty(), "{what}");
+            }
+        }
     }
 }
 
@@ -1000,6 +1217,113 @@ async fn a_permitted_delete_of_an_absent_value_commits_nothing() {
         .expect("permitted");
         assert_eq!(r.receipt.retract_count, 1, "indexed={indexed}");
     }
+}
+
+/// The identity may view everything, and `verb` an `ex:Thing` and nothing
+/// else.
+async fn view_all_and(ledger: &LedgerState, verb: &str) -> PolicyContext {
+    policy(
+        ledger,
+        GovernanceOptions {
+            policy: Some(json!([
+                {
+                    "@id": "http://example.org/ns/viewAll",
+                    "f:action": "f:view",
+                    "f:allow": true
+                },
+                {
+                    "@id": "http://example.org/ns/verbOnThing",
+                    "f:onClass": [{"@id": "http://example.org/ns/Thing"}],
+                    "f:action": verb,
+                    "f:allow": true
+                }
+            ])),
+            default_allow: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// A write-verb policy tells a subject's full removal by fact identity, as
+/// storage holds the facts. An indexed `x^^xsd:integer` with
+/// `x^^xsd:nonNegativeInteger` written since the build is one stored fact:
+/// the pre-state read returns the indexed term, and the removal retracts the
+/// newer one. Removing every fact of the subject (with a language-tagged
+/// value and a list beside it) is a delete, so a delete-only grant permits
+/// it and an update-only grant does not, on SPARQL and JSON-LD. Never
+/// indexed, both terms are read and retracted. Each attempt has a ledger of
+/// its own, read cold, with no background indexer.
+#[tokio::test]
+async fn a_full_removal_is_a_delete_whichever_term_names_a_fact() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for surface in ["SPARQL", "JSON-LD"] {
+            for (verb, permitted) in [("f:update", false), ("f:delete", true)] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().to_string_lossy().to_string();
+                let open = || {
+                    FlureeBuilder::file(path.clone())
+                        .without_indexing()
+                        .build()
+                        .expect("file fluree")
+                };
+                let id = "it/delete-stored-lifecycle:main";
+                let fluree = open();
+                let ledger = fluree.create_ledger(id).await.expect("create");
+                // A language tag and list positions are part of a fact's
+                // identity, so the removal has to name those as stored too.
+                let seed = json!({
+                    "@context": ctx(),
+                    "@id": "ex:s",
+                    "@type": "ex:Thing",
+                    "ex:p": {"@value": BIG, "@type": "xsd:integer"},
+                    "ex:label": {"@value": "Al", "@language": "en"},
+                    "ex:scores": {"@list": [1, 2]}
+                });
+                fluree.insert(ledger, &seed).await.expect("seed");
+                if indexed {
+                    support::rebuild_and_publish_index(&fluree, id).await;
+                }
+                let fluree = open();
+                let ledger = fluree.ledger(id).await.expect("ledger");
+                assert_eq!(ledger.snapshot.range_provider.is_some(), indexed);
+                let since =
+                    format!("INSERT DATA {{ ex:s ex:p \"{BIG}\"^^xsd:nonNegativeInteger }}");
+                sparql_update(&fluree, ledger, &since).await;
+                let fluree = open();
+                let ledger = fluree.ledger(id).await.expect("ledger");
+                let policy = view_all_and(&ledger, verb).await;
+                let r = if surface == "SPARQL" {
+                    sparql_update_as(&fluree, ledger, "DELETE WHERE { ex:s ?p ?o }", policy).await
+                } else {
+                    let txn = json!({
+                        "@context": ctx(),
+                        "where": {"@id": "ex:s", "?p": "?o"},
+                        "delete": {"@id": "ex:s", "?p": "?o"}
+                    });
+                    fluree
+                        .stage_owned(ledger)
+                        .update(&txn)
+                        .policy(policy)
+                        .execute()
+                        .await
+                };
+                let what = format!("{surface} under {verb} alone, indexed={indexed}");
+                match (permitted, r) {
+                    (false, r) => failures.extend(not_refused(r, &what)),
+                    (true, Err(e)) => failures.push(format!("{what}: {e}")),
+                    (true, Ok(r)) => {
+                        let left = facts(&fluree, &r.ledger).await;
+                        if !left.is_empty() {
+                            failures.push(format!("{what}: left {left:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 // =============================================================================
@@ -1218,9 +1542,6 @@ async fn delete_insert_of_one_value_refused_by_policy_regardless_of_stored_value
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Restating a value the identity can view commits nothing, without modify
-/// permission, as it did before; a changed value is still refused. As root,
-/// a restatement commits nothing either.
 /// A transfer judges a fact the destination already holds as a restatement:
 /// `ADD` or `COPY` of a value the identity can neither view nor modify is
 /// refused with one answer whether or not the destination holds it. A held
@@ -1276,6 +1597,9 @@ async fn transfer_refused_by_policy_regardless_of_destination_contents() {
     }
 }
 
+/// Restating a value the identity can view commits nothing, without modify
+/// permission, as it did before; a changed value is still refused. As root,
+/// a restatement commits nothing either.
 #[tokio::test]
 async fn restating_a_viewable_value_commits_nothing_without_modify() {
     for indexed in [false, true] {
@@ -1310,6 +1634,196 @@ async fn restating_a_viewable_value_commits_nothing_without_modify() {
         .await
         .expect("restating a viewable value");
         no_commit(&r, t, &format!("SPARQL, indexed={indexed}"));
+    }
+}
+
+const G2: &str = "http://example.org/g2";
+
+/// `G1` holding Alice's name and salary, and with `dest_holds` `G2` holding
+/// the same facts; optionally indexed.
+async fn transfer_seed(
+    name: &str,
+    dest_holds: bool,
+    indexed: bool,
+) -> (tempfile::TempDir, Fluree, LedgerState) {
+    let alice = r#"ex:alice ex:name "Alice" ; ex:salary 100 ."#;
+    let dest = if dest_holds {
+        format!("GRAPH <{G2}> {{ {alice} }}")
+    } else {
+        String::new()
+    };
+    seeded_with(
+        name,
+        &format!("INSERT DATA {{ GRAPH <{G1}> {{ {alice} }} {dest} }}"),
+        indexed,
+    )
+    .await
+}
+
+/// ADD, COPY and MOVE into a graph are refused with one answer whether or
+/// not the destination already holds the source's facts, the source holding
+/// a name the identity may change beside the salary it may not. A fact the
+/// destination holds is restated, not skipped unseen: when the identity
+/// cannot view it, both sides go to the modify check, as for upsert and
+/// sync. (MOVE also retracts the source, which this identity may not.)
+#[tokio::test]
+async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for dest_holds in [false, true] {
+            for verb in ["ADD", "COPY", "MOVE"] {
+                let (_d, fluree, ledger) =
+                    transfer_seed("restate-transfer", dest_holds, indexed).await;
+                let policy = name_only(&ledger).await;
+                let r =
+                    sparql_update_as(&fluree, ledger, &format!("{verb} <{G1}> TO <{G2}>"), policy)
+                        .await;
+                failures.extend(not_refused(
+                    r,
+                    &format!("{verb}, dest_holds={dest_holds}, indexed={indexed}"),
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// ADD of a list into a graph holding its own list on the same subject and
+/// property is refused with one answer whether or not that graph already
+/// holds the list beside it, as a chain: the chain is restated, not skipped
+/// unseen, so an identity that cannot view it learns nothing of it. One
+/// that can commits nothing.
+#[tokio::test]
+async fn adding_a_list_held_as_a_chain_restates_it() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for dest_holds in [false, true] {
+            let seed = format!(
+                "INSERT DATA {{ GRAPH <{G1}> {{ ex:alice ex:items (1 2) }} \
+                 GRAPH <{G2}> {{ ex:alice ex:items (3 4) }} }}"
+            );
+            let (_d, fluree, mut ledger) = seeded_with("chain-restate", &seed, indexed).await;
+            let add = format!("ADD <{G1}> TO <{G2}>");
+            if dest_holds {
+                ledger = sparql_update(&fluree, ledger, &add).await.ledger;
+            }
+            let t = ledger.t();
+            let policy = name_only(&ledger).await;
+            let r = sparql_update_as(&fluree, ledger.clone(), &add, policy).await;
+            failures.extend(not_refused(
+                r,
+                &format!("dest_holds={dest_holds}, indexed={indexed}"),
+            ));
+            if dest_holds {
+                let policy = view_all_modify_name(&ledger).await;
+                let r = sparql_update_as(&fluree, ledger, &add, policy)
+                    .await
+                    .expect("restating a viewable chain");
+                no_commit(&r, t, &format!("viewable, indexed={indexed}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A destination fact the identity can view, restated by ADD or COPY,
+/// commits nothing without modify permission, as before; as root as well.
+#[tokio::test]
+async fn transferring_viewable_facts_the_destination_holds_commits_nothing() {
+    for indexed in [false, true] {
+        for verb in ["ADD", "COPY"] {
+            let body = format!("{verb} <{G1}> TO <{G2}>");
+            let (_d, fluree, ledger) = transfer_seed("restate-transfer-view", true, indexed).await;
+            let t = ledger.t();
+            let policy = view_all_modify_name(&ledger).await;
+            let r = sparql_update_as(&fluree, ledger, &body, policy)
+                .await
+                .expect(&body);
+            no_commit(&r, t, &format!("{body}, indexed={indexed}"));
+
+            let (_d, fluree, ledger) = transfer_seed("restate-transfer-root", true, indexed).await;
+            let t = ledger.t();
+            let r = sparql_update(&fluree, ledger, &body).await;
+            no_commit(&r, t, &format!("root, {body}, indexed={indexed}"));
+        }
+    }
+}
+
+// =============================================================================
+// A DELETE naming a graph the ledger does not have
+// =============================================================================
+
+/// A DELETE naming a graph the ledger does not have commits nothing and
+/// registers no graph: nothing is stored there to retract. An INSERT into a
+/// new graph, a `CREATE GRAPH`, and a DELETE beside an INSERT into the same
+/// new graph still register it, and the graph a transaction inserts into
+/// beside a DELETE-only new graph gets the id the commit gives it.
+#[tokio::test]
+async fn a_delete_naming_a_graph_the_ledger_lacks_commits_nothing() {
+    const NEW: &str = "http://example.org/new";
+    const ALSO_NEW: &str = "http://example.org/also-new";
+    let registered = |ledger: &LedgerState, iri: &str| {
+        ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .is_some()
+    };
+    for indexed in [false, true] {
+        for body in [
+            format!("DELETE DATA {{ GRAPH <{NEW}> {{ ex:alice ex:salary 100 }} }}"),
+            format!("DELETE {{ GRAPH <{NEW}> {{ ?s ex:salary ?o }} }} WHERE {{ ?s ex:salary ?o }}"),
+            format!("WITH <{NEW}> DELETE {{ ?s ex:salary ?o }} WHERE {{ ?s ex:salary ?o }}"),
+            format!(
+                "DELETE {{ GRAPH ?g {{ ?s ex:salary ?o }} }} \
+                 WHERE {{ ?s ex:salary ?o VALUES ?g {{ <{NEW}> }} }}"
+            ),
+        ] {
+            let (_d, fluree, ledger) = seeded("missing-graph", salary_seed(), indexed).await;
+            let t = ledger.t();
+            let r = sparql_update(&fluree, ledger, &body).await;
+            no_commit(&r, t, &format!("{body}, indexed={indexed}"));
+            assert!(
+                !registered(&r.ledger, NEW),
+                "{body}, indexed={indexed}: registered"
+            );
+        }
+        for body in [
+            format!("INSERT DATA {{ GRAPH <{NEW}> {{ ex:alice ex:salary 1 }} }}"),
+            format!("CREATE GRAPH <{NEW}>"),
+            format!(
+                "DELETE {{ GRAPH <{NEW}> {{ ?s ex:salary ?o }} }} \
+                 INSERT {{ GRAPH <{NEW}> {{ ?s ex:salary 1 }} }} WHERE {{ ?s ex:salary ?o }}"
+            ),
+        ] {
+            let (_d, fluree, ledger) = seeded("new-graph", salary_seed(), indexed).await;
+            let r = sparql_update(&fluree, ledger, &body).await;
+            assert!(
+                registered(&r.ledger, NEW),
+                "{body}, indexed={indexed}: not registered"
+            );
+        }
+
+        // `ALSO_NEW` sorts before `NEW`: leaving it out of the commit must not
+        // shift the id the inserted graph's flakes were routed to.
+        let (_d, fluree, ledger) = seeded("new-graph-beside", salary_seed(), indexed).await;
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "DELETE {{ GRAPH <{ALSO_NEW}> {{ ?s ex:salary ?o }} }} \
+                 INSERT {{ GRAPH <{NEW}> {{ ?s ex:salary 1 }} }} WHERE {{ ?s ex:salary ?o }}"
+            ),
+        )
+        .await;
+        assert!(!registered(&r.ledger, ALSO_NEW), "indexed={indexed}");
+        let q = format!("SELECT ?o WHERE {{ GRAPH <{NEW}> {{ ex:alice ex:salary ?o }} }}");
+        let rows = support::query_sparql(&fluree, &r.ledger, &format!("PREFIX ex: <{EX}>\n{q}"))
+            .await
+            .expect("query")
+            .to_jsonld(&r.ledger.snapshot)
+            .expect("jsonld");
+        assert_eq!(rows, json!([[1]]), "indexed={indexed}");
     }
 }
 
@@ -1354,13 +1868,44 @@ async fn graph_objects(ledger: &LedgerState, iri: Option<&str>) -> Vec<String> {
     out
 }
 
-/// A ledger with a named graph registered under its own address, which a
-/// TriG block can create. `USING <address>` with `GRAPH <address>`
-/// templates: the templates write that graph, and a WHERE row witnesses a
-/// template only when the graph the WHERE read is the graph the template
-/// writes, compared as graph ids. The row's value is inserted into that
-/// graph whichever graph the WHERE reads for the address, and the default
-/// graph is left alone.
+/// Rebuild and publish a branch's index, reading its commits through the
+/// branch's ancestry (the commits before its branch point are its source's).
+async fn rebuild_and_publish_branch_index(fluree: &Fluree, ledger_id: &str) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    let store = fluree
+        .branched_content_store(ledger_id)
+        .await
+        .expect("branched content store");
+    let result = fluree_db_indexer::rebuild_index_from_commits(
+        store,
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("index rebuild should succeed");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+}
+
+/// A ledger branch with a named graph registered under its own address: the
+/// legacy layout, built the one way still open (`main` writes a graph named
+/// by the branch's address, which on `main` is just a graph IRI, and the
+/// branch inherits it). The update reads `USING <address>`, the default
+/// graph, and its templates write `GRAPH <address#address>`, the legacy
+/// graph. A WHERE row witnesses a template only when the graph the WHERE
+/// read is the graph the template writes, compared as graph ids, so the
+/// row's value is inserted into the legacy graph and the default graph is
+/// left alone.
 #[tokio::test]
 async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
     for indexed in [false, true] {
@@ -1368,16 +1913,21 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
             .build()
             .expect("file fluree");
-        let id = format!("legacyaddress{indexed}:main");
-        let ledger = fluree.create_ledger(&id).await.expect("create");
+        let name = format!("legacyaddress{indexed}");
+        let id = format!("{name}:dev");
+        let main = fluree
+            .create_ledger(&format!("{name}:main"))
+            .await
+            .expect("create");
         let trig = format!(
             "@prefix ex: <{EX}> .\nex:s ex:p \"d\" .\nGRAPH <{id}> {{ ex:s ex:p \"l\" . }}\n"
         );
-        let mut ledger = fluree
-            .insert_turtle(ledger, &trig)
+        fluree.insert_turtle(main, &trig).await.expect("seed");
+        fluree
+            .create_branch(&name, "dev", None, None)
             .await
-            .expect("seed")
-            .ledger;
+            .expect("create the branch");
+        let mut ledger = fluree.ledger(&id).await.expect("load the branch");
         assert!(
             ledger
                 .snapshot
@@ -1388,15 +1938,15 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
         );
         if indexed {
             drop(ledger);
-            support::rebuild_and_publish_index(&fluree, &id).await;
+            rebuild_and_publish_branch_index(&fluree, &id).await;
             ledger = fluree.ledger(&id).await.expect("reload");
         }
         let r = sparql_update(
             &fluree,
             ledger,
             &format!(
-                "DELETE {{ GRAPH <{id}> {{ ?s ex:p ?o }} }} \
-                 INSERT {{ GRAPH <{id}> {{ ?s ex:p \"d\" }} }} \
+                "DELETE {{ GRAPH <{id}#{id}> {{ ?s ex:p ?o }} }} \
+                 INSERT {{ GRAPH <{id}#{id}> {{ ?s ex:p \"d\" }} }} \
                  USING <{id}> WHERE {{ ?s ex:p ?o }}"
             ),
         )
@@ -1417,87 +1967,822 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
 }
 
 // =============================================================================
-// A DELETE can name a stored ill-typed literal
+// A write that restates a stored value keeps it
 // =============================================================================
 
-/// A file-backed ledger holding the Turtle `ttl`, optionally indexed.
-async fn seeded_turtle(
-    name: &str,
-    ttl: &str,
-    indexed: bool,
-) -> (tempfile::TempDir, Fluree, LedgerState) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-        .build()
-        .expect("file fluree");
-    let id = format!("it/delete-stored-{name}-{indexed}:main");
-    let ledger = fluree.create_ledger(&id).await.expect("create");
-    let ledger = fluree
-        .insert_turtle(ledger, ttl)
-        .await
-        .expect("seed")
-        .ledger;
-    if !indexed {
-        return (dir, fluree, ledger);
-    }
-    drop(ledger);
-    support::rebuild_and_publish_index(&fluree, &id).await;
-    let ledger = fluree.ledger(&id).await.expect("reload");
-    (dir, fluree, ledger)
-}
-
-/// A Turtle write keeps an ill-typed literal as its lexical form with the
-/// declared datatype. A DELETE names that stored term: its template keeps the
-/// lexical form as stored instead of refusing it, on SPARQL and JSON-LD. An
-/// insert still refuses one.
+/// One write that retracts a stored value and asserts it again, as written,
+/// keeps it. On an indexed ledger the delete side names the value as the
+/// index stores it, which holds less than the write for a big integer with
+/// an XSD subtype; the two are still one fact to storage, so they cancel, as
+/// a value stored exactly as written does (as a `dateTime` or `time` written
+/// past the microsecond now is, read to the microsecond on both sides):
+/// - `DELETE { x } INSERT { x } WHERE {}` and its JSON-LD twin commit
+///   nothing (`retractions.md`'s example);
+/// - an upsert or a graph sync of a payload that holds `x` keeps it.
+///
+/// Read cold, after the write and again after the next index build, with
+/// the slot held by the index alone or with a novelty op beside it.
 #[tokio::test]
-async fn a_delete_names_a_stored_ill_typed_literal() {
-    let ttl = format!(
-        "@prefix ex: <{EX}> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
-         ex:s ex:n \"abc\"^^xsd:integer .\n"
-    );
-    for indexed in [false, true] {
-        for surface in ["sparql", "jsonld"] {
-            let (_d, fluree, ledger) =
-                seeded_turtle(&format!("ill-typed-{surface}"), &ttl, indexed).await;
-            assert_eq!(facts(&fluree, &ledger).await, ["n=abc"], "precondition");
-            let r = if surface == "sparql" {
-                sparql_update(
-                    &fluree,
-                    ledger,
-                    "DELETE DATA { ex:s ex:n \"abc\"^^xsd:integer }",
-                )
-                .await
-            } else {
-                jsonld_update(
-                    &fluree,
-                    ledger,
-                    json!({"delete": {"@id": "ex:s", "ex:n": {"@value": "abc", "@type": "xsd:integer"}}}),
-                )
-                .await
-            };
-            assert_eq!(r.receipt.retract_count, 1, "{surface}, indexed={indexed}");
-            assert!(
-                facts(&fluree, &r.ledger).await.is_empty(),
-                "{surface}, indexed={indexed}"
-            );
+async fn a_write_that_restates_a_stored_value_keeps_it() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    const TTL_PFX: &str = "@prefix ex: <http://example.org/ns/> .\n\
+                           @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
+    const G: &str = "http://example.org/ns/g";
+    // (SPARQL/Turtle literal, JSON-LD value). The last two are stored as
+    // written and are the controls.
+    let values = [
+        (
+            "\"123456789012345678901234567890\"^^xsd:nonNegativeInteger",
+            json!({"@value": "123456789012345678901234567890", "@type": "xsd:nonNegativeInteger"}),
+        ),
+        (
+            "\"2020-01-01T00:00:00.123456789Z\"^^xsd:dateTime",
+            json!({"@value": "2020-01-01T00:00:00.123456789Z", "@type": "xsd:dateTime"}),
+        ),
+        (
+            "\"12:00:00.123456789\"^^xsd:time",
+            json!({"@value": "12:00:00.123456789", "@type": "xsd:time"}),
+        ),
+        (
+            "\"2020-01-01T00:00:00.123456Z\"^^xsd:dateTime",
+            json!({"@value": "2020-01-01T00:00:00.123456Z", "@type": "xsd:dateTime"}),
+        ),
+        ("\"x\"", json!("x")),
+    ];
+    let lanes: [(&str, bool); 7] = [
+        ("DELETE { x } INSERT { x } WHERE {}", false),
+        ("DELETE { x } INSERT { x } WHERE {}", true),
+        ("JSON-LD delete and insert", false),
+        ("JSON-LD delete and insert", true),
+        ("JSON-LD upsert", false),
+        ("Turtle upsert", false),
+        ("graph sync", true),
+    ];
+    let mut failures = Vec::new();
+    for (lit, jv) in &values {
+        for novelty_beside in [false, true] {
+            for (lane, named) in lanes {
+                let wrap = |triples: &str| {
+                    if named {
+                        format!("GRAPH <{G}> {{ {triples} }}")
+                    } else {
+                        triples.to_string()
+                    }
+                };
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().to_string_lossy().to_string();
+                let id = "it/restated-lossy:main";
+                {
+                    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                    fluree.create_ledger(id).await.expect("create");
+                    let seed = format!(
+                        "{PFX}INSERT DATA {{ {} }}",
+                        wrap(&format!("ex:s ex:p {lit} ; ex:k \"keep\" ."))
+                    );
+                    fluree
+                        .graph(id)
+                        .transact()
+                        .sparql_update(&seed)
+                        .commit()
+                        .await
+                        .expect("seed");
+                    support::rebuild_and_publish_index(&fluree, id).await;
+                    if novelty_beside {
+                        let sib = format!("{PFX}INSERT DATA {{ {} }}", wrap("ex:s ex:p \"sib\" ."));
+                        fluree
+                            .graph(id)
+                            .transact()
+                            .sparql_update(&sib)
+                            .commit()
+                            .await
+                            .expect("novelty beside");
+                    }
+                }
+                let read = |path: String| {
+                    let q = format!(
+                        "{PFX}SELECT ?o (DATATYPE(?o) AS ?dt) WHERE {{ {} }}",
+                        wrap("ex:s ex:p ?o .")
+                    );
+                    async move {
+                        let fluree = FlureeBuilder::file(path).build().expect("reload");
+                        let ledger = fluree.ledger(id).await.expect("ledger");
+                        let json = support::query_sparql(&fluree, &ledger, &q)
+                            .await
+                            .expect("query")
+                            .to_sparql_json(&ledger.snapshot)
+                            .expect("json");
+                        let mut rows: Vec<String> = json["results"]["bindings"]
+                            .as_array()
+                            .expect("bindings")
+                            .iter()
+                            .map(|b| {
+                                format!(
+                                    "{}^^{}",
+                                    b["o"]["value"].as_str().unwrap_or("?"),
+                                    b["dt"]["value"].as_str().unwrap_or("")
+                                )
+                            })
+                            .collect();
+                        rows.sort();
+                        rows
+                    }
+                };
+                let before = read(path.clone()).await;
+                let restates = !lane.ends_with("upsert") && lane != "graph sync";
+                let flakes = {
+                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let graph = fluree.graph(id);
+                    let tx = graph.transact();
+                    let x = wrap(&format!("ex:s ex:p {lit} ."));
+                    let update = format!("{PFX}DELETE {{ {x} }} INSERT {{ {x} }} WHERE {{}}");
+                    let node = json!({"@id": "ex:s", "ex:p": jv});
+                    let delins = if named {
+                        json!({"@context": ctx(), "graph": G, "delete": node, "insert": node})
+                    } else {
+                        json!({"@context": ctx(), "delete": node, "insert": node})
+                    };
+                    let upsert = json!({"@context": ctx(), "@id": "ex:s", "ex:p": jv});
+                    let ttl = format!("{TTL_PFX}ex:s ex:p {lit} .\n");
+                    let synced = json!({
+                        "@context": ctx(),
+                        "@graph": [{"@id": "ex:s", "ex:p": jv, "ex:k": "keep"}]
+                    });
+                    if lane == "graph sync" {
+                        let report = fluree
+                            .sync_named_graph(id, G, &synced, SyncGraphOpts::default())
+                            .await
+                            .expect("sync");
+                        report.asserted + report.retracted
+                    } else {
+                        let tx = match lane {
+                            "JSON-LD delete and insert" => tx.update(&delins),
+                            "JSON-LD upsert" => tx.upsert(&upsert),
+                            "Turtle upsert" => tx.upsert_turtle(&ttl),
+                            _ => tx.sparql_update(&update),
+                        };
+                        tx.commit().await.expect("write").receipt.flake_count
+                    }
+                };
+                let after = read(path.clone()).await;
+                {
+                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    support::rebuild_and_publish_index(&fluree, id).await;
+                }
+                let reindexed = read(path.clone()).await;
+                // The upserts and the sync replace `ex:p`'s values with the
+                // payload's, so a novelty value beside `x` goes.
+                let want: Vec<String> = before
+                    .iter()
+                    .filter(|v| restates || !v.starts_with("sib^^"))
+                    .cloned()
+                    .collect();
+                let committed_nothing = flakes == 0;
+                if after != want || reindexed != want || (restates && !committed_nothing) {
+                    failures.push(format!(
+                        "{lit}, {lane}{}{}: flakes {}, values {after:?}, after reindex \
+                         {reindexed:?}; expected {want:?}{}",
+                        if named { " in a named graph" } else { "" },
+                        if novelty_beside {
+                            ", novelty beside"
+                        } else {
+                            ""
+                        },
+                        flakes,
+                        if restates { " and no commit" } else { "" },
+                    ));
+                }
+            }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
 
-    // An insert still refuses an ill-typed literal.
-    let text = format!(
-        "PREFIX ex: <{EX}>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
-         INSERT DATA {{ ex:s ex:n \"abc\"^^xsd:integer }}"
-    );
-    let parsed = fluree_db_sparql::parse_sparql(&text);
-    let mut ns = fluree_db_transact::NamespaceRegistry::new();
-    assert!(
-        fluree_db_transact::lower_sparql_update_ast(
-            &parsed.ast.expect("ast"),
-            &mut ns,
-            fluree_db_transact::TxnOpts::default(),
-        )
-        .is_err(),
-        "INSERT DATA refuses an ill-typed literal"
-    );
+/// The values of `ex:s`'s `pred`, read cold from the ledger at `path`.
+async fn values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
+    let fluree = FlureeBuilder::file(path.to_string())
+        .without_indexing()
+        .build()
+        .expect("reload");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let q = format!("PREFIX ex: <{EX}>\nSELECT ?o WHERE {{ ex:s {pred} ?o }}");
+    let json = support::query_sparql(&fluree, &ledger, &q)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("json");
+    let mut values: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["o"]["value"].as_str().unwrap_or("?").to_string())
+        .collect();
+    values.sort();
+    values
+}
+
+/// [`values_of`] through a JSON-LD query, which sees a list's entries as
+/// values.
+async fn stored_values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
+    let fluree = FlureeBuilder::file(path.to_string())
+        .without_indexing()
+        .build()
+        .expect("reload");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let query = json!({
+        "@context": {"ex": EX},
+        "select": ["?o"],
+        "where": {"@id": "ex:s", pred: "?o"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("json");
+    let mut values: Vec<String> = support::normalize_rows(&rows)
+        .iter()
+        .map(JsonValue::to_string)
+        .collect();
+    values.sort();
+    values
+}
+
+/// An integer too large for 64 bits is one stored fact per value, whatever
+/// XSD subtype it is written with: the index keys it by value. So a write
+/// that retracts it under one subtype and asserts it under another commits
+/// nothing and keeps it, whether the index holds it, holds the value for
+/// another subject only, has not seen it since its last build, or does not
+/// exist yet; and it is still there after the next index build. In one
+/// operation (SPARQL and JSON-LD) and across two of one request.
+#[tokio::test]
+async fn changing_a_big_integers_subtype_keeps_it() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    const BIG: &str = "123456789012345678901234567890";
+    let nonneg = format!("\"{BIG}\"^^xsd:nonNegativeInteger");
+    let posint = format!("\"{BIG}\"^^xsd:positiveInteger");
+    // (case, indexed seed, novelty seed after the index build; no build
+    // without an indexed seed)
+    let cases = [
+        (
+            "the index holds it",
+            format!("ex:s ex:p {nonneg} ; ex:k \"keep\" ."),
+            String::new(),
+        ),
+        (
+            "written since the last index build, which holds the value for another subject",
+            format!("ex:t ex:p {nonneg} . ex:s ex:k \"keep\" ."),
+            format!("ex:s ex:p {nonneg} ."),
+        ),
+        (
+            "written since the last index build, which never saw the value",
+            "ex:t ex:p 1 . ex:s ex:k \"keep\" .".to_string(),
+            format!("ex:s ex:p {nonneg} ."),
+        ),
+        (
+            "never indexed",
+            String::new(),
+            format!("ex:s ex:p {nonneg} ; ex:k \"keep\" ."),
+        ),
+    ];
+    let jv = |dt: &str| json!({"@value": BIG, "@type": format!("xsd:{dt}")});
+    let lanes = [
+        "DELETE { x } INSERT { y } WHERE {}",
+        "JSON-LD delete and insert",
+        "DELETE DATA { x } ; INSERT DATA { y }",
+    ];
+    let mut failures = Vec::new();
+    for (case, indexed, novelty) in &cases {
+        for lane in lanes {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let id = "it/big-subtype:main";
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                fluree.create_ledger(id).await.expect("create");
+                for (seed, index) in [(indexed, true), (novelty, false)] {
+                    if seed.is_empty() {
+                        continue;
+                    }
+                    fluree
+                        .graph(id)
+                        .transact()
+                        .sparql_update(&format!("{PFX}INSERT DATA {{ {seed} }}"))
+                        .commit()
+                        .await
+                        .expect("seed");
+                    if index {
+                        support::rebuild_and_publish_index(&fluree, id).await;
+                    }
+                }
+            }
+            let flakes = {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let graph = fluree.graph(id);
+                let tx = graph.transact();
+                let update = match lane {
+                    "DELETE { x } INSERT { y } WHERE {}" => format!(
+                        "{PFX}DELETE {{ ex:s ex:p {nonneg} }} INSERT {{ ex:s ex:p {posint} }} \
+                         WHERE {{}}"
+                    ),
+                    _ => format!(
+                        "{PFX}DELETE DATA {{ ex:s ex:p {nonneg} }} ;\n\
+                         INSERT DATA {{ ex:s ex:p {posint} }}"
+                    ),
+                };
+                let delins = json!({
+                    "@context": ctx(),
+                    "delete": {"@id": "ex:s", "ex:p": jv("nonNegativeInteger")},
+                    "insert": {"@id": "ex:s", "ex:p": jv("positiveInteger")}
+                });
+                let tx = match lane {
+                    "JSON-LD delete and insert" => tx.update(&delins),
+                    _ => tx.sparql_update(&update),
+                };
+                tx.commit().await.expect("write").receipt.flake_count
+            };
+            let after = values_of(&path, id, "ex:p").await;
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                support::rebuild_and_publish_index(&fluree, id).await;
+            }
+            let reindexed = values_of(&path, id, "ex:p").await;
+            if flakes != 0 || after != [BIG] || reindexed != [BIG] {
+                failures.push(format!(
+                    "{case}, {lane}: flakes {flakes}, values {after:?}, after reindex \
+                     {reindexed:?}; expected no commit and [{BIG}]"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A list that holds one value twice holds two facts, one per position,
+/// for the kinds of value storage keys by value too (a double, an integer
+/// too large for 64 bits). A write that retracts the value and asserts
+/// something else retracts both entries, before and after an index build.
+#[tokio::test]
+async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
+    const TTL_PFX: &str = "@prefix ex: <http://example.org/ns/> .\n\
+                           @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
+    const BIG: &str = "\"123456789012345678901234567890\"^^xsd:integer";
+    let mut failures = Vec::new();
+    for (list, v) in [
+        ("( 1.5E0 1.5E0 2.5E0 )".to_string(), "(= ?o 1.5)"),
+        // The big value's two entries, picked out without spelling a big
+        // integer in a filter.
+        (format!("( {BIG} {BIG} 7 )"), "(!= ?o 7)"),
+    ] {
+        for indexed in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let id = "it/list-twice:main";
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                fluree.create_ledger(id).await.expect("create");
+                fluree
+                    .graph(id)
+                    .transact()
+                    .upsert_turtle(&format!("{TTL_PFX}ex:s ex:l {list} ; ex:k \"keep\" .\n"))
+                    .commit()
+                    .await
+                    .expect("seed");
+                if indexed {
+                    support::rebuild_and_publish_index(&fluree, id).await;
+                }
+            }
+            // The list's entries are the values of `ex:l` in JSON-LD's view;
+            // SPARQL reads the list as its head and cells.
+            let before = stored_values_of(&path, id, "ex:l").await;
+            let receipt = {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let update = json!({
+                    "@context": {
+                        "ex": "http://example.org/ns/",
+                        "xsd": "http://www.w3.org/2001/XMLSchema#"
+                    },
+                    "where": [{"@id": "ex:s", "ex:l": "?o"}, ["filter", v]],
+                    "delete": {"@id": "ex:s", "ex:l": "?o"},
+                    "insert": {"@id": "ex:s", "ex:q": "done"}
+                });
+                fluree
+                    .graph(id)
+                    .transact()
+                    .update(&update)
+                    .commit()
+                    .await
+                    .expect("write")
+                    .receipt
+            };
+            let after = stored_values_of(&path, id, "ex:l").await;
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                support::rebuild_and_publish_index(&fluree, id).await;
+            }
+            let reindexed = stored_values_of(&path, id, "ex:l").await;
+            let got = (receipt.flake_count, receipt.retract_count);
+            if before.len() != 3 || got != (3, 2) || after.len() != 1 || reindexed != after {
+                failures.push(format!(
+                    "{list}, indexed={indexed}: list {before:?}, (flakes, retractions) {got:?}, \
+                     list {after:?}, after reindex {reindexed:?}; expected three entries, (3, 2) \
+                     and one entry left"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// ADD, COPY and MOVE tell the facts of the source and the destination apart
+/// the way storage does: a big integer by value, whatever XSD subtype either
+/// side holds it with. So a value both graphs hold, one in its index and the
+/// other since its last build, is a restatement: it stays in the destination,
+/// read in process, after a reload and after the next full index build (no
+/// background indexer, so the index state is the test's). Before,
+/// the destination's term was retracted and the source's asserted at one
+/// `t`, and the retraction won. Both directions (indexed destination,
+/// novelty source and the reverse), into a named graph and into the default
+/// graph. A `dateTime` written past the microsecond is a control: both sides
+/// hold it at the microsecond.
+#[tokio::test]
+async fn a_transfer_keeps_a_value_both_graphs_hold() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    const BIG: &str = "\"123456789012345678901234567890\"";
+    // (source spelling, destination spelling)
+    let values = [
+        (
+            format!("{BIG}^^xsd:nonNegativeInteger"),
+            format!("{BIG}^^xsd:nonNegativeInteger"),
+        ),
+        (
+            format!("{BIG}^^xsd:positiveInteger"),
+            format!("{BIG}^^xsd:nonNegativeInteger"),
+        ),
+        (
+            "\"2020-01-01T00:00:00.123456789Z\"^^xsd:dateTime".to_string(),
+            "\"2020-01-01T00:00:00.1234567Z\"^^xsd:dateTime".to_string(),
+        ),
+        ("\"x\"".to_string(), "\"x\"".to_string()),
+    ];
+    let src = "<http://example.org/g1>";
+    let count = |fluree: Fluree, id: String, graph: Option<&'static str>| async move {
+        let ledger = fluree.ledger(&id).await.expect("ledger");
+        let pattern = match graph {
+            Some(g) => format!("GRAPH {g} {{ ex:s ex:p ?o }}"),
+            None => "ex:s ex:p ?o".to_string(),
+        };
+        let q = format!("{PFX}SELECT (COUNT(?o) AS ?n) WHERE {{ {pattern} }}");
+        let json = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("query")
+            .to_sparql_json(&ledger.snapshot)
+            .expect("json");
+        json["results"]["bindings"][0]["n"]["value"]
+            .as_str()
+            .expect("count")
+            .to_string()
+    };
+    let mut failures = Vec::new();
+    let mut case = 0;
+    for (src_value, dest_value) in &values {
+        for dest in [Some("<http://example.org/g2>"), None] {
+            for dest_indexed in [true, false] {
+                for verb in ["ADD", "COPY", "MOVE"] {
+                    case += 1;
+                    let id = &format!("it/transfer-keeps-{case}:main");
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = dir.path().to_string_lossy().to_string();
+                    let insert = |graph: Option<&str>, value: &str| {
+                        let triple = format!("ex:s ex:p {value}");
+                        match graph {
+                            Some(g) => format!("{PFX}INSERT DATA {{ GRAPH {g} {{ {triple} }} }}"),
+                            None => format!("{PFX}INSERT DATA {{ {triple} }}"),
+                        }
+                    };
+                    // The indexed side first, then the other since the build.
+                    let (first, second) = if dest_indexed {
+                        (insert(dest, dest_value), insert(Some(src), src_value))
+                    } else {
+                        (insert(Some(src), src_value), insert(dest, dest_value))
+                    };
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .without_indexing()
+                        .build()
+                        .expect("build");
+                    fluree.create_ledger(id).await.expect("create");
+                    for (n, seed) in [first, second].iter().enumerate() {
+                        fluree
+                            .graph(id)
+                            .transact()
+                            .sparql_update(seed)
+                            .commit()
+                            .await
+                            .expect("seed");
+                        if n == 0 {
+                            support::rebuild_and_publish_index(&fluree, id).await;
+                        }
+                    }
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .without_indexing()
+                        .build()
+                        .expect("reload");
+                    let transfer = format!("{verb} {src} TO {}", dest.unwrap_or("DEFAULT"));
+                    fluree
+                        .graph(id)
+                        .transact()
+                        .sparql_update(&transfer)
+                        .commit()
+                        .await
+                        .expect("transfer");
+                    let reload = || {
+                        FlureeBuilder::file(path.clone())
+                            .without_indexing()
+                            .build()
+                            .expect("reload")
+                    };
+                    // Read with no build since the transfer, after an
+                    // incremental build over the seeding's full one, and
+                    // after a full rebuild. The rebuild is published through
+                    // `reindex`, which replaces an index of the same `t`;
+                    // `publish_index` would keep the incremental one.
+                    let mut got = vec![
+                        count(fluree, id.clone(), dest).await,
+                        count(reload(), id.clone(), dest).await,
+                    ];
+                    let mut src_left = vec![count(reload(), id.clone(), Some(src)).await];
+                    support::build_incrementally_and_publish_index(&reload(), id).await;
+                    got.push(count(reload(), id.clone(), dest).await);
+                    // An incremental build can bring back a fact inserted and
+                    // retracted since its base in a graph the base holds
+                    // nothing for (#2118), which a MOVE source written since
+                    // the seeding's build is. A full rebuild cannot.
+                    if !(verb == "MOVE" && dest_indexed) {
+                        src_left.push(count(reload(), id.clone(), Some(src)).await);
+                    }
+                    reload()
+                        .reindex(id, ReindexOptions::default())
+                        .await
+                        .expect("full rebuild");
+                    got.push(count(reload(), id.clone(), dest).await);
+                    src_left.push(count(reload(), id.clone(), Some(src)).await);
+                    let want_src = if verb == "MOVE" { "0" } else { "1" };
+                    if got.iter().any(|n| n != "1") || src_left.iter().any(|n| n != want_src) {
+                        failures.push(format!(
+                            "{verb} of {src_value} onto {dest_value} ({} indexed) into {}: \
+                             destination values in process, reloaded, after an incremental \
+                             and a full build = {got:?}, source values reloaded and after \
+                             the builds {src_left:?}; expected 1 each and {want_src}",
+                            if dest_indexed {
+                                "destination"
+                            } else {
+                                "source"
+                            },
+                            dest.unwrap_or("the default graph"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Merge and revert net a range of commits per fact, and an integer too large
+/// for 64 bits is one fact whatever XSD subtype it is written with. So a
+/// range that deletes it under one subtype and writes it again under another
+/// replays as that one fact's last op, not as a retraction of one term and
+/// an assertion of the other at one `t`, which storage resolves as the
+/// retraction. Reverting `DELETE x^^integer` and `INSERT x^^nonNegativeInteger`
+/// brings the value back, and merging a branch that ends by writing it keeps
+/// it, on a ledger indexed before the range and on one never indexed, read
+/// after the write and after the next index build.
+#[tokio::test]
+async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    let integer = format!("\"{BIG}\"^^xsd:integer");
+    let nonneg = format!("\"{BIG}\"^^xsd:nonNegativeInteger");
+    let write = |fluree: &Fluree, id: &str, body: String| {
+        let (fluree, id) = (fluree.clone(), id.to_string());
+        async move {
+            fluree
+                .graph(&id)
+                .transact()
+                .sparql_update(&format!("{PFX}{body}"))
+                .commit()
+                .await
+                .expect("write")
+                .receipt
+        }
+    };
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        let index_note = if indexed { "indexed" } else { "never indexed" };
+        // Revert both commits of `DELETE x^^integer`, `INSERT x^^nonNegativeInteger`.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("build");
+            let name = format!("it/revert-subtype-{indexed}");
+            let id = format!("{name}:main");
+            fluree.create_ledger(&id).await.expect("create");
+            write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {integer} ; ex:k \"keep\" }}"),
+            )
+            .await;
+            if indexed {
+                support::rebuild_and_publish_index(&fluree, &id).await;
+            }
+            let deleted = write(
+                &fluree,
+                &id,
+                format!("DELETE DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            let inserted = write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {nonneg} }}"),
+            )
+            .await;
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("reload");
+            fluree
+                .revert_commits(
+                    &name,
+                    "main",
+                    vec![
+                        CommitRef::Exact(deleted.commit_id),
+                        CommitRef::Exact(inserted.commit_id),
+                    ],
+                    ConflictStrategy::TakeSource,
+                )
+                .await
+                .expect("revert");
+            let after = values_of(&path, &id, "ex:p").await;
+            support::build_and_publish_index(
+                &FlureeBuilder::file(path.clone())
+                    .without_indexing()
+                    .build()
+                    .expect("reload"),
+                &id,
+            )
+            .await;
+            let reindexed = values_of(&path, &id, "ex:p").await;
+            if after != [BIG] || reindexed != [BIG] {
+                failures.push(format!(
+                    "revert, {index_note}: values {after:?}, after a build {reindexed:?}"
+                ));
+            }
+        }
+        // Revert both writes of a value novelty holds under two subtypes
+        // (a ledger never indexed): the net retraction retracts it under
+        // each, so it is gone at once, not only after the next build.
+        if !indexed {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("build");
+            let name = "it/revert-two-terms";
+            let id = format!("{name}:main");
+            fluree.create_ledger(&id).await.expect("create");
+            write(
+                &fluree,
+                &id,
+                "INSERT DATA { ex:s ex:k \"keep\" }".to_string(),
+            )
+            .await;
+            let first = write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            let second = write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {nonneg} }}"),
+            )
+            .await;
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("reload");
+            fluree
+                .revert_commits(
+                    name,
+                    "main",
+                    vec![
+                        CommitRef::Exact(first.commit_id),
+                        CommitRef::Exact(second.commit_id),
+                    ],
+                    ConflictStrategy::TakeSource,
+                )
+                .await
+                .expect("revert");
+            let after = values_of(&path, &id, "ex:p").await;
+            support::rebuild_and_publish_index(
+                &FlureeBuilder::file(path.clone())
+                    .without_indexing()
+                    .build()
+                    .expect("reload"),
+                &id,
+            )
+            .await;
+            let reindexed = values_of(&path, &id, "ex:p").await;
+            if !after.is_empty() || !reindexed.is_empty() {
+                failures.push(format!(
+                    "revert of both subtypes, never indexed: values {after:?}, after a build \
+                     {reindexed:?}; expected none"
+                ));
+            }
+        }
+        // Merge a branch that inserts, deletes, and inserts again under
+        // another subtype, into a main that moved on meanwhile.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("build");
+            let name = format!("it/merge-subtype-{indexed}");
+            let id = format!("{name}:main");
+            let dev = format!("{name}:dev");
+            fluree.create_ledger(&id).await.expect("create");
+            write(
+                &fluree,
+                &id,
+                "INSERT DATA { ex:base ex:k \"b\" }".to_string(),
+            )
+            .await;
+            if indexed {
+                support::rebuild_and_publish_index(&fluree, &id).await;
+            }
+            fluree
+                .create_branch(&name, "dev", None, None)
+                .await
+                .expect("branch");
+            write(
+                &fluree,
+                &dev,
+                format!("INSERT DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            write(
+                &fluree,
+                &dev,
+                format!("DELETE DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            write(
+                &fluree,
+                &dev,
+                format!("INSERT DATA {{ ex:s ex:p {nonneg} }}"),
+            )
+            .await;
+            write(
+                &fluree,
+                &id,
+                "INSERT DATA { ex:other ex:k \"o\" }".to_string(),
+            )
+            .await;
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("reload");
+            let report = fluree
+                .merge_branch(&name, "dev", None, ConflictStrategy::default())
+                .await
+                .expect("merge");
+            assert!(!report.fast_forward, "the merge replays the branch");
+            let after = values_of(&path, &id, "ex:p").await;
+            support::build_and_publish_index(
+                &FlureeBuilder::file(path.clone())
+                    .without_indexing()
+                    .build()
+                    .expect("reload"),
+                &id,
+            )
+            .await;
+            let reindexed = values_of(&path, &id, "ex:p").await;
+            if after != [BIG] || reindexed != [BIG] {
+                failures.push(format!(
+                    "merge, {index_note}: values {after:?}, after a build {reindexed:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

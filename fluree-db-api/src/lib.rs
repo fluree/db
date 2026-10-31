@@ -37,6 +37,7 @@
 pub mod admin;
 pub mod authorization;
 pub use authorization::PolicyAuthorization;
+pub mod advisory;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
@@ -107,6 +108,7 @@ pub mod server_defaults;
 #[cfg(feature = "native")]
 pub mod shared;
 pub(crate) mod sparql_lang;
+pub mod target_dataset;
 mod time_resolve;
 mod transaction;
 pub mod tx;
@@ -156,8 +158,9 @@ pub use commit_transfer::{
     PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
-    TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
+    sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,
+    DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource, TimeSpec,
+    ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
@@ -197,7 +200,7 @@ pub use ledger_manager::{
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
     UpdatePlan, WritePathStats,
 };
-pub use ledger_view::{CommitRef, LedgerView, COMMIT_PREFIX_MIN_LEN};
+pub use ledger_view::{CommitRef, GraphNames, LedgerView, COMMIT_PREFIX_MIN_LEN};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
@@ -226,6 +229,11 @@ pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
 #[cfg(feature = "native")]
 pub use shared::{SharedFluree, SharedOptions};
+pub use target_dataset::{
+    jsonld_dataset_ledger, jsonld_lane, jsonld_names_dataset, jsonld_view_ledger,
+    resolve_in_target, resolve_jsonld_dataset_in_target, GraphLookup, InTarget, JsonLdInTarget,
+    JsonLdLane, SingleFrom,
+};
 pub use transaction::{CypherReturn, Savepoint, Transaction, TransactionOptions, TxnOperation};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
@@ -372,10 +380,12 @@ pub use fluree_db_transact::{
 };
 
 // Re-export SPARQL types (product feature; always enabled)
+pub use advisory::QueryAdvisory;
 pub use fluree_db_sparql::{
-    lower_sparql, parse_sparql, validate as validate_sparql, Capabilities as SparqlCapabilities,
-    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError, ParamMap as SparqlParamMap,
-    ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue, QueryBody as SparqlQueryBody,
+    lower_sparql, parse_sparql, resolve_dataset_clause, validate as validate_sparql,
+    Capabilities as SparqlCapabilities, Diagnostic as SparqlDiagnostic,
+    LowerError as SparqlLowerError, ParamMap as SparqlParamMap, ParseOutput as SparqlParseOutput,
+    Prologue as SparqlPrologue, QueryBody as SparqlQueryBody, ResolvedDatasetClause,
     Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
     UpdateOperation as SparqlUpdateOperation,
 };
@@ -683,6 +693,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().all_records().await
+    }
+
+    async fn branch_records(
+        &self,
+        ledger_name: &str,
+    ) -> std::result::Result<
+        Vec<fluree_db_nameservice::NsRecord>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().branch_records(ledger_name).await
     }
 
     async fn heads(
@@ -1449,6 +1469,15 @@ fn build_indexer_config(config: &ConnectionConfig) -> wasm_compat::IndexerConfig
         .and_then(|i| i.gc_min_time_mins)
     {
         indexer_config.gc_min_time_mins = min_time.min(u32::MAX as u64) as u32;
+    }
+
+    if let Some(ceiling) = config
+        .defaults
+        .as_ref()
+        .and_then(|d| d.indexing.as_ref())
+        .and_then(|i| i.gc_hard_max_old_indexes)
+    {
+        indexer_config.gc_hard_max_old_indexes = Some(ceiling.min(u32::MAX as u64) as u32);
     }
 
     indexer_config
@@ -2438,13 +2467,15 @@ impl FlureeBuilder {
     /// default; order relative to [`Self::with_indexing_thresholds`] does not
     /// matter, since each preserves the other's half of the config.
     ///
-    /// `max_old_indexes` and `min_time_mins` are ANDed, so under a fast publish
-    /// rate the age guard always wins and the count target bounds nothing.
-    /// `hard_max_old_indexes` is an opt-in ceiling past which the guard is
-    /// overridden. It bounds retained versions, not bytes, and overriding the
-    /// guard can release artifacts a query still reading an older version
-    /// needs; see `CleanGarbageConfig::hard_max_old_indexes` in
-    /// `fluree_db_indexer::gc` for the trade-off.
+    /// `min_time_mins` is the age guard: a superseded version is kept that long
+    /// so a query that started on it can finish. `hard_max_old_indexes` is a
+    /// ceiling (default 10) past which versions go whatever their age, and
+    /// `max_old_indexes` an optional floor (default 0) kept whatever its age.
+    /// The ceiling bounds retained versions, not bytes, and can release
+    /// artifacts a query still reading an older version needs; see
+    /// `CleanGarbageConfig::hard_max_old_indexes` in `fluree_db_indexer::gc`
+    /// for the trade-off. To remove it, set
+    /// `IndexerConfig::gc_hard_max_old_indexes` to `None`.
     pub fn with_gc_settings(
         mut self,
         max_old_indexes: Option<u32>,
@@ -4907,23 +4938,43 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
+        // Not a call to `ledger_handle`: awaiting it would nest one more future
+        // in every caller's, and some test futures sit at the type-layout
+        // depth limit.
         let ledger_id = LedgerId::parse(ledger_id)?;
         match &self.ledger_manager {
             Some(mgr) => mgr.get_or_load(&ledger_id).await,
-            None => {
-                // Caching disabled: load fresh, wrap in ephemeral handle.
-                // Note: This handle is NOT cached; each call loads fresh.
-                // Extract the concrete BinaryIndexStore from the state's TypeErasedStore
-                // so the handle's binary_store stays coherent with db.range_provider.
-                let state = self.ledger(&ledger_id).await?;
-                let binary_store = state.binary_store.as_ref().and_then(|te| {
-                    te.0.clone()
-                        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
-                        .ok()
-                });
-                Ok(LedgerHandle::new(ledger_id, state, binary_store))
-            }
+            None => Ok(Self::ephemeral_handle(
+                &ledger_id,
+                self.ledger(&ledger_id).await?,
+            )),
         }
+    }
+
+    /// [`ledger_cached`](Self::ledger_cached) for an id the caller has
+    /// already parsed (a route's path ledger): the handle is found by the id
+    /// as it stands, with no second parse.
+    pub async fn ledger_handle(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
+        match &self.ledger_manager {
+            Some(mgr) => mgr.get_or_load(ledger_id).await,
+            None => Ok(Self::ephemeral_handle(
+                ledger_id,
+                self.ledger(ledger_id).await?,
+            )),
+        }
+    }
+
+    /// Caching disabled: a fresh load wrapped in an ephemeral handle, which is
+    /// NOT cached (each call loads fresh). The concrete `BinaryIndexStore` is
+    /// taken from the state's type-erased store, so the handle's binary store
+    /// stays coherent with the snapshot's range provider.
+    fn ephemeral_handle(ledger_id: &LedgerId, state: LedgerState) -> LedgerHandle {
+        let binary_store = state.binary_store.as_ref().and_then(|te| {
+            te.0.clone()
+                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+                .ok()
+        });
+        LedgerHandle::new(ledger_id.clone(), state, binary_store)
     }
 
     /// Disconnect a ledger from the connection cache
@@ -5727,9 +5778,10 @@ mod tests {
             defaults.gc_min_time_mins
         );
         assert_eq!(
-            cfg3.indexer_config.gc_hard_max_old_indexes, None,
-            "the ceiling is opt-in"
+            cfg3.indexer_config.gc_hard_max_old_indexes,
+            defaults.gc_hard_max_old_indexes
         );
+        assert_eq!(defaults.gc_hard_max_old_indexes, Some(10));
         assert!(!b3.indexer_config_user_set);
     }
 
@@ -5772,7 +5824,7 @@ mod tests {
             .with_writer(buf.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = fluree_test_support::scoped_default(subscriber);
         (buf, guard)
     }
 
@@ -5850,6 +5902,7 @@ mod tests {
                     indexing_enabled: None,
                     track_class_stats: None,
                     gc_min_time_mins: None,
+                    gc_hard_max_old_indexes: None,
                 }),
             }),
             ..Default::default()
@@ -5858,6 +5911,45 @@ mod tests {
         let idx = derive_index_config(&config);
         assert_eq!(idx.reindex_min_bytes, 250_000);
         assert_eq!(idx.reindex_max_bytes, 2_500_000);
+    }
+
+    /// The three retention settings reach the indexer from a JSON-LD
+    /// connection config, and an absent ceiling keeps the indexer's default.
+    #[cfg(feature = "native")]
+    #[test]
+    fn connection_config_gc_retention_reaches_the_indexer() {
+        use serde_json::{json, Value as JsonValue};
+
+        let parse = |indexing: JsonValue| {
+            ConnectionConfig::from_json_ld(&json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    {"@id": "memory", "@type": "Storage"},
+                    {
+                        "@id": "connection",
+                        "@type": "Connection",
+                        "indexStorage": {"@id": "memory"},
+                        "defaults": {"indexing": indexing}
+                    }
+                ]
+            }))
+            .expect("parse")
+        };
+
+        let set = build_indexer_config(&parse(json!({
+            "maxOldIndexes": 3,
+            "gcMinTimeMins": 60,
+            "gcHardMaxOldIndexes": 40
+        })));
+        assert_eq!(set.gc_max_old_indexes, 3);
+        assert_eq!(set.gc_min_time_mins, 60);
+        assert_eq!(set.gc_hard_max_old_indexes, Some(40));
+
+        let unset = build_indexer_config(&parse(json!({"gcMinTimeMins": 60})));
+        assert_eq!(unset.gc_hard_max_old_indexes, Some(10));
     }
 
     #[test]

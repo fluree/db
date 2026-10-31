@@ -69,6 +69,8 @@ pub mod ir;
 pub mod join;
 pub mod lang_support;
 pub mod limit;
+pub mod list_entries;
+pub mod list_view;
 pub mod materializer;
 pub(crate) mod membership_join;
 pub mod minus;
@@ -121,7 +123,7 @@ pub use binding::{
     Batch, BatchError, BatchView, Binding, RelValue, RowAccess, RowView, UnmatchedOptional,
 };
 pub use context::{ExecutionContext, WellKnownDatatypes};
-pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef};
+pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef, MemberKind};
 pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};

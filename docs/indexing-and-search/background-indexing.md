@@ -187,6 +187,7 @@ At `INFO`, background indexing now emits coarse-grained progress logs that make 
 - incremental vs. rebuild path selection
 - commit-chain walking progress
 - commit resolution progress and phase completion
+- index garbage collection: `Garbage collection complete` or `Garbage collection released nothing`, with how many versions each pass left (see [Monitoring](#monitoring))
 
 When background indexing is queued by an HTTP transaction request, the worker logs also include copied `request_id` and `trace_id` fields from the triggering request. This provides log-level correlation between the foreground request and the later background build without making the index build part of the original request trace.
 
@@ -265,26 +266,68 @@ The nameservice stores the current index root CID (`index_head_id`) and its wate
 
 ### Index Retention
 
-Old index snapshots are retained for time-travel safety and concurrent query safety. Cleanup is performed by the binary index garbage collector, governed by:
+Each index build publishes a new version of the ledger's index and supersedes the previous one. New queries read the newest version. A query already running keeps reading the version it started on, whether it runs on the server, on a [query peer](../operations/query-peers.md), or in an application that embeds Fluree as a library. So a superseded version stays in storage until the garbage collector releases it. Superseded versions are not needed for [time travel](../concepts/time-travel.md): a historical query reads history from the current index.
 
-- `IndexerConfig.gc_max_old_indexes` (`--gc-max-old-indexes` / `FLUREE_GC_MAX_OLD_INDEXES`, default 5): old versions to retain.
-- `IndexerConfig.gc_min_time_mins` (`--gc-min-time-mins` / `FLUREE_GC_MIN_TIME_MINS`, default 15): minimum age before a version can be collected.
+#### Settings
 
-Both must be satisfied, so the slower of the two wins. Under a sustained publish rate that is the age guard: a ledger publishing every few seconds holds far more than `gc_max_old_indexes` versions inside the 15-minute window, and the count bounds nothing. Retention becomes "however many versions fit in the window", which grows with publish rate and per-version size. Every one of those versions is still reachable and still on disk.
+The age guard decides when a superseded version goes, and a ceiling backs it up for ledgers that publish fast:
 
-- `IndexerConfig.gc_hard_max_old_indexes` (`--gc-hard-max-old-indexes` / `FLUREE_GC_HARD_MAX_OLD_INDEXES`, unset by default): a ceiling past which versions are collected regardless of age.
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| Age guard | 15 minutes | A superseded version is kept this long, so a query that started on it can finish. |
+| Ceiling | 10 | Past this many old versions, a version is collected even inside the age guard. |
+| Floor | 0 | Optional. The newest this many old versions are always kept, whatever their age. |
 
-The ceiling is opt-in because the age guard is what protects a query that started against an older version: until the guard expires, that version's leaves are still in storage. Past the ceiling they are released regardless, and a query still reading them fails or reads a torn version. Set it well above the number of versions the ledger publishes during your longest query. Each GC pass reports how many versions it collected past the ceiling (`age_guard_overridden` in the completion log line), so an override that is firing is visible at the default log level.
+Where each one is set:
 
-It is a bound on versions, not bytes. What a retained version costs varies by orders of magnitude between ledgers — one deployment measured ~7.7 GiB per version on one ledger and ~3.3 GiB on another — so size the ceiling from the per-version disk use you observe, and expect `objects/history` to hold roughly `versions × per-version bytes` at the ceiling.
+| | Age guard | Ceiling | Floor |
+|---|---|---|---|
+| Server flag | `--gc-min-time-mins` | `--gc-hard-max-old-indexes` | `--gc-max-old-indexes` |
+| Environment | `FLUREE_GC_MIN_TIME_MINS` | `FLUREE_GC_HARD_MAX_OLD_INDEXES` | `FLUREE_GC_MAX_OLD_INDEXES` |
+| Config file, `[server.indexing]` | `gc_min_time_mins` | `gc_hard_max_old_indexes` | `gc_max_old_indexes` |
+| [JSON-LD connection config](../reference/connection-config-jsonld.md), `defaults.indexing` | `gcMinTimeMins` | `gcHardMaxOldIndexes` | `maxOldIndexes` |
+| Rust, `IndexerConfig` | `gc_min_time_mins` | `gc_hard_max_old_indexes` | `gc_max_old_indexes` |
 
-The collector runs after every index publish, and also on the worker's periodic tick (`IndexerConfig.catchup_interval`, default 300 s), including once at start-up. The periodic pass is what reaches a ledger that stops publishing: a load-once dataset whose final burst left hundreds of versions inside the age guard would otherwise keep them until its next write, which may never come. Passes are serialised per ledger name, the tick runs them one at a time, and releases go out in batches — one `DeleteObjects` request per thousand artifacts on S3, a few in flight — so a large pass does not take the storage request cap away from readers.
+From Rust, `FlureeBuilder::with_gc_settings(floor, age_guard, ceiling)` sets them on the builder; `None` leaves a setting at its default. See [Index retention](../getting-started/rust-api.md#index-retention).
+
+The process that runs the indexer collects garbage, so its settings are the ones that apply. A query peer, or a server with indexing disabled, collects nothing: set retention on the server that indexes.
+
+#### How the settings combine
+
+The collector keeps each old version until it has been superseded for longer than the age guard, and collects everything past the ceiling whatever its age. A floor, if set, is kept regardless of either, and a ceiling at or below the floor is raised to it: the floor's versions are kept, and every version past them goes whatever its age. With the defaults:
+
+| Publish rate | Old versions kept | Decided by |
+|--------------|-------------------|------------|
+| Once an hour | 1, then 0 | The age guard: the previous version is kept for 15 minutes after each publish, then collected. |
+| Every 2 minutes | 7 or 8 | The age guard: the versions superseded in the last 15 minutes. |
+| Every 10 seconds | 10 | The ceiling: the age guard alone would keep about 90. |
+
+The collector runs after every index publish, and also on the worker's periodic tick (`IndexerConfig.catchup_interval`, default 300 s), including once at start-up. So a version can outlive its age guard until the next pass. The periodic pass is what reaches a ledger that stops publishing: a load-once dataset whose final burst left versions inside the age guard would otherwise keep them until its next write, which may never come. Passes are serialised per ledger name, the tick runs them one at a time, and releases go out in batches — one `DeleteObjects` request per thousand artifacts on S3, a few in flight — so a large pass does not take the storage request cap away from readers.
+
+#### Sizing
+
+- **Age guard.** Keep it above your longest query. A server stops a query at `query_timeout_ms`, which defaults to 15 minutes, the same as the guard. If you raise that timeout, or set it to `0` so nothing bounds a query, raise the guard to match. An embedding application should size the guard from the longest query it runs.
+- **Ceiling.** Keep it above the number of versions the ledger publishes during your longest query. Past the ceiling, a query still reading a collected version fails or reads a torn version. At the default of 10, a ledger that publishes every 6 seconds can collect a version a query started on a minute earlier. To let the age guard alone decide, raise the ceiling; an embedding application can also remove it with `IndexerConfig::with_gc_hard_max_old_indexes(None)`.
+- **Disk.** The ceiling bounds versions, not bytes. What a retained version costs varies by orders of magnitude between ledgers — one deployment measured ~7.7 GiB per version on one ledger and ~3.3 GiB on another — so size the ceiling from the per-version disk use you observe, and expect `objects/history` to hold roughly `versions × per-version bytes` at the ceiling.
+
+#### Monitoring
+
+Each pass logs what it left at `INFO`. A pass that releases something logs `Garbage collection complete`. A pass that releases nothing while the age guard is holding old versions logs `Garbage collection released nothing`, so the versions a ledger keeps are visible either way. Both carry:
+
+- `retained`: the versions left on the chain, the current one included.
+- `retention_target`: the floor, counting the current version (`1 + gc_max_old_indexes`, so `1` by default).
+- `past_target`: the retained versions beyond the floor, which the age guard is holding. With the default floor of 0, that is every old version kept. With the ceiling set, it stays at or below `gc_hard_max_old_indexes − gc_max_old_indexes`, and at 0 once the floor reaches the ceiling, unless a garbage manifest could not be read.
+- `stopped_by`: present when the pass stopped before the oldest version. `age_guard` means the next version was inside `gc_min_time_mins`. `unreadable_manifest` means a garbage manifest could not be read.
+
+The completion line also carries `age_guard_overridden`: the versions collected past the ceiling while still inside the age guard. A non-zero value means the ceiling, not the age guard, is limiting retention, and a query still reading one of those versions may have lost it.
+
+#### What the collector reclaims
 
 The collector reclaims artifacts by *name*. Each index root carries a garbage manifest listing what the previous version replaced, and the collector walks the prev-index chain releasing exactly those. It therefore reaches only artifacts that some manifest records.
 
 Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace, shared by every branch: a branch created from another starts out reading the source's dictionaries rather than a copy, so the source's manifest can name a blob the fork still reads. The collector releases a dictionary blob only when no other branch of the ledger — retracted branches included — still reaches it through its own index chain. A blob a sibling still reaches is deferred; when that sibling replaces it, its own manifest names it and the sibling's pass releases it. Whichever branch drops a blob last deletes it, and dropping a branch releases the blobs only that branch referenced. A ledger with a single branch releases every blob its manifests name.
 
-A manifest's word is not final. Content addressing gives byte-identical output the same name, so a later build can recreate a blob an earlier manifest recorded as replaced — reverse-dictionary leaves do this routinely under monotonically increasing keys (ULIDs, UUIDv7, sequential ids). The collector therefore never releases anything a retained root still references, whatever a manifest says. And because a build can recreate such a blob at any moment, a pass plans against a snapshot and then releases inside a short window during which no branch of the ledger builds: it waits for a build in flight, defers new ones, re-reads the current index head of the branch and of each of its siblings, and only then releases. Builds resume when the window closes. A pass that has nothing to release never opens one, and a pass that finds a branch held by a reindex or sweep releases nothing and leaves the work to a later pass. Which branches are siblings comes from the worker's branch listing, refreshed every `catchup_interval`, plus any branch the worker has built since; with `gc_hard_max_old_indexes` set, or an age guard under ten minutes, the listing is taken fresh for every pass. All of this behaves the same on every storage and nameservice backend: it needs only a consistent single-record lookup, which the file, S3 and DynamoDB nameservices all provide. It covers the indexer in one process; two processes indexing the same storage are not coordinated.
+A manifest's word is not final. Content addressing gives byte-identical output the same name, so a later build can recreate a blob an earlier manifest recorded as replaced — reverse-dictionary leaves do this routinely under monotonically increasing keys (ULIDs, UUIDv7, sequential ids). The collector therefore never releases anything a retained root still references, whatever a manifest says. And because a build can recreate such a blob at any moment, a pass plans against a snapshot and then releases inside a short window during which no branch of the ledger builds: it waits for a build in flight, defers new ones, re-reads the current index head of the branch and of each of its siblings, and only then releases. Builds resume when the window closes. A pass that has nothing to release never opens one, and a pass that finds a branch held by a reindex or sweep releases nothing and leaves the work to a later pass. Which branches are siblings comes from a listing of the ledger's own branches, taken inside the window, plus any branch the worker has built. The listing reads that ledger's records only, so its cost does not grow with the number of ledgers on the server; DynamoDB lists through an eventually consistent index, which is why branches the worker has built are added. All of this behaves the same on every storage and nameservice backend: it needs only a consistent single-record lookup, which the file, S3 and DynamoDB nameservices all provide. It covers the indexer in one process; two processes indexing the same storage are not coordinated.
 
 ### Reclaiming orphaned artifacts
 
@@ -316,6 +359,16 @@ A sweep is ledger-wide rather than per-branch, because dictionary blobs are shar
 2. Increase resources for the indexer (CPU/memory and storage throughput)
 3. Consider running a dedicated indexer process (separate from the transactor)
 4. For incremental indexing, consider increasing `IndexerConfig.incremental_max_concurrency`
+
+### Index storage keeps growing
+
+**Symptom:** the ledger's index storage (`objects/history` on disk, or its prefix in a bucket) grows much faster than its data.
+
+**Check** the garbage collection log lines (see [Monitoring](#monitoring)):
+- `past_target` near `gc_hard_max_old_indexes − gc_max_old_indexes` (10 by default): the age guard is holding versions up to the ceiling, which is retention working as configured. Lower the ceiling, or the age guard, if your queries allow it (see [Sizing](#sizing)).
+- `past_target` above that, with `stopped_by=unreadable_manifest`: a garbage manifest could not be read, and the collector cannot pass it. Look for storage errors on the manifest named at `DEBUG`.
+- `retained` small but storage still large: the artifacts are outside the chain the collector walks. Run a [sweep](#reclaiming-orphaned-artifacts).
+- No collector lines at all: either the ledger keeps no old versions, or this process does not run the indexer. Retention is decided where indexing runs.
 
 ### Slow Indexing
 

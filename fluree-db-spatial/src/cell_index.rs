@@ -101,13 +101,13 @@ impl CellEntry {
 
     /// Compare for index ordering: (cell_id, subject_id, t DESC, op ASC).
     ///
-    /// The `op` tie-break ensures that for same `(cell_id, subject_id, t)`:
-    /// - retract (op=0) sorts before assert (op=1)
-    /// - this gives "retract wins" semantics during replay
-    ///
-    /// Note: Same-t assert+retract pairs shouldn't occur in normal commits
-    /// (each commit produces one operation per subject/predicate), but this
-    /// ordering provides defined behavior if they do.
+    /// The `op` tie-break makes the order total: for the same
+    /// `(cell_id, subject_id, t)` a retract (op=0) sorts before an assert
+    /// (op=1). Replay does not read the winner off this position; it
+    /// resolves every entry at one `t` by rule (an assert holds,
+    /// `fluree_db_core::same_t`; see `replay::holding_at`). Such pairs are
+    /// ordinary: the key holds no value, so a geometry that changes within
+    /// one cell retracts and asserts that cell at one `t`.
     pub fn cmp_index(&self, other: &Self) -> Ordering {
         match self.cell_id.cmp(&other.cell_id) {
             Ordering::Equal => match self.subject_id.cmp(&other.subject_id) {

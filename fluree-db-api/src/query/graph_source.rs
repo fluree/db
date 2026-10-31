@@ -84,6 +84,7 @@ impl Fluree {
             ContextConfig {
                 tracker: Some(&tracker),
                 r2rml: Some((&r2rml_provider, &r2rml_provider)),
+                primary_kind: fluree_db_query::MemberKind::Native,
                 ..Default::default()
             },
         )
@@ -106,7 +107,7 @@ impl Fluree {
         sparql: &str,
     ) -> Result<QueryResult> {
         // See `query_graph_source` above — no default-context injection here.
-        let (vars, parsed) = parse_sparql_to_ir(sparql, &ledger.snapshot, None, None)?;
+        let (vars, parsed) = parse_sparql_to_ir(sparql, &ledger.snapshot, None, None, false)?;
         let executable = ExecutableQuery::simple(parsed.clone());
 
         let r2rml_provider = crate::r2rml_provider!(self);
@@ -119,6 +120,7 @@ impl Fluree {
             ContextConfig {
                 tracker: Some(&tracker),
                 r2rml: Some((&r2rml_provider, &r2rml_provider)),
+                primary_kind: fluree_db_query::MemberKind::Native,
                 ..Default::default()
             },
         )

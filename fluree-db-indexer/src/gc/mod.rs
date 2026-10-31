@@ -40,12 +40,14 @@
 //! defer it, and both would consume the manifests that named it. The worker
 //! serialises passes per ledger name for that reason.
 //!
-//! Which branches are siblings comes from a listing that may be minutes old,
-//! because `all_records()` is O(ledgers) on every nameservice backend, plus
-//! every branch this process has built since, which is the only way a fork
-//! the listing predates can reference more than its source did. Each
-//! sibling's *head* is never cached: it is one consistent `lookup`, made as
-//! the pass releases. See [`current_sibling_heads`].
+//! Which branches are siblings comes from a listing of the ledger's own
+//! branches (`NameServiceLookup::branch_records`), taken as the pass
+//! releases, plus every branch this process has built: DynamoDB lists through
+//! an eventually consistent index, so a branch created a moment ago can be
+//! missing from it. The listing is one ledger's records, not the
+//! nameservice's, because the pass holds that ledger's builds while it runs.
+//! Each sibling's *head* is one consistent `lookup`, made as the pass
+//! releases. See [`current_sibling_heads`].
 //!
 //! Blobs named by manifests the collector has already consumed, and anything
 //! orphaned off the chain, are reachable only by [`plan_sweep`], which
@@ -93,33 +95,42 @@
 //!
 //! ## Time-Based Retention
 //!
-//! GC respects two thresholds:
-//! - `max_old_indexes`: Maximum number of old index versions to keep (default: 5)
-//! - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 15)
+//! A superseded index version is kept so a query that started against it can
+//! finish; newer queries read the newest version. The age guard decides when it
+//! goes, and a ceiling backs it up:
+//! - `min_time_garbage_mins` (default 15): the age guard. A version is kept
+//!   until it has been superseded this long.
+//! - `hard_max_old_indexes` (the indexer's default is 10): the ceiling. Past
+//!   this many old versions, a version goes whatever its age.
+//! - `max_old_indexes` (default 0): an optional floor. The newest this many old
+//!   versions are kept whatever their age.
 //!
-//! Both thresholds must be satisfied for GC to occur, so the slower of the two
-//! wins. Under a sustained publish rate that is the age guard: a ledger
-//! publishing twice a minute holds ~30 versions inside a 15-minute guard, and
-//! `max_old_indexes = 5` then bounds nothing. Real retention becomes "however
-//! many versions fit in `min_time_garbage_mins`", which grows with publish rate
-//! and per-version size.
+//! So a ledger keeps the versions superseded within the guard, up to the
+//! ceiling: none once it has been idle past the guard, all of them when it
+//! publishes slowly, and the ceiling when it publishes fast.
 //!
-//! Observed on a deployment: 79 retained versions against a target of 5, with
-//! `objects/history` at 14 GiB for a ledger whose live index was 260 MiB and
-//! whose entire commit log was 417 MiB — i.e. ~34x the dataset, all of it
-//! age-guarded garbage.
+//! Without a ceiling, retention under a sustained publish rate is "however many
+//! versions fit in the guard", which grows with publish rate and per-version
+//! size. Observed on a deployment before the ceiling had a default: 79 retained
+//! versions against a floor of 5, with `objects/history` at 14 GiB for a ledger
+//! whose live index was 260 MiB and whose entire commit log was 417 MiB — ~34x
+//! the dataset, all of it age-guarded garbage.
 //!
 //! ## Version Ceiling
 //!
-//! An optional third threshold overrides the age guard:
-//! - `hard_max_old_indexes`: past this many old versions, collect regardless of age
+//! The ceiling trades reader safety for a bound on the chain. The age guard is
+//! what keeps a query that started against an older version from having that
+//! version's artifacts released underneath it; past the ceiling they go anyway.
+//! At the default of 10, a ledger publishing every 6 s can collect a version a
+//! query started on a minute earlier. Raise it for a ledger that publishes fast
+//! and serves long queries. The ceiling never reaches a version the floor
+//! keeps, so a ceiling at or below `max_old_indexes` is raised to it: the
+//! floor's versions are kept, and every version past them goes whatever its
+//! age.
 //!
-//! It is off by default. The age guard is what keeps a query that started
-//! against an older index version from having that version's artifacts
-//! released underneath it; overriding the guard removes artifacts such a query
-//! may still need. Enabling the ceiling is therefore an operator decision that
-//! trades reader safety for a bound on the chain. Once set, the guard still
-//! governs everything inside the ceiling.
+//! [`CleanGarbageConfig::hard_max_old_indexes`] of `None` sets no ceiling; the
+//! default lives in the indexer's configuration
+//! ([`DEFAULT_HARD_MAX_OLD_INDEXES`]).
 //!
 //! A ceiling bounds the number of retained versions, not their bytes. What a
 //! retained version costs varies by orders of magnitude between ledgers (one
@@ -171,18 +182,25 @@ pub enum SharedBlobPolicy {
     },
 }
 
-/// Default maximum number of old indexes to retain
-pub const DEFAULT_MAX_OLD_INDEXES: u32 = 5;
+/// Default floor of old index versions kept whatever their age: none, so the
+/// age guard alone decides below the ceiling.
+pub const DEFAULT_MAX_OLD_INDEXES: u32 = 0;
 
 /// Default minimum age (in minutes) before an index can be garbage collected
 pub const DEFAULT_MIN_TIME_GARBAGE_MINS: u32 = 15;
 
+/// Default ceiling on retained old index versions, past which versions are
+/// collected regardless of age. The indexer's default; a bare
+/// [`CleanGarbageConfig`] sets none.
+pub const DEFAULT_HARD_MAX_OLD_INDEXES: u32 = 10;
+
 /// Configuration for garbage collection
 #[derive(Debug, Clone, Default)]
 pub struct CleanGarbageConfig {
-    /// Maximum number of old indexes to keep (None = default 5)
+    /// Old index versions kept whatever their age (None = default 0)
     ///
-    /// With max_old_indexes=5, we keep current + 5 old = 6 total index versions.
+    /// With max_old_indexes=5, the current version and the newest 5 old ones
+    /// are never collected.
     pub max_old_indexes: Option<u32>,
     /// Minimum age in minutes before GC (None = default 15)
     ///
@@ -190,14 +208,15 @@ pub struct CleanGarbageConfig {
     pub min_time_garbage_mins: Option<u32>,
     /// Ceiling on retained old index versions, past which
     /// `min_time_garbage_mins` is overridden and versions are collected
-    /// regardless of age. `None` (the default) sets no ceiling: the age guard
-    /// is always honoured.
+    /// regardless of age. `None` sets no ceiling: the age guard is always
+    /// honoured. The indexer passes its configured ceiling, by default
+    /// [`DEFAULT_HARD_MAX_OLD_INDEXES`].
     ///
-    /// Exists because `max_old_indexes` and `min_time_garbage_mins` are ANDed, so
-    /// under a fast publish rate the age guard always wins and the count target
-    /// bounds nothing (see the module docs).
+    /// Exists because under a fast publish rate the age guard holds every
+    /// version inside it, so without a ceiling retention grows with the
+    /// publish rate (see the module docs).
     ///
-    /// Setting it trades reader safety for that bound. The guard is what keeps a
+    /// It trades reader safety for that bound. The guard is what keeps a
     /// query that started against an older version from having that version's
     /// artifacts released while it is still reading them; past the ceiling those
     /// artifacts go regardless, and such a query fails or reads a torn version.
@@ -216,8 +235,14 @@ pub struct CleanGarbageConfig {
 /// Result of garbage collection
 #[derive(Debug, Clone, Default)]
 pub struct CleanGarbageResult {
-    /// Versions collected past `hard_max_old_indexes`, where the age guard was
-    /// not applied. Non-zero means a query that was still reading one of them
+    /// Versions left on the chain the pass walked: its length less
+    /// `indexes_cleaned`, the current version included. More than
+    /// `1 + max_old_indexes` means the pass stopped short of its target,
+    /// usually at the age guard, or failed to release a version. Versions
+    /// published while it ran are not counted.
+    pub retained: usize,
+    /// Versions collected past `hard_max_old_indexes` while still inside the
+    /// age guard. Non-zero means a query that was still reading one of them
     /// may have lost artifacts it needed.
     pub age_guard_overridden: usize,
     /// Number of old index versions cleaned up

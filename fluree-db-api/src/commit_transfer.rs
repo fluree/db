@@ -27,11 +27,8 @@ use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
 use fluree_db_core::LedgerId;
-use fluree_db_core::{
-    range_with_overlay, ContentAddressedWrite, ContentKind, Flake, GraphId, IndexType, Sid,
-    TXN_META_GRAPH_ID,
-};
-use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
+use fluree_db_core::Storage;
+use fluree_db_core::{ContentAddressedWrite, ContentKind, Flake, GraphId, Sid, TXN_META_GRAPH_ID};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
@@ -40,7 +37,7 @@ use fluree_db_novelty::{
     stamp_graph_on_commit_flakes, warn_if_forged_commit_flakes_dropped, Novelty,
 };
 use fluree_db_policy::PolicyContext;
-use fluree_db_transact::datatype_limit;
+use fluree_db_transact::{datatype_limit, vector_dims};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -493,16 +490,33 @@ impl Fluree {
             .map_err(ApiError::Transact)?;
             pushed_datatypes.extend(adding);
 
-            // 4.1 Retraction invariant (strict).
-            assert_retractions_exist(
-                &base_state.snapshot,
+            // 4.0.3 Vectors the index can store: checked against the ledger
+            // and the earlier commits of this push, as a local write is.
+            vector_dims::check_vectors(
+                &base_state,
                 &evolving_novelty,
-                current_t,
                 &c.commit.flakes,
                 &reverse_graph,
+                |sid| {
+                    base_state
+                        .snapshot
+                        .decode_sid(sid)
+                        .or_else(|| {
+                            pushed_namespaces
+                                .get(&sid.namespace_code)
+                                .map(|prefix| format!("{prefix}{}", sid.name))
+                        })
+                        .unwrap_or_else(|| sid.to_string())
+                },
             )
-            .await
-            .map_err(PushError::into_api_error)?;
+            .map_err(ApiError::Transact)?;
+
+            // 4.1 Retraction invariant (strict), read as of `current_t`: the
+            // state's `t` is the greater of the index's and novelty's.
+            let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
+            assert_retractions_exist(&evolving_state, &c.commit.flakes, &reverse_graph)
+                .await
+                .map_err(PushError::into_api_error)?;
 
             // 4.2 Policy enforcement: build policy context from opts against current state.
             let policy_ctx =
@@ -510,7 +524,6 @@ impl Fluree {
                     .await?;
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
-            let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
             let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
@@ -1217,82 +1230,62 @@ async fn stage_commit_flakes(
 }
 
 async fn assert_retractions_exist(
-    snapshot: &fluree_db_core::LedgerSnapshot,
-    overlay: &dyn fluree_db_core::OverlayProvider,
-    to_t: i64,
+    state: &LedgerState,
     flakes: &[Flake],
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<(), PushError> {
+    let mut at = Vec::new();
+    let mut items = Vec::new();
     for (idx, f) in flakes.iter().enumerate() {
         if f.op {
             continue;
         }
-
-        if !is_currently_asserted(snapshot, overlay, to_t, f, reverse_graph).await? {
-            return Err(PushError::Invalid(format!(
-                "retraction invariant violated at flake[{idx}]: retract targets non-existent assertion"
-            )));
-        }
+        at.push(idx);
+        items.push((retraction_slot(f, reverse_graph)?, f));
     }
-    Ok(())
+    if items.is_empty() {
+        return Ok(());
+    }
+    // Read through `CurrentFacts`, which stamps the graph on index rows (a
+    // range read returns them with `g: None` whatever graph they live in),
+    // reads each slot once, and names a fact by the identity storage gives
+    // it, so a retraction carrying a term the index keeps less of (a big
+    // integer's XSD subtype) names the stored fact.
+    let named = fluree_db_transact::CurrentFacts::new(state)
+        .named_by(&items)
+        .await
+        .map_err(|e| PushError::Internal(e.to_string()))?;
+    match at.iter().zip(&named).find(|(_, fact)| fact.is_none()) {
+        Some((idx, _)) => Err(PushError::Invalid(format!(
+            "retraction invariant violated at flake[{idx}]: retract targets non-existent assertion"
+        ))),
+        None => Ok(()),
+    }
 }
 
-async fn is_currently_asserted(
-    snapshot: &fluree_db_core::LedgerSnapshot,
-    overlay: &dyn fluree_db_core::OverlayProvider,
-    to_t: i64,
+/// The slot whose stored fact `target` retracts, in the graph the push's
+/// routing gives it.
+fn retraction_slot(
     target: &Flake,
     reverse_graph: &HashMap<Sid, GraphId>,
-) -> std::result::Result<bool, PushError> {
-    // Resolve the correct graph for this flake's range query.
-    //
+) -> std::result::Result<fluree_db_transact::Slot, PushError> {
     // With per-graph novelty, ALL graphs (including overlay-only ones) have proper
-    // GraphIds assigned by the cumulative routing. The overlay returns only that
-    // graph's flakes, so no post-filtering by flake.g is needed for graph isolation.
+    // GraphIds assigned by the cumulative routing.
     let g_id = match &target.g {
         None => 0,
         Some(g_sid) => *reverse_graph.get(g_sid).ok_or_else(|| {
             PushError::Internal(format!(
-                "is_currently_asserted: graph Sid {g_sid:?} not found in reverse_graph map \
+                "retraction_slot: graph Sid {g_sid:?} not found in reverse_graph map \
                  — derive_graph_routing should have included it",
             ))
         })?,
     };
-
-    let rm = RangeMatch::new()
-        .with_subject(target.s.clone())
-        .with_predicate(target.p.clone())
-        .with_object(target.o.clone())
-        .with_datatype(target.dt.clone());
-
-    let found = range_with_overlay(
-        snapshot,
+    Ok(fluree_db_transact::Slot {
         g_id,
-        overlay,
-        IndexType::Spot,
-        RangeTest::Eq,
-        rm,
-        RangeOptions::new().with_to_t(to_t),
-    )
-    .await
-    .map_err(|e| PushError::Internal(e.to_string()))?;
-
-    let mut last_t: Option<i64> = None;
-    let mut last_op: bool = false;
-
-    for f in found {
-        // Exact match on graph + metadata. (RangeMatch does not include these fields.)
-        if f.g != target.g || f.m != target.m {
-            continue;
-        }
-        // Current truth is the op of the latest t <= to_t.
-        if last_t.map(|t| f.t > t).unwrap_or(true) {
-            last_t = Some(f.t);
-            last_op = f.op;
-        }
-    }
-
-    Ok(last_t.is_some() && last_op)
+        g_sid: target.g.clone(),
+        s: target.s.clone(),
+        p: target.p.clone(),
+    })
 }
 
 async fn write_required_blobs<S>(

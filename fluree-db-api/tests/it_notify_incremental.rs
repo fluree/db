@@ -112,9 +112,6 @@ async fn scan_translates_overlay(
     state: &fluree_db_api::LedgerState,
 ) -> bool {
     let (spans, _guard) = support::span_capture::init_test_tracing();
-    // Other tests in this binary hit the same callsite. Recompute its interest
-    // now that this subscriber is installed, or it can stay pinned to "never".
-    tracing::callsite::rebuild_interest_cache();
     fluree_db_api::GraphDb::from_ledger_state(state)
         .query(fluree)
         .sparql(

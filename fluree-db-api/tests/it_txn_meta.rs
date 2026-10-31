@@ -979,8 +979,8 @@ async fn test_sparql_graph_pattern_txn_meta() {
             // Build dataset spec with txn-meta as a named graph
             let txn_meta_graph = format!("{ledger_id}#txn-meta");
             let spec = DatasetSpec::new()
-                .with_default(GraphSource::new(ledger_id))
-                .with_named(GraphSource::new(&txn_meta_graph));
+                .with_default(GraphSource::parse(ledger_id).unwrap())
+                .with_named(GraphSource::parse(&txn_meta_graph).unwrap());
 
             let dataset = fluree
                 .build_dataset_view(&spec)
@@ -2096,6 +2096,53 @@ async fn test_txn_meta_sidecar_rejects_f_identity() {
     assert!(err
         .to_string()
         .contains("only f:message and f:author are user-settable"));
+}
+
+/// An index build keeps the user claims `f:message` and `f:author`, which
+/// live in the reserved `f:` namespace beside the system's own entries:
+/// they stay queryable in the txn-meta graph once indexed.
+#[tokio::test]
+async fn an_index_build_keeps_the_user_message_and_author() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("file fluree");
+    let ledger_id = "it/txn-meta-claims-reindex:main";
+    let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}],
+        "f:message": "initial load",
+        "f:author": "alice"
+    });
+    fluree.insert(ledger, &data).await.expect("insert");
+
+    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    let query = json!({
+        "from": format!("{ledger_id}#txn-meta"),
+        "select": ["?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let results = fluree.query_connection(&query).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let rows = results.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let has = |p: &str, o: &str| {
+        rows.as_array().expect("rows").iter().any(|row| {
+            row.as_array().is_some_and(|r| {
+                r.first().and_then(|v| v.as_str()) == Some(p)
+                    && r.get(1).and_then(|v| v.as_str()) == Some(o)
+            })
+        })
+    };
+    assert!(
+        has("https://ns.flur.ee/db#message", "initial load"),
+        "{rows}"
+    );
+    assert!(has("https://ns.flur.ee/db#author", "alice"), "{rows}");
 }
 
 /// The Fluree-namespace entries a commit's txn-meta holds (a user's
