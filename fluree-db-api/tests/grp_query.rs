@@ -5,6 +5,8 @@ mod support;
 mod it_bounded_overlay_translation;
 #[path = "it_differential_fastpath.rs"]
 mod it_differential_fastpath;
+#[path = "it_filter_pushdown_operators.rs"]
+mod it_filter_pushdown_operators;
 #[path = "it_jsonld_join_batched_lane.rs"]
 mod it_jsonld_join_batched_lane;
 #[path = "it_materializer_decode_errors.rs"]

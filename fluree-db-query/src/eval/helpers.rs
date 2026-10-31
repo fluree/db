@@ -8,14 +8,14 @@ use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
 use crate::ir::{CompareOp, Expression, Function};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::temporal::CalendarField;
-use fluree_db_core::{FlakeValue, ObjKind};
+use fluree_db_core::{DictNovelty, FlakeValue, ObjKind};
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use crate::var_registry::VarId;
 
@@ -52,7 +52,42 @@ enum EncodedBindingCacheKey {
     },
 }
 
-type EncodedBoolPredicateKey = (usize, u16, u64, EncodedBindingCacheKey);
+impl EncodedBindingCacheKey {
+    /// Whether every dictionary id in the key names a term the store itself
+    /// persisted, by the watermarks the decoder routes on: a string or
+    /// subject id above them resolves from the view's dictionary novelty, and
+    /// a predicate id at or past the store's count was allocated for one
+    /// scan. A layered view (a staged preview, a SHACL or post-state policy
+    /// check) gives its new terms ids of its own, so one id can name
+    /// different terms in two views over the same store, and a verdict keyed
+    /// by it is not remembered. Language and datatype ids and big-number
+    /// handles only ever come from the persisted dictionaries.
+    fn names_persisted_terms(&self, novelty: Option<&DictNovelty>, predicate_count: u32) -> bool {
+        let novelty = novelty.filter(|dn| dn.is_initialized());
+        match *self {
+            Self::Lit { o_kind, o_key, .. } => {
+                let kind = ObjKind::from_u8(o_kind);
+                if kind == ObjKind::LEX_ID || kind == ObjKind::JSON_ID {
+                    novelty.is_none_or(|dn| o_key <= u64::from(dn.strings.watermark()))
+                } else if kind == ObjKind::REF_ID {
+                    novelty.is_none_or(|dn| subject_is_persisted(dn, o_key))
+                } else {
+                    true
+                }
+            }
+            Self::Sid { s_id } => novelty.is_none_or(|dn| subject_is_persisted(dn, s_id)),
+            Self::Pid { p_id } => p_id < predicate_count,
+        }
+    }
+}
+
+fn subject_is_persisted(novelty: &DictNovelty, s_id: u64) -> bool {
+    let s_id = SubjectId::from_u64(s_id);
+    s_id.local_id() <= novelty.subjects.watermark_for_ns(s_id.ns_code())
+}
+
+/// (store instance id, graph, expression hash, encoded binding).
+type EncodedBoolPredicateKey = (u64, u16, u64, EncodedBindingCacheKey);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CacheableBoolPredicate {
@@ -252,9 +287,15 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
     let Some(binding_key) = encoded_binding_cache_key(binding) else {
         return Ok(None);
     };
+    if !binding_key.names_persisted_terms(ctx.dict_novelty.as_deref(), store.predicate_count()) {
+        return Ok(None);
+    }
 
+    // The store's instance id, not its address: a dropped store's address can
+    // be reused by the next one built, and its verdicts would then answer for
+    // a different dictionary (an ABA misread).
     let cache_key = (
-        Arc::as_ptr(store) as usize,
+        store.store_id(),
         ctx.binary_g_id,
         spec.expr_hash,
         binding_key,
@@ -432,8 +473,7 @@ fn analyze_bool_cache_inner(expr: &Expression, state: &mut impl Hasher) -> BoolC
             may_materialize: false,
         },
         Expression::Call { func, args } => {
-            hash_function(func, state);
-            args.len().hash(state);
+            hash_function_and_arity(func, args.len(), state);
 
             let mut vars = VarUsage::None;
             let mut supported = function_supported_for_bool_cache(func);
@@ -628,11 +668,40 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
     )
 }
 
-fn hash_function(func: &Function, state: &mut impl Hasher) {
+/// A call's function, fields included, and its arity.
+///
+/// `Lang { strict }` and `Datatype { strict }` answer differently in each
+/// mode, so SPARQL's strict verdict must not answer for JSON-LD's lenient one.
+/// The mode rides in the arity word's top bit instead of a write of its own:
+/// a one-byte write would leave every later word write in the walk straddling
+/// the hasher's buffer, and costs the analysis about 8%.
+fn hash_function_and_arity(func: &Function, arity: usize, state: &mut impl Hasher) {
     std::mem::discriminant(func).hash(state);
-    if let Function::Custom(name) = func {
-        name.hash(state);
-    }
+    let mode = match func {
+        Function::Lang { strict } | Function::Datatype { strict } => u64::from(*strict) << 63,
+        Function::Custom(name) => {
+            name.hash(state);
+            0
+        }
+        _ => {
+            debug_assert!(
+                carries_no_field(func),
+                "{func:?} carries a field the filter hash does not take"
+            );
+            0
+        }
+    };
+    (arity as u64 | mode).hash(state);
+}
+
+/// Whether `func`'s own hash, which follows its equality, is its variant
+/// alone: true for every function without fields.
+fn carries_no_field(func: &Function) -> bool {
+    let mut whole = DefaultHasher::new();
+    func.hash(&mut whole);
+    let mut variant = DefaultHasher::new();
+    std::mem::discriminant(func).hash(&mut variant);
+    whole.finish() == variant.finish()
 }
 
 fn hash_flake_value(value: &FlakeValue, state: &mut impl Hasher) {
@@ -932,5 +1001,110 @@ mod tests {
             0,
             0
         ));
+    }
+    /// `Function`'s hash follows its equality, fields included, so the strict
+    /// and lenient `LANG` / `DATATYPE` of SPARQL and JSON-LD never share an
+    /// encoded bool-predicate cache entry.
+    #[test]
+    fn strict_and_lenient_functions_hash_apart() {
+        fn hash_of(func: &Function) -> u64 {
+            let mut h = DefaultHasher::new();
+            func.hash(&mut h);
+            h.finish()
+        }
+        for (a, b) in [
+            (
+                Function::Lang { strict: true },
+                Function::Lang { strict: false },
+            ),
+            (
+                Function::Datatype { strict: true },
+                Function::Datatype { strict: false },
+            ),
+        ] {
+            assert_ne!(a, b);
+            assert_ne!(hash_of(&a), hash_of(&b), "{a:?} / {b:?}");
+            assert_eq!(hash_of(&a), hash_of(&a.clone()), "{a:?}");
+            assert!(!carries_no_field(&a), "{a:?}");
+        }
+        assert!(carries_no_field(&Function::Eq));
+        assert!(!carries_no_field(&Function::Custom("f".to_string())));
+
+        let funcs: [fn(bool) -> Function; 2] = [
+            |strict| Function::Lang { strict },
+            |strict| Function::Datatype { strict },
+        ];
+        for func in funcs {
+            let is_empty = |strict| {
+                Expression::call(
+                    Function::Eq,
+                    vec![
+                        Expression::call(
+                            Function::Str,
+                            vec![Expression::call(
+                                func(strict),
+                                vec![Expression::Var(VarId(0))],
+                            )],
+                        ),
+                        Expression::Const(FlakeValue::String(String::new())),
+                    ],
+                )
+            };
+            let strict = analyze_cacheable_bool_predicate(&is_empty(true)).expect("cacheable");
+            let lenient = analyze_cacheable_bool_predicate(&is_empty(false)).expect("cacheable");
+            assert_ne!(strict.expr_hash, lenient.expr_hash, "{:?}", func(true));
+        }
+    }
+    /// A verdict is remembered only for ids the store persisted: a string or
+    /// subject id up to its watermark and a predicate id below the store's
+    /// count. One past them is a view's own and is not.
+    #[test]
+    fn only_ids_the_store_persisted_are_remembered() {
+        let novelty = DictNovelty::with_watermarks(vec![0, 10], 100);
+        let lit = |o_kind: ObjKind, o_key| EncodedBindingCacheKey::Lit {
+            o_kind: o_kind.as_u8(),
+            o_key,
+            p_id: 0,
+            dt_id: 1,
+            lang_id: 0,
+        };
+        let sid = |local_id| EncodedBindingCacheKey::Sid {
+            s_id: SubjectId::new(1, local_id).as_u64(),
+        };
+        let pid = |p_id| EncodedBindingCacheKey::Pid { p_id };
+        let persisted = |key: EncodedBindingCacheKey| key.names_persisted_terms(Some(&novelty), 5);
+
+        for kind in [ObjKind::LEX_ID, ObjKind::JSON_ID] {
+            assert!(persisted(lit(kind, 100)), "{kind:?} at the watermark");
+            assert!(!persisted(lit(kind, 101)), "{kind:?} above the watermark");
+        }
+        assert!(persisted(lit(
+            ObjKind::REF_ID,
+            SubjectId::new(1, 10).as_u64()
+        )));
+        assert!(!persisted(lit(
+            ObjKind::REF_ID,
+            SubjectId::new(1, 11).as_u64()
+        )));
+        assert!(
+            persisted(lit(ObjKind::NUM_INT, u64::MAX)),
+            "an inline value is no id"
+        );
+        assert!(persisted(sid(10)));
+        assert!(!persisted(sid(11)));
+        assert!(
+            !persisted(EncodedBindingCacheKey::Sid {
+                s_id: SubjectId::new(7, 1).as_u64()
+            }),
+            "a namespace with no persisted subjects"
+        );
+        assert!(persisted(pid(4)));
+        assert!(!persisted(pid(5)));
+
+        // With no novelty layer, or one not yet given its watermarks, the
+        // decoder reads every id from the store, so every id is the store's.
+        assert!(lit(ObjKind::LEX_ID, 101).names_persisted_terms(None, 5));
+        assert!(sid(11).names_persisted_terms(Some(&DictNovelty::new_uninitialized()), 5));
+        assert!(!pid(5).names_persisted_terms(None, 5));
     }
 }

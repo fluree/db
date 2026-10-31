@@ -939,7 +939,12 @@ impl From<&crate::parse::ast::UnresolvedFilterValue> for FlakeValue {
 }
 
 /// Built-in functions
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Hash` agrees with `Eq` over the whole value, fields included: a
+/// `Lang { strict }` or `Datatype { strict }` computes a different answer in
+/// each mode, so anything keyed by a function (the encoded bool-predicate
+/// cache) must see the mode.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Function {
     // =========================================================================
     // Comparison operators
