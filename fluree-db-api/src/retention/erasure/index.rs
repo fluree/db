@@ -631,6 +631,29 @@ impl ErasureIndex {
             .map_err(|e| ApiError::internal(format!("stored proof {key}: {e}")))
     }
 
+    /// Record that member `node` proves the step `key` names.
+    pub(crate) async fn put_proving(&self, key: &str, node: u64) -> Result<()> {
+        let bytes = serde_json::to_vec(&serde_json::json!({ "node": node }))
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        self.storage
+            .write_bytes(&self.address(&format!("proving/{key}.json")), &bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// The member recorded as proving the step `key` names, if one was.
+    pub(crate) async fn proving(&self, key: &str) -> Result<Option<u64>> {
+        let Some(bytes) = self
+            .read_raw(&self.address(&format!("proving/{key}.json")))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let record: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ApiError::internal(format!("proving record {key}: {e}")))?;
+        Ok(record["node"].as_u64())
+    }
+
     /// An artifact's bytes, checked against the hash that names them.
     pub(crate) async fn artifact(&self, kind: Artifact, hex: &str) -> Result<Vec<u8>> {
         let bytes = self

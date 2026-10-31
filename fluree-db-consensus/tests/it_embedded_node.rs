@@ -237,15 +237,34 @@ async fn start_node(
     tempfile::TempDir,
     fluree_db_consensus::raft::ClusterNode,
 ) {
+    start_node_with(node_id, data_dir, build, configure, |app| app).await
+}
+
+/// [`start_node`], its routes served through `wrap`.
+async fn start_node_with(
+    node_id: u64,
+    data_dir: &std::path::Path,
+    build: impl FnOnce(FlureeBuilder) -> FlureeBuilder,
+    configure: impl FnOnce(EmbeddedRaftConfig) -> EmbeddedRaftConfig,
+    wrap: impl FnOnce(axum::Router) -> axum::Router,
+) -> (
+    Arc<RaftIntegration>,
+    Arc<fluree_db_api::Fluree>,
+    EmbeddedRaftNode,
+    tempfile::TempDir,
+    fluree_db_consensus::raft::ClusterNode,
+) {
     let raft_dir = tempfile::tempdir().expect("raft dir");
     let integration = Arc::new(
         RaftIntegration::bootstrap(RaftBootstrapConfig::new(node_id, raft_dir.path()))
             .await
             .expect("bootstrap"),
     );
-    let app = axum::Router::new()
-        .nest("/raft/nameservice", integration.raft_rpc_router())
-        .nest("/cluster/nameservice", integration.cluster_admin_router());
+    let app = wrap(
+        axum::Router::new()
+            .nest("/raft/nameservice", integration.raft_rpc_router())
+            .nest("/cluster/nameservice", integration.cluster_admin_router()),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -837,6 +856,11 @@ async fn a_push_of_erased_history_is_refused() {
 /// A leader with a learner, both proving natively on one storage, and an
 /// erasure of a value the leader's ledger asserted, accepted.
 async fn erasing_pair() -> Pair {
+    erasing_pair_with(|app| app).await
+}
+
+/// [`erasing_pair`], the learner's routes served through `wrap`.
+async fn erasing_pair_with(wrap: impl FnOnce(axum::Router) -> axum::Router) -> Pair {
     use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
     use fluree_db_api::retention::FactSelector;
 
@@ -866,8 +890,14 @@ async fn erasing_pair() -> Pair {
         integration.raft.current_leader().await == Some(61)
     })
     .await;
-    let (member_integration, member, member_node, member_raft, address) =
-        start_node(62, data_dir.path(), erasing(&provers[1]), |config| config).await;
+    let (member_integration, member, member_node, member_raft, address) = start_node_with(
+        62,
+        data_dir.path(),
+        erasing(&provers[1]),
+        |config| config,
+        wrap,
+    )
+    .await;
     integration
         .raft
         .add_learner(62, address, true)
@@ -991,7 +1021,7 @@ async fn a_step_proved_for_an_earlier_leader_is_not_proved_again() {
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match pair.member.prove_for_leader(step.clone()) {
+            match pair.member.prove_for_leader(step.clone(), 62) {
                 MemberProving::Done(outcome) => {
                     assert!(
                         matches!(
@@ -1027,6 +1057,351 @@ async fn a_step_proved_for_an_earlier_leader_is_not_proved_again() {
     assert!(pair.provers[0].proved().is_empty());
     assert_eq!(pair.provers[1].proved().len(), job.commits.len());
     pair.shutdown().await;
+}
+
+/// Proves natively once let through, counting the proofs begun and the
+/// most under way at once.
+#[derive(Debug)]
+struct GatedProver {
+    inner: fluree_db_erasure::testing::NativeProver,
+    gate: tokio::sync::Semaphore,
+    begun: std::sync::atomic::AtomicUsize,
+    running: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl GatedProver {
+    fn closed() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Default::default(),
+            gate: tokio::sync::Semaphore::new(0),
+            begun: Default::default(),
+            running: Default::default(),
+            most: Default::default(),
+        })
+    }
+
+    fn open(&self) {
+        self.gate.add_permits(1_000);
+    }
+
+    fn begun(&self) -> usize {
+        self.begun.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn most(&self) -> usize {
+        self.most.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl fluree_db_erasure::Prover for GatedProver {
+    async fn prove(
+        &self,
+        request: &fluree_db_erasure::ProveRequest,
+    ) -> Result<fluree_db_erasure::ProveResponse, fluree_db_erasure::ProverError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        struct Running<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, SeqCst);
+            }
+        }
+        self.begun.fetch_add(1, SeqCst);
+        let now = self.running.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        let _running = Running(&self.running);
+        let _permit = self.gate.acquire().await.expect("gate");
+        self.inner.prove(request).await
+    }
+}
+
+fn erasing_with(prover: &Arc<GatedProver>) -> impl FnOnce(FlureeBuilder) -> FlureeBuilder {
+    let prover = Arc::clone(prover);
+    move |builder| {
+        builder.with_erasure(fluree_db_api::retention::erasure::ErasureConfig {
+            prover,
+            verifier: Arc::new(
+                fluree_db_api::retention::erasure::Verifier::accepting_dev_receipts(),
+            ),
+            retry_ms: 10,
+        })
+    }
+}
+
+/// Insert a value on `id` and accept an erasure of it through `node`.
+async fn insert_and_erase(fluree: &fluree_db_api::Fluree, node: &EmbeddedRaftNode, id: &str) {
+    use fluree_db_api::retention::erasure::ErasureRequest;
+    use fluree_db_api::retention::FactSelector;
+
+    let mut request = bulk_request(id, 1);
+    request.body = TransactionBody::JsonLdInsert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/email": "a@secret"
+    }));
+    node.committer.transact(request).await.expect("insert");
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::new(
+        std::sync::OnceLock::from(Arc::clone(&node.committer)),
+    ));
+    let erasure = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(serde_json::json!("a@secret")),
+        }],
+        ..Default::default()
+    };
+    fluree
+        .erase_occurrences_with(&writer, id, erasure, None)
+        .await
+        .expect("accepted");
+}
+
+async fn first_job(
+    fluree: &fluree_db_api::Fluree,
+    id: &str,
+) -> fluree_db_api::retention::erasure::ErasureJob {
+    fluree
+        .retention_status(id)
+        .await
+        .expect("status")
+        .registration
+        .expect("registered")
+        .erasures
+        .remove(0)
+}
+
+/// A host proves one step at a time, whether for its leader or for itself:
+/// a member still proving a step handed to it before it led waits for that
+/// proof when it comes to the step itself, and finds it stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_proves_one_step_at_a_time() {
+    use fluree_db_api::retention::erasure::{MemberProving, ProofStep};
+
+    let prover = GatedProver::closed();
+    let (_integration, fluree, node, _dirs) =
+        stand_up_with(73, erasing_with(&prover), |config| config).await;
+    let id = "gated/db:main";
+    fluree.create_ledger("gated/db").await.expect("create");
+    insert_and_erase(&fluree, &node, id).await;
+    let job = first_job(&fluree, id).await;
+    let step = ProofStep {
+        branch: id.to_string(),
+        request_id: job.request_id.clone(),
+        commit: job.commits[0].commit.clone(),
+        branches: job.commits[0].branches.clone(),
+    };
+    assert_eq!(fluree.prove_for_leader(step, 73), MemberProving::Proving);
+    eventually("the handed proof to begin", async || prover.begun() == 1).await;
+
+    let pass = tokio::spawn({
+        let fluree = Arc::clone(&fluree);
+        async move { fluree.run_erasure_pass(id).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prover.begun(), 1, "a second proof began beside the first");
+    prover.open();
+    let report = pass.await.expect("pass task").expect("pass");
+    assert_eq!(report.proved, job.commits.len(), "{report:?}");
+    assert_eq!(prover.begun(), job.commits.len(), "a step was proved twice");
+    assert_eq!(prover.most(), 1);
+    node.shutdown().await;
+}
+
+/// A member whose first answer to the leader is lost has taken the step: the
+/// leader asks again rather than proving it elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_answer_does_not_hand_the_step_on() {
+    let lost = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pair = erasing_pair_with(move |app| {
+        app.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let lost = Arc::clone(&lost);
+                async move {
+                    let prove = request.uri().path().ends_with("/erasure_prove");
+                    let response = next.run(request).await;
+                    if prove && lost.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return axum::response::IntoResponse::into_response("garbled");
+                    }
+                    response
+                }
+            },
+        ))
+    })
+    .await;
+    let report = pair
+        .fluree
+        .run_erasure_pass("proved/db:main")
+        .await
+        .expect("pass");
+    let job = pair.job().await;
+    assert_eq!(report.proved, job.commits.len(), "{report:?}");
+    assert!(pair.provers[0].proved().is_empty(), "the leader proved too");
+    assert_eq!(pair.provers[1].proved().len(), job.commits.len());
+    pair.shutdown().await;
+}
+
+/// A leader that loses its leadership mid-proof stops waiting on the member
+/// proving its step, and the next leader, another member, asks that member
+/// first and takes the proof under way over rather than proving it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_leader_adopts_a_proof_under_way() {
+    adopted(false).await;
+}
+
+/// [`the_next_leader_adopts_a_proof_under_way`], led next by the member
+/// proving the step: it waits for its own proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_leads_next_adopts_its_own_proof() {
+    adopted(true).await;
+}
+
+async fn adopted(next_is_prover: bool) {
+    use fluree_db_consensus::raft::ownership::owner;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let ids = [81u64, 82, 83];
+    let provers = [
+        GatedProver::closed(),
+        GatedProver::closed(),
+        GatedProver::closed(),
+    ];
+    let asks: [Arc<AtomicUsize>; 3] = Default::default();
+    let mut nodes = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let counted = Arc::clone(&asks[i]);
+        let started = start_node_with(
+            *id,
+            data_dir.path(),
+            erasing_with(&provers[i]),
+            |config| config,
+            move |app| {
+                app.layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        if request.uri().path().ends_with("/erasure_prove") {
+                            counted.fetch_add(1, SeqCst);
+                        }
+                        next.run(request)
+                    },
+                ))
+            },
+        )
+        .await;
+        nodes.push(started);
+    }
+    let leader = &nodes[0].0;
+    leader
+        .raft
+        .initialize(BTreeMap::from([(81, nodes[0].4.clone())]))
+        .await
+        .expect("initialize");
+    eventually("self-election", async || {
+        leader.raft.current_leader().await == Some(81)
+    })
+    .await;
+    for i in [1, 2] {
+        leader
+            .raft
+            .add_learner(ids[i], nodes[i].4.clone(), true)
+            .await
+            .expect("learner added");
+    }
+    leader
+        .raft
+        .change_membership(
+            openraft::ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([82, 83])),
+            false,
+        )
+        .await
+        .expect("voters");
+
+    // A ledger a follower owns: the leader hands its step to the other, and
+    // a new leader asking by preference alone would ask the old leader.
+    let name = (0..)
+        .map(|n| format!("adopted-{n}/db"))
+        .find(|name| owner(&RefKey::new(name, "main"), &ids) != Some(81))
+        .expect("a name");
+    let owning = owner(&RefKey::new(&name, "main"), &ids).expect("an owner");
+    let proving = if owning == 82 { 2 } else { 1 };
+    let other = 3 - proving;
+    let id = format!("{name}:main");
+    let first = &nodes[0].1;
+    first.create_ledger(&name).await.expect("create");
+    insert_and_erase(first, &nodes[0].2, &id).await;
+    let steps = first_job(first, &id).await.commits.len();
+
+    let housekeeping = |i: usize| {
+        let writer: Arc<dyn fluree_db_api::retention::RetentionWriter> = Arc::new(
+            fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::new(
+                std::sync::OnceLock::from(Arc::clone(&nodes[i].2.committer)),
+            )),
+        );
+        nodes[i].1.retention_housekeeping(
+            Some(writer),
+            fluree_db_api::retention::RetentionOptions {
+                interval: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+    };
+    let leading = housekeeping(0);
+    leading.tick().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while provers[proving].begun() == 0 {
+        assert!(std::time::Instant::now() < deadline, "the member to begin");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(provers[other].begun(), 0);
+
+    // The leader goes quiet, and the member meant to lead next is elected.
+    let next = if next_is_prover { proving } else { other };
+    leader.raft.runtime_config().elect(false);
+    leader.raft.runtime_config().heartbeat(false);
+    nodes[3 - next].0.raft.runtime_config().elect(false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let led = nodes[next].0.raft.metrics().borrow().current_leader;
+        let deposed = leader.raft.metrics().borrow().current_leader != Some(81);
+        if led == Some(ids[next]) && deposed {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "a new leader");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // As when a leader's tasks are aborted.
+    drop(leading);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let before = asks[proving].load(SeqCst);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        asks[proving].load(SeqCst) <= before + 1,
+        "the deposed leader still waits on its step"
+    );
+
+    let led = housekeeping(next);
+    led.tick().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for prover in &provers {
+        prover.open();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let job = first_job(&nodes[next].1, &id).await;
+        if job.commits.iter().all(|c| c.proved.is_some()) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{job:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let begun: usize = provers.iter().map(|p| p.begun()).sum();
+    assert_eq!(begun, steps, "a step was proved twice");
+    drop(led);
+    for (_, _, node, _, _) in nodes {
+        node.shutdown().await;
+    }
 }
 
 /// An erasure reaches only the branches whose history holds its commits:

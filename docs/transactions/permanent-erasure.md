@@ -169,10 +169,13 @@ release; until then it refuses with `501`. What differs from a single node:
 - **Proving.** The leader accepts requests only with a prover of its own, so install it on every
   member. It has each step proved by another member with a prover, voter or learner: first one that
   neither leads nor stages the transactions of a branch holding the commit, then any other. The
-  member proves one step at a time, once it has installed the cluster's erasures, and stores the
-  result in the shared storage; the leader verifies it and records it. The leader proves a step
-  itself only when no other member can. A step a member proved for a leader since replaced is found
-  by the next one and not proved again.
+  member records that it proves the step, proves it once it has installed the cluster's erasures,
+  and stores the result in the shared storage; the leader verifies it and records it. The leader
+  proves a step itself only when no other member can. A host proves one step at a time, for its
+  leader or for itself. The next leader asks the member recorded as proving a step first, and takes
+  up its proof or its stored result rather than proving it again; a member that leaves the leader's
+  asks unanswered for a minute is passed over, and one cut off from the leader that long may then
+  have proved its step for nothing.
 - **Publication.** The leader writes the prepared erasure as an immutable manifest and activates it
   through Raft. The activation is refused, and the erasure prepared again, if a branch holding the
   erased commits changed meanwhile. A branch whose history does not reach an erased commit, one made

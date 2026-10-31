@@ -53,10 +53,13 @@ pub enum MemberProving {
 /// A cluster's other members, through which its leader has steps proved.
 #[async_trait]
 pub trait ProvingMembers: Send + Sync + std::fmt::Debug {
-    /// Have `step` proved by another member with a prover: first one that
-    /// neither leads nor owns a branch holding the commit, then any other.
-    /// `None` when none takes it, and this member proves it.
-    async fn prove(&self, step: &ProofStep) -> Option<StepOutcome>;
+    /// Have `step` proved by another member with a prover: `assigned`, the
+    /// member recorded as proving it for an earlier ask, first, then one that
+    /// neither leads nor owns a branch holding the commit, then any other. A
+    /// member that does not answer for a while is passed over. `None` when
+    /// none takes it, or this member was the one assigned, and this member
+    /// proves it.
+    async fn prove(&self, step: &ProofStep, assigned: Option<u64>) -> Option<StepOutcome>;
 
     /// Resolves once this member no longer leads in the term it leads now,
     /// at once if it does not lead.
@@ -75,10 +78,11 @@ impl Fluree {
         }
     }
 
-    /// Where this member is with `step`, which its leader hands it: begun in
-    /// the background unless another is under way, and its outcome once it
-    /// ends. One at a time: a proof can take most of the host's memory.
-    pub fn prove_for_leader(self: &Arc<Self>, step: ProofStep) -> MemberProving {
+    /// Where this member, `node`, is with `step`, which its leader hands it:
+    /// begun in the background unless another is under way, and its outcome
+    /// once it ends. One at a time: a proof can take most of the host's
+    /// memory.
+    pub fn prove_for_leader(self: &Arc<Self>, step: ProofStep, node: u64) -> MemberProving {
         let Some(runtime) = self.retention.erasure.get() else {
             return MemberProving::NoProver;
         };
@@ -103,7 +107,7 @@ impl Fluree {
         *current = Some((step.clone(), rx));
         let fluree = Arc::clone(self);
         tokio::spawn(async move {
-            let _ = tx.send(Some(fluree.prove_handed(&step).await));
+            let _ = tx.send(Some(fluree.prove_handed(&step, node).await));
         });
         MemberProving::Proving
     }

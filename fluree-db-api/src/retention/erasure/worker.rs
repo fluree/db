@@ -484,7 +484,21 @@ impl Fluree {
                 commit: commit.to_string(),
                 branches: step.branches.clone(),
             };
-            match members.prove(&handed).await {
+            // This host proves it for an earlier leader: it ends here.
+            let here = runtime
+                .for_leader
+                .lock()
+                .as_ref()
+                .is_some_and(|(held, _)| held == &handed);
+            if here {
+                return self.prove_prepared(&step).await.map(Some);
+            }
+            let assigned = runtime
+                .index
+                .proving(&step.key())
+                .await
+                .map_err(StepError::Retry)?;
+            match members.prove(&handed, assigned).await {
                 Some(StepOutcome::Proved(proved)) => {
                     self.verify_proved(&step, &proved).await?;
                     return Ok(Some(proved));
@@ -501,12 +515,13 @@ impl Fluree {
     }
 
     /// [`Self::prove_step`] with this member's own prover, for its leader:
-    /// over the erasures installed here, once they are the cluster's.
-    pub(super) async fn prove_handed(&self, step: &ProofStep) -> StepOutcome {
+    /// over the erasures installed here, once they are the cluster's. The
+    /// member, `node`, is recorded as proving it, for a leader asking again.
+    pub(super) async fn prove_handed(&self, step: &ProofStep, node: u64) -> StepOutcome {
         if let Err(e) = self.confirm_history_current(&step.branch).await {
             return StepOutcome::Retry(e.to_string());
         }
-        AssertUnwindSafe(self.prove_here(step))
+        AssertUnwindSafe(self.prove_here(step, node))
             .catch_unwind()
             .await
             .unwrap_or_else(|_| Err(StepError::Retry(ApiError::internal("the step panicked"))))
@@ -516,6 +531,7 @@ impl Fluree {
     async fn prove_here(
         &self,
         step: &ProofStep,
+        node: u64,
     ) -> std::result::Result<Option<ProvedStep>, StepError> {
         let Some(prepared) = self
             .prepare_step(&step.branch, &step.request_id, &step.commit)
@@ -523,10 +539,16 @@ impl Fluree {
         else {
             return Ok(None);
         };
-        match self.stored_proof(&prepared).await? {
-            Some(proved) => Ok(Some(proved)),
-            None => self.prove_prepared(&prepared).await.map(Some),
+        if let Some(proved) = self.stored_proof(&prepared).await? {
+            return Ok(Some(proved));
         }
+        self.erasure_runtime()
+            .map_err(StepError::Retry)?
+            .index
+            .put_proving(&prepared.key(), node)
+            .await
+            .map_err(StepError::Retry)?;
+        self.prove_prepared(&prepared).await.map(Some)
     }
 
     /// What the step of `request_id` on `commit` proves over the commit's
@@ -589,7 +611,8 @@ impl Fluree {
     }
 
     /// Prove `step` with this member's prover, verify it, and store its
-    /// artifacts and result.
+    /// artifacts and result: one proof at a time on this host, whether for
+    /// itself or for its leader.
     async fn prove_prepared(
         &self,
         step: &PreparedStep,
@@ -599,6 +622,11 @@ impl Fluree {
             .config
             .as_ref()
             .ok_or_else(|| StepError::Retry(ApiError::internal("no prover")))?;
+        let _proving = runtime.proving.lock().await;
+        // The proof this one waited for may have been this step's.
+        if let Some(proved) = self.stored_proof(step).await? {
+            return Ok(proved);
+        }
         let input = self
             .commit_bytes(&step.branches[0], &step.cid)
             .await

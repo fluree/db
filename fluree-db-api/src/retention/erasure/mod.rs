@@ -113,6 +113,8 @@ pub(crate) struct ErasureRuntime {
     pub(crate) members: std::sync::OnceLock<Arc<dyn ProvingMembers>>,
     /// The step this member proves for its leader.
     pub(crate) for_leader: parking_lot::Mutex<Option<members::ForLeader>>,
+    /// Held while this host proves: a proof can take most of its memory.
+    pub(crate) proving: tokio::sync::Mutex<()>,
 }
 
 /// What reconciling a branch with received erasures took out of its
@@ -145,6 +147,7 @@ impl ErasureRuntime {
             activator: Default::default(),
             members: Default::default(),
             for_leader: Default::default(),
+            proving: Default::default(),
         }
     }
 

@@ -21,16 +21,26 @@ use crate::raft::{ClusterNode, NodeId};
 /// How often the leader asks a member proving its step how it is going.
 const POLL: Duration = Duration::from_secs(1);
 
-/// How long a member proving a step may go unheard before the leader stops
-/// waiting for it.
+/// How long a member asked to prove a step may go unheard before the leader
+/// passes it over. One cut off from the leader that long may still be
+/// proving it, so another can prove it again.
 const SILENCE: Duration = Duration::from_secs(60);
 
 /// What a member answered for a step.
 enum Asked {
     Ended(StepOutcome),
     Busy,
-    /// It has no prover, runs an earlier release, or cannot be reached.
+    /// It has no prover, runs an earlier release, or went unheard.
     Cannot,
+}
+
+/// Why an ask went unanswered.
+enum Unanswered {
+    /// It did not reach the member's route, or the route refused it: the
+    /// member did not take the step.
+    Refused,
+    /// The answer was lost: the member may have taken the step.
+    Lost,
 }
 
 impl RaftNameService {
@@ -89,39 +99,47 @@ impl RaftNameService {
             node.raft_addr.trim_end_matches('/'),
             ERASURE_PROVE_PATH
         );
-        let mut heard: Option<Instant> = None;
+        let mut heard = Instant::now();
+        let mut took = false;
         loop {
-            let answer = async {
-                let resp = forwarding
-                    .http_client
-                    .post(&target)
-                    .timeout(forwarding.request_timeout)
-                    .json(step)
-                    .send()
-                    .await
-                    .ok()?;
-                if !resp.status().is_success() {
-                    return None;
+            match ask(forwarding, &target, step).await {
+                Ok(MemberProving::Done(outcome)) => return Asked::Ended(outcome),
+                Ok(MemberProving::Proving) => {
+                    took = true;
+                    heard = Instant::now();
                 }
-                resp.json::<MemberProving>().await.ok()
-            }
-            .await;
-            match (answer, heard) {
-                (Some(MemberProving::Done(outcome)), _) => return Asked::Ended(outcome),
-                (Some(MemberProving::Proving), _) => heard = Some(Instant::now()),
-                (Some(MemberProving::Busy), _) => return Asked::Busy,
-                (Some(MemberProving::NoProver), _) | (None, None) => return Asked::Cannot,
-                (None, Some(at)) if at.elapsed() > SILENCE => {
-                    return Asked::Ended(StepOutcome::Retry(format!(
-                        "the member proving the step, at {}, stopped answering",
-                        node.raft_addr
-                    )))
-                }
-                (None, Some(_)) => {}
+                Ok(MemberProving::Busy) => return Asked::Busy,
+                Ok(MemberProving::NoProver) => return Asked::Cannot,
+                Err(Unanswered::Refused) if !took => return Asked::Cannot,
+                Err(_) if heard.elapsed() > SILENCE => return Asked::Cannot,
+                Err(_) => {}
             }
             tokio::time::sleep(POLL).await;
         }
     }
+}
+
+/// One ask of a member at `target` to prove `step`, or how far it got.
+async fn ask(
+    forwarding: &ForwardingConfig,
+    target: &str,
+    step: &ProofStep,
+) -> Result<MemberProving, Unanswered> {
+    let resp = forwarding
+        .http_client
+        .post(target)
+        .timeout(forwarding.request_timeout)
+        .json(step)
+        .send()
+        .await
+        .map_err(|e| match e.is_connect() {
+            true => Unanswered::Refused,
+            false => Unanswered::Lost,
+        })?;
+    if !resp.status().is_success() {
+        return Err(Unanswered::Refused);
+    }
+    resp.json().await.map_err(|_| Unanswered::Lost)
 }
 
 /// The members other than `me`, in the order to ask them to prove: first
@@ -139,9 +157,13 @@ fn preference(
 
 #[async_trait]
 impl ProvingMembers for RaftNameService {
-    async fn prove(&self, step: &ProofStep) -> Option<StepOutcome> {
+    async fn prove(&self, step: &ProofStep, assigned: Option<u64>) -> Option<StepOutcome> {
         let forwarding = self.forwarding.as_ref()?;
-        let candidates = self.provers_for(step).await;
+        let mut candidates = self.provers_for(step).await;
+        if let Some(at) = candidates.iter().position(|(id, _)| Some(*id) == assigned) {
+            let first = candidates.remove(at);
+            candidates.insert(0, first);
+        }
         let loopback = {
             let me = self.raft.metrics().borrow().id;
             self.raft
@@ -199,7 +221,7 @@ pub(super) async fn handle_erasure_prove(
         }
     };
     let answer = match ns.prover() {
-        Some(fluree) => fluree.prove_for_leader(step),
+        Some(fluree) => fluree.prove_for_leader(step, ns.raft.metrics().borrow().id),
         None => MemberProving::NoProver,
     };
     axum::Json(answer).into_response()
