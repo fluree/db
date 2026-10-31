@@ -299,7 +299,7 @@ async fn run_update_branch(
     // uploader is behind, capping resident blobs to the channel depth + the
     // in-flight puts. Depth tracks the upload budget so the CoW can run a few
     // leaves ahead without unbounded buffering.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<NewLeafBlob>(upload_buffer.max(1));
+    let (tx, rx) = tokio::sync::mpsc::channel::<NewLeafBlob>(upload_buffer.max(1));
 
     // CPU-bound CoW update on a blocking thread. The fetch closures read the
     // prefetched in-memory maps — no `block_on`, no S3 inside the closure. Each
@@ -327,18 +327,20 @@ async fn run_update_branch(
         )
     });
 
-    // Async uploader: drain the channel, uploading each blob under the global
-    // budget and freeing its bytes. Runs concurrently with the CoW.
+    // Async uploader: drain the channel, uploading up to `upload_buffer` blobs
+    // at once under the global budget and freeing each one's bytes as its put
+    // completes. Runs concurrently with the CoW. Upload order is free: the
+    // branch records each leaf's CID from the CoW, not from the put.
     let upload_budget_ref = upload_budget.as_ref();
     let uploader = {
         let content_store = content_store.as_ref();
         let tracker = &tracker;
         let cache_dir = &cache_dir;
         let warm_cache = warm_cache.as_ref();
-        async move {
-            let mut totals = LeafUploadCounts::default();
-            while let Some(blob) = rx.recv().await {
-                let c = upload_one_leaf_blob(
+        // The stream owns `rx`, so a failed put drops it (see the join below).
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|blob| (blob, rx)) })
+            .map(move |blob| {
+                upload_one_leaf_blob(
                     content_store,
                     tracker,
                     upload_budget_ref,
@@ -346,13 +348,14 @@ async fn run_update_branch(
                     blob,
                     warm_cache,
                 )
-                .await?;
+            })
+            .buffer_unordered(upload_buffer.max(1))
+            .try_fold(LeafUploadCounts::default(), |mut totals, c| async move {
                 totals.leaf_bytes += c.leaf_bytes;
                 totals.sidecar_bytes += c.sidecar_bytes;
                 totals.sidecar_count += c.sidecar_count;
-            }
-            Ok::<LeafUploadCounts, IndexerError>(totals)
-        }
+                Ok(totals)
+            })
     };
 
     // Drive both to completion. If the uploader fails it drops `rx`, so the
