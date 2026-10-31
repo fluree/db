@@ -19,6 +19,7 @@
 //!   `range_with_overlay` core API, below the planner.
 
 use crate::binding::UnmatchedOptional;
+use crate::index_scope::ScopeKind;
 
 /// Whether a query is evaluating current state or full history.
 ///
@@ -80,6 +81,23 @@ pub struct PlanningContext {
     /// (which assume bag cardinality over the union). Only ever `true` in
     /// current mode — history datasets keep per-event (assert/retract) rows.
     pub multi_default_graph: bool,
+    /// How many graphs the query's default graph reads ([`ScopeKind::of`]):
+    /// the planner's twin of [`ExecutionContext::scope_kind`], from the same
+    /// definition. A plan choice that reads one graph (the fused fast paths,
+    /// the partitioned GROUP BY) is made only under [`ScopeKind::One`], and
+    /// each has a runtime gate on the same definition that falls back. A
+    /// choice that also needs the graph's binary index and has no fallback
+    /// (the geo index search) gates on [`Self::reads_one_graph_index`].
+    ///
+    /// [`ScopeKind::None`] when the planner was never given its scope
+    /// ([`Self::with_dataset_scope`]), so such a plan reads no index.
+    ///
+    /// [`ExecutionContext::scope_kind`]: crate::context::ExecutionContext::scope_kind
+    pub index_scope_kind: ScopeKind,
+    /// Whether the query's dataset spans ledgers. Such a dataset reads every
+    /// graph through the range scan (the query path attaches no binary store),
+    /// so [`Self::reads_one_graph_index`] is false whatever its default graph.
+    pub spans_ledgers: bool,
     /// What an unmatched OPTIONAL binds its optional-only variables to — the
     /// surface language's null semantics. Folded in from `Query` at the plan
     /// root; defaults to SPARQL's `Unbound`.
@@ -99,6 +117,8 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            index_scope_kind: ScopeKind::One,
+            spans_ledgers: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
         }
@@ -111,6 +131,8 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            index_scope_kind: ScopeKind::One,
+            spans_ledgers: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
         }
@@ -136,6 +158,34 @@ impl PlanningContext {
     pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
         self.multi_default_graph = multi && self.mode.is_current();
         self
+    }
+
+    /// Plan for the query's default graph over `dataset` (`None`: the
+    /// ledger's own default graph): [`Self::multi_default_graph`] when it has
+    /// two or more members, and [`Self::index_scope_kind`] by the one
+    /// definition the runtime uses. Every entry point that runs a query over a
+    /// dataset plans through this.
+    pub fn with_dataset_scope(self, dataset: Option<&crate::dataset::DataSet<'_>>) -> Self {
+        let mut planning =
+            self.with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2));
+        planning.index_scope_kind = ScopeKind::of(&crate::dataset::ActiveGraph::Default, dataset);
+        planning.spans_ledgers =
+            dataset.is_some_and(crate::dataset::DataSet::spans_multiple_ledgers);
+        planning
+    }
+
+    /// Whether a plan choice that reads one graph's binary index and has no
+    /// fallback without it may be made: the default graph is one graph, the
+    /// dataset does not span ledgers, and the query runs with a store
+    /// (`has_store`, the store the planner was given). The same definition as
+    /// the runtime's [`ExecutionContext::has_binary_store`]
+    /// ([`ScopeKind::reads_one_graph_index`]), so such a lane is planned only
+    /// where it can run.
+    ///
+    /// [`ExecutionContext::has_binary_store`]: crate::context::ExecutionContext::has_binary_store
+    pub fn reads_one_graph_index(&self, has_store: bool) -> bool {
+        self.index_scope_kind
+            .reads_one_graph_index(has_store, self.spans_ledgers)
     }
 
     /// Set the surface language's OPTIONAL null semantics (see

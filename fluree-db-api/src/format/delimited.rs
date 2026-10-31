@@ -484,6 +484,7 @@ fn write_binding_cell(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => {
             let gv = require_graph_view(gv)?;
@@ -494,7 +495,14 @@ fn write_binding_cell(
                 // writing) and the novelty-aware decode takes over.
                 if store.write_string_value_bytes(*o_key as u32, cell).is_err() {
                     let val = gv
-                        .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                        .decode_value_from_kind(
+                            *o_kind,
+                            *o_key,
+                            *p_id,
+                            *dt_id,
+                            *lang_id,
+                            *arena_g_id,
+                        )
                         .map_err(|e| {
                             FormatError::InvalidBinding(format!(
                                 "Failed to resolve string (kind={o_kind}, key={o_key}): {e}"
@@ -512,7 +520,7 @@ fn write_binding_cell(
                 cell.extend_from_slice(rendered.as_bytes());
             } else {
                 let val = gv
-                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                     .map_err(|e| {
                         FormatError::InvalidBinding(format!(
                             "Failed to decode value (kind={o_kind}, key={o_key}, p_id={p_id}): {e}"

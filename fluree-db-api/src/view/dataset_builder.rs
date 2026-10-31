@@ -5,6 +5,7 @@
 //! defaults are applied later, at the query-preparation choke point
 //! (`Fluree::complete_config_defaults`).
 
+use crate::view::fluree_ext::LedgerLoads;
 use crate::view::{DataSetDb, GraphDb};
 use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
 use fluree_db_core::VerifiedIdentity;
@@ -14,10 +15,10 @@ macro_rules! build_dataset_view_from_spec {
         $self:expr,
         $spec:expr,
         history_transform = $history_transform:expr,
-        load_view = $load_view:expr,
         apply_policy = $apply_policy:expr $(,)?
     ) => {{
         let spec = $spec;
+        let mut loads = LedgerLoads::default();
 
         // History/changes queries are a Fluree dataset extension.
         // In this mode, the "from" array specifies a (from,to) range on ONE ledger,
@@ -37,7 +38,7 @@ macro_rules! build_dataset_view_from_spec {
 
             // Load default graphs, applying per-source policy
             for source in &spec.default_graphs {
-                let view = ($load_view)(source).await?;
+                let view = $self.load_dataset_source(source, &mut loads).await?;
                 let view = ($apply_policy)(view, source).await?;
                 members.push(view.graph_source_id.clone());
                 // If this is a graph source, also register as a named graph
@@ -64,7 +65,7 @@ macro_rules! build_dataset_view_from_spec {
 
             // Load named graphs, applying per-source policy
             for source in &spec.named_graphs {
-                let view = ($load_view)(source).await?;
+                let view = $self.load_dataset_source(source, &mut loads).await?;
                 let view = ($apply_policy)(view, source).await?;
                 // Register under exactly ONE enumerable key: the name the user
                 // gave the member (its alias, else its text as written, pin
@@ -160,7 +161,6 @@ impl Fluree {
             self,
             spec,
             history_transform = |view| self.wrap_policy_defaults(view),
-            load_view = |source| self.load_view_from_source(source),
             apply_policy =
                 |view, source| self.maybe_apply_source_policy(view, source, server_identity),
         )
@@ -186,7 +186,6 @@ impl Fluree {
             self,
             spec,
             history_transform = |view| async { self.wrap_policy(view, opts).await },
-            load_view = |source| self.load_view_from_source(source),
             apply_policy = |view, source| self.apply_policy_with_override(view, source, opts),
         )
     }
@@ -256,6 +255,18 @@ impl Fluree {
         &self,
         source: &dataset::GraphSource,
     ) -> Result<GraphDb> {
+        self.load_dataset_source(source, &mut LedgerLoads::default())
+            .await
+    }
+
+    /// [`Self::load_view_from_source`] for one source of a dataset whose
+    /// ledgers are loaded through `loads`, once per ledger and time (see
+    /// [`LedgerLoads`]).
+    async fn load_dataset_source(
+        &self,
+        source: &dataset::GraphSource,
+        loads: &mut LedgerLoads,
+    ) -> Result<GraphDb> {
         use fluree_db_core::{DatasetRef, MemberRef};
         let address = match source.reference() {
             MemberRef::Dataset(
@@ -285,10 +296,7 @@ impl Fluree {
         // plain `select *` connection query past the default ~2 MB worker stack
         // (fluree/db#1408). Boxing keeps the load future's state on the heap so
         // it costs O(1) stack here and in the callers above.
-        let loaded = match time_spec {
-            None => Box::pin(self.load_graph_db(address.id())).await,
-            Some(spec) => Box::pin(self.load_graph_db_at(address.id(), spec.clone())).await,
-        };
+        let loaded = Box::pin(self.load_graph_db_in_dataset(address.id(), time_spec, loads)).await;
         match loaded {
             Ok(view) => {
                 let view = Self::apply_graph_selector(view, address.graph())?;

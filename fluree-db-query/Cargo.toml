@@ -27,6 +27,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+smallvec = { workspace = true }
 regex = "1"
 chrono.workspace = true
 # Numeric types for filter comparison

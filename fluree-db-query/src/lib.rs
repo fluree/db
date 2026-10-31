@@ -13,6 +13,13 @@
 //!
 //! Build a `TriplePattern` with a `VarRegistry`, then call `execute_pattern` with a `GraphDbRef` to get result batches.
 
+// `ExecutionContext::binary_g_id` is deprecated so that its readers are
+// listed: a lane takes its graph from `ExecutionContext::index_scope()`, which
+// says how many graphs it reads. Allowed here until #2075 makes the field
+// private. To list the readers, delete this line and run
+// `cargo check -p fluree-db-query --all-targets`.
+#![allow(deprecated)]
+
 pub mod aggregate;
 pub(crate) mod aggregate_complement_fold;
 pub mod annotation_edge_probe;
@@ -65,6 +72,7 @@ pub mod group_aggregate;
 pub mod groupby;
 pub mod hash_join;
 pub mod having;
+pub mod index_scope;
 pub mod ir;
 pub mod join;
 pub mod lang_support;
@@ -73,6 +81,7 @@ pub mod list_entries;
 pub mod list_view;
 pub mod materializer;
 pub(crate) mod membership_join;
+pub mod merged_cursor;
 pub mod minus;
 pub(crate) mod object_binding;
 pub mod offset;
@@ -108,6 +117,8 @@ pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
 pub mod union;
+pub(crate) mod union_fact;
+pub mod union_group_count;
 pub mod unwind;
 pub mod values;
 pub mod var_registry;
@@ -388,7 +399,7 @@ pub async fn execute_where_streaming<'a>(
     // blank minting. Single-graph datasets keep the flag off (byte-identical
     // planning).
     let planning = temporal_mode::PlanningContext::current()
-        .with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2))
+        .with_dataset_scope(dataset)
         .with_unmatched_optional(unmatched_optional);
     let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)
         .map_err(|e| e.name_variables(vars))?;

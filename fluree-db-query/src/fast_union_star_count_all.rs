@@ -107,8 +107,9 @@ impl Operator for UnionStarCountAllOperator {
         // History mode is filtered at the planner — see
         // `execute::operator_tree::build_operator_tree_inner` — so this gate
         // doesn't duplicate that check.
+        // The counts read one graph's index (`binary_g_id`'s).
         let allow_fast =
-            !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered();
+            ctx.reads_exactly_one_graph() && !ctx.is_history_range() && ctx.allow_unfiltered();
         if allow_fast {
             if let Some(store) = ctx.binary_store.as_ref() {
                 let started = fluree_db_core::clock::Instant::now();

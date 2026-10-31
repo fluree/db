@@ -37,7 +37,7 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
-use crate::operator::{Operator, OperatorState};
+use crate::operator::{Operator, OperatorState, RowFact};
 use crate::policy::QueryPolicyEnforcer;
 use crate::sid_iri;
 use crate::stats_cache::cached_stats_view_for_db;
@@ -231,6 +231,10 @@ pub struct BinaryScanOperator {
     check_p_eq_o: bool,
     /// Range-scan fallback iterator (used when no binary store is attached).
     range_iter: Option<std::vec::IntoIter<Flake>>,
+    /// The pattern's datatype in the scanned snapshot's namespace space, set by
+    /// the range fallback: the flakes it reads carry that snapshot's codes,
+    /// which a dataset member of another ledger may assign differently.
+    range_dt: Option<Sid>,
     /// When a bound subject IRI cannot be translated to a persisted `s_id`,
     /// keep a widened base scan correct by checking the resolved subject IRI row-by-row.
     unresolved_bound_subject_iri: Option<Arc<str>>,
@@ -244,6 +248,10 @@ pub struct BinaryScanOperator {
     /// `mode == Current`, it is constructed by `ScanDatasetBuilder` directly
     /// and emits current-state bindings without the `op` channel.
     mode: crate::temporal_mode::TemporalMode,
+    /// The fact each row of the batch being built matched, when a union of
+    /// graphs that deduplicates on fact identity armed recording
+    /// ([`Operator::record_row_facts`]).
+    row_facts: Option<Vec<RowFact>>,
 }
 
 /// A filter that can be evaluated on encoded index columns (no term decoding).
@@ -757,8 +765,10 @@ impl BinaryScanOperator {
             check_s_eq_p,
             check_p_eq_o,
             range_iter: None,
+            range_dt: None,
             unresolved_bound_subject_iri: None,
             mode,
+            row_facts: None,
         }
     }
 
@@ -766,6 +776,12 @@ impl BinaryScanOperator {
     pub fn hiding_list_members(mut self) -> Self {
         self.hide_list_members = true;
         self
+    }
+
+    /// Whether the pattern's object is a constant literal, the one position
+    /// a constant can match several terms at.
+    fn object_is_constant_literal(&self) -> bool {
+        matches!(&self.pattern.o, Term::Value(v) if !matches!(v, FlakeValue::Ref(_)))
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -809,6 +825,9 @@ impl BinaryScanOperator {
         let base_len = self.base_schema_len();
         let num_vars = columns.len();
         let mut produced = 0;
+        // Read once: see `batch_to_bindings`.
+        let record_facts = self.row_facts.is_some();
+        let record_object = record_facts && self.object_is_constant_literal();
 
         while produced < batch_size {
             let Some(flake) = self.range_iter.as_mut().and_then(std::iter::Iterator::next) else {
@@ -868,7 +887,7 @@ impl BinaryScanOperator {
 
             // Datatype / language constraint checks (range fallback path).
             if let Some(dtc) = &self.pattern.dtc {
-                if dtc.datatype() != &flake.dt {
+                if self.range_dt.as_ref().unwrap_or_else(|| dtc.datatype()) != &flake.dt {
                     continue;
                 }
                 if let Some(tag) = dtc.lang_tag() {
@@ -938,6 +957,9 @@ impl BinaryScanOperator {
             for (col, binding) in columns.iter_mut().zip(bindings) {
                 col.push(binding);
             }
+            if record_facts {
+                self.record_flake_fact(record_object, &flake);
+            }
             produced += 1;
         }
 
@@ -952,6 +974,11 @@ impl BinaryScanOperator {
         // DatasetOperator which wraps this operator at all scan sites.
         let overlay: &dyn OverlayProvider = ctx.overlay.unwrap_or(&no_overlay);
         let match_val = build_match_val_for_snapshot(ctx, ctx.active_snapshot, &self.pattern)?;
+        self.range_dt = self
+            .pattern
+            .dtc
+            .as_ref()
+            .map(|dtc| datatype_in_snapshot(ctx, ctx.active_snapshot, dtc.datatype()));
         let opts = RangeOptions {
             to_t: Some(ctx.to_t),
             from_t: ctx.from_t,
@@ -1410,6 +1437,14 @@ impl BinaryScanOperator {
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // Whether a union's dedup armed fact recording, read once per batch:
+        // a scan that is not a union member pays nothing per row.
+        let record_facts = self.row_facts.is_some();
+        let record_object = record_facts && self.object_is_constant_literal();
+        // Prepared once per batch: a string bound ordered against temporal
+        // rows is parsed once per temporal kind, not per row.
+        let object_bounds = self.object_bounds.clone();
+        let object_bounds = object_bounds.as_ref().map(ObjectBounds::prepare);
         // Decided per batch: a leaflet holding no list rows loads its
         // position column as the constant "none".
         let hide_members = self.hide_list_members
@@ -1507,13 +1542,13 @@ impl BinaryScanOperator {
                 }
             }
 
-            if let Some(bounds) = &self.object_bounds {
+            if let Some(bounds) = &object_bounds {
                 let Some(val) = decoded_o.as_ref() else {
                     return Err(QueryError::Internal(
                         "object bounds require object decoding".to_string(),
                     ));
                 };
-                if !bounds.matches(val) {
+                if !bounds.matches_encoded(val, OType::from_u16(o_type)) {
                     continue;
                 }
             }
@@ -1562,9 +1597,9 @@ impl BinaryScanOperator {
                 let binding = if needs_o_decode || !late_materialize {
                     let val = decoded_o.expect("decoded object required");
                     materialized_object_binding(self.store(), o_type, p_id, val, t_opt, None)
-                } else if let Some(encoded) =
-                    late_materialized_object_binding(o_type, o_key, p_id, t_enc, o_i, None)
-                {
+                } else if let Some(encoded) = late_materialized_object_binding(
+                    o_type, o_key, p_id, t_enc, o_i, None, self.g_id,
+                ) {
                     encoded
                 } else {
                     // Fallback: decode if we don't have a safe encoded representation.
@@ -1599,10 +1634,82 @@ impl BinaryScanOperator {
             for (i, binding) in bindings.drain(..).enumerate() {
                 columns[i].push(binding);
             }
+            if record_facts {
+                self.record_index_row_fact(&view, record_object, o_type, o_key, p_id, o_i)?;
+            }
             produced += 1;
         }
 
         Ok(produced)
+    }
+}
+
+impl BinaryScanOperator {
+    /// Record the fact an index row matched: its list position, and the term
+    /// it matched when the pattern's object is a constant literal (a constant
+    /// can match terms of several datatypes). Out of line, so a scan that
+    /// records nothing carries none of it in its row loop.
+    #[inline(never)]
+    fn record_index_row_fact(
+        &mut self,
+        view: &BinaryGraphView,
+        record_object: bool,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+        o_i: u32,
+    ) -> Result<()> {
+        let object = if record_object {
+            let val = view
+                .decode_value(o_type, o_key, p_id)
+                .map_err(|e| QueryError::from_io("decode_value", e))?;
+            Some(materialized_object_binding(
+                self.store(),
+                o_type,
+                p_id,
+                val,
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
+        let list_index = (o_i != u32::MAX).then_some(o_i);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
+        Ok(())
+    }
+
+    /// [`Self::record_index_row_fact`] for a decoded flake.
+    #[inline(never)]
+    fn record_flake_fact(&mut self, record_object: bool, flake: &Flake) {
+        let object = record_object.then(|| flake_object_binding(flake));
+        let list_index = flake.m.as_ref().and_then(|m| m.i).map(|i| i as u32);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
+    }
+}
+
+/// A decoded flake's object as the scan binds it, without its `t`: the
+/// matched object of a recorded fact ([`RowFact`]).
+fn flake_object_binding(flake: &Flake) -> Binding {
+    match &flake.o {
+        FlakeValue::Ref(r) => Binding::sid(r.clone()),
+        v => {
+            let dtc = match flake.m.as_ref().and_then(|m| m.lang.as_ref()) {
+                Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang.as_str())),
+                None => DatatypeConstraint::Explicit(flake.dt.clone()),
+            };
+            Binding::Lit {
+                val: v.clone(),
+                dtc,
+                t: None,
+                op: None,
+                p_id: None,
+            }
+        }
     }
 }
 
@@ -1907,7 +2014,8 @@ impl BinaryScanOperator {
 
         // Apply object bounds (post-filter) when present.
         if let Some(bounds) = self.object_bounds.as_ref() {
-            flakes.retain(|f| bounds.matches(&f.o));
+            let bounds = bounds.prepare();
+            flakes.retain(|f| bounds.matches(&f.o, &f.dt));
         }
 
         self.range_iter = Some(flakes.into_iter());
@@ -1974,7 +2082,33 @@ fn build_match_val_for_snapshot(
         Term::Iri(iri) => match_val.o = reencode_iri_subject(iri)?.map(FlakeValue::Ref),
     }
 
+    // A bound string's datatype is part of the term: `xsd:string`, a language
+    // tag's `rdf:langString`, or a custom datatype. Carry it so the range
+    // reads that datatype, not every bound string as `xsd:string`.
+    if let (Term::Value(FlakeValue::String(_)), Some(dtc)) = (&pattern.o, pattern.dtc.as_ref()) {
+        match_val.dt = Some(datatype_in_snapshot(ctx, snapshot, dtc.datatype()));
+    }
+
     Ok(match_val)
+}
+
+/// A pattern's datatype, coded in the primary snapshot's namespace space, in
+/// `snapshot`'s. A built-in namespace codes it the same in every ledger, and a
+/// snapshot of the primary's ledger codes it as the primary does, so only a
+/// datatype read from another ledger outside the built-in namespaces is
+/// re-coded. One `snapshot` cannot code stays as it is, as the pattern's terms
+/// do.
+fn datatype_in_snapshot(
+    ctx: &ExecutionContext<'_>,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    dt: &Sid,
+) -> Sid {
+    if crate::context::namespace_code_is_shared(dt.namespace_code)
+        || snapshot.ledger_id == ctx.original_snapshot.ledger_id
+    {
+        return dt.clone();
+    }
+    crate::context::reencode_sid(ctx, snapshot, dt).unwrap_or_else(|| dt.clone())
 }
 
 /// Pre-compute which repeated-variable equality checks are needed for a pattern.
@@ -2004,6 +2138,15 @@ fn repeated_var_flags(pattern: &TriplePattern) -> (bool, bool, bool) {
 impl Operator for BinaryScanOperator {
     fn schema(&self) -> &[VarId] {
         &self.schema
+    }
+
+    fn record_row_facts(&mut self) -> bool {
+        self.row_facts = Some(Vec::new());
+        true
+    }
+
+    fn take_row_facts(&mut self) -> Option<Vec<RowFact>> {
+        self.row_facts.as_mut().map(std::mem::take)
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
@@ -2427,6 +2570,7 @@ impl Operator for BinaryScanOperator {
         let mut range_min_okey: Option<u64> = None;
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
+        let mut bound_slices = false;
         if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
             if let Some(bounds) = self.object_bounds.as_ref() {
                 let supports_range = |ot: OType| -> bool {
@@ -2473,6 +2617,16 @@ impl Operator for BinaryScanOperator {
                     range_o_type = Some(o_type);
                     // Also set the filter o_type so directory-level pre-skip can eliminate non-matching leaflets.
                     filter.o_type = Some(o_type);
+                    // `<`, `<=`, `>` and `>=` also order an `xsd:string` row
+                    // against a temporal bound, reading it as a value of that
+                    // type, so seek that slice too, unranged (string ids are
+                    // not in date order). `=` never equates the two, so its
+                    // seek stays on the temporal slice.
+                    if bounds.temporal_string_ordering {
+                        object_slices =
+                            vec![(OType::from_u16(o_type), None), (OType::XSD_STRING, None)];
+                        bound_slices = true;
+                    }
                 }
 
                 // Integer EQUALITY bounds (`FILTER(?v = 4112)`, the id-lookup
@@ -2505,6 +2659,53 @@ impl Operator for BinaryScanOperator {
                         }
                     }
                 }
+
+                // A string bound admits only `xsd:string` objects (plus, when
+                // it orders against temporals, the temporal types its strings
+                // parse as), so seek those slices rather than read every type
+                // the predicate holds: tagged and otherwise-typed strings sort
+                // into other o_types. An equality seeks its one string id, as
+                // `?s <p> "a"` does. A bound already narrowed above (a date
+                // on the other side) keeps that narrowing.
+                let narrowed =
+                    range_o_type.is_some() || range_min_okey.is_some() || range_max_okey.is_some();
+                if let Some(otypes) = bounds.string_bound_otypes().filter(|_| !narrowed) {
+                    stamp_string_bound_seek();
+                    let point = match (&bounds.lower, &bounds.upper) {
+                        (
+                            Some((lo @ FlakeValue::String(_), true)),
+                            Some((hi @ FlakeValue::String(_), true)),
+                        ) if lo == hi && otypes == [OType::XSD_STRING] => Some(lo),
+                        _ => None,
+                    };
+                    let encoded = point.map(|s| {
+                        value_to_otype_okey(
+                            s,
+                            &Sid::xsd_string(),
+                            None,
+                            store_ref,
+                            ctx.dict_novelty.as_ref(),
+                            None,
+                        )
+                    });
+                    match encoded {
+                        Some(Ok((ot, key))) => {
+                            filter.o_type = Some(ot.as_u16());
+                            filter.o_key = Some(key);
+                        }
+                        // Absent from the base dictionary; only novelty can hold it.
+                        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
+                        }
+                        _ => match otypes.as_slice() {
+                            [ot] => filter.o_type = Some(ot.as_u16()),
+                            _ => {
+                                object_slices = otypes.into_iter().map(|ot| (ot, None)).collect();
+                                bound_slices = true;
+                            }
+                        },
+                    }
+                }
             }
         }
 
@@ -2523,7 +2724,7 @@ impl Operator for BinaryScanOperator {
         // A bare number spanning several numeric datatypes seeks each slice
         // with its own cursor, drained in turn.
         let slice_filters = object_slice_filters(order, filter, &object_slices);
-        if !object_slices.is_empty() {
+        if !object_slices.is_empty() && !bound_slices {
             stamp_bare_number_seek(slice_filters.len() > 1);
         }
         let open_cursor = |filter: BinaryFilter| {
@@ -2538,6 +2739,14 @@ impl Operator for BinaryScanOperator {
                 .with_tracker(ctx.tracker.clone());
                 return (cursor, None);
             }
+            // The temporal key range bounds the temporal slice only, not an
+            // `xsd:string` slice sought beside it.
+            let in_range = filter.o_type.is_none() || filter.o_type == range_o_type;
+            let (range_min_okey, range_max_okey) = if in_range {
+                (range_min_okey, range_max_okey)
+            } else {
+                (None, None)
+            };
             let min_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(0)),
                 o_key: filter.o_key.or(range_min_okey).unwrap_or(0),
@@ -2886,7 +3095,10 @@ impl Operator for BinaryScanOperator {
                                     .and_then(|m| m.lang.as_deref())
                                     .is_some_and(|l| l.eq_ignore_ascii_case(lang))
                             })
-                            && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
+                            && self
+                                .object_bounds
+                                .as_ref()
+                                .is_none_or(|b| b.matches(&f.o, &f.dt))
                     })
                     .cloned()
                     .collect();
@@ -2938,6 +3150,9 @@ impl Operator for BinaryScanOperator {
         let mut columns: Vec<Vec<Binding>> = (0..num_vars)
             .map(|_| Vec::with_capacity(batch_size))
             .collect();
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.clear();
+        }
 
         // Residency mode: handle a store's ContentStore + retry budget for
         // the drain/fetch/retry arm in the cursor loop below.
@@ -4153,6 +4368,15 @@ fn stamp_bare_number_seek(seeks: bool) {
     );
 }
 
+/// Routing stamp: a scan under a string object bound seeks the `o_type`
+/// slices the bound admits (see `ObjectBounds::string_bound_otypes`).
+const STRING_BOUND_SEEK_SITE: &str = "string_bound_seek";
+
+fn stamp_string_bound_seek() {
+    use crate::fast_path_outcome::{stamp_fast_path, FastPathOutcome};
+    stamp_fast_path(STRING_BOUND_SEEK_SITE, FastPathOutcome::Proceed);
+}
+
 /// One seek of a bare-number scan: the rows of `o_type` keyed `o_key`, or with
 /// no `o_key` every row of `o_type`, left to the decoded-value filter.
 pub(crate) type ObjectSlice = (OType, Option<u64>);
@@ -4179,10 +4403,11 @@ const NUMERIC_TAGS: [fluree_db_core::ValueTypeTag; 15] = {
     ]
 };
 
-/// Every slice an untyped `Long` or `Double` can be stored under, in `o_type`
-/// order: one per numeric datatype in `observed` (the predicate's observed
-/// datatypes; every integer and float datatype when `None`), keyed by that
-/// datatype's encoding of the value.
+/// Every slice an untyped number can be stored under, in `o_type` order: one per
+/// numeric datatype in `observed` (the predicate's observed datatypes; every
+/// integer and float datatype when `None`), keyed by that datatype's encoding of
+/// the value. The number is a `Long` or `Double` (a bare integer or double), or
+/// a `Decimal` or `BigInt` (a bare decimal, or an integer too large for `i64`).
 ///
 /// A bare number matches every numeric datatype holding an equal value, and
 /// the families encode differently (`i64` keys for integer types, `f64` keys
@@ -4215,6 +4440,13 @@ pub(crate) fn untyped_numeric_slices(
         FlakeValue::Double(d) if d.is_finite() => {
             let integral = d.fract() == 0.0 && *d >= -(2f64.powi(63)) && *d < 2f64.powi(63);
             (integral.then_some(*d as i64), Some(*d))
+        }
+        // A decimal or a big integer has an integer or float slice only where
+        // that type holds the value exactly: `numeric_cmp` compares exactly.
+        FlakeValue::Decimal(d) => (exact_i64(d), exact_f64(d)),
+        FlakeValue::BigInt(b) => {
+            let d = bigdecimal::BigDecimal::from((**b).clone());
+            (exact_i64(&d), exact_f64(&d))
         }
         _ => return None,
     };
@@ -4252,6 +4484,24 @@ pub(crate) fn untyped_numeric_slices(
     Some(slices)
 }
 
+/// `value` as an `i64`, when it is one exactly.
+fn exact_i64(value: &bigdecimal::BigDecimal) -> Option<i64> {
+    use num_traits::ToPrimitive;
+    if value.is_integer() {
+        value.to_i64()
+    } else {
+        None
+    }
+}
+
+/// `value` as an `f64`, when an `f64` holds it exactly.
+fn exact_f64(value: &bigdecimal::BigDecimal) -> Option<f64> {
+    use num_traits::ToPrimitive;
+    let f = value.to_f64().filter(|f| f.is_finite())?;
+    let back = bigdecimal::BigDecimal::try_from(f).ok()?;
+    (back.cmp(value) == std::cmp::Ordering::Equal).then_some(f)
+}
+
 /// The predicate's observed datatypes for [`untyped_numeric_slices`]; `None`
 /// when unknown. The observed set, never the `datatypes` counts: a no-op
 /// retraction can zero a tag's count while its rows remain (#1738).
@@ -4279,11 +4529,22 @@ fn numbig_slices(
     arena_is_current: bool,
 ) -> Vec<ObjectSlice> {
     // Arena integers lie outside `i64`, so only an integral double beyond it
-    // can equal one; the handle lookup covers decimals only.
+    // can equal one; for a double the handle lookup covers decimals only.
     let decimal = match value {
         FlakeValue::Long(n) => Some(bigdecimal::BigDecimal::from(*n)),
         FlakeValue::Double(d) if as_i64.is_some() || d.fract() != 0.0 => {
             bigdecimal::BigDecimal::try_from(*d).ok()
+        }
+        FlakeValue::Decimal(d) => Some((**d).clone()),
+        FlakeValue::BigInt(b) => Some(bigdecimal::BigDecimal::from((**b).clone())),
+        _ => None,
+    };
+    // A decimal or big integer beyond `i64` that is integral can also equal an
+    // arena integer, which the decimal lookup does not find.
+    let big_int = match value {
+        FlakeValue::BigInt(b) if as_i64.is_none() => Some((**b).clone()),
+        FlakeValue::Decimal(d) if as_i64.is_none() && d.is_integer() => {
+            num_bigint::ToBigInt::to_bigint(&**d)
         }
         _ => None,
     };
@@ -4291,12 +4552,26 @@ fn numbig_slices(
         return vec![(OType::NUM_BIG_OVERFLOW, None)];
     };
     let handles: Vec<u32> = match p_id {
-        Some(p_id) => store
-            .find_decimal_handles(g_id, p_id, &decimal)
-            .unwrap_or_default(),
+        Some(p_id) => {
+            let mut handles = store
+                .find_decimal_handles(g_id, p_id, &decimal)
+                .unwrap_or_default();
+            if let Some(big_int) = &big_int {
+                handles.extend(store.find_numbig_handle(
+                    g_id,
+                    p_id,
+                    &FlakeValue::BigInt(Box::new(big_int.clone())),
+                ));
+            }
+            handles
+        }
         None => store
             .numbig_arenas(g_id)
-            .flat_map(|(_, arena)| arena.find_bigdec_handles(&decimal))
+            .flat_map(|(_, arena)| {
+                let mut handles = arena.find_bigdec_handles(&decimal);
+                handles.extend(big_int.as_ref().and_then(|b| arena.find_bigint(b)));
+                handles
+            })
             .collect(),
     };
     handles

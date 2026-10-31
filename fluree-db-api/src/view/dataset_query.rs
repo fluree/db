@@ -766,7 +766,7 @@ impl Fluree {
         // the `DatasetOperator` deduplicates across members.
         prepare_config.planning = prepare_config
             .planning
-            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
+            .with_dataset_scope(Some(&runtime_dataset));
         if !is_single_ledger_dataset {
             prepare_config = prepare_config.without_binary_scans();
         }
@@ -952,7 +952,7 @@ impl Fluree {
         // a set (SPARQL §13.2), so the planner enforces triple-identity dedup.
         prepare_config.planning = prepare_config
             .planning
-            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
+            .with_dataset_scope(Some(&runtime_dataset));
         if !is_single_ledger_dataset {
             prepare_config = prepare_config.without_binary_scans();
         }

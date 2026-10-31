@@ -421,6 +421,19 @@ path = "tests/it_count_star_row_multiplicity.rs"
 name = "it_topk_large_limit_offset"
 path = "tests/it_topk_large_limit_offset.rs"
 
+# Own binary: fixture A and the scope matrix of the multigraph lanes. It
+# toggles the process-global fast-path kill switch and asserts fast-path
+# routing, so it must not share a process with either.
+[[test]]
+name = "it_multigraph_lanes"
+path = "tests/it_multigraph_lanes.rs"
+
+# Own binary: asserts the index-scope stamp through thread-scoped tracing
+# capture, which misses events while other tests set and drop their own.
+[[test]]
+name = "it_index_scope"
+path = "tests/it_index_scope.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
@@ -435,6 +448,12 @@ path = "tests/it_grouped_projection_lanes.rs"
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
+
+# Own binary: switches the cyclic lane off through FLUREE_CYCLIC_BGP, a
+# process-global env var, for its oracle runs.
+[[test]]
+name = "it_cyclic_bgp_multiplicity"
+path = "tests/it_cyclic_bgp_multiplicity.rs"
 
 [[test]]
 name = "it_cyclic_bgp_probe"
@@ -813,6 +832,20 @@ required-features = ["native"]
 [[test]]
 name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch.
+[[test]]
+name = "it_union_annotation_chain"
+path = "tests/it_union_annotation_chain.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts string-bound seek routing via span capture.
+[[test]]
+name = "it_string_filter_pushdown"
+path = "tests/it_string_filter_pushdown.rs"
 required-features = ["native"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

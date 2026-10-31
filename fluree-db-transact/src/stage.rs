@@ -3602,11 +3602,12 @@ fn materialize_one_binding(
             lang_id,
             i_val,
             t,
+            arena_g_id,
         } => {
             let (o_kind, o_key, p_id, dt_id, lang_id, i_val, t) =
                 (*o_kind, *o_key, *p_id, *dt_id, *lang_id, *i_val, *t);
             let val = gv
-                .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
+                .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, *arena_g_id)
                 .map_err(|e| {
                     TransactError::Query(fluree_db_query::QueryError::Internal(format!(
                         "decode_value_from_kind: {e}"
@@ -4287,6 +4288,7 @@ mod tests {
             lang_id: 0,
             i_val: 0,
             t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         }]));
 
         // A column with a single encoded entry among many concrete entries

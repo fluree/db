@@ -468,17 +468,23 @@ pub async fn prepare_execution_with_config(
             // Detects Triple(?s, pred, ?loc) + Bind(?dist = geof:distance(?loc, WKT)) + Filter(?dist < r)
             // and collapses them into a single Pattern::GeoSearch for index acceleration.
             // This runs for both SPARQL and JSON-LD queries — same patterns, same rewrite.
-            // The GeoSearch operator reads the binary index, so without one
-            // covering `to_t` (a ledger not yet indexed, a time before the
-            // index's base) the patterns stay as written and evaluate as such.
-            // The operator reads the store its execution context takes from
-            // the snapshot, which a caller need not have passed in here,
-            // unless execution runs with none (a multi-ledger dataset).
-            let geo_index_covers = binary_scans
-                && binary_store
-                    .cloned()
-                    .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
-                    .is_some_and(|store| db.t >= store.base_t());
+            // The GeoSearch operator reads one graph's binary index and has no
+            // fallback, so the patterns stay as written, evaluated as such,
+            // unless the scope reads exactly one graph through a binary index
+            // the operators will get (`planning.reads_one_graph_index`: one
+            // graph, a dataset that does not span ledgers, and a store with
+            // binary scans on; the definition the operator's refusal,
+            // `ExecutionContext::has_binary_store`, shares) and that index
+            // covers `to_t` (not a ledger yet to be indexed, nor a time before
+            // the index's base). The operator reads the store its execution
+            // context takes from the snapshot, which a caller need not have
+            // passed in here.
+            let geo_store = binary_store
+                .cloned()
+                .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot));
+            let geo_index_covers = planning
+                .reads_one_graph_index(binary_scans && geo_store.is_some())
+                && geo_store.is_some_and(|store| db.t >= store.base_t());
             let rewritten_patterns = crate::geo_rewrite::rewrite_geo_patterns_if_indexed(
                 rewritten_patterns,
                 &|iri: &str| db.snapshot.encode_iri(iri),
@@ -1044,6 +1050,8 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx.r2rml_graph_ids = r2rml_ids;
     }
 
+    crate::fast_path_outcome::stamp_index_scope("query", &ctx);
+
     // A sub-query plans at run time; name the variables in its plan errors.
     run_operator_streaming(prepared.operator, &ctx, sink)
         .await
@@ -1067,11 +1075,7 @@ pub async fn execute<'a>(
     // the dataset paths do, so the members' scans deduplicate on full rows.
     let mut prepare_config =
         PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
-    prepare_config.planning = prepare_config.planning.with_multi_default_graph(
-        config
-            .dataset
-            .is_some_and(|ds| ds.default_graphs().len() >= 2),
-    );
+    prepare_config.planning = prepare_config.planning.with_dataset_scope(config.dataset);
     let prepared = prepare_execution_with_config(db, query, &prepare_config)
         .await
         .map_err(|e| e.name_variables(vars))?;

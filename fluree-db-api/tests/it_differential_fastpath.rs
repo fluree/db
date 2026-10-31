@@ -582,10 +582,9 @@ async fn run_query(fluree: &Fluree, alias: &str, sparql: &str) -> Value {
 ///
 /// Global-state hazard: under plain `cargo test` threads share the process
 /// (unlike nextest's process-per-test), so any concurrent test in THIS binary
-/// runs generically during the switched window. Benign today — results stay
-/// correct and the only routing-asserting test (`it_minmax_fast_path_fired`)
-/// lives in `grp_misc`, a different binary. Keep it that way: tests asserting
-/// fast-path *routing* must not share this binary (`grp_query`).
+/// runs generically during the switched window. Results stay correct; a test
+/// here that asserts fast-path *routing* holds the read side of
+/// `support::FAST_PATH_SWITCH`, and the switched window holds the write side.
 struct FastPathGuard;
 impl Drop for FastPathGuard {
     fn drop(&mut self) {
@@ -619,9 +618,13 @@ async fn differential_fastpath_and_condition_matrix() {
         for (ci, case) in cases.iter().enumerate() {
             set_fast_paths_disabled(false);
             let fast = run_query(&fluree, &alias, case.sparql).await;
-            set_fast_paths_disabled(true);
-            let generic = run_query(&fluree, &alias, case.sparql).await;
-            set_fast_paths_disabled(false);
+            let generic = {
+                let _switch = crate::support::FAST_PATH_SWITCH.write().await;
+                set_fast_paths_disabled(true);
+                let generic = run_query(&fluree, &alias, case.sparql).await;
+                set_fast_paths_disabled(false);
+                generic
+            };
 
             let fast_n = normalize(&fast, case.ordered);
             let generic_n = normalize(&generic, case.ordered);

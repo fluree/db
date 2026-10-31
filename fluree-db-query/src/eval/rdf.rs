@@ -7,6 +7,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::Expression;
 use crate::object_binding::{canonical_iri_id, TermDicts};
+use crate::parse::encode::IriEncoder;
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeDictId, Sid};
 use std::sync::Arc;
@@ -97,11 +98,13 @@ fn datatype_of_binding(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if *o_kind == ObjKind::NUM_BIG.as_u8() => {
             let decoded = ctx.and_then(|c| {
                 let store = c.binary_store.as_deref()?;
-                let val = c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?;
+                let val =
+                    c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?;
                 Some((store, val))
             });
             let Some((store, val)) = decoded else {
@@ -195,11 +198,11 @@ fn datatype_of_comparable(
         ComparableValue::TypedLiteral { dtc, .. } => match dtc {
             Some(UnresolvedDatatypeConstraint::LangTag(_)) => dts.rdf_lang_string.clone(),
             Some(UnresolvedDatatypeConstraint::Explicit(iri)) => {
-                // Prefer a Sid (comparable to a datatype IRI written in the
-                // query); fall back to the raw IRI for datatypes the ledger
-                // has never seen.
-                match ctx.and_then(|c| c.active_snapshot.encode_iri_strict(iri)) {
-                    Some(sid) => sid,
+                // The Sid a BIND of the value carries (`to_binding`), so
+                // `DATATYPE(STRDT(..))` and `DATATYPE(?bound)` are one term,
+                // also for a datatype the ledger has never seen.
+                match ctx {
+                    Some(c) => c.active_snapshot.encode_datatype(iri),
                     None => return Ok(Some(ComparableValue::Iri(iri.clone()))),
                 }
             }

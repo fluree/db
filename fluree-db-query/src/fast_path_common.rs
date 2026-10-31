@@ -7,6 +7,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::index_scope::{overlay_carries_novelty, IndexScope};
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::policy::PredicateCoverage;
@@ -344,7 +345,7 @@ pub const fn is_post_desc_orderable(o_type: u16) -> bool {
 
 /// Construct min/max `RunRecordV2` keys spanning all rows for a predicate.
 #[inline]
-fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) {
+pub(crate) fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) {
     let min_key = RunRecordV2 {
         s_id: SubjectId(0),
         o_key: 0,
@@ -697,10 +698,24 @@ pub fn collect_subjects_for_predicate_set(
     g_id: GraphId,
     p_id: u32,
 ) -> Result<FxHashSet<u64>> {
+    let mut out: FxHashSet<u64> = FxHashSet::default();
+    extend_subjects_for_predicate_set(store, g_id, p_id, &mut out)?;
+    Ok(out)
+}
+
+/// Add the distinct subject IDs of a predicate in one graph (PSOT) to `out`.
+///
+/// For a set over several graphs: each graph's subjects go into one set, with
+/// no per-graph set to build and merge.
+pub fn extend_subjects_for_predicate_set(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    out: &mut FxHashSet<u64>,
+) -> Result<()> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_only();
 
-    let mut out: FxHashSet<u64> = FxHashSet::default();
     let mut prev: Option<u64> = None;
 
     for leaf_entry in leaves {
@@ -724,7 +739,7 @@ pub fn collect_subjects_for_predicate_set(
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2708,6 +2723,10 @@ pub(crate) fn probe_lane_admission(
     if ctx.is_history_range() {
         return Some(ProbeLanePlan::Decline);
     }
+    // The lanes read one graph's index (`binary_g_id`'s).
+    if !ctx.reads_exactly_one_graph() {
+        return Some(ProbeLanePlan::Decline);
+    }
     // Every predicate the lane reads must clear; an empty set has nothing to
     // clear and declines under any non-root policy. `Allow` keeps the lane,
     // anything else declines it (the lanes have no empty result to
@@ -3780,35 +3799,8 @@ pub fn term_to_ref_s_id(
         .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))
 }
 
-/// Check whether the execution context allows fast-path operators.
-///
-/// Fast paths are only valid when single-ledger, no `from_t`, root (or no)
-/// policy, and no uncommitted overlay. History mode is filtered at the
-/// planner level (in `execute::operator_tree::build_operator_tree_inner`),
-/// so this runtime gate doesn't repeat that check.
-#[inline]
-fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    fast_path_eligible_no_policy(ctx) && ctx.allow_unfiltered()
-}
-
-/// The non-policy half of [`allow_fast_path`]: single-ledger, no `from_t`, no
-/// uncommitted overlay.
-///
-/// Fast paths rely on a single binary index + single-ledger semantics for
-/// encoded IDs; dataset (multi-ledger) execution can span multiple
-/// ledgers/graphs, so they are disabled there. History mode is filtered at the
-/// planner level, so this runtime gate doesn't repeat that check.
-///
-/// Split out so single-predicate O1 callers can reuse the structural conditions
-/// after discharging the view policy themselves via
-/// [`cursor_fast_path_for_predicate`] (an uncovered predicate is safe to read
-/// unfiltered).
-#[inline]
-fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
-}
-
-/// True when the overlay can still contribute flakes.
+/// True when the overlay can still contribute flakes
+/// ([`overlay_carries_novelty`]).
 ///
 /// `epoch()` is a monotonic mutation counter that never resets, so
 /// `epoch() == 0` means "never had novelty since this overlay was created" —
@@ -3820,54 +3812,55 @@ fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
 /// exactly this distinction; keep `epoch()` itself for cache keys only.
 #[inline]
 pub fn overlay_has_novelty(ctx: &ExecutionContext<'_>) -> bool {
-    match &ctx.overlay {
-        Some(o) => o.epoch() != 0 && !o.is_effectively_empty(),
-        None => false,
-    }
+    ctx.overlay.is_some_and(overlay_carries_novelty)
 }
 
-/// Combined fast-path eligibility: [`allow_fast_path`] + binary store present + `to_t == max_t`.
+/// The store a metadata fast path reads, when it may: the scope reads one
+/// graph ([`IndexScope::One`] from [`ExecutionContext::index_scope`]: a store,
+/// one graph, no `from_t`, root or no policy) whose index alone answers for it
+/// ([`IndexMember::index_is_current`]: no novelty, `to_t == max_t`). `None`
+/// otherwise.
 ///
-/// Returns the store reference if the fast path can proceed, `None` otherwise.
+/// A default graph of several graphs is not `One`: there `binary_g_id` names
+/// one member, which these lanes would read alone.
+///
+/// [`IndexMember::index_is_current`]: crate::index_scope::IndexMember::index_is_current
 #[inline]
 pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<BinaryIndexStore>> {
-    if !allow_fast_path(ctx) {
-        return None;
+    match ctx.index_scope()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
     }
-    let store = ctx.binary_store.as_ref()?;
-    if ctx.to_t != store.max_t() {
-        return None;
-    }
-    Some(store)
 }
 
 /// Like [`fast_path_store`] but with the view-policy clause **already
-/// discharged by the caller** — use only after [`cursor_fast_path_for_predicate`]
-/// returned [`PredicateFastPath::Allow`] for the operator's single scanned
-/// predicate. Same structural metadata-lane conditions otherwise: single-ledger,
-/// no `from_t`, overlay-free, store present, `to_t == max_t`.
+/// discharged by the caller** ([`ExecutionContext::index_scope_policy_cleared`])
+/// — use only after [`cursor_fast_path_for_predicate`] returned
+/// [`PredicateFastPath::Allow`] for the operator's single scanned predicate.
+/// Same structural metadata-lane conditions otherwise: one graph, no `from_t`,
+/// overlay-free, store present, `to_t == max_t`.
 #[inline]
 pub fn fast_path_store_policy_cleared<'a>(
     ctx: &'a ExecutionContext<'_>,
 ) -> Option<&'a Arc<BinaryIndexStore>> {
-    if !fast_path_eligible_no_policy(ctx) {
-        return None;
+    match ctx.index_scope_policy_cleared()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
     }
-    let store = ctx.binary_store.as_ref()?;
-    (ctx.to_t == store.max_t()).then_some(store)
 }
 
 /// Cursor-flavored fast-path gate (strategy (b)).
 ///
-/// Unlike [`allow_fast_path`], this does **not** reject uncommitted overlay or
+/// Unlike [`fast_path_store`], this does **not** reject uncommitted overlay or
 /// `to_t < max_t`: operators using this gate read through a [`BinaryCursor`]
 /// (built by [`build_psot_cursor_for_predicate`]) that folds the novelty overlay
-/// in and honors `to_t`, so those cases stay correct. It still requires
-/// single-ledger, no `from_t`, and root (or no) policy; History mode is filtered
-/// at the planner level.
+/// in and honors `to_t`, so those cases stay correct. It still requires a scope
+/// of one graph read through a store ([`IndexScope::One`]: the cursor reads
+/// `binary_g_id`'s graph), no `from_t`, and root (or no) policy; History mode
+/// is filtered at the planner level too.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered()
+    matches!(ctx.index_scope(), Some(IndexScope::One(_)))
 }
 
 /// Verdict for a single-predicate cursor fast path under a view policy, returned
@@ -3896,8 +3889,9 @@ pub enum PredicateFastPath {
 ///   uncovered + default-allow).
 /// - [`PredicateFastPath::Empty`] — uncovered + default-deny: emit the empty
 ///   result for this predicate without scanning.
-/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the query is
-///   multi-ledger / historical: take the filtered fallback.
+/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the scope
+///   reads more than one graph ([`ExecutionContext::reads_exactly_one_graph`])
+///   or is historical: take the filtered fallback.
 ///
 /// Only valid for an operator that scans exactly one ground predicate; multi- or
 /// wildcard-predicate fast paths must keep using [`allow_cursor_fast_path`]
@@ -3907,7 +3901,7 @@ pub fn cursor_fast_path_for_predicate(
     ctx: &ExecutionContext<'_>,
     pred_sid: &Sid,
 ) -> PredicateFastPath {
-    if ctx.is_multi_ledger() || ctx.is_history_range() {
+    if !ctx.reads_exactly_one_graph() || ctx.is_history_range() {
         return PredicateFastPath::Decline;
     }
     // No policy or root: nothing to filter, run the fast path unfiltered.

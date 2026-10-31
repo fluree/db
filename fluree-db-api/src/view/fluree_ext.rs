@@ -13,7 +13,7 @@ use crate::{
 use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{
-    ContentId, ContentStore, DictNovelty, GraphSel, IndexType, LedgerRef, TargetLedger,
+    ContentId, ContentStore, DictNovelty, GraphSel, IndexType, LedgerId, LedgerRef, TargetLedger,
     DEFAULT_GRAPH_ID,
 };
 use fluree_db_query::ir::ReasoningModes;
@@ -23,6 +23,40 @@ use tracing::Instrument;
 // ============================================================================
 // View Loading
 // ============================================================================
+
+/// The ledgers one dataset has loaded, by ledger and time.
+///
+/// Every source of a dataset that names a ledger at one time reads one load
+/// of it ([`Fluree::load_graph_db_in_dataset`]), so the graphs a dataset takes from one
+/// ledger share that load's binary index store and dictionary novelty, as the
+/// members of a ledger's union default graph and of a within-ledger `FROM`
+/// dataset do. The index lanes read several graphs as one ledger only when
+/// they share both (`ExecutionContext::index_scope`).
+///
+/// Loading each source on its own gave each graph a store of its own wherever
+/// the ledger cache did not serve the load (a `t` below the head; a
+/// connection built `without_ledger_caching`, as the CLI's is), and could read
+/// one ledger at two `t`s when a commit landed between two loads.
+///
+/// Keyed by the parsed [`LedgerId`], so `ledger` and `ledger:main` are one
+/// ledger here.
+#[derive(Default)]
+pub(crate) struct LedgerLoads {
+    loads: Vec<(LedgerId, Option<TimeSpec>, GraphDb)>,
+}
+
+impl LedgerLoads {
+    fn get(&self, ledger_id: &LedgerId, spec: Option<&TimeSpec>) -> Option<GraphDb> {
+        self.loads
+            .iter()
+            .find(|(id, at, _)| id == ledger_id && at.as_ref() == spec)
+            .map(|(_, _, view)| view.clone())
+    }
+
+    fn insert(&mut self, ledger_id: LedgerId, spec: Option<&TimeSpec>, view: &GraphDb) {
+        self.loads.push((ledger_id, spec.cloned(), view.clone()));
+    }
+}
 
 /// A view of a cached handle's head, with its binary store attached.
 fn graph_db_from_cached_head(snap: LedgerView) -> GraphDb {
@@ -557,6 +591,27 @@ impl Fluree {
         let view = self.load_graph_db_at(address.id(), spec).await?;
         let view = Self::select_graph(view, address.graph())?;
         self.resolve_and_attach_config(view).await
+    }
+
+    /// The view of `ledger_id` at `spec` (head when `None`), loaded once per
+    /// ledger and time for a whole dataset through `loads`: every source of
+    /// the dataset that names that ledger at that time selects its graph from
+    /// this one load.
+    pub(crate) async fn load_graph_db_in_dataset(
+        &self,
+        ledger_id: &LedgerId,
+        spec: Option<&TimeSpec>,
+        loads: &mut LedgerLoads,
+    ) -> Result<GraphDb> {
+        if let Some(view) = loads.get(ledger_id, spec) {
+            return Ok(view);
+        }
+        let view = match spec {
+            None => self.load_graph_db(ledger_id).await?,
+            Some(spec) => self.load_graph_db_at(ledger_id, spec.clone()).await?,
+        };
+        loads.insert(ledger_id.clone(), spec, &view);
+        Ok(view)
     }
 
     /// Like [`db()`](Self::db) but includes the ledger's default context.
