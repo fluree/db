@@ -254,9 +254,9 @@ pub fn typed_value_to_json(value: &TypedValue) -> JsonValue {
         TypedValue::String(s) => JsonValue::from(s.clone()),
         TypedValue::Bytes(b) => JsonValue::from(hex_encode(b)),
         TypedValue::Uuid(bytes) => JsonValue::from(format_uuid(bytes)),
-        TypedValue::Decimal {
-            unscaled, scale, ..
-        } => JsonValue::from(format_decimal(*unscaled, *scale)),
+        TypedValue::Decimal { unscaled, scale } => {
+            JsonValue::from(format_decimal(*unscaled, *scale))
+        }
     }
 }
 
@@ -665,7 +665,6 @@ mod tests {
         assert_eq!(
             typed_value_to_json(&TypedValue::Decimal {
                 unscaled: 12345,
-                precision: 10,
                 scale: 2
             }),
             serde_json::json!("123.45")
@@ -673,7 +672,6 @@ mod tests {
         assert_eq!(
             typed_value_to_json(&TypedValue::Decimal {
                 unscaled: -5,
-                precision: 10,
                 scale: 2
             }),
             serde_json::json!("-0.05")

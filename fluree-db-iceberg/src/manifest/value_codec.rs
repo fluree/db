@@ -30,10 +30,10 @@ pub enum TypedValue {
     Bytes(Vec<u8>),
     /// UUID as 16 bytes
     Uuid([u8; 16]),
-    /// Decimal: (unscaled_value, precision, scale)
+    /// Decimal: `unscaled × 10^-scale`. A value carries no precision; the
+    /// column's declared precision lives on its type (`decimal(p, s)`).
     Decimal {
         unscaled: i128,
-        precision: u8,
         scale: i8,
     },
 }
@@ -302,7 +302,9 @@ pub fn decode_by_type_string(bytes: &[u8], type_str: Option<&str>) -> Result<Typ
             if parts.len() != 2 {
                 return Err(IcebergError::Manifest(format!("Invalid decimal type: {s}")));
             }
-            let precision: u8 = parts[0].trim().parse().map_err(|_| {
+            // The declared precision is validated but not carried: it belongs to
+            // the column's type, not to a bound value.
+            parts[0].trim().parse::<u8>().map_err(|_| {
                 IcebergError::Manifest(format!("Invalid decimal precision: {}", parts[0]))
             })?;
             let scale: i8 = parts[1].trim().parse().map_err(|_| {
@@ -312,11 +314,7 @@ pub fn decode_by_type_string(bytes: &[u8], type_str: Option<&str>) -> Result<Typ
             // Decimal is stored as unscaled big-endian two's complement
             let unscaled = decode_decimal_bytes(bytes)?;
 
-            Ok(TypedValue::Decimal {
-                unscaled,
-                precision,
-                scale,
-            })
+            Ok(TypedValue::Decimal { unscaled, scale })
         }
         _ => Err(IcebergError::Manifest(format!(
             "Unsupported type for bound decoding: {type_str}"
@@ -517,7 +515,6 @@ mod tests {
             result,
             TypedValue::Decimal {
                 unscaled: 12345,
-                precision: 10,
                 scale: 2
             }
         );
@@ -544,7 +541,6 @@ mod tests {
             result,
             TypedValue::Decimal {
                 unscaled: -12345,
-                precision: 10,
                 scale: 2
             }
         );
@@ -624,11 +620,7 @@ mod tests {
     #[test]
     fn test_decimal_partial_cmp() {
         use std::cmp::Ordering;
-        let d = |unscaled, scale| TypedValue::Decimal {
-            unscaled,
-            precision: 18,
-            scale,
-        };
+        let d = |unscaled, scale| TypedValue::Decimal { unscaled, scale };
         // Same scale → compare unscaled directly.
         assert_eq!(d(12345, 2).partial_cmp(&d(999, 2)), Some(Ordering::Greater));
         assert_eq!(d(999, 2).partial_cmp(&d(12345, 2)), Some(Ordering::Less));
@@ -699,11 +691,7 @@ mod tests {
 
     #[test]
     fn decimal_lt_le_cross_scale() {
-        let d = |unscaled, scale| TypedValue::Decimal {
-            unscaled,
-            precision: 38,
-            scale,
-        };
+        let d = |unscaled, scale| TypedValue::Decimal { unscaled, scale };
         // 9.99 (scale 2) vs 9.990 (scale 3) are the SAME value.
         assert_eq!(d(999, 2).lt(&d(9990, 3)), Some(false));
         assert_eq!(d(999, 2).le(&d(9990, 3)), Some(true));

@@ -352,9 +352,6 @@ fn int_pushdown_literal(
         Some("int") => i32::try_from(n).ok().map(LiteralValue::Int32),
         Some(t) if t.starts_with("decimal") && numeric_stats => Some(LiteralValue::Decimal {
             unscaled: i128::from(n),
-            // precision is cosmetic for pruning (`decimal_cmp` ignores it); an i64
-            // is ≤19 digits, so the decimal128 max always covers it.
-            precision: 38,
             scale: 0,
         }),
         _ => Some(LiteralValue::Int64(n)),
@@ -945,14 +942,9 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
         // against the column's scale. Row-group stats prune only when the
         // column is FLBA-encoded (see `prunable_stats`); file-level manifest
         // bounds prune regardless.
-        ScanValue::Decimal {
-            unscaled,
-            precision,
-            scale,
-        } => match field_type {
+        ScanValue::Decimal { unscaled, scale } => match field_type {
             Some(t) if t.starts_with("decimal") => LiteralValue::Decimal {
                 unscaled: *unscaled,
-                precision: *precision,
                 scale: *scale,
             },
             // A decimal literal against an integer column has no exact
@@ -5294,7 +5286,6 @@ mod tests {
             op: ScanCmpOp::Lt,
             value: ScanValue::Decimal {
                 unscaled: 999,
-                precision: 3,
                 scale: 2,
             },
         };

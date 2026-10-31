@@ -1008,10 +1008,12 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     }
 }
 
-/// Decompose a `BigDecimal` into `ScanValue::Decimal { unscaled, precision, scale }`.
+/// Decompose a `BigDecimal` into `ScanValue::Decimal { unscaled, scale }`.
 /// Normalizes first (so `9.99` and `9.990` decompose identically), then reads the
 /// unscaled mantissa and base-10 exponent. Returns `None` if the unscaled value
 /// exceeds i128 or the scale exceeds i8 — those stay with the in-engine FILTER.
+/// Whether the value fits a particular column is the reader's call, made
+/// against that column's own `decimal(p, s)`.
 fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> {
     use num_traits::ToPrimitive;
     // value = unscaled * 10^-scale. Normalize so scale-equivalent forms (9.99 vs
@@ -1019,17 +1021,7 @@ fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> 
     let (unscaled_bi, scale) = bd.normalized().as_bigint_and_exponent();
     let scale = i8::try_from(scale).ok()?;
     let unscaled = unscaled_bi.to_i128()?;
-    // precision is cosmetic for pruning (`decimal_cmp` ignores it); derive it from
-    // the unscaled magnitude so it is self-consistent across scale-equivalent
-    // forms, clamped to the decimal128 max.
-    let precision = u8::try_from(unscaled.unsigned_abs().checked_ilog10().unwrap_or(0) + 1)
-        .unwrap_or(38)
-        .clamp(1, 38);
-    Some(ScanValue::Decimal {
-        unscaled,
-        precision,
-        scale,
-    })
+    Some(ScanValue::Decimal { unscaled, scale })
 }
 
 /// The subject var of a regular-predicate R2RML pattern that can join a
@@ -3061,7 +3053,6 @@ mod tests {
         // cross-scale shape the pruning layer must then compare correctly).
         let want = Some(ScanValue::Decimal {
             unscaled: 999,
-            precision: 3,
             scale: 2,
         });
         assert_eq!(scan_value_from_bigdecimal(&bd("9.99")), want);
@@ -3076,7 +3067,6 @@ mod tests {
             scan_value_from_bigdecimal(&bd("-0.05")),
             Some(ScanValue::Decimal {
                 unscaled: -5,
-                precision: 1,
                 scale: 2,
             })
         );

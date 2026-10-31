@@ -259,16 +259,11 @@ pub fn batch_sort_values(batch: &ColumnBatch, field_id: i32) -> Vec<TypedValue> 
             .flatten()
             .map(|&x| TypedValue::TimestampTz(x))
             .collect(),
-        Column::Decimal {
-            values,
-            precision,
-            scale,
-        } => values
+        Column::Decimal { values, scale, .. } => values
             .iter()
             .flatten()
             .map(|&unscaled| TypedValue::Decimal {
                 unscaled,
-                precision: *precision,
                 scale: *scale,
             })
             .collect(),
