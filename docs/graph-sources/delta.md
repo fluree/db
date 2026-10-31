@@ -74,7 +74,10 @@ Content-Type: application/json
 Optional fields: `branch`, `r2rml_type`, `s3_endpoint`, `s3_path_style`,
 `azure_tenant_id`, `azure_client_id`, `azure_client_secret_env` /
 `azure_client_secret`, the [Unity Catalog](#unity-catalog) fields, `model`,
-`default_allow`. The response reports the stored mapping, the mapped
+`default_allow`, and the [latest-by-key](#materialization) fields
+`delete_column`, `delete_values` (a `null` entry matches a NULL value) and
+`order_by`. `fluree delta map` does not set the latest-by-key fields; send them
+to `/delta/map` directly. The response reports the stored mapping, the mapped
 table names, `table_versions` (the current Delta version of each table that
 opened with every column its maps reference) and `table_warnings` (a table that
 could not be read, or a mapped column it lacks; the source is registered
@@ -485,7 +488,8 @@ A pass applies at most `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` changed rows (by
 default derived from the novelty ceiling; see
 [Configuration](../operations/configuration.md)). It stops at a commit boundary,
 records the last version it applied, and the next pass continues from there. A
-read pinned to a version, and a first whole read, are not bounded.
+read pinned to a version is not bounded, and neither is a whole read: the first
+pass, one with `"force_full": true`, or the fallback below.
 
 When the change feed cannot serve a window, the pass reads the latest version
 whole instead and logs why at `warn`: the feed was off for part of the window,

@@ -210,7 +210,7 @@ When a background server is running, these files are created in the `.fluree/` d
 |------|-------------|
 | `server.pid` | PID of the background server process |
 | `server.log` | stdout + stderr from the background server |
-| `server.meta.json` | Metadata for `restart` and `status` (PID, address, args, start time) |
+| `server.meta.json` | Metadata for `restart` and `status` (PID, address, args, start time, and the storage root the server locks) |
 
 These files are cleaned up automatically by `fluree server stop`.
 

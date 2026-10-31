@@ -204,9 +204,7 @@ See
 fluree query warehouse-orders --at snapshot:5648190075564901028 'SELECT * WHERE { ?s ?p ?o } LIMIT 10'
 ```
 
-Tracked/remote ledgers also support `--at`. The CLI will translate `--at` into the appropriate dataset/time-travel form when forwarding the query to the remote server.
-
-SPARQL note (remote): if your SPARQL already includes `FROM` / `FROM NAMED`, the CLI will **not** rewrite it for `--at`. In that case, encode time travel directly in the `FROM` IRI (e.g., `FROM <myledger:main@t:5>`).
+Tracked/remote ledgers also support `--at`. The CLI sends the query as written to the ledger's route pinned to that time (`/query/{ledger}@t:N`), so a query's own `FROM` / `FROM NAMED` (or `from`) keeps what it names and is read at that time. NDJSON, TSV and CSV output, and a server older than v4.2.2, take the older form instead, which carries the time in an injected `FROM` (SPARQL) or in the body's `from` (JSON-LD); with that form, `--at` is refused for a SPARQL query that has its own `FROM` / `FROM NAMED`, so encode the time in the IRI instead (e.g., `FROM <myledger:main@t:5>`). See [Remote time travel](server-integration.md).
 
 A query whose dataset names another ledger runs on the connection path (`/query`); one that names only the ledger and its graphs runs on the ledger's own route. Against a remote server the CLI cannot read the ledger's graph registry, so text that reads both as a graph IRI and as another ledger's address (`other:main`, `urn:x`) is taken as that ledger and goes to the connection path. To name a graph of the ledger that is spelled that way, name it through the ledger: `FROM <myledger:main#urn:x>`.
 

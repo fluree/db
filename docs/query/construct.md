@@ -283,7 +283,7 @@ A CONSTRUCT template is instantiated once per **solution**, and a WHERE clause
 is a bag — a subject with three `ex:tag` values contributes three solutions,
 not one (SPARQL 1.1 §16.2). Because the result is an RDF graph, identical
 triples built from different solutions collapse into one, so this is usually
-invisible. It becomes visible in exactly two places:
+invisible. It becomes visible in three places:
 
 **Blank nodes in the template mint one blank node per solution.** A template
 blank node (`[ ... ]` or `_:b`) is fresh for every solution, so each solution
@@ -301,6 +301,12 @@ distinct `ex:note` blank nodes — one per solution, not one per gadget. If you
 want one node per subject, make the WHERE clause produce one solution per
 subject (for example, drop the `?s ex:tag ?o` pattern, or move it into a
 subquery with `SELECT DISTINCT ?s`).
+
+**List entries keep their repeats.** A template triple that repeats a WHERE
+pattern reading a list writes the entries it reads as the list, in order, so a
+member the list holds twice is written twice, and a `LIMIT` that keeps one
+solution for a repeated member still writes every entry holding it. This holds
+for the JSON-LD `construct` form too. See [Lists](sparql.md#lists).
 
 **`LIMIT` counts solutions, not output triples.** The slice is applied to the
 solution sequence *before* the template is instantiated, and duplicate triples
@@ -370,8 +376,9 @@ details of each.
   tail `s p o ~ ?r`. Fluree reifies asserted edges only, as every write form does (see
   [Edge annotations](../concepts/edge-annotations.md)), so a result never carries a reifier
   without its triple.
-- A SPARQL datalog rule whose head (the template) annotates an edge or writes into a named
-  graph is rejected: rules infer default-graph triples only.
+- A SPARQL datalog rule whose head (the template) annotates an edge is rejected: rules infer
+  plain triples only. A `GRAPH <iri> { … }` block in the head derives into that named graph
+  (see [Named graphs](datalog-rules.md#named-graphs)).
 
 ## Related Documentation
 
