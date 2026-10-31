@@ -36,7 +36,10 @@ pub struct IcebergMapRequest {
     pub catalog_id: Option<String>,
     /// AWS S3 Tables table-bucket ARN (s3tables mode)
     pub table_bucket_arn: Option<String>,
-    /// R2RML mapping source
+    /// Inline R2RML mapping content (required): a source is queried through
+    /// its mapping, which also names its tables. Optional here only so a
+    /// request without it is refused by [`required_mapping`], in words, rather
+    /// than by the JSON parser.
     pub r2rml: Option<String>,
     /// R2RML mapping media type
     pub r2rml_type: Option<String>,
@@ -107,16 +110,14 @@ pub struct IcebergMapResponse {
     pub table_identifier: String,
     pub catalog_uri: String,
     pub connection_tested: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mapping_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub triples_map_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub table_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub table_names: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mapping_validated: Option<bool>,
+    /// What the registration's table check found; `connection_tested` is
+    /// `true` exactly when its `outcome` is `verified`.
+    pub connection_check: fluree_db_api::ConnectionCheck,
+    pub mapping_source: String,
+    pub triples_map_count: usize,
+    pub table_count: usize,
+    pub table_names: Vec<String>,
+    pub mapping_validated: bool,
     /// Warnings about the `model` reference (policies a virtual source cannot
     /// evaluate).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -169,53 +170,31 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
             req.s3_endpoint.as_deref(),
         )?;
 
+        let mapping = required_mapping(&req)?;
         let fluree = &state.fluree;
         let iceberg_config = build_iceberg_config(&req)?;
 
-        let response = if let Some(ref r2rml_content) = req.r2rml {
-            // R2RML mode — mapping content provided inline
-            let config = fluree_db_api::R2rmlCreateConfig {
-                iceberg: iceberg_config,
-                mapping: fluree_db_api::R2rmlMappingInput::Content(r2rml_content.clone()),
-                mapping_media_type: req.r2rml_type.clone(),
-            };
-
-            let result = fluree
-                .create_r2rml_graph_source(config)
-                .await
-                .map_err(ServerError::Api)?;
-
-            IcebergMapResponse {
-                model_warnings: result.model_warnings,
-                graph_source_id: result.graph_source_id,
-                table_identifier: result.table_identifier,
-                catalog_uri: result.catalog_uri,
-                connection_tested: result.connection_tested,
-                mapping_source: Some(result.mapping_source),
-                triples_map_count: Some(result.triples_map_count),
-                table_count: Some(result.table_count),
-                table_names: Some(result.table_names),
-                mapping_validated: Some(result.mapping_validated),
-            }
-        } else {
-            // Raw Iceberg mode
-            let result = fluree
-                .create_iceberg_graph_source(iceberg_config)
-                .await
-                .map_err(ServerError::Api)?;
-
-            IcebergMapResponse {
-                model_warnings: result.model_warnings,
-                graph_source_id: result.graph_source_id,
-                table_identifier: result.table_identifier,
-                catalog_uri: result.catalog_uri,
-                connection_tested: result.connection_tested,
-                mapping_source: None,
-                triples_map_count: None,
-                table_count: None,
-                table_names: None,
-                mapping_validated: None,
-            }
+        let config = fluree_db_api::R2rmlCreateConfig {
+            iceberg: iceberg_config,
+            mapping: fluree_db_api::R2rmlMappingInput::Content(mapping.to_string()),
+            mapping_media_type: req.r2rml_type.clone(),
+        };
+        let result = fluree
+            .create_r2rml_graph_source(config)
+            .await
+            .map_err(ServerError::Api)?;
+        let response = IcebergMapResponse {
+            model_warnings: result.model_warnings,
+            graph_source_id: result.graph_source_id,
+            table_identifier: result.table_identifier,
+            catalog_uri: result.catalog_uri,
+            connection_tested: result.connection_tested,
+            connection_check: result.connection_check,
+            mapping_source: result.mapping_source,
+            triples_map_count: result.triples_map_count,
+            table_count: result.table_count,
+            table_names: result.table_names,
+            mapping_validated: result.mapping_validated,
         };
 
         tracing::info!(
@@ -678,6 +657,19 @@ fn given_rest_only(fields: &[(&'static str, bool)]) -> Vec<&'static str> {
         .collect()
 }
 
+/// The request's R2RML mapping, which every Iceberg source needs: its queries
+/// are answered from it. A missing or blank one is a 400 that says so.
+fn required_mapping(req: &IcebergMapRequest) -> Result<&str> {
+    req.r2rml
+        .as_deref()
+        .filter(|mapping| !mapping.trim().is_empty())
+        .ok_or_else(|| {
+            ServerError::bad_request(
+                "an R2RML mapping is required: send `r2rml`, the mapping's Turtle content",
+            )
+        })
+}
+
 fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
     build_iceberg_config_allowing(req, &allowed_secret_env())
 }
@@ -715,7 +707,6 @@ fn build_iceberg_config_allowing(
             rest_only: &rest_only,
         },
         req.table.as_deref(),
-        req.r2rml.is_some(),
     )
     .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
 
@@ -1386,7 +1377,8 @@ mod tests {
             "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
             "oauth2_client_secret": "pat",
             "oauth2_scope": "session:role:ICEBERG_READER",
-            "oauth2_audience": "polaris"
+            "oauth2_audience": "polaris",
+            "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
         });
         let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
         assert_eq!(
@@ -1410,6 +1402,7 @@ mod tests {
         let mut body = serde_json::json!({
             "name": "gs", "mode": "rest",
             "catalog_uri": "https://catalog.example.com", "table": "ns.tbl",
+            "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
         });
         body.as_object_mut()
             .unwrap()
@@ -1483,7 +1476,8 @@ mod tests {
             "name": "gs",
             "catalog_uri": "https://catalog.example.com",
             "table": "ns.tbl",
-            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens"
+            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
+            "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
         });
         let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
         let config = build_iceberg_config(&req).unwrap();
@@ -1641,14 +1635,19 @@ mod tests {
         assert!(config.connection.is_glue());
         config.validate().unwrap();
 
-        // Without a mapping it needs one, and says so in the wire spelling.
-        let body = serde_json::json!({ "name": "orders", "mode": "glue" });
-        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
-        let err = build_iceberg_config(&req).unwrap_err().to_string();
-        assert!(
-            err.contains("table is required for glue mode (or provide r2rml"),
-            "{err}"
-        );
+        // A request without a mapping, or with a blank one, is refused in
+        // words: the mapping is what a source's queries are answered from.
+        for body in [
+            serde_json::json!({ "name": "orders", "mode": "glue", "table": "db.t" }),
+            serde_json::json!({ "name": "orders", "mode": "glue", "table": "db.t", "r2rml": "  " }),
+        ] {
+            let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+            let err = required_mapping(&req).unwrap_err().to_string();
+            assert!(
+                err.contains("an R2RML mapping is required: send `r2rml`"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

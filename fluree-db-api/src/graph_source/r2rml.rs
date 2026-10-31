@@ -7,11 +7,11 @@
 
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
-use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateConfig};
+use crate::graph_source::config::R2rmlCreateConfig;
 use crate::graph_source::iceberg_catalog::{
     decide_credential_source, storage_query_error, CredentialSource,
 };
-use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
+use crate::graph_source::result::{ConnectionCheck, R2rmlCreateResult};
 use crate::Result;
 use async_trait::async_trait;
 use fluree_db_core::ContentStore;
@@ -115,24 +115,108 @@ fn require_iceberg_backed(
     Ok(())
 }
 
+/// Refusal for an R2RML mapping that compiles to no `rr:TriplesMap`, naming the
+/// usual cause: the `rr:` prefix without its trailing `#` (or a misspelled
+/// class) parses as other triples, which the loader does not see as maps.
+pub(crate) const EMPTY_MAPPING: &str =
+    "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
+     http://www.w3.org/ns/r2rml# (with the trailing #) and each map is typed rr:TriplesMap";
+
+/// Whether a failed catalog-mode table load carries evidence that the catalog
+/// answered: a refusal (the typed catalog and storage denials), the catalog
+/// saying it has no such table, or any other HTTP status from a REST catalog.
+/// Without such evidence (a refused connection, a DNS or TLS failure, a
+/// timeout, a client error, a Glue or S3 Tables call that failed without a
+/// typed answer) the catalog is taken not to have answered. This keys on the
+/// text `IcebergError::TableNotFound` and the REST client's status message
+/// render with, because both reach registration as an untyped
+/// [`QueryError::Internal`]; `catalog_answer_classification` pins it to the
+/// errors the real conversions produce.
+pub(crate) fn catalog_answered(error: &QueryError) -> bool {
+    match error {
+        QueryError::CatalogAccessDenied { .. }
+        | QueryError::CatalogCredentialsNotVended { .. }
+        | QueryError::StorageAccessDenied { .. } => true,
+        QueryError::Internal(message) => {
+            message.contains(TABLE_NOT_FOUND_TEXT) || message.contains(CATALOG_STATUS_TEXT)
+        }
+        _ => false,
+    }
+}
+
+/// How `IcebergError::TableNotFound` renders: the REST catalog's 404, and Glue
+/// and S3 Tables' not-found codes.
+const TABLE_NOT_FOUND_TEXT: &str = "Table not found: ";
+/// How the REST catalog client renders any other non-success HTTP status.
+const CATALOG_STATUS_TEXT: &str = "Catalog request failed (";
+
+/// How long registration spends loading a new source's tables. A map request
+/// can sit behind a gateway with its own deadline (API Gateway's is 29 s), and a
+/// mapping over a warehouse can name many tables, so past this the source is
+/// registered unverified rather than the request held open.
+pub(crate) const REGISTRATION_PROBE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// The R2RML mapping reference carried by a mapped graph-source record, per
 /// source family. `None` for a non-mapped type, an unparseable config, or a
 /// record registered without a mapping.
 pub(crate) fn mapping_source_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> Option<fluree_db_iceberg::config::MappingSource> {
-    match record.source_type {
+    mapping_reference(record)
+        .and_then(std::result::Result::ok)
+        .flatten()
+}
+
+/// The mapping a live graph-source record answers queries from: `Ok(None)`
+/// for a record of no mapped family that is not refused below, which no
+/// R2RML probe serves.
+///
+/// A mapped record without a mapping (an Iceberg source stored before
+/// registration required one) is [`QueryError::GraphSourceUnmapped`], one of a
+/// family this build does not read (SQL without `sql`, Delta without `delta`)
+/// is [`QueryError::GraphSourceUnsupported`], an index source (BM25, vector,
+/// geo) is [`QueryError::GraphSourceNotAGraph`], and one whose config does not
+/// parse is an internal error. Read as `None`, any of them would send its query
+/// to the ledger lookup or to an empty genesis graph. The R2RML probe and the
+/// genesis-view resolver both decide here.
+pub(crate) fn served_mapping_of(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> QueryResult<Option<fluree_db_iceberg::config::MappingSource>> {
+    super::refuse_unservable(record)?;
+    let graph_source_id = record.graph_source_id.as_str();
+    match mapping_reference(record) {
+        None => Ok(None),
+        Some(Ok(Some(mapping))) => Ok(Some(mapping)),
+        Some(Ok(None)) => Err(QueryError::GraphSourceUnmapped {
+            graph_source_id: graph_source_id.to_string(),
+            empty_mapping: false,
+        }),
+        Some(Err(e)) => Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' has a config that cannot be read: {e}"
+        ))),
+    }
+}
+
+/// The mapping reference of a mapped record, per source family, keeping a
+/// config that does not parse (`Some(Err)`) apart from one with no mapping
+/// (`Some(Ok(None))`). `None` when the record is not a mapped family this
+/// build reads.
+fn mapping_reference(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> Option<std::result::Result<Option<fluree_db_iceberg::config::MappingSource>, String>> {
+    Some(match record.source_type {
         GraphSourceType::R2rml | GraphSourceType::Iceberg => {
             IcebergGsConfig::from_json(&record.config)
-                .ok()
-                .and_then(|c| c.mapping)
+                .map(|c| c.mapping)
+                .map_err(|e| e.to_string())
         }
         #[cfg(feature = "sql")]
         GraphSourceType::Sql => super::sql::mapping_source(record),
         #[cfg(feature = "delta")]
         GraphSourceType::Delta => super::delta::mapping_source(record),
-        _ => None,
-    }
+        _ => return None,
+    })
 }
 
 /// The policy configuration a virtual source's record carries: its model
@@ -1018,74 +1102,6 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
 // =============================================================================
 
 impl crate::Fluree {
-    /// Create an Iceberg graph source.
-    ///
-    /// This operation:
-    /// 1. Validates the configuration
-    /// 2. Optionally tests the catalog connection
-    /// 3. Publishes the graph source record to the nameservice
-    pub async fn create_iceberg_graph_source(
-        &self,
-        config: IcebergCreateConfig,
-    ) -> Result<IcebergCreateResult> {
-        let graph_source_id = config.graph_source_id();
-        info!(
-            graph_source_id = %graph_source_id,
-            catalog = %config.catalog_uri_or_location(),
-            table = %config.table_identifier_display(),
-            "Creating Iceberg graph source"
-        );
-
-        // 1. Validate configuration
-        config.validate()?;
-        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
-
-        // 2. Test catalog connection (REST mode only — Direct mode verified at query time)
-        let connection_tested = if config.is_rest() {
-            let ok = self.test_iceberg_connection(&config).await.is_ok();
-            if !ok {
-                warn!(
-                    graph_source_id = %graph_source_id,
-                    "Could not verify catalog connection - graph source will be created but may fail at query time"
-                );
-            }
-            ok
-        } else {
-            false
-        };
-
-        // 3. Convert config to storage format
-        let iceberg_config = config.to_iceberg_gs_config();
-        let config_json = iceberg_config
-            .to_json()
-            .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
-
-        // 4. Publish graph source record to nameservice
-        self.publisher()?
-            .publish_graph_source(
-                &config.name,
-                config.effective_branch(),
-                GraphSourceType::Iceberg,
-                &config_json,
-                &[], // No ledger dependencies for Iceberg graph sources
-            )
-            .await?;
-
-        info!(
-            graph_source_id = %graph_source_id,
-            connection_tested = connection_tested,
-            "Created Iceberg graph source"
-        );
-
-        Ok(IcebergCreateResult {
-            model_warnings,
-            graph_source_id,
-            table_identifier: config.table_identifier_display(),
-            catalog_uri: config.catalog_uri_or_location().to_string(),
-            connection_tested,
-        })
-    }
-
     /// Create an R2RML graph source (Iceberg table with R2RML mapping).
     ///
     /// For `R2rmlMappingInput::Content`, validates the mapping content and
@@ -1115,13 +1131,6 @@ impl crate::Fluree {
         let mapping_address = registered.address;
         let table_count = table_names.len();
 
-        // Test catalog connection (REST mode only)
-        let connection_tested = if config.iceberg.is_rest() {
-            self.test_iceberg_connection(&config.iceberg).await.is_ok()
-        } else {
-            false
-        };
-
         // Store config with CAS mapping address
         let iceberg_config = config.to_iceberg_gs_config(&mapping_address);
         let config_json = iceberg_config
@@ -1138,7 +1147,12 @@ impl crate::Fluree {
             )
             .await?;
 
-        info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created R2RML graph source");
+        let connection_check = self
+            .probe_tables(&graph_source_id, &table_names, config.iceberg.is_direct())
+            .await;
+        let connection_tested = connection_check.is_verified();
+
+        info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
 
         Ok(R2rmlCreateResult {
             model_warnings,
@@ -1150,74 +1164,148 @@ impl crate::Fluree {
             table_count,
             table_names,
             connection_tested,
+            connection_check,
             mapping_validated,
         })
     }
 
-    /// Test connection to an Iceberg REST catalog.
-    ///
-    /// Only applicable to REST mode. Direct mode has no catalog to test.
-    async fn test_iceberg_connection(&self, config: &IcebergCreateConfig) -> Result<()> {
-        use fluree_db_iceberg::catalog::parse_table_identifier;
-
-        let rest = match &config.connection.catalog_mode {
-            CatalogMode::Rest(rest) => rest,
-            CatalogMode::Direct { .. } => {
-                return Err(crate::ApiError::Config(
-                    "Connection test is not supported for Direct catalog mode".to_string(),
-                ));
+    /// Load each table a just-published source reads, the way its queries do,
+    /// within [`REGISTRATION_PROBE_BUDGET`]. A failure or an expired budget is
+    /// logged and returned as the outcome, never as an error, so it cannot fail
+    /// registration.
+    async fn probe_tables(
+        &self,
+        graph_source_id: &str,
+        table_names: &[String],
+        direct: bool,
+    ) -> ConnectionCheck {
+        let check = self
+            .probe_tables_within(
+                graph_source_id,
+                table_names,
+                direct,
+                REGISTRATION_PROBE_BUDGET,
+            )
+            .await;
+        match &check {
+            ConnectionCheck::Verified => {}
+            ConnectionCheck::NoTables => {
+                debug!(
+                    graph_source_id = %graph_source_id,
+                    "No mapped table to load: the mapping could not be read"
+                );
             }
-            // Only REST sources are connection-tested at create time (the callers
-            // gate on `is_rest()`); a Glue / S3 Tables table is resolved, and any
-            // catalog error surfaces, at query time.
-            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
-                return Err(crate::ApiError::Config(
-                    "Connection test is not supported for AWS Glue / S3 Tables catalog mode"
-                        .to_string(),
-                ));
+            ConnectionCheck::ClientFailed { error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    error = %error,
+                    "Could not build the catalog client - graph source was created but may fail at query time"
+                );
             }
+            ConnectionCheck::TableFailed { table, error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    table = %table,
+                    error = %error,
+                    "Could not load a mapped table - graph source was created but may fail at query time"
+                );
+            }
+            ConnectionCheck::CatalogUnreachable { table, error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    table = %table,
+                    error = %error,
+                    "The catalog did not answer for a mapped table - graph source was created but may fail at query time"
+                );
+            }
+            ConnectionCheck::TimedOut {
+                loaded,
+                total,
+                budget_secs,
+            } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    loaded,
+                    total,
+                    budget_secs,
+                    "Loading the mapped tables ran past the registration budget ({loaded} of {total} loaded) - graph source was created but is not verified"
+                );
+            }
+        }
+        check
+    }
+
+    /// Load each named table the way its queries do (`load_table_context`):
+    /// through the catalog's `loadTable` for REST, AWS Glue and S3 Tables, and
+    /// by resolving the table's current metadata at its location for Direct (a
+    /// warehouse root's per-table directory, the local-root guard, version-hint
+    /// or metadata listing). Table metadata only, never a manifest or data
+    /// file; the first failure ends it, and so does `budget`. A catalog-mode
+    /// (`!direct`) table failure with no sign of a catalog answer is
+    /// [`ConnectionCheck::CatalogUnreachable`] ([`catalog_answered`]).
+    pub(crate) async fn probe_tables_within(
+        &self,
+        graph_source_id: &str,
+        table_names: &[String],
+        direct: bool,
+        budget: std::time::Duration,
+    ) -> ConnectionCheck {
+        use futures::TryStreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        /// Catalog round trips in flight at once: a mapping over a warehouse
+        /// can name dozens of tables, each its own `loadTable`.
+        const CONCURRENT_LOADS: usize = 8;
+
+        // A mapping that could not be read names no tables, and nothing else
+        // names one: a catalog source's own `table` is the placeholder that
+        // only satisfies the identifier shape, never a table to load.
+        if table_names.is_empty() {
+            return ConnectionCheck::NoTables;
+        }
+        let provider = FlureeR2rmlProvider::new(self);
+        let loaded = AtomicUsize::new(0);
+        let probe = async {
+            // One catalog client for every load below. The client cache does
+            // not coalesce concurrent misses, and each build hydrates the
+            // auth's secrets, so loads that each found it cold would build
+            // one apiece.
+            provider
+                .warm_catalog_client(graph_source_id)
+                .await
+                .map_err(|error| ConnectionCheck::ClientFailed {
+                    error: error.to_string(),
+                })?;
+            futures::stream::iter(table_names.iter().map(Ok))
+                .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
+                    let (provider, loaded) = (&provider, &loaded);
+                    async move {
+                        provider
+                            .load_table_context(graph_source_id, table)
+                            .await
+                            .map_err(|error| {
+                                let (table, answered) = (table.clone(), catalog_answered(&error));
+                                let error = error.to_string();
+                                if direct || answered {
+                                    ConnectionCheck::TableFailed { table, error }
+                                } else {
+                                    ConnectionCheck::CatalogUnreachable { table, error }
+                                }
+                            })?;
+                        loaded.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                })
+                .await
         };
-
-        // Hydrate any SecretRef auth BEFORE building the provider — this is the
-        // connection-test gate, so a secret reference with no resolver (or a
-        // Denied resolution) must error HERE, actionably, before any network call.
-        let hydrated_auth = rest
-            .auth
-            .hydrate(self.secret_resolver())
-            .await
-            .map_err(|e| {
-                crate::ApiError::Config(format!("Failed to resolve catalog auth secret: {e}"))
-            })?;
-
-        // Create auth provider
-        let auth = hydrated_auth
-            .create_provider_arc()
-            .map_err(|e| crate::ApiError::Config(format!("Failed to create auth provider: {e}")))?;
-
-        // Create catalog client
-        let catalog_config = RestCatalogConfig {
-            uri: rest.catalog_uri.clone(),
-            warehouse: rest.warehouse.clone(),
-            ..Default::default()
-        };
-
-        let catalog = RestCatalogClient::new(catalog_config, auth).map_err(|e| {
-            crate::ApiError::Config(format!("Failed to create catalog client: {e}"))
-        })?;
-
-        // Parse table identifier
-        let table_id = parse_table_identifier(&config.table_identifier)
-            .map_err(|e| crate::ApiError::Config(format!("Invalid table identifier: {e}")))?;
-
-        // Attempt to load table metadata (this tests the connection)
-        catalog
-            .load_table(&table_id, config.connection.io.vended_credentials)
-            .await
-            .map_err(|e| {
-                crate::ApiError::Config(format!("Failed to load table from catalog: {e}"))
-            })?;
-
-        Ok(())
+        match tokio::time::timeout(budget, probe).await {
+            Ok(Ok(())) => ConnectionCheck::Verified,
+            Ok(Err(failed)) => failed,
+            Err(_elapsed) => ConnectionCheck::TimedOut {
+                loaded: loaded.load(Ordering::Relaxed),
+                total: table_names.len(),
+                budget_secs: budget.as_secs(),
+            },
+        }
     }
 
     /// Resolve a registration's mapping input to the address the record stores.
@@ -1236,6 +1324,10 @@ impl crate::Fluree {
     ) -> Result<RegisteredMapping> {
         use crate::graph_source::config::R2rmlMappingInput;
         let check = |compiled: &CompiledR2rmlMapping| {
+            // Every query of such a source would answer no rows.
+            if compiled.is_empty() {
+                return Err(crate::ApiError::Config(EMPTY_MAPPING.to_string()));
+            }
             if allow_sql_queries {
                 Ok(())
             } else {
@@ -2520,7 +2612,9 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     /// parse as a graph-source id names no source, so it is `false` without a
     /// lookup. A failed lookup of a well-formed id fails the query: reading it
     /// as "no mapping" would query an R2RML / Iceberg / SQL source as an empty
-    /// native graph whenever the nameservice is unavailable.
+    /// native graph whenever the nameservice is unavailable. A source no query
+    /// can read as a graph (a mapped one with no mapping, an index) fails it
+    /// for the same reason ([`served_mapping_of`]).
     async fn has_r2rml_mapping(&self, graph_source_id: &str) -> QueryResult<bool> {
         let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
             return Ok(false);
@@ -2531,8 +2625,11 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .lookup_graph_source(&id)
             .await
             .map_err(|e| QueryError::Nameservice(e.to_string()))?;
-        // A drop leaves the record as a tombstone.
-        Ok(record.is_some_and(|r| !r.retracted && mapping_source_of(&r).is_some()))
+        match record {
+            // A drop leaves the record as a tombstone.
+            Some(record) if !record.retracted => Ok(served_mapping_of(&record)?.is_some()),
+            _ => Ok(false),
+        }
     }
 
     /// Get the compiled R2RML mapping for a graph source.
@@ -2567,9 +2664,10 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             )));
         }
 
-        let mapping_config = mapping_source_of(&record).ok_or_else(|| {
+        let mapping_config = served_mapping_of(&record)?.ok_or_else(|| {
             QueryError::InvalidQuery(format!(
-                "Graph source '{graph_source_id}' is missing 'mapping' in config"
+                "Graph source '{}' is not an R2RML graph source (type: {:?})",
+                graph_source_id, record.source_type
             ))
         })?;
         let mapping_config = &mapping_config;
@@ -2653,6 +2751,14 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             }
         };
 
+        // A mapping that defines nothing has nothing to answer from; a source
+        // registered before registration refused one keeps it.
+        if compiled.is_empty() {
+            return Err(QueryError::GraphSourceUnmapped {
+                graph_source_id: graph_source_id.to_string(),
+                empty_mapping: true,
+            });
+        }
         let compiled = Arc::new(compiled);
 
         // Cache the compiled mapping
@@ -2949,10 +3055,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 /// `create_provider_arc`: that resolves `ConfigValue`s SYNCHRONOUSLY, so a `SecretRef`
 /// reaching it un-hydrated hard-errors via `resolve()`'s fail-closed arm. Pairing the
 /// two here means a NEW client-construction site cannot silently ship without
-/// hydration — which is exactly how the pointer rung's copy arrived. (The one
-/// deliberate exception is `test_iceberg_connection`, which is `ApiError`-typed and
-/// hydrates inline so a missing/denied resolver surfaces as an actionable *config*
-/// error at the connection-test gate rather than a query error.)
+/// hydration — which is exactly how the pointer rung's copy arrived.
 ///
 /// ⚠️ ORDERING: the caller MUST already have computed its `catalog_client_cache_key`
 /// fingerprint over the RAW, reference-bearing config BEFORE calling this. Hydrating
@@ -3517,6 +3620,36 @@ impl FlureeR2rmlProvider<'_> {
                 }
             };
         Ok(format!("{root}/{matched}"))
+    }
+
+    /// Build (or find cached) the shared catalog client a source's table loads
+    /// use, so loads issued together share one. A Direct source has none.
+    async fn warm_catalog_client(&self, graph_source_id: &str) -> QueryResult<()> {
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
+            .ok_or_else(|| {
+                QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
+            })?;
+        require_iceberg_backed(&record, graph_source_id)?;
+        let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
+            QueryError::Internal(format!(
+                "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+        shared_catalog_client(
+            self.fluree,
+            graph_source_id,
+            &record.config,
+            &iceberg_config,
+        )
+        .await
+        .map(drop)
     }
 
     async fn load_table_context(
@@ -4822,6 +4955,52 @@ fn listing_is_single_table(listing: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed table load counts as answered by the catalog only with
+    /// evidence of an answer, as the real conversions render it: not-found,
+    /// any other REST status, and the typed refusals. A connection-level
+    /// failure (refused, DNS, TLS, timeout) and an untyped AWS failure are
+    /// not.
+    #[test]
+    fn catalog_answer_classification() {
+        use fluree_db_iceberg::IcebergError as E;
+        let via = |e: E| storage_query_error("Failed to load table from catalog", e);
+        let answered = [
+            via(E::TableNotFound(
+                "Resource not found at v1/ns/tables/t: {}".into(),
+            )),
+            via(E::TableNotFound(
+                "Glue table ns.t not found: EntityNotFoundException".into(),
+            )),
+            via(E::Catalog(
+                "Catalog request failed (500 Internal Server Error): boom".into(),
+            )),
+            via(E::CatalogAccessDenied {
+                table: "ns.t".into(),
+                message: "Catalog request failed (403 Forbidden): no".into(),
+            }),
+            via(E::CatalogCredentialsNotVended {
+                catalog_uri: "https://c".into(),
+            }),
+        ];
+        for error in &answered {
+            assert!(catalog_answered(error), "answered: {error}");
+        }
+        let unanswered = [
+            via(E::Http(
+                "Connection error: error sending request: connection refused".into(),
+            )),
+            via(E::Http("Request timeout: operation timed out".into())),
+            via(E::Http("HTTP error: invalid peer certificate".into())),
+            via(E::Catalog(
+                "GetTable on Glue table ns.t failed: dispatch failure".into(),
+            )),
+            QueryError::Nameservice("down".into()),
+        ];
+        for error in &unanswered {
+            assert!(!catalog_answered(error), "not answered: {error}");
+        }
+    }
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
@@ -5803,6 +5982,97 @@ mod tests {
             "fallback path must perform exactly one storage read"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The registration probe stops at its budget, reporting how far it got,
+    /// rather than holding the map request open; given room, the same catalog
+    /// answers and the table loads, so the budget is what stopped it.
+    #[tokio::test]
+    async fn the_registration_probe_stops_at_its_budget() {
+        use std::time::{Duration, Instant};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let metadata_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/iceberg/silver/people/metadata");
+        let current = std::fs::read_dir(&metadata_dir)
+            .expect("people metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .max()
+            .expect("a metadata file");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/silver/tables/people"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(600))
+                    .set_body_json(json!({
+                        "metadata-location": format!("file://{}", current.display()),
+                        "metadata": metadata,
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let config = R2rmlCreateConfig::new("slow-catalog", server.uri(), "silver.people", "")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .to_iceberg_gs_config("unused-mapping-address")
+            .to_json()
+            .expect("serialize");
+        fluree
+            .publisher()
+            .unwrap()
+            .publish_graph_source(
+                "slow-catalog",
+                "main",
+                GraphSourceType::Iceberg,
+                &config,
+                &[],
+            )
+            .await
+            .unwrap();
+        let tables = vec!["silver.people".to_string()];
+
+        let started = Instant::now();
+        let probe = fluree
+            .probe_tables_within(
+                "slow-catalog:main",
+                &tables,
+                false,
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(
+            matches!(
+                probe,
+                ConnectionCheck::TimedOut {
+                    loaded: 0,
+                    total: 1,
+                    ..
+                }
+            ),
+            "{probe:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the probe returned at its budget, not at the catalog's answer: {:?}",
+            started.elapsed()
+        );
+
+        let probe = fluree
+            .probe_tables_within("slow-catalog:main", &tables, false, Duration::from_secs(10))
+            .await;
+        assert!(matches!(probe, ConnectionCheck::Verified), "{probe:?}");
     }
 
     // ── ORDERING-TRAP GUARD: catalog_client_cache_key must fingerprint the RAW,

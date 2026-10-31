@@ -134,9 +134,9 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
   }'
 ```
 
-For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. With `r2rml`, `table` may be omitted in `glue` and `s3tables` modes, as in `rest`: each `rr:tableName` names a table.
+For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. `table` may be omitted in every mode: each `rr:tableName` in the `r2rml` mapping names a table.
 
-Without `r2rml` the source is registered as a plain Iceberg source with no mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+`r2rml` is required: a source's queries are answered from its mapping, so a request without one is a 400 and registers nothing. A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused the same way. A source that answers every query with `409` `err:db/GraphSourceUnmapped` predates that check; see [Unmapped Sources](#unmapped-sources). An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
 
@@ -211,7 +211,7 @@ fluree.create_r2rml_graph_source(config).await?;
 
 Iceberg graph sources are persisted as an `IcebergGsConfig` JSON document in the nameservice record’s `config` field.
 
-Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Optional top-level fields not shown below: `mapping` (the stored R2RML address and media type), `delete` and `order_by` (materialization conventions), and `model` (the governing model ledger, see [Access policy](#access-policy)).
+Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Top-level fields not shown below: `mapping` (the stored R2RML address and media type, which registration always writes; a record without one cannot be queried), and the optional `delete` and `order_by` (materialization conventions) and `model` (the governing model ledger, see [Access policy](#access-policy)).
 
 **REST catalog config:**
 
@@ -1238,7 +1238,7 @@ triples map a scan skipped because its predicates were hidden.
 
 ### Connection Issues
 
-**AWS Glue / S3 Tables.** `fluree iceberg map` tests the connection for REST catalogs only; for these modes it reports `Connection: not tested`, and catalog errors first surface on the first query. To check a connection before querying, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
+**AWS Glue / S3 Tables.** `fluree iceberg map` loads each mapped table through the Glue or S3 Tables catalog, as a query will, and reports `Connection: not verified` when one cannot be loaded; the source is still registered. To check that the credentials can also read the table's storage, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
 
 | Error | Cause |
 |---|---|
@@ -1272,6 +1272,10 @@ Mapping a source compiles the R2RML mapping (a mapping that does not parse or co
 Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
 
 At query time a column the table does not have is read like a NULL: the triples it would supply are not produced, and a row whose subject template names it produces no subject, so the query returns fewer results instead of failing. Only when none of the columns a scan needs exist does the query fail, with HTTP `400` `err:db/InvalidQuery`: `None of the projected columns [...] exist in table schema. Available: [...]`.
+
+### Unmapped Sources
+
+Every query that names a source answers `409` with `err:db/GraphSourceUnmapped` when the source has no R2RML mapping, or one that defines no `rr:TriplesMap`. Registration refuses both, so such a source was registered before it did. Map it again under the same name, with a mapping that defines one, to replace it. See [409 Conflict](../api/errors.md#409-conflict).
 
 ### Slow Queries
 

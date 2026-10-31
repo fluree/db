@@ -2089,50 +2089,6 @@ fn test_r2rml_graph_source_config_serialization() {
     assert_eq!(mapping.media_type, Some("text/turtle".to_string()));
 }
 
-/// Integration test: Create Iceberg graph source via Fluree API.
-///
-/// This tests the full graph source creation flow with an in-memory nameservice.
-/// The catalog connection test will fail (no real Polaris) but the
-/// graph source record should still be created.
-#[tokio::test]
-async fn integration_create_iceberg_graph_source() {
-    let fluree = FlureeBuilder::memory().build_memory();
-
-    let config =
-        IcebergCreateConfig::new("test-iceberg-gs", "https://polaris.example.com", "ns.table");
-
-    // Create the graph source - connection test will fail but it should be registered
-    let result = fluree.create_iceberg_graph_source(config).await;
-
-    // Should succeed (connection_tested will be false due to no real catalog)
-    assert!(
-        result.is_ok(),
-        "Graph source creation should succeed: {:?}",
-        result.err()
-    );
-
-    let create_result = result.unwrap();
-    assert_eq!(create_result.graph_source_id, "test-iceberg-gs:main");
-    assert!(
-        !create_result.connection_tested,
-        "Connection test should fail without real catalog"
-    );
-
-    // Verify graph source is registered in nameservice
-    let gs_record = fluree
-        .nameservice()
-        .lookup_graph_source("test-iceberg-gs:main")
-        .await;
-    assert!(gs_record.is_ok(), "Nameservice lookup should succeed");
-    let record = gs_record.unwrap();
-    assert!(record.is_some(), "Graph source record should exist");
-    let record = record.unwrap();
-    assert_eq!(
-        record.source_type,
-        fluree_db_nameservice::GraphSourceType::Iceberg
-    );
-}
-
 /// Integration test: Create R2RML graph source with mapping validation.
 ///
 /// This test stores a real mapping file and validates the creation flow.
@@ -2185,6 +2141,10 @@ async fn integration_create_r2rml_graph_source_with_mapping() {
 
     // The config JSON should contain the mapping
     let record = gs_record.unwrap();
+    assert_eq!(
+        record.source_type,
+        fluree_db_nameservice::GraphSourceType::Iceberg
+    );
     let config_json: serde_json::Value = serde_json::from_str(&record.config).unwrap();
     assert!(
         config_json.get("mapping").is_some(),

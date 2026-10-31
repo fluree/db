@@ -371,7 +371,9 @@ impl VectorCreateConfig {
 // Iceberg Configuration
 // =============================================================================
 
-/// Configuration for creating an Iceberg graph source.
+/// The Iceberg half of an Iceberg graph source's configuration: the table and
+/// how to reach it. A source is registered from an [`R2rmlCreateConfig`], which
+/// pairs this with the R2RML mapping its queries are answered from.
 ///
 /// Iceberg graph sources provide access to Apache Iceberg tables stored in data lakes
 /// (S3, GCS, etc.) via REST catalogs like Apache Polaris.
@@ -379,9 +381,9 @@ impl VectorCreateConfig {
 /// # Example
 ///
 /// ```ignore
-/// use fluree_db_api::IcebergCreateConfig;
+/// use fluree_db_api::{IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput};
 ///
-/// let config = IcebergCreateConfig::new(
+/// let iceberg = IcebergCreateConfig::new(
 ///     "openflights-gs",
 ///     "https://polaris.example.com",
 ///     "openflights.airlines",
@@ -389,7 +391,12 @@ impl VectorCreateConfig {
 /// .with_auth_bearer("my-token")
 /// .with_warehouse("my-warehouse");
 ///
-/// let result = fluree.create_iceberg_graph_source(config).await?;
+/// let config = R2rmlCreateConfig {
+///     iceberg,
+///     mapping: R2rmlMappingInput::Content(mapping_ttl),
+///     mapping_media_type: None,
+/// };
+/// let result = fluree.create_r2rml_graph_source(config).await?;
 /// ```
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone)]
@@ -535,8 +542,6 @@ pub enum CatalogModeError {
         mode: &'static str,
         field: &'static str,
     },
-    /// A catalog mode with no R2RML mapping needs the source's own `table`.
-    MissingTable { mode: &'static str },
     /// `field` is a REST catalog setting, which this mode would ignore.
     NotForMode {
         mode: &'static str,
@@ -555,11 +560,6 @@ impl CatalogModeError {
             CatalogModeError::MissingField { mode, field } => {
                 format!("{} is required for {mode} mode", spell(field))
             }
-            CatalogModeError::MissingTable { mode } => format!(
-                "{} is required for {mode} mode (or provide {} to define tables via mapping)",
-                spell("table"),
-                spell("r2rml")
-            ),
             CatalogModeError::NotForMode { mode, field } => format!(
                 "{} applies to rest mode only; {mode} mode would ignore it",
                 spell(field)
@@ -1007,31 +1007,25 @@ impl IcebergCreateConfig {
 
     /// Parse a catalog mode, its fields, and the source's own `table` into a
     /// create config — the one dispatch every surface goes through (see
-    /// [`CatalogModeArgs`]). A catalog mode (rest, glue, s3tables) needs `table`
-    /// unless the source's tables come from an R2RML mapping (`has_mapping`), in
-    /// which case each `rr:tableName` names its table; Direct ignores `table`.
+    /// [`CatalogModeArgs`]). The source's tables come from its R2RML mapping,
+    /// each `rr:tableName` naming one, so a catalog mode (rest, glue, s3tables)
+    /// needs no `table`; registration's table check loads the mapped tables,
+    /// never this one. Direct ignores `table`.
     pub fn from_mode(
         name: impl Into<String>,
         args: CatalogModeArgs<'_>,
         table: Option<&str>,
-        has_mapping: bool,
     ) -> std::result::Result<Self, CatalogModeError> {
         let connection = IcebergConnectionConfig::from_mode(args)?;
-        let mode = match &connection.catalog_mode {
-            CatalogMode::Direct { .. } => {
-                return Ok(Self::from_connection(name, connection, String::new()));
-            }
-            CatalogMode::Rest(_) => "rest",
-            CatalogMode::Glue { .. } => "glue",
-            CatalogMode::S3Tables { .. } => "s3tables",
-        };
-        let table = match table.map(str::trim).filter(|t| !t.is_empty()) {
-            Some(table) => table,
-            // A mapping-defined source has no table of its own; the placeholder
-            // only satisfies the identifier shape and is never loaded.
-            None if has_mapping => fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
-            None => return Err(CatalogModeError::MissingTable { mode }),
-        };
+        if connection.is_direct() {
+            return Ok(Self::from_connection(name, connection, String::new()));
+        }
+        // A mapping-defined source has no table of its own; the placeholder
+        // only satisfies the identifier shape and is never loaded.
+        let table = table
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(fluree_db_iceberg::config::MAPPING_DEFINED_TABLE);
         Ok(Self::from_connection(name, connection, table))
     }
 
@@ -2135,23 +2129,19 @@ mod tests {
 
     #[cfg(feature = "iceberg")]
     #[test]
-    fn create_from_mode_needs_a_table_unless_a_mapping_defines_them() {
+    fn create_from_mode_takes_its_tables_from_the_mapping() {
         let glue = || mode_args("glue");
         // A mapping-defined source has no table of its own (each rr:tableName is
         // one), for glue and s3tables exactly as for rest.
-        let mapped = IcebergCreateConfig::from_mode("gs", glue(), None, true).unwrap();
-        assert_eq!(
-            mapped.table_identifier,
-            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE
-        );
-        let named =
-            IcebergCreateConfig::from_mode("gs", glue(), Some("sales.orders"), true).unwrap();
+        for table in [None, Some(" ")] {
+            let mapped = IcebergCreateConfig::from_mode("gs", glue(), table).unwrap();
+            assert_eq!(
+                mapped.table_identifier,
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE
+            );
+        }
+        let named = IcebergCreateConfig::from_mode("gs", glue(), Some("sales.orders")).unwrap();
         assert_eq!(named.table_identifier, "sales.orders");
-        let err = IcebergCreateConfig::from_mode("gs", glue(), Some(" "), false).unwrap_err();
-        assert_eq!(
-            err.message(str::to_string),
-            "table is required for glue mode (or provide r2rml to define tables via mapping)"
-        );
         // Direct takes its table from the location.
         let direct = IcebergCreateConfig::from_mode(
             "gs",
@@ -2160,7 +2150,6 @@ mod tests {
                 ..mode_args("direct")
             },
             Some("ignored.table"),
-            false,
         )
         .unwrap();
         assert_eq!(direct.table_identifier, "");

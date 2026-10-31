@@ -5,6 +5,8 @@ mod cypher_http_integration;
 mod delta_http_integration;
 #[path = "graph_source_format_gating.rs"]
 mod graph_source_format_gating;
+#[path = "graph_source_unmapped.rs"]
+mod graph_source_unmapped;
 #[path = "ledger_route_config_defaults.rs"]
 mod ledger_route_config_defaults;
 #[path = "ledger_route_from_object.rs"]

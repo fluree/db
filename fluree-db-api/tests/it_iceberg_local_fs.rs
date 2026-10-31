@@ -684,8 +684,9 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         .await;
     expect_refused(result, "pinned + latest", "two different states");
 
-    // A graph source that is not an Iceberg-backed table (here a BM25 index)
-    // reads its current state only: a pin on it is refused, not ignored.
+    // A BM25 index is not a graph: named as the dataset, pinned or not, it is
+    // refused as one (a pin on a SQL source, which is one, is refused in
+    // it_sql_graph_source).
     let ledger = fluree.create_ledger("bm25-src").await.expect("ledger");
     fluree
         .insert(
@@ -720,7 +721,7 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         expect_refused(
             result,
             &format!("bm25 @{suffix}"),
-            "does not support time-pinned reads",
+            "is a BM25 index, not a graph",
         );
     }
 
@@ -1605,6 +1606,964 @@ async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
             is_top(&rows_out[0][0]),
             offset == 0,
             "JSON-LD OFFSET {offset}: {result}"
+        );
+    }
+}
+
+/// Store an Iceberg graph-source record with no R2RML mapping, as registration
+/// once allowed: no surface can register one now, but records stored then
+/// remain. Its location is a real table, so only the missing mapping can be
+/// why a query of it fails.
+async fn publish_unmapped_source(fluree: &fluree_db_api::Fluree, name: &str) -> String {
+    let config = fluree_db_api::IcebergCreateConfig::new_direct(name, table_location())
+        .to_iceberg_gs_config()
+        .to_json()
+        .expect("serialize config");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_graph_source(
+            name,
+            "main",
+            fluree_db_nameservice::GraphSourceType::Iceberg,
+            &config,
+            &[],
+        )
+        .await
+        .expect("publish unmapped record");
+    format!("{name}:main")
+}
+
+/// The refusal every route gives a query that names a graph source with no
+/// mapping: the typed code and status, naming the source and the cause.
+fn assert_unmapped<T: std::fmt::Debug>(result: Result<T, ApiError>, gs: &str, route: &str) {
+    let err = match result {
+        Ok(answer) => panic!("{route}: answered instead of refusing: {answer:?}"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.error_type(),
+        "err:db/GraphSourceUnmapped",
+        "{route}: {err}"
+    );
+    assert_eq!(err.status_code(), 409, "{route}: {err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("graph source '{gs}' has no R2RML mapping")),
+        "{route}: {message}"
+    );
+    assert!(!message.contains("not found"), "{route}: {message}");
+}
+
+const NAME_SPARQL: &str = "SELECT ?name WHERE { ?s <http://example.org/name> ?name }";
+
+fn name_jsonld() -> serde_json::Value {
+    serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    })
+}
+
+/// A graph source with no mapping queried as the target itself refuses with
+/// its cause. Read as "not a mapped source", the target fell through to the
+/// ledger lookup and answered "Ledger not found".
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_query_that_targets_it() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-target").await;
+
+    let graph = fluree.graph(&gs);
+    assert_unmapped(
+        graph.query().sparql(NAME_SPARQL).execute_formatted().await,
+        &gs,
+        "SPARQL target",
+    );
+    let jsonld = name_jsonld();
+    assert_unmapped(
+        graph.query().jsonld(&jsonld).execute_formatted().await,
+        &gs,
+        "JSON-LD target",
+    );
+
+    // Materializing it reads the same mapping, and refuses the same way.
+    assert_unmapped(
+        fluree
+            .materialize_r2rml_graph_source(&gs, "unmapped-target-copy:main", false)
+            .await
+            .map(|_| ()),
+        &gs,
+        "materialize",
+    );
+
+    // The remedy the refusal names: registering it again under the same name,
+    // with a mapping, replaces the record, and the source answers.
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("unmapped-target", table_location(), PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("register again with a mapping");
+    let rows = fluree
+        .graph(&gs)
+        .query()
+        .sparql(NAME_SPARQL)
+        .execute()
+        .await
+        .expect("query the remapped source");
+    assert_eq!(rows.row_count(), 5, "the remapped source answers");
+}
+
+/// A graph source with no mapping named in a dataset (`FROM`, `FROM NAMED`)
+/// refuses with its cause. It used to resolve to an empty genesis graph and
+/// answer no rows without an error.
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_query_that_names_it_in_its_dataset() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-dataset").await;
+    fluree.create_ledger("crm:main").await.expect("ledger");
+
+    let from = format!("SELECT ?name FROM <{gs}> WHERE {{ ?s <http://example.org/name> ?name }}");
+    assert_unmapped(
+        fluree.query_from().sparql(&from).execute_formatted().await,
+        &gs,
+        "SPARQL FROM",
+    );
+    let mut from_jsonld = name_jsonld();
+    from_jsonld["from"] = gs.clone().into();
+    assert_unmapped(
+        fluree
+            .query_from()
+            .jsonld(&from_jsonld)
+            .execute_formatted()
+            .await,
+        &gs,
+        "JSON-LD from",
+    );
+
+    // Every server SPARQL request carries governance options; that branch once
+    // ran without the graph-source providers, so the refusal must not depend
+    // on them.
+    assert_unmapped(
+        fluree
+            .query_from()
+            .sparql(&from)
+            .connection_opts(fluree_db_api::GovernanceOptions::default())
+            .execute_formatted()
+            .await,
+        &gs,
+        "SPARQL FROM with governance options",
+    );
+    // `query_dataset` runs a dataset built up front without the graph-source
+    // providers, so their probe never sees the source: resolving it into the
+    // dataset is what has to refuse.
+    let spec = fluree_db_api::DatasetSpec::new()
+        .with_default(fluree_db_api::GraphSource::parse(&gs).expect("parse source"));
+    assert_unmapped(
+        fluree.build_dataset_view(&spec).await.map(|_| ()),
+        &gs,
+        "build_dataset_view",
+    );
+
+    // A tracked query reports only a status and a message.
+    match fluree.query_from().sparql(&from).execute_tracked().await {
+        Ok(answer) => panic!("tracked SPARQL FROM: answered {}", answer.result),
+        Err(err) => {
+            assert_eq!(err.status, 409, "tracked SPARQL FROM: {}", err.error);
+            assert!(
+                err.error.contains("has no R2RML mapping"),
+                "tracked SPARQL FROM: {}",
+                err.error
+            );
+        }
+    }
+
+    let named = format!(
+        "SELECT ?name FROM <crm:main> FROM NAMED <{gs}> \
+         WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}"
+    );
+    assert_unmapped(
+        fluree.query_from().sparql(&named).execute_formatted().await,
+        &gs,
+        "SPARQL FROM NAMED + GRAPH",
+    );
+    let named_jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "crm:main",
+        "fromNamed": [gs],
+        "select": ["?name"],
+        "where": [["graph", gs, {"@id": "?s", "ex:name": "?name"}]],
+    });
+    assert_unmapped(
+        fluree
+            .query_from()
+            .jsonld(&named_jsonld)
+            .execute_formatted()
+            .await,
+        &gs,
+        "JSON-LD fromNamed + graph",
+    );
+}
+
+/// `GRAPH <source>` inside a query of a ledger, with no dataset naming the
+/// source, asks the R2RML probe directly rather than resolving a dataset. A
+/// source with no mapping refuses there too, instead of matching nothing.
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_graph_pattern_in_a_ledger_query() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-graph").await;
+    let ledger = fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "http://example.org/person/1", "ex:tier": "gold"
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let graph = fluree.graph("crm:main");
+    let sparql =
+        format!("SELECT ?name WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}");
+    assert_unmapped(
+        graph.query().sparql(&sparql).execute_formatted().await,
+        &gs,
+        "SPARQL GRAPH in a ledger query",
+    );
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": [["graph", gs, {"@id": "?s", "ex:name": "?name"}]],
+    });
+    assert_unmapped(
+        graph.query().jsonld(&jsonld).execute_formatted().await,
+        &gs,
+        "JSON-LD graph in a ledger query",
+    );
+}
+
+/// Registering a Direct source reaches its tables the way its queries do (a
+/// warehouse root's per-table directory included) and reports the outcome as
+/// `connection_tested`, as registering a REST source does. A table that cannot
+/// be read still registers, and then fails when queried.
+#[tokio::test]
+async fn a_direct_registration_reports_whether_its_tables_resolve() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let register = |name: &'static str, location: String| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .create_r2rml_graph_source(
+                    R2rmlCreateConfig::new_direct(name, &location, PEOPLE_R2RML)
+                        .with_mapping_media_type("text/turtle"),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("register {name}: {e}"))
+        }
+    };
+
+    let table = register("probe-table", table_location()).await;
+    assert!(table.connection_tested, "a readable table is verified");
+
+    // The mapping's `silver.people` resolves to its own directory beneath the
+    // root, as it does when the source is queried.
+    let root = format!("file://{}/silver", fixtures_dir().display());
+    let rooted = register("probe-root", root).await;
+    assert!(
+        rooted.connection_tested,
+        "a warehouse root resolves the mapping's table"
+    );
+    let rows = fluree
+        .query_from()
+        .sparql(
+            "SELECT ?name FROM <probe-root:main> \
+             WHERE { ?s <http://example.org/name> ?name }",
+        )
+        .execute()
+        .await
+        .expect("query the warehouse-root source");
+    assert_eq!(rows.row_count(), 5, "the probe and the query agree");
+
+    let missing = format!("file://{}/silver/no_such_table", fixtures_dir().display());
+    let unread = register("probe-missing", missing).await;
+    assert!(
+        !unread.connection_tested,
+        "a table that cannot be read is not verified"
+    );
+    assert!(
+        matches!(
+            &unread.connection_check,
+            fluree_db_api::ConnectionCheck::TableFailed { table, .. } if table == "silver.people"
+        ),
+        "the outcome names the table: {:?}",
+        unread.connection_check
+    );
+    assert_eq!(
+        table.connection_check,
+        fluree_db_api::ConnectionCheck::Verified
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup_graph_source("probe-missing:main")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "and is still registered"
+    );
+    let err = fluree
+        .query_from()
+        .sparql(
+            "SELECT ?name FROM <probe-missing:main> \
+             WHERE { ?s <http://example.org/name> ?name }",
+        )
+        .execute()
+        .await
+        .expect_err("a source whose table cannot be read fails when queried");
+    assert!(
+        err.to_string().contains("no_such_table"),
+        "the failure names the location: {err}"
+    );
+}
+
+/// A REST catalog that serves the committed `people` fixture's current
+/// metadata inline at `silver.people` and refuses `silver.refused` (403).
+async fn people_catalog() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let metadata_dir = fixtures_dir().join("silver/people/metadata");
+    let current = std::fs::read_dir(&metadata_dir)
+        .expect("people metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&current).expect("read metadata"))
+            .expect("parse metadata");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/people"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata-location": format!("file://{}", current.display()),
+            "metadata": metadata,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/refused"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("not yours"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/broken"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("catalog fault"))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Registering a REST source loads each table its mapping names through the
+/// catalog, as its queries will, and reports it as `connection_tested`. A
+/// source whose tables come from its mapping has no table of its own; the
+/// check once loaded the placeholder standing in for one, so it reported
+/// `false` for every such source. A table the catalog refuses still
+/// registers, reported as not verified.
+#[tokio::test]
+async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let register = |name: &'static str, mapping: String| {
+        let fluree = &fluree;
+        let config = R2rmlCreateConfig::new(
+            name,
+            catalog.uri(),
+            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+            mapping,
+        )
+        .with_mapping_media_type("text/turtle")
+        .with_vended_credentials(false)
+        .with_s3_region("us-east-1");
+        async move {
+            fluree
+                .create_r2rml_graph_source(config)
+                .await
+                .unwrap_or_else(|e| panic!("register {name}: {e}"))
+        }
+    };
+
+    let mapped = register("rest-people", PEOPLE_R2RML.to_string()).await;
+    assert!(
+        mapped.connection_tested,
+        "a table the catalog serves is verified"
+    );
+    let asked: Vec<String> = catalog
+        .received_requests()
+        .await
+        .expect("request recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        asked
+            .iter()
+            .any(|p| p == "/v1/namespaces/silver/tables/people"),
+        "the mapped table was loaded: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|p| p.contains("default")),
+        "the placeholder is never loaded: {asked:?}"
+    );
+
+    let refused = register(
+        "rest-refused",
+        PEOPLE_R2RML.replace("silver.people", "silver.refused"),
+    )
+    .await;
+    assert!(
+        !refused.connection_tested,
+        "a table the catalog refuses is not verified"
+    );
+    match &refused.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.refused");
+            assert!(error.contains("not yours"), "the catalog's reason: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    assert_eq!(
+        mapped.connection_check,
+        fluree_db_api::ConnectionCheck::Verified
+    );
+
+    // A table the catalog answers it does not have, or answers for with an
+    // error status, did not load; a catalog that does not answer at all is
+    // unreachable.
+    let missing = register(
+        "rest-missing",
+        PEOPLE_R2RML.replace("silver.people", "silver.nope"),
+    )
+    .await;
+    match &missing.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.nope");
+            assert!(error.contains("not found"), "the catalog's answer: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    let broken = register(
+        "rest-broken",
+        PEOPLE_R2RML.replace("silver.people", "silver.broken"),
+    )
+    .await;
+    match &broken.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.broken");
+            assert!(
+                error.contains("catalog fault"),
+                "the catalog's answer: {error}"
+            );
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    let unreachable = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "rest-unreachable",
+                "http://127.0.0.1:9/catalog",
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                PEOPLE_R2RML.to_string(),
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1"),
+        )
+        .await
+        .expect("an unreachable catalog still registers");
+    match &unreachable.connection_check {
+        fluree_db_api::ConnectionCheck::CatalogUnreachable { table, error } => {
+            assert_eq!(table, "silver.people");
+            assert!(!error.contains("not found"), "no catalog answered: {error}");
+        }
+        other => panic!("expected CatalogUnreachable, got {other:?}"),
+    }
+
+    // A catalog client that cannot be built loads no table, and is not
+    // reported as a table: its catalog credential names a secret that no
+    // resolver holds.
+    let unbuilt = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "rest-unbuilt",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                PEOPLE_R2RML.to_string(),
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .with_auth_bearer_token_ref("catalog/no-such-token"),
+        )
+        .await
+        .expect("a source whose client cannot be built still registers");
+    assert!(!unbuilt.connection_tested);
+    assert!(
+        matches!(
+            unbuilt.connection_check,
+            fluree_db_api::ConnectionCheck::ClientFailed { .. }
+        ),
+        "{:?}",
+        unbuilt.connection_check
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup_graph_source("rest-refused:main")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "and is still registered"
+    );
+
+    // Verified means every mapped table: one refused among served ones is not.
+    let both = format!(
+        "{PEOPLE_R2RML}\n{}",
+        PEOPLE_R2RML
+            .replace("silver.people", "silver.refused")
+            .replace("mapping#PeopleMapping", "mapping#RefusedMapping")
+    );
+    let partial = register("rest-partial", both).await;
+    assert_eq!(partial.table_count, 2, "{:?}", partial.table_names);
+    assert!(
+        !partial.connection_tested,
+        "one refused table leaves the source unverified"
+    );
+}
+
+/// Mappings that parse but define no `rr:TriplesMap`: the `rr:` prefix without
+/// its trailing `#` turns every `rr:` term into another IRI, and a misspelled
+/// class types no map. Every query of a source with one would answer no rows.
+fn mappings_that_define_nothing() -> [(&'static str, String); 2] {
+    [
+        ("no-hash", PEOPLE_R2RML.replace("r2rml#>", "r2rml>")),
+        (
+            "misspelled",
+            PEOPLE_R2RML.replace("a rr:TriplesMap", "a rr:TripleMap"),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_mapping_that_defines_no_triples_map_is_refused_at_registration() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (name, mapping) in mappings_that_define_nothing() {
+        let err = fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, table_location(), mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect_err(name);
+        assert_eq!(err.status_code(), 400, "{name}: {err}");
+        assert!(
+            err.to_string().contains(
+                "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
+                 http://www.w3.org/ns/r2rml#"
+            ),
+            "{name}: {err}"
+        );
+        assert!(
+            fluree
+                .nameservice()
+                .lookup_graph_source(&format!("{name}:main"))
+                .await
+                .expect("lookup")
+                .is_none(),
+            "{name}: a refused registration stores no record"
+        );
+    }
+}
+
+/// Store a source whose mapping defines no `rr:TriplesMap`, as registration
+/// once allowed: the mapping is in the content store, as a registration would
+/// have put it, and the record points at it.
+async fn publish_empty_mapping_source(fluree: &fluree_db_api::Fluree, name: &str) -> String {
+    use fluree_db_core::ContentStore;
+    let (_, empty) = mappings_that_define_nothing().into_iter().next().unwrap();
+    let gs = format!("{name}:main");
+    let cid = fluree
+        .content_store(&gs)
+        .put(
+            fluree_db_core::ContentKind::GraphSourceMapping,
+            empty.as_bytes(),
+        )
+        .await
+        .expect("store the mapping");
+    let config = R2rmlCreateConfig::new_direct(name, table_location(), empty)
+        .with_mapping_media_type("text/turtle")
+        .to_iceberg_gs_config(&cid.to_string())
+        .to_json()
+        .expect("serialize config");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_graph_source(
+            name,
+            "main",
+            fluree_db_nameservice::GraphSourceType::Iceberg,
+            &config,
+            &[],
+        )
+        .await
+        .expect("publish");
+    gs
+}
+
+/// A source stored with a mapping that defines nothing (registered before
+/// registration refused one) refuses every query with the cause, rather than
+/// answering no rows.
+#[tokio::test]
+async fn a_stored_mapping_that_defines_no_triples_map_refuses_every_query() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_empty_mapping_source(&fluree, "empty-mapping").await;
+    let gs = gs.as_str();
+    fluree.create_ledger("crm:main").await.expect("ledger");
+
+    let refused = |result: Result<serde_json::Value, ApiError>, route: &str| {
+        let err = match result {
+            Ok(answer) => panic!("{route}: answered instead of refusing: {answer}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.error_type(),
+            "err:db/GraphSourceUnmapped",
+            "{route}: {err}"
+        );
+        assert_eq!(err.status_code(), 409, "{route}: {err}");
+        assert!(
+            err.to_string().contains(&format!(
+                "graph source '{gs}' has an R2RML mapping that defines no rr:TriplesMap"
+            )),
+            "{route}: {err}"
+        );
+    };
+    let from = format!("SELECT ?name FROM <{gs}> WHERE {{ ?s <http://example.org/name> ?name }}");
+    refused(
+        fluree.query_from().sparql(&from).execute_formatted().await,
+        "SPARQL FROM",
+    );
+    let mut from_jsonld = name_jsonld();
+    from_jsonld["from"] = gs.into();
+    refused(
+        fluree
+            .query_from()
+            .jsonld(&from_jsonld)
+            .execute_formatted()
+            .await,
+        "JSON-LD from",
+    );
+    let target = fluree.graph(gs);
+    refused(
+        target.query().sparql(NAME_SPARQL).execute_formatted().await,
+        "SPARQL target",
+    );
+    let jsonld = name_jsonld();
+    refused(
+        target.query().jsonld(&jsonld).execute_formatted().await,
+        "JSON-LD target",
+    );
+    let in_ledger =
+        format!("SELECT ?name WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}");
+    refused(
+        fluree
+            .graph("crm:main")
+            .query()
+            .sparql(&in_ledger)
+            .execute_formatted()
+            .await,
+        "SPARQL GRAPH in a ledger query",
+    );
+}
+
+/// A mapping that cannot be read names no table, and the catalog source's own
+/// `table` is a placeholder: registration loads nothing, so the source is not
+/// verified, and the placeholder never reaches the catalog.
+#[tokio::test]
+async fn a_registration_whose_mapping_cannot_be_read_loads_no_table() {
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let created = fluree
+        .create_r2rml_graph_source(R2rmlCreateConfig {
+            iceberg: fluree_db_api::IcebergCreateConfig::new(
+                "unread-mapping",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+            )
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1"),
+            mapping: fluree_db_api::R2rmlMappingInput::Address("no/such/mapping.ttl".into()),
+            mapping_media_type: Some("text/turtle".into()),
+        })
+        .await
+        .expect("an unreadable mapping address registers unvalidated");
+    assert!(!created.mapping_validated);
+    assert!(!created.connection_tested, "nothing was loaded");
+    assert_eq!(
+        created.connection_check,
+        fluree_db_api::ConnectionCheck::NoTables
+    );
+    let asked: Vec<String> = catalog
+        .received_requests()
+        .await
+        .expect("request recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        !asked.iter().any(|p| p.contains("/tables/")),
+        "no table, placeholder or otherwise, was loaded: {asked:?}"
+    );
+}
+
+/// Registration loads a mapping's tables together, through one catalog client
+/// built before the loads: the client cache does not coalesce concurrent
+/// misses, so loads that each found it cold would each build one, resolving
+/// the catalog's token reference once per table.
+#[tokio::test]
+async fn a_registration_builds_one_catalog_client_for_all_its_tables() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CountingResolver(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::SecretResolver for CountingResolver {
+        async fn resolve_secret(
+            &self,
+            _secret_ref: &str,
+        ) -> Result<String, fluree_db_iceberg::SecretResolveError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            // Hold the build open, as a real resolver's round trip does, so
+            // loads issued together would overlap it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok("catalog-token".to_string())
+        }
+    }
+
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        let metadata_dir = fixtures_dir().join("silver/people/metadata");
+        let current = std::fs::read_dir(&metadata_dir)
+            .expect("people metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .max()
+            .expect("a metadata file");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v1/namespaces/silver/tables/people_[0-9]+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": format!("file://{}", current.display()),
+                "metadata": metadata,
+            })))
+            .mount(&catalog)
+            .await;
+    }
+    let resolver = std::sync::Arc::new(CountingResolver::default());
+    let fluree = FlureeBuilder::memory()
+        .with_secret_resolver(resolver.clone())
+        .build_memory();
+    let mapping = (1..=4)
+        .map(|i| {
+            PEOPLE_R2RML
+                .replace("silver.people", &format!("silver.people_{i}"))
+                .replace("mapping#PeopleMapping", &format!("mapping#People{i}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let created = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "wide",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                mapping,
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .with_auth_bearer_token_ref("catalog/token"),
+        )
+        .await
+        .expect("register");
+    assert_eq!(created.table_count, 4, "{:?}", created.table_names);
+    assert!(created.connection_tested, "every table loaded");
+    assert_eq!(
+        resolver.0.load(Ordering::SeqCst),
+        1,
+        "one client, so the token reference was resolved once"
+    );
+}
+
+/// `GRAPH ?g` with `?g` bound from data before the block runs. A binding that
+/// names a source no query reads as a graph (no mapping, an empty mapping, a
+/// BM25 index) is a graph outside the dataset: it yields no rows, SPARQL's
+/// answer, and the query goes on, answering for the other bindings. A
+/// constant `GRAPH <source>` naming the same source is refused.
+#[tokio::test]
+async fn a_graph_variable_bound_from_data_to_an_unreadable_source_yields_no_rows() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let unmapped = publish_unmapped_source(&fluree, "bound-unmapped").await;
+    let empty = publish_empty_mapping_source(&fluree, "bound-empty").await;
+    fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .graph("crm:main")
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX ex: <http://example.org/> \
+             INSERT DATA {{ \
+               <urn:a> ex:in <{unmapped}> . <urn:b> ex:in <{empty}> . \
+               <urn:c> ex:in <bound-search:main> . <urn:d> ex:in <urn:g1> . \
+               <urn:doc> a ex:Doc ; ex:title \"hello\" . \
+               GRAPH <urn:g1> {{ <urn:x> ex:p \"in g1\" }} }}"
+        ))
+        .commit()
+        .await
+        .expect("seed");
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "bound-search",
+            "crm:main",
+            serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": [{"@id": "?x", "@type": "ex:Doc", "ex:title": "?t"}],
+                "select": {"?x": ["@id", "ex:title"]}
+            }),
+        ))
+        .await
+        .expect("index");
+
+    // `?g` is bound before the GRAPH block runs only where the block is
+    // correlated with the rows binding it: after a subquery, or inside
+    // OPTIONAL. (A plain join evaluates `GRAPH ?g` over the ledger's own named
+    // graphs and never probes a source.)
+    let ledger = fluree.graph("crm:main");
+    let one_row = |rows: &serde_json::Value, route: &str| {
+        let bindings = rows["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{route}: {rows}"));
+        assert_eq!(
+            bindings.len(),
+            1,
+            "{route}: only urn:g1 is a graph here: {rows}"
+        );
+        assert_eq!(bindings[0]["g"]["value"], "urn:g1", "{route}: {rows}");
+        assert_eq!(bindings[0]["o"]["value"], "in g1", "{route}: {rows}");
+    };
+    let subquery = "PREFIX ex: <http://example.org/> SELECT ?g ?o WHERE { \
+                    { SELECT ?g WHERE { ?s ex:in ?g } } GRAPH ?g { ?x ex:p ?o } }";
+    let rows = ledger
+        .query()
+        .sparql(subquery)
+        .execute_formatted()
+        .await
+        .expect("SPARQL subquery: a data-bound GRAPH variable does not fail the query");
+    one_row(&rows, "SPARQL subquery");
+    let optional = "PREFIX ex: <http://example.org/> SELECT ?g ?o WHERE { \
+                    ?s ex:in ?g OPTIONAL { GRAPH ?g { ?x ex:p ?o } } }";
+    let rows = ledger
+        .query()
+        .sparql(optional)
+        .execute_formatted()
+        .await
+        .expect("SPARQL OPTIONAL: a data-bound GRAPH variable does not fail the query");
+    let bindings = rows["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(bindings.len(), 4, "every ?g row is kept: {rows}");
+    let matched: Vec<_> = bindings.iter().filter(|b| b.get("o").is_some()).collect();
+    assert_eq!(matched.len(), 1, "only urn:g1 matches inside GRAPH: {rows}");
+    assert_eq!(matched[0]["g"]["value"], "urn:g1", "{rows}");
+
+    let jsonld_subquery = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?o"],
+        "where": [
+            ["query", {"select": ["?g"], "where": {"@id": "?s", "http://example.org/in": "?g"}}],
+            ["graph", "?g", {"@id": "?x", "ex:p": "?o"}]
+        ]
+    });
+    let rows = ledger
+        .query()
+        .jsonld(&jsonld_subquery)
+        .execute_formatted()
+        .await
+        .expect("JSON-LD subquery: a data-bound graph variable does not fail the query");
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "only urn:g1 is a graph here: {rows:?}");
+    assert!(rows[0].to_string().contains("in g1"), "{rows:?}");
+    let jsonld_optional = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?o"],
+        "where": [
+            {"@id": "?s", "ex:in": "?g"},
+            ["optional", ["graph", "?g", {"@id": "?x", "ex:p": "?o"}]]
+        ]
+    });
+    let rows = ledger
+        .query()
+        .jsonld(&jsonld_optional)
+        .execute_formatted()
+        .await
+        .expect("JSON-LD optional: a data-bound graph variable does not fail the query");
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 4, "every ?g row is kept: {rows:?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.to_string().contains("in g1"))
+            .count(),
+        1,
+        "only urn:g1 matches inside graph: {rows:?}"
+    );
+
+    // The same sources named as constants are refused.
+    for gs in [unmapped.as_str(), empty.as_str(), "bound-search:main"] {
+        let constant = format!(
+            "PREFIX ex: <http://example.org/> SELECT ?o WHERE {{ GRAPH <{gs}> {{ ?x ex:p ?o }} }}"
+        );
+        let err = ledger
+            .query()
+            .sparql(&constant)
+            .execute_formatted()
+            .await
+            .expect_err(gs);
+        assert!(
+            matches!(
+                err.error_type(),
+                "err:db/GraphSourceUnmapped" | "err:db/GraphSourceNotAGraph"
+            ),
+            "{gs}: {err}"
         );
     }
 }

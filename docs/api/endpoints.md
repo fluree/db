@@ -3066,12 +3066,12 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `name` | string | Graph source name (required) |
 | `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
-| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables |
 | `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
 | `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
 | `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
 | `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
-| `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle (required). A request without it is a 400 and registers nothing. |
 | `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
 | `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
@@ -3114,19 +3114,33 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
   "table_identifier": "sales.orders",
   "catalog_uri": "https://polaris.example.com/api/catalog",
   "connection_tested": true,
+  "connection_check": {"outcome": "verified"},
   "mapping_source": "r2rml-inline",
   "triples_map_count": 3,
+  "table_count": 1,
+  "table_names": ["sales.orders"],
   "mapping_validated": true
 }
 ```
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — missing required fields, or an `r2rml` that does not parse or compile
+- `400 Bad Request` — missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`)
 - `401/403` — admin auth required
 - `500 Internal Server Error` — the graph source could not be published
 
-A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
+`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
+
+`connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
+
+| `outcome` | Meaning | Other fields |
+|---|---|---|
+| `verified` | Every mapped table loaded | |
+| `table_failed` | `table` did not load: the catalog answered that it has no such table, refused it, or answered with another error status; in `direct` mode, its metadata could not be read. `error` is the reason | `table`, `error` |
+| `catalog_unreachable` | The catalog did not answer for `table`: a refused connection, a timeout, a DNS or TLS failure, or a failure that carries no answer from the catalog. Catalog modes only | `table`, `error` |
+| `client_failed` | The client every load goes through could not be built (for example, a catalog credential that does not resolve), so no table was loaded | `error` |
+| `timed_out` | The check ran past `budget_secs` with `loaded` of `total` tables loaded. The tables may only be slow | `loaded`, `total`, `budget_secs` |
+| `no_tables` | The mapping could not be read, so it named no table to load | |
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
@@ -3476,7 +3490,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 
 An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
 
-**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
 
 See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
 

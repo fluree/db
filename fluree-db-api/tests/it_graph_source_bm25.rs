@@ -2055,3 +2055,221 @@ async fn sync_with_variable_predicate_always_rebuilds() {
         .unwrap();
     assert!(after.term_idx("quokka").is_some());
 }
+
+/// The refusal every route gives a query that names an index source where a
+/// graph is read.
+fn assert_not_a_graph<T: std::fmt::Debug>(
+    result: Result<T, fluree_db_api::ApiError>,
+    gs: &str,
+    route: &str,
+) {
+    let err = match result {
+        Ok(answer) => panic!("{route}: answered instead of refusing: {answer:?}"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.error_type(),
+        "err:db/GraphSourceNotAGraph",
+        "{route}: {err}"
+    );
+    assert_eq!(err.status_code(), 400, "{route}: {err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!(
+            "graph source '{gs}' is a BM25 index, not a graph: query it with an \
+             f:graphSource pattern, with its source ledger as the dataset"
+        )),
+        "{route}: {message}"
+    );
+}
+
+/// An index source has no triples: its searches find it by the `f:graphSource`
+/// id in their own pattern, with the source ledger as the dataset. Named where
+/// a graph is read (the query target, `FROM`, `FROM NAMED`, `GRAPH`) it is
+/// refused on SPARQL and JSON-LD alike. Each route once answered something
+/// else: triple patterns read it as an empty graph (0 rows), the target
+/// answered "Ledger not found", and a search with the index as the dataset
+/// either answered (through `query_connection_with_bm25`) or failed with "No
+/// BM25 snapshot ... at t=0" (through `query_from`). The documented form, the
+/// source ledger as the dataset, still answers.
+#[tokio::test]
+async fn an_index_source_is_refused_as_a_graph_and_searched_through_its_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "notagraph/docs:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Python for beginners" }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert");
+    let cfg = Bm25CreateConfig::new(
+        "notagraph-search",
+        ledger_id,
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+            "select": { "?x": ["@id", "ex:title"] }
+        }),
+    );
+    let gs = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index")
+        .graph_source_id;
+    let ctx = json!({ "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" });
+    let search = json!({
+        "f:graphSource": gs,
+        "f:searchText": "rust",
+        "f:searchLimit": 10,
+        "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+    });
+
+    // A3, the documented form: the source ledger is the dataset.
+    let documented = json!({
+        "@context": ctx, "from": ledger_id, "where": [search], "select": ["?doc", "?score"]
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&documented)
+        .execute_formatted()
+        .await
+        .expect("search through the source ledger");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(
+        fluree
+            .query_connection_with_bm25(&documented)
+            .await
+            .expect("search through the source ledger")
+            .row_count(),
+        1
+    );
+
+    // A1 / A2: the same search with the index as the dataset.
+    let search_from_index = json!({
+        "@context": ctx, "from": gs, "where": [search], "select": ["?doc", "?score"]
+    });
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .jsonld(&search_from_index)
+            .execute_formatted()
+            .await,
+        &gs,
+        "A1 search, index as dataset",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_connection_with_bm25(&search_from_index)
+            .await
+            .map(|r| r.row_count()),
+        &gs,
+        "A2 query_connection_with_bm25, index as dataset",
+    );
+
+    // B / C / C2: triple patterns over FROM <index>.
+    let triples = json!({
+        "@context": ctx, "from": gs,
+        "where": [{"@id": "?s", "ex:title": "?t"}], "select": ["?s", "?t"]
+    });
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .jsonld(&triples)
+            .execute_formatted()
+            .await,
+        &gs,
+        "B JSON-LD from",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s ?t FROM <{gs}> WHERE {{ ?s <http://example.org/title> ?t }}"
+            ))
+            .execute_formatted()
+            .await,
+        &gs,
+        "C SPARQL FROM",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!("SELECT * FROM <{gs}> WHERE {{ ?s ?p ?o }}"))
+            .execute_formatted()
+            .await,
+        &gs,
+        "C2 SPARQL FROM, ?s ?p ?o",
+    );
+
+    // D / D2: the index as the query target.
+    let target = fluree.graph(&gs);
+    let target_search = json!({"@context": ctx, "where": [search], "select": ["?doc", "?score"]});
+    assert_not_a_graph(
+        target
+            .query()
+            .jsonld(&target_search)
+            .execute_formatted()
+            .await,
+        &gs,
+        "D JSON-LD target",
+    );
+    assert_not_a_graph(
+        target
+            .query()
+            .sparql("SELECT * WHERE { ?s ?p ?o }")
+            .execute_formatted()
+            .await,
+        &gs,
+        "D2 SPARQL target",
+    );
+
+    // E: FROM NAMED <index> + GRAPH <index>.
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT * FROM <{ledger_id}> FROM NAMED <{gs}> WHERE {{ GRAPH <{gs}> {{ ?s ?p ?o }} }}"
+            ))
+            .execute_formatted()
+            .await,
+        &gs,
+        "E SPARQL FROM NAMED + GRAPH",
+    );
+    let named = json!({
+        "@context": ctx, "from": ledger_id, "fromNamed": [gs],
+        "where": [["graph", gs, {"@id": "?s", "ex:title": "?t"}]], "select": ["?s", "?t"]
+    });
+    assert_not_a_graph(
+        fluree.query_from().jsonld(&named).execute_formatted().await,
+        &gs,
+        "E JSON-LD fromNamed + graph",
+    );
+
+    // F: GRAPH <index> inside a query of the ledger, with no dataset naming it.
+    // Only the iceberg feature resolves a GRAPH IRI that names a graph source;
+    // without it the IRI names no graph in the ledger and matches nothing.
+    if cfg!(feature = "iceberg") {
+        let ledger = fluree.graph(ledger_id);
+        assert_not_a_graph(
+            ledger
+                .query()
+                .sparql(&format!("SELECT * WHERE {{ GRAPH <{gs}> {{ ?s ?p ?o }} }}"))
+                .execute_formatted()
+                .await,
+            &gs,
+            "F SPARQL GRAPH in a ledger query",
+        );
+        let in_ledger = json!({
+            "@context": ctx,
+            "where": [["graph", gs, {"@id": "?s", "ex:title": "?t"}]], "select": ["?s", "?t"]
+        });
+        assert_not_a_graph(
+            ledger.query().jsonld(&in_ledger).execute_formatted().await,
+            &gs,
+            "F JSON-LD graph in a ledger query",
+        );
+    }
+}

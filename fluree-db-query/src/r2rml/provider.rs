@@ -198,11 +198,31 @@ pub trait R2rmlProvider: Debug + Send + Sync {
     /// # Returns
     ///
     /// `Ok(true)` if the graph source exists and has an R2RML mapping,
-    /// `Ok(false)` if the id names no mapped graph source (including an IRI
-    /// that is no graph-source id at all). An error when the answer cannot be
-    /// determined, for example because the nameservice is unavailable: the
-    /// caller fails the query rather than reading a graph source as an empty
-    /// native graph.
+    /// `Ok(false)` if the id names no graph source (including an IRI that is
+    /// no graph-source id at all, and a dropped source).
+    ///
+    /// # Errors
+    ///
+    /// Two kinds, and callers tell them apart, so an implementor must return
+    /// the right one:
+    ///
+    /// - The id names a graph source that no query reads as a graph: a mapped
+    ///   source with no mapping, an index source (BM25, vector, geo), or a
+    ///   family this build has no reader for. The error must be one for which
+    ///   [`QueryError::is_unreadable_graph_source`](crate::error::QueryError::is_unreadable_graph_source)
+    ///   is true. A query that names such a source in its text fails with it;
+    ///   a `GRAPH ?g` whose `?g` took the IRI from data reads the IRI as a
+    ///   graph outside the dataset and yields no rows for that binding. An
+    ///   `Ok(false)` here would query the source as an empty native graph, and
+    ///   any other error would fail a query whose data merely mentions it.
+    /// - The answer cannot be determined, for example because the nameservice
+    ///   is unavailable. This must NOT be an unreadable-source error: every
+    ///   caller fails the query rather than reading a graph source as an empty
+    ///   native graph.
+    ///
+    /// A provider that serves only mapped sources it holds (a test double, a
+    /// provisional mapping) never names an unreadable source and need not
+    /// return the first kind.
     async fn has_r2rml_mapping(&self, graph_source_id: &str) -> Result<bool>;
 
     /// Get the compiled R2RML mapping for a graph source alias.
@@ -219,7 +239,12 @@ pub trait R2rmlProvider: Debug + Send + Sync {
     /// # Returns
     ///
     /// The compiled mapping, or an error if the graph source doesn't exist or
-    /// the mapping couldn't be loaded.
+    /// the mapping couldn't be loaded. A mapping that defines no
+    /// `rr:TriplesMap` is an error for which
+    /// [`QueryError::is_unreadable_graph_source`](crate::error::QueryError::is_unreadable_graph_source)
+    /// is true: [`Self::has_r2rml_mapping`] cannot see an empty mapping
+    /// without compiling it, so the data-bound `GRAPH ?g` arm relies on this
+    /// error to yield no rows for such a source.
     async fn compiled_mapping(
         &self,
         graph_source_id: &str,

@@ -902,6 +902,9 @@ impl ApiError {
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                QE::GraphSourceUnmapped { .. } => errors::GRAPH_SOURCE_UNMAPPED,
+                QE::GraphSourceUnsupported { .. } => errors::GRAPH_SOURCE_UNSUPPORTED,
+                QE::GraphSourceNotAGraph { .. } => errors::GRAPH_SOURCE_NOT_A_GRAPH,
                 // Typed as `ApiError::NameService` is: the backend's fault.
                 QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
@@ -1021,6 +1024,13 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         QE::StorageAccessDenied { .. }
         | QE::CatalogCredentialsNotVended { .. }
         | QE::CatalogAccessDenied { .. } => 403,
+        // The source's stored state, not the query, is what is wrong, and
+        // registering it again with a mapping clears it: a conflict with the
+        // resource, as querying a dropped source is.
+        QE::GraphSourceUnmapped { .. } => 409,
+        // The deployment lacks the reader, and no request can supply it: the
+        // server does not support what the request needs.
+        QE::GraphSourceUnsupported { .. } => 501,
         // Engine and storage faults no change to the query can clear.
         QE::Core(_)
         | QE::OperatorNotOpened
@@ -1046,6 +1056,8 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::ResourceLimit(_)
         | QE::FuelLimitExceeded(_)
         | QE::R2rmlUnsupportedPattern { .. }
+        // The request names an index where a graph is read; the index is fine.
+        | QE::GraphSourceNotAGraph { .. }
         | QE::UnsupportedMode(_)
         | QE::UnsupportedFeature(_)
         | QE::TimeRangeNotCovered { .. }
@@ -1307,6 +1319,32 @@ mod tests {
                 ApiError::GraphSourceRetracted("x".into()),
                 409,
                 GRAPH_SOURCE_RETRACTED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceUnmapped {
+                    graph_source_id: "gs:main".into(),
+                    empty_mapping: true,
+                }),
+                409,
+                GRAPH_SOURCE_UNMAPPED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceUnsupported {
+                    graph_source_id: "gs:main".into(),
+                    family: "a 'f:FutureSource'".into(),
+                    cause: "it does not recognize that type".into(),
+                }),
+                501,
+                GRAPH_SOURCE_UNSUPPORTED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceNotAGraph {
+                    graph_source_id: "search:main".into(),
+                    index: "a BM25 index".into(),
+                    remedy: "r",
+                }),
+                400,
+                GRAPH_SOURCE_NOT_A_GRAPH,
             ),
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),
