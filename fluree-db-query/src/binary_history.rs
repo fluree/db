@@ -75,6 +75,7 @@
 //!   queries (`?s ?p ?o` across a wide range) can benefit from a
 //!   leaflet-at-a-time streaming cursor — also tracked as a follow-up.
 
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -343,7 +344,7 @@ impl BinaryHistoryScanOperator {
                                     let p_id = batch.p_id.get_or(i, 0);
                                     let o_type = batch.o_type.get_or(i, 0);
                                     let o_key = batch.o_key.get(i);
-                                    let o_i = batch.o_i.get_or(i, u32::MAX);
+                                    let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
                                     let t_u32 = batch.t.get_or(i, 0);
                                     let t = t_u32 as i64;
 
@@ -551,7 +552,7 @@ fn gspo_leaf_range(
         o_key: if low { 0 } else { u64::MAX },
         p_id: if low { 0 } else { u32::MAX },
         t: if low { 0 } else { u32::MAX },
-        o_i: if low { 0 } else { u32::MAX },
+        o_i: if low { 0 } else { u64::MAX },
         o_type: if low { 0 } else { u16::MAX },
         g_id: g,
     };
@@ -601,7 +602,7 @@ fn decode_event_to_flake(
     p_id: u32,
     o_type: u16,
     o_key: u64,
-    o_i: u32,
+    o_i: u64,
     t: i64,
     op: bool,
 ) -> Result<Option<Flake>> {
@@ -622,18 +623,7 @@ fn decode_event_to_flake(
     let lang = store
         .resolve_lang_tag(o_type)
         .map(std::string::ToString::to_string);
-    let meta = if lang.is_some() || o_i != u32::MAX {
-        Some(FlakeMeta {
-            lang,
-            i: if o_i != u32::MAX {
-                Some(o_i as i32)
-            } else {
-                None
-            },
-        })
-    } else {
-        None
-    };
+    let meta = FlakeMeta::from_packed(lang.as_deref(), o_i);
     Ok(Some(Flake {
         g: None,
         s: s_sid,

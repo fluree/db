@@ -1977,10 +1977,7 @@ impl<'a> HydrationFormatter<'a> {
         super::triple_term_node(term, self.compactor, |_| match &term.o {
             FlakeValue::TripleTerm(inner) => self.format_triple_term(inner),
             _ => {
-                let meta = term.lang.clone().map(|lang| fluree_db_core::FlakeMeta {
-                    lang: Some(lang),
-                    i: None,
-                });
+                let meta = term.lang.clone().map(fluree_db_core::FlakeMeta::with_lang);
                 let object = Flake::new(
                     term.s.clone(),
                     term.p.clone(),

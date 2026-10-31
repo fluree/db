@@ -1107,7 +1107,7 @@ async fn graphs_in_pool(
         o_key: if low { 0 } else { u64::MAX },
         p_id: if low { 0 } else { u32::MAX },
         t: if low { 0 } else { u32::MAX },
-        o_i: if low { 0 } else { u32::MAX },
+        o_i: if low { 0 } else { u64::MAX },
         o_type: if low { 0 } else { u16::MAX },
         g_id: if low { 0 } else { u32::MAX },
     };
@@ -2404,7 +2404,7 @@ fn pooled_rows_at(
     store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
     order: fluree_db_binary_index::RunSortOrder,
     t: i64,
-) -> Vec<(u32, u64, u32, u16, u64, u32, u32)> {
+) -> Vec<(u32, u64, u32, u16, u64, u64, u32)> {
     use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection};
     let branch = Arc::clone(store.pool_branch(order).expect("pooled order"));
     let mut cursor = BinaryCursor::scan_all(
@@ -2424,7 +2424,7 @@ fn pooled_rows_at(
                 b.p_id.get_or(i, 0),
                 b.o_type.get_or(i, 0),
                 b.o_key.get(i),
-                b.o_i.get_or(i, u32::MAX),
+                b.o_i.get_or(i, u64::MAX),
                 b.t.get_or(i, 0),
             ));
         }

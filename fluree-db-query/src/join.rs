@@ -30,6 +30,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::read::batched_lookup::WildcardDirection;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
@@ -2258,7 +2259,7 @@ impl NestedLoopJoinOperator {
             o_key: u64::MAX,
             p_id,
             t: u32::MAX,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type: u16::MAX,
             g_id: _g_id,
         };
@@ -2279,7 +2280,7 @@ impl NestedLoopJoinOperator {
             o_key: if low { 0 } else { u64::MAX },
             p_id: if low { 0 } else { u32::MAX },
             t: if low { 0 } else { u32::MAX },
-            o_i: if low { 0 } else { u32::MAX },
+            o_i: if low { 0 } else { u64::MAX },
             o_type: if low { 0 } else { u16::MAX },
             g_id,
         };
@@ -2359,7 +2360,7 @@ impl NestedLoopJoinOperator {
                             p_id,
                             o_type_val,
                             o_key_val,
-                            batch.o_i.get_or(row, u32::MAX),
+                            batch.o_i.get_or(row, LIST_INDEX_NONE),
                             batch.t.get_or(row, 0) as i64,
                         )?
                     };
@@ -2492,7 +2493,7 @@ impl NestedLoopJoinOperator {
                             .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                         let o_key_val = batch.o_key.get(row);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                            let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
                             if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
                                 == RowFate::Drop
                             {
@@ -2514,7 +2515,7 @@ impl NestedLoopJoinOperator {
                         {
                             Binding::encoded_sid(o_key_val)
                         } else {
-                            let o_i = batch.o_i.get_or(row, u32::MAX);
+                            let o_i = batch.o_i.get_or(row, LIST_INDEX_NONE);
                             let t = batch.t.get_or(row, 0) as i64;
                             build_probe_object_binding(
                                 ctx,
@@ -3292,7 +3293,7 @@ fn build_probe_object_binding(
     p_id: u32,
     o_type_val: u16,
     o_key_val: u64,
-    o_i: u32,
+    o_i: u64,
     t: i64,
 ) -> Result<Binding> {
     if let Some(binding) =
@@ -3411,7 +3412,7 @@ pub(crate) fn for_each_object_probe_match(
             o_key: o_s_id,
             p_id,
             t: u32::MAX,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type,
             g_id: ctx.binary_g_id,
         };
@@ -3511,7 +3512,7 @@ pub(crate) fn for_each_object_probe_match(
                     let s_id = batch.s_id.get_or(row, 0);
                     if let Some(probe) = probe_ops.as_mut() {
                         let win = probe.object_window(o_key);
-                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
                         if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
                             continue;
                         }
@@ -3573,7 +3574,7 @@ pub(crate) fn for_each_object_probe_match(
 
                     let s_id = batch.s_id.get_or(r, 0);
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                        let o_i_val = batch.o_i.get_or(r, u32::MAX);
+                        let o_i_val = batch.o_i.get_or(r, LIST_INDEX_NONE);
                         if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
                             continue;
                         }
@@ -3647,7 +3648,7 @@ fn subject_probe_row_object(
         p_id,
         o_type,
         o_key,
-        batch.o_i.get_or(row, u32::MAX),
+        batch.o_i.get_or(row, LIST_INDEX_NONE),
         batch.t.get_or(row, 0) as i64,
     )?)))
 }
@@ -3684,7 +3685,7 @@ fn pooled_subject_probe(
         o_key: if low { 0 } else { u64::MAX },
         p_id: if low { 0 } else { u32::MAX },
         t: if low { 0 } else { u32::MAX },
-        o_i: if low { 0 } else { u32::MAX },
+        o_i: if low { 0 } else { u64::MAX },
         o_type: if low { 0 } else { u16::MAX },
         g_id,
     };
@@ -3856,7 +3857,7 @@ fn batched_subject_probe_binary_uncharged(
         o_key: u64::MAX,
         p_id,
         t: u32::MAX,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id: ctx.binary_g_id,
     };
@@ -3922,7 +3923,7 @@ fn batched_subject_probe_binary_uncharged(
                         .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
                         if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
                             == RowFate::Drop
                         {
@@ -4078,7 +4079,7 @@ fn batched_subject_star_spot_uncharged(
         p_id: u32::MAX,
         o_key: u64::MAX,
         t: u32::MAX,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id: ctx.binary_g_id,
     };
@@ -4149,7 +4150,7 @@ fn batched_subject_star_spot_uncharged(
                         .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
                     if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        let o_i_val = batch.o_i.get_or(row, LIST_INDEX_NONE);
                         if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
                             == RowFate::Drop
                         {
@@ -4185,7 +4186,7 @@ fn batched_subject_star_spot_uncharged(
                             p_id,
                             o_type_val,
                             o_key_val,
-                            batch.o_i.get_or(row, u32::MAX),
+                            batch.o_i.get_or(row, LIST_INDEX_NONE),
                             batch.t.get_or(row, 0) as i64,
                         )?)
                     } else {

@@ -16,6 +16,7 @@ use crate::format::leaflet::flags::{
     HAS_O_I as FLAG_HAS_O_I, HAS_O_TYPE_COL as FLAG_HAS_O_TYPE_COL,
 };
 use crate::format::run_record::RunSortOrder;
+use crate::format::run_record::{widen_list_index, LIST_INDEX_NONE};
 
 /// Load columns from a single leaflet within a V3 leaf blob.
 ///
@@ -164,11 +165,19 @@ pub fn load_leaflet_columns(
 
     // ── o_i ── (optional: only present when FLAG_HAS_O_I is set)
     let o_i = if eff.contains(ColumnId::OI) {
-        if entry.flags & FLAG_HAS_O_I != 0 {
-            ColumnData::Block(Arc::from(decode_u32(ColumnId::OI)?))
-        } else {
+        if entry.flags & FLAG_HAS_O_I == 0 {
             // All values are the sentinel — no column block exists.
-            ColumnData::Const(u32::MAX)
+            ColumnData::Const(LIST_INDEX_NONE)
+        } else if find_ref(ColumnId::OI).is_some_and(|r| r.elem_width == 4) {
+            // A v4 leaflet's 32-bit positions, widened to list places.
+            ColumnData::Block(
+                decode_u32(ColumnId::OI)?
+                    .into_iter()
+                    .map(widen_list_index)
+                    .collect(),
+            )
+        } else {
+            ColumnData::Block(Arc::from(decode_u64(ColumnId::OI)?))
         }
     } else {
         ColumnData::AbsentDefault
@@ -314,7 +323,7 @@ mod tests {
             o_key,
             p_id,
             t,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type,
             g_id: 0,
         }
@@ -372,9 +381,9 @@ mod tests {
         assert!(batch.o_type.is_const());
         assert_eq!(batch.o_type.get(0), ot);
 
-        // o_i should be Const(u32::MAX) — HAS_O_I flag is not set (all sentinel).
+        // o_i should be Const(LIST_INDEX_NONE) — HAS_O_I flag is not set (all sentinel).
         assert!(batch.o_i.is_const());
-        assert_eq!(batch.o_i.get(0), u32::MAX);
+        assert_eq!(batch.o_i.get(0), LIST_INDEX_NONE);
 
         // s_id should be Block with values 1..=5.
         assert!(matches!(batch.s_id, ColumnData::Block(_)));

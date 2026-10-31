@@ -1376,7 +1376,7 @@ impl<'a> ExecutionContext<'a> {
         let resolved: Option<Arc<str>> = self
             .binary_store
             .as_deref()
-            .and_then(|s| s.decode_meta(lang_id, i32::MIN))
+            .and_then(|s| s.decode_meta(lang_id, fluree_db_core::list_index::NONE))
             .and_then(|m| m.lang)
             .map(Arc::from);
         self.lang_tag_cache

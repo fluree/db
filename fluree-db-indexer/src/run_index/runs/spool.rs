@@ -25,9 +25,9 @@
 //!
 //! ## Wire format
 //!
-//! Each record is exactly [`SPOOL_RECORD_WIRE_SIZE`] (36) bytes, little-endian,
+//! Each record is exactly [`SPOOL_RECORD_WIRE_SIZE`] (42) bytes, little-endian,
 //! serialized via [`RunRecord::write_spool_le`] / [`RunRecord::read_spool_le`].
-//! Unlike the 34-byte run wire format, spool records include `g_id: fluree_db_core::GraphId`
+//! Unlike the 38-byte run wire format, spool records include `g_id: fluree_db_core::GraphId`
 //! because spool files are pre-graph-partition.
 
 use crate::run_index::build::graph_scope::GraphScope;
@@ -265,7 +265,7 @@ impl StringRemap for MmapStringRemap {
 pub const SPOOL_MAGIC: [u8; 4] = *b"FSP2";
 
 /// Current version of the versioned spool format.
-pub const SPOOL_VERSION: u8 = 2;
+pub const SPOOL_VERSION: u8 = 3;
 
 /// Fixed header length in bytes for versioned spool files.
 pub const SPOOL_HEADER_LEN: usize = 32;
@@ -723,6 +723,9 @@ impl super::streaming_reader::MergeSource for V1SpoolMergeAdapter {
 /// Magic bytes for a V2-native sorted-commit artifact.
 pub const SORTED_COMMIT_V2_MAGIC: [u8; 4] = *b"FSV2";
 
+/// Sorted-commit file version: records hold a 64-bit list place.
+const SORTED_COMMIT_V2_VERSION: u8 = 3;
+
 /// Fixed header length in bytes for versioned V2 sorted-commit files.
 pub const SORTED_COMMIT_V2_HEADER_LEN: usize = 32;
 
@@ -764,7 +767,7 @@ impl SortedCommitV2Header {
             ));
         }
         let version = buf[4];
-        if version != 2 {
+        if version != SORTED_COMMIT_V2_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("sorted commit v2: unsupported version {version}"),
@@ -808,7 +811,7 @@ impl SortedCommitWriterV2 {
         };
 
         let header = SortedCommitV2Header {
-            version: 2,
+            version: SORTED_COMMIT_V2_VERSION,
             flags,
             chunk_idx: chunk_idx as u32,
             record_count: 0,
@@ -858,7 +861,7 @@ impl SortedCommitWriterV2 {
 
         file.seek(SeekFrom::Start(0))?;
         let header = SortedCommitV2Header {
-            version: 2,
+            version: SORTED_COMMIT_V2_VERSION,
             flags: self.flags,
             chunk_idx: self.chunk_idx as u32,
             record_count: self.record_count,

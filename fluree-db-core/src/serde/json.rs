@@ -228,16 +228,25 @@ pub fn deserialize_meta(value: &serde_json::Value) -> Result<Option<FlakeMeta>> 
                 .get("i")
                 .and_then(serde_json::Value::as_i64)
                 .map(|v| v as i32);
+            let list = map
+                .get("list")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|_| i.is_some())
+                .map_or(0, |v| v as u32);
             if lang.is_none() && i.is_none() {
                 Ok(None)
             } else {
-                Ok(Some(FlakeMeta { lang, i }))
+                Ok(Some(FlakeMeta { lang, i, list }))
             }
         }
         // Integer metadata (hash for comparison)
         serde_json::Value::Number(n) => {
             let i = n.as_i64().map(|v| v as i32);
-            Ok(Some(FlakeMeta { lang: None, i }))
+            Ok(Some(FlakeMeta {
+                lang: None,
+                i,
+                list: 0,
+            }))
         }
         _ => Ok(None),
     }

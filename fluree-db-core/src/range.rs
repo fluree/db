@@ -543,6 +543,7 @@ mod tests {
         let m = i.map(|i| FlakeMeta {
             lang: None,
             i: Some(i),
+            list: 0,
         });
         Flake {
             s: Sid::new(1, s),
@@ -653,6 +654,7 @@ mod tests {
             m: Some(FlakeMeta {
                 lang: Some(lang.to_string()),
                 i: Some(0),
+                list: 0,
             }),
             g: None,
         };
@@ -723,6 +725,7 @@ mod tests {
             m: Some(FlakeMeta {
                 lang: Some(lang.to_string()),
                 i: None,
+                list: 0,
             }),
             g: None,
         };

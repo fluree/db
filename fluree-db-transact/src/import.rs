@@ -918,7 +918,7 @@ mod inner {
                                 o: &o,
                                 dt: &dt,
                                 lang: lang.as_deref(),
-                                list_index: None,
+                                place: None,
                                 t: new_t,
                             },
                         )?;

@@ -592,12 +592,13 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     }
     let version = bytes[4];
     // FIR6 version 2 adds `lang_id` to each `FulltextArenaRef`; version 3 enables
-    // inline xsd:decimal encoding. Neither changes the header layout this helper
-    // reads — it only consumes the fixed header + optional-section bits, not arena
-    // refs or leaf data — so all three versions are accepted here. The
-    // authoritative parser (`IndexRoot::decode` in `fluree-db-binary-index`)
-    // enforces version matching for the full-root deserialization path.
-    if version != 1 && version != 2 && version != 3 {
+    // inline xsd:decimal encoding; version 4 widens the list places its
+    // artifacts store. None changes the header layout this helper reads — it
+    // only consumes the fixed header + optional-section bits, not arena refs or
+    // leaf data — so every version is accepted here. The authoritative parser
+    // (`IndexRoot::decode` in `fluree-db-binary-index`) enforces version
+    // matching for the full-root deserialization path.
+    if !(1..=4).contains(&version) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("FIR6: unsupported version {version}"),
@@ -925,12 +926,13 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         let _order_id = read_u8(bytes, &mut pos)?;
         let leaf_count = read_u32(bytes, &mut pos)? as usize;
         for _ in 0..leaf_count {
-            // first_key + last_key (RunRecordV2 ordered key)
-            const RECORD_V2_WIRE_SIZE: usize = 30;
-            ensure(bytes, pos, RECORD_V2_WIRE_SIZE, "RunRecordV2 first_key")?;
-            pos += RECORD_V2_WIRE_SIZE;
-            ensure(bytes, pos, RECORD_V2_WIRE_SIZE, "RunRecordV2 last_key")?;
-            pos += RECORD_V2_WIRE_SIZE;
+            // first_key + last_key (RunRecordV2 ordered key): 34 bytes, the
+            // 30 of a root before version 4, whose keys hold a 32-bit `o_i`.
+            let record_v2_wire_size: usize = if version >= 4 { 34 } else { 30 };
+            ensure(bytes, pos, record_v2_wire_size, "RunRecordV2 first_key")?;
+            pos += record_v2_wire_size;
+            ensure(bytes, pos, record_v2_wire_size, "RunRecordV2 last_key")?;
+            pos += record_v2_wire_size;
             let _row_count = read_u64(bytes, &mut pos)?;
             skip_cid(bytes, &mut pos)?;
             let has_sidecar = read_u8(bytes, &mut pos)?;

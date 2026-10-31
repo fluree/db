@@ -3,6 +3,7 @@
 //! Plugs into `range_with_overlay()` so all 25+ callers (policy, SHACL,
 //! reasoner, property paths, API) transparently query V3 indexes.
 
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -832,7 +833,7 @@ fn binary_range_eq_v3(
                         o_key: filter.o_key.unwrap_or(u64::MAX),
                         p_id: filter.p_id.unwrap_or(u32::MAX),
                         t: u32::MAX,
-                        o_i: u32::MAX,
+                        o_i: LIST_INDEX_NONE,
                         o_type: filter.o_type.unwrap_or(u16::MAX),
                         g_id,
                     };
@@ -958,7 +959,7 @@ fn binary_range_eq_v3(
             let o_type = batch.o_type.get_or(i, 0);
             let o_key = batch.o_key.get(i);
             let t = batch.t.get_or(i, 0) as i64;
-            let o_i = batch.o_i.get_or(i, u32::MAX);
+            let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
 
             // Resolve subject. Reuse the caller-supplied Sid when present —
             // the bound `match_val.s` IS the subject for every base row this
@@ -987,18 +988,7 @@ fn binary_range_eq_v3(
                 .resolve_lang_tag(o_type)
                 .map(std::string::ToString::to_string);
             // List index.
-            let meta = if lang.is_some() || o_i != u32::MAX {
-                Some(fluree_db_core::FlakeMeta {
-                    lang,
-                    i: if o_i != u32::MAX {
-                        Some(o_i as i32)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            };
+            let meta = fluree_db_core::FlakeMeta::from_packed(lang.as_deref(), o_i);
 
             let flake = fluree_db_core::Flake {
                 g: None,
@@ -1150,7 +1140,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
         o_key: u64::MAX,
         p_id,
         t: 0,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };
@@ -1524,7 +1514,7 @@ fn binary_range_bounded_v3(
         o_key: u64::MAX,
         p_id: u32::MAX,
         t: 0,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };
@@ -1575,7 +1565,7 @@ fn binary_range_bounded_v3(
             let o_type = batch.o_type.get_or(i, 0);
             let o_key = batch.o_key.get(i);
             let t = batch.t.get_or(i, 0) as i64;
-            let o_i = batch.o_i.get_or(i, u32::MAX);
+            let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
 
             let s_sid = resolve_sid(s_id, &view)?;
 
@@ -1602,18 +1592,7 @@ fn binary_range_bounded_v3(
             let lang = store
                 .resolve_lang_tag(o_type)
                 .map(std::string::ToString::to_string);
-            let meta = if lang.is_some() || o_i != u32::MAX {
-                Some(fluree_db_core::FlakeMeta {
-                    lang,
-                    i: if o_i != u32::MAX {
-                        Some(o_i as i32)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            };
+            let meta = fluree_db_core::FlakeMeta::from_packed(lang.as_deref(), o_i);
 
             let flake = Flake {
                 g: None,

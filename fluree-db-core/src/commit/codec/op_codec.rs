@@ -127,12 +127,13 @@ pub fn encode_op(
         buf.extend_from_slice(lang_bytes);
     }
 
-    // Optional list index (unsigned varint — negative indices not supported)
-    if let Some(i) = flake.m.as_ref().and_then(|m| m.i) {
+    // Optional list place (unsigned varint, `crate::list_index::pack` —
+    // negative positions not supported)
+    if let Some((list, i)) = flake.m.as_ref().and_then(FlakeMeta::place) {
         if i < 0 {
             return Err(CommitCodecError::NegativeListIndex(i));
         }
-        encode_varint(i as u64, buf);
+        encode_varint(crate::list_index::pack(list, i), buf);
     }
 
     Ok(())
@@ -387,28 +388,14 @@ pub fn decode_op(
         None
     };
 
-    // Optional list index (unsigned varint)
-    let i = if flags & OP_FLAG_HAS_I != 0 {
-        let raw = decode_varint(data, pos)?;
-        if raw > i32::MAX as u64 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "list index {raw} exceeds i32::MAX"
-            )));
-        }
-        Some(raw as i32)
+    // Optional list place (unsigned varint)
+    let place = if flags & OP_FLAG_HAS_I != 0 {
+        Some(decode_place(decode_varint(data, pos)?)?)
     } else {
         None
     };
 
-    let meta = match (&lang, i) {
-        (Some(l), Some(idx)) => Some(FlakeMeta {
-            lang: Some(l.clone()),
-            i: Some(idx),
-        }),
-        (Some(l), None) => Some(FlakeMeta::with_lang(l)),
-        (None, Some(idx)) => Some(FlakeMeta::with_index(idx)),
-        (None, None) => None,
-    };
+    let meta = FlakeMeta::from_place(lang.as_deref(), place);
 
     Ok(match g {
         Some(g) => Flake::new_in_graph(g, s, p, o, dt, t, op, meta),
@@ -440,6 +427,15 @@ fn decode_object(
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// The list and position a commit's list place `raw` packs
+/// (`crate::list_index`): a commit written before lists had identities
+/// holds the position alone, list 0.
+pub(crate) fn decode_place(raw: u64) -> Result<(u32, i32), CommitCodecError> {
+    crate::list_index::unpack(raw).ok_or_else(|| {
+        CommitCodecError::InvalidOp(format!("list place {raw} holds a position past i32::MAX"))
+    })
+}
 
 #[cfg(test)]
 mod tests {

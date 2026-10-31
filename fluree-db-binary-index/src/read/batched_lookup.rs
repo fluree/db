@@ -13,6 +13,7 @@ use super::binary_index_store::BinaryIndexStore;
 use super::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
 use crate::format::column_block::ColumnId;
 use crate::format::run_record::RunSortOrder;
+use crate::format::run_record::LIST_INDEX_NONE;
 use crate::format::run_record_v2::RunRecordV2;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::o_type::OType;
@@ -156,7 +157,7 @@ pub fn batched_lookup_predicate_refs(
                     o_key: u64::MAX,
                     p_id,
                     t: 0,
-                    o_i: u32::MAX,
+                    o_i: LIST_INDEX_NONE,
                     o_type: u16::MAX,
                     g_id,
                 },
@@ -194,7 +195,7 @@ pub fn batched_lookup_predicate_refs(
             o_key: u64::MAX,
             p_id,
             t: 0,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type: u16::MAX,
             g_id,
         };
@@ -538,7 +539,7 @@ impl BatchedWildcardCursor {
             o_key: u64::MAX,
             p_id: u32::MAX,
             t: 0,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             o_type: u16::MAX,
             g_id,
         };

@@ -15,6 +15,7 @@ use fluree_db_core::Tracker;
 
 use crate::format::branch::BranchManifest;
 use crate::format::run_record::RunSortOrder;
+use crate::format::run_record::LIST_INDEX_NONE;
 use crate::format::run_record_v2::cmp_v2_for_order;
 use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2};
 use crate::read::types::cmp_overlay_vs_record;
@@ -754,7 +755,7 @@ impl BinaryCursor {
             let r_p = base.p_id.get_or(ri, 0);
             let r_ot = base.o_type.get_or(ri, 0);
             let r_ok = base.o_key.get(ri);
-            let r_oi = base.o_i.get_or(ri, u32::MAX);
+            let r_oi = base.o_i.get_or(ri, LIST_INDEX_NONE);
             // Only the pooled tree has a graph column to compare.
             let r_g = if pooled { base.g_id.get_or(ri, 0) } else { 0 };
 
@@ -845,7 +846,7 @@ struct OutRows {
     o_key: Vec<u64>,
     p_id: Vec<u32>,
     o_type: Vec<u16>,
-    o_i: Vec<u32>,
+    o_i: Vec<u64>,
     t: Vec<u32>,
     g_id: Option<Vec<fluree_db_core::GraphId>>,
 }
@@ -868,7 +869,7 @@ impl OutRows {
         self.o_key.push(batch.o_key.get(i));
         self.p_id.push(batch.p_id.get_or(i, 0));
         self.o_type.push(batch.o_type.get_or(i, 0));
-        self.o_i.push(batch.o_i.get_or(i, u32::MAX));
+        self.o_i.push(batch.o_i.get_or(i, LIST_INDEX_NONE));
         self.t.push(batch.t.get_or(i, 0));
         if let Some(g) = &mut self.g_id {
             g.push(batch.g_id.get_or(i, 0));
@@ -929,7 +930,7 @@ fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch, order: RunSortOrder)
         let o_key = batch.o_key.get(i); // always present
         let p_id = batch.p_id.get_or(i, 0);
         let o_type = batch.o_type.get_or(i, 0);
-        let o_i = batch.o_i.get_or(i, u32::MAX);
+        let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
         if filter.matches(s_id, p_id, o_type, o_key, o_i)
             && (!check_graph || filter.matches_graph(batch.g_id.get_or(i, 0)))
         {
@@ -1117,7 +1118,7 @@ mod tests {
             p_id,
             o_type: 0,
             o_key: 0,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             t: 1,
             op: true,
             g_id: 0,

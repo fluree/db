@@ -1230,6 +1230,7 @@ mod tests {
             m: Some(FlakeMeta {
                 lang: None,
                 i: Some(0),
+                list: 0,
             }),
         };
         let flake_i1 = Flake {
@@ -1243,6 +1244,7 @@ mod tests {
             m: Some(FlakeMeta {
                 lang: None,
                 i: Some(1),
+                list: 0,
             }),
         };
 

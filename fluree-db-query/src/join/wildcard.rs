@@ -5,6 +5,7 @@
 //! As with other unordered physical plans, output order is not guaranteed.
 
 use super::*;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::read::batched_lookup::{
     BatchedWildcardCursor, WildcardDirection, WildcardMatches,
 };
@@ -130,7 +131,7 @@ impl WildcardJoin {
                             p_id,
                             batch.o_type.get_or(row, 0),
                             batch.o_key.get(row),
-                            batch.o_i.get_or(row, u32::MAX),
+                            batch.o_i.get_or(row, LIST_INDEX_NONE),
                             batch.t.get_or(row, 0) as i64,
                         )?
                     };

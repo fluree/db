@@ -2547,6 +2547,7 @@ mod tests {
             let mut f = string_flake(&s, &p, "a", t, true, None);
             f.m = Some(fluree_db_core::FlakeMeta {
                 i: Some(i),
+                list: 0,
                 ..Default::default()
             });
             f

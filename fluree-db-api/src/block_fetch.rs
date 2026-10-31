@@ -29,6 +29,7 @@
 use crate::dataset::GovernanceOptions;
 use crate::policy_builder;
 use fluree_db_binary_index::format::leaf::{decode_leaf_dir_v3_with_base, decode_leaf_header_v3};
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
 use fluree_db_binary_index::read::column_types::ColumnProjection;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
@@ -260,7 +261,7 @@ pub fn decode_leaf_block(
             let o_type = batch.o_type.get_or(i, 0);
             let o_key = batch.o_key.get(i);
             let t_u32 = batch.t.get_or(i, 0);
-            let o_i = batch.o_i.get_or(i, u32::MAX);
+            let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
 
             // Subject: resolve to IRI then encode to Sid.
             let s_iri = store
@@ -323,18 +324,7 @@ pub fn decode_leaf_block(
             let lang = store
                 .resolve_lang_tag(o_type)
                 .map(std::string::ToString::to_string);
-            let meta = if lang.is_some() || o_i != u32::MAX {
-                Some(fluree_db_core::FlakeMeta {
-                    lang,
-                    i: if o_i != u32::MAX {
-                        Some(o_i as i32)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            };
+            let meta = fluree_db_core::FlakeMeta::from_packed(lang.as_deref(), o_i);
 
             // Basic sanity: o_type should always be valid.
             let _ = OType::from_u16(o_type);

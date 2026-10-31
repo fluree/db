@@ -7,6 +7,7 @@
 //!   for `eager_materialization` contexts, and when one variable fills two
 //!   positions (`?x ?x ?o`, `?s ?x ?x`).
 
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -1531,7 +1532,7 @@ impl BinaryScanOperator {
         let hide_members = self.hide_list_members
             && !matches!(
                 batch.o_i,
-                fluree_db_binary_index::ColumnData::Const(u32::MAX)
+                fluree_db_binary_index::ColumnData::Const(LIST_INDEX_NONE)
                     | fluree_db_binary_index::ColumnData::AbsentDefault
             );
         for row in 0..batch.row_count {
@@ -1539,7 +1540,7 @@ impl BinaryScanOperator {
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
-            let o_i = batch.o_i.get_or(row, u32::MAX);
+            let o_i = batch.o_i.get_or(row, LIST_INDEX_NONE);
             let t_opt = if batch.t.is_absent() {
                 None
             } else {
@@ -1566,7 +1567,7 @@ impl BinaryScanOperator {
             if self.is_internal_predicate(p_id) {
                 continue;
             }
-            if hide_members && o_i != u32::MAX {
+            if hide_members && o_i != LIST_INDEX_NONE {
                 continue;
             }
 
@@ -2913,7 +2914,7 @@ impl Operator for BinaryScanOperator {
                 o_key: filter.o_key.or(range_max_okey).unwrap_or(u64::MAX),
                 p_id: filter.p_id.unwrap_or(u32::MAX),
                 t: u32::MAX,
-                o_i: u32::MAX,
+                o_i: LIST_INDEX_NONE,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(u16::MAX),
                 g_id: if self.spans_pool() {
                     GraphId::MAX
@@ -3975,9 +3976,7 @@ pub(crate) fn translate_one_flake_v3_pub(
         let o_i = flake
             .m
             .as_ref()
-            .and_then(|m| m.i)
-            .map(|i| i as u32)
-            .unwrap_or(u32::MAX);
+            .map_or(LIST_INDEX_NONE, fluree_db_core::FlakeMeta::packed_place);
         let f32_vec: Vec<f32> = v.iter().map(|&x| x as f32).collect();
         if let Some(handle) = store
             .find_vector_handle_by_fact(g_id, s_id, p_id, o_i, &f32_vec)
@@ -4027,9 +4026,7 @@ pub(crate) fn translate_one_flake_v3_pub(
     let o_i = flake
         .m
         .as_ref()
-        .and_then(|m| m.i)
-        .map(|i| i as u32)
-        .unwrap_or(u32::MAX);
+        .map_or(LIST_INDEX_NONE, fluree_db_core::FlakeMeta::packed_place);
 
     Ok(OverlayOp {
         s_id,
@@ -5087,7 +5084,7 @@ mod bounded_overlay_walk_tests {
     }
 
     /// `OverlayOp` is a foreign type without `PartialEq`; compare by value.
-    fn op_tuple(o: &OverlayOp) -> (u64, u32, u16, u64, u32, i64, bool) {
+    fn op_tuple(o: &OverlayOp) -> (u64, u32, u16, u64, u64, i64, bool) {
         (o.s_id, o.p_id, o.o_type, o.o_key, o.o_i, o.t, o.op)
     }
 
@@ -5378,7 +5375,7 @@ mod bounded_overlay_walk_tests {
                     p_id: (rng(&mut st) % 4) as u32,
                     o_type: 0,
                     o_key: rng(&mut st) % 3,
-                    o_i: u32::MAX,
+                    o_i: LIST_INDEX_NONE,
                     t: (rng(&mut st) % 9) as i64,
                     op: rng(&mut st).is_multiple_of(2),
                     g_id: 0,
@@ -5423,7 +5420,7 @@ mod bounded_overlay_walk_tests {
                     p_id: (rng(&mut st) % 4) as u32,
                     o_type: 0,
                     o_key: rng(&mut st) % 3,
-                    o_i: u32::MAX,
+                    o_i: LIST_INDEX_NONE,
                     t: (rng(&mut st) % 9) as i64,
                     op: rng(&mut st).is_multiple_of(2),
                     g_id: 0,
@@ -5464,7 +5461,7 @@ mod bounded_overlay_walk_tests {
             p_id: 9,
             o_type: 1,
             o_key: 4,
-            o_i: u32::MAX,
+            o_i: LIST_INDEX_NONE,
             t: 5,
             op: true,
             g_id: 0,

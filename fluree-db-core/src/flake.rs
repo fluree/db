@@ -27,7 +27,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 /// Flake metadata - contains language tags, list indices, etc.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FlakeMeta {
     /// Language tag for langString values (e.g., "en", "fr")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +35,28 @@ pub struct FlakeMeta {
     /// Index position for list items
     #[serde(skip_serializing_if = "Option::is_none")]
     pub i: Option<i32>,
+    /// Which list of its graph, subject and predicate a list item is in
+    /// (see [`crate::list_index`]); 0 for the first, and for every value
+    /// with no position.
+    #[serde(default, skip_serializing_if = "is_first_list")]
+    pub list: u32,
+}
+
+fn is_first_list(list: &u32) -> bool {
+    *list == 0
+}
+
+impl fmt::Debug for FlakeMeta {
+    /// `list` is shown only when it is not the first list, so a value's
+    /// debug form reads as it did before lists had identities.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("FlakeMeta");
+        out.field("lang", &self.lang).field("i", &self.i);
+        if self.list != 0 {
+            out.field("list", &self.list);
+        }
+        out.finish()
+    }
 }
 
 /// Canonical form of a BCP 47 language tag: ASCII-lowercased. RDF 1.1 defines
@@ -61,19 +83,45 @@ impl FlakeMeta {
         Self {
             lang: Some(normalize_lang_tag(&lang.into()).into_owned()),
             i: None,
+            list: 0,
         }
     }
 
     /// Metadata for a value with an optional language tag and/or list
     /// position; the tag is normalized like [`with_lang`](Self::with_lang).
     pub fn from_parts(lang: Option<&str>, i: Option<i32>) -> Option<Self> {
-        match (lang, i) {
+        Self::from_place(lang, i.map(|i| (0, i)))
+    }
+
+    /// Metadata for a value with an optional language tag and/or list place:
+    /// which list of its owner it is in, and its position there.
+    pub fn from_place(lang: Option<&str>, place: Option<(u32, i32)>) -> Option<Self> {
+        match (lang, place) {
             (None, None) => None,
-            (lang, i) => Some(Self {
+            (lang, place) => Some(Self {
                 lang: lang.map(|l| normalize_lang_tag(l).into_owned()),
-                i,
+                i: place.map(|(_, i)| i),
+                list: place.map_or(0, |(list, _)| list),
             }),
         }
+    }
+
+    /// [`Self::from_place`] for a place packed as [`crate::list_index`]
+    /// packs it.
+    pub fn from_packed(lang: Option<&str>, packed: u64) -> Option<Self> {
+        Self::from_place(lang, crate::list_index::unpack(packed))
+    }
+
+    /// The list and position of a list item.
+    pub fn place(&self) -> Option<(u32, i32)> {
+        self.i.map(|i| (self.list, i))
+    }
+
+    /// [`Self::place`] packed, or [`crate::list_index::NONE`].
+    pub fn packed_place(&self) -> u64 {
+        self.place().map_or(crate::list_index::NONE, |(list, i)| {
+            crate::list_index::pack(list, i)
+        })
     }
 
     /// Create metadata with list index
@@ -81,6 +129,7 @@ impl FlakeMeta {
         Self {
             lang: None,
             i: Some(i),
+            list: 0,
         }
     }
 
@@ -89,16 +138,18 @@ impl FlakeMeta {
         Self {
             lang: None,
             i: Some(i32::MIN),
+            list: 0,
         }
     }
 
     /// Maximum metadata for range bounds
     ///
     /// This is an upper bound for the metadata a query can reach, **not** a
-    /// maximum over the whole type: `{lang: Some(_), i: Some(i32::MAX)}`
-    /// sorts strictly above it, because [`Ord`] breaks an `i` tie on `lang`
-    /// and `None < Some`. An inclusive upper bound built from this therefore
-    /// excludes a language-tagged value sitting at list index `i32::MAX`.
+    /// maximum over the whole type: `{lang: Some(_), i: Some(i32::MAX),
+    /// list: u32::MAX}` sorts strictly above it, because [`Ord`] breaks a
+    /// place tie on `lang` and `None < Some`. An inclusive upper bound built
+    /// from this therefore excludes a language-tagged value sitting at the
+    /// last position of the last list.
     ///
     /// Unreachable through every bound builder in the tree — [`Flake::max_spot`],
     /// [`Flake::max_for_subject`], [`Flake::max_for_subject_predicate`] and
@@ -122,6 +173,7 @@ impl FlakeMeta {
         Self {
             lang: None,
             i: Some(i32::MAX),
+            list: u32::MAX,
         }
     }
 }
@@ -135,9 +187,10 @@ impl PartialOrd for FlakeMeta {
 impl Ord for FlakeMeta {
     /// Compare metadata for ordering
     ///
-    /// List index first — it is the discriminator a `@list` range walks —
-    /// then the language tag as a tiebreak. `None` sorts before `Some` on
-    /// both fields.
+    /// List place first — it is the discriminator a `@list` range walks —
+    /// then the language tag as a tiebreak. A value with no position sorts
+    /// before every list item, and list items sort by list, then position.
+    /// `None` sorts before `Some` on the tag.
     ///
     /// The tiebreak is what makes this relation agree with the derived
     /// [`Eq`]: `cmp(a, b) == Equal` if and only if `a == b`. Without it,
@@ -147,8 +200,8 @@ impl Ord for FlakeMeta {
     /// test, an exclusive `partition_point` seek — folded the two distinct
     /// facts into one.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.i
-            .cmp(&other.i)
+        self.place()
+            .cmp(&other.place())
             .then_with(|| self.lang.cmp(&other.lang))
     }
 }
@@ -721,14 +774,17 @@ mod tests {
         let m1 = FlakeMeta {
             lang: None,
             i: Some(1),
+            list: 0,
         };
         let m2 = FlakeMeta {
             lang: None,
             i: Some(2),
+            list: 0,
         };
         let m3 = FlakeMeta {
             lang: None,
             i: None,
+            list: 0,
         };
 
         assert!(m1 < m2);
@@ -763,6 +819,7 @@ mod tests {
                 out.push(FlakeMeta {
                     lang: lang.map(str::to_string),
                     i: *i,
+                    list: 0,
                 });
             }
         }
@@ -831,17 +888,23 @@ mod tests {
 
         // The one behavioral consequence of the refinement, pinned where the
         // change is described. `FlakeMeta::max()` is a query range bound, not
-        // a maximum of the type: a language-tagged value at list index
-        // `i32::MAX` now sorts strictly above it, so an inclusive upper bound
-        // built from it no longer admits that (unreachable) case. See the doc
-        // on `FlakeMeta::max`.
+        // a maximum of the type: a language-tagged value at the last position
+        // of list `u32::MAX` sorts strictly above it, so an inclusive upper
+        // bound built from it does not admit that (unreachable) case. See the
+        // doc on `FlakeMeta::max`.
         let sentinel = FlakeMeta::max();
         let tagged_at_max = FlakeMeta {
             lang: Some("en".to_string()),
             i: Some(i32::MAX),
+            list: u32::MAX,
         };
         assert_eq!(legacy_cmp(&tagged_at_max, &sentinel), Ordering::Equal);
         assert_eq!(tagged_at_max.cmp(&sentinel), Ordering::Greater);
+        let tagged_in_first_list = FlakeMeta {
+            list: 0,
+            ..tagged_at_max
+        };
+        assert_eq!(tagged_in_first_list.cmp(&sentinel), Ordering::Less);
     }
 
     /// The law the type was violating: `cmp` returns `Equal` exactly when

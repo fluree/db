@@ -12,6 +12,7 @@
 //! 3. `OTypeRegistry` built from root's `datatype_iris` + `language_tags`
 
 use crate::run_index::resolve::link_synth::SlotValue;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -236,6 +237,11 @@ pub async fn resolve_incremental_commits_v6(
         (bytes, t0.elapsed().as_millis() as u64)
     };
 
+    if !fluree_db_binary_index::format::index_root::is_current_format(&root_bytes) {
+        return Err(IncrementalResolveError::RootLoad(
+            "the base index is of an earlier format; a full rebuild replaces it".to_string(),
+        ));
+    }
     let (root, t_root_decode_ms) = {
         let t0 = Instant::now();
         let root = IndexRoot::decode(&root_bytes).map_err(|e| {
@@ -974,7 +980,7 @@ fn same_sort_prefix(a: &RunRecord, b: &RunRecord) -> bool {
 
 /// Resolved V2 fact identity within a sort-prefix group: `(o_type, o_i)` —
 /// the identity `merge_novelty`, replay, and the query overlay compare by.
-type ResolvedIdentity = (u16, u32);
+type ResolvedIdentity = (u16, u64);
 
 /// Resolve each fact's event sequence within the commit window to a single
 /// final op, so the updated index materializes the same state the in-memory
@@ -1216,7 +1222,7 @@ async fn seed_vector_fact_handles(
                         o_key: if low { 0 } else { u64::MAX },
                         p_id: if low { 0 } else { u32::MAX },
                         t: if low { 0 } else { u32::MAX },
-                        o_i: if low { 0 } else { u32::MAX },
+                        o_i: if low { 0 } else { u64::MAX },
                         o_type: if low { 0 } else { u16::MAX },
                         g_id: g,
                     };
@@ -1247,7 +1253,7 @@ async fn seed_vector_fact_handles(
                 let s_id = batch.s_id.get(i);
                 let p_id = batch.p_id.get(i);
                 let handle = batch.o_key.get(i) as u32;
-                let o_i = batch.o_i.get_or(i, u32::MAX);
+                let o_i = batch.o_i.get_or(i, LIST_INDEX_NONE);
                 let (ns_code, name) = match store.resolve_subject_parts(s_id) {
                     Ok(parts) => parts,
                     Err(e) => {
@@ -1947,7 +1953,7 @@ mod tests {
             o_key,
             p_id,
             t,
-            i: u32::MAX,
+            i: LIST_INDEX_NONE,
             g_id: 0,
             dt: 0,
             lang_id: 0,
@@ -1977,7 +1983,7 @@ mod tests {
         }
     }
 
-    fn list_rec(s_id: u64, p_id: u32, o_key: u64, i: u32, t: u32, op: u8) -> RunRecord {
+    fn list_rec(s_id: u64, p_id: u32, o_key: u64, i: u64, t: u32, op: u8) -> RunRecord {
         RunRecord {
             i,
             ..rec(s_id, p_id, o_key, t, op)
@@ -1993,7 +1999,7 @@ mod tests {
     }
 
     /// Field projection for assertions (`RunRecord` has no `Debug`).
-    type RecordKey = (u64, u32, u64, u16, u32, u16, u32, u8);
+    type RecordKey = (u64, u32, u64, u16, u64, u16, u32, u8);
 
     fn key(r: &RunRecord) -> RecordKey {
         (

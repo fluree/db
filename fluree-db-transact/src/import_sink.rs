@@ -83,7 +83,8 @@ mod inner {
         pub o: &'a FlakeValue,
         pub dt: &'a Sid,
         pub lang: Option<&'a str>,
-        pub list_index: Option<i32>,
+        /// The list and position of a list member (`FlakeMeta::place`).
+        pub place: Option<(u32, i32)>,
         pub t: i64,
     }
 
@@ -587,7 +588,7 @@ mod inner {
                 o,
                 dt,
                 lang,
-                list_index,
+                place,
                 t,
             } = rec;
             let s_id = self.assign_subject_id(s);
@@ -600,16 +601,20 @@ mod inner {
                 return Ok(()); // a triple term is spooled through the term table
             };
             let lang_id = lang.map(|l| self.assign_lang_id(l)).unwrap_or(0);
-            let i = list_index
-                .map(|idx| {
+            let i = place
+                .map(|(list, idx)| {
                     debug_assert!(idx >= 0, "negative list index {idx} in import data");
-                    u32::try_from(idx).unwrap_or(LIST_INDEX_NONE)
+                    if idx < 0 {
+                        LIST_INDEX_NONE
+                    } else {
+                        fluree_db_core::list_index::pack(list, idx)
+                    }
                 })
                 .unwrap_or(LIST_INDEX_NONE);
             // Observe the position on the branch that actually records one:
-            // an out-of-range `list_index` coerces to the sentinel above and
-            // is not a list row in the index, so gate on `i`, not on
-            // `list_index.is_some()`.
+            // an out-of-range position coerces to the sentinel above and is
+            // not a list row in the index, so gate on `i`, not on
+            // `place.is_some()`.
             self.saw_list_meta |= i != LIST_INDEX_NONE;
 
             let record = RunRecord {
@@ -1275,7 +1280,7 @@ mod inner {
                     o: &flake.o,
                     dt: &flake.dt,
                     lang: meta.and_then(|m| m.lang.as_deref()),
-                    list_index: meta.and_then(|m| m.i),
+                    place: meta.and_then(FlakeMeta::place),
                     t: flake.t,
                 };
                 let written = match &flake.g {
@@ -1720,7 +1725,7 @@ mod inner {
                 o: &o,
                 dt,
                 lang: None,
-                list_index: None,
+                place: None,
                 t: 1,
             };
 
@@ -1756,13 +1761,13 @@ mod inner {
             let p = Sid::new(fluree_vocab::namespaces::RDF, "pred");
             let dt = Sid::new(fluree_vocab::namespaces::XSD, "string");
             let o = FlakeValue::String("v".to_string());
-            let rec = |list_index| FlakeRecord {
+            let rec = |place| FlakeRecord {
                 s: &s,
                 p: &p,
                 o: &o,
                 dt: &dt,
                 lang: None,
-                list_index,
+                place,
                 t: 1,
             };
 
@@ -1777,7 +1782,7 @@ mod inner {
 
             let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-b.spool"), 1, 0, &config)
                 .expect("spool ctx");
-            ctx.write_record(rec(Some(0))).unwrap();
+            ctx.write_record(rec(Some((0, 0)))).unwrap();
             let _ = ctx.finish_buffered();
             assert!(
                 config.saw_list_meta.load(Ordering::Relaxed),

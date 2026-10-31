@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
 };
@@ -367,7 +368,7 @@ fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) 
         o_key: u64::MAX,
         p_id,
         t: u32::MAX,
-        o_i: u32::MAX,
+        o_i: LIST_INDEX_NONE,
         o_type: u16::MAX,
         g_id,
     };
@@ -1175,13 +1176,13 @@ impl<'a> PsotSubjectSeek<'a> {
     pub fn rows_for_subject_identity(
         &mut self,
         target_s: u64,
-        mut on_row: impl FnMut(u16, u64, u32),
+        mut on_row: impl FnMut(u16, u64, u64),
     ) -> Result<Option<u64>> {
         self.visit_subject(target_s, |batch, row| {
             on_row(
                 batch.o_type.get(row),
                 batch.o_key.get(row),
-                batch.o_i.get_or(row, u32::MAX),
+                batch.o_i.get_or(row, LIST_INDEX_NONE),
             );
         })
     }
@@ -2415,7 +2416,7 @@ impl ProbeOps {
         p_id: u32,
         o_type: u16,
         o_key: u64,
-        o_i: u32,
+        o_i: u64,
     ) -> RowFate {
         if window.is_empty() {
             return RowFate::Keep;
@@ -2465,7 +2466,7 @@ impl ProbeOps {
 struct ObjectProbeOp {
     o_key: u64,
     s_id: u64,
-    o_i: u32,
+    o_i: u64,
     /// true = assert, false = retract.
     op: bool,
 }
@@ -2533,7 +2534,7 @@ impl ObjectProbeOps {
         &mut self,
         window: &std::ops::Range<usize>,
         s_id: u64,
-        o_i: u32,
+        o_i: u64,
     ) -> RowFate {
         if window.is_empty() {
             return RowFate::Keep;
