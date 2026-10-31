@@ -36,6 +36,8 @@
   - [prefix](cli/prefix.md)
   - [token](cli/token.md)
   - [auth](cli/auth.md)
+  - [login](cli/login.md)
+  - [logout](cli/logout.md)
   - [remote](cli/remote.md)
   - [upstream](cli/upstream.md)
   - [fetch](cli/fetch.md)

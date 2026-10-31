@@ -2,13 +2,15 @@
 
 Manage authentication tokens for remote servers. Tokens are stored in `.fluree/config.toml` as part of the remote configuration.
 
+A fluree.ai account is signed in to separately, once per machine, with [`fluree login`](login.md); `fluree auth status` shows that sign-in too.
+
 Token values reach stdout only through the explicit `auth token` subcommand, which prints exactly one access token for scripting. The `status` command shows token presence, expiry, and identity only. Refresh tokens are never printed except by the explicit raw-config escape hatch `fluree config list --reveal` (plain `config list` masks all credentials as `[redacted]`).
 
 ## Subcommands
 
 | Subcommand | Description |
 |------------|-------------|
-| `status` | Show authentication status for a remote |
+| `status` | Show the machine's fluree.ai sign-in and a remote's authentication status |
 | `login` | Store a bearer token for a remote |
 | `logout` | Clear the stored token for a remote |
 | `token` | Print the stored access token for a remote (for scripting) |
@@ -18,6 +20,18 @@ Token values reach stdout only through the explicit `auth token` subcommand, whi
 ## fluree auth status
 
 Show the current authentication state for a remote, including token presence, expiry time, identity, and issuer.
+
+Without `--remote`, it first shows the machine's fluree.ai sign-in (from [`fluree login`](login.md)) when there is one, then
+the only configured remote, if exactly one is configured. Outside any project it shows the sign-in alone. It reads local
+state only and never contacts a server:
+
+```
+Account:
+  Signed in to fluree.ai as you@example.com (Your Org)
+  Tier: free
+  Access token: valid until 2026-11-02 15:04 UTC
+  Credentials: ~/Library/Application Support/fluree/account.toml
+```
 
 ### Usage
 
