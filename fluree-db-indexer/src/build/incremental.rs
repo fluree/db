@@ -244,7 +244,7 @@ async fn run_update_branch(
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let leaf_map: HashMap<ContentId, Vec<u8>> = leaf_pairs.into_iter().collect();
+    let leaf_map = Prefetched::new(leaf_pairs, touched.iter().map(|(leaf, _)| leaf));
 
     // Sidecars: NotFound => absent (None); other errors abort (preserved).
     let sidecar_pairs: Vec<(ContentId, Option<Vec<u8>>)> = stream::iter(sidecar_cids)
@@ -288,10 +288,12 @@ async fn run_update_branch(
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let sidecar_map: HashMap<ContentId, Vec<u8>> = sidecar_pairs
-        .into_iter()
-        .filter_map(|(cid, opt)| opt.map(|b| (cid, b)))
-        .collect();
+    let sidecar_map = Prefetched::new(
+        sidecar_pairs
+            .into_iter()
+            .filter_map(|(cid, opt)| opt.map(|b| (cid, b))),
+        touched.iter().filter_map(|(_, sidecar)| sidecar.as_ref()),
+    );
 
     // Bounded channel from the blocking CoW to the async uploader. The bound
     // gives backpressure: the CoW parks on `blocking_send` (it's already on a
@@ -315,11 +317,11 @@ async fn run_update_branch(
             &branch_config,
             &|cid| {
                 leaf_map
-                    .get(cid)
-                    .cloned()
+                    .take(cid)?
                     .ok_or_else(|| std::io::Error::other(format!("leaf {cid} not prefetched")))
             },
-            &|cid| Ok(sidecar_map.get(cid).cloned()),
+            // A sidecar storage did not hold was never prefetched: absent.
+            &|cid| sidecar_map.take(cid),
             &mut |blob| {
                 tx.blocking_send(blob)
                     .map_err(|_| std::io::Error::other("leaf upload channel closed"))
@@ -417,6 +419,67 @@ fn par_batched_lookup<V: Send>(
             a.extend(b);
             Ok(a)
         })
+}
+
+/// Prefetched blobs for one branch's copy-on-write, each handed over on its
+/// last read: the CoW owns what it reads, so a blob it reads once is moved,
+/// not copied, and leaves memory as its leaf is rewritten instead of when the
+/// whole order finishes.
+struct Prefetched {
+    blobs: std::sync::Mutex<HashMap<ContentId, PrefetchSlot>>,
+}
+
+/// A prefetched blob (`None` once handed over) and the reads still expected.
+type PrefetchSlot = (Option<Vec<u8>>, usize);
+
+impl Prefetched {
+    /// `blobs` as fetched, and the CID of every read the CoW will make, one
+    /// per touched leaf (two leaves can share a CID).
+    fn new<'a>(
+        blobs: impl IntoIterator<Item = (ContentId, Vec<u8>)>,
+        reads: impl IntoIterator<Item = &'a ContentId>,
+    ) -> Self {
+        let mut expected: HashMap<&ContentId, usize> = HashMap::new();
+        for cid in reads {
+            *expected.entry(cid).or_insert(0) += 1;
+        }
+        let blobs = blobs
+            .into_iter()
+            .map(|(cid, bytes)| {
+                let reads = expected.get(&cid).copied().unwrap_or(1);
+                (cid, (Some(bytes), reads))
+            })
+            .collect();
+        Self {
+            blobs: std::sync::Mutex::new(blobs),
+        }
+    }
+
+    /// The blob at `cid`, `None` if it was not prefetched. A read past the
+    /// last expected one is an error, never `None`: for a sidecar `None`
+    /// means "this leaf has no history".
+    fn take(&self, cid: &ContentId) -> std::io::Result<Option<Vec<u8>>> {
+        let mut blobs = self
+            .blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((bytes, reads)) = blobs.get_mut(cid) else {
+            return Ok(None);
+        };
+        match (*reads, bytes.as_ref()) {
+            (_, None) => Err(std::io::Error::other(format!(
+                "{cid} read more often than prefetched"
+            ))),
+            (1, Some(_)) => {
+                *reads = 0;
+                Ok(bytes.take())
+            }
+            (_, Some(b)) => {
+                *reads -= 1;
+                Ok(Some(b.clone()))
+            }
+        }
+    }
 }
 
 enum Phase2TaskKind {
@@ -5761,5 +5824,42 @@ mod par_batched_lookup_tests {
         })
         .unwrap_err();
         assert_eq!(err.to_string(), "leaf unreadable");
+    }
+}
+
+#[cfg(test)]
+mod prefetched_tests {
+    use super::Prefetched;
+    use fluree_db_core::{ContentId, ContentKind};
+
+    #[test]
+    fn each_expected_read_gets_the_blob_and_an_extra_read_fails() {
+        let shared = ContentId::new(ContentKind::IndexLeaf, b"empty leaf");
+        let once = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+        let prefetched = Prefetched::new(
+            [
+                (shared.clone(), b"empty leaf".to_vec()),
+                (once.clone(), b"leaf".to_vec()),
+            ],
+            [&shared, &once, &shared],
+        );
+        assert_eq!(
+            prefetched.take(&shared).unwrap().as_deref(),
+            Some(&b"empty leaf"[..])
+        );
+        assert_eq!(
+            prefetched.take(&once).unwrap().as_deref(),
+            Some(&b"leaf"[..])
+        );
+        assert_eq!(
+            prefetched.take(&shared).unwrap().as_deref(),
+            Some(&b"empty leaf"[..])
+        );
+        assert!(
+            prefetched.take(&shared).is_err(),
+            "a read past the expected ones must not read as an absent blob"
+        );
+        let never = ContentId::new(ContentKind::HistorySidecar, b"absent");
+        assert_eq!(prefetched.take(&never).unwrap(), None);
     }
 }
