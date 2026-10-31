@@ -1245,16 +1245,15 @@ impl Fluree {
                 holders.push(record);
             }
         }
+        let current: HashMap<ContentId, bool> = heads
+            .into_iter()
+            .filter_map(|head| reached.get(&head).map(|reaches| (head, *reaches)))
+            .collect();
         let mut kept = runtime.reached_heads.lock();
         if kept.len() >= REACHED_SETS && !kept.contains_key(&key) {
             kept.clear();
         }
-        let kept = kept.entry(key).or_default();
-        for head in heads {
-            if let Some(reaches) = reached.get(&head) {
-                kept.insert(head, *reaches);
-            }
-        }
+        kept.insert(key, current);
         Ok(Some(holders))
     }
 

@@ -923,3 +923,44 @@ async fn a_branch_reaching_an_erased_commit_only_through_a_merge_holds_it() {
     }
     assert!(holds(&fluree).await, "once the side's head is above it");
 }
+
+/// A set keeps the heads its branches had at the last walk: one a branch has
+/// moved past is dropped.
+#[tokio::test]
+async fn an_erased_set_keeps_only_its_branches_current_heads() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    let name = "holders/kept-heads";
+    let main = "holders/kept-heads:main";
+    fluree.create_ledger(name).await.unwrap();
+    insert(
+        &fluree,
+        main,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences(main, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    let job = fluree.job(main, &receipt.request_id).await.unwrap();
+    for n in 0..4 {
+        insert(
+            &fluree,
+            main,
+            json!({"@id": format!("http://example.org/s{n}"), "http://example.org/name": n}),
+        )
+        .await;
+        let holders = fluree.holders(main, &job).await.unwrap().unwrap();
+        assert!(holders.iter().any(|r| r.ledger_id == main));
+    }
+    let kept: Vec<usize> = fluree
+        .erasure_runtime()
+        .unwrap()
+        .reached_heads
+        .lock()
+        .values()
+        .map(std::collections::HashMap::len)
+        .collect();
+    assert_eq!(kept, vec![1]);
+}

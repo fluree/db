@@ -115,8 +115,8 @@ pub(crate) struct ErasureRuntime {
     pub(crate) for_leader: parking_lot::Mutex<Option<members::ForLeader>>,
     /// Held while this host proves: a proof can take most of its memory.
     pub(crate) proving: tokio::sync::Mutex<()>,
-    /// Per erased set, whether each branch head found so far reaches it: a
-    /// commit's history never changes, so a later walk stops at one.
+    /// Per erased set, whether each branch's head at the last walk reaches
+    /// it: a commit's history never changes, so the next walk stops there.
     pub(crate) reached_heads: parking_lot::Mutex<
         std::collections::HashMap<
             String,
