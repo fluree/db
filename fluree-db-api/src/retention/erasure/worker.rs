@@ -341,10 +341,23 @@ impl Fluree {
                 return;
             };
             let _clear = InFlight(&runtime.purge_in_flight);
-            for name in due {
-                if let Err(e) = fluree.run_purge_pass(&name, grace).await {
-                    tracing::warn!(ledger = %name, error = %e, "erasure: purge pass failed");
+            let passes = async {
+                for name in due {
+                    if let Err(e) = fluree.run_purge_pass(&name, grace).await {
+                        tracing::warn!(ledger = %name, error = %e, "erasure: purge pass failed");
+                    }
                 }
+            };
+            match runtime.members.get() {
+                // A cluster's passes end with the leadership that began them;
+                // the next leader resumes them.
+                Some(members) => {
+                    tokio::select! {
+                        () = passes => {}
+                        () = members.deposed() => {}
+                    }
+                }
+                None => passes.await,
             }
         });
     }
