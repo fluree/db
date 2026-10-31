@@ -380,6 +380,11 @@ async fn run_update_branch(
     Ok((meta, stats.snapshot()))
 }
 
+/// A batch re-typing more than this fraction (1/n) of the base index's typed
+/// subjects defers class stats to a full rebuild; see
+/// `IndexerConfig::incremental_retype_max_subjects` for the floor.
+const RETYPE_REBUILD_SHARE: u64 = 8;
+
 /// Run a batched base-index lookup over `ids` on the rayon pool.
 ///
 /// The batched lookups answer per requested id, and each slice here is a
@@ -2708,22 +2713,63 @@ pub async fn incremental_index(
                 // let the caller fall back to rebuild. Only count subjects that existed in
                 // the base index (those drive the re-scan work); brand-new typed subjects
                 // are free. An IncrementalAbort is caught in lib.rs and routed to rebuild.
+                //
+                // The rebuild re-reads the whole index, so the cap scales with
+                // it: the configured count is the floor, and a ledger with more
+                // typed subjects aborts only once a share of them changed type.
+                // A fixed count sent every large batch of entity deletes on a
+                // large ledger (each retracts its subject's types) to a rebuild
+                // costing minutes where the re-scan costs seconds.
                 let retype_workload = changed_membership
                     .iter()
                     .filter(|key| base_subject_classes.contains_key(*key))
                     .count();
-                if retype_workload > config.incremental_retype_max_subjects {
+                // Subjects, as the workload counts them: per graph, the
+                // distinct subjects of rdf:type, or with no estimate for it the
+                // largest class (a lower bound, which only defers sooner).
+                // Summing class counts would count a subject once per type.
+                let base_typed_subjects: u64 = base_root
+                    .stats
+                    .as_ref()
+                    .and_then(|stats| stats.graphs.as_ref())
+                    .map(|graphs| {
+                        graphs
+                            .iter()
+                            .map(|graph| {
+                                graph
+                                    .properties
+                                    .iter()
+                                    .find(|p| p.p_id == rdf_type_p_id)
+                                    .map(|p| p.ndv_subjects)
+                                    .filter(|&n| n > 0)
+                                    .unwrap_or_else(|| {
+                                        graph
+                                            .classes
+                                            .iter()
+                                            .flatten()
+                                            .map(|class| class.count)
+                                            .max()
+                                            .unwrap_or(0)
+                                    })
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let retype_threshold = config.incremental_retype_max_subjects.max(
+                    usize::try_from(base_typed_subjects / RETYPE_REBUILD_SHARE)
+                        .unwrap_or(usize::MAX),
+                );
+                if retype_workload > retype_threshold {
                     tracing::warn!(
                         retype_workload,
-                        threshold = config.incremental_retype_max_subjects,
+                        threshold = retype_threshold,
                         "Phase 3b: existing-subject rdf:type changes exceed threshold; \
                          aborting incremental for full rebuild (class stats recomputed \
                          from the SPOT pass)"
                     );
                     return Err(IndexerError::IncrementalAbort(format!(
-                        "re-type workload {retype_workload} exceeds threshold {} \
-                         (deferring class-stat recompute to full rebuild)",
-                        config.incremental_retype_max_subjects
+                        "re-type workload {retype_workload} exceeds threshold {retype_threshold} \
+                         (deferring class-stat recompute to full rebuild)"
                     )));
                 }
 
