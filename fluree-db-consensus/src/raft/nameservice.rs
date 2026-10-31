@@ -112,6 +112,8 @@ pub struct RaftNameService {
     erasure: Option<Arc<crate::raft::erasure::ErasureNode>>,
     /// Set once this node checks its writes against collection intents.
     checks_writes: std::sync::atomic::AtomicBool,
+    /// The engine that proves the steps this node's leader hands it.
+    prover: std::sync::OnceLock<std::sync::Weak<fluree_db_api::Fluree>>,
 }
 
 /// Per-node forwarding configuration for [`RaftNameService`]. Held as
@@ -142,6 +144,7 @@ impl RaftNameService {
             forwarding: None,
             erasure: None,
             checks_writes: std::sync::atomic::AtomicBool::new(false),
+            prover: std::sync::OnceLock::new(),
         }
     }
 
@@ -891,6 +894,7 @@ pub struct StagedCommit {
 
 mod activation;
 mod collection;
+mod proving;
 pub mod read_index;
 mod wire;
 
@@ -1376,19 +1380,24 @@ impl FromRaftWriteError for ApplyErasureReportError {
     }
 }
 
-/// Axum router for [`ERASURE_REPORT_PATH`], mounted beside
-/// [`apply_queue_poison_router`] with the same trust posture. The report
-/// is as small as a poison, so it takes the same body cap.
+/// Path under [`erasure_report_router`]'s root the leader posts a proving
+/// step to, again until the member answers how it ended.
+pub const ERASURE_PROVE_PATH: &str = "/erasure_prove";
+
+/// Axum router for [`ERASURE_REPORT_PATH`] and [`ERASURE_PROVE_PATH`],
+/// mounted beside [`apply_queue_poison_router`] with the same trust
+/// posture. A report or a step is as small as a poison, so each takes the
+/// same body cap.
 pub fn erasure_report_router(
     ns: Arc<RaftNameService>,
     network_config: &crate::raft::network::NetworkConfig,
 ) -> Router {
+    let cap = DefaultBodyLimit::max(network_config.apply_queue_poison_max_body_bytes);
     Router::new()
+        .route(ERASURE_REPORT_PATH, post(handle_erasure_report).layer(cap))
         .route(
-            ERASURE_REPORT_PATH,
-            post(handle_erasure_report).layer(DefaultBodyLimit::max(
-                network_config.apply_queue_poison_max_body_bytes,
-            )),
+            ERASURE_PROVE_PATH,
+            post(proving::handle_erasure_prove).layer(cap),
         )
         .with_state(ns)
 }

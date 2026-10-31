@@ -608,6 +608,29 @@ impl ErasureIndex {
         Ok(hex)
     }
 
+    /// Store `proved`, a verified step, under `key`, which names what it
+    /// proved from.
+    pub(crate) async fn put_proved(&self, key: &str, proved: &super::ProvedStep) -> Result<()> {
+        let bytes = serde_json::to_vec(proved).map_err(|e| ApiError::internal(e.to_string()))?;
+        self.storage
+            .write_bytes(&self.address(&format!("proved/{key}.json")), &bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// The step stored under `key`, if one was proved.
+    pub(crate) async fn proved(&self, key: &str) -> Result<Option<super::ProvedStep>> {
+        let Some(bytes) = self
+            .read_raw(&self.address(&format!("proved/{key}.json")))
+            .await?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| ApiError::internal(format!("stored proof {key}: {e}")))
+    }
+
     /// An artifact's bytes, checked against the hash that names them.
     pub(crate) async fn artifact(&self, kind: Artifact, hex: &str) -> Result<Vec<u8>> {
         let bytes = self

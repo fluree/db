@@ -29,6 +29,7 @@
 
 mod activation;
 pub(crate) mod index;
+mod members;
 pub(crate) mod purge;
 mod request;
 pub(crate) mod transfer;
@@ -43,6 +44,7 @@ pub use fluree_db_erasure::{
     PROVER_BINARY, REDACT_IMAGE_IDS,
 };
 pub use index::{ErasedCommit, ErasureStep};
+pub use members::{MemberProving, ProofStep, ProvingMembers, StepOutcome};
 pub use purge::{PurgeInspection, PurgePlan, PurgeReport, PurgeScan, PurgeTimings};
 pub use request::{BranchRemoval, ErasureReceipt, ErasureRequest};
 use serde::{Deserialize, Serialize};
@@ -107,6 +109,10 @@ pub(crate) struct ErasureRuntime {
     fact_keys: std::collections::hash_map::RandomState,
     /// Set on a cluster member: publications go through it.
     pub(crate) activator: std::sync::OnceLock<Arc<dyn ErasureActivator>>,
+    /// Set on a cluster member: as leader, it has steps proved on others.
+    pub(crate) members: std::sync::OnceLock<Arc<dyn ProvingMembers>>,
+    /// The step this member proves for its leader.
+    pub(crate) for_leader: parking_lot::Mutex<Option<members::ForLeader>>,
 }
 
 /// What reconciling a branch with received erasures took out of its
@@ -137,6 +143,8 @@ impl ErasureRuntime {
             fences: Default::default(),
             fact_keys: Default::default(),
             activator: Default::default(),
+            members: Default::default(),
+            for_leader: Default::default(),
         }
     }
 

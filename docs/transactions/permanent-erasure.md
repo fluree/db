@@ -166,6 +166,13 @@ earlier releases.
 A Raft cluster accepts a request on its leader once every member, voter or learner, runs this
 release; until then it refuses with `501`. What differs from a single node:
 
+- **Proving.** The leader accepts requests only with a prover of its own, so install it on every
+  member. It has each step proved by another member with a prover, voter or learner: first one that
+  neither leads nor stages the transactions of a branch holding the commit, then any other. The
+  member proves one step at a time, once it has installed the cluster's erasures, and stores the
+  result in the shared storage; the leader verifies it and records it. The leader proves a step
+  itself only when no other member can. A step a member proved for a leader since replaced is found
+  by the next one and not proved again.
 - **Publication.** The leader writes the prepared erasure as an immutable manifest and activates it
   through Raft. The activation is refused, and the erasure prepared again, if a branch holding the
   erased commits changed meanwhile. Each member installs activations in order. Until it has, its

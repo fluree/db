@@ -208,8 +208,36 @@ async fn stand_up_with(
     EmbeddedRaftNode,
     (tempfile::TempDir, tempfile::TempDir),
 ) {
-    let raft_dir = tempfile::tempdir().expect("raft dir");
     let data_dir = tempfile::tempdir().expect("data dir");
+    let (integration, fluree, node, raft_dir, address) =
+        start_node(node_id, data_dir.path(), build, configure).await;
+    integration
+        .raft
+        .initialize(BTreeMap::from([(node_id, address)]))
+        .await
+        .expect("initialize");
+    eventually("self-election", async || {
+        integration.raft.current_leader().await == Some(node_id)
+    })
+    .await;
+    (integration, fluree, node, (raft_dir, data_dir))
+}
+
+/// A node on the storage at `data_dir`, serving its Raft routes, attached
+/// but in no cluster yet, and the address it is reached at.
+async fn start_node(
+    node_id: u64,
+    data_dir: &std::path::Path,
+    build: impl FnOnce(FlureeBuilder) -> FlureeBuilder,
+    configure: impl FnOnce(EmbeddedRaftConfig) -> EmbeddedRaftConfig,
+) -> (
+    Arc<RaftIntegration>,
+    Arc<fluree_db_api::Fluree>,
+    EmbeddedRaftNode,
+    tempfile::TempDir,
+    fluree_db_consensus::raft::ClusterNode,
+) {
+    let raft_dir = tempfile::tempdir().expect("raft dir");
     let integration = Arc::new(
         RaftIntegration::bootstrap(RaftBootstrapConfig::new(node_id, raft_dir.path()))
             .await
@@ -226,7 +254,7 @@ async fn stand_up_with(
         let _ = axum::serve(listener, app).await;
     });
     let ns: Arc<dyn NameServicePublisher> = integration.nameservice();
-    let builder = FlureeBuilder::file(data_dir.path().to_string_lossy().as_ref())
+    let builder = FlureeBuilder::file(data_dir.to_string_lossy().as_ref())
         .with_event_bus(Arc::clone(&integration.event_bus))
         .with_storage_wal_owner(format!("node-{node_id}"));
     let fluree = Arc::new(
@@ -241,24 +269,11 @@ async fn stand_up_with(
         configure(EmbeddedRaftConfig::for_engine(&fluree)),
     )
     .await;
-    let mut members = BTreeMap::new();
-    members.insert(
-        node_id,
-        fluree_db_consensus::raft::ClusterNode::new(
-            format!("http://127.0.0.1:{port}/raft/nameservice"),
-            format!("http://127.0.0.1:{port}"),
-        ),
+    let address = fluree_db_consensus::raft::ClusterNode::new(
+        format!("http://127.0.0.1:{port}/raft/nameservice"),
+        format!("http://127.0.0.1:{port}"),
     );
-    integration
-        .raft
-        .initialize(members)
-        .await
-        .expect("initialize");
-    eventually("self-election", async || {
-        integration.raft.current_leader().await == Some(node_id)
-    })
-    .await;
-    (integration, fluree, node, (raft_dir, data_dir))
+    (integration, fluree, node, raft_dir, address)
 }
 
 /// A transaction large enough that staging plus the Raft round trip
@@ -817,6 +832,201 @@ async fn a_push_of_erased_history_is_refused() {
         }
     }
     node.shutdown().await;
+}
+
+/// A leader with a learner, both proving natively on one storage, and an
+/// erasure of a value the leader's ledger asserted, accepted.
+async fn erasing_pair() -> Pair {
+    use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
+    use fluree_db_api::retention::FactSelector;
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let provers = [
+        Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+        Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+    ];
+    let erasing = |prover: &Arc<fluree_db_erasure::testing::NativeProver>| {
+        let prover = Arc::clone(prover);
+        move |builder: FlureeBuilder| {
+            builder.with_erasure(ErasureConfig {
+                prover,
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+        }
+    };
+    let (integration, fluree, node, leader_raft, address) =
+        start_node(61, data_dir.path(), erasing(&provers[0]), |config| config).await;
+    integration
+        .raft
+        .initialize(BTreeMap::from([(61, address)]))
+        .await
+        .expect("initialize");
+    eventually("self-election", async || {
+        integration.raft.current_leader().await == Some(61)
+    })
+    .await;
+    let (member_integration, member, member_node, member_raft, address) =
+        start_node(62, data_dir.path(), erasing(&provers[1]), |config| config).await;
+    integration
+        .raft
+        .add_learner(62, address, true)
+        .await
+        .expect("learner added");
+
+    let id = "proved/db:main";
+    fluree.create_ledger("proved/db").await.expect("create");
+    let mut request = bulk_request(id, 1);
+    request.body = TransactionBody::JsonLdInsert(serde_json::json!({
+        "@id": "http://example.org/alice",
+        "http://example.org/email": "a@secret"
+    }));
+    node.committer.transact(request).await.expect("insert");
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::new(
+        std::sync::OnceLock::from(Arc::clone(&node.committer)),
+    ));
+    let erasure = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/alice".into(),
+            predicate: "http://example.org/email".into(),
+            graph: None,
+            object: Some(serde_json::json!("a@secret")),
+        }],
+        ..Default::default()
+    };
+    fluree
+        .erase_occurrences_with(&writer, id, erasure, None)
+        .await
+        .expect("accepted");
+    Pair {
+        integration,
+        fluree,
+        node,
+        member_integration,
+        member,
+        member_node,
+        provers,
+        _dirs: (leader_raft, member_raft, data_dir),
+    }
+}
+
+struct Pair {
+    integration: Arc<RaftIntegration>,
+    fluree: Arc<fluree_db_api::Fluree>,
+    node: EmbeddedRaftNode,
+    member_integration: Arc<RaftIntegration>,
+    member: Arc<fluree_db_api::Fluree>,
+    member_node: EmbeddedRaftNode,
+    /// The leader's, then the member's.
+    provers: [Arc<fluree_db_erasure::testing::NativeProver>; 2],
+    _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
+}
+
+impl Pair {
+    async fn job(&self) -> fluree_db_api::retention::erasure::ErasureJob {
+        self.fluree
+            .retention_status("proved/db:main")
+            .await
+            .expect("status")
+            .registration
+            .expect("registered")
+            .erasures
+            .remove(0)
+    }
+
+    async fn shutdown(self) {
+        self.member_node.shutdown().await;
+        self.node.shutdown().await;
+    }
+}
+
+/// A leader has its proving steps proved by another member with a prover,
+/// and records what that member proved; its own prover proves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_member_proves_the_leaders_steps() {
+    let pair = erasing_pair().await;
+    let report = pair
+        .fluree
+        .run_erasure_pass("proved/db:main")
+        .await
+        .expect("pass");
+    let job = pair.job().await;
+    assert_eq!(report.proved, job.commits.len(), "{report:?}");
+    assert!(pair.provers[0].proved().is_empty());
+    assert_eq!(pair.provers[1].proved().len(), job.commits.len());
+    assert!(job.commits.iter().all(|c| c.proved.is_some()), "{job:?}");
+
+    // A step ends with its leader's leadership: a member that does not
+    // lead has none to wait out.
+    use fluree_db_api::retention::erasure::ProvingMembers;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        pair.member_integration.nameservice().deposed(),
+    )
+    .await
+    .expect("a learner leads nothing");
+    assert!(tokio::time::timeout(
+        Duration::from_millis(300),
+        pair.integration.nameservice().deposed()
+    )
+    .await
+    .is_err());
+    pair.shutdown().await;
+}
+
+/// A step a member proved for a leader since gone is not proved again: the
+/// next leader finds what it stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_proved_for_an_earlier_leader_is_not_proved_again() {
+    use fluree_db_api::retention::erasure::{MemberProving, ProofStep};
+
+    let pair = erasing_pair().await;
+    let job = pair.job().await;
+    for task in &job.commits {
+        let step = ProofStep {
+            branch: "proved/db:main".to_string(),
+            request_id: job.request_id.clone(),
+            commit: task.commit.clone(),
+            branches: task.branches.clone(),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match pair.member.prove_for_leader(step.clone()) {
+                MemberProving::Done(outcome) => {
+                    assert!(
+                        matches!(
+                            outcome,
+                            fluree_db_api::retention::erasure::StepOutcome::Proved(_)
+                        ),
+                        "{outcome:?}"
+                    );
+                    break;
+                }
+                MemberProving::Proving => {}
+                other => panic!("{other:?}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "the member proves");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // Gone from the cluster, the member is asked nothing.
+    pair.integration
+        .raft
+        .change_membership(
+            openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([62])),
+            false,
+        )
+        .await
+        .expect("member removed");
+    let report = pair
+        .fluree
+        .run_erasure_pass("proved/db:main")
+        .await
+        .expect("pass");
+    assert_eq!(report.proved, job.commits.len(), "{report:?}");
+    assert!(pair.provers[0].proved().is_empty());
+    assert_eq!(pair.provers[1].proved().len(), job.commits.len());
+    pair.shutdown().await;
 }
 
 /// An erasure made on a cluster publishes through Raft: the leader

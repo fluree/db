@@ -16,7 +16,9 @@ use futures::FutureExt;
 
 use super::activation::{ErasureActivator, HOLD};
 use super::index::{Artifact, ErasedCommit, ErasureStep, REFRESH};
-use super::{ClusterPublication, CommitErasure, ErasureJob, ErasureStage, ProvedStep};
+use super::{
+    ClusterPublication, CommitErasure, ErasureJob, ErasureStage, ProofStep, ProvedStep, StepOutcome,
+};
 use crate::retention::lineage::span_ends;
 use crate::retention::registry;
 use crate::retention::removal::OccurrenceRef;
@@ -275,9 +277,19 @@ impl Fluree {
                 return;
             };
             let _clear = InFlight(&runtime.in_flight);
-            fluree
-                .step_and_record(&branch, &request_id, &commit, retry_ms)
-                .await;
+            let step = fluree.step_and_record(&branch, &request_id, &commit, retry_ms);
+            match runtime.members.get() {
+                // A cluster's step ends with the leadership that began it.
+                Some(members) => {
+                    tokio::select! {
+                        _ = step => {}
+                        () = members.deposed() => {}
+                    }
+                }
+                None => {
+                    step.await;
+                }
+            }
             fluree.retention.nudge.notify_one();
         });
     }
@@ -434,18 +446,83 @@ impl Fluree {
 
     /// Prove the step of `request_id` on `commit` over its published
     /// erasure, verify it with every earlier step, and store its artifacts.
-    /// `None` when the published erasure leaves nothing to prove.
+    /// `None` when the published erasure leaves nothing to prove. On a
+    /// cluster another member proves it when one can, and its result is
+    /// verified here.
     async fn prove_step(
         &self,
         branch: &str,
         request_id: &str,
         commit: &str,
     ) -> std::result::Result<Option<ProvedStep>, StepError> {
+        let Some(step) = self.prepare_step(branch, request_id, commit).await? else {
+            return Ok(None);
+        };
+        if let Some(proved) = self.stored_proof(&step).await? {
+            return Ok(Some(proved));
+        }
         let runtime = self.erasure_runtime().map_err(StepError::Retry)?;
-        let config = runtime
-            .config
-            .as_ref()
-            .ok_or_else(|| StepError::Retry(ApiError::internal("no prover")))?;
+        if let Some(members) = runtime.members.get() {
+            let handed = ProofStep {
+                branch: branch.to_string(),
+                request_id: request_id.to_string(),
+                commit: commit.to_string(),
+                branches: step.branches.clone(),
+            };
+            match members.prove(&handed).await {
+                Some(StepOutcome::Proved(proved)) => {
+                    self.verify_proved(&step, &proved).await?;
+                    return Ok(Some(proved));
+                }
+                Some(StepOutcome::Nothing) => return Ok(None),
+                Some(StepOutcome::Refused(why)) => return Err(StepError::Refused(why)),
+                Some(StepOutcome::Retry(why)) => {
+                    return Err(StepError::Retry(ApiError::internal(why)))
+                }
+                None => {}
+            }
+        }
+        self.prove_prepared(&step).await.map(Some)
+    }
+
+    /// [`Self::prove_step`] with this member's own prover, for its leader:
+    /// over the erasures installed here, once they are the cluster's.
+    pub(super) async fn prove_handed(&self, step: &ProofStep) -> StepOutcome {
+        if let Err(e) = self.confirm_history_current(&step.branch).await {
+            return StepOutcome::Retry(e.to_string());
+        }
+        AssertUnwindSafe(self.prove_here(step))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(StepError::Retry(ApiError::internal("the step panicked"))))
+            .into()
+    }
+
+    async fn prove_here(
+        &self,
+        step: &ProofStep,
+    ) -> std::result::Result<Option<ProvedStep>, StepError> {
+        let Some(prepared) = self
+            .prepare_step(&step.branch, &step.request_id, &step.commit)
+            .await?
+        else {
+            return Ok(None);
+        };
+        match self.stored_proof(&prepared).await? {
+            Some(proved) => Ok(Some(proved)),
+            None => self.prove_prepared(&prepared).await.map(Some),
+        }
+    }
+
+    /// What the step of `request_id` on `commit` proves over the commit's
+    /// published erasure; `None` when that leaves nothing to prove.
+    async fn prepare_step(
+        &self,
+        branch: &str,
+        request_id: &str,
+        commit: &str,
+    ) -> std::result::Result<Option<PreparedStep>, StepError> {
+        let runtime = self.erasure_runtime().map_err(StepError::Retry)?;
         let job = self
             .job(branch, request_id)
             .await
@@ -466,15 +543,56 @@ impl Fluree {
             .as_ref()
             .and_then(|p| p.steps.last())
             .map(|s| s.replacement.clone());
+        Ok(Some(PreparedStep {
+            cid,
+            slots,
+            base,
+            prior,
+            ledger_id: task.ledger_id.clone(),
+            branches: task.branches.clone(),
+            signatures: job.signatures,
+        }))
+    }
+
+    /// A stored result of `step`, proved before by this member or another,
+    /// verified here.
+    async fn stored_proof(
+        &self,
+        step: &PreparedStep,
+    ) -> std::result::Result<Option<ProvedStep>, StepError> {
+        let runtime = self.erasure_runtime().map_err(StepError::Retry)?;
+        let Some(proved) = runtime
+            .index
+            .proved(&step.key())
+            .await
+            .map_err(StepError::Retry)?
+        else {
+            return Ok(None);
+        };
+        self.verify_proved(step, &proved).await?;
+        Ok(Some(proved))
+    }
+
+    /// Prove `step` with this member's prover, verify it, and store its
+    /// artifacts and result.
+    async fn prove_prepared(
+        &self,
+        step: &PreparedStep,
+    ) -> std::result::Result<ProvedStep, StepError> {
+        let runtime = self.erasure_runtime().map_err(StepError::Retry)?;
+        let config = runtime
+            .config
+            .as_ref()
+            .ok_or_else(|| StepError::Retry(ApiError::internal("no prover")))?;
         let input = self
-            .commit_bytes(&task.branches[0], &cid)
+            .commit_bytes(&step.branches[0], &step.cid)
             .await
             .map_err(StepError::Retry)?;
         let request = ProveRequest {
             input,
-            removed_slots: slots.clone(),
-            ledger_id: task.ledger_id.clone(),
-            signatures: job.signatures.into(),
+            removed_slots: step.slots.clone(),
+            ledger_id: step.ledger_id.clone(),
+            signatures: step.signatures.into(),
         };
         let started = Instant::now();
         let response = config.prover.prove(&request).await.map_err(|e| match e {
@@ -482,37 +600,8 @@ impl Fluree {
             other => StepError::Retry(ApiError::internal(other.to_string())),
         })?;
         let prove_ms = started.elapsed().as_millis() as u64;
-
-        let mut receipts = Vec::new();
-        let mut authorized = Vec::new();
-        for step in prior.iter().flat_map(|p| &p.steps) {
-            receipts.push(
-                runtime
-                    .index
-                    .artifact(Artifact::Proof, &step.proof)
-                    .await
-                    .map_err(StepError::Retry)?,
-            );
-            authorized.push(step.slots.clone());
-        }
-        receipts.push(response.receipt.clone());
-        authorized.push(slots.clone());
-        let verifier = config.verifier.clone();
-        let (original, ledger_id, replacement) = (
-            cid.to_bytes(),
-            task.ledger_id.clone(),
-            response.replacement.clone(),
-        );
-        tokio::task::spawn_blocking(move || {
-            verifier.verify_chain(&receipts, &replacement, &original, &ledger_id, &authorized)
-        })
-        .await
-        .map_err(|e| StepError::Retry(ApiError::internal(e.to_string())))?
-        .map_err(|e| {
-            StepError::Retry(ApiError::internal(format!(
-                "the prover's proof does not verify: {e}"
-            )))
-        })?;
+        self.verify_chain(step, response.receipt.clone(), response.replacement.clone())
+            .await?;
 
         let replacement_id = ContentId::new(ContentKind::Commit, &response.replacement);
         runtime
@@ -525,9 +614,9 @@ impl Fluree {
             .put_artifact(Artifact::Proof, &response.receipt)
             .await
             .map_err(StepError::Retry)?;
-        Ok(Some(ProvedStep {
-            slots,
-            base,
+        let proved = ProvedStep {
+            slots: step.slots.clone(),
+            base: step.base.clone(),
             replacement: replacement_id.to_string(),
             proof,
             input_bytes: request.input.len() as u64,
@@ -535,7 +624,85 @@ impl Fluree {
             user_cycles: response.user_cycles,
             segments: response.segments,
             prove_ms,
-        }))
+        };
+        runtime
+            .index
+            .put_proved(&step.key(), &proved)
+            .await
+            .map_err(StepError::Retry)?;
+        Ok(proved)
+    }
+
+    /// Verify `proved`, stored by whichever member proved it, as a proof of
+    /// `step`.
+    async fn verify_proved(
+        &self,
+        step: &PreparedStep,
+        proved: &ProvedStep,
+    ) -> std::result::Result<(), StepError> {
+        if proved.slots != step.slots || proved.base != step.base {
+            return Err(StepError::Retry(ApiError::internal(
+                "the step was proved over another erasure",
+            )));
+        }
+        let runtime = self.erasure_runtime().map_err(StepError::Retry)?;
+        let replacement: ContentId = proved
+            .replacement
+            .parse()
+            .map_err(|_| StepError::Retry(ApiError::internal("not a replacement id")))?;
+        let replacement = runtime
+            .index
+            .artifact(Artifact::Replacement, &replacement.address_digest())
+            .await
+            .map_err(StepError::Retry)?;
+        let receipt = runtime
+            .index
+            .artifact(Artifact::Proof, &proved.proof)
+            .await
+            .map_err(StepError::Retry)?;
+        self.verify_chain(step, receipt, replacement).await
+    }
+
+    /// Verify `receipt`, proving `replacement` of `step`, with every earlier
+    /// step of the commit.
+    async fn verify_chain(
+        &self,
+        step: &PreparedStep,
+        receipt: Vec<u8>,
+        replacement: Vec<u8>,
+    ) -> std::result::Result<(), StepError> {
+        let runtime = self.erasure_runtime().map_err(StepError::Retry)?;
+        let config = runtime
+            .config
+            .as_ref()
+            .ok_or_else(|| StepError::Retry(ApiError::internal("no prover")))?;
+        let mut receipts = Vec::new();
+        let mut authorized = Vec::new();
+        for earlier in step.prior.iter().flat_map(|p| &p.steps) {
+            receipts.push(
+                runtime
+                    .index
+                    .artifact(Artifact::Proof, &earlier.proof)
+                    .await
+                    .map_err(StepError::Retry)?,
+            );
+            authorized.push(earlier.slots.clone());
+        }
+        receipts.push(receipt);
+        authorized.push(step.slots.clone());
+        let verifier = config.verifier.clone();
+        let (original, ledger_id) = (step.cid.to_bytes(), step.ledger_id.clone());
+        tokio::task::spawn_blocking(move || {
+            verifier.verify_chain(&receipts, &replacement, &original, &ledger_id, &authorized)
+        })
+        .await
+        .map_err(|e| StepError::Retry(ApiError::internal(e.to_string())))?
+        .map_err(|e| {
+            StepError::Retry(ApiError::internal(format!(
+                "the prover's proof does not verify: {e}"
+            )))
+        })?;
+        Ok(())
     }
 
     /// Record a step's outcome on its job.
@@ -1153,6 +1320,45 @@ enum StepError {
     Refused(String),
     /// Anything else: tried again later.
     Retry(ApiError),
+}
+
+impl From<std::result::Result<Option<ProvedStep>, StepError>> for StepOutcome {
+    fn from(outcome: std::result::Result<Option<ProvedStep>, StepError>) -> Self {
+        match outcome {
+            Ok(Some(proved)) => StepOutcome::Proved(proved),
+            Ok(None) => StepOutcome::Nothing,
+            Err(StepError::Refused(why)) => StepOutcome::Refused(why),
+            Err(StepError::Retry(e)) => StepOutcome::Retry(e.to_string()),
+        }
+    }
+}
+
+/// A step ready to prove: the slots of the commit its published erasure
+/// still holds, and the replacement it redacts.
+struct PreparedStep {
+    cid: ContentId,
+    slots: Vec<u32>,
+    base: Option<String>,
+    prior: Option<ErasedCommit>,
+    ledger_id: String,
+    /// The branches holding the commit.
+    branches: Vec<String>,
+    signatures: super::SignatureMode,
+}
+
+impl PreparedStep {
+    /// Names the step by what it proves from, so a result stored under it
+    /// serves whichever member is asked again.
+    fn key(&self) -> String {
+        let inputs = serde_json::json!([
+            self.cid.to_string(),
+            self.base,
+            self.slots,
+            self.ledger_id,
+            self.signatures,
+        ]);
+        fluree_db_core::sha256_hex(inputs.to_string().as_bytes())
+    }
 }
 
 #[cfg(test)]

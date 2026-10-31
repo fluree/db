@@ -276,6 +276,12 @@ only once every member, voter or learner, runs a release that checks its writes:
 earlier release cannot read the commands involved. From then on, do not add or restart a member on an
 earlier release.
 
+Install the prover on every member (`fluree prover install`). The leader takes erasure requests only
+with one, and hands each proof to another member: first one that neither leads nor stages the
+transactions of the erased ledger's branches. A proof can take most of a host's memory and every
+core (`--erasure-prover-threads` caps them), so a learner started with a prover makes a dedicated
+proving node.
+
 While the cluster collects, a write that names commits it did not store in the same request is
 refused, since nothing checked them: the nameservice ref endpoint's commit-head push
 (`POST /v1/fluree/nameservice/refs/:alias/commit`, used by ref-based sync), and transfers through the

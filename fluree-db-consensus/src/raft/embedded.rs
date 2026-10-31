@@ -223,6 +223,10 @@ impl EmbeddedRaftNode {
         // This member's publications of erasures activate through the
         // cluster.
         fluree.set_erasure_activator(Arc::clone(&nameservice) as _);
+        // As leader it has steps proved on other members; as a member it
+        // proves those its leader hands it.
+        fluree.set_proving_members(Arc::clone(&nameservice) as _);
+        nameservice.prove_with(&fluree);
         let erasure_installer = {
             let cancel = CancellationToken::new();
             let task = tokio::spawn(crate::raft::erasure::run_installer(
