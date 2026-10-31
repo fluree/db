@@ -409,3 +409,59 @@ async fn each_logical_list_on_a_shape_is_its_own_constraint() {
         }
     }
 }
+
+/// A `sh:or` value with no list may head a list whose cells another shapes
+/// graph holds. Such heads resolve once every shapes graph is read, in
+/// either order, and stay two lists: two disjunctions, not one.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn logical_list_heads_resolve_across_shapes_graphs() {
+    use fluree_db_api::validate::{ShapesSource, ValidateOptions};
+    let shapes = "ex:A a sh:NodeShape ; sh:property [ sh:path ex:a ; sh:minCount 1 ] .
+        ex:B a sh:NodeShape ; sh:property [ sh:path ex:b ; sh:minCount 1 ] .
+        ex:C a sh:NodeShape ; sh:property [ sh:path ex:c ; sh:minCount 1 ] .
+        ex:D a sh:NodeShape ; sh:property [ sh:path ex:d ; sh:minCount 1 ] .
+        ex:S sh:targetClass ex:T ; sh:or ex:l1, ex:l2 .";
+    let cells =
+        "ex:l1 rdf:first ex:A ; rdf:rest ex:l1b . ex:l1b rdf:first ex:B ; rdf:rest rdf:nil .
+        ex:l2 rdf:first ex:C ; rdf:rest ex:l2b . ex:l2b rdf:first ex:D ; rdf:rest rdf:nil .";
+    // The ledger's default graph is read first, the named graph second.
+    for (order, default, named) in [
+        ("shape-first", shapes, cells),
+        ("cells-first", cells, shapes),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let id = format!("it/list-identity/shacl-graphs-{order}:main");
+        let ledger = fluree.create_ledger(&id).await.expect("create");
+        let trig = format!(
+            "@prefix ex: <{EX}> .
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            {default}
+            ex:x a ex:T ; ex:a 1 .
+            ex:y a ex:T ; ex:a 1 ; ex:c 1 .
+            GRAPH <{EX}g> {{ {named} }}"
+        );
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&trig)
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{order}: {e}"));
+        let options = ValidateOptions {
+            shapes: ShapesSource::Graph(format!("{EX}g")),
+            include_attached: true,
+            ..Default::default()
+        };
+        let report = fluree
+            .validate_ledger(&id, &options)
+            .await
+            .expect("validate");
+        let failing: Vec<_> = report
+            .results
+            .iter()
+            .filter_map(|r| r.focus_node.as_str())
+            .collect();
+        assert_eq!(failing, [format!("{EX}x")], "{order}: {report:?}");
+    }
+}

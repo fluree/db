@@ -179,16 +179,27 @@ struct ShapeMetadata {
 #[derive(Default)]
 struct ShapeLists {
     /// The values read in the current graph, each with its list when it is a
-    /// compact list member. Grouped into `lists` once the graph is read.
+    /// compact list member. Grouped once the graph is read.
     read: Vec<(Option<u32>, Sid)>,
     lists: Vec<Vec<Sid>>,
-    /// Which of `lists` holds the shapes written as values with no list.
-    plain: Option<usize>,
+    /// The values read with no list: each heads an `rdf:first` / `rdf:rest`
+    /// spine stored in one of the graphs, or is a shape. Which, is known only
+    /// once every graph is read.
+    unplaced: Vec<Sid>,
 }
 
 impl ShapeLists {
-    fn is_empty(&self) -> bool {
-        self.read.is_empty() && self.lists.is_empty()
+    /// Group the values read in one graph: a compact list's members are one
+    /// list. List ids are the graph's own, so lists of two graphs never merge.
+    fn group_read(&mut self) {
+        let mut compact: BTreeMap<u32, Vec<Sid>> = BTreeMap::new();
+        for (list, value) in self.read.drain(..) {
+            match list {
+                Some(list) => compact.entry(list).or_default().push(value),
+                None => self.unplaced.push(value),
+            }
+        }
+        self.lists.extend(compact.into_values());
     }
 }
 
@@ -438,8 +449,9 @@ impl ShapeCompiler {
             for flake in &flakes {
                 compiler.get_or_create_shape(&flake.s);
             }
-            // Expand rdf:first/rdf:rest lists referenced by sh:in / sh:and /
-            // sh:or / sh:xone / sh:ignoredProperties. Run after each graph so
+            // Expand rdf:first/rdf:rest lists referenced by sh:in /
+            // sh:languageIn / sh:ignoredProperties, and group the sh:and /
+            // sh:or / sh:xone values this graph held. Run after each graph so
             // that lists whose head lives in this graph can resolve — a list
             // spanning multiple graphs will still resolve on a later pass
             // because `expand_rdf_lists` walks transitively via `db.range`.
@@ -450,6 +462,10 @@ impl ShapeCompiler {
             // resolve; a plain-predicate path resolves trivially on any graph.
             compiler.resolve_paths(*db).await?;
         }
+
+        // A sh:and / sh:or / sh:xone value with no list may head a spine
+        // stored in any graph, so it resolves once all are read.
+        compiler.resolve_logical_lists(dbs).await?;
 
         compiler.claim_metadata();
 
@@ -713,70 +729,49 @@ impl ShapeCompiler {
             }
         }
 
-        // sh:and / sh:or / sh:xone members. A JSON-LD @list or a Turtle
+        // sh:and / sh:or / sh:xone values. A JSON-LD @list or a Turtle
         // collection arrives as one flake per member, placed in its list; an
-        // RDF collection stored as an rdf:first / rdf:rest spine (as a SPARQL
-        // UPDATE writes `( … )`) arrives as one flake whose object is the
-        // spine's head. A member that heads a list in this graph is replaced,
-        // in its own list, by that list's members, as for
-        // sh:ignoredProperties.
-        let logical: Vec<Sid> = self
-            .shapes
-            .iter()
-            .filter(|(_, sd)| {
-                !(sd.and_shapes.is_empty() && sd.or_shapes.is_empty() && sd.xone_shapes.is_empty())
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for shape_id in logical {
-            let Some(sd) = self.shapes.get_mut(&shape_id) else {
-                continue;
-            };
-            let mut lists = [
-                std::mem::take(&mut sd.and_shapes),
-                std::mem::take(&mut sd.or_shapes),
-                std::mem::take(&mut sd.xone_shapes),
-            ];
-            for term in &mut lists {
-                // Lists read from earlier graphs, whose spines may live here.
-                for members in &mut term.lists {
-                    let mut expanded = Vec::with_capacity(members.len());
-                    for member in members.drain(..) {
-                        match spine_members(db, &member, &rdf_first, &rdf_rest, &rdf_nil).await? {
-                            Some(spine) => expanded.extend(spine),
-                            None => expanded.push(member),
-                        }
-                    }
-                    *members = expanded;
-                }
-                let mut compact: BTreeMap<u32, Vec<Sid>> = BTreeMap::new();
-                for (list, value) in std::mem::take(&mut term.read) {
-                    let spine = spine_members(db, &value, &rdf_first, &rdf_rest, &rdf_nil).await?;
-                    match (list, spine) {
-                        (Some(list), spine) => compact
-                            .entry(list)
-                            .or_default()
-                            .extend(spine.unwrap_or_else(|| vec![value])),
-                        (None, Some(spine)) => term.lists.push(spine),
-                        (None, None) => match term.plain {
-                            Some(at) => term.lists[at].push(value),
-                            None => {
-                                term.plain = Some(term.lists.len());
-                                term.lists.push(vec![value]);
-                            }
-                        },
-                    }
-                }
-                term.lists.extend(compact.into_values());
-            }
-            let [and_shapes, or_shapes, xone_shapes] = lists;
-            if let Some(sd) = self.shapes.get_mut(&shape_id) {
-                sd.and_shapes = and_shapes;
-                sd.or_shapes = or_shapes;
-                sd.xone_shapes = xone_shapes;
-            }
+        // RDF collection stored as an rdf:first / rdf:rest spine, cell by
+        // cell, arrives as one flake whose object is the spine's head,
+        // resolved once every graph is read (`resolve_logical_lists`).
+        for sd in self.shapes.values_mut() {
+            sd.and_shapes.group_read();
+            sd.or_shapes.group_read();
+            sd.xone_shapes.group_read();
         }
 
+        Ok(())
+    }
+
+    /// Resolve the `sh:and` / `sh:or` / `sh:xone` values read with no list,
+    /// once every graph is read: a value heading an `rdf:first` / `rdf:rest`
+    /// spine stored in any of `dbs` is a list of its own, and the values
+    /// heading none are shapes, one list together.
+    async fn resolve_logical_lists(&mut self, dbs: &[GraphDbRef<'_>]) -> Result<()> {
+        let rdf_first = Sid::new(RDF, rdf_names::FIRST);
+        let rdf_rest = Sid::new(RDF, rdf_names::REST);
+        let rdf_nil = Sid::new(RDF, rdf_names::NIL);
+        for sd in self.shapes.values_mut() {
+            for term in [&mut sd.and_shapes, &mut sd.or_shapes, &mut sd.xone_shapes] {
+                let mut plain = Vec::new();
+                for value in std::mem::take(&mut term.unplaced) {
+                    let mut spine = None;
+                    for db in dbs {
+                        spine = spine_members(*db, &value, &rdf_first, &rdf_rest, &rdf_nil).await?;
+                        if spine.is_some() {
+                            break;
+                        }
+                    }
+                    match spine {
+                        Some(spine) => term.lists.push(spine),
+                        None => plain.push(value),
+                    }
+                }
+                if !plain.is_empty() {
+                    term.lists.push(plain);
+                }
+            }
+        }
         Ok(())
     }
 
