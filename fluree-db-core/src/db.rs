@@ -118,6 +118,9 @@ pub struct LedgerSnapshotMetadata {
     /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
     /// canonical contract.
     pub has_list_meta: Option<bool>,
+    /// Content id of the index root this metadata was decoded from; `None`
+    /// when the caller doesn't have it.
+    pub index_root_id: Option<ContentId>,
 }
 
 /// Database value at a specific point in time.
@@ -250,6 +253,13 @@ pub struct LedgerSnapshot {
     /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
     /// canonical contract.
     pub has_list_meta: Option<bool>,
+
+    /// Content id of the index root the stats, schema and annotation arena
+    /// came from. Two loads of one root agree and roots with different stats
+    /// don't, which makes it the stats' identity for caches derived from
+    /// them. `None` when the snapshot wasn't loaded from a root, or was
+    /// decoded by [`Self::from_root_bytes`] without one.
+    index_root_id: Option<ContentId>,
 }
 
 impl Clone for LedgerSnapshot {
@@ -274,6 +284,7 @@ impl Clone for LedgerSnapshot {
             had_annotation_arena: self.had_annotation_arena,
             has_list_meta: self.has_list_meta,
             content_store: self.content_store.clone(),
+            index_root_id: self.index_root_id.clone(),
         }
     }
 }
@@ -334,6 +345,7 @@ impl LedgerSnapshot {
             // exact — everything lives in novelty, which tracks its own bit.
             has_list_meta: Some(false),
             content_store: None,
+            index_root_id: None,
         }
     }
 
@@ -374,6 +386,7 @@ impl LedgerSnapshot {
             had_annotation_arena: meta.had_annotation_arena,
             has_list_meta: meta.has_list_meta,
             content_store: None,
+            index_root_id: meta.index_root_id,
         })
     }
 
@@ -390,7 +403,27 @@ impl LedgerSnapshot {
         Self::new_meta(meta)
     }
 
+    /// [`Self::from_root_bytes`] for the root `root_id` names, which then
+    /// identifies the snapshot's stats.
+    pub fn from_root(root_id: &ContentId, bytes: &[u8]) -> Result<Self> {
+        let mut snapshot = Self::from_root_bytes(bytes)?;
+        snapshot.index_root_id = Some(root_id.clone());
+        Ok(snapshot)
+    }
+
     // FIR6 decoding lives in `decode_fir6_metadata` below.
+
+    /// Content id of the index root this snapshot's stats, schema and
+    /// annotation arena came from.
+    pub fn index_root_id(&self) -> Option<&ContentId> {
+        self.index_root_id.as_ref()
+    }
+
+    /// Take the stats of the index root `root_id`, keeping the two together.
+    pub fn set_index_root_stats(&mut self, stats: Option<Arc<IndexStats>>, root_id: ContentId) {
+        self.stats = stats;
+        self.index_root_id = Some(root_id);
+    }
 
     /// Attach a range provider for binary index queries.
     pub fn with_range_provider(mut self, provider: Arc<dyn RangeProvider>) -> Self {
@@ -1091,6 +1124,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         annotation_index,
         had_annotation_arena,
         has_list_meta,
+        index_root_id: None,
     })
 }
 
@@ -1114,7 +1148,7 @@ pub async fn load_ledger_snapshot(
         &root_id.digest_hex(),
     );
     let bytes = storage.read_bytes(&root_address).await?;
-    LedgerSnapshot::from_root_bytes(&bytes)
+    LedgerSnapshot::from_root(root_id, &bytes)
 }
 
 #[cfg(test)]
@@ -1191,6 +1225,7 @@ mod tests {
             annotation_index: None,
             had_annotation_arena: false,
             has_list_meta: None,
+            index_root_id: None,
         })
         .unwrap();
 
