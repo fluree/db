@@ -116,7 +116,6 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     if let Ok(query) = &mut result {
         query.include_system_facts = ast.pragmas.include_system_facts.unwrap_or(false);
         query.union_default_graph = ast.pragmas.union_default_graph;
-        query.rdf_list_view = true;
     }
 
     match &result {
@@ -5068,6 +5067,20 @@ mod pragma_tests {
                 None,
                 "{form}"
             );
+        }
+    }
+
+    /// Every query form reads a list's members as values of its property;
+    /// SPARQL has no way to ask for its RDF cells.
+    #[test]
+    fn every_query_form_reads_list_members() {
+        for form in [
+            "SELECT * WHERE { ?s ?p ?o }",
+            "ASK { ?s ?p ?o }",
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "DESCRIBE ?s WHERE { ?s ?p ?o }",
+        ] {
+            assert!(!lower_query(form).unwrap().rdf_list_view, "{form}");
         }
     }
 

@@ -365,6 +365,70 @@ async fn transact_cypher_create_round_trips_to_jsonld_query() {
     assert_eq!(rows.row_count(), 1);
 }
 
+/// A variable named like another form's minted label stays its own node. Each
+/// statement here used to fuse two: `anon_7_11` with the anonymous node at
+/// that span, `rel_r` with relationship `r`'s annotation, and `ann_0` with the
+/// first anonymous relationship's annotation. A backticked variable holding a
+/// space is created and returned like any other.
+#[tokio::test]
+async fn transact_cypher_variables_never_spell_a_minted_label() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "it/cypher:minted-labels").await;
+    for stmt in [
+        "CREATE (:A), (anon_7_11:C)",
+        "CREATE (rel_r:P)-[r:KNOWS]->(b:Q)",
+        "CREATE (ann_0:R)-[:KNOWS]->(c:S)",
+    ] {
+        ledger = fluree
+            .transact_cypher(ledger, stmt)
+            .await
+            .expect(stmt)
+            .ledger;
+    }
+    let (result, returned) = fluree
+        .transact_cypher_returning(ledger, "CREATE (`my node`:T) RETURN `my node`", None)
+        .await
+        .expect("backticked variable");
+    let returned = returned.expect("RETURN produces rows");
+    let db = graphdb_from_ledger(&result.ledger);
+
+    let rows = |q: &'static str| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            let cj = fluree
+                .query_cypher(db, q)
+                .await
+                .expect(q)
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .expect(q);
+            cj["results"][0]["data"]
+                .as_array()
+                .expect("data")
+                .iter()
+                .map(|d| d["row"].clone())
+                .collect::<Vec<JsonValue>>()
+        }
+    };
+
+    assert_eq!(rows("MATCH (n:A) RETURN labels(n)").await, [json!([["A"]])]);
+    assert_eq!(rows("MATCH (n:C) RETURN labels(n)").await, [json!([["C"]])]);
+    for q in [
+        "MATCH (x:P)-[r:KNOWS]->(:Q) RETURN id(x), id(r)",
+        "MATCH (x:R)-[e:KNOWS]->(:S) RETURN id(x), id(e)",
+    ] {
+        let found = rows(q).await;
+        assert_eq!(found.len(), 1, "{q}: {found:?}");
+        assert_ne!(found[0][0], found[0][1], "{q}: a node is its own edge");
+    }
+    assert_eq!(
+        rows("MATCH (n:T) RETURN id(n)").await,
+        [returned["results"][0]["data"][0]["row"].clone()],
+        "the returned node is the one stored"
+    );
+}
+
 #[tokio::test]
 async fn transact_cypher_set_property_replaces_old_value() {
     // End-to-end: seed via JSON-LD, MATCH … SET via Cypher, read back.
@@ -974,7 +1038,7 @@ async fn transact_cypher_match_create_return_edge() {
         data[0]["row"][0]
             .as_str()
             .expect("edge id")
-            .contains("cy_rel_e"),
+            .ends_with("--cyre"),
         "{rows}"
     );
 

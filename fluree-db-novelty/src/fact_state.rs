@@ -37,6 +37,7 @@
 //! of the key — `Flake` equality ignores `g`, so state is held in a separate map
 //! per `g_id`.
 
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
 use imbl::OrdMap;
 
@@ -80,17 +81,16 @@ impl NoveltyFactState {
 
     /// Record `flake` as an op for its identity in graph `g`. Lifecycle
     /// resolution is **order-independent**: the highest-`t` op wins, and on a
-    /// same-`t` tie the retract wins. This mirrors the query overlay's
-    /// resolution ([`fluree-db-binary-index`] `resolve_overlay_ops`), so
-    /// `fact_state` cannot disagree with what a read would see no matter what
-    /// order records arrive in (commit/batch order, the sorted bulk walk, or the
-    /// `clear_up_to` rebuild) — rather than depending on callers feeding ops in
-    /// ascending-`t`, retract-last order.
+    /// same-`t` tie the assert ([`fluree_db_core::same_t`]). That is the rule
+    /// the query overlay (`resolve_overlay_ops`) and every index build apply,
+    /// so `fact_state` cannot disagree with what a read would see no matter
+    /// what order records arrive in (commit/batch order, the sorted bulk walk,
+    /// or the `clear_up_to` rebuild).
     pub(crate) fn record(&mut self, g: GraphId, flake: &Flake) {
         let m = self.graphs.entry(g).or_default();
         let key = key_of(flake);
         let wins = match m.get(&key) {
-            Some(&(cur_t, cur_op)) => flake.t > cur_t || (flake.t == cur_t && cur_op && !flake.op),
+            Some(&cur) => supersedes((flake.t, flake.op), cur),
             None => true,
         };
         if wins {
@@ -130,15 +130,15 @@ mod tests {
     }
 
     #[test]
-    fn same_t_retract_wins_order_independent() {
-        // A same-`t` assert+retract of one identity resolves to ABSENT (retract
-        // wins), matching overlay lifecycle resolution — regardless of the order
-        // the two ops are recorded.
+    fn same_t_assert_holds_order_independent() {
+        // A same-`t` assert+retract of one identity resolves to PRESENT (the
+        // assert holds), matching overlay lifecycle resolution and every index
+        // build — regardless of the order the two ops are recorded.
         let mut fs = NoveltyFactState::new();
         fs.record(0, &mk(1, 5, true, None));
         fs.record(0, &mk(1, 5, false, None));
         assert!(
-            !fs.is_asserted(0, &mk(1, 5, true, None)),
+            fs.is_asserted(0, &mk(1, 5, true, None)),
             "assert then retract"
         );
 
@@ -146,7 +146,7 @@ mod tests {
         fs2.record(0, &mk(2, 5, false, None));
         fs2.record(0, &mk(2, 5, true, None));
         assert!(
-            !fs2.is_asserted(0, &mk(2, 5, true, None)),
+            fs2.is_asserted(0, &mk(2, 5, true, None)),
             "retract then assert"
         );
     }

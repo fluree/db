@@ -11,7 +11,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub use fluree_db_indexer::{
     ConfiguredFulltextProperty, ConfiguredFulltextScope, IndexerConfig, IndexerError,
-    IndexerHandle, DEFAULT_CATCHUP_INTERVAL_SECS, DEFAULT_MAX_OLD_INDEXES,
+    IndexerHandle, DEFAULT_CATCHUP_INTERVAL_SECS, DEFAULT_HARD_MAX_OLD_INDEXES,
+    DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
 
 /// Spawn a fire-and-forget background task.
@@ -91,7 +92,13 @@ where
 #[cfg(target_arch = "wasm32")]
 mod stubs {
     /// Mirrors `fluree_db_indexer::gc::DEFAULT_MAX_OLD_INDEXES`.
-    pub const DEFAULT_MAX_OLD_INDEXES: u32 = 5;
+    pub const DEFAULT_MAX_OLD_INDEXES: u32 = 0;
+
+    /// Mirrors `fluree_db_indexer::gc::DEFAULT_MIN_TIME_GARBAGE_MINS`.
+    pub const DEFAULT_MIN_TIME_GARBAGE_MINS: u32 = 15;
+
+    /// Mirrors `fluree_db_indexer::gc::DEFAULT_HARD_MAX_OLD_INDEXES`.
+    pub const DEFAULT_HARD_MAX_OLD_INDEXES: u32 = 10;
 
     /// Mirrors `fluree_db_indexer::DEFAULT_CATCHUP_INTERVAL_SECS`.
     ///
@@ -200,8 +207,18 @@ mod stub_drift {
         );
         assert_eq!(
             super::DEFAULT_MAX_OLD_INDEXES,
-            5,
+            0,
             "stubs::DEFAULT_MAX_OLD_INDEXES must be updated to match"
+        );
+        assert_eq!(
+            super::DEFAULT_MIN_TIME_GARBAGE_MINS,
+            15,
+            "stubs::DEFAULT_MIN_TIME_GARBAGE_MINS must be updated to match"
+        );
+        assert_eq!(
+            super::DEFAULT_HARD_MAX_OLD_INDEXES,
+            10,
+            "stubs::DEFAULT_HARD_MAX_OLD_INDEXES must be updated to match"
         );
     }
 }

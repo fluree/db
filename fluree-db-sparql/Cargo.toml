@@ -17,6 +17,7 @@ lowering = ["dep:fluree-db-query", "dep:fluree-db-core", "dep:bigdecimal", "dep:
 fluree-db-query = { path = "../fluree-db-query", optional = true }
 fluree-db-core = { path = "../fluree-db-core", optional = true }
 fluree-vocab = { path = "../fluree-vocab" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
 # JSON-LD triple-term shape, for parameters
 fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 bigdecimal = { version = "0.4", optional = true }

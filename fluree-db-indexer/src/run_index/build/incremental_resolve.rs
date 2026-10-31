@@ -25,6 +25,7 @@ use fluree_db_binary_index::format::run_record::{cmp_for_order, RunRecord, RunSo
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_core::content_id::ContentId;
 use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::same_t::op_order;
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -982,9 +983,9 @@ type ResolvedIdentity = (u16, u32);
 /// - A re-assert of a currently-asserted fact is a no-op: the earlier assert
 ///   (and its `t`) survives, matching `NoveltyFactState`'s skip rule.
 /// - Every other op becomes the identity's winner: a retract after an assert,
-///   an assert after a retract, and a repeat retract at higher `t`.
-/// - An assert at the same `t` as a winning retract loses (same-`t` ties
-///   resolve retract-wins), matching `resolve_overlay_ops`.
+///   an assert after a retract (at a later `t` or the same one: a same-`t`
+///   pair holds the assert, [`fluree_db_core::same_t`]), and a repeat retract
+///   at higher `t`.
 ///
 /// Fact identity is the resolved V2 identity `(o_type, o_i)` within the
 /// sort-prefix group — the identity `merge_novelty`, replay, and the query
@@ -1005,8 +1006,10 @@ type ResolvedIdentity = (u16, u32);
 /// lifecycle steps the winner stream collapses away; `merge_novelty` turns
 /// the ones that were real state transitions into history-sidecar entries so
 /// index-served time travel can see states a fact held only within this
-/// window. No-op re-asserts and same-`t` losers are discarded outright: they
-/// transition nothing anywhere.
+/// window. A same-`t` pair's retraction is superseded like any other
+/// replaced winner, so the merge walks the same events a full rebuild does
+/// and writes the same row and sidecar. No-op re-asserts are discarded
+/// outright: they transition nothing anywhere.
 pub(crate) fn dedup_fact_lifecycles(
     mut records: Vec<RunRecord>,
     o_types: &OTypeRegistry,
@@ -1049,10 +1052,10 @@ pub(crate) fn dedup_fact_lifecycles(
 /// in `keyed` in comparator order (`dt`, `t`, `op`) and appending superseded
 /// events to `superseded`.
 ///
-/// The group is keyed by resolved V2 identity and sorted by
-/// `(identity, t, op)` first: the incoming `(g_id, SPOT)` order interleaves
-/// `dt` before `t`, so events of one identity spread across `dt` variants
-/// would otherwise arrive out of chronological order.
+/// The group is keyed by resolved V2 identity and sorted by identity, then
+/// [`op_order`]: the incoming `(g_id, SPOT)` order interleaves `dt` before
+/// `t`, so events of one identity spread across `dt` variants would
+/// otherwise arrive out of chronological order.
 fn dedup_group(
     group: &[RunRecord],
     o_types: &OTypeRegistry,
@@ -1072,12 +1075,13 @@ fn dedup_group(
     }));
     keyed.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
-            .then(a.1.t.cmp(&b.1.t))
-            .then(a.1.op.cmp(&b.1.op))
+            .then(op_order(a.1.t, a.1.op == 1).cmp(&op_order(b.1.t, b.1.op == 1)))
     });
 
     // Compact each identity run to its winner, in place. Replaced winners
-    // are the identity's intermediate lifecycle steps → superseded.
+    // are the identity's intermediate lifecycle steps → superseded. Walked in
+    // `op_order`, every event replaces the current winner (a same-`t` assert
+    // included) except a re-assert of an asserted fact.
     let mut w = 0;
     for r in 1..keyed.len() {
         if keyed[r].0 != keyed[w].0 {
@@ -1089,8 +1093,7 @@ fn dedup_group(
         let rec = keyed[r].1;
         let winner = &mut keyed[w].1;
         let noop_reassert = rec.op == 1 && winner.op == 1;
-        let same_t_retract_wins = rec.op == 1 && winner.op == 0 && rec.t == winner.t;
-        if !noop_reassert && !same_t_retract_wins {
+        if !noop_reassert {
             superseded.push(*winner);
             *winner = rec;
         }
@@ -2047,13 +2050,20 @@ mod tests {
         assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
     }
 
-    /// Same-`t` ties resolve retract-wins, matching `resolve_overlay_ops` and
-    /// `NoveltyFactState`. Sorted input puts the retract first (op 0 < 1).
+    /// A same-`t` pair holds the assert ([`fluree_db_core::same_t`]), as
+    /// `resolve_overlay_ops`, `NoveltyFactState` and the full rebuild resolve
+    /// it, whatever the input's order. The losing retract is superseded, so
+    /// the merge walks both events, as a rebuild does.
     #[test]
-    fn same_t_retract_beats_assert() {
-        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)];
-        let out = dedup(records);
-        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+    fn same_t_assert_beats_retract() {
+        for records in [
+            vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)],
+            vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 5, OP_RETRACT)],
+        ] {
+            let (out, superseded) = dedup_with_superseded(records);
+            assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+            assert_eq!(keys(&superseded), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+        }
     }
 
     /// Distinct language tags on `rdf:langString` values are distinct fact

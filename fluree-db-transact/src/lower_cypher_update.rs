@@ -35,6 +35,7 @@ use fluree_db_query::parse::{
     UnresolvedTriplePattern, UnresolvedValue,
 };
 use fluree_db_query::VarRegistry;
+use fluree_graph_ir::syntax::reserved_blank_label;
 use fluree_vocab::{rdf, reifies_iris};
 use thiserror::Error;
 
@@ -46,6 +47,58 @@ use fluree_db_cypher::ast::{
 
 use crate::ir::{TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 use crate::namespace::NamespaceRegistry;
+
+/// What a Cypher `CREATE` mints a blank node for.
+#[derive(Clone, Copy, Debug)]
+pub enum CypherBlank<'a> {
+    /// A node bound to a variable the statement creates.
+    NodeVar(&'a str),
+    /// An anonymous node, keyed by its pattern's source span.
+    AnonNode { start: usize, end: usize },
+    /// A created relationship's annotation, bound to a variable.
+    RelVar(&'a str),
+    /// A created relationship's annotation with no variable, numbered in
+    /// order.
+    AnonRel(u32),
+}
+
+/// The blank-node label (without `_:`) Cypher mints for `blank`: the `{label}`
+/// of the stored id `fdb-{txn}-{solution}-{label}`, which a write's `RETURN`
+/// rebuilds with this same function.
+///
+/// Each form has its own reserved kind, all of one width, so no form can spell
+/// another's label. A variable name is the user's, so it is encoded: any name,
+/// a backticked one included, gives a legal label, and two names never give
+/// the same one.
+pub fn cypher_blank_label(blank: CypherBlank<'_>) -> String {
+    match blank {
+        CypherBlank::NodeVar(name) => reserved_blank_label("cyv", encode_var_name(name)),
+        CypherBlank::AnonNode { start, end } => {
+            reserved_blank_label("cya", format_args!("{start}_{end}"))
+        }
+        CypherBlank::RelVar(name) => reserved_blank_label("cyr", encode_var_name(name)),
+        CypherBlank::AnonRel(n) => reserved_blank_label("cye", n),
+    }
+}
+
+/// `name` with every byte outside `[A-Za-z0-9]`, `_` included, written as `_`
+/// and two hex digits.
+fn encode_var_name(name: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "_{b:02x}");
+        }
+    }
+    out
+}
+
+fn blank_term(blank: CypherBlank<'_>) -> TemplateTerm {
+    TemplateTerm::BlankNode(format!("_:{}", cypher_blank_label(blank)))
+}
 
 /// Errors raised by Cypher → Txn lowering.
 #[derive(Debug, Error)]
@@ -160,7 +213,7 @@ struct CypherLowering<'a> {
     /// the bundle).
     rel_var_edges: std::collections::HashMap<String, (String, Sid, String)>,
     /// Relationship variables already used for a CREATE relationship — each
-    /// names one created edge's annotation (label `_:cy_rel_{name}`), so a
+    /// names one created edge's annotation ([`CypherBlank::RelVar`]), so a
     /// reuse would silently merge two edges' annotations.
     created_rel_vars: std::collections::HashSet<String>,
     /// Stable per-pattern-occurrence node labels, keyed by node span.
@@ -220,7 +273,6 @@ impl<'a> CypherLowering<'a> {
             txn_meta: Vec::new(),
             write_graphs: Default::default(),
             namespace_delta: std::collections::HashMap::new(),
-            rdf_list_view: false,
             graph_mgmt: None,
             sync_graph: None,
         }
@@ -1744,8 +1796,7 @@ impl<'a> CypherLowering<'a> {
         //
         // A named relationship (`CREATE (a)-[e:T]->(b)`) uses a label derived
         // from the variable so a trailing `RETURN e` can reconstruct the
-        // created annotation's Sid (the `cy_rel_` prefix keeps it disjoint
-        // from node-variable labels `cy_{name}`).
+        // created annotation's Sid.
         let ann = match &rel.var {
             Some(v) => {
                 if !self.created_rel_vars.insert(v.name.clone()) {
@@ -1755,7 +1806,7 @@ impl<'a> CypherLowering<'a> {
                         v.name
                     )));
                 }
-                TemplateTerm::BlankNode(format!("_:cy_rel_{}", v.name))
+                blank_term(CypherBlank::RelVar(&v.name))
             }
             None => self.fresh_bnode(),
         };
@@ -1965,23 +2016,25 @@ impl<'a> CypherLowering<'a> {
             if self.bound_vars.contains(&var.name) {
                 return self.var_term(&var.name);
             }
-            return TemplateTerm::BlankNode(format!("_:cy_{}", var.name));
+            return blank_term(CypherBlank::NodeVar(&var.name));
         }
         // Anonymous node — cache by span.
         let key = (n.span.start, n.span.end);
         if let Some(t) = self.node_subject_cache.get(&key) {
             return t.clone();
         }
-        let label = format!("_:cy_anon_{}_{}", n.span.start, n.span.end);
-        let t = TemplateTerm::BlankNode(label);
+        let t = blank_term(CypherBlank::AnonNode {
+            start: n.span.start,
+            end: n.span.end,
+        });
         self.node_subject_cache.insert(key, t.clone());
         t
     }
 
     fn fresh_bnode(&mut self) -> TemplateTerm {
-        let label = format!("_:cy_ann_{}", self.bnode_counter);
+        let t = blank_term(CypherBlank::AnonRel(self.bnode_counter));
         self.bnode_counter += 1;
-        TemplateTerm::BlankNode(label)
+        t
     }
 
     fn resolve_iri(&self, name: &str) -> String {
@@ -2121,4 +2174,39 @@ fn lower_literal_value(lit: &Literal) -> Result<FlakeValue, LowerCypherError> {
             ));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_graph_ir::syntax::is_blank_node_label;
+
+    /// Each form has its own kind, so no variable spells another form's label,
+    /// and an encoded name is a legal label whatever the user wrote.
+    #[test]
+    fn a_variable_name_never_spells_another_label() {
+        let pairs = [
+            (CypherBlank::NodeVar("rel_r"), CypherBlank::RelVar("r")),
+            (
+                CypherBlank::NodeVar("anon_7_11"),
+                CypherBlank::AnonNode { start: 7, end: 11 },
+            ),
+            (CypherBlank::NodeVar("ann_0"), CypherBlank::AnonRel(0)),
+            (CypherBlank::NodeVar("x"), CypherBlank::RelVar("x")),
+            (CypherBlank::NodeVar("a_b"), CypherBlank::NodeVar("a b")),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                cypher_blank_label(a),
+                cypher_blank_label(b),
+                "{a:?} and {b:?}"
+            );
+        }
+        for name in ["n", "my node", "a#b", "ends.", "\u{e9}", ""] {
+            let label = cypher_blank_label(CypherBlank::NodeVar(name));
+            assert!(!is_blank_node_label(&label), "{label} can be written");
+            let stored = format!("fdb-01h-0-{label}");
+            assert!(is_blank_node_label(&stored), "{stored} does not serialize");
+        }
+    }
 }

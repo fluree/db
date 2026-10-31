@@ -1033,10 +1033,15 @@ where
             //
             // Uses two separate passes over the .fsc files:
             //   Pass 1 (HLL): feeds ALL records to IdStatsHook in HLL-only mode
-            //                  (no per-subject maps — bounded memory).
-            //   Pass 2 (class): k-way merges .fsc files, deduplicates, feeds
-            //                   winning assertions to SpotClassStatsCollector
-            //                   (O(1) per-subject, class-level accumulators).
+            //                  (no per-subject maps — bounded memory). It
+            //                  observes them for the sketches only: counts
+            //                  from an op's sign miscount a same-`t` pair or a
+            //                  retraction of a fact never asserted.
+            //   Pass 2 (class + counts): k-way merges .fsc files, deduplicates,
+            //                   feeds winning assertions to
+            //                   SpotClassStatsCollector (O(1) per-subject,
+            //                   class-level accumulators) and counts them, one
+            //                   per fact the index holds, in the IdStatsHook.
             //
             // This replaces the old approach that accumulated ~16 GB of per-subject
             // HashMaps. Total stats-phase memory is now ~200 MB - 1 GB.
@@ -1059,21 +1064,9 @@ where
                         &record, &registry,
                     );
                     let sr = crate::stats::stats_record_from_v2(&v2, record.op);
-                    stats_hook.on_record(&sr);
+                    stats_hook.observe_record(&sr);
                 }
             }
-
-            // Upload HLL sketches to CAS.
-            let sketch_ref = super::upload::upload_stats_sketch(
-                &content_store,
-                commit_t,
-                stats_hook.properties(),
-            )
-            .await?
-            .map(|(cid, _)| cid);
-
-            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
-            let id_stats_result = stats_hook.finalize();
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
@@ -1115,7 +1108,9 @@ where
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
                 // Iterate with dedup: next_deduped() returns the winning record
-                // per identity group (highest t wins). Feed assertions to collector.
+                // per identity group (highest t, and at one t the assert): an
+                // assertion is a fact the index holds. Feed it to the collector
+                // and count it.
                 //
                 // Link counts come from here, not from pass 1: a commit chain can
                 // re-assert a live link (a bulk import restating an annotation),
@@ -1134,6 +1129,7 @@ where
                             *live_term_rows.entry((winner.p_id, inner)).or_insert(0) += 1;
                         }
                         collector.on_record(&winner);
+                        stats_hook.count_present(&crate::stats::stats_record_from_v2(&winner, op));
                     }
                 }
                 let live_term_rows: Vec<(u32, u32, u64)> = live_term_rows
@@ -1143,6 +1139,18 @@ where
 
                 (collector.finish(), live_term_rows)
             };
+
+            // Upload HLL sketches (counts included) to CAS.
+            let sketch_ref = super::upload::upload_stats_sketch(
+                &content_store,
+                commit_t,
+                stats_hook.properties(),
+            )
+            .await?
+            .map(|(cid, _)| cid);
+
+            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
+            let id_stats_result = stats_hook.finalize();
 
             // ---- Build IndexStats for FIR6 root ----
             let trie_for_stats =

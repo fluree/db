@@ -170,7 +170,7 @@ impl crate::NameServiceLookup for MemoryNameService {
         crate::read_all_resolved(self, records).await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         let records: Vec<NsRecord> = self
             .records
             .read()
@@ -178,9 +178,7 @@ impl crate::NameServiceLookup for MemoryNameService {
             .filter(|r| r.name == ledger_name)
             .cloned()
             .collect();
-        let mut records = crate::read_all_resolved(self, records).await?;
-        records.retain(|r| !r.retracted);
-        Ok(records)
+        crate::read_all_resolved(self, records).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<crate::LedgerHeads>> {
@@ -1754,7 +1752,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_branches() {
+    async fn test_branch_records() {
         let ns = MemoryNameService::new();
         crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_commit_id("commit-3");
@@ -1766,7 +1764,7 @@ mod tests {
         // Also create a different ledger to ensure filtering works
         crate::testing::create(&ns, "other:main").await.unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
+        let branches = ns.branch_records("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
         let mut names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
         names.sort();
@@ -1774,14 +1772,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_branches_unknown_ledger() {
+    async fn test_branch_records_unknown_ledger() {
         let ns = MemoryNameService::new();
-        let branches = ns.list_branches("nonexistent").await.unwrap();
+        let branches = ns.branch_records("nonexistent").await.unwrap();
         assert!(branches.is_empty());
     }
 
+    /// `branch_records` keeps retracted branches: a soft-dropped branch is
+    /// restorable, so GC must still see it.
     #[tokio::test]
-    async fn test_list_branches_excludes_retracted() {
+    async fn branch_records_keeps_retracted_branches() {
         let ns = MemoryNameService::new();
         crate::testing::create(&ns, "mydb:main").await.unwrap();
         let cid = test_commit_id("commit-1");
@@ -1795,9 +1795,16 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::testing::create(&ns, "other:main").await.unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
-        assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0].branch, "main");
+        let mut branches: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        branches.sort();
+        assert_eq!(branches, ["dead", "main"]);
     }
 }

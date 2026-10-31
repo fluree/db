@@ -11,6 +11,7 @@ use crate::ast::{
 };
 use crate::lex::TokenKind;
 use crate::span::SourceSpan;
+use fluree_graph_ir::syntax::reserved_blank_label;
 
 use super::path::parse_property_path;
 
@@ -174,10 +175,7 @@ impl super::Parser<'_> {
             Some(ReifierId::BlankNode(b)) => SubjectTerm::BlankNode(b),
             Some(ReifierId::Var(v)) => SubjectTerm::Var(v),
             None => {
-                // A label can't start with `-`, so this synthetic one never
-                // collides with a user-written `_:…` label (same scheme as
-                // `-bnpl…` / `-coll…`).
-                let label = format!("-reif{}", self.bnode_counter);
+                let label = reserved_blank_label("reif", self.bnode_counter);
                 self.bnode_counter += 1;
                 SubjectTerm::BlankNode(BlankNode::labeled(&label, span))
             }
@@ -552,11 +550,7 @@ impl super::Parser<'_> {
     }
 
     fn parse_blank_node_property_list_inner(&mut self, start: SourceSpan) -> Option<BlankNode> {
-        // `BLANK_NODE_LABEL` can't start with `-`, so the lexer never produces
-        // this label: a user-written `_:…` can't collide with it and be joined
-        // to the synthetic node. Mid-label `-` is legal, so the skolemized
-        // `fdb-…--bnpl{N}` a write stores serializes as written.
-        let label = format!("-bnpl{}", self.bnode_counter);
+        let label = reserved_blank_label("bnpl", self.bnode_counter);
         self.bnode_counter += 1;
         let subject = SubjectTerm::BlankNode(BlankNode::labeled(&label, start));
 
@@ -670,12 +664,9 @@ impl super::Parser<'_> {
             return Some(Term::Iri(Iri::rdf_nil(span)));
         }
 
-        // Mint the list-cell blank nodes. A label can't start with `-`, so a
-        // user-written `_:…` label never collides with these (same scheme as
-        // the `-bnpl…` property-list labels).
         let cells: Vec<String> = (0..items.len())
             .map(|_| {
-                let label = format!("-coll{}", self.bnode_counter);
+                let label = reserved_blank_label("coll", self.bnode_counter);
                 self.bnode_counter += 1;
                 label
             })

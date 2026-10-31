@@ -236,25 +236,27 @@ pub trait GraphSink {
     }
 
     /// Emit a list item in the named graph `graph`: [`Self::emit_list_item`]
-    /// as [`Self::emit_quad`] is [`Self::emit_triple`].
+    /// for a quad.
     ///
-    /// Only called when [`Self::supports_quads`] returns `true`; the default
-    /// refuses, for the reason `emit_quad`'s does.
+    /// Only called when [`Self::supports_quads`] returns `true`. The default
+    /// body errors, as [`Self::emit_quad`]'s does: a quad sink that does not
+    /// override it refuses list items in a named graph rather than drop the
+    /// graph name or the index.
     fn emit_quad_list_item(
         &mut self,
         subject: TermId,
         predicate: TermId,
         object: TermId,
-        index: i32,
         graph: TermId,
+        index: i32,
     ) -> SinkResult {
-        let _ = (subject, predicate, object, index, graph);
+        let _ = (subject, predicate, object, graph, index);
         debug_assert!(
             self.supports_quads(),
             "emit_quad_list_item called on a sink that does not support quads"
         );
         Err(SinkError::rejected(
-            "this sink is triple-only and cannot represent named graphs",
+            "this sink cannot represent list items in named graphs",
         ))
     }
 
@@ -703,18 +705,9 @@ impl GraphSink for GraphCollectorSink {
             }
             None => {
                 // Anonymous blank node (`[ … ]`, collection spine nodes,
-                // reifiers) — unique counter-based label. The leading '-'
-                // keeps the minted namespace disjoint from every
-                // user-written label: Turtle's BLANK_NODE_LABEL must start
-                // with PN_CHARS_U | [0-9], so `_:-b1` can never lex, while
-                // '-' stays legal medially so the label still serializes.
-                //
-                // Without it a document's own `_:b1` and the first mint are
-                // the same `BlankId` and their nodes silently MERGE. Matches
-                // `FlakeSink`/`ImportSink`, which carry the same fix for the
-                // same reason.
+                // reifiers): a counter-based reserved label.
                 self.blank_counter += 1;
-                let label = format!("-b{}", self.blank_counter);
+                let label = crate::syntax::reserved_blank_label("b", self.blank_counter);
                 self.add_term(Term::blank(label))
             }
         }
@@ -866,8 +859,8 @@ impl GraphSink for GraphCollectorSink {
         subject: TermId,
         predicate: TermId,
         object: TermId,
-        index: i32,
         graph: TermId,
+        index: i32,
     ) -> SinkResult {
         let s = self.get_term(subject).clone();
         let p = self.get_term(predicate).clone();
@@ -1042,7 +1035,7 @@ mod tests {
         let (g, r) = (sink.term_iri("http://ex/g"), sink.term_blank(Some("r")));
         sink.emit_triple(s, p, o).unwrap();
         sink.emit_quad(s, p, o, g).unwrap();
-        sink.emit_quad_list_item(s, p, o, 0, g).unwrap();
+        sink.emit_quad_list_item(s, p, o, g, 0).unwrap();
         sink.emit_quad_reified_triple(s, p, o, r, g).unwrap();
         sink.end_statement();
 
@@ -1270,6 +1263,12 @@ mod tests {
         let err = sink
             .emit_quad(s, p, o, g)
             .expect_err("the default quad body must refuse, never silently fall back");
+        assert!(matches!(err, SinkError::Rejected(_)), "{err:?}");
+        assert!(err.to_string().contains("named graphs"), "{err}");
+
+        let err = sink
+            .emit_quad_list_item(s, p, o, g, 0)
+            .expect_err("the default quad list-item body must refuse too");
         assert!(matches!(err, SinkError::Rejected(_)), "{err:?}");
         assert!(err.to_string().contains("named graphs"), "{err}");
     }

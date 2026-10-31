@@ -1886,6 +1886,16 @@ impl BinaryIndexStore {
         arena.lookup_vector(handle)
     }
 
+    /// The length of `(g_id, p_id)`'s vectors, from the arena manifest (no
+    /// shard is loaded). `None` when the predicate has no vectors in `g_id`.
+    pub fn vector_dims(&self, g_id: GraphId, p_id: u32) -> Option<u16> {
+        self.graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+            .map(crate::arena::vector::LazyVectorArena::dims)
+            .filter(|&dims| dims != 0)
+    }
+
     /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
     ///
     /// See [`crate::arena::vector::LazyVectorArena::snapshot`] — scan loops

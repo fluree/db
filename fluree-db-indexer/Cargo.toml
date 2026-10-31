@@ -61,6 +61,7 @@ fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = 
 xxhash-rust.workspace = true
 tempfile = "3"
 tracing-subscriber.workspace = true
+fluree-test-support = { path = "../fluree-test-support" }
 
 [lints]
 workspace = true

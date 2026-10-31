@@ -27,6 +27,7 @@ use crate::parse::txn_meta::check_user_predicate;
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue};
+use fluree_graph_ir::syntax::reserved_blank_label;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -572,10 +573,8 @@ impl GraphSink for TemplateSink<'_> {
                 id
             }
             None => {
-                // The leading '-' keeps minted labels out of the
-                // user-writable BLANK_NODE_LABEL space (see FlakeSink).
                 self.anon += 1;
-                let label = format!("-b{}", self.anon);
+                let label = reserved_blank_label("b", self.anon);
                 let hash = if self.identity() {
                     hash_parts(b"B", &[label.as_bytes()])
                 } else {

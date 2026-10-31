@@ -211,9 +211,10 @@ async fn deleting_one_value_of_a_wide_slot_removes_what_reading_the_slot_does() 
     for lane in ["Indexed", "NoveltyOverIndex"] {
         expect(&format!(r#"{lane} a plain value: removed ["t3"]"#));
         expect(&format!(
-            r#"{lane} a value also in a list: removed ["t1#0"]"#
+            r#"{lane} a value also in a list: removed ["t1", "t1#0", "t1#2"]"#
         ));
-        expect(&format!(r#"{lane} a list entry: removed ["t5#1"]"#));
+        // `t5` is one of the plain values too, which goes with its entry.
+        expect(&format!(r#"{lane} a list entry: removed ["t5", "t5#1"]"#));
         expect(&format!(
             r#"{lane} the untagged twin of a tagged value: removed ["t2"]"#
         ));

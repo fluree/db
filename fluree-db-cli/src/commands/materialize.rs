@@ -128,7 +128,7 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     let (twin_name, twin_branch) = fluree_db_core::ledger_id::split_ledger_id(&twin_ledger)?;
     let existing_branches = fluree
         .nameservice()
-        .list_branches(&twin_name)
+        .branch_records(&twin_name)
         .await
         .map_err(|e| CliError::Import(format!("check twin ledger freshness: {e}")))?;
     if let Some(other) = blocking_existing_branch(&existing_branches, &twin_branch) {

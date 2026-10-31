@@ -22,7 +22,9 @@ use crate::binding::{
     RegistryCas, Versioned,
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
-use crate::ns_format::{merge_heads, ns_context, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION};
+use crate::ns_format::{
+    merge_heads, ns_context, parse_record, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION,
+};
 use crate::{
     deserialize_json, serialize_json, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -36,8 +38,13 @@ use fluree_db_core::{
     CasAction, CasOutcome, ContentId, Error as CoreError, InstanceId, LedgerId, StorageCas,
     StorageList, StorageRead, StorageWrite,
 };
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+
+/// Record reads [`NameServiceLookup::branch_records`] keeps in flight. Each
+/// is a GET or two on an object store.
+const BRANCH_RECORD_READS_IN_FLIGHT: usize = 8;
 
 /// Storage-backed nameservice
 ///
@@ -312,10 +319,7 @@ where
     /// Read and parse a JSON file from storage
     async fn read_json<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
         match self.storage.read_bytes(key).await {
-            Ok(bytes) => {
-                let parsed = serde_json::from_slice(&bytes)?;
-                Ok(Some(parsed))
-            }
+            Ok(bytes) => Ok(Some(parse_record(&bytes, key)?)),
             Err(CoreError::NotFound(_)) => Ok(None),
             Err(e) => Err(NameServiceError::storage(format!(
                 "Failed to read {key}: {e}"
@@ -339,7 +343,7 @@ where
         if Self::is_graph_source_from_bytes(&main_bytes) {
             return Ok(None);
         }
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, &main_key)?;
         if main.is_deleted() {
             return Ok(None);
         }
@@ -357,6 +361,22 @@ where
         // differ from the requested ones belongs to another ledger that maps
         // to the same path (`a:b/c` vs `a/b:c`), so this ledger does not exist.
         Ok(record.filter(|r| r.name == ledger_name && r.branch == branch))
+    }
+
+    /// The `.json` keys under `ledger_name`'s prefix: its branches' records,
+    /// their sidecars, and any ledger nested under the name.
+    async fn ledger_record_keys(&self, ledger_name: &str) -> Result<Vec<String>> {
+        let prefix = if self.prefix.is_empty() {
+            format!("{NS_VERSION}/{ledger_name}/")
+        } else {
+            format!("{}/{}/{}/", self.prefix, NS_VERSION, ledger_name)
+        };
+
+        let mut keys = StorageList::list_prefix(&self.storage, &prefix)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("Failed to list branches: {e}")))?;
+        keys.retain(|key| key.ends_with(".json"));
+        Ok(keys)
     }
 
     /// Read the ledger record stored at `main_key`, taking its identity from
@@ -400,7 +420,7 @@ where
             return Ok(None);
         }
 
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, main_key)?;
         let Some(ledger_id) =
             crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, main_key)
         else {
@@ -551,36 +571,24 @@ where
         self.load_heads(&ledger_name, &branch).await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        let prefix = if self.prefix.is_empty() {
-            format!("{NS_VERSION}/{ledger_name}/")
-        } else {
-            format!("{}/{}/{}/", self.prefix, NS_VERSION, ledger_name)
-        };
-
-        let keys = StorageList::list_prefix(&self.storage, &prefix)
-            .await
-            .map_err(|e| NameServiceError::storage(format!("Failed to list branches: {e}")))?;
-
-        let mut records = Vec::new();
-
-        for key in keys {
-            if !key.ends_with(".json") || self.is_registry_key(&key) {
-                continue;
-            }
-
-            // Keys under `{ledger_name}/` also include nested ledgers
-            // (`{ledger_name}/sub/main.json`); the record says which it is.
-            if let Ok(Some(record)) = self.read_record_at(&key).await {
-                if record.name == ledger_name {
-                    records.push(record);
-                }
-            }
-        }
-
-        let mut records = crate::read_all_resolved(self, records).await?;
-        records.retain(|r| !r.retracted);
-        Ok(records)
+    /// One LIST under the ledger's prefix and a bounded number of record
+    /// reads in flight, so the cost follows this ledger's branches, not the
+    /// store's ledgers. Keys under the prefix include nested ledgers
+    /// (`{ledger_name}/sub/main.json`); the record says which it is.
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        let keys = self.ledger_record_keys(ledger_name).await?;
+        let records: Vec<Option<NsRecord>> = stream::iter(keys)
+            .filter(|key| std::future::ready(!self.is_registry_key(key)))
+            .map(|key| async move { self.read_record_at(&key).await })
+            .buffered(BRANCH_RECORD_READS_IN_FLIGHT)
+            .try_collect()
+            .await?;
+        let records = records
+            .into_iter()
+            .flatten()
+            .filter(|r| r.name == ledger_name)
+            .collect();
+        crate::read_all_resolved(self, records).await
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -1552,7 +1560,7 @@ where
             }
         };
 
-        let file: NsFileV2 = serde_json::from_slice(&data)?;
+        let file: NsFileV2 = parse_record(&data, &key)?;
         if file.is_deleted() {
             return Ok(None);
         }
@@ -1660,7 +1668,7 @@ where
             }
         };
 
-        let file: NsFileV2 = serde_json::from_slice(&data)?;
+        let file: NsFileV2 = parse_record(&data, &key)?;
         if file.is_deleted() {
             return Ok(None);
         }
@@ -2378,10 +2386,10 @@ mod tests {
             ]
         );
 
-        let acme: Vec<_> = ns.list_branches("acme").await.unwrap();
+        let acme: Vec<_> = ns.branch_records("acme").await.unwrap();
         assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
         let mut mydb: Vec<String> = ns
-            .list_branches("mydb")
+            .branch_records("mydb")
             .await
             .unwrap()
             .into_iter()
@@ -2393,6 +2401,55 @@ mod tests {
         // Same path, different identity: not this ledger.
         assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
         assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
+    }
+
+    /// `branch_records` lists one ledger's branches, retracted ones included,
+    /// and fails on a record it cannot read rather than leave it out: GC reads
+    /// a missing branch as one with nothing to protect. Another ledger's
+    /// records are never read.
+    #[tokio::test]
+    async fn branch_records_lists_one_ledger_strictly() {
+        let ns = make_storage_ns();
+        for id in ["mydb:main", "mydb:dev", "mydb/nested:main", "other:main"] {
+            crate::testing::create(&ns, id).await.unwrap();
+            publish_commit(&ns, id, 1, &dummy_cid(id)).await;
+        }
+        crate::lifecycle::begin_drop_branch(
+            &ns,
+            &fluree_db_core::LedgerName::parse("mydb").unwrap(),
+            "dev",
+        )
+        .await
+        .unwrap();
+        ns.storage
+            .write_bytes(&ns.ns_key("other", "main"), b"not json")
+            .await
+            .unwrap();
+        assert!(ns.all_records().await.is_err());
+
+        let mut branches: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        branches.sort();
+        assert_eq!(
+            branches,
+            ["dev", "main"],
+            "retracted kept, nested ledger left out"
+        );
+
+        ns.storage
+            .write_bytes(&ns.ns_key("mydb", "dev"), b"not json")
+            .await
+            .unwrap();
+        let err = ns.branch_records("mydb").await.unwrap_err();
+        assert!(
+            err.to_string().contains("mydb/dev.json"),
+            "an unreadable branch fails the listing, naming its record: {err}"
+        );
     }
 
     /// A store holding ids an older release accepted but bindings cannot

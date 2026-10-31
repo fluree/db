@@ -57,7 +57,8 @@ pub use gc::{
     plan_garbage, plan_sweep, release_garbage_plan, shared_blob_policy_for,
     shared_refs_of_branches, siblings_of, write_garbage_record, BranchIndexHead,
     CleanGarbageConfig, CleanGarbageResult, GarbagePlan, GarbageRecord, SharedBlobPolicy,
-    SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
+    SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES,
+    DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,

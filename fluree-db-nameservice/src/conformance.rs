@@ -37,6 +37,14 @@ fn assert_conflict(err: NameServiceError) {
 }
 
 /// The child count readers see on `ledger_id`'s record.
+/// The branches of `ledger` a listing shows, retracted ones left out, as
+/// `Fluree::list_branches` filters `branch_records`.
+async fn live_branches<S: crate::NameServiceLookup>(store: &S, ledger: &str) -> Vec<NsRecord> {
+    let mut records = store.branch_records(ledger).await.unwrap();
+    records.retain(|r| !r.retracted);
+    records
+}
+
 async fn children<S: crate::NameServiceLookup>(store: &S, ledger_id: &str) -> u32 {
     store.lookup(ledger_id).await.unwrap().unwrap().branches
 }
@@ -574,8 +582,8 @@ pub async fn listings_skip_registry_state<S: LifecycleStore + crate::NameService
         .collect();
     all.sort();
     assert_eq!(all, vec!["kept:dev", "kept:main"]);
-    assert!(store.list_branches("gone").await.unwrap().is_empty());
-    assert_eq!(store.list_branches("kept").await.unwrap().len(), 2);
+    assert!(live_branches(store, "gone").await.is_empty());
+    assert_eq!(live_branches(store, "kept").await.len(), 2);
     assert!(store.lookup("gone:main").await.unwrap().is_none());
 }
 
@@ -605,7 +613,12 @@ pub async fn leaf_branch_drop_frees_the_branch<S: LifecycleStore + crate::NameSe
     assert_eq!(record.storage_root, dev.storage_root);
     assert!(store.raw_record("mydb:dev").await.unwrap().unwrap().frozen);
     assert!(store.lookup("mydb:dev").await.unwrap().unwrap().retracted);
-    assert_eq!(store.list_branches("mydb").await.unwrap().len(), 1);
+    assert_eq!(live_branches(store, "mydb").await.len(), 1);
+    assert_eq!(
+        store.branch_records("mydb").await.unwrap().len(),
+        2,
+        "a dropped branch still listed is kept for GC"
+    );
     assert_exists(
         lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
             .await
@@ -714,7 +727,7 @@ pub async fn a_branch_being_created_reads_as_absent<
     assert!(store.insert_record(&record).await.unwrap().is_none());
 
     assert!(store.lookup("mydb:fx").await.unwrap().is_none());
-    assert_eq!(store.list_branches("mydb").await.unwrap().len(), 2);
+    assert_eq!(live_branches(store, "mydb").await.len(), 2);
     assert_eq!(children(store, "mydb:dev").await, 0);
     assert!(matches!(
         lifecycle::begin_drop_branch(store, &name("mydb"), "fx")
@@ -935,7 +948,7 @@ pub async fn mirror_binds_the_origin_instance<S: LifecycleStore + crate::NameSer
     assert_eq!(Some(&binding.root), main.storage_root.as_ref());
     assert_eq!(binding.root_branch, "main");
     assert_eq!(binding.fence_of("dev"), dev.fence);
-    assert_eq!(store.list_branches("mydb").await.unwrap().len(), 2);
+    assert_eq!(live_branches(store, "mydb").await.len(), 2);
 
     lifecycle::drop_ledger(&origin, &name("mydb"), true)
         .await

@@ -412,7 +412,7 @@ impl<'a, 'input, S: GraphSink, L: TokenStream> Parser<'a, 'input, S, L> {
                 .emit_list_item(subject, predicate, object, index)?,
             Some(graph) => self
                 .sink
-                .emit_quad_list_item(subject, predicate, object, index, graph)?,
+                .emit_quad_list_item(subject, predicate, object, graph, index)?,
         }
         self.emit_count += 1;
         Ok(())

@@ -54,6 +54,7 @@ pub mod template_sink;
 #[cfg(test)]
 mod test_support;
 pub mod value_convert;
+pub mod vector_dims;
 
 #[cfg(feature = "import")]
 pub mod import;
@@ -66,12 +67,13 @@ pub use fluree_graph_turtle::splitter as turtle_splitter;
 // Re-exports
 pub use address::parse_commit_id;
 pub use commit::{
-    build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
+    build_commit, check_index_loaded, commit, CommitOpts, CommitOptsRequest, CommitReceipt,
+    StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{
-    graph_id_in, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey, Origin, Retraction, Slot,
-    StoredFact, DELETE_POINT_READ_SITE,
+    graph_id_in, resolve_same_t_pairs, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey,
+    Origin, Retraction, SameTPair, Slot, StoredFact, DELETE_POINT_READ_SITE,
 };
 pub use error::{ReportResult, Result, ShaclViolations, TransactError};
 pub use flake_sink::FlakeSink;

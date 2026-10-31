@@ -2201,7 +2201,7 @@ ex:bob ex:name \"Bob\" .
             .with_max_level(tracing::Level::INFO)
             .with_writer(std::io::sink)
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        fluree_test_support::with_scoped_default(subscriber, || {
             assert!(tracing::enabled!(tracing::Level::INFO));
             for character in ['±', '界', '🦀'] {
                 let start = "@prefix ex: <http://example.org/";

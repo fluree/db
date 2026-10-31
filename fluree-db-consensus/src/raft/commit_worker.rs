@@ -1661,10 +1661,14 @@ fn stage_failure(message: &str) -> WorkerError {
 }
 
 /// A `build_commit` failure the request itself caused — malformed input
-/// (400) or a delta too large to ever commit (413) — fails the same way on
-/// every attempt, so it poisons now instead of spending the retry budget.
+/// (400), a delta too large to ever commit (413), or a value that breaks a
+/// constraint the ledger holds (422: the datatype limit, a vector the index
+/// cannot store) — fails the same way on every attempt, so it poisons now
+/// instead of spending the retry budget. A lagging view can only miss such a
+/// constraint, never invent one, so a refusal stands after a refresh.
 /// Anything else can be rooted in this node's view (a commit or namespace
-/// conflict, policy or SHACL over lagging state) and stays transient.
+/// conflict, policy or SHACL over lagging state, an index this node has not
+/// loaded: 503) and stays transient.
 fn build_commit_failure(err: ApiError) -> WorkerError {
     if matches!(
         &err,
@@ -1678,7 +1682,7 @@ fn build_commit_failure(err: ApiError) -> WorkerError {
         return WorkerError::PolicyDenied(err.to_string());
     }
     match err.status_code() {
-        400 | 413 => stage(PoisonReason::BodyMalformed {
+        400 | 413 | 422 => stage(PoisonReason::BodyMalformed {
             error: err.to_string(),
         }),
         _ => stage_failure(&format!("build_commit failed: {err}")),
@@ -1816,7 +1820,7 @@ mod tests {
 
     #[test]
     fn request_errors_from_build_commit_poison_without_retry() {
-        for status in [400, 413] {
+        for status in [400, 413, 422] {
             assert!(
                 matches!(
                     build_commit_failure(ApiError::http(status, "bad")),
@@ -1825,7 +1829,27 @@ mod tests {
                 "{status}"
             );
         }
-        for status in [403, 409, 422, 500, 503] {
+        // The two refusals that answer 422, as `build_commit` returns them.
+        for refused in [
+            fluree_db_api::TransactError::InvalidVector(
+                "vector dims mismatch: expected 3, got 2".into(),
+            ),
+            fluree_db_api::TransactError::DatatypeLimitExceeded {
+                used: 16_369,
+                adding: 1,
+                max: 16_369,
+            },
+        ] {
+            let what = refused.to_string();
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::Transact(refused)),
+                    WorkerError::Stage(reason) if matches!(*reason, PoisonReason::BodyMalformed { .. })
+                ),
+                "{what}"
+            );
+        }
+        for status in [403, 409, 500, 503] {
             assert!(
                 matches!(
                     build_commit_failure(ApiError::http(status, "maybe stale")),
@@ -1834,6 +1858,15 @@ mod tests {
                 "{status}"
             );
         }
+        // This node's state, not the request's: retried after a refresh.
+        assert!(matches!(
+            build_commit_failure(ApiError::Transact(
+                fluree_db_api::TransactError::IndexNotLoaded(
+                    "the ledger's index (t=1) is not loaded".into()
+                )
+            )),
+            WorkerError::Transient(_)
+        ));
     }
 
     #[test]

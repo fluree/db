@@ -29,6 +29,7 @@ once_cell.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

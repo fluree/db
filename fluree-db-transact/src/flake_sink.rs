@@ -10,6 +10,7 @@ use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_graph_ir::syntax::reserved_blank_label;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -317,16 +318,9 @@ impl GraphSink for FlakeSink<'_> {
             }
             None => {
                 // Anonymous blank node (`[]`, bare `~` reifiers, `{| … |}`
-                // blocks) — unique counter-based label. The leading '-'
-                // keeps the minted namespace disjoint from every
-                // user-written label: BLANK_NODE_LABEL must start with
-                // PN_CHARS_U | [0-9], so `_:-b1` can never lex (`_:b1` +
-                // an anonymous mint used to skolemize identically and
-                // silently merge). '-' stays legal medially, so the full
-                // skolemized `fdb-{txn}--b{N}` label still serializes and
-                // re-imports as the same stored node.
+                // blocks): a counter-based reserved label.
                 self.blank_counter += 1;
-                let label = format!("-b{}", self.blank_counter);
+                let label = reserved_blank_label("b", self.blank_counter);
                 let sid = self.skolemize(&label);
                 self.add_term(ResolvedTerm::Sid(sid))
             }

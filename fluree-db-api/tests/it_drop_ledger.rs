@@ -425,7 +425,7 @@ async fn drop_ledger_hard_clears_every_branch_and_shared() {
     // Nameservice empty for this ledger name.
     assert!(fluree
         .nameservice()
-        .list_branches("multi-drop")
+        .branch_records("multi-drop")
         .await
         .unwrap()
         .is_empty());

@@ -1,6 +1,8 @@
 //! Indexer configuration
 
-use crate::gc::{DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS};
+use crate::gc::{
+    DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
+};
 use async_trait::async_trait;
 use fluree_db_binary_index::LeafletCache;
 use fluree_db_core::ledger_config::GraphPlacementIntent;
@@ -104,11 +106,13 @@ pub struct IndexerConfig {
     /// Default: 200
     pub branch_max_children: usize,
 
-    /// Maximum number of old index versions to retain before garbage collection.
+    /// Old index versions always retained, whatever their age: an optional
+    /// floor under the age guard.
     ///
-    /// After each index refresh, if there are more than this many old index
-    /// versions in the prev-index chain, the oldest ones become eligible for GC.
-    /// Default: 5
+    /// After each index refresh, the old versions past this many in the
+    /// prev-index chain become eligible for GC once the age guard
+    /// (`gc_min_time_mins`) has passed.
+    /// Default: 0, so the age guard alone decides below the ceiling.
     pub gc_max_old_indexes: u32,
 
     /// Minimum age in minutes before an index version can be garbage collected.
@@ -120,14 +124,15 @@ pub struct IndexerConfig {
     pub gc_min_time_mins: u32,
 
     /// Retained old index versions past which `gc_min_time_mins` is overridden
-    /// and versions are collected regardless of age. `None` (the default) sets
-    /// no ceiling.
+    /// and versions are collected regardless of age. `None` sets no ceiling.
+    /// Default: 10 ([`DEFAULT_HARD_MAX_OLD_INDEXES`]).
     ///
-    /// Exists because the two thresholds above are ANDed, so under a fast
-    /// publish rate the age guard always wins and `gc_max_old_indexes` bounds
-    /// nothing. Overriding the guard can release artifacts a query that started
-    /// against an older version still needs, and the ceiling bounds versions
-    /// rather than bytes; see
+    /// Bounds the chain of a ledger that publishes faster than the age guard,
+    /// which would otherwise keep every version inside it. It never reaches a
+    /// version `gc_max_old_indexes` keeps, so a ceiling at or below the floor
+    /// is raised to it. Overriding the guard
+    /// can release artifacts a query that started against an older version
+    /// still needs, and the ceiling bounds versions rather than bytes; see
     /// [`crate::gc::CleanGarbageConfig::hard_max_old_indexes`].
     pub gc_hard_max_old_indexes: Option<u32>,
 
@@ -388,7 +393,7 @@ impl Default for IndexerConfig {
             branch_max_children: 200,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
-            gc_hard_max_old_indexes: None,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
@@ -426,7 +431,7 @@ impl IndexerConfig {
             branch_max_children,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
-            gc_hard_max_old_indexes: None,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
@@ -457,7 +462,7 @@ impl IndexerConfig {
             branch_max_children: 40,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
-            gc_hard_max_old_indexes: None,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
@@ -488,7 +493,7 @@ impl IndexerConfig {
             branch_max_children: 400,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
-            gc_hard_max_old_indexes: None,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
@@ -673,14 +678,15 @@ mod tests {
         assert_eq!(config.gc_min_time_mins, 60);
         assert_eq!(config.gc_hard_max_old_indexes, Some(40));
 
-        // The ceiling is opt-in: no preset derives one.
         for preset in [
             IndexerConfig::default(),
             IndexerConfig::small(),
             IndexerConfig::large(),
         ] {
-            assert_eq!(preset.gc_hard_max_old_indexes, None);
+            assert_eq!(preset.gc_hard_max_old_indexes, Some(10));
         }
+        let unbounded = IndexerConfig::default().with_gc_hard_max_old_indexes(None);
+        assert_eq!(unbounded.gc_hard_max_old_indexes, None);
     }
 
     #[test]

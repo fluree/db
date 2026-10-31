@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;
-use super::reasoning_prep::{compute_derived_facts, schema_hierarchy_with_overlay};
+use super::reasoning_prep::compute_derived_facts;
 use super::rewrite_glue::rewrite_query_patterns;
 
 /// Remove exact duplicate triple patterns inside conjunctive blocks.
@@ -335,8 +335,12 @@ pub async fn prepare_execution_with_config(
             }
 
             // Step 1: Compute schema hierarchy from overlay
-            let hierarchy =
-                schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t).await?;
+            let hierarchy = fluree_db_core::compute_schema_hierarchy_with_overlay(
+                db.snapshot,
+                effective_overlay,
+                db.t,
+            )
+            .await?;
 
             tracing::debug!(
                 rdfs = reasoning.rdfs,
@@ -581,6 +585,28 @@ pub async fn prepare_execution_with_config(
             let stats_view =
                 cached_stats_view_for_db(db, binary_store, planning.allow_semantic_elision);
             build_operator_tree(&rewritten_query, stats_view, &planning)?
+        };
+
+        // A CONSTRUCT writes the list entries its template restates
+        // (`crate::list_entries`), for a ledger that may hold list members
+        // and a template triple whose predicate may hold them.
+        let operator = match &rewritten_query.output {
+            crate::ir::QueryOutput::Construct(template)
+                if template.writes_list_entries()
+                    && !rewritten_query.rdf_list_view
+                    && !planning.is_history() =>
+            {
+                match crate::list_view::view_for(db.snapshot, db.overlay, binary_store)? {
+                    Some(view) => crate::list_entries::ListEntriesOperator::over(
+                        operator,
+                        template,
+                        view,
+                        &|iri| db.snapshot.encode_iri(iri),
+                    ),
+                    None => operator,
+                }
+            }
+            _ => operator,
         };
 
         Ok(PreparedExecution {

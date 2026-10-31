@@ -109,6 +109,14 @@ pub const LIFECYCLE_CONFLICT: &str = "err:db/LifecycleConflict";
 /// having retried.
 pub const COMMIT_CONTENTION: &str = "err:db/CommitContention";
 
+/// The server has not loaded the ledger's index: it failed to load, or the
+/// one the server holds is older than the ledger's.
+///
+/// Retryable, surfaced as HTTP 503 with `Retry-After`: the write was refused
+/// before it read or committed anything, and the same request can succeed
+/// once the index loads.
+pub const INDEX_NOT_LOADED: &str = "err:db/IndexNotLoaded";
+
 /// Empty transaction (no flakes)
 pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 

@@ -217,14 +217,17 @@ fn apply_time_travel(
 /// Resolve assert/retract set-semantics among the untranslated overlay flakes.
 ///
 /// Untranslated flakes bypass the cursor's overlay merge, so we apply the same
-/// rule here: for each fact identity `(s, p, o, dt, m)` keep the highest-`t`
-/// flake and emit it only if it is an assertion. `Flake`'s `Eq`/`Hash` key on
-/// fact identity (ignoring `t`/`op`), so the map collapses each identity.
+/// rule here: for each fact identity `(s, p, o, dt, m)` keep the flake that
+/// holds (the highest `t`, and at one `t` the assertion:
+/// `fluree_db_core::same_t`) and emit it only if it is an assertion.
+/// `Flake`'s `Eq`/`Hash` key on fact identity (ignoring `t`/`op`), so the map
+/// collapses each identity.
 fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
     let mut latest: HashMap<Flake, Flake> = HashMap::with_capacity(flakes.len());
     for f in flakes {
         match latest.get(&f) {
-            Some(existing) if existing.t >= f.t => {}
+            Some(existing)
+                if !fluree_db_core::same_t::supersedes((f.t, f.op), (existing.t, existing.op)) => {}
             _ => {
                 latest.insert(f.clone(), f);
             }
@@ -2779,6 +2782,29 @@ fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retraction and an assertion of one untranslated fact at one `t`
+    /// leave the fact, in either order; a later retraction removes it.
+    #[test]
+    fn surviving_untranslated_holds_a_same_t_pairs_assertion() {
+        let f = |t: i64, op: bool| {
+            Flake::new(
+                fluree_db_core::Sid::new(100, "s"),
+                fluree_db_core::Sid::new(100, "p"),
+                fluree_db_core::FlakeValue::String("v".to_string()),
+                fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "string"),
+                t,
+                op,
+                None,
+            )
+        };
+        for ops in [[false, true], [true, false]] {
+            let out = surviving_untranslated(ops.iter().map(|&op| f(5, op)).collect());
+            assert_eq!(out.len(), 1, "{ops:?}");
+            assert!(out[0].op);
+        }
+        assert!(surviving_untranslated(vec![f(5, false), f(5, true), f(6, false)]).is_empty());
+    }
 
     #[test]
     fn test_write_iri_or_bnode() {

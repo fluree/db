@@ -78,7 +78,7 @@ Fluree supports JSON-LD 1.1:
 Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored.
 
 Deviations from the JSON-LD 1.1 expansion algorithm:
-- Other `@`-keywords on a node object are refused, where the algorithm drops them.
+- Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
 - A type-scoped context also applies to the node objects nested in the typed node (the algorithm's default is `@propagate: false`), and a node with several types applies their scoped contexts in the order written rather than in lexicographic order.
 - A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
 
@@ -133,6 +133,8 @@ Why: before this, a parsed value kept its offset and source lexical while it sat
 
 **Arithmetic over offset-carrying `xsd:date` / `xsd:time` operands (deviation from XPath):** follows from the paragraph above. XPath anchors each such operand in its own timezone; Fluree has already discarded it, so `"2026-01-01+05:00" - "2026-01-01Z"` is `PT0S` where XPath says `-PT5H`, and XPath's own `op:subtract-times` example `"17:00:00-06:00" - "08:00:00+09:00"` answers `PT9H` rather than `P1D`. `xsd:dateTime` arithmetic matches XPath exactly, since the instant is the value. Pinned across both storage lanes by `it_temporal_lane_stability`.
 
+**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it (W3C tests `list-2` to `list-4`). The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
+
 **Dataset clauses (§13.2):** A `FROM` / `FROM NAMED` clause defines the query's dataset exhaustively — the default graph is the union of the `FROM` clauses, and `GRAPH ?g` ranges over exactly the `FROM NAMED` graphs. `FROM NAMED` with no `FROM` therefore gives an **empty default graph**. **Changed in 4.1.4:** the HTTP endpoints now implement this; earlier releases substituted a ledger's default graph, and separately enumerated the ledger alias as an extra named graph, which duplicated every `GRAPH ?g` solution. The embedded Rust API was already conformant, so this removes a divergence between surfaces rather than introducing one. The change covers all four HTTP query surfaces — ledger-scoped and connection-scoped `/query`, plus both streaming routes — and the JSON-LD `fromNamed` form follows the identical semantics, so byte-equivalent SPARQL and JSON-LD queries return the same result. A query with no dataset clause keeps its existing behavior. Requests that name only named graphs while also carrying patterns outside `GRAPH { ... }` / `["graph", ...]` receive an `x-fdb-warning` response header. See [Datasets and named graphs](../concepts/datasets-and-named-graphs.md#http-endpoints-and-default-graph-behavior).
 
 **`x-fdb-warning` is a permanent advisory, not a migration aid.** It has no sunset and no opt-out. It describes a query *shape* whose §13.2 semantics are perennially surprising — naming only named graphs and then matching outside them — so it fires on every query surface wherever that shape appears, including the connection-scoped route where §13.2 was already in force before 4.1.4 and no behavior changed. It is named `warning` rather than `deprecation` deliberately: nothing it points at is going away. The response body and status are unaffected — the status is always the one the request earned on its own — so clients should treat the header as informational and must not key error handling on its presence.
@@ -165,6 +167,11 @@ Differences from the specification:
   `CREATE` of an existing graph is not an error
 - The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
   management operations
+- A list is written and deleted through its members: deleting a value deletes
+  every entry of a list that holds it, and a list's cells cannot be edited one
+  by one ([Writing lists](../query/sparql.md#writing-lists))
+- `ADD` of a list the destination already holds restates it, and so does
+  `ADD` of the same list again beside another list there
 
 See [SPARQL UPDATE](../query/sparql.md#sparql-update-restrictions). JSON-LD
 transactions remain available as an alternative write surface.
@@ -355,6 +362,10 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 Changes within v1 that a client may need to account for.
 
+#### Writing schema triples is checked by modify policy
+
+Schema triples (`rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`, and `rdf:type` declaring a class or property) used to be exempt from `f:modify` policy, so any identity able to transact could write or retract them. A policy on a class or property also covers its subclasses and subproperties, so writing the hierarchy changes what policies allow. Schema triples are now checked like any other flake. An identity with `f:defaultAllow` or no policy is unaffected. A restricted identity that maintains the ontology needs modify permission for those triples: an `f:onProperty` policy on the four schema properties, and one on `rdf:type` whose condition admits only class and property types ([Schema writes](../security/policy-in-transactions.md#schema-writes) has the pair). This includes `CLEAR` and `DROP` of a graph holding schema triples. Reading the schema is unchanged: view policy still lets every schema triple through. See [Schema writes](../security/policy-in-transactions.md#schema-writes).
+
 #### SHACL is enforced only where the ledger config enables it (breaking)
 
 Shapes no longer enable SHACL on their own. A ledger that holds shapes but has no config setting `f:shaclEnabled true` used to validate every write against them in reject mode; it now validates nothing until its config enables SHACL, ledger-wide or per graph. Ledgers whose config already enables SHACL are unchanged, and so are configs without a SHACL group, which were already unenforced. The same applies to shapes published through GraphQL or `fluree model entity define`, and to branch merge, rebase, revert and push. In a GraphQL schema, `sh:minCount ≥ 1` makes a field non-null only where the config enables SHACL; elsewhere the field is nullable.
@@ -387,7 +398,11 @@ A node nested under a node with an `@graph` selector is now written to that grap
 
 A term defined in a scoped (property- or type-scoped) `@context` whose `@id` is a compact IRI over a prefix only the outer context defines (`"a": {"@id": "ex:a", "@context": {"b": {"@id": "ex:b"}}}`) now expands to the full IRI. It used to stay compact, so the key was written as the string `ex:b`, an IRI with the scheme `ex`. Data already written that way stays as it is.
 
-Related JSON-LD changes: graph names must be absolute IRIs (relative ones are refused, and a graph name no longer expands through `@vocab`); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern, its graph name resolved as in insert and delete templates, and in a CONSTRUCT template, the `"construct": true` shorthand included, it names the graph the node's triples are written to (it was read as a property named `@graph`, and the triples went to the default graph); `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata; an update's `fromNamed` list that gives one name to two graphs is refused (an alias spelled `urn:default` that names another graph among them, since that name means the default graph); `"default"` in an update's `from` list reads the default graph beside the other graphs listed (it was dropped); and `opts.unionDefaultGraph` is refused on an update, as a SPARQL update refuses the `union-default-graph` pragma. Bulk JSON-LD import refuses `@graph` scoping instead of folding it into the default graph; use `fluree insert`, or import TriG or N-Quads.
+Related JSON-LD changes: graph names must be absolute IRIs (relative ones are refused, and a graph name no longer expands through `@vocab`); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern, its graph name resolved as in insert and delete templates, and in a CONSTRUCT template, the `"construct": true` shorthand included, it names the graph the node's triples are written to (it was read as a property named `@graph`, and the triples went to the default graph); `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata; an update's `fromNamed` list that gives one name to two graphs is refused (an alias spelled `urn:default` that names another graph among them, since that name means the default graph); `"default"` in an update's `from` list reads the default graph beside the other graphs listed (it was dropped); and `opts.unionDefaultGraph` is refused on an update, as a SPARQL update refuses the `union-default-graph` pragma. Bulk JSON-LD import reads all of this as a transaction does (see below).
+
+#### Bulk JSON-LD import writes graph-scoped data, and refuses what it cannot place
+
+A bulk JSON-LD import (`fluree create --from`, `.jsonld` and `.jsonl`/`.ndjson`) now writes `@graph` scoping as a transaction does: a node's graph selector puts it and the nodes nested in it in that graph, and a JSON-LD named graph puts its content there, through the same graph-name table a transaction and a TriG import use. It used to refuse such documents (and before that, dropped the named graphs' content). A few documents that imported before now fail, naming what they cannot place: an unknown `@`-keyword on a node (it used to be dropped), and a graph name a transaction refuses as well. `"config"` and `"txn-meta"` stay refused, as in a TriG import. Each `.jsonl` line is read as a document of its own under the shared context.
 
 #### Data written by an earlier release that reads differently
 
@@ -397,6 +412,10 @@ No stored format changes, and no migration is needed. Two kinds of earlier data 
 - **Edges written through a reverse-defined term** (a context term with `"@reverse"`). With `"childOf": {"@reverse": "ex:child"}`, the node `{"@id": "ex:kid", "childOf": {"@id": "ex:mom"}}` means `ex:mom ex:child ex:kid`. Earlier releases stored `ex:kid ex:child ex:mom`, as if the term were not reversed. The term is now read as JSON-LD defines it, so the same document no longer reaches an edge an earlier release stored: deleting with it does nothing. To repair a predicate that was written only through a reverse term, flip its edges once, for example `DELETE { ?s ex:child ?o } INSERT { ?o ex:child ?s } WHERE { ?s ex:child ?o }`. If it was also written in the forward direction, select only the edges the reverse term wrote.
 
 `@annotation` on a value of a reverse property (inside `@reverse`, or under a reverse-defined term) now annotates the edge in the direction it is stored.
+
+#### Deleting a value a list repeats deletes every entry holding it
+
+A delete naming a value, without a list position, used to delete the first entry of a list holding it, unless its WHERE clause handed each stored entry over (`DELETE { ex:s ex:items ?o } WHERE { ex:s ex:items ?o FILTER(?o = 1) }`), which deleted every one. It now deletes every entry of a list that holds the value, and the value where it is also stored beside the list, however it is written: SPARQL `DELETE DATA`, `DELETE WHERE`, a WHERE with `VALUES`, and a JSON-LD `delete`. A value that is no list entry is deleted as before. To remove one entry of a list that repeats a value, upsert the list.
 
 #### `fluree-track-policy` is now parsed by the server
 

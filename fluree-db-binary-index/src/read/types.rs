@@ -5,6 +5,7 @@
 //! `(s_id, p_id, o_type, o_key, o_i)` instead of `(s_id, p_id, o_kind, o_key, dt)`.
 
 use crate::format::run_record::RunSortOrder;
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::GraphId;
 use std::cmp::Ordering;
 
@@ -188,7 +189,9 @@ pub fn sort_overlay_ops_stable(ops: &mut [OverlayOp], order: RunSortOrder) {
 /// When the same fact (same `FactKeyV3`) has both an assertion and a retraction
 /// in the overlay — e.g., an insert at t=N followed by an upsert at t=N+1 that
 /// retracts the old value — only the latest operation (highest `t`) should
-/// survive. This collapses each fact's lifecycle to its current state.
+/// survive. This collapses each fact's lifecycle to its current state. A
+/// retraction and an assertion at one `t` resolve to the assertion
+/// ([`fluree_db_core::same_t`]), as every index build resolves them.
 ///
 /// The `BinaryCursor` merge assumes each fact appears at most once in the overlay
 /// ops. Without this resolution, both the stale assertion and the retraction are
@@ -210,21 +213,12 @@ pub fn resolve_overlay_ops(ops: &mut Vec<OverlayOp>) {
         let key = ops[read].fact_key();
         read += 1;
         while read < ops.len() && ops[read].fact_key() == key {
-            // Keep the highest-t op; on a same-t tie prefer the retract, so an
-            // assert+retract of the same fact in one commit resolves to absent
-            // (consistent with the per-commit apply path). The accumulator dedups
-            // within a txn so the tie is currently unreachable, but the
-            // segment-aware assembly merges runs across segments — keep it
-            // deterministic rather than dependent on sort position.
-            //
-            // The merge and revert fold was the other producer: it concatenated
-            // a source range's flakes into one commit at one `t`. It now nets
-            // per fact, so the pairs it used to emit stop here, but merge
-            // commits written by the older code keep them on disk. Do not
-            // remove the tie-break on the strength of the accumulator alone.
-            let better = ops[read].t > ops[best].t
-                || (ops[read].t == ops[best].t && !ops[read].op && ops[best].op);
-            if better {
+            // Keep the op that holds: the highest `t`, and at one `t` the
+            // assertion. Decided by rule, not by sort position: commits written
+            // before the staging fix (and merges before the net-change fold)
+            // hold same-`t` pairs, and the segment-aware assembly merges runs
+            // across segments.
+            if supersedes((ops[read].t, ops[read].op), (ops[best].t, ops[best].op)) {
                 best = read;
             }
             read += 1;
@@ -237,9 +231,9 @@ pub fn resolve_overlay_ops(ops: &mut Vec<OverlayOp>) {
 
 /// Each fact's state at `to_t` among `events`, which are sorted by `order`'s
 /// key (a fact's events adjacent, in any `t` order): its latest event at or
-/// before `to_t`, a retract winning a same-`t` tie. Unlike
-/// [`resolve_overlay_ops`], a fact's identity includes its graph, so the same
-/// triple in two pooled graphs stays two facts.
+/// before `to_t`, the assertion holding at one `t` (`fluree_db_core::same_t`).
+/// Unlike [`resolve_overlay_ops`], a fact's identity includes its graph, so
+/// the same triple in two pooled graphs stays two facts.
 pub fn resolve_events_at(events: &[OverlayOp], to_t: i64) -> Vec<OverlayOp> {
     let mut out: Vec<OverlayOp> = Vec::new();
     let mut i = 0;
@@ -252,8 +246,7 @@ pub fn resolve_events_at(events: &[OverlayOp], to_t: i64) -> Vec<OverlayOp> {
             if e.t > to_t {
                 continue;
             }
-            let better = best.is_none_or(|b| e.t > b.t || (e.t == b.t && !e.op && b.op));
-            if better {
+            if best.is_none_or(|b| supersedes((e.t, e.op), (b.t, b.op))) {
                 best = Some(e);
             }
         }

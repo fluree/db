@@ -20,7 +20,7 @@ use fluree_graph_ir::{BlankId, Dataset, Datatype, LiteralValue, Term as IrTerm, 
 use fluree_vocab::{geo, rdf, xsd};
 use rustc_hash::FxHashMap;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// Format CONSTRUCT query results as JSON-LD graph
@@ -135,6 +135,7 @@ pub(super) fn instantiate_construct_graph(
             Vec::new(),
             const_term,
             template.is_asserted(i),
+            template.list_entries(i),
         ));
     }
     for r in template.reifications() {
@@ -159,6 +160,7 @@ pub(super) fn instantiate_construct_graph(
     // This row's triple terms, by term template; `None` where a component
     // is unbound.
     let mut row_terms: Vec<Option<IrTerm>> = Vec::with_capacity(term_slots.len());
+    let mut lists = Lists::default();
 
     for batch in &result.batches {
         for row in 0..batch.len() {
@@ -196,7 +198,9 @@ pub(super) fn instantiate_construct_graph(
             let mut resolve = |terms: &mut TermResolver<'_>, slot: &Slot, position| {
                 resolve_in(terms, &row_terms, slot, position)
             };
-            'pattern: for (slots, graph_slot, reifier_slots, const_term, asserted) in &patterns {
+            'pattern: for (slots, graph_slot, reifier_slots, const_term, asserted, list_vars) in
+                &patterns
+            {
                 // `?r rdf:reifies ?t` with a triple term bound to ?t (or a
                 // constant one) writes what `?r rdf:reifies <<( s p o )>>`
                 // does: ?r's reification of the term's triple, which it does
@@ -244,6 +248,17 @@ pub(super) fn instantiate_construct_graph(
                 let [Some(s), Some(p), Some(o)] = triple else {
                     unreachable!("every position was filled above")
                 };
+                // A triple the WHERE read as entries of a list is written as
+                // that list (`fluree_db_query::list_entries`), and as a value
+                // only where its owner also holds it beside the list.
+                if let Some(vars) = list_vars {
+                    if let Some(Binding::List(at)) = batch.get(row, vars.positions) {
+                        lists.add(&s, &p, at, &o);
+                        if !batch.get(row, vars.beside).is_some_and(Binding::is_bound) {
+                            continue 'pattern;
+                        }
+                    }
+                }
                 if graph_slot.is_none() && reifier_slots.is_empty() {
                     dataset.default.add(Triple::new(s, p, o));
                     continue;
@@ -273,8 +288,57 @@ pub(super) fn instantiate_construct_graph(
             }
         }
     }
+    lists.write(&mut dataset.default);
 
     Ok(dataset)
+}
+
+/// The lists a CONSTRUCT writes: each owner's entries by position, owners in
+/// the order the solutions first name them.
+#[derive(Default)]
+struct Lists {
+    owners: Vec<((IrTerm, IrTerm), BTreeMap<i64, IrTerm>)>,
+    index: HashMap<(IrTerm, IrTerm), usize>,
+}
+
+impl Lists {
+    /// `o` as the entries of `s`'s list under `p` at the positions `at`.
+    fn add(&mut self, s: &IrTerm, p: &IrTerm, at: &[Binding], o: &IrTerm) {
+        let owner = (s.clone(), p.clone());
+        let n = *self.index.entry(owner.clone()).or_insert_with(|| {
+            self.owners.push((owner, BTreeMap::new()));
+            self.owners.len() - 1
+        });
+        for position in at {
+            if let Binding::Lit {
+                val: FlakeValue::Long(i),
+                ..
+            } = position
+            {
+                self.owners[n].1.insert(*i, o.clone());
+            }
+        }
+    }
+
+    /// Each list as its owner's edge to a chain of `rdf:first`/`rdf:rest`
+    /// cells, which the writers spell as `( … )` and `@list`.
+    fn write(self, graph: &mut fluree_graph_ir::Graph) {
+        let iri = |iri: &str| IrTerm::Iri(Arc::from(iri));
+        for (n, ((s, p), entries)) in self.owners.into_iter().enumerate() {
+            let cell = |k: usize| IrTerm::BlankNode(BlankId::new(format!("l{n}-{k}")));
+            graph.add(Triple::new(s, p, cell(0)));
+            let len = entries.len();
+            for (k, member) in entries.into_values().enumerate() {
+                let next = if k + 1 == len {
+                    iri(rdf::NIL)
+                } else {
+                    cell(k + 1)
+                };
+                graph.add(Triple::new(cell(k), iri(rdf::FIRST), member));
+                graph.add(Triple::new(cell(k), iri(rdf::REST), next));
+            }
+        }
+    }
 }
 
 /// A template position: a constant resolved up front, a variable bound per

@@ -34,16 +34,30 @@ mod inner {
     use fluree_db_core::commit::codec::CommitCodecError;
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::{ObjKey, ObjKind};
+    use fluree_db_core::vector::VectorError;
     use fluree_db_core::DatatypeConstraint;
     use fluree_db_core::{DatatypeDictId, Flake, FlakeMeta, FlakeValue, GraphId, Sid};
     use fluree_db_indexer::run_index::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_indexer::run_index::spool::{SpoolFileInfo, SpoolWriter};
+    use fluree_graph_ir::syntax::reserved_blank_label;
     use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// An import sink's deferred failure as the import reports it: a value
+    /// the ledger refuses (an `Invalid vector`, the datatype limit) keeps the
+    /// type a transaction's refusal has; anything else failed to encode.
+    pub fn encode_failure(error: TransactError) -> TransactError {
+        match error {
+            TransactError::CommitCodec(e) => {
+                TransactError::Parse(format!("flake encode error: {e}"))
+            }
+            refused => refused,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // ResolvedTerm — local term representation (same shape as FlakeSink's)
@@ -126,7 +140,7 @@ mod inner {
         /// Chunk-local string dictionary (chunk-local ID → string bytes).
         pub strings: ChunkStringDict,
         /// Triple-term table: one pseudo-record per reified base edge, in
-        /// ordinal order (see [`SpoolContext::write_link_record`]).
+        /// ordinal order (see [`SpoolContext::write_term_record`]).
         pub terms: Vec<RunRecord>,
     }
 
@@ -145,7 +159,7 @@ mod inner {
         /// Chunk index (for deterministic ordering in merge phase).
         pub chunk_idx: usize,
         /// Triple-term table: one pseudo-record per reified base edge, in
-        /// ordinal order (see [`SpoolContext::write_link_record`]).
+        /// ordinal order (see [`SpoolContext::write_term_record`]).
         pub terms: Vec<RunRecord>,
     }
 
@@ -377,7 +391,7 @@ mod inner {
         ///
         /// Fails once the import holds more non-reserved datatypes than a
         /// ledger can, so no record carries an ID the index cannot store.
-        fn assign_datatype_id(&mut self, sid: &Sid) -> Result<u16, CommitCodecError> {
+        fn assign_datatype_id(&mut self, sid: &Sid) -> Result<u16, TransactError> {
             let code = sid.namespace_code;
             self.cache_prefix(code);
             let prefix = self
@@ -388,14 +402,13 @@ mod inner {
             let id = self.datatypes.get_or_insert_parts(prefix, &sid.name);
             DatatypeDictId::try_from_dict_id(id)
                 .map(DatatypeDictId::as_u16)
-                .ok_or_else(|| {
+                .ok_or({
                     let max = MAX_NON_RESERVED_DATATYPES;
-                    let limit = TransactError::DatatypeLimitExceeded {
+                    TransactError::DatatypeLimitExceeded {
                         used: max,
                         adding: 1,
                         max,
-                    };
-                    CommitCodecError::InvalidOp(limit.to_string())
+                    }
                 })
         }
 
@@ -419,8 +432,15 @@ mod inner {
         /// Uses the same encoders as `CommitResolver` in the indexer for inline
         /// types. For subjects and strings, assigns chunk-local IDs (remapped
         /// during merge). For BigInt/Decimal/Vector, uses shared global pools.
-        fn resolve_object_value(&mut self, value: &FlakeValue, p_id: u32) -> Option<(u8, u64)> {
-            Some(match value {
+        ///
+        /// Fails when the shared vector pool cannot store a vector, which stops
+        /// the import. `None` for a value with no spool encoding.
+        fn resolve_object_value(
+            &mut self,
+            value: &FlakeValue,
+            p_id: u32,
+        ) -> Result<Option<(u8, u64)>, VectorError> {
+            Ok(Some(match value {
                 FlakeValue::Ref(sid) => {
                     let local_id = self.assign_subject_id(sid);
                     (ObjKind::REF_ID.as_u8(), local_id)
@@ -492,7 +512,7 @@ mod inner {
                 FlakeValue::GeoPoint(bits) => (ObjKind::GEO_POINT.as_u8(), bits.0),
                 // Only the link path produces term objects, through the
                 // chunk's term table; a materialized term here has no encoding.
-                FlakeValue::TripleTerm(_) => return None,
+                FlakeValue::TripleTerm(_) => return Ok(None),
                 FlakeValue::BigInt(bi) => {
                     use num_bigint::BigInt;
                     use std::convert::TryFrom;
@@ -536,24 +556,31 @@ mod inner {
                 }
                 FlakeValue::Vector(v) => {
                     // Use shared vector pool for global handle.
-                    match self.vector_pool.insert_f64(self.g_id, p_id, v) {
-                        Ok(handle) => (
-                            ObjKind::VECTOR_ID.as_u8(),
-                            ObjKey::encode_u32_id(handle).as_u64(),
-                        ),
-                        Err(e) => {
-                            tracing::error!("SpoolContext: vector insert failed: {}", e);
-                            return None;
-                        }
-                    }
+                    let handle = self.vector_pool.insert_f64(self.g_id, p_id, v)?;
+                    (
+                        ObjKind::VECTOR_ID.as_u8(),
+                        ObjKey::encode_u32_id(handle).as_u64(),
+                    )
                 }
-            })
+            }))
         }
 
-        /// Write a spool record for one flake.
+        /// Write a spool record for one default-graph flake.
         ///
-        /// Fails if the flake's datatype would pass the datatype limit.
-        fn write_record(&mut self, rec: FlakeRecord) -> Result<(), CommitCodecError> {
+        /// Fails if the flake's datatype would pass the datatype limit, or its
+        /// vector is one the ledger cannot store: the refusals a transaction
+        /// gets for the same data.
+        fn write_record(&mut self, rec: FlakeRecord) -> Result<(), TransactError> {
+            self.write_record_in(rec, None)
+        }
+
+        /// [`Self::write_record`] for a flake of the named graph `graph`, or
+        /// the default graph.
+        fn write_record_in(
+            &mut self,
+            rec: FlakeRecord,
+            graph: Option<&str>,
+        ) -> Result<(), TransactError> {
             let FlakeRecord {
                 s,
                 p,
@@ -566,8 +593,11 @@ mod inner {
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
             let dt_id = self.assign_datatype_id(dt)?;
-            let Some((o_kind, o_key)) = self.resolve_object_value(o, p_id) else {
-                return Ok(()); // skip spool record on unresolvable value (e.g. bad vector)
+            let Some((o_kind, o_key)) = self
+                .resolve_object_value(o, p_id)
+                .map_err(|e| self.invalid_vector(p, graph, &e))?
+            else {
+                return Ok(()); // a triple term is spooled through the term table
             };
             let lang_id = lang.map(|l| self.assign_lang_id(l)).unwrap_or(0);
             let i = list_index
@@ -599,23 +629,6 @@ mod inner {
             Ok(())
         }
 
-        /// Spool the RDF 1.2 link `ann rdf:reifies <<( s p o )>>`.
-        ///
-        /// The term becomes a pseudo-record in the chunk's term table,
-        /// resolved as the base triple's own record would be, except that a
-        /// decimal, big-integer or vector object holds the string id of its
-        /// canonical form. The link record's `o_key` is that entry's ordinal;
-        /// the build remaps the entry to global ids and interns it, replacing
-        /// the ordinal with the term handle.
-        fn write_link_record(
-            &mut self,
-            ann: &Sid,
-            term: &fluree_db_core::TripleTermValue,
-            t: i64,
-        ) -> Result<(), CommitCodecError> {
-            self.write_term_record(ann, None, term, t)
-        }
-
         /// A term's term-table entry, written after its inner term's when it
         /// nests one (whose ordinal is then its object): the entry's ordinal,
         /// or `None` when its object has no spool encoding.
@@ -623,7 +636,7 @@ mod inner {
             &mut self,
             term: &fluree_db_core::TripleTermValue,
             t: i64,
-        ) -> Result<Option<u64>, CommitCodecError> {
+        ) -> Result<Option<u64>, TransactError> {
             let s_id = self.assign_subject_id(&term.s);
             let p_id = self.assign_predicate_id(&term.p);
             let dt_id = self.assign_datatype_id(&term.dt)?;
@@ -644,6 +657,7 @@ mod inner {
                 Some((o_kind.as_u8(), ObjKey::encode_u32_id(id).as_u64()))
             } else {
                 self.resolve_object_value(&term.o, p_id)
+                    .map_err(|e| self.invalid_vector(&term.p, None, &e))?
             };
             let Some((o_kind, o_key)) = resolved else {
                 return Ok(None);
@@ -669,16 +683,22 @@ mod inner {
             Ok(Some(ordinal))
         }
 
-        /// Spool `s p <<( … )>>`: the term's components as a term-table
-        /// pseudo-record, and the statement with the term's ordinal as its
-        /// object. `p` is `rdf:reifies` when `None`.
+        /// Spool `s p <<( … )>>`, an RDF 1.2 link when `p` is `rdf:reifies`
+        /// (or `None`).
+        ///
+        /// The term becomes a pseudo-record in the chunk's term table,
+        /// resolved as the base triple's own record would be, except that a
+        /// decimal, big-integer or vector object holds the string id of its
+        /// canonical form. The statement's `o_key` is that entry's ordinal;
+        /// the build remaps the entry to global ids and interns it, replacing
+        /// the ordinal with the term handle.
         fn write_term_record(
             &mut self,
             s: &Sid,
             p: Option<&Sid>,
             term: &fluree_db_core::TripleTermValue,
             t: i64,
-        ) -> Result<(), CommitCodecError> {
+        ) -> Result<(), TransactError> {
             let Some(ordinal) = self.spool_term(term, t)? else {
                 return Ok(());
             };
@@ -715,6 +735,21 @@ mod inner {
             Ok(())
         }
 
+        /// The refusal of a vector of `p` the ledger cannot store.
+        /// `assign_predicate_id` has cached `p`'s prefix.
+        fn invalid_vector(
+            &self,
+            p: &Sid,
+            graph: Option<&str>,
+            error: &VectorError,
+        ) -> TransactError {
+            let prefix = self
+                .ns_prefix_cache
+                .get(&p.namespace_code)
+                .map_or("", String::as_str);
+            crate::vector_dims::invalid_vector(&format!("{prefix}{}", p.name), graph, error)
+        }
+
         /// Allocate (or look up) the `g_id` for a named-graph IRI via the shared
         /// graph allocator.
         ///
@@ -738,11 +773,12 @@ mod inner {
         pub fn push_named_graph_record(
             &mut self,
             g_id: GraphId,
+            graph_iri: &str,
             rec: FlakeRecord,
-        ) -> Result<(), CommitCodecError> {
+        ) -> Result<(), TransactError> {
             let saved = self.g_id;
             self.g_id = g_id;
-            let result = self.write_record(rec);
+            let result = self.write_record_in(rec, Some(graph_iri));
             self.g_id = saved;
             result
         }
@@ -756,7 +792,7 @@ mod inner {
             p: Option<&Sid>,
             term: &fluree_db_core::TripleTermValue,
             t: i64,
-        ) -> Result<(), CommitCodecError> {
+        ) -> Result<(), TransactError> {
             let saved = self.g_id;
             self.g_id = g_id;
             let result = self.write_term_record(s, p, term, t);
@@ -802,8 +838,10 @@ mod inner {
         /// `term_blank`.
         sub_chunk: u32,
         writer: StreamingCommitWriter,
-        /// First encoding error encountered (checked after parse).
-        encode_error: Option<CommitCodecError>,
+        /// First encoding error encountered (checked after parse): a value the
+        /// ledger refuses, typed as a transaction's refusal, or else a
+        /// `CommitCodec` failure.
+        encode_error: Option<TransactError>,
         /// Turtle @prefix short names: IRI → short prefix (e.g., "http://example.org/" → "ex").
         /// Captured from `on_prefix()` calls during parse.
         prefix_map: HashMap<String, String>,
@@ -813,22 +851,56 @@ mod inner {
         /// their chain's cells would be minted under. Written when the chunk
         /// ends ([`Self::into_parts`]).
         lists: Vec<(Vec<Flake>, String)>,
-        /// The list each subject and predicate is adding items to.
-        open_lists: HashMap<(Sid, Sid), usize>,
+        /// The list each graph, subject and predicate is adding items to.
+        open_lists: HashMap<crate::lists::Owner, usize>,
         /// The owners whose list another chunk of the import has stored
         /// compactly, when not the spool context's.
         list_owners: Option<crate::lists::ClaimedOwners>,
         /// Each reifier's `f:reifies*` slots seen so far, when its triple
         /// arrives as slots (see [`Self::absorb_slot`]).
         pending_links: HashMap<Sid, PendingLink>,
+        /// The named graphs this sink wrote statements to, in first-use
+        /// order, and the graph SID of each.
+        named_graphs: Vec<(Sid, NamedGraphUse)>,
+        /// Graph SID -> index into `named_graphs`.
+        named_graph_slots: HashMap<Sid, usize>,
+        /// The graph term the last quad named, and its slot: a producer names
+        /// one graph for a run of statements.
+        last_graph: Option<(TermId, usize)>,
     }
 
-    /// A reifier's slots, collected until all three are in.
+    /// A reifier's slots, collected until all three are in, and the
+    /// `named_graphs` slot of the graph they were written to.
     #[derive(Default)]
     struct PendingLink {
         s: Option<Sid>,
         p: Option<Sid>,
         o: Option<(FlakeValue, DatatypeConstraint)>,
+        graph: Option<usize>,
+    }
+
+    /// A named graph an [`ImportSink`] wrote statements to (JSON-LD `@graph`
+    /// scoping, through [`GraphSink::emit_quad`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NamedGraphUse {
+        /// The graph IRI.
+        pub iri: String,
+        /// Its `g_id` from the spool's shared graph allocator, when a spool
+        /// context is attached. Without one, the serial finalizer assigns it.
+        pub g_id: Option<GraphId>,
+    }
+
+    /// What an [`ImportSink`] produced: see [`ImportSink::into_output`].
+    pub struct ImportSinkOutput {
+        /// The commit writer, holding every flake the sink encoded.
+        pub writer: StreamingCommitWriter,
+        /// Turtle `@prefix` short names: IRI -> short prefix.
+        pub prefix_map: HashMap<String, String>,
+        /// The spool context, if one was attached.
+        pub spool_ctx: Option<SpoolContext>,
+        /// The named graphs the sink wrote, in first-use order. Each one
+        /// new to the import belongs in its commit's `graph_delta`.
+        pub named_graphs: Vec<NamedGraphUse>,
     }
 
     impl<'a> ImportSink<'a> {
@@ -863,6 +935,9 @@ mod inner {
                 open_lists: HashMap::new(),
                 list_owners: None,
                 pending_links: HashMap::new(),
+                named_graphs: Vec::new(),
+                named_graph_slots: HashMap::new(),
+                last_graph: None,
             })
         }
 
@@ -890,6 +965,9 @@ mod inner {
                 open_lists: HashMap::new(),
                 list_owners: None,
                 pending_links: HashMap::new(),
+                named_graphs: Vec::new(),
+                named_graph_slots: HashMap::new(),
+                last_graph: None,
             })
         }
 
@@ -911,13 +989,18 @@ mod inner {
 
         /// Consume the sink and return the writer for finalization.
         ///
-        /// Returns an error if any flake failed to encode during parsing.
+        /// Returns an error if any flake failed to encode during parsing (see
+        /// [`encode_failure`]).
         ///
         /// Distinct from the protocol's [`GraphSink::finish`] (flush /
         /// finalize): this is the sink's *product*. Deferred-error semantics
         /// are unchanged by the fallible protocol — `emit_*` still records the
         /// first encode failure and keeps going, and this method is where it
         /// becomes a hard error.
+        ///
+        /// Refuses a sink that wrote to a named graph: its caller has no way
+        /// to record the graph in the commit's `graph_delta`, so the graph
+        /// would be lost. Such a caller uses [`Self::into_output`].
         #[allow(clippy::type_complexity)]
         pub fn into_parts(
             self,
@@ -927,8 +1010,27 @@ mod inner {
                 HashMap<String, String>,
                 Option<SpoolContext>,
             ),
-            CommitCodecError,
+            TransactError,
         > {
+            let output = self.into_output()?;
+            if let Some(graph) = output.named_graphs.first() {
+                return Err(TransactError::CommitCodec(CommitCodecError::InvalidOp(
+                    format!(
+                        "the import wrote the named graph <{}>, which this import path \
+                         cannot record",
+                        graph.iri
+                    ),
+                )));
+            }
+            Ok((output.writer, output.prefix_map, output.spool_ctx))
+        }
+
+        /// Consume the sink and return everything it produced, the named
+        /// graphs it wrote included. Writes the lists the chunk began first.
+        ///
+        /// Returns an error if any flake failed to encode during parsing (see
+        /// [`encode_failure`]).
+        pub fn into_output(self) -> Result<ImportSinkOutput, TransactError> {
             let mut sink = self;
             let lists: Vec<_> = std::mem::take(&mut sink.lists)
                 .into_iter()
@@ -947,7 +1049,12 @@ mod inner {
             if let Some(err) = sink.encode_error {
                 return Err(err);
             }
-            Ok((sink.writer, sink.prefix_map, sink.spool_ctx))
+            Ok(ImportSinkOutput {
+                writer: sink.writer,
+                prefix_map: sink.prefix_map,
+                spool_ctx: sink.spool_ctx,
+                named_graphs: sink.named_graphs.into_iter().map(|(_, g)| g).collect(),
+            })
         }
 
         /// Share `owners` — the owners whose list another chunk of this
@@ -987,12 +1094,43 @@ mod inner {
             }
         }
 
+        /// The `named_graphs` slot of the graph `graph` names, registered on
+        /// first use.
+        fn named_graph_slot(&mut self, graph: TermId) -> Result<usize, SinkError> {
+            if let Some((last, slot)) = self.last_graph {
+                if last == graph {
+                    return Ok(slot);
+                }
+            }
+            let Some(sid) = self.resolve_sid(graph) else {
+                return Err(SinkError::rejected("a graph name must be an IRI"));
+            };
+            if let Some(&slot) = self.named_graph_slots.get(&sid) {
+                self.last_graph = Some((graph, slot));
+                return Ok(slot);
+            }
+            let iri = self.ns.iri_for_sid(&sid).ok_or_else(|| {
+                SinkError::rejected(format!(
+                    "graph name {sid:?} uses a namespace code with no prefix"
+                ))
+            })?;
+            let slot = self.named_graphs.len();
+            self.named_graphs
+                .push((sid.clone(), NamedGraphUse { iri, g_id: None }));
+            self.named_graph_slots.insert(sid, slot);
+            self.last_graph = Some((graph, slot));
+            Ok(slot)
+        }
+
+        /// One statement: in the default graph (`graph` is `None`), or in a
+        /// named graph by its `named_graphs` slot.
         fn push_triple(
             &mut self,
             subject: TermId,
             predicate: TermId,
             object: TermId,
             list_index: Option<i32>,
+            graph: Option<usize>,
         ) {
             let Some(s) = self.resolve_sid(subject) else {
                 return;
@@ -1004,7 +1142,7 @@ mod inner {
                 return;
             };
             if fluree_db_core::is_reserved_reifies_predicate(&p) {
-                self.absorb_slot(s, &p, o, dtc);
+                self.absorb_slot(s, &p, o, dtc, graph);
                 return;
             }
 
@@ -1019,7 +1157,8 @@ mod inner {
                                than an ordinary object"
                         .to_string();
                     tracing::error!("ImportSink: {msg}");
-                    self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                    self.encode_error =
+                        Some(TransactError::CommitCodec(CommitCodecError::InvalidOp(msg)));
                 }
                 return;
             }
@@ -1031,23 +1170,50 @@ mod inner {
 
             // Late hard guard: reject (FlakeValue, datatype) shapes that would
             // produce corrupt flakes (e.g. scalar object key with VECTOR_ID
-            // datatype). Surface as a CommitCodecError so the import fails
+            // datatype). Surface as the sink's encode error so the import fails
             // loudly rather than silently dropping/storing bad records.
             if let Err(e) = crate::generate::flakes::validate_value_dt_pair(&o, &dt) {
                 if self.encode_error.is_none() {
-                    let msg = format!("invariant violation: {e}");
-                    tracing::error!("ImportSink: {msg}");
-                    self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                    // A vector no ledger can store is refused as a write of
+                    // it is, naming its property and graph.
+                    let graph_iri = graph.map(|slot| self.named_graphs[slot].1.iri.as_str());
+                    let refusal = match &o {
+                        FlakeValue::Vector(v) => fluree_db_core::vector::check_vector_f64(None, v)
+                            .err()
+                            .map(|ve| {
+                                crate::vector_dims::invalid_vector(&self.ns.iri(&p), graph_iri, &ve)
+                            }),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        TransactError::CommitCodec(CommitCodecError::InvalidOp(format!(
+                            "invariant violation: {e}"
+                        )))
+                    });
+                    tracing::error!("ImportSink: {refusal}");
+                    self.encode_error = Some(refusal);
                 }
                 return;
             }
 
-            let flake = Flake::new(s, p, o, dt, self.t, true, meta);
+            let flake = match graph {
+                None => Flake::new(s, p, o, dt, self.t, true, meta),
+                Some(slot) => Flake::new_in_graph(
+                    self.named_graphs[slot].0.clone(),
+                    s,
+                    p,
+                    o,
+                    dt,
+                    self.t,
+                    true,
+                    meta,
+                ),
+            };
             if list_index.is_none() {
                 self.write_flake(&flake);
                 return;
             }
-            let owner = (flake.s.clone(), flake.p.clone());
+            let owner = (flake.g.clone(), flake.s.clone(), flake.p.clone());
             let list = match self.open_lists.get(&owner) {
                 Some(&list) if list_index != Some(0) => list,
                 _ => {
@@ -1071,7 +1237,7 @@ mod inner {
             if let Err(e) = self.writer.push_flake(flake) {
                 if self.encode_error.is_none() {
                     tracing::error!("ImportSink: flake encode failed: {}", e);
-                    self.encode_error = Some(e);
+                    self.encode_error = Some(TransactError::CommitCodec(e));
                 }
                 return; // Don't spool a flake that failed to encode
             }
@@ -1079,13 +1245,31 @@ mod inner {
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
                 if let FlakeValue::TripleTerm(term) = &flake.o {
-                    if let Err(e) = ctx.write_term_record(&flake.s, Some(&flake.p), term, flake.t) {
+                    let written = match &flake.g {
+                        None => ctx.write_term_record(&flake.s, Some(&flake.p), term, flake.t),
+                        Some(graph) => match named_graph_g_id(
+                            &mut self.named_graphs,
+                            &self.named_graph_slots,
+                            ctx,
+                            graph,
+                        ) {
+                            Ok((g_id, _)) => ctx.push_named_graph_term(
+                                g_id,
+                                &flake.s,
+                                Some(&flake.p),
+                                term,
+                                flake.t,
+                            ),
+                            Err(e) => Err(e),
+                        },
+                    };
+                    if let Err(e) = written {
                         self.encode_error.get_or_insert(e);
                     }
                     return;
                 }
                 let meta = flake.m.as_ref();
-                let written = ctx.write_record(FlakeRecord {
+                let record = FlakeRecord {
                     s: &flake.s,
                     p: &flake.p,
                     o: &flake.o,
@@ -1093,7 +1277,19 @@ mod inner {
                     lang: meta.and_then(|m| m.lang.as_deref()),
                     list_index: meta.and_then(|m| m.i),
                     t: flake.t,
-                });
+                };
+                let written = match &flake.g {
+                    None => ctx.write_record(record),
+                    Some(graph) => match named_graph_g_id(
+                        &mut self.named_graphs,
+                        &self.named_graph_slots,
+                        ctx,
+                        graph,
+                    ) {
+                        Ok((g_id, iri)) => ctx.push_named_graph_record(g_id, &iri, record),
+                        Err(e) => Err(e),
+                    },
+                };
                 if let Err(e) = written {
                     self.encode_error.get_or_insert(e);
                 }
@@ -1104,10 +1300,19 @@ mod inner {
         /// links, describe a reified triple by its `f:reifies*` slots; a
         /// reifier's slots become its `rdf:reifies` link once its subject,
         /// predicate and object are in. The object slot carries the
-        /// triple's datatype and tag, so the other slots add nothing.
-        fn absorb_slot(&mut self, ann: Sid, slot: &Sid, o: FlakeValue, dtc: DatatypeConstraint) {
+        /// triple's datatype and tag, so the other slots add nothing. The
+        /// link goes to the graph the slots were written to.
+        fn absorb_slot(
+            &mut self,
+            ann: Sid,
+            slot: &Sid,
+            o: FlakeValue,
+            dtc: DatatypeConstraint,
+            graph: Option<usize>,
+        ) {
             use fluree_vocab::db;
             let entry = self.pending_links.entry(ann.clone()).or_default();
+            entry.graph = graph;
             match (slot.name.as_ref(), o) {
                 (db::REIFIES_SUBJECT, FlakeValue::Ref(s)) => entry.s = Some(s),
                 (db::REIFIES_PREDICATE, FlakeValue::Ref(p)) => entry.p = Some(p),
@@ -1121,14 +1326,16 @@ mod inner {
                 s: Some(s),
                 p: Some(p),
                 o: Some((o, dtc)),
+                graph,
             }) = self.pending_links.remove(&ann)
             else {
                 unreachable!("all three slots checked above");
             };
-            self.push_link(s, p, o, &dtc, &ann);
+            self.push_link(s, p, o, &dtc, &ann, graph);
         }
 
-        /// Write `ann rdf:reifies <<( s p o )>>` to the commit and the spool.
+        /// Write `ann rdf:reifies <<( s p o )>>` to the commit and the spool,
+        /// in the graph of `named_graphs` slot `graph`, or the default graph.
         fn push_link(
             &mut self,
             s: Sid,
@@ -1136,32 +1343,23 @@ mod inner {
             o: FlakeValue,
             dtc: &DatatypeConstraint,
             ann: &Sid,
+            graph: Option<usize>,
         ) {
+            let g = graph.map(|slot| self.named_graphs[slot].0.clone());
             let link =
-                match crate::generate::flakes::reified_triple_link(None, s, p, o, dtc, ann, self.t)
-                {
+                match crate::generate::flakes::reified_triple_link(g, s, p, o, dtc, ann, self.t) {
                     Ok(link) => link,
                     Err(e) => {
                         if self.encode_error.is_none() {
                             let msg = format!("invariant violation in reified triple: {e}");
                             tracing::error!("ImportSink: {msg}");
-                            self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                            self.encode_error =
+                                Some(TransactError::CommitCodec(CommitCodecError::InvalidOp(msg)));
                         }
                         return;
                     }
                 };
-            if let Err(e) = self.writer.push_flake(&link) {
-                if self.encode_error.is_none() {
-                    tracing::error!("ImportSink: link flake encode failed: {}", e);
-                    self.encode_error = Some(e);
-                }
-                return;
-            }
-            if let (Some(ctx), FlakeValue::TripleTerm(term)) = (&mut self.spool_ctx, &link.o) {
-                if let Err(e) = ctx.write_link_record(ann, term, self.t) {
-                    self.encode_error.get_or_insert(e);
-                }
-            }
+            self.write_flake(&link);
         }
     }
 
@@ -1195,12 +1393,8 @@ mod inner {
                     id
                 }
                 None => {
-                    // Anonymous mint: leading '-' keeps the namespace
-                    // disjoint from every lexable user label (labels cannot
-                    // start with '-'), while the full skolemized
-                    // `fdb-{skolem_base}--b{sub_chunk}-{N}` stays
-                    // serializable — see `FlakeSink::term_blank` for the full
-                    // rationale.
+                    // Anonymous mint: a reserved label,
+                    // `fdb-{skolem_base}--b{sub_chunk}-{N}` once skolemized.
                     //
                     // `sub_chunk` is in the label because the counter alone is
                     // NOT enough: it restarts at 0 in every sink (one per
@@ -1218,7 +1412,10 @@ mod inner {
                     // import, so adding one file to the front of a directory
                     // would renumber every anonymous node behind it.
                     self.blank_counter += 1;
-                    let label = format!("-b{}-{}", self.sub_chunk, self.blank_counter);
+                    let label = reserved_blank_label(
+                        "b",
+                        format_args!("{}-{}", self.sub_chunk, self.blank_counter),
+                    );
                     let sid = self.skolemize(&label);
                     self.add_term(ResolvedTerm::Sid(sid))
                 }
@@ -1265,7 +1462,7 @@ mod inner {
             predicate: TermId,
             object: TermId,
         ) -> SinkResult {
-            self.push_triple(subject, predicate, object, None);
+            self.push_triple(subject, predicate, object, None, None);
             Ok(())
         }
 
@@ -1276,7 +1473,40 @@ mod inner {
             object: TermId,
             index: i32,
         ) -> SinkResult {
-            self.push_triple(subject, predicate, object, Some(index));
+            self.push_triple(subject, predicate, object, Some(index), None);
+            Ok(())
+        }
+
+        fn supports_quads(&self) -> bool {
+            true
+        }
+
+        /// A statement in a named graph (JSON-LD `@graph` scoping): the flake
+        /// carries the graph in the commit, and its spool record the graph's
+        /// `g_id`, as TriG's named-graph flakes do. The caller records the
+        /// graph in the commit's `graph_delta` from [`Self::into_output`].
+        fn emit_quad(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            graph: TermId,
+        ) -> SinkResult {
+            let slot = self.named_graph_slot(graph)?;
+            self.push_triple(subject, predicate, object, None, Some(slot));
+            Ok(())
+        }
+
+        fn emit_quad_list_item(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            graph: TermId,
+            index: i32,
+        ) -> SinkResult {
+            let slot = self.named_graph_slot(graph)?;
+            self.push_triple(subject, predicate, object, Some(index), Some(slot));
             Ok(())
         }
 
@@ -1330,9 +1560,63 @@ mod inner {
                 return Ok(());
             };
 
-            self.push_link(s, p, o, &dtc, &ann);
+            self.push_link(s, p, o, &dtc, &ann, None);
             Ok(())
         }
+
+        /// [`Self::emit_reified_triple`] with the link in the named graph
+        /// `graph`.
+        fn emit_quad_reified_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            reifier: TermId,
+            graph: TermId,
+        ) -> SinkResult {
+            let slot = self.named_graph_slot(graph)?;
+            let Some(s) = self.resolve_sid(subject) else {
+                return Ok(());
+            };
+            let Some(p) = self.resolve_sid(predicate) else {
+                return Ok(());
+            };
+            let Some((o, dtc)) = self.resolve_object(object) else {
+                return Ok(());
+            };
+            let Some(ann) = self.resolve_sid(reifier) else {
+                return Ok(());
+            };
+
+            self.push_link(s, p, o, &dtc, &ann, Some(slot));
+            Ok(())
+        }
+    }
+
+    /// The spool `g_id` and IRI of the named graph `graph`, which a flake
+    /// names: its `g_id` from the shared graph allocator, as TriG's
+    /// named-graph flakes have, assigned on first use.
+    fn named_graph_g_id(
+        named_graphs: &mut [(Sid, NamedGraphUse)],
+        slots: &HashMap<Sid, usize>,
+        ctx: &mut SpoolContext,
+        graph: &Sid,
+    ) -> Result<(GraphId, String), TransactError> {
+        let Some(&slot) = slots.get(graph) else {
+            return Err(TransactError::CommitCodec(CommitCodecError::InvalidOp(
+                format!("a flake names the graph {graph:?}, which this sink never opened"),
+            )));
+        };
+        let graph = &mut named_graphs[slot].1;
+        let g_id = match graph.g_id {
+            Some(g_id) => g_id,
+            None => {
+                let g_id = ctx.graph_g_id_for_iri(&graph.iri);
+                graph.g_id = Some(g_id);
+                g_id
+            }
+        };
+        Ok((g_id, graph.iri.clone()))
     }
 
     // -----------------------------------------------------------------------
@@ -1448,7 +1732,7 @@ mod inner {
             let new = Sid::new(fluree_vocab::namespaces::XSD, "int");
             let err = ctx.write_record(rec(&new)).unwrap_err();
             assert!(
-                err.to_string().contains("datatype limit exceeded"),
+                matches!(err, TransactError::DatatypeLimitExceeded { .. }),
                 "unexpected error: {err}"
             );
             assert_eq!(ctx.record_count(), 1, "the refused record is not spooled");
@@ -1506,6 +1790,144 @@ mod inner {
             ctx.write_record(rec(None)).unwrap();
             let _ = ctx.finish_buffered();
             assert!(config.saw_list_meta.load(Ordering::Relaxed));
+        }
+
+        /// A statement in a named graph carries its graph into the commit,
+        /// a list member its position too, and the sink reports the graph
+        /// for the commit's `graph_delta`.
+        #[test]
+        fn a_named_graph_statement_carries_its_graph_into_the_commit() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+            assert!(sink.supports_quads());
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let o = sink.term_literal("v", Datatype::xsd_string(), None);
+            let g = sink.term_iri("http://example.org/g");
+            sink.emit_quad(s, p, o, g).unwrap();
+            let items = sink.term_iri("http://example.org/items");
+            let b = sink.term_iri("http://example.org/b");
+            let g_again = sink.term_iri("http://example.org/g");
+            sink.emit_quad_list_item(s, items, b, g_again, 0).unwrap();
+            sink.emit_triple(s, p, o).unwrap();
+
+            let output = sink.into_output().unwrap();
+            assert_eq!(
+                output.named_graphs,
+                [NamedGraphUse {
+                    iri: "http://example.org/g".to_string(),
+                    g_id: None
+                }]
+            );
+            let result = output.writer.finish(&make_envelope(1)).unwrap();
+            let flakes = read_commit(&result.bytes).unwrap().flakes;
+            let g = ns.lookup_sid_for_iri("http://example.org/g");
+            // (graph, predicate name, list position), in no particular order:
+            // list members are written when the chunk ends.
+            let mut seen: Vec<_> = flakes
+                .iter()
+                .map(|f| {
+                    (
+                        f.g.clone(),
+                        f.p.name.to_string(),
+                        f.m.as_ref().and_then(|m| m.i),
+                    )
+                })
+                .collect();
+            seen.sort();
+            let mut expected = vec![
+                (None, "q".to_string(), None),
+                (g.clone(), "q".to_string(), None),
+                (g, "items".to_string(), Some(0)),
+            ];
+            expected.sort();
+            assert_eq!(seen, expected);
+        }
+
+        /// A list belongs to its graph, subject and predicate: a list on one
+        /// property in the default graph and another in a named graph are
+        /// each that property's only list there, so both stay compact rather
+        /// than one becoming an `rdf:first`/`rdf:rest` chain.
+        #[test]
+        fn a_list_in_a_named_graph_is_its_own_property_list() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+            let s = sink.term_iri("http://example.org/a");
+            let items = sink.term_iri("http://example.org/items");
+            let b = sink.term_iri("http://example.org/b");
+            let g = sink.term_iri("http://example.org/g");
+            sink.emit_list_item(s, items, b, 0).unwrap();
+            sink.emit_quad_list_item(s, items, b, g, 0).unwrap();
+
+            let output = sink.into_output().unwrap();
+            let result = output.writer.finish(&make_envelope(1)).unwrap();
+            let flakes = read_commit(&result.bytes).unwrap().flakes;
+            let g = ns.lookup_sid_for_iri("http://example.org/g");
+            let mut seen: Vec<_> = flakes
+                .iter()
+                .map(|f| {
+                    (
+                        f.g.clone(),
+                        f.p.name.to_string(),
+                        f.m.as_ref().and_then(|m| m.i),
+                    )
+                })
+                .collect();
+            seen.sort();
+            let mut expected = vec![
+                (None, "items".to_string(), Some(0)),
+                (g, "items".to_string(), Some(0)),
+            ];
+            expected.sort();
+            assert_eq!(seen, expected, "no rdf:first/rdf:rest chain: {flakes:#?}");
+        }
+
+        /// With a spool, a named-graph record goes under the graph's `g_id`
+        /// from the shared graph allocator, which the sink reports.
+        #[test]
+        fn a_named_graph_record_spools_under_its_g_id() {
+            let ns = NamespaceRegistry::new();
+            let config = make_spool_config(&ns);
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-named-graph-{}.spool",
+                std::process::id()
+            ));
+            sink.set_spool_context(SpoolContext::new(&path, 0, 0, &config).unwrap());
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let o = sink.term_literal("v", Datatype::xsd_string(), None);
+            let g = sink.term_iri("http://example.org/g");
+            sink.emit_quad(s, p, o, g).unwrap();
+            sink.emit_triple(s, p, o).unwrap();
+
+            let output = sink.into_output().unwrap();
+            let g_id = output.named_graphs[0]
+                .g_id
+                .expect("a spooled graph has a g_id");
+            assert_eq!(
+                config.graph_alloc.get_or_insert("http://example.org/g") + 1,
+                g_id
+            );
+            let spool = output.spool_ctx.expect("spool");
+            let g_ids: Vec<_> = spool.records.iter().map(|r| r.g_id).collect();
+            assert_eq!(g_ids, [g_id, 0]);
+        }
+
+        /// A caller that cannot record a named graph does not get a writer
+        /// that silently holds one.
+        #[test]
+        fn into_parts_refuses_a_sink_that_wrote_a_named_graph() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let g = sink.term_iri("http://example.org/g");
+            sink.emit_quad(s, p, s, g).unwrap();
+            let err = sink.into_parts().err().expect("refused");
+            assert!(err.to_string().contains("<http://example.org/g>"), "{err}");
         }
 
         #[test]
@@ -1642,6 +2064,20 @@ mod inner {
             assert_eq!(b1, b2);
             assert_ne!(b1, b3);
             assert_ne!(b3, b4);
+        }
+
+        /// An anonymous node's id is part of its document's import: a later
+        /// import of the same file agrees with an earlier one only while this
+        /// spelling holds, so it is pinned exactly.
+        #[test]
+        fn anonymous_nodes_mint_the_ids_a_reimport_agrees_on() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = ImportSink::new(&mut ns, 1, "doc".to_string(), 3, true).unwrap();
+            let ids: Vec<String> = [sink.term_blank(None), sink.term_blank(None)]
+                .into_iter()
+                .map(|t| sink.resolve_sid(t).unwrap().name_str().to_string())
+                .collect();
+            assert_eq!(ids, ["fdb-doc--b3-1", "fdb-doc--b3-2"]);
         }
 
         #[test]
@@ -1842,9 +2278,12 @@ mod inner {
     }
 }
 
+pub use inner::encode_failure;
 pub use inner::BufferedSpoolResult;
 pub use inner::FlakeRecord;
 pub use inner::ImportSink;
+pub use inner::ImportSinkOutput;
+pub use inner::NamedGraphUse;
 pub use inner::SpoolConfig;
 pub use inner::SpoolContext;
 pub use inner::SpoolResult;

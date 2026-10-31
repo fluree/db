@@ -496,25 +496,25 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
     pub reindex_max_bytes: Option<usize>,
 
-    /// Old index versions to retain before GC (default 5)
+    /// Old index versions always retained, whatever their age (default 0)
     #[arg(long, env = "FLUREE_GC_MAX_OLD_INDEXES")]
     pub gc_max_old_indexes: Option<u32>,
 
     /// Minimum age in minutes before an index version can be GC'd (default 15)
     ///
-    /// Protects queries that started against an older version. This is ANDed
-    /// with `--gc-max-old-indexes`, so the slower of the two wins.
+    /// Protects queries that started against an older version. Decides
+    /// retention between `--gc-max-old-indexes` and
+    /// `--gc-hard-max-old-indexes`.
     #[arg(long, env = "FLUREE_GC_MIN_TIME_MINS")]
     pub gc_min_time_mins: Option<u32>,
 
     /// Retained old index versions past which the age guard is overridden and
-    /// versions are collected regardless of age (default: unset, no ceiling)
+    /// versions are collected regardless of age (default: 10)
     ///
-    /// Because the two above are ANDed, a ledger publishing faster than the age
-    /// guard accumulates versions without limit and `--gc-max-old-indexes`
-    /// bounds nothing. Set this to cap the chain anyway. Past the ceiling GC
+    /// Bounds the chain of a ledger that publishes faster than the age guard,
+    /// which would otherwise keep every version inside it. Past the ceiling GC
     /// releases artifacts a query still reading an older version may need, so
-    /// set it well above the number of versions published during your longest
+    /// raise it above the number of versions published during your longest
     /// query. It bounds versions, not bytes: size it from observed per-version
     /// disk use.
     #[arg(long, env = "FLUREE_GC_HARD_MAX_OLD_INDEXES")]
@@ -1607,7 +1607,10 @@ mod gc_retention_flag_tests {
         assert_eq!(cfg.gc_hard_max_old_indexes, Some(12));
 
         let unset = ServerConfig::try_parse_from(["fluree-server"]).expect("no flags parse");
-        assert_eq!(unset.gc_hard_max_old_indexes, None, "the ceiling is opt-in");
+        assert_eq!(
+            unset.gc_hard_max_old_indexes, None,
+            "unset leaves the indexer's default"
+        );
 
         let cmd = ServerConfig::command();
         let env_of = |id: &str| {

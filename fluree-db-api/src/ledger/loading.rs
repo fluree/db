@@ -462,8 +462,13 @@ impl Fluree {
 
 impl Fluree {
     /// List all non-retracted branches for a ledger.
+    ///
+    /// Fails if any branch record cannot be read, rather than return a list
+    /// that silently leaves that branch out.
     pub async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        Ok(self.nameservice().list_branches(ledger_name).await?)
+        let mut branches = self.nameservice().branch_records(ledger_name).await?;
+        branches.retain(|r| !r.retracted);
+        Ok(branches)
     }
 }
 

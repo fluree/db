@@ -423,7 +423,7 @@ async fn resolve_block_ledger(
     if matches!(kind, ContentKind::DictBlob { .. }) {
         if let Ok((name, _)) = fluree_db_core::ledger_id::split_ledger_id(ledger) {
             let branches = ns
-                .list_branches(&name)
+                .branch_records(&name)
                 .await
                 .map_err(|e| ServerError::internal(format!("Branch listing failed: {e}")))?;
             if let Some(record) = branches.into_iter().next() {

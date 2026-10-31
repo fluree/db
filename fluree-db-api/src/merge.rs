@@ -4,7 +4,7 @@
 //! merges (the target's head is on the source's first-parent line) and
 //! general merges with conflict resolution strategies.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold, OwnChanges};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold, NetChange, OwnChanges};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
@@ -659,7 +659,10 @@ impl crate::Fluree {
             .await?;
 
         let CollectedCommitData {
-            flakes: source_flakes,
+            net: NetChange {
+                flakes: source_flakes,
+                ..
+            },
             namespace_delta,
             graph_iris,
         } = source_data;

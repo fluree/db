@@ -511,20 +511,22 @@ pub trait NameServiceLookup:
     /// Used for building in-memory query indexes over the nameservice.
     async fn all_records(&self) -> Result<Vec<NsRecord>>;
 
-    /// List all branches for a given ledger name.
+    /// Every branch record of `ledger_name`, retracted ones included: passing
+    /// `"mydb"` returns `"mydb:main"`, `"mydb:feature-x"` and so on, but not a
+    /// ledger nested under the name, such as `"mydb/sub:main"`.
     ///
-    /// Returns the [`NsRecord`] for every non-retracted branch that shares the
-    /// given base name (e.g., passing `"mydb"` returns records for `"mydb:main"`,
-    /// `"mydb:feature-x"`, etc.).
+    /// A record that cannot be read fails the call, as in
+    /// [`all_records`](Self::all_records): a caller deciding what to delete
+    /// would read a missing branch as one with nothing to protect. A retracted
+    /// branch is restorable, so it is listed; the branches a user sees are the
+    /// ones not [`retracted`](NsRecord::retracted).
     ///
-    /// The default implementation filters [`all_records`](Self::all_records);
-    /// backends may override for efficiency.
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+    /// The default implementation filters [`all_records`](Self::all_records),
+    /// which is O(ledgers). Backends that can list one ledger's branches
+    /// directly override it, and wrappers must forward it.
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         let all = self.all_records().await?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.name == ledger_name && !r.retracted)
-            .collect())
+        Ok(all.into_iter().filter(|r| r.name == ledger_name).collect())
     }
 
     /// Read both head pointers without assembling a full [`NsRecord`].
@@ -1622,8 +1624,8 @@ where
         (**self).all_records().await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        (**self).list_branches(ledger_name).await
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        (**self).branch_records(ledger_name).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {

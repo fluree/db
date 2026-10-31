@@ -70,6 +70,7 @@ In peer mode:
 
 - **Write forwarding**: write and admin endpoints are forwarded to the transaction server configured by `--tx-server-url`.
 - **Read serving**: query endpoints are served locally, using ledger/index data obtained either from shared storage or via storage proxy reads (see below). History queries are executed via the standard `/query` endpoint with time range specifiers.
+- **Index retention**: a peer query reads an index version the transaction server's indexer published, and keeps reading it after a newer one arrives. That indexer's garbage collector decides how long a superseded version stays in storage, so a peer query that outlasts its age guard (15 minutes by default) or its version ceiling (10 old versions by default) can lose the version it is reading. A peer does not collect garbage itself, so set retention on the transaction server; see [Index Retention](../indexing-and-search/background-indexing.md#index-retention).
 
 ### Peer configuration (SSE subscription)
 

@@ -6,6 +6,7 @@
 
 use crate::run_index::runs::streaming_reader::MergeSource;
 use fluree_db_binary_index::format::run_record_v2::{same_identity_v2, RunRecordV2};
+use fluree_db_core::same_t::supersedes;
 use std::cmp::Ordering;
 use std::io;
 
@@ -172,9 +173,10 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
 
     /// Dequeue the next record with deduplication.
     ///
-    /// When multiple records share the same identity, keeps the one with
-    /// the highest `t` (merge tie-breaking). Non-winners are discarded.
-    /// The op byte of the winning record is preserved.
+    /// When multiple records share the same identity, keeps the one that
+    /// holds: the highest `t`, and at one `t` the assert
+    /// ([`fluree_db_core::same_t`]). Non-winners are discarded. The op byte
+    /// of the winning record is preserved.
     ///
     /// For the import-only milestone, dedup is rarely needed (each fact
     /// appears once). This is kept for correctness in chunk-overlap edge cases.
@@ -190,7 +192,7 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
                 break;
             }
             let (dup, dup_op) = self.next_record()?.unwrap();
-            if dup.t > winner.t {
+            if supersedes((dup.t, dup_op == 1), (winner.t, winner_op == 1)) {
                 winner = dup;
                 winner_op = dup_op;
             }
@@ -202,8 +204,9 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
     /// Like `next_deduped`, but also returns non-winning entries as history.
     ///
     /// Returns `(winner, winner_op, history)` where `history` contains all
-    /// non-winning duplicates (same identity, lower t) as `(RunRecordV2, u8)` pairs.
-    /// These are the entries that should become history sidecar entries.
+    /// non-winning duplicates (same identity; the winner as in
+    /// [`Self::next_deduped`]) as `(RunRecordV2, u8)` pairs. These are the
+    /// entries that should become history sidecar entries.
     #[allow(clippy::type_complexity)]
     pub fn next_deduped_with_history(
         &mut self,
@@ -215,13 +218,13 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
 
         let mut history: Vec<(RunRecordV2, u8)> = Vec::new();
 
-        // Consume consecutive duplicates, keeping the highest-t as winner.
+        // Consume consecutive duplicates, keeping the op that holds as winner.
         while let Some(peeked) = self.heap.first().map(|e| &e.record) {
             if !(self.identity)(&winner, peeked) {
                 break;
             }
             let (dup, dup_op) = self.next_record()?.unwrap();
-            if dup.t > winner.t {
+            if supersedes((dup.t, dup_op == 1), (winner.t, winner_op == 1)) {
                 // The old winner becomes history.
                 history.push((winner, winner_op));
                 winner = dup;
@@ -469,5 +472,28 @@ mod tests {
         assert_eq!(winner.t, 5);
         assert_eq!(op, 0); // retract-winner
         assert!(merge.next_deduped().unwrap().is_none());
+    }
+
+    /// A same-`t` retract and assert of one identity dedup to the assert
+    /// (`fluree_db_core::same_t`), whichever stream yields first; with
+    /// history, the retract is the history entry.
+    #[test]
+    fn dedup_same_t_pair_keeps_the_assert() {
+        for ops in [[0u8, 1u8], [1, 0]] {
+            let s1 = VecSourceWithOp::new(vec![make_rec(1, 1, 10, 5)], vec![ops[0]]);
+            let s2 = VecSourceWithOp::new(vec![make_rec(1, 1, 10, 5)], vec![ops[1]]);
+            let mut merge = KWayMerge::new(vec![s1, s2], cmp_v2_spot).unwrap();
+            let (winner, op) = merge.next_deduped().unwrap().unwrap();
+            assert_eq!((winner.t, op), (5, 1));
+            assert!(merge.next_deduped().unwrap().is_none());
+
+            let s1 = VecSourceWithOp::new(vec![make_rec(1, 1, 10, 5)], vec![ops[0]]);
+            let s2 = VecSourceWithOp::new(vec![make_rec(1, 1, 10, 5)], vec![ops[1]]);
+            let mut merge = KWayMerge::new(vec![s1, s2], cmp_v2_spot).unwrap();
+            let (winner, op, history) = merge.next_deduped_with_history().unwrap().unwrap();
+            assert_eq!((winner.t, op), (5, 1));
+            let history: Vec<(u32, u8)> = history.iter().map(|(r, op)| (r.t, *op)).collect();
+            assert_eq!(history, vec![(5, 0)]);
+        }
     }
 }

@@ -54,6 +54,7 @@ use fluree_db_sparql::ast::{
     SubjectTerm, Term, TriplePattern, TripleTerm as SparqlTripleTerm, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
+use fluree_graph_ir::syntax::reserved_blank_label;
 use thiserror::Error;
 
 use crate::ir::{
@@ -117,10 +118,7 @@ impl BlankNodeCounter {
         Self { next: 0 }
     }
 
-    /// The label of a template `[]`. A label can't start with `-`, so no
-    /// hand-written `_:label` collides with it (a user's `_:b0` next to a
-    /// template `[]` used to fuse into one node). Mid-label `-` is legal, so
-    /// the skolemized `fdb-…--anon{N}` serializes as written.
+    /// The label of a template `[]`.
     fn next(&mut self) -> String {
         format!("_:{}", self.mint("anon"))
     }
@@ -132,7 +130,7 @@ impl BlankNodeCounter {
     }
 
     fn mint(&mut self, kind: &str) -> String {
-        let label = format!("-{kind}{}", self.next);
+        let label = reserved_blank_label(kind, self.next);
         self.next += 1;
         label
     }
@@ -850,7 +848,6 @@ pub fn lower_sparql_update(
     // persisted namespace map omits them, and post-commit SELECT can't resolve
     // the predicate IRI back to the same Sid.
     txn.namespace_delta = ns.delta().clone();
-    txn.rdf_list_view = true;
     Ok(txn)
 }
 
@@ -1016,7 +1013,6 @@ fn lower_insert_data(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1072,7 +1068,6 @@ fn lower_delete_data(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1175,7 +1170,6 @@ fn lower_delete_where(
         txn_meta: Vec::new(),
         write_graphs: BTreeSet::new(),
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1241,7 +1235,6 @@ fn lower_delete_where_with_graphs(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })
@@ -1497,7 +1490,6 @@ fn lower_modify(
         txn_meta: Vec::new(),
         write_graphs,
         namespace_delta: std::collections::HashMap::new(),
-        rdf_list_view: true,
         graph_mgmt: None,
         sync_graph: None,
     })

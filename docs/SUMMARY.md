@@ -56,6 +56,7 @@
   - [sql](cli/sql.md)
   - [bm25](cli/bm25.md)
   - [doc](cli/doc.md)
+  - [ontology](cli/ontology.md)
   - [materialize](cli/materialize.md)
   - [completions](cli/completions.md)
 

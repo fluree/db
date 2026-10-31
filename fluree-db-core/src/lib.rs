@@ -74,6 +74,7 @@ pub mod range;
 pub mod range_provider;
 pub mod rdf_list;
 pub mod runtime_small_dicts;
+pub mod same_t;
 pub mod schema_hierarchy;
 pub mod serde;
 pub mod sid;
@@ -92,6 +93,7 @@ pub mod triple_term;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+pub mod vector;
 pub mod verified_identity;
 // moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
 // unit tests. See module docs.

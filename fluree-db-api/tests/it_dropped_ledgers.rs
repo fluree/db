@@ -139,7 +139,6 @@ async fn restore_keeps_a_dropped_branch_dropped() {
 
     fluree.restore_dropped(instance.as_str()).await.unwrap();
     let mut live: Vec<String> = fluree
-        .nameservice()
         .list_branches("mydb")
         .await
         .unwrap()

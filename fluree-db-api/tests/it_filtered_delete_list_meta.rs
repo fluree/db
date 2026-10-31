@@ -261,10 +261,9 @@ async fn list_ledger_hydrates_positions_across_base_and_novelty() {
             assert_eq!(list_values(&fluree, &ledger, "ex:base1").await, vec!["a", "b", "c"]);
             assert_eq!(list_values(&fluree, &ledger, "ex:nov1").await, vec!["b", "e"]);
 
-            // Delete every "b" everywhere. Each (subject, "b") binding must
-            // remove exactly one positional entry: base1 loses its b, base2
-            // keeps one of its two b's (one binding → one entry), nov1 loses
-            // its b, every filler empties.
+            // Delete every "b" everywhere: each list loses every entry
+            // holding it, so base1 loses its b, base2 both of its b's, nov1
+            // its b, and every filler empties.
             let del = json!({
                 "@context": ctx(),
                 "where": [{"@id": "?s", "ex:items": "b"}],
@@ -274,10 +273,10 @@ async fn list_ledger_hydrates_positions_across_base_and_novelty() {
                 .update_with_opts(ledger, &del, TxnOpts::default(), CommitOpts::default(), &index_cfg())
                 .await
                 .unwrap();
-            assert_eq!(r.receipt.flake_count, 203, "base1 + base2 + nov1 + 200 fillers");
+            assert_eq!(r.receipt.flake_count, 204, "base1 + base2's two + nov1 + 200 fillers");
             let ledger = fluree.ledger(ledger_id).await.unwrap();
             assert_eq!(list_values(&fluree, &ledger, "ex:base1").await, vec!["a", "c"]);
-            assert_eq!(list_values(&fluree, &ledger, "ex:base2").await, vec!["b", "d"]);
+            assert_eq!(list_values(&fluree, &ledger, "ex:base2").await, vec!["d"]);
             assert_eq!(list_values(&fluree, &ledger, "ex:nov1").await, vec!["e"]);
             assert_eq!(list_values(&fluree, &ledger, "ex:f7").await, Vec::<String>::new());
         })
@@ -760,12 +759,13 @@ async fn novelty_only_predicate_resolves_metadata_siblings() {
                 vec!["a", "b", "a"]
             );
 
-            // One WHERE binding retracts exactly one positional entry, and
-            // hydration copies the FIRST candidate meta — position 0.
+            // A delete naming the list position retracts exactly that entry:
+            // the one at position 0, whose metadata sorts first. (Naming the
+            // value alone deletes every entry holding it.)
             let del_a = json!({
                 "@context": ctx(),
                 "where": [{"@id": "ex:dup", "ex:items": "a"}],
-                "delete": [{"@id": "ex:dup", "ex:items": "a"}]
+                "delete": [{"@id": "ex:dup", "ex:items": {"@list": ["a"]}}]
             });
             let r = fluree
                 .update_with_opts(ledger, &del_a, TxnOpts::default(), CommitOpts::default(), &index_cfg())

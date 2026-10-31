@@ -44,8 +44,9 @@
 //! CLEAR: modify policy still runs on the staged flakes.
 
 use crate::error::{Result, TransactError};
-use fluree_db_core::comparator::IndexType;
+use fluree_db_core::comparator::{cmp_object, IndexType};
 use fluree_db_core::range::resolve_current_flakes;
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
     range_with_overlay, Flake, FlakeMeta, FlakeValue, GraphId, NoOverlay, OverlayProvider,
     RangeMatch, RangeOptions, RangeTest, Sid, Tracker, DEFAULT_GRAPH_ID,
@@ -55,6 +56,7 @@ use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, Fast
 use fluree_db_query::BinaryRangeProvider;
 use num_bigint::BigInt;
 use rustc_hash::{FxHashMap, FxHasher};
+use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -216,12 +218,9 @@ impl RetractIntent {
         Self { flake, witnessed }
     }
 
+    #[cfg(test)]
     pub(crate) fn flake(&self) -> &Flake {
         &self.flake
-    }
-
-    pub(crate) fn into_flake(self) -> Flake {
-        self.flake
     }
 }
 
@@ -424,7 +423,7 @@ impl<'l> IndexKeys<'l> {
 
     /// Merge the ops of one read that share an index key, the way storage
     /// does: per predicate, key and list position the newest op wins, and on
-    /// one `t` the retraction; the others are dropped, so the term fold that
+    /// one `t` the assertion; the others are dropped, so the term fold that
     /// follows sees one op per key. Index rows are one per key already (the
     /// index merged them), so a read changes only when it holds a novelty op
     /// whose kind of value can share a key; any other read is returned as
@@ -455,7 +454,8 @@ impl<'l> IndexKeys<'l> {
                     }
                     Entry::Occupied(mut e) => {
                         let best = *e.get();
-                        if newer(f, &flakes[best]) {
+                        let cur = &flakes[best];
+                        if supersedes((f.t, f.op), (cur.t, cur.op)) {
                             dropped[best] = true;
                             e.insert(n);
                         } else {
@@ -475,13 +475,6 @@ impl<'l> IndexKeys<'l> {
             .filter_map(|(f, dropped)| (!dropped).then_some(f))
             .collect()
     }
-}
-
-/// Storage's rule for two ops on one fact (`resolve_overlay_ops`,
-/// [`resolve_current_flakes`]): the higher `t` wins, and on one `t` the
-/// retraction.
-fn newer(a: &Flake, b: &Flake) -> bool {
-    a.t > b.t || (a.t == b.t && !a.op && b.op)
 }
 
 /// How storage tells two facts of one `(graph, subject, predicate)` apart.
@@ -524,9 +517,10 @@ pub type MergeKey = (FactKey, Option<i32>);
 /// One rule decides when a retraction and an assertion are the same fact:
 /// within one operation (the flake accumulator), across the operations of
 /// one request (the sequential fold), and against what the state stores
-/// ([`CurrentFacts::named_by`]). Storage resolves a retraction and an
-/// assertion of one fact at one `t` as the retraction, so wherever the two
-/// should cancel they must be told apart by this identity, not by term.
+/// ([`CurrentFacts::named_by`]). A commit built here may not hold a
+/// retraction and an assertion of one fact at one `t` (`build_commit`
+/// refuses one), so wherever the two should cancel they must be told apart
+/// by this identity, not by term.
 pub struct FactIdentity<'l> {
     ledger: &'l LedgerState,
     keys: IndexKeys<'l>,
@@ -598,6 +592,154 @@ impl<'l> FactIdentity<'l> {
             None => FactTerm::Term(flake.o.clone(), flake.dt.clone(), flake.m.clone()),
         }
     }
+
+    /// Every retraction among `flakes` that the same flakes also assert as
+    /// one fact (this identity) in the same graph, each with one such
+    /// assertion: the pairs a commit built here may not hold.
+    ///
+    /// `flakes` must share one `t` and be in SPOT order, as a staged view
+    /// keeps them ([`StagedLedger::staged_flakes_spot`]). One walk: a
+    /// `(subject, predicate)` slot holding only one op is passed over, two
+    /// terms of one fact are found among neighbours with equal objects, and
+    /// index keys are computed only for the kinds of value whose key can
+    /// merge terms, in slots holding both ops. Each pair names its
+    /// retraction's position in `flakes` ([`SameTPair::retraction_at`]).
+    ///
+    /// [`StagedLedger::staged_flakes_spot`]: fluree_db_ledger::StagedLedger::staged_flakes_spot
+    pub fn same_t_pairs<'f>(
+        &self,
+        flakes: impl IntoIterator<Item = &'f Flake>,
+    ) -> Vec<SameTPair<'f>> {
+        let mut pairs = Vec::new();
+        let mut slot: Vec<&'f Flake> = Vec::new();
+        let mut flakes = flakes.into_iter().peekable();
+        let mut at = 0;
+        while let Some(first) = flakes.next() {
+            slot.clear();
+            slot.push(first);
+            while let Some(next) = flakes.next_if(|f| f.s == first.s && f.p == first.p) {
+                slot.push(next);
+            }
+            if slot.len() > 1 {
+                self.pairs_in_slot(&slot, at, &mut pairs);
+            }
+            at += slot.len();
+        }
+        pairs
+    }
+
+    /// [`Self::same_t_pairs`] for one `(subject, predicate)` slot, in SPOT
+    /// order, starting at position `at` of the walk.
+    fn pairs_in_slot<'f>(&self, slot: &[&'f Flake], at: usize, pairs: &mut Vec<SameTPair<'f>>) {
+        if !(slot.iter().any(|f| f.op) && slot.iter().any(|f| !f.op)) {
+            return;
+        }
+        // One term: SPOT orders the object first, so both ops of a term sit
+        // in one run of equal objects.
+        let found = pairs.len();
+        let mut run_at = at;
+        for run in slot.chunk_by(|a, b| cmp_object(a, b).is_eq()) {
+            for (i, &r) in run.iter().enumerate().filter(|(_, f)| !f.op) {
+                if let Some(&a) = run.iter().find(|&&a| a.op && a.g == r.g && *a == *r) {
+                    pairs.push(SameTPair {
+                        retraction: r,
+                        assertion: a,
+                        retraction_at: run_at + i,
+                    });
+                }
+            }
+            run_at += run.len();
+        }
+        // Two terms of one index key.
+        let may_merge = |op: bool| {
+            slot.iter()
+                .any(|f| f.op == op && f.o.index_key_may_merge_terms())
+        };
+        if !(may_merge(true) && may_merge(false)) {
+            return;
+        }
+        // Every retraction of a key pairs with an assertion of it: one fact
+        // can be retracted under several terms (novelty holding a big integer
+        // under two subtypes), and a retraction left over would still pair.
+        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), KeyRetractions<'f>> =
+            FxHashMap::default();
+        for (i, &f) in slot
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.op && f.o.index_key_may_merge_terms())
+        {
+            if pairs[found..].iter().any(|p| p.retraction_at == at + i) {
+                continue;
+            }
+            if let Some(key) = self.key(self.graph_id(&f.g), f) {
+                retracted.entry((&f.g, key)).or_default().push((at + i, f));
+            }
+        }
+        if retracted.is_empty() {
+            return;
+        }
+        for &a in slot
+            .iter()
+            .filter(|f| f.op && f.o.index_key_may_merge_terms())
+        {
+            let Some(key) = self.key(self.graph_id(&a.g), a) else {
+                continue;
+            };
+            for (retraction_at, r) in retracted.remove(&(&a.g, key)).into_iter().flatten() {
+                pairs.push(SameTPair {
+                    retraction: r,
+                    assertion: a,
+                    retraction_at,
+                });
+            }
+        }
+    }
+}
+
+/// The retractions of one index key in a slot, each with its position in
+/// the walk. One per key is the usual case, held inline.
+type KeyRetractions<'f> = SmallVec<[(usize, &'f Flake); 1]>;
+
+/// A retraction and an assertion of one fact ([`FactIdentity`]) in one
+/// graph at one `t` ([`FactIdentity::same_t_pairs`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SameTPair<'f> {
+    pub retraction: &'f Flake,
+    pub assertion: &'f Flake,
+    /// The retraction's position in the sequence
+    /// [`FactIdentity::same_t_pairs`] walked.
+    pub retraction_at: usize,
+}
+
+/// `flakes` with each same-`t` pair resolved to its assertion: the pair's
+/// retraction is dropped. For replaying a commit written before the staging
+/// fix, which may hold such pairs: the pair means the fact holds
+/// ([`fluree_db_core::same_t`]), and a commit built here may not hold the
+/// pair. Facts are identified in `ledger`, the state the replay lands on.
+pub fn resolve_same_t_pairs(ledger: &LedgerState, flakes: Vec<Flake>) -> Vec<Flake> {
+    if !(flakes.iter().any(|f| f.op) && flakes.iter().any(|f| !f.op)) {
+        return flakes;
+    }
+    let dropped: Vec<usize> = {
+        let mut spot: Vec<(usize, &Flake)> = flakes.iter().enumerate().collect();
+        spot.sort_by(|a, b| IndexType::Spot.compare(a.1, b.1));
+        let ids = FactIdentity::new(ledger);
+        let pairs = ids.same_t_pairs(spot.iter().map(|&(_, f)| f));
+        if pairs.is_empty() {
+            return flakes;
+        }
+        // Each pair names its retraction's place in `spot`, which holds the
+        // position in `flakes`: a legacy merge commit can hold many pairs.
+        pairs.iter().map(|p| spot[p.retraction_at].0).collect()
+    };
+    let mut keep = vec![true; flakes.len()];
+    for n in dropped {
+        keep[n] = false;
+    }
+    let mut keep = keep.into_iter();
+    let mut flakes = flakes;
+    flakes.retain(|_| keep.next().unwrap_or(true));
+    flakes
 }
 
 /// The id `ledger` gives graph `g` (`None` is the default graph), or `None`
@@ -639,6 +781,10 @@ impl Slot {
 }
 
 /// Reads a ledger's current facts as of its current `t`.
+///
+/// Each read refuses with [`crate::TransactError::IndexNotLoaded`] when this
+/// process has not loaded the ledger's index ([`crate::check_index_loaded`]):
+/// merge and rebase read here before they commit.
 pub struct CurrentFacts<'l> {
     ledger: &'l LedgerState,
     to_t: i64,
@@ -648,9 +794,15 @@ pub struct CurrentFacts<'l> {
 impl<'l> CurrentFacts<'l> {
     /// Current facts of `ledger` as of `ledger.t()`.
     pub fn new(ledger: &'l LedgerState) -> Self {
+        Self::at(ledger, ledger.t())
+    }
+
+    /// Current facts of `ledger` as of `to_t` (at most `ledger.t()`): the
+    /// index read as of `to_t`, and novelty up to it.
+    pub fn at(ledger: &'l LedgerState, to_t: i64) -> Self {
         Self {
             ledger,
-            to_t: ledger.t(),
+            to_t: to_t.min(ledger.t()),
             keys: IndexKeys::new(ledger),
         }
     }
@@ -842,7 +994,7 @@ impl<'l> CurrentFacts<'l> {
         Ok(self.resolve(g_id, flakes, g_sid, index_only))
     }
 
-    /// Every current fact of graph `g_id`, graph Sid stamped.
+    /// Every current fact of graph `g_id` as of `to_t`, graph Sid stamped.
     ///
     /// The whole-graph verbs (graph sync, CLEAR, DROP, COPY, MOVE) read
     /// through this. `limit` bounds what is materialized, not just what is
@@ -855,6 +1007,7 @@ impl<'l> CurrentFacts<'l> {
         limit: Option<usize>,
         tracker: Option<&Tracker>,
     ) -> Result<Vec<StoredFact>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         let db_ref = match tracker {
             Some(t) => self.ledger.as_graph_db_ref(g_id).with_tracker(t),
             None => self.ledger.as_graph_db_ref(g_id),
@@ -865,7 +1018,7 @@ impl<'l> CurrentFacts<'l> {
         // (overlay-only) path matches an empty `Eq` against every flake.
         let opts = RangeOptions {
             flake_limit: limit.map(|l| l.saturating_add(1)),
-            ..Default::default()
+            ..RangeOptions::new().with_to_t(self.to_t)
         };
         let flakes = db_ref
             .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
@@ -888,7 +1041,11 @@ impl<'l> CurrentFacts<'l> {
     /// Persisted-index rows matching `rm` in graph `g_id`, read through
     /// `NoOverlay`: one leaf seek, no novelty translation. At genesis (no
     /// index yet) there is no provider and the answer is empty.
+    ///
+    /// Every reader that reads the index reads it here, so this is where an
+    /// index this process has not loaded is refused.
     async fn base(&self, g_id: GraphId, rm: RangeMatch) -> Result<Vec<Flake>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         Ok(range_with_overlay(
             &self.ledger.snapshot,
             g_id,
@@ -1021,10 +1178,13 @@ type SlotKey = (GraphId, Sid, Sid);
 ///   key can merge terms by its persisted index key. Novelty holds the terms
 ///   of one big integer apart until the next index build, so the intent
 ///   retracts every term of the fact it names, not just one. An intent
-///   with a list position names that position. One without names the first
-///   list entry holding the term, in slot order, else the plain value: the
-///   contract hydration had, under which a value asserted at N list
-///   positions loses exactly one entry per distinct DELETE row. The fact is
+///   with a list position names that position. One without names every
+///   list entry holding the term and the plain value holding it, so a value
+///   is deleted from a list however often the list repeats it, and beside
+///   it, however the delete is written, as witnessed rows delete them when
+///   the WHERE hands each over. Identical intents name the same facts once.
+///   (Hydration named one entry per distinct DELETE row, so identical rows
+///   deleted one entry and a `FILTER` deleted them all.) The fact is
 ///   retracted as read. An intent that names no stored fact stages
 ///   nothing; with `unmatched`, it is also appended there as instantiated,
 ///   for the caller's modify-policy check.
@@ -1054,13 +1214,14 @@ pub(crate) struct DeleteResolver<'l> {
     /// Witnessed rows matched so far, by slot and by the first stored fact
     /// of the facts they can be.
     taken: HashMap<(SlotKey, u32), usize>,
+    /// Intents without a list position already expanded to list entries: one
+    /// naming the same term again names the same entries, so it adds nothing
+    /// (`SlotFacts::named_all`). A value no list holds is never kept here.
+    expanded: HashSet<(SlotKey, Flake)>,
     /// [`NARROW_SLOT`], or another bound for tests.
     narrow_slot: usize,
     /// A fixed [`Self::point_bound`] for tests (`Some(0)`: never).
     point_bound_override: Option<usize>,
-    /// The intents name RDF triples, which list members are not
-    /// (`fluree_db_query::list_view`): an intent never names one.
-    hide_list_members: bool,
 }
 
 impl<'l> DeleteResolver<'l> {
@@ -1073,17 +1234,10 @@ impl<'l> DeleteResolver<'l> {
             wide: Vec::new(),
             wide_index: HashMap::new(),
             taken: HashMap::new(),
+            expanded: HashSet::new(),
             narrow_slot: NARROW_SLOT,
             point_bound_override: None,
-            hide_list_members: false,
         }
-    }
-
-    /// With `hide`, intents never name a list member: a SPARQL write's
-    /// `s p o` is the RDF triple, and a member is no value of `p`.
-    pub(crate) fn hiding_list_members(mut self, hide: bool) -> Self {
-        self.hide_list_members = hide;
-        self
     }
 
     /// For each slot this batch reads (`at`'s `Read` places), the values
@@ -1262,12 +1416,7 @@ impl<'l> DeleteResolver<'l> {
                 },
             );
         }
-        let mut read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
-        if self.hide_list_members {
-            for facts in &mut read_facts {
-                facts.retain(|f| f.flake().m.as_ref().and_then(|m| m.i).is_none());
-            }
-        }
+        let read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
         let mut read: Vec<ReadSlot> = Vec::with_capacity(to_read.len());
         let mut narrow: Vec<(SlotKey, SlotFacts)> = Vec::with_capacity(to_read.len());
         for ((slot, facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {
@@ -1331,9 +1480,38 @@ impl<'l> DeleteResolver<'l> {
                     }
                     None => out.push(Retraction(intent.flake)),
                 }
+            } else if facts.has_entries && list_index_of(&intent.flake).is_none() {
+                // A value without a position is every list entry holding it
+                // (see `named_all`), unless an identical intent named them.
+                let key = (slot.clone(), intent.flake.clone());
+                if self.expanded.contains(&key) {
+                    stats.matched += 1;
+                    continue;
+                }
+                let named = facts.named_all(&intent.flake, keys);
+                if named.is_empty() {
+                    stats.phantom_intents += 1;
+                    if let Some(unmatched) = unmatched.as_deref_mut() {
+                        unmatched.push(intent.flake);
+                    }
+                    continue;
+                }
+                if named
+                    .iter()
+                    .any(|&n| list_index_of(&facts.facts[n].flake).is_some())
+                {
+                    self.expanded.insert(key);
+                }
+                stats.matched += 1;
+                for m in facts.same_facts(&named) {
+                    out.push(facts.facts[m].clone().retract(t));
+                }
+                for n in named {
+                    out.push(facts.facts[n].retract_named(intent.flake.clone(), t));
+                }
             } else if let Some(n) = facts.named(&intent.flake, keys) {
                 stats.matched += 1;
-                for m in facts.same_fact(n) {
+                for m in facts.same_facts(&[n]) {
                     out.push(facts.facts[m].clone().retract(t));
                 }
                 out.push(facts.facts[n].retract_named(intent.flake, t));
@@ -1382,6 +1560,8 @@ struct SlotFacts {
     terms: Option<Groups<u64>>,
     /// A wide slot's list entries, by `(position, fact)`.
     positions: Vec<(i32, u32)>,
+    /// Whether any fact is a list entry.
+    has_entries: bool,
     /// Each fact's index key, computed when an intent first needs one.
     keys: Option<Vec<Option<IndexKey>>>,
     /// A wide slot's facts by index key, grouped with `keys`.
@@ -1406,6 +1586,7 @@ impl SlotFacts {
     ) -> Self {
         let wide = facts.len() > narrow_slot;
         let terms = wide.then(|| Groups::build(&facts, |_, f| Some(hash(&f.flake)), same_term));
+        let has_entries = facts.iter().any(|f| list_index_of(&f.flake).is_some());
         let mut positions = Vec::new();
         if wide {
             positions = facts
@@ -1423,6 +1604,7 @@ impl SlotFacts {
             hash,
             terms,
             positions,
+            has_entries,
             keys: None,
             by_key: None,
             by_value: None,
@@ -1477,21 +1659,29 @@ impl SlotFacts {
         }
     }
 
-    /// The slot's other facts that are the same stored fact as fact `n`:
-    /// terms of one big integer at one list position, which novelty holds
-    /// apart until the next index build. Every other kind is one term per
-    /// fact once the read is resolved.
-    fn same_fact(&mut self, n: usize) -> Vec<usize> {
+    /// The slot's other facts that are the same stored fact as one of
+    /// `named`, which hold one value: terms of one big integer at one list
+    /// position, which novelty holds apart until the next index build. Every
+    /// other kind is one term per fact once the read is resolved. One pass
+    /// over the value's facts, however many entries hold it.
+    fn same_facts(&mut self, named: &[usize]) -> Vec<usize> {
+        let Some(&n) = named.first() else {
+            return Vec::new();
+        };
         if !self.facts[n].flake.o.index_keys_by_value() {
             return Vec::new();
         }
         self.ensure_by_value();
         let fact = &self.facts[n].flake;
-        let at = list_index_of(fact);
+        let at: HashSet<Option<i32>> = named
+            .iter()
+            .map(|&n| list_index_of(&self.facts[n].flake))
+            .collect();
+        let named: HashSet<usize> = named.iter().copied().collect();
         let sibling = |m: usize| {
-            m != n
+            !named.contains(&m)
                 && same_value(&self.facts[m].flake, fact)
-                && list_index_of(&self.facts[m].flake) == at
+                && at.contains(&list_index_of(&self.facts[m].flake))
         };
         match (&self.by_value, value_hash(fact)) {
             (Some(groups), Some(h)) => groups
@@ -1540,6 +1730,79 @@ impl SlotFacts {
             Some(groups) => self.first_in(groups.get(key), groups, position, by_key),
             None => self.first(position, by_key),
         }
+    }
+
+    /// The stored facts an intent without a list position names, found by
+    /// the lookup [`Self::named`] makes: every list entry holding its term,
+    /// and the first plain value holding it, which [`Self::named`] names
+    /// when there is no entry. So a value is deleted from a list however
+    /// often the list repeats it, and beside it, as witnessed rows delete
+    /// both when the WHERE hands each over.
+    fn named_all(&mut self, intent: &Flake, keys: &IndexKeys) -> Vec<usize> {
+        let hits = 'lookup: {
+            let by_term = |_: usize, f: &StoredFact| same_term(&f.flake, intent);
+            let hits = match &self.terms {
+                Some(terms) => self.all_in(terms.get((self.hash)(intent)), terms, by_term),
+                None => self.all(by_term),
+            };
+            if !hits.is_empty() {
+                break 'lookup hits;
+            }
+            if intent.o.index_keys_by_value() {
+                self.ensure_by_value();
+                let same = |_: usize, f: &StoredFact| same_value(&f.flake, intent);
+                break 'lookup match &self.by_value {
+                    Some(groups) => {
+                        let group = value_hash(intent).and_then(|h| groups.get(h));
+                        self.all_in(group, groups, same)
+                    }
+                    None => self.all(same),
+                };
+            }
+            let Some(key) = self.key_of(keys, intent) else {
+                break 'lookup Vec::new();
+            };
+            self.ensure_keys(keys);
+            let Some(fact_keys) = self.keys.as_deref() else {
+                break 'lookup Vec::new();
+            };
+            let by_key = |n: usize, _: &StoredFact| fact_keys[n] == Some(key);
+            match &self.by_key {
+                Some(groups) => self.all_in(groups.get(key), groups, by_key),
+                None => self.all(by_key),
+            }
+        };
+        let is_entry = |n: usize| list_index_of(&self.facts[n].flake).is_some();
+        let plain = hits.iter().copied().find(|&n| !is_entry(n));
+        hits.into_iter()
+            .filter(|&n| is_entry(n))
+            .chain(plain)
+            .collect()
+    }
+
+    /// Narrow slot: every fact satisfying `pred`, in slot order.
+    fn all(&self, pred: impl Fn(usize, &StoredFact) -> bool) -> Vec<usize> {
+        (0..self.facts.len())
+            .filter(|&n| pred(n, &self.facts[n]))
+            .collect()
+    }
+
+    /// Wide slot: [`Self::all`] through `groups` (`group` is the one the
+    /// intent's key selects).
+    fn all_in<K: Copy + Eq + Hash + Ord>(
+        &self,
+        group: Option<Group>,
+        groups: &Groups<K>,
+        pred: impl Fn(usize, &StoredFact) -> bool,
+    ) -> Vec<usize> {
+        group.map_or_else(Vec::new, |group| {
+            groups
+                .members(group)
+                .iter()
+                .map(|&n| n as usize)
+                .filter(|&n| pred(n, &self.facts[n]))
+                .collect()
+        })
     }
 
     /// The stored fact a witnessed row decodes (see [`DeleteResolver`]).
@@ -1909,6 +2172,44 @@ mod tests {
                 .expect("apply commit");
         }
         LedgerState::new(LedgerSnapshot::genesis("test:main"), novelty)
+    }
+
+    /// A ledger with an index this process has not loaded refuses every
+    /// read here with `IndexNotLoaded`; merge and rebase read here first.
+    #[tokio::test]
+    async fn an_index_that_is_not_loaded_refuses_every_read() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        let ledger = LedgerState::new(snapshot, Novelty::new(1));
+        let facts = CurrentFacts::new(&ledger);
+        let refused = |r: Result<Vec<StoredFact>>| {
+            assert!(
+                matches!(r, Err(crate::TransactError::IndexNotLoaded(_))),
+                "{r:?}"
+            );
+        };
+        refused(
+            facts
+                .of_slots(&[slot(0, None, "a", "b")])
+                .await
+                .map(|mut v| v.pop().unwrap_or_default()),
+        );
+        refused(facts.of_subject(0, None, &sid("a")).await);
+        refused(facts.whole_graph(0, None, None, None).await);
+        let named = flake("a", "b", "x", 1, true, None);
+        let items = [(slot(0, None, "a", "b"), &named)];
+        refused(
+            facts
+                .named_by(&items)
+                .await
+                .map(|v| v.into_iter().flatten().collect()),
+        );
+        refused(
+            facts
+                .all_named_by(&items)
+                .await
+                .map(|mut v| v.pop().unwrap_or_default()),
+        );
     }
 
     fn slot(g_id: GraphId, g_sid: Option<&Sid>, s: &str, p: &str) -> Slot {
@@ -2283,11 +2584,11 @@ mod tests {
         }
     }
 
-    /// An intent that is not witnessed names the first list entry holding
-    /// its term, so identical intents name one entry (the accumulator then
-    /// collapses them); an intent with a position names that position.
+    /// An intent that is not witnessed names every list entry holding its
+    /// term and the plain value, and an identical intent names nothing
+    /// again; an intent with a position names that position.
     #[tokio::test]
-    async fn named_intents_name_the_first_entry_or_their_position() {
+    async fn named_intents_name_every_entry_or_their_position() {
         let ledger = ledger(
             vec![vec![
                 flake("a", "items", "v", 1, true, None),
@@ -2310,8 +2611,35 @@ mod tests {
                     narrow_slot,
                 )
                 .await,
-                vec![at("v", 0), at("v", 0), at("v", 1)],
+                vec![at("v", 0), at("v", 1), plain("v"), at("v", 1)],
                 "narrow_slot={narrow_slot}"
+            );
+        }
+    }
+
+    /// Identical intents naming a value a list repeats expand once: each
+    /// entry is retracted once, not once per intent, in one batch or across
+    /// several.
+    #[tokio::test]
+    async fn identical_intents_expand_once() {
+        let ledger = ledger(
+            vec![(0..3)
+                .map(|i| flake("a", "items", "v", 1, true, Some(FlakeMeta::with_index(i))))
+                .collect()],
+            &HashMap::new(),
+        );
+        let named = || intent("items", "v", false, None);
+        let entries = vec![at("v", 0), at("v", 1), at("v", 2)];
+        for narrow_slot in [usize::MAX, 0] {
+            assert_eq!(
+                resolve_batches(&ledger, vec![vec![named(), named(), named()]], narrow_slot).await,
+                entries,
+                "one batch, narrow_slot={narrow_slot}"
+            );
+            assert_eq!(
+                resolve_batches(&ledger, vec![vec![named()], vec![named()]], narrow_slot).await,
+                entries,
+                "two batches, narrow_slot={narrow_slot}"
             );
         }
     }
@@ -2379,15 +2707,17 @@ mod tests {
         let narrow = resolve_batches(&ledger, vec![mixed_intents()], usize::MAX).await;
         let wide = resolve_batches(&ledger, vec![mixed_intents()], 0).await;
         assert_eq!(narrow, wide);
-        let mut expected = vec![
-            plain("v3"),
-            plain("v11"),
-            at("x", 0),
+        let mut expected = vec![plain("v3"), plain("v11")];
+        // `x` named without a position: every entry holding it, and the
+        // plain `x`.
+        expected.extend((0..8).map(|i| at("x", i)));
+        expected.push(plain("x"));
+        expected.extend([
             at("x", 5),
             ("y".to_string(), Some(FlakeMeta::with_lang("EN-us"))),
             plain("v7"),
             ("y".to_string(), Some(FlakeMeta::with_lang("en"))),
-        ];
+        ]);
         expected.extend((0..8).map(|i| at("x", i)));
         expected.extend([plain("x"), plain("x")]);
         assert_eq!(narrow, expected);
@@ -2615,7 +2945,8 @@ mod tests {
             resolve_reading_values(&ledger, &batches, Some(usize::MAX), 1).await;
         assert_eq!(point_reads, 2);
         assert!(unmatched.is_empty(), "{unmatched:?}");
-        assert_eq!(out.len(), 2, "{out:?}");
+        // `y`'s two list entries and its plain value, and `x`.
+        assert_eq!(out.len(), 4, "{out:?}");
     }
 
     /// Witnessed rows read their slot even when one row names it: the k-th
@@ -2751,5 +3082,188 @@ mod tests {
                 want => assert_eq!(got.as_deref(), *want, "{what}"),
             }
         }
+    }
+
+    /// A big integer novelty holds under two subtypes, at each of three list
+    /// positions and beside the list, loses every term to one intent naming
+    /// it with no position: each entry's and the plain value's other term
+    /// are the same stored fact. On the scanned and on the indexed path.
+    #[tokio::test]
+    async fn a_value_named_once_retracts_every_term_of_every_entry() {
+        let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+        let big = |dt: &str, t: i64, i: Option<i32>| {
+            Flake::new(
+                sid("a"),
+                sid("items"),
+                FlakeValue::BigInt(Box::new(v.clone())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                t,
+                true,
+                i.map(FlakeMeta::with_index),
+            )
+        };
+        let held = |dt: &str, t: i64| {
+            vec![
+                big(dt, t, Some(0)),
+                big(dt, t, Some(1)),
+                big(dt, t, Some(2)),
+                big(dt, t, None),
+            ]
+        };
+        let ledger = ledger(
+            vec![held("nonNegativeInteger", 1), held("positiveInteger", 2)],
+            &HashMap::new(),
+        );
+        let named = RetractIntent::new(
+            Flake {
+                t: 9,
+                op: false,
+                ..big("nonNegativeInteger", 9, None)
+            },
+            false,
+        );
+        for narrow_slot in [usize::MAX, 0] {
+            let mut got = resolve_batches(&ledger, vec![vec![named.clone()]], narrow_slot).await;
+            got.sort_by_key(|(_, m)| m.as_ref().and_then(|m| m.i));
+            let positions: Vec<Option<i32>> = got
+                .iter()
+                .map(|(_, m)| m.as_ref().and_then(|m| m.i))
+                .collect();
+            assert_eq!(
+                positions,
+                [
+                    None,
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    Some(2)
+                ],
+                "narrow_slot={narrow_slot}"
+            );
+        }
+    }
+
+    /// Two retractions of one big integer, under two subtypes, and an
+    /// assertion of it at one `t`: novelty held the value under both
+    /// subtypes when the commit was written. Both retractions pair with the
+    /// assertion, so resolving the pairs drops both and keeps the assertion.
+    #[test]
+    fn every_retraction_of_a_key_pairs_with_its_assertion() {
+        let ledger = ledger(Vec::new(), &HashMap::new());
+        let ids = FactIdentity::new(&ledger);
+        let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+        let big = |dt: &str, op: bool| {
+            Flake::new(
+                sid("s"),
+                sid("p"),
+                FlakeValue::BigInt(Box::new(v.clone())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                2,
+                op,
+                None,
+            )
+        };
+        let flakes = vec![
+            big("integer", false),
+            big("nonNegativeInteger", false),
+            big("positiveInteger", true),
+        ];
+        let mut spot: Vec<&Flake> = flakes.iter().collect();
+        spot.sort_by(|a, b| IndexType::Spot.compare(a, b));
+        assert_eq!(ids.same_t_pairs(spot).len(), 2);
+        let resolved = resolve_same_t_pairs(&ledger, flakes);
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert!(resolved[0].op);
+    }
+
+    /// Resolving a commit's pairs drops each pair's retraction wherever it
+    /// sits: flakes out of SPOT order, two pairs by term (one behind another
+    /// value of its slot) and one by index key, and a retraction and
+    /// assertions that pair with nothing. Each pair names its retraction's
+    /// place in the walk.
+    #[test]
+    fn resolving_pairs_drops_each_retraction_wherever_it_sits() {
+        let ledger = ledger(Vec::new(), &HashMap::new());
+        let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+        let big = |dt: &str, op: bool| {
+            Flake::new(
+                sid("k"),
+                sid("p"),
+                FlakeValue::BigInt(Box::new(v.clone())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                2,
+                op,
+                None,
+            )
+        };
+        let flakes = vec![
+            flake("z", "p", "z", 2, true, None),
+            flake("a", "p", "lone", 2, false, None),
+            big("integer", false),
+            flake("m", "p", "m", 2, false, None),
+            flake("z", "p", "z", 2, false, None),
+            big("nonNegativeInteger", true),
+            flake("m", "p", "m", 2, true, None),
+            flake("b", "p", "new", 2, true, None),
+            flake("m", "p", "a", 2, true, None),
+        ];
+        let mut spot: Vec<&Flake> = flakes.iter().collect();
+        spot.sort_by(|a, b| IndexType::Spot.compare(a, b));
+        let pairs = FactIdentity::new(&ledger).same_t_pairs(spot.iter().copied());
+        assert_eq!(pairs.len(), 3);
+        for p in &pairs {
+            assert!(std::ptr::eq(spot[p.retraction_at], p.retraction));
+        }
+        let shape = |f: &Flake| {
+            (
+                f.s.name_str().to_string(),
+                f.op,
+                format!("{:?}", f.o),
+                f.dt.name_str().to_string(),
+            )
+        };
+        let got: Vec<_> = resolve_same_t_pairs(&ledger, flakes.clone())
+            .iter()
+            .map(shape)
+            .collect();
+        let want: Vec<_> = [0, 1, 5, 6, 7, 8]
+            .iter()
+            .map(|&n| shape(&flakes[n]))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// `whole_graph` reads as of `to_t`, as the other reads here do: at
+    /// `t = 1` a value asserted at 2 isn't there yet, and the one retracted
+    /// at 2 still is.
+    #[tokio::test]
+    async fn whole_graph_reads_as_of_to_t() {
+        let ledger = ledger(
+            vec![
+                vec![flake("a", "b", "x", 1, true, None)],
+                vec![
+                    flake("a", "b", "x", 2, false, None),
+                    flake("a", "b", "y", 2, true, None),
+                ],
+            ],
+            &HashMap::new(),
+        );
+        let objects = |facts: Vec<StoredFact>| -> Vec<String> {
+            facts.iter().map(|f| format!("{:?}", f.flake().o)).collect()
+        };
+        let string = |s: &str| format!("{:?}", FlakeValue::String(s.to_string()));
+        let head = CurrentFacts::new(&ledger)
+            .whole_graph(0, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(objects(head), vec![string("y")]);
+        let at_1 = CurrentFacts::at(&ledger, 1)
+            .whole_graph(0, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(objects(at_1), vec![string("x")]);
     }
 }

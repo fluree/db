@@ -430,6 +430,40 @@ async fn nameservice_ledger_lifecycle() {
     assert!(ns.lookup(alias).await.unwrap().is_none());
 }
 
+/// `branch_records` narrows GSI1 to one ledger's `name:` key prefix. A
+/// retracted branch stays listed; a nested ledger and a ledger whose name
+/// only starts the same do not.
+#[tokio::test]
+async fn nameservice_branch_records() {
+    let (_lock, _container, ns) = setup_localstack_ns().await;
+
+    for id in [
+        "br-test:main",
+        "br-test:dev",
+        "br-test/nested:main",
+        "br-test2:main",
+    ] {
+        create(&ns, id).await.unwrap();
+    }
+    fluree_db_nameservice::lifecycle::begin_drop_branch(
+        &ns,
+        &fluree_db_core::LedgerName::parse("br-test").unwrap(),
+        "dev",
+    )
+    .await
+    .unwrap();
+
+    let mut branches: Vec<String> = ns
+        .branch_records("br-test")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.branch)
+        .collect();
+    branches.sort();
+    assert_eq!(branches, ["dev", "main"]);
+}
+
 #[tokio::test]
 async fn nameservice_admin_publisher() {
     let (_lock, _container, ns) = setup_localstack_ns().await;

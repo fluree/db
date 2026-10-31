@@ -37,6 +37,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod multi_query;
+pub mod ontology;
 pub mod prefix;
 pub mod query;
 pub mod query_stream;

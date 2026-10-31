@@ -5638,11 +5638,14 @@ async fn write_delta_run(
 /// Split events into each fact's winner — its latest event — and the
 /// earlier events it superseded, the shape the leaf merge consumes. A
 /// same-`t` pair is a replacement (see [`with_replacements`]): its retract
-/// comes first.
+/// comes first, and the assertion holds (`fluree_db_core::same_t`).
 fn split_lifecycles(mut events: Events, order: RunSortOrder) -> (Events, Events) {
+    use fluree_db_core::same_t::op_order;
     let cmp = cmp_v2_for_order(order);
     let same = fluree_db_binary_index::format::run_record_v2::identity_v2_for_order(order);
-    events.sort_by(|a, b| cmp(&a.0, &b.0).then(a.0.t.cmp(&b.0.t)).then(a.1.cmp(&b.1)));
+    events.sort_by(|a, b| {
+        cmp(&a.0, &b.0).then_with(|| op_order(a.0.t, a.1 == 1).cmp(&op_order(b.0.t, b.1 == 1)))
+    });
     let (mut winners, mut earlier) = (Vec::new(), Vec::new());
     for (i, &event) in events.iter().enumerate() {
         match events.get(i + 1) {

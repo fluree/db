@@ -84,6 +84,12 @@ pub enum ServerError {
     /// role as `NoveltyBackpressure`.
     #[error("{0}")]
     CommitContention(String),
+
+    /// This server has not loaded the ledger's index (503 +
+    /// `err:db/IndexNotLoaded` + `Retry-After`). Same consensus-boundary
+    /// role as `NoveltyBackpressure`.
+    #[error("{0}")]
+    IndexNotLoaded(String),
 }
 
 impl ServerError {
@@ -108,6 +114,7 @@ impl ServerError {
             ServerError::NoveltyDeltaTooLarge(_) => errors::NOVELTY_DELTA_TOO_LARGE,
             ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
             ServerError::CommitContention(_) => errors::COMMIT_CONTENTION,
+            ServerError::IndexNotLoaded(_) => errors::INDEX_NOT_LOADED,
         }
     }
 
@@ -131,9 +138,9 @@ impl ServerError {
             ServerError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ServerError::NoveltyDeltaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            ServerError::NoveltyBackpressure(_) | ServerError::CommitContention(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ServerError::NoveltyBackpressure(_)
+            | ServerError::CommitContention(_)
+            | ServerError::IndexNotLoaded(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -294,15 +301,19 @@ pub(crate) const RETRY_AFTER_SECS_MAX: u32 = 8;
 ///   deferral-only `MaterializePartial` split) — same capacity class.
 /// - `COMMIT_CONTENTION`: every commit attempt lost its race with other
 ///   writers — clears when they ease off.
+/// - `INDEX_NOT_LOADED`: this server has not loaded the ledger's index; the
+///   write was refused before it read anything — clears when the index
+///   loads.
 /// - `INTERNAL`: the status-passthrough hole — `SubmissionError::Overloaded`
 ///   (committer in-flight cap, retryable by its contract) and any tracked
 ///   error relayed via `ApiError::Http { status: 503 }` reach `error_type`'s
 ///   `Http` catch-all. If a new 503 lands here, give it a typed code instead
 ///   of relying on this entry.
-pub(crate) const RETRYABLE_503_TYPES: [&str; 4] = [
+pub(crate) const RETRYABLE_503_TYPES: [&str; 5] = [
     fluree_vocab::errors::NOVELTY_AT_MAX,
     fluree_vocab::errors::NOVELTY_DEFERRED,
     fluree_vocab::errors::COMMIT_CONTENTION,
+    fluree_vocab::errors::INDEX_NOT_LOADED,
     fluree_vocab::errors::INTERNAL,
 ];
 
@@ -724,7 +735,7 @@ mod tests {
     #[test]
     fn every_503_source_is_classified_retryable_capacity() {
         // One entry per 503-producing path, with the code it must carry.
-        let sources: [(ServerError, &str, &str); 8] = [
+        let sources: [(ServerError, &str, &str); 10] = [
             (
                 ServerError::Api(ApiError::NoveltyDeferred { remaining: 3 }),
                 errors::NOVELTY_DEFERRED,
@@ -775,6 +786,20 @@ mod tests {
                 "consensus-flattened commit contention",
             ),
             (
+                ServerError::Api(ApiError::Transact(
+                    fluree_db_api::TransactError::IndexNotLoaded(
+                        "the ledger's index (t=1) is not loaded".into(),
+                    ),
+                )),
+                errors::INDEX_NOT_LOADED,
+                "the ledger's index is not loaded",
+            ),
+            (
+                ServerError::IndexNotLoaded("index not loaded (flattened)".into()),
+                errors::INDEX_NOT_LOADED,
+                "consensus-flattened index not loaded",
+            ),
+            (
                 // `SubmissionError::Overloaded` reaches this shape via
                 // `submission_error_to_server_error` — retryable by its
                 // contract (in-flight cap), but its `@type` is the `Http`
@@ -805,7 +830,7 @@ mod tests {
         }
         // The allowlist itself is part of the contract: growing it is a
         // conscious act, recorded here.
-        assert_eq!(RETRYABLE_503_TYPES.len(), 4);
+        assert_eq!(RETRYABLE_503_TYPES.len(), 5);
     }
 
     /// The two 413s carry distinct codes for clients to branch on: the HTTP
@@ -859,6 +884,30 @@ mod tests {
                     .is_none(),
                 "413 must not invite a retry"
             );
+        }
+    }
+
+    /// A vector the index cannot store is a permanent refusal: 422 +
+    /// `err:db/InvalidTransaction` with no `Retry-After`, as the typed error
+    /// and as the committer flattens it (`Http { status }` from
+    /// `ApiError::status_code`).
+    #[test]
+    fn invalid_vector_is_422_invalid_transaction_without_retry_after() {
+        let typed = ApiError::Transact(fluree_db_api::TransactError::InvalidVector(
+            "vector dims mismatch: expected 3, got 2".into(),
+        ));
+        let flattened = ApiError::Http {
+            status: typed.status_code(),
+            message: typed.to_string(),
+        };
+        for se in [ServerError::Api(typed), ServerError::Api(flattened)] {
+            assert_eq!(se.status_code(), StatusCode::UNPROCESSABLE_ENTITY, "{se}");
+            assert_eq!(se.error_type(), errors::INVALID_TRANSACTION, "{se}");
+            let resp = se.into_response();
+            assert!(resp
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none());
         }
     }
 

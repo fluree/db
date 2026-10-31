@@ -19,12 +19,16 @@
 //! [`commit`] composes [`build_commit`] + [`StagedCommit::apply`] for
 //! the existing single-node transactional path.
 
+use crate::current_facts::FactIdentity;
 use crate::error::{Result, TransactError};
 use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
+use fluree_db_core::{
+    ContentId, ContentKind, ContentStore, DictNovelty, Flake, GraphId, LedgerSnapshot, Sid,
+    TXN_META_GRAPH_ID,
+};
 use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{
@@ -557,6 +561,94 @@ pub(crate) fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>>
         })
 }
 
+/// Refuse a staged view holding a retraction and an assertion of one fact
+/// ([`FactIdentity`]) in one graph: every staged flake carries one `t`, and
+/// a commit built here may not hold such a pair (`fluree_db_core::same_t`).
+/// A view without both ops (most inserts and deletes) is passed over
+/// without a walk.
+fn check_no_same_t_pair(view: &StagedLedger) -> Result<()> {
+    let staged = view.staged_flakes();
+    if !(staged.iter().any(|f| f.op) && staged.iter().any(|f| !f.op)) {
+        return Ok(());
+    }
+    let ids = FactIdentity::new(view.base());
+    let Some(pair) = ids
+        .same_t_pairs(view.staged_flakes_spot())
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let snapshot = view.db();
+    let name = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .map_or_else(|| format!("{sid:?}"), |iri| format!("<{iri}>"))
+    };
+    let term = |f: &Flake| {
+        let mut term = format!("{:?}^^{}", f.o, name(&f.dt));
+        if let Some(m) = &f.m {
+            term.push_str(&format!(" {m:?}"));
+        }
+        term
+    };
+    let graph = pair.retraction.g.as_ref().map_or_else(
+        || "the default graph".to_string(),
+        |g| format!("graph {}", name(g)),
+    );
+    Err(TransactError::SameTPair {
+        fact: format!(
+            "{graph}, subject {}, predicate {}",
+            name(&pair.retraction.s),
+            name(&pair.retraction.p)
+        ),
+        retracted: term(pair.retraction),
+        asserted: term(pair.assertion),
+    })
+}
+
+/// Refuse a write on `snapshot` when this process has not loaded the
+/// ledger's index: the ledger has one, but no range provider is attached
+/// (a store that failed to load), or the binary store attached is older than
+/// it. Every read of such a snapshot fails, or misses what was indexed in
+/// between, so a write lane calls this before its first read and refuses
+/// with [`TransactError::IndexNotLoaded`] rather than failing inside one.
+///
+/// The process's state, not the request's: the same write can succeed once
+/// the index loads.
+pub fn check_index_loaded(snapshot: &LedgerSnapshot) -> Result<()> {
+    if snapshot.t == 0 {
+        return Ok(());
+    }
+    match snapshot.range_provider.as_ref() {
+        None => Err(TransactError::IndexNotLoaded(format!(
+            "the ledger's index (t={}) is not loaded",
+            snapshot.t
+        ))),
+        Some(provider) => match provider.as_any().downcast_ref::<BinaryRangeProvider>() {
+            Some(brp) if brp.store().max_t() < snapshot.t => {
+                Err(TransactError::IndexNotLoaded(format!(
+                    "the loaded index (t={}) is older than the ledger's (t={})",
+                    brp.store().max_t(),
+                    snapshot.t
+                )))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The id of each graph `snapshot` holds, by its IRI's Sid, the txn-meta
+/// graph included: how a commit's flakes are routed into novelty.
+pub(crate) fn graph_ids(snapshot: &LedgerSnapshot) -> Result<HashMap<Sid, GraphId>> {
+    let mut graph_ids = snapshot.build_reverse_graph()?;
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(snapshot.ledger_id.as_str());
+    if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
+        graph_ids.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
+    }
+    Ok(graph_ids)
+}
+
 /// Commit a staged transaction
 ///
 /// This function:
@@ -588,8 +680,18 @@ pub async fn build_commit(
     index_config: &IndexConfig,
     opts: CommitOpts,
 ) -> Result<StagedCommit> {
+    // 0. A commit built here may not hold a retraction and an assertion of
+    //    one fact at one `t`: staging cancels the two by fact identity, so a
+    //    pair is a staging defect, refused rather than written. Commits that
+    //    arrive whole (push, clone, restore, import) never pass through here.
+    check_no_same_t_pair(&view)?;
+
     // 1. Extract flakes from view
     let (mut base, flakes) = view.into_parts();
+    // The checks below read the base's index; refuse before they fail on one
+    // this process has not loaded. Merge, rebase and revert reach here
+    // without staging.
+    check_index_loaded(&base.snapshot)?;
 
     // Move commit options into locals so we can pass ownership where useful
     // (e.g., txn_meta) without forcing clones, while still using other fields later.
@@ -695,6 +797,24 @@ pub async fn build_commit(
     // 4b. Datatype dictionary limit. Not subject to `skip_backpressure`:
     //     draining novelty never frees a datatype ID.
     crate::datatype_limit::check_commit(&base, &flakes, &txn_meta)?;
+
+    // 4c. Vectors the index can store. Not subject to `skip_backpressure`
+    //     either: no later index build could store them.
+    crate::vector_dims::check_commit(
+        &base,
+        &flakes,
+        || graph_ids(&base.snapshot),
+        |sid| {
+            base.snapshot
+                .decode_sid(sid)
+                .or_else(|| {
+                    ns_registry
+                        .get_prefix(sid.namespace_code)
+                        .map(|prefix| format!("{prefix}{}", sid.name))
+                })
+                .unwrap_or_else(|| sid.to_string())
+        },
+    )?;
 
     // 5. Build commit record
     //    (sequencing verification + nameservice lookup are the
@@ -1074,10 +1194,6 @@ fn finalize_state_with_base(
     let mut all_flakes = std::mem::take(&mut commit_record.flakes);
     all_flakes.extend(commit_metadata_flakes);
 
-    // Capture the ledger id before moving novelty fields out of `base`: after a
-    // partial move we can no longer call `&self` methods on `base`.
-    let base_ledger_id = base.ledger_id().to_string();
-
     // Move the snapshot out of `base` up front so we can DETACH its range
     // provider *before* mutating the dictionaries below. A `BinaryRangeProvider`
     // owns `Arc::clone`s of `dict_novelty` / `runtime_small_dicts`; if it stays
@@ -1142,11 +1258,7 @@ fn finalize_state_with_base(
     {
         let span = tracing::debug_span!("commit_apply_to_novelty");
         let _g = span.enter();
-        let mut reverse_graph = snapshot.build_reverse_graph()?;
-        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(&base_ledger_id);
-        if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
-            reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
-        }
+        let reverse_graph = graph_ids(&snapshot)?;
         let links =
             Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
         if !links.is_empty() {
@@ -1626,6 +1738,47 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(TransactError::EmptyTransaction)));
+    }
+
+    /// A view on a base whose index this process has not loaded, built
+    /// without staging as merge, rebase and revert build one, is refused
+    /// before any check reads that index.
+    #[tokio::test]
+    async fn build_commit_refuses_a_base_whose_index_is_not_loaded() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        let ns_registry = NamespaceRegistry::from_db(&snapshot);
+        let base = LedgerState::new(snapshot, Novelty::new(1));
+        let flake = Flake::new(
+            Sid::new(1, "ex:alice"),
+            Sid::new(1, "ex:name"),
+            FlakeValue::String("Alice".to_string()),
+            Sid::new(fluree_vocab::namespaces::XSD, "string"),
+            2,
+            true,
+            None,
+        );
+        let view = StagedLedger::new(base, vec![flake], &HashMap::new()).unwrap();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
+        match build_commit(
+            view,
+            ns_registry,
+            None,
+            None,
+            &config,
+            CommitOpts::default(),
+        )
+        .await
+        {
+            Err(TransactError::IndexNotLoaded(msg)) => {
+                assert!(msg.contains("index (t=1) is not loaded"), "{msg}");
+            }
+            Err(e) => panic!("expected an index-not-loaded refusal, got: {e}"),
+            Ok(_) => panic!("a commit on an index this process has not loaded was built"),
+        }
     }
 
     #[tokio::test]

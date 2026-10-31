@@ -1,11 +1,13 @@
-//! What one RDF list costs queries that do not read it.
+//! What one list costs queries that do not read it.
 //!
-//! SPARQL reads a stored list as RDF: the owner edge `s p head` and a chain of
-//! `rdf:first`/`rdf:rest` cells, which no row stores (`fluree-db-query`'s
-//! `list_view`). A ledger that has never held a list skips that view entirely.
-//! One that has answers any pattern a list could match through it: every
-//! variable-predicate pattern, and every pattern on `rdf:first`, `rdf:rest` or
-//! a predicate holding list members.
+//! A query reads a list's members as values of the property holding it, so a
+//! SELECT pays nothing for a list it does not read. A CONSTRUCT does: where a
+//! template triple restates a triple of the WHERE, it writes the lists that
+//! triple read (`fluree-db-query`'s `list_entries`), which looks at each
+//! row's predicate on any ledger that has held a list. A ledger that has
+//! never held one skips that entirely. A JSON-LD crawl reads a blank-node
+//! value that heads a list stored as its triples as that list's members, and
+//! asks only on a graph holding an `rdf:first`, which a compact list is not.
 //!
 //! Each scenario runs against two ledgers that differ in one unrelated
 //! two-member list (`ex:config ex:order (ex:a ex:b)`). The `listed / plain`
@@ -13,29 +15,34 @@
 //!
 //! ## Scenarios
 //!
-//! 1. **count/whole_graph**: `COUNT(*)` over `?s ?p ?o`. Its fast paths read
-//!    index metadata, which counts list members as stored rows; on the listed
-//!    ledger the count must add the list triples and drop the members.
+//! 1. **count/whole_graph**: `COUNT(*)` over `?s ?p ?o`, read from index
+//!    metadata.
 //! 2. **count/by_predicate**: `GROUP BY ?p` counts, the same way.
 //! 3. **join/var_predicate_count**: `COUNT(*)` over `?s ex:knows ?f . ?f ?p ?o`,
 //!    "fetch everything about each node a pattern finds".
 //! 4. **join/var_predicate_select**: the same join, projected.
-//! 5. **join/fixed_predicate**: `?s ex:knows ?f . ?f ex:name ?o`, which no list
-//!    can match. The control: it should read the same on both ledgers.
+//! 5. **join/fixed_predicate**: `?s ex:knows ?f . ?f ex:name ?o`.
 //! 6. **subject/bound**: `ex:n7 ?p ?o`.
-//! 7. **list/walk**: `ex:config ex:order/rdf:rest*/rdf:first ?x`, the list's
-//!    members through the RDF idiom. Empty on the plain ledger.
+//! 7. **list/members**: `ex:config ex:order ?x`, the list's members. Empty on
+//!    the plain ledger.
+//! 8. **construct/fixed_predicate**: `CONSTRUCT { ?s ex:name ?o } WHERE
+//!    { ?s ex:name ?o }`, on a predicate no list is held on.
+//! 9. **construct/var_predicate**: `CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }`,
+//!    whose every row is asked whether its predicate holds a list.
+//! 10. **crawl/blank_nodes**: a JSON-LD crawl of every subject's properties,
+//!     one of them the blank node `ex:addr`.
 //!
 //! ## Acceptance
 //!
-//! A scenario that no list can match (5), or that reads subjects owning no
-//! list (3, 4, 6), should run on the listed ledger within a few percent of the
-//! plain one. Scenarios 1 and 2 pay for the list itself on the listed ledger.
+//! Every scenario but 7 should run on the listed ledger within a few percent
+//! of the plain one: 1 and 2 count the list's two members as two values, and
+//! 9 writes the one list as its cells.
 //!
 //! ## Matrix
 //!
 //!   inputs:    BenchScale → n subjects (Tiny=1k, Small=10k, Medium=100k,
-//!              Large=1M), each with `ex:name` and one `ex:knows`
+//!              Large=1M), each with `ex:name`, one `ex:knows` and an
+//!              `ex:addr` blank node with an `ex:city`
 //!   metric:    ns/query (criterion default)
 //!
 //! ## Running
@@ -49,10 +56,11 @@ use fluree_bench_support::{
     bench_runtime, current_profile, current_scale, init_tracing_for_bench, next_ledger_alias,
 };
 use fluree_db_api::admin::ReindexOptions;
-use fluree_db_api::{CommitOpts, Fluree, FlureeBuilder, GraphDb, IndexConfig, TxnOpts};
+use fluree_db_api::{
+    CommitOpts, Fluree, FlureeBuilder, FormatterConfig, GraphDb, IndexConfig, TxnOpts,
+};
 
 const PREFIXES: &str = "PREFIX ex: <http://example.org/>
-PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 ";
 
 const SCENARIOS: &[(&str, &str)] = &[
@@ -77,18 +85,31 @@ const SCENARIOS: &[(&str, &str)] = &[
         "SELECT ?s ?f ?o WHERE { ?s ex:knows ?f . ?f ex:name ?o }",
     ),
     ("subject/bound", "SELECT ?p ?o WHERE { ex:n7 ?p ?o }"),
+    ("list/members", "SELECT ?x WHERE { ex:config ex:order ?x }"),
     (
-        "list/walk",
-        "SELECT ?x WHERE { ex:config ex:order/rdf:rest*/rdf:first ?x }",
+        "construct/fixed_predicate",
+        "CONSTRUCT { ?s ex:name ?o } WHERE { ?s ex:name ?o }",
+    ),
+    (
+        "construct/var_predicate",
+        "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
     ),
 ];
 
-/// `n` subjects in a ring of `ex:knows`, each with an `ex:name`.
+/// A JSON-LD crawl of every subject's properties.
+const CRAWL: &str = r#"{
+  "@context": {"ex": "http://example.org/"},
+  "select": {"?s": ["*"]},
+  "where": {"@id": "?s", "ex:name": "?n"}
+}"#;
+
+/// `n` subjects in a ring of `ex:knows`, each with an `ex:name` and an
+/// `ex:addr` blank node.
 fn ring_turtle(n: usize) -> String {
     let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
     for i in 0..n {
         ttl.push_str(&format!(
-            "ex:n{i} ex:name \"n{i}\" ; ex:knows ex:n{} .\n",
+            "ex:n{i} ex:name \"n{i}\" ; ex:knows ex:n{} ; ex:addr [ ex:city \"c{i}\" ] .\n",
             (i + 1) % n
         ));
     }
@@ -134,18 +155,32 @@ async fn count(fluree: &Fluree, db: &GraphDb, body: &str) -> serde_json::Value {
     result.to_jsonld(&db.snapshot).expect("to_jsonld")
 }
 
-/// The listed ledger answers through the list view, and the plain one does
-/// not: a setup where the view silently stayed off would time nothing.
+/// The listed ledger holds the list and writes it as a list, and the plain
+/// one holds none: a setup where the list was stored as triples would time
+/// nothing.
 async fn sanity_check(fluree: &Fluree, plain: &GraphDb, listed: &GraphDb, n: usize) {
     let whole = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }";
     assert_eq!(
         count(fluree, plain, whole).await,
-        serde_json::json!([[2 * n]])
+        serde_json::json!([[4 * n]])
     );
-    // The owner edge and two cells of two triples each, for two members.
+    // The list's two members, as values of `ex:order`.
     assert_eq!(
         count(fluree, listed, whole).await,
-        serde_json::json!([[2 * n + 1 + 2 * 2]])
+        serde_json::json!([[4 * n + 2]])
+    );
+    let written = listed
+        .query(fluree)
+        .sparql(&format!(
+            "{PREFIXES}CONSTRUCT {{ ex:config ?p ?o }} WHERE {{ ex:config ?p ?o }}"
+        ))
+        .format(FormatterConfig::ntriples())
+        .execute_formatted_string()
+        .await
+        .expect("construct");
+    assert!(
+        written.contains("<http://www.w3.org/1999/02/22-rdf-syntax-ns#first>"),
+        "the listed ledger's CONSTRUCT writes its list: {written}"
     );
 }
 
@@ -197,6 +232,26 @@ fn bench_query_hot_list_view(c: &mut Criterion) {
                 },
             );
         }
+    }
+    let crawl: serde_json::Value = serde_json::from_str(CRAWL).expect("crawl query");
+    for (ledger, db) in [("plain", &plain), ("listed", &listed)] {
+        group.bench_with_input(
+            BenchmarkId::new(format!("crawl/blank_nodes/{ledger}"), scale.as_str()),
+            &crawl,
+            |b, q| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let result = db
+                            .query(&fluree)
+                            .jsonld(q)
+                            .execute_formatted()
+                            .await
+                            .unwrap_or_else(|e| panic!("crawl {ledger}: {e}"));
+                        black_box(result);
+                    });
+                });
+            },
+        );
     }
     group.finish();
 }

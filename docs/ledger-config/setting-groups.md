@@ -24,7 +24,7 @@ An unconfigured ledger applies no validation and no reasoning. Policy is the one
 - A request that carries **no policy inputs** — no identity, no `policy-class`, no inline `policy` — is governed by the ledger's [policy defaults](#policy-defaults) when the ledger configures any; `f:defaultAllow false`, for example, denies it. On a ledger with no policy configuration it reads everything. This is the case that makes a fresh ledger feel fully open.
 - A request that carries **any** of those inputs is enforced. If the identity has no policies granting it anything and nothing sets `f:defaultAllow true`, it reads no data — authenticating *reduces* what a caller sees on an unpoliced ledger. Setting `f:defaultAllow true` on the ledger is what opens an unpoliced ledger to identity-carrying requests.
 
-Schema flakes (`rdf:type` with a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`) bypass policy, so even a fully denied identity can read the ontology.
+Schema flakes (`rdf:type` with a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`) bypass view policy, so even a fully denied identity can read the ontology. Writing them is checked by modify policy like any other triple.
 
 To find out whether a given request was enforced, ask for policy tracking — see [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 

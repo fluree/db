@@ -42,6 +42,7 @@
 //! }
 //! ```
 
+use fluree_db_core::vector::VectorError;
 use fluree_db_core::ContentBytes;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -91,31 +92,13 @@ impl VectorArena {
 
     /// Insert an f32 vector, returning its handle.
     ///
-    /// Non-finite values (NaN, ±Inf) are rejected. The coercion layer
-    /// should have already validated this, but we check here as a safety net.
-    pub fn insert_f32(&mut self, vec: &[f32]) -> Result<u32, String> {
-        if vec.is_empty() {
-            return Err("vector must not be empty".into());
-        }
-        // Reject non-finite elements
-        if let Some(pos) = vec.iter().position(|v| !v.is_finite()) {
-            return Err(format!(
-                "vector element [{}] is not finite: {}",
-                pos, vec[pos]
-            ));
-        }
-        if self.dims == 0 {
-            if vec.len() > u16::MAX as usize {
-                return Err(format!("vector dims {} exceeds u16::MAX", vec.len()));
-            }
-            self.dims = vec.len() as u16;
-        } else if vec.len() != self.dims as usize {
-            return Err(format!(
-                "vector dims mismatch: expected {}, got {}",
-                self.dims,
-                vec.len()
-            ));
-        }
+    /// Refuses what [`fluree_db_core::vector::check_vector`] refuses: an
+    /// empty vector, more than `u16::MAX` elements, a length other than the
+    /// arena's, or a non-finite element. The write paths check the same rule
+    /// before they commit.
+    pub fn insert_f32(&mut self, vec: &[f32]) -> Result<u32, VectorError> {
+        let dims = (self.dims != 0).then_some(self.dims);
+        self.dims = fluree_db_core::vector::check_vector(dims, vec.iter().copied())?;
 
         // Check unit norm
         if self.all_unit_norm {
@@ -132,7 +115,7 @@ impl VectorArena {
     }
 
     /// Insert an f64 vector by downcasting to f32, returning its handle.
-    pub fn insert_f64(&mut self, vec: &[f64]) -> Result<u32, String> {
+    pub fn insert_f64(&mut self, vec: &[f64]) -> Result<u32, VectorError> {
         let f32_vec: Vec<f32> = vec.iter().map(|&x| x as f32).collect();
         self.insert_f32(&f32_vec)
     }
@@ -1006,7 +989,13 @@ mod tests {
         let mut arena = VectorArena::new();
         arena.insert_f32(&[1.0, 2.0, 3.0]).unwrap();
         let err = arena.insert_f32(&[1.0, 2.0]).unwrap_err();
-        assert!(err.contains("dims mismatch"));
+        assert_eq!(
+            err,
+            VectorError::LengthMismatch {
+                expected: 3,
+                len: 2
+            }
+        );
     }
 
     #[test]
@@ -1134,18 +1123,27 @@ mod tests {
     fn test_nan_rejected() {
         let mut arena = VectorArena::new();
         let err = arena.insert_f32(&[1.0, f32::NAN, 3.0]).unwrap_err();
-        assert!(err.contains("not finite"), "got: {err}");
+        assert!(
+            matches!(err, VectorError::NotFinite { index: 1, .. }),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn test_infinity_rejected() {
         let mut arena = VectorArena::new();
         let err = arena.insert_f32(&[f32::INFINITY, 0.0]).unwrap_err();
-        assert!(err.contains("not finite"), "got: {err}");
+        assert!(
+            matches!(err, VectorError::NotFinite { index: 0, .. }),
+            "got: {err}"
+        );
 
         let mut arena2 = VectorArena::new();
         let err2 = arena2.insert_f32(&[0.0, f32::NEG_INFINITY]).unwrap_err();
-        assert!(err2.contains("not finite"), "got: {err2}");
+        assert!(
+            matches!(err2, VectorError::NotFinite { index: 1, .. }),
+            "got: {err2}"
+        );
     }
 
     #[test]
@@ -1153,7 +1151,10 @@ mod tests {
         let mut arena = VectorArena::new();
         // f64::MAX overflows to f32::INFINITY
         let err = arena.insert_f64(&[1.0, f64::MAX]).unwrap_err();
-        assert!(err.contains("not finite"), "got: {err}");
+        assert!(
+            matches!(err, VectorError::NotFinite { index: 1, .. }),
+            "got: {err}"
+        );
     }
 
     // ========================================================================
