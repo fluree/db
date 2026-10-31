@@ -579,7 +579,68 @@ pub fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
     patterns.iter().flat_map(Pattern::produced_vars).collect()
 }
 
+/// How a pattern constrains the order of the other patterns in its group.
+///
+/// Every pass that reorders a group asks this rather than keeping its own list.
+/// Hand-kept lists drifted narrower than the planner's, each time as silent
+/// wrong rows around a left join or anti-join: #1924, #1690, the R2RML
+/// rewrite's OPTIONAL-only sort, then its fusions lifting a scan past a MINUS.
+/// [`Pattern::order_role`] is an exhaustive match, so a new kind of pattern is
+/// a decision made here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderRole {
+    /// Joins its group; free to move among the other joins.
+    Join,
+    /// OPTIONAL: a left join whose left side is what is written before it.
+    LeftJoin,
+    /// MINUS: an anti-join whose left side is what is written before it.
+    AntiJoin,
+    /// FILTER: constrains the whole group wherever it is written.
+    GroupFilter,
+    /// EXISTS / NOT EXISTS: a test over the whole group, which the planner
+    /// places after the patterns written before it.
+    GroupTest,
+}
+
+impl OrderRole {
+    /// Whether the patterns written before this one are its left side, so a
+    /// pattern written after it that shares one of its variables cannot move
+    /// above it (nor one written before it below).
+    pub fn is_positional(self) -> bool {
+        matches!(self, OrderRole::LeftJoin | OrderRole::AntiJoin)
+    }
+}
+
 impl Pattern {
+    /// This pattern's [`OrderRole`] in its group.
+    pub fn order_role(&self) -> OrderRole {
+        match self {
+            Pattern::Optional(_) => OrderRole::LeftJoin,
+            Pattern::Minus(_) => OrderRole::AntiJoin,
+            Pattern::Filter(_) => OrderRole::GroupFilter,
+            Pattern::Exists(_) | Pattern::NotExists(_) => OrderRole::GroupTest,
+            Pattern::Triple(_)
+            | Pattern::ListView(_)
+            | Pattern::Union(_)
+            | Pattern::Bind { .. }
+            | Pattern::Unwind { .. }
+            | Pattern::Values { .. }
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
+            | Pattern::Subquery(_)
+            | Pattern::IndexSearch(_)
+            | Pattern::VectorSearch(_)
+            | Pattern::R2rml(_)
+            | Pattern::GeoSearch(_)
+            | Pattern::S2Search(_)
+            | Pattern::Graph { .. }
+            | Pattern::Service(_)
+            | Pattern::DefaultGraphSource { .. }
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. } => OrderRole::Join,
+        }
+    }
+
     /// Apply `f` once to every immediate nested pattern list inside this
     /// pattern, reconstructing the surrounding container around the result.
     ///

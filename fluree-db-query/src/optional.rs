@@ -39,7 +39,7 @@ use crate::join::{
     UnifyInstruction,
 };
 use crate::object_binding::{equality_norm, same_term, EqualityNorm, TermDicts};
-use crate::operator::flush::FlushSchedule;
+use crate::operator::flush::{pull_window, FlushSchedule};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -2592,40 +2592,14 @@ impl OptionalOperator {
         // as before.
         let exact = window < self.optional_builder.seed_coalesce_cap();
         self.coalesce_schedule.advance();
-        let mut schema: Option<Arc<[VarId]>> = None;
-        let mut columns: Vec<Vec<Binding>> = Vec::new();
-        let mut rows = 0usize;
-        while rows < window {
-            let (batch, start) = match self.required_pending.take() {
-                Some(pending) => pending,
-                None => match self.required.next_batch(ctx).await? {
-                    Some(batch) => (batch, 0),
-                    None => break,
-                },
-            };
-            let end = if exact {
-                batch.len().min(start + window - rows)
-            } else {
-                batch.len()
-            };
-            if schema.is_none() {
-                schema = Some(batch.schema_arc());
-                columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
-            }
-            for (c, col) in columns.iter_mut().enumerate() {
-                let column = batch.column_by_idx(c).expect("column index within schema");
-                col.extend_from_slice(&column[start..end]);
-            }
-            rows += end - start;
-            if end < batch.len() {
-                self.required_pending = Some((batch, end));
-            }
-        }
-        let Some(schema) = schema.filter(|_| rows > 0) else {
-            return Ok(None);
-        };
-        // `from_parts` keeps the row count of a 0-column driving side.
-        Ok(Some(Batch::from_parts(schema, columns, rows)?))
+        pull_window(
+            &mut self.required,
+            &mut self.required_pending,
+            window,
+            exact,
+            ctx,
+        )
+        .await
     }
 
     /// The next required batch, starting with rows a seed left unread.

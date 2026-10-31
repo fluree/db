@@ -247,8 +247,9 @@ pub fn rewrite_patterns_for_r2rml(
     let mut origins: Vec<usize> = Vec::with_capacity(patterns.len());
     let mut star_origin: HashMap<VarId, usize> = HashMap::new();
     let mut class_origin: HashMap<VarId, usize> = HashMap::new();
-    // Variables of each OPTIONAL seen so far, by input position.
-    let mut optional_vars: Vec<(usize, HashSet<VarId>)> = Vec::new();
+    // Variables of each positional pattern (OPTIONAL, MINUS) seen so far, by
+    // input position.
+    let mut barrier_vars: Vec<(usize, HashSet<VarId>)> = Vec::new();
 
     for (i, pattern) in patterns.iter().enumerate() {
         match pattern {
@@ -260,15 +261,17 @@ pub fn rewrite_patterns_for_r2rml(
                     // subject; a bound-subject pattern (subject_var = None) is
                     // never star/class eligible and falls to standalone emit.
                     if let Some(sv) = star_member_subject(&r2rml_pattern) {
-                        // Joining a star opened before an OPTIONAL moves this
-                        // member above it: sound only if the OPTIONAL does not
-                        // also reference its object variable (#1924).
+                        // Joining a star opened before an OPTIONAL or a MINUS
+                        // moves this member above it: sound only if that
+                        // pattern does not also reference its object variable
+                        // (#1924).
                         let crosses_optional = star_origin.get(&sv).is_some_and(|&opened| {
-                            r2rml_pattern.object_var.is_some_and(|v| {
-                                optional_vars
-                                    .iter()
-                                    .any(|(at, vars)| *at > opened && vars.contains(&v))
-                            })
+                            lifts_past_barrier(
+                                &barrier_vars,
+                                opened,
+                                i,
+                                r2rml_pattern.object_var.iter().copied(),
+                            )
                         });
                         match star_groups.iter_mut().find(|(s, _)| *s == sv) {
                             _ if crosses_optional => {
@@ -309,8 +312,8 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::Exists(_)
             | Pattern::NotExists(_)
             | Pattern::Service(_) => {
-                if matches!(pattern, Pattern::Optional(_)) {
-                    optional_vars.push((i, pattern.referenced_vars().into_iter().collect()));
+                if pattern.order_role().is_positional() {
+                    barrier_vars.push((i, pattern.referenced_vars().into_iter().collect()));
                 }
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
                     let r = rewrite_patterns_for_r2rml(
@@ -528,8 +531,54 @@ pub fn rewrite_patterns_for_r2rml(
             .filter_map(|m| Some((m.predicate_filter?, m.object_constant?)))
             .collect();
 
+        // A class written above the star rises with it only if the star can
+        // rise to the class's slot (see `lifts_past_barrier`); a class written
+        // below binds nothing but the subject, so it always may.
+        let class_slot = class_origin
+            .get(&subject)
+            .copied()
+            .filter(|&at| at < origin);
+        let may_fuse_class = class_slot.is_none_or(|to| {
+            !lifts_past_barrier(
+                &barrier_vars,
+                to,
+                origin,
+                var_members.iter().flat_map(bound_besides_subject),
+            )
+        });
         let mut base = var_members.remove(0);
-        fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
+        let class_fused = fuse_class_if_safe(
+            &mut base,
+            &mut class_groups,
+            subject,
+            mapping,
+            may_fuse_class,
+        );
+        let origin = match class_slot {
+            Some(to) if class_fused => to,
+            _ => origin,
+        };
+        // The class now constrains the star alone, so a wildcard on the same
+        // subject (a crawl's `?s ?p ?o`) would still resolve every TriplesMap:
+        // when the star's subjects are few, the wildcard's LIMIT budget is never
+        // met and it streams every other table looking for subjects their
+        // templates cannot produce. Its rows only survive by joining the star's
+        // subjects, so when every other map's template is disjoint from the
+        // class's, hint it to the class's maps (resolution only, as PR-3 (b')).
+        if class_fused {
+            if let (Some(m), Some(class)) = (mapping, base.class_filter.clone()) {
+                if wildcard_class_fusion_is_safe(m, &class) {
+                    for p in &mut result_patterns {
+                        if let Pattern::R2rml(rp) = p {
+                            if is_standalone_wildcard(rp, subject) && rp.class_prune_hint.is_none()
+                            {
+                                rp.class_prune_hint = Some(class.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // PR-F20: if no query-declared class fused/pinned this star, but its
         // subject is a provable RefObjectMap object (invariant A+B, precomputed),
         // constrain resolution to the FK parent's class via the same
@@ -582,6 +631,11 @@ pub fn rewrite_patterns_for_r2rml(
             [ref m] => m.class_filter.as_deref().map(|class| {
                 try_fuse_wildcard_class(
                     &mut result_patterns,
+                    &mut origins,
+                    WrittenAt {
+                        class: class_origin[&subject],
+                        barriers: &barrier_vars,
+                    },
                     subject,
                     class,
                     mapping,
@@ -621,12 +675,26 @@ pub fn rewrite_patterns_for_r2rml(
     // star_constraint is the same existence filter the standalone join was (subject
     // kept iff the constraint column equals the constant). If the wildcard is gone
     // (defensive — fusion never removes it), re-emit the members standalone.
+    // The constraints keep their written slot: the wildcard rises to it when
+    // written below, and when it cannot (see `lifts_past_barrier`) they stay
+    // standalone scans there.
     for (subject, const_members) in deferred_wildcard_constraints {
-        match result_patterns
+        let written = star_origin[&subject];
+        let wildcard = result_patterns
             .iter()
-            .position(|p| matches!(p, Pattern::R2rml(rp) if is_crawl_wildcard(rp, subject)))
-        {
-            Some(idx) => {
+            .position(|p| matches!(p, Pattern::R2rml(rp) if is_crawl_wildcard(rp, subject)));
+        let cannot_rise = wildcard.is_some_and(|idx| match &result_patterns[idx] {
+            Pattern::R2rml(rp) => lifts_past_barrier(
+                &barrier_vars,
+                written,
+                origins[idx],
+                bound_besides_subject(rp),
+            ),
+            _ => false,
+        });
+        match wildcard {
+            Some(idx) if !cannot_rise => {
+                origins[idx] = origins[idx].min(written);
                 if let Pattern::R2rml(rp) = &mut result_patterns[idx] {
                     for m in const_members {
                         if let (Some(pred), Some(obj)) = (m.predicate_filter, m.object_constant) {
@@ -635,18 +703,19 @@ pub fn rewrite_patterns_for_r2rml(
                     }
                 }
             }
-            None => {
+            _ => {
                 for m in const_members {
                     result_patterns.push(Pattern::R2rml(m));
-                    origins.push(star_origin[&subject]);
+                    origins.push(written);
                 }
             }
         }
     }
 
-    // An OPTIONAL is evaluated where it is written relative to the patterns it
-    // shares a variable with, so restore written order around it.
-    if patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
+    // An OPTIONAL or a MINUS is evaluated over what is written before it, so
+    // restore written order around it: the grouped scans above were emitted
+    // after the loop, below every positional pattern.
+    if patterns.iter().any(|p| p.order_role().is_positional()) {
         assert_eq!(origins.len(), result_patterns.len());
         let mut ordered: Vec<(usize, Pattern)> = origins.into_iter().zip(result_patterns).collect();
         ordered.sort_by_key(|(origin, _)| *origin);
@@ -1032,6 +1101,42 @@ fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> 
     })
 }
 
+/// Whether lifting a scan written at slot `from` up to slot `to` (`to < from`)
+/// carries it past a positional pattern (an OPTIONAL or a MINUS, see
+/// [`crate::ir::OrderRole::is_positional`]) that reads one of `vars`.
+///
+/// Every fusion here merges scans written at different slots into one, and the
+/// written-order restore places the fused scan at a single slot. That slot must
+/// be the EARLIEST constituent's: a constraint written above an OPTIONAL or a
+/// MINUS is part of its left side, and sinking it below runs the OPTIONAL over
+/// an unconstrained seed (dropping every row it does not match) or the MINUS
+/// against too little (removing nothing). So the later constituents rise, and
+/// each rise is sound only when no positional pattern in between reads a
+/// variable that constituent binds (#1924): the subject is shared, so pass the
+/// others. Past a MINUS that does read one, the MINUS would need that variable
+/// to agree as well, and remove fewer rows.
+fn lifts_past_barrier(
+    barrier_vars: &[(usize, HashSet<VarId>)],
+    to: usize,
+    from: usize,
+    mut vars: impl Iterator<Item = VarId>,
+) -> bool {
+    let between: Vec<&HashSet<VarId>> = barrier_vars
+        .iter()
+        .filter(|(at, _)| *at > to && *at < from)
+        .map(|(_, read)| read)
+        .collect();
+    !between.is_empty() && vars.any(|v| between.iter().any(|read| read.contains(&v)))
+}
+
+/// Variables a scan binds besides its subject: what [`lifts_past_barrier`]
+/// checks when a fusion raises the scan.
+fn bound_besides_subject(p: &R2rmlPattern) -> impl Iterator<Item = VarId> + '_ {
+    p.produced_vars()
+        .into_iter()
+        .filter(move |v| Some(*v) != p.subject_var)
+}
+
 /// The subject var of a regular-predicate R2RML pattern that can join a
 /// same-subject star: variable subject, constant predicate, no class/TM filter,
 /// and either a fresh object var (distinct from the subject) or a constant-object
@@ -1083,26 +1188,31 @@ fn class_only_subject(p: &R2rmlPattern) -> Option<VarId> {
 /// the engine joins on the shared subject — the always-correct pre-fusion path.
 /// Fusion is also skipped when the subject carries more than one class (a single
 /// `class_filter` cannot represent them) or when the mapping is unavailable.
+///
+/// `may_consume` false (the star cannot rise to the class's slot) keeps the
+/// class its own scan; the resolution-only `class_prune_hint` still applies, as
+/// it never moves the class. Returns whether the class was consumed.
 fn fuse_class_if_safe(
     base: &mut R2rmlPattern,
     class_groups: &mut Vec<(VarId, Vec<R2rmlPattern>)>,
     subject: VarId,
     mapping: Option<&CompiledR2rmlMapping>,
-) {
+    may_consume: bool,
+) -> bool {
     let Some(idx) = class_groups.iter().position(|(s, _)| *s == subject) else {
-        return;
+        return false;
     };
     if class_groups[idx].1.len() != 1 {
-        return;
+        return false;
     }
     let Some(class) = class_groups[idx].1[0].class_filter.clone() else {
-        return;
+        return false;
     };
     // The base predicate drives TriplesMap selection; a star always has one.
     let Some(base_pred) = base.predicate_filter.as_deref() else {
-        return;
+        return false;
     };
-    if !mapping.is_some_and(|m| class_fusion_is_safe(m, &class, base_pred)) {
+    if !(may_consume && mapping.is_some_and(|m| class_fusion_is_safe(m, &class, base_pred))) {
         // Strong fusion (every base-predicate map declares the class) failed —
         // some OTHER TriplesMap carries the base predicate without the class.
         if let Some(m) = mapping {
@@ -1121,13 +1231,14 @@ fn fuse_class_if_safe(
             // single-pattern gate → decline → materialize the fact. Distinct from
             // strong fusion, which needs no disjointness because it already proved
             // every base-predicate map is a class map (nothing to drop).
-            if shared_predicate_fusion_enabled()
+            if may_consume
+                && shared_predicate_fusion_enabled()
                 && class_declares_predicate(m, &class, base_pred)
                 && wildcard_class_fusion_is_safe(m, &class)
             {
                 class_groups.remove(idx);
                 base.class_filter = Some(class);
-                return;
+                return true;
             }
             // PR-3 fix (b'): the class lives in a DIFFERENT TriplesMap than the base
             // predicate (no class map co-locates it — the vertically partitioned
@@ -1143,10 +1254,11 @@ fn fuse_class_if_safe(
                 base.class_prune_hint = Some(class);
             }
         }
-        return;
+        return false;
     }
     class_groups.remove(idx);
     base.class_filter = Some(class);
+    true
 }
 
 /// Whether at least one TriplesMap declares BOTH `class_iri` and `base_predicate`
@@ -1389,6 +1501,15 @@ fn is_standalone_type_var(rp: &R2rmlPattern, subject: VarId) -> bool {
         && rp.object_var.is_none()
 }
 
+/// Where a class pattern was written, and the positional patterns around it,
+/// for [`try_fuse_wildcard_class`] to place the fused wildcard.
+struct WrittenAt<'a> {
+    /// The class pattern's input slot.
+    class: usize,
+    /// The variables of each positional pattern in the scope, by input slot.
+    barriers: &'a [(usize, HashSet<VarId>)],
+}
+
 /// Outcome of [`try_fuse_wildcard_class`].
 enum WildcardClassFusion {
     /// Not fused; the class stays a standalone scan.
@@ -1419,8 +1540,11 @@ enum WildcardClassFusion {
 /// - **Otherwise** (hand-written SPARQL, multiple type-vars, or fusion off): leave
 ///   the type-var a standalone scan and only class-constrain it, preserving the
 ///   known-correct two-scan plan.
+#[allow(clippy::too_many_arguments)]
 fn try_fuse_wildcard_class(
     patterns: &mut [Pattern],
+    origins: &mut [usize],
+    written: WrittenAt<'_>,
     subject: VarId,
     class: &str,
     mapping: Option<&CompiledR2rmlMapping>,
@@ -1478,10 +1602,42 @@ fn try_fuse_wildcard_class(
         None
     };
 
+    // The fused wildcard takes the earliest slot among the class, the wildcard
+    // and a merged type-var, and every later one must be able to rise to it
+    // (see `lifts_past_barrier`); otherwise the class stays its own scan.
+    let constituents: Vec<usize> = patterns
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            matches!(p, Pattern::R2rml(rp) if is_standalone_wildcard(rp, subject)
+                || (do_merge && is_standalone_type_var(rp, subject)))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let slot = constituents
+        .iter()
+        .map(|&i| origins[i])
+        .fold(written.class, usize::min);
+    let refused = constituents.iter().any(|&i| {
+        let Pattern::R2rml(rp) = &patterns[i] else {
+            return false;
+        };
+        lifts_past_barrier(
+            written.barriers,
+            slot,
+            origins[i],
+            bound_besides_subject(rp),
+        )
+    });
+    if refused {
+        return WildcardClassFusion::Refused;
+    }
+
     let mut fused = false;
-    for p in patterns.iter_mut() {
+    for (p, origin) in patterns.iter_mut().zip(origins.iter_mut()) {
         if let Pattern::R2rml(rp) = p {
             if is_standalone_wildcard(rp, subject) {
+                *origin = slot;
                 rp.class_filter = Some(class.to_string());
                 // Merge: bind the projected class in the SAME scan.
                 if let Some(tv) = merged_type_var {
@@ -2027,7 +2183,7 @@ mod tests {
             subject,
             vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
         )];
-        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping), true);
         // Fused to one scan: class filter set, no separate class scan, no hint.
         assert_eq!(base.class_filter.as_deref(), Some(CLASS));
         assert_eq!(base.class_prune_hint, None);
@@ -2063,7 +2219,7 @@ mod tests {
             subject,
             vec![R2rmlPattern::new("gs", subject, None).with_class(TICKET_CLASS)],
         )];
-        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping), true);
         assert_eq!(base.class_filter.as_deref(), Some(TICKET_CLASS));
         assert_eq!(base.class_prune_hint, None);
         assert_eq!(class_groups.len(), 0, "one scan, category group-by fuses");
@@ -2088,7 +2244,7 @@ mod tests {
             subject,
             vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
         )];
-        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping), true);
         assert_eq!(base.class_filter, None, "must not fuse");
         assert_eq!(
             base.class_prune_hint, None,
@@ -2911,6 +3067,341 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A Person map and a second map over another subject template, so a class
+    /// fuses into a wildcard or star (`wildcard_class_fusion_is_safe`).
+    fn written_order_mapping() -> CompiledR2rmlMapping {
+        let person = TriplesMap::new("#P", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"))
+            .with_predicate_object(pom(OTHER_PRED, "nick"));
+        let agent = TriplesMap::new("#A", "people")
+            .with_subject_template("http://example.org/agent/{id}")
+            .with_predicate_object(pom(SCORE_PRED, "score"));
+        CompiledR2rmlMapping::new(vec![person, agent])
+    }
+
+    const OTHER_PRED: &str = "http://example.org/nick";
+    const SCORE_PRED: &str = "http://example.org/score";
+
+    fn triple(s: u16, p: &str, o: Term) -> Pattern {
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(s)),
+            Ref::Iri(p.into()),
+            o,
+        ))
+    }
+
+    fn wildcard_triple(s: u16, p: u16, o: u16) -> Pattern {
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(s)),
+            Ref::Var(VarId(p)),
+            Term::Var(VarId(o)),
+        ))
+    }
+
+    fn class_triple(s: u16) -> Pattern {
+        triple(
+            s,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            Term::Iri(CLASS.into()),
+        )
+    }
+
+    fn rewrite_scope(patterns: &[Pattern], crawl_active: bool) -> Vec<Pattern> {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        rewrite_patterns_for_r2rml(
+            patterns,
+            "gs:main",
+            &snapshot,
+            Some(&written_order_mapping()),
+            false,
+            crawl_active,
+        )
+        .patterns
+    }
+
+    /// Position of the first R2RML scan matching `pred`, and of the OPTIONAL.
+    fn slots(out: &[Pattern], pred: impl Fn(&R2rmlPattern) -> bool) -> (usize, usize) {
+        let scan = out
+            .iter()
+            .position(|p| matches!(p, Pattern::R2rml(rp) if pred(rp)))
+            .unwrap_or_else(|| panic!("no matching scan: {out:?}"));
+        let optional = out
+            .iter()
+            .position(|p| matches!(p, Pattern::Optional(_)))
+            .expect("the OPTIONAL stays a scope");
+        (scan, optional)
+    }
+
+    /// `?s a C OPTIONAL { ?s score ?x } ?s ?p ?o`: the class is part of the
+    /// OPTIONAL's left side. Fusing it into the wildcard written below the
+    /// OPTIONAL must lift the wildcard to the class's slot, not sink the class:
+    /// below, the OPTIONAL runs over an empty seed and every subject without a
+    /// score is lost.
+    #[test]
+    fn a_class_fused_into_a_later_wildcard_stays_above_the_optional() {
+        for crawl_active in [false, true] {
+            let out = rewrite_scope(
+                &[
+                    class_triple(0),
+                    Pattern::Optional(vec![triple(0, SCORE_PRED, Term::Var(VarId(3)))]),
+                    wildcard_triple(0, 1, 2),
+                ],
+                crawl_active,
+            );
+            let (wildcard, optional) = slots(&out, |rp| rp.predicate_var.is_some());
+            assert!(wildcard < optional, "crawl={crawl_active}: {out:?}");
+            let Pattern::R2rml(rp) = &out[wildcard] else {
+                unreachable!()
+            };
+            assert_eq!(rp.class_filter.as_deref(), Some(CLASS), "{out:?}");
+        }
+    }
+
+    /// The wildcard cannot rise past an OPTIONAL that reads its object variable,
+    /// so the class is not fused into it: it stays a scan of its own above the
+    /// OPTIONAL, and the wildcard stays below, unconstrained.
+    #[test]
+    fn a_wildcard_an_optional_reads_keeps_the_class_apart() {
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                Pattern::Optional(vec![triple(0, SCORE_PRED, Term::Var(VarId(2)))]),
+                wildcard_triple(0, 1, 2),
+            ],
+            true,
+        );
+        let (class, optional) = slots(&out, |rp| {
+            rp.class_filter.is_some() && rp.predicate_var.is_none()
+        });
+        assert!(class < optional, "the class stays above: {out:?}");
+        let (wildcard, _) = slots(&out, |rp| rp.predicate_var.is_some());
+        assert!(wildcard > optional, "the wildcard stays below: {out:?}");
+        let Pattern::R2rml(rp) = &out[wildcard] else {
+            unreachable!()
+        };
+        assert!(rp.class_filter.is_none(), "{out:?}");
+    }
+
+    /// `?s a C OPTIONAL { ?s score ?x } ?s name ?n`: the class fuses into the
+    /// star written below the OPTIONAL only by lifting the star above it.
+    #[test]
+    fn a_class_fused_into_a_later_star_stays_above_the_optional() {
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                Pattern::Optional(vec![triple(0, SCORE_PRED, Term::Var(VarId(3)))]),
+                triple(0, PRED, Term::Var(VarId(1))),
+            ],
+            false,
+        );
+        let (star, optional) = slots(&out, |rp| rp.predicate_filter.as_deref() == Some(PRED));
+        assert!(star < optional, "{out:?}");
+        let Pattern::R2rml(rp) = &out[star] else {
+            unreachable!()
+        };
+        assert_eq!(rp.class_filter.as_deref(), Some(CLASS), "{out:?}");
+
+        // An OPTIONAL reading the star's object variable keeps the star below
+        // and the class above, unfused.
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                Pattern::Optional(vec![triple(0, SCORE_PRED, Term::Var(VarId(1)))]),
+                triple(0, PRED, Term::Var(VarId(1))),
+            ],
+            false,
+        );
+        let (class, optional) = slots(&out, |rp| {
+            rp.class_filter.is_some() && rp.predicate_filter.is_none()
+        });
+        assert!(class < optional, "{out:?}");
+        let (star, _) = slots(&out, |rp| rp.predicate_filter.as_deref() == Some(PRED));
+        assert!(star > optional, "{out:?}");
+    }
+
+    /// W4-1b: a constant-object constraint written above an OPTIONAL folds onto
+    /// the crawl wildcard only by lifting the wildcard to the constraint's slot.
+    #[test]
+    fn a_constraint_folded_onto_a_later_wildcard_stays_above_the_optional() {
+        use fluree_db_core::FlakeValue;
+        let out = rewrite_scope(
+            &[
+                triple(0, PRED, Term::Value(FlakeValue::String("alice".into()))),
+                Pattern::Optional(vec![triple(0, SCORE_PRED, Term::Var(VarId(3)))]),
+                wildcard_triple(0, 1, 2),
+            ],
+            true,
+        );
+        let (wildcard, optional) = slots(&out, |rp| rp.predicate_var.is_some());
+        assert!(wildcard < optional, "{out:?}");
+        let Pattern::R2rml(rp) = &out[wildcard] else {
+            unreachable!()
+        };
+        assert_eq!(rp.star_constraints.len(), 1, "{out:?}");
+
+        // Lifting is refused when the OPTIONAL reads the wildcard's object: the
+        // constraint stays a standalone scan above the OPTIONAL.
+        let out = rewrite_scope(
+            &[
+                triple(0, PRED, Term::Value(FlakeValue::String("alice".into()))),
+                Pattern::Optional(vec![triple(0, SCORE_PRED, Term::Var(VarId(2)))]),
+                wildcard_triple(0, 1, 2),
+            ],
+            true,
+        );
+        let (constraint, optional) = slots(&out, |rp| rp.object_constant.is_some());
+        assert!(constraint < optional, "{out:?}");
+        let (wildcard, _) = slots(&out, |rp| rp.predicate_var.is_some());
+        let Pattern::R2rml(rp) = &out[wildcard] else {
+            unreachable!()
+        };
+        assert!(rp.star_constraints.is_empty(), "{out:?}");
+    }
+
+    /// Positions of the first R2RML scan matching `pred` and of the MINUS.
+    fn minus_slots(out: &[Pattern], pred: impl Fn(&R2rmlPattern) -> bool) -> (usize, usize) {
+        let scan = out
+            .iter()
+            .position(|p| matches!(p, Pattern::R2rml(rp) if pred(rp)))
+            .unwrap_or_else(|| panic!("no matching scan: {out:?}"));
+        let minus = out
+            .iter()
+            .position(|p| matches!(p, Pattern::Minus(_)))
+            .expect("the MINUS stays a scope");
+        (scan, minus)
+    }
+
+    /// A MINUS is positional like an OPTIONAL: what is written before it is
+    /// its left side. The class written above it fuses into the wildcard
+    /// below by lifting the wildcard, which is sound when the MINUS reads none
+    /// of the wildcard's variables, and refused when it does: the MINUS would
+    /// then need `?o` to agree as well, and remove fewer rows.
+    #[test]
+    fn a_fused_scan_rises_past_a_minus_only_when_the_minus_reads_none_of_it() {
+        for crawl_active in [false, true] {
+            let out = rewrite_scope(
+                &[
+                    class_triple(0),
+                    Pattern::Minus(vec![triple(0, SCORE_PRED, Term::Var(VarId(3)))]),
+                    wildcard_triple(0, 1, 2),
+                ],
+                crawl_active,
+            );
+            let (wildcard, minus) = minus_slots(&out, |rp| rp.predicate_var.is_some());
+            assert!(wildcard < minus, "crawl={crawl_active}: {out:?}");
+            let Pattern::R2rml(rp) = &out[wildcard] else {
+                unreachable!()
+            };
+            assert_eq!(rp.class_filter.as_deref(), Some(CLASS), "{out:?}");
+        }
+
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                Pattern::Minus(vec![triple(0, PRED, Term::Var(VarId(2)))]),
+                wildcard_triple(0, 1, 2),
+            ],
+            true,
+        );
+        let (class, minus) = minus_slots(&out, |rp| {
+            rp.class_filter.is_some() && rp.predicate_var.is_none()
+        });
+        assert!(class < minus, "the class stays above: {out:?}");
+        let (wildcard, _) = minus_slots(&out, |rp| rp.predicate_var.is_some());
+        assert!(wildcard > minus, "the wildcard stays below: {out:?}");
+    }
+
+    /// A scope with a MINUS and no OPTIONAL is restored to written order too:
+    /// the grouped scans are emitted after the loop, so without the restore the
+    /// class and the star written above the MINUS ran below it, and the MINUS
+    /// removed nothing.
+    #[test]
+    fn a_minus_only_scope_keeps_its_written_order() {
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                triple(0, PRED, Term::Var(VarId(1))),
+                Pattern::Minus(vec![triple(0, SCORE_PRED, Term::Var(VarId(3)))]),
+            ],
+            false,
+        );
+        let (star, minus) = minus_slots(&out, |rp| rp.predicate_filter.as_deref() == Some(PRED));
+        assert!(star < minus, "{out:?}");
+    }
+
+    /// `?s a C ; name ?n . ?s ?p ?o`: the class fuses into the `name` star, so
+    /// the crawl wildcard beside it is hinted to C's maps. Unhinted it resolves
+    /// every map, and when the star's subjects are few its LIMIT budget is never
+    /// met: it streams every other table for subjects their templates cannot
+    /// produce. The hint only narrows resolution; the class is not emitted.
+    #[test]
+    fn a_class_fused_into_a_star_hints_the_wildcard_beside_it() {
+        let out = rewrite_scope(
+            &[
+                class_triple(0),
+                triple(0, PRED, Term::Var(VarId(1))),
+                wildcard_triple(0, 2, 3),
+            ],
+            true,
+        );
+        let scans: Vec<&R2rmlPattern> = out
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect();
+        let star = scans
+            .iter()
+            .find(|rp| rp.predicate_filter.as_deref() == Some(PRED))
+            .expect("the name star");
+        assert_eq!(star.class_filter.as_deref(), Some(CLASS), "{out:?}");
+        let wildcard = scans
+            .iter()
+            .find(|rp| rp.predicate_var.is_some())
+            .expect("the wildcard");
+        assert_eq!(wildcard.class_prune_hint.as_deref(), Some(CLASS), "{out:?}");
+        assert!(wildcard.class_filter.is_none(), "{out:?}");
+    }
+
+    /// A second map sharing the class's subject template (a vertical partition)
+    /// supplies the same subjects' other triples, so the wildcard must still
+    /// resolve it: no hint.
+    #[test]
+    fn a_vertical_partition_keeps_the_wildcard_unhinted() {
+        let person = TriplesMap::new("#P", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let nick = TriplesMap::new("#N", "nicks")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(OTHER_PRED, "nick"));
+        let mapping = CompiledR2rmlMapping::new(vec![person, nick]);
+        let out = rewrite_patterns_for_r2rml(
+            &[
+                class_triple(0),
+                triple(0, PRED, Term::Var(VarId(1))),
+                wildcard_triple(0, 2, 3),
+            ],
+            "gs:main",
+            &LedgerSnapshot::genesis("test:main"),
+            Some(&mapping),
+            false,
+            true,
+        )
+        .patterns;
+        let wildcard = out
+            .iter()
+            .find_map(|p| match p {
+                Pattern::R2rml(rp) if rp.predicate_var.is_some() => Some(rp),
+                _ => None,
+            })
+            .expect("the wildcard");
+        assert!(wildcard.class_prune_hint.is_none(), "{out:?}");
     }
 
     /// PR-0/0a: a non-lowered sub-scope that would evaluate against the R2RML

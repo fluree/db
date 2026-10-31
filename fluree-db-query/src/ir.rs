@@ -58,7 +58,9 @@ pub use path::{
     PathDirection, PathModifier, PathNodeFilter, PathStep, PropertyPathPattern, ShortestPathMode,
     ShortestPathPattern,
 };
-pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
+pub use pattern::{
+    GraphName, OrderRole, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
+};
 pub use projection::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec,
     Projection, Root,

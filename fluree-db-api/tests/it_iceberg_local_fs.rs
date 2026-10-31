@@ -1608,3 +1608,690 @@ async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
         );
     }
 }
+
+/// A subgraph crawl over a graph source answers the subjects its ORDER BY puts
+/// on the page, in that order, as the same crawl over a native ledger does. The
+/// crawl runs as one flat scan regrouped by subject, and that scan used to drop
+/// the ORDER BY: the page came back in scan order and, under an OFFSET, held the
+/// wrong subjects. The native twin carries the fixture's IRIs and scores, so it
+/// is the oracle; every projection shape the expansion handles is covered,
+/// because each one builds its own flat query.
+#[tokio::test]
+async fn a_graph_source_crawl_answers_in_order_by_order() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("ordered-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let twin = fluree
+        .create_ledger("ordered-twin:main")
+        .await
+        .expect("twin ledger");
+    let people = [
+        (1, "alice", 91.5),
+        (2, "bob", 82.0),
+        (3, "carol", 77.25),
+        (4, "dave", 64.0),
+        (5, "erin", 99.9),
+    ];
+    let graph: Vec<Value> = people
+        .iter()
+        .map(|(id, name, score)| {
+            json!({
+                "@id": format!("http://example.org/person/{id}"),
+                "@type": "http://example.org/Person",
+                "http://example.org/name": name,
+                "http://example.org/score": score,
+            })
+        })
+        .collect();
+    fluree
+        .insert(twin, &json!({ "@graph": graph }))
+        .await
+        .expect("seed native twin");
+
+    let optional_sort = json!([
+        {"@id": "?s", "@type": "ex:Person"},
+        ["optional", {"@id": "?s", "ex:score": "?sort"}]
+    ]);
+    let one_map = json!({"@id": "?s", "@type": "ex:Person", "ex:score": "?sort"});
+    // Scores: 1 → 91.5, 2 → 82, 3 → 77.25, 4 → 64, 5 → 99.9.
+    let cases = [
+        // The live R2-3 shape: the sort key comes from an OPTIONAL.
+        (
+            "[*] desc",
+            json!(["*"]),
+            optional_sort.clone(),
+            json!([["desc", "?sort"]]),
+            5,
+            0,
+            vec![5, 1, 2, 3, 4],
+        ),
+        // OFFSET and LIMIT cut the ordered subjects, not the scan's.
+        (
+            "[*] asc page",
+            json!(["*"]),
+            one_map.clone(),
+            json!("?sort"),
+            3,
+            1,
+            vec![3, 2, 1],
+        ),
+        (
+            "[@id] desc page",
+            json!(["@id"]),
+            one_map.clone(),
+            json!("(desc ?sort)"),
+            2,
+            1,
+            vec![1, 2],
+        ),
+        (
+            "predicates desc",
+            json!(["@id", "ex:name"]),
+            optional_sort,
+            json!([["desc", "?sort"]]),
+            4,
+            0,
+            vec![5, 1, 2, 3],
+        ),
+    ];
+    for (label, projection, where_clause, order_by, limit, offset, expected) in cases {
+        let expected: Vec<String> = expected.iter().map(|n| format!("ex:person/{n}")).collect();
+        for from in ["ordered-people:main", "ordered-twin:main"] {
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": from,
+                "select": {"?s": projection},
+                "where": where_clause,
+                "orderBy": order_by,
+                "limit": limit,
+                "offset": offset,
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} on {from}: {e}"));
+            let ids: Vec<&str> = result
+                .as_array()
+                .expect("a crawl answers an array")
+                .iter()
+                .map(|doc| doc["@id"].as_str().expect("each document has an @id"))
+                .collect();
+            assert_eq!(ids, expected, "{label} on {from}: {result}");
+        }
+    }
+}
+
+/// The crawl's flat scan carries no GROUP BY / HAVING, so a crawl that asks for
+/// them is refused, as a top-level `values` is, rather than answered without
+/// them.
+#[tokio::test]
+async fn a_graph_source_crawl_refuses_group_by_and_having() {
+    use serde_json::json;
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("grouped-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    for (key, value) in [
+        ("groupBy", json!(["?s"])),
+        ("having", json!("(> (count ?n) 1)")),
+    ] {
+        let mut query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "grouped-people:main",
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "ex:name": "?n"},
+        });
+        query[key] = value;
+        let err = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .expect_err("a crawl cannot honor {key}");
+        assert!(
+            matches!(
+                err,
+                ApiError::Query(fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. })
+            ),
+            "{key}: {err}"
+        );
+    }
+}
+
+/// A subgraph crawl over a graph source keeps the request's options: its
+/// fuel limit, from the body's `opts` or a tracked request's override, on the
+/// connection and the graph terminals alike, and its reasoning keys. The crawl runs
+/// a rewritten flat query, which used to carry only the context, `select`,
+/// `where`, `orderBy` and `limit`, so a crawl ran without its fuel limit and
+/// without reasoning. SPARQL has no subgraph crawl, so there is no twin.
+#[tokio::test]
+async fn crawl_over_a_graph_source_keeps_its_query_options() {
+    use fluree_db_api::{TrackedQueryResponse, TrackingOptions};
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("optioned-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+
+    let crawl = |extra: Value| {
+        let mut q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "ex:Person"},
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            q[k] = v.clone();
+        }
+        q
+    };
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+    let fuel_exceeded = |err: &ApiError| {
+        matches!(
+            err,
+            ApiError::Query(fluree_db_query::QueryError::FuelLimitExceeded(_))
+        )
+    };
+    let tracked_fuel_exceeded =
+        |status: u16, error: &str| status == 400 && error.to_lowercase().contains("fuel");
+    // Five people with a name and a score cost more than 1.001 fuel: the
+    // 1.000 floor and one thousandth per row.
+    let tight = json!({"opts": {"max-fuel": 1.001}});
+    let generous = json!({"opts": {"max-fuel": 1_000_000}});
+    let with_from = |mut q: Value| {
+        q["from"] = json!("optioned-people:main");
+        q
+    };
+
+    // Connection terminal, body limit.
+    let ok = fluree
+        .query_from()
+        .jsonld(&with_from(crawl(generous.clone())))
+        .execute_formatted()
+        .await
+        .expect("a crawl under its limit succeeds");
+    assert_eq!(rows(&ok), 5, "{ok}");
+    let err = fluree
+        .query_from()
+        .jsonld(&with_from(crawl(tight.clone())))
+        .execute_formatted()
+        .await
+        .expect_err("a crawl past its body fuel limit fails");
+    assert!(fuel_exceeded(&err), "connection, body limit: {err:?}");
+
+    // Graph terminal, body limit.
+    let graph = fluree.graph("optioned-people:main");
+    let err = graph
+        .query()
+        .with_r2rml()
+        .jsonld(&crawl(tight.clone()))
+        .execute_formatted()
+        .await
+        .expect_err("a crawl past its body fuel limit fails");
+    assert!(fuel_exceeded(&err), "graph, body limit: {err:?}");
+
+    // Tracked terminals: the override's limit holds, and replaces the body's.
+    let override_limit = TrackingOptions {
+        track_fuel: true,
+        max_fuel: Some(1_001),
+        ..TrackingOptions::default()
+    };
+    let check_tracked = |label: &str,
+                         limited: Result<TrackedQueryResponse, _>,
+                         lifted: Result<TrackedQueryResponse, _>| {
+        let limited: fluree_db_api::TrackedErrorResponse =
+            limited.expect_err(&format!("{label}: the override's limit holds"));
+        assert!(
+            tracked_fuel_exceeded(limited.status, &limited.error),
+            "{label}: {} {}",
+            limited.status,
+            limited.error
+        );
+        let lifted = lifted.unwrap_or_else(|e| {
+            panic!("{label}: an override with no limit lifts the body's: {e:?}")
+        });
+        assert_eq!(rows(&lifted.result), 5, "{label}: {:?}", lifted.result);
+        // The crawl reports what it cost, as a tracked flat query does.
+        assert!(
+            lifted.fuel.is_some_and(|fuel| fuel > 1.0),
+            "{label}: fuel {:?}",
+            lifted.fuel
+        );
+        assert!(lifted.time.is_some(), "{label}: no time reported");
+        assert!(
+            limited.fuel.is_some(),
+            "{label}: a crawl past its limit reports the fuel it spent"
+        );
+    };
+    check_tracked(
+        "connection",
+        fluree
+            .query_from()
+            .jsonld(&with_from(crawl(json!({}))))
+            .tracking(override_limit.clone())
+            .execute_tracked()
+            .await,
+        fluree
+            .query_from()
+            .jsonld(&with_from(crawl(tight.clone())))
+            .track_all()
+            .execute_tracked()
+            .await,
+    );
+    check_tracked(
+        "graph",
+        graph
+            .query()
+            .with_r2rml()
+            .jsonld(&crawl(json!({})))
+            .tracking(override_limit.clone())
+            .execute_tracked()
+            .await,
+        graph
+            .query()
+            .with_r2rml()
+            .jsonld(&crawl(tight.clone()))
+            .track_all()
+            .execute_tracked()
+            .await,
+    );
+
+    // Reasoning reaches the flat query's parser: an unknown mode is refused,
+    // as on a flat query, where the crawl used to answer as if none were named.
+    // (`crawl::e2e::crawl_carries_reasoning` shows an RDFS crawl answering the
+    // subclass's instances.)
+    for (label, query) in [
+        (
+            "crawl",
+            with_from(crawl(json!({"reasoning": "no-such-mode"}))),
+        ),
+        (
+            "flat",
+            with_from(json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": ["?s"],
+                "where": {"@id": "?s", "@type": "ex:Person"},
+                "reasoning": "no-such-mode",
+            })),
+        ),
+    ] {
+        let err = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .expect_err("an unknown reasoning mode is refused");
+        assert!(err.to_string().contains("reasoning"), "{label}: {err}");
+    }
+}
+
+/// SPARQL twin of the crawl ordering. SPARQL has no subgraph crawl: the
+/// shape that picks a page of subjects by ORDER BY and returns their triples is
+/// a CONSTRUCT, which runs on the ordinary R2RML path and keeps only the
+/// ordered page's triples. DESCRIBE lowers to a subquery, which a graph source
+/// refuses rather than answering from its empty native index.
+#[tokio::test]
+async fn sparql_construct_over_a_graph_source_keeps_the_ordered_page() {
+    fn strings<'v>(v: &'v serde_json::Value, out: &mut Vec<&'v str>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("constructed-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let construct = "PREFIX ex: <http://example.org/> \
+        CONSTRUCT { ?s ex:name ?name } FROM <constructed-people:main> \
+        WHERE { ?s a ex:Person ; ex:name ?name OPTIONAL { ?s ex:score ?sort } } \
+        ORDER BY DESC(?sort) LIMIT 2 OFFSET 1";
+    let result = fluree
+        .query_from()
+        .sparql(construct)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT");
+    let mut found = Vec::new();
+    strings(&result, &mut found);
+    let mut names: Vec<&str> = found
+        .into_iter()
+        .filter(|s| ["alice", "bob", "carol", "dave", "erin"].contains(s))
+        .collect();
+    names.sort_unstable();
+    // DESC(score): erin, alice, bob, carol, dave; OFFSET 1 LIMIT 2 → alice, bob.
+    assert_eq!(names, ["alice", "bob"], "CONSTRUCT: {result}");
+
+    let describe = "PREFIX ex: <http://example.org/> \
+        DESCRIBE ?s FROM <constructed-people:main> \
+        WHERE { ?s a ex:Person } ORDER BY ?s LIMIT 2";
+    let err = fluree
+        .query_from()
+        .sparql(describe)
+        .execute_formatted()
+        .await
+        .expect_err("DESCRIBE over a graph source is refused");
+    assert!(err.to_string().contains("subquery"), "DESCRIBE: {err}");
+}
+
+/// The people table mapped twice over disjoint subject templates: persons
+/// carry a name, agents a score. So a person never has a score, and a class
+/// or constraint on persons fuses into the scan beside it (the templates prove
+/// the fusion drops nothing).
+const SPLIT_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+    <http://example.org/mapping#Agent> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/agent/{id}" ; rr:class ex:Agent ] ;
+        rr:predicateObjectMap [ rr:predicate ex:score ; rr:objectMap [ rr:column "score" ] ] .
+"#;
+
+/// A pattern written above an OPTIONAL is part of its left side. The rewrite
+/// fuses a class (or a constant-object constraint) into the scan written below
+/// the OPTIONAL; that fused scan must stay above it. Below, the OPTIONAL runs
+/// over an empty seed, binds `?s` to the agents it matches, and every person,
+/// none of whom has a score, is lost. On a lake the trigger is a null column
+/// under an OPTIONAL.
+#[tokio::test]
+async fn an_optional_keeps_the_class_written_above_it() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("split-people", &location, SPLIT_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let jsonld = |query: Value| {
+        let fluree = &fluree;
+        async move {
+            let mut query = query;
+            query["@context"] = json!({"ex": "http://example.org/"});
+            query["from"] = json!("split-people:main");
+            fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+        }
+    };
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+    let no_score = json!(["optional", {"@id": "?s", "ex:score": "?x"}]);
+
+    // The browse crawl: the class fuses into the injected wildcard.
+    let crawl = jsonld(json!({
+        "select": {"?s": ["*"]},
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score],
+    }))
+    .await;
+    assert_eq!(rows(&crawl), 5, "crawl: {crawl}");
+    assert!(
+        crawl
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["ex:name"].is_string()),
+        "each person keeps its name: {crawl}"
+    );
+
+    // A constant-object constraint folded onto the crawl wildcard (W4-1b).
+    let alice = jsonld(json!({
+        "select": {"?s": ["*"]},
+        "where": [{"@id": "?s", "ex:name": "alice"}, no_score],
+    }))
+    .await;
+    assert_eq!(rows(&alice), 1, "constraint crawl: {alice}");
+
+    // The class fused into a star written below the OPTIONAL.
+    let star = jsonld(json!({
+        "select": ["?s", "?n", "?x"],
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score, {"@id": "?s", "ex:name": "?n"}],
+    }))
+    .await;
+    assert_eq!(rows(&star), 5, "class into star: {star}");
+
+    // A flat wildcard, and its SPARQL twin: a type and a name per person.
+    let flat = jsonld(json!({
+        "select": ["?s", "?p", "?o"],
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score, {"@id": "?s", "?p": "?o"}],
+    }))
+    .await;
+    assert_eq!(rows(&flat), 10, "flat wildcard: {flat}");
+    let sparql = fluree
+        .query_from()
+        .sparql(
+            "PREFIX ex: <http://example.org/> SELECT ?s ?p ?o FROM <split-people:main> \
+             WHERE { ?s a ex:Person OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+        )
+        .execute_formatted()
+        .await
+        .expect("SPARQL");
+    assert_eq!(
+        rows(&sparql["results"]["bindings"]),
+        10,
+        "SPARQL wildcard: {sparql}"
+    );
+}
+
+/// A MINUS is positional like an OPTIONAL: what is written before it is its
+/// left side, so a scan the rewrite fuses or groups must not cross it. Every
+/// shape runs over `SPLIT_R2RML` and over a native twin holding the same
+/// triples, on SPARQL and JSON-LD, and must give the count Jena ARQ and
+/// Oxigraph both give. The fused shapes lifted the wildcard or the star above a
+/// MINUS that reads its variables; the scopes without an OPTIONAL were never
+/// restored to written order, so the grouped scans ran below the MINUS.
+#[tokio::test]
+async fn a_minus_keeps_the_scans_written_above_it() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("minus-people", &location, SPLIT_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let twin = fluree
+        .create_ledger("minus-twin:main")
+        .await
+        .expect("twin ledger");
+    let people = [
+        (1, "alice", "91.5"),
+        (2, "bob", "82.0"),
+        (3, "carol", "77.25"),
+        (4, "dave", "64.0"),
+        (5, "erin", "99.9"),
+    ];
+    let mut graph: Vec<Value> = Vec::new();
+    for (id, name, score) in people {
+        graph.push(json!({
+            "@id": format!("http://example.org/person/{id}"),
+            "@type": "http://example.org/Person",
+            "http://example.org/name": name,
+        }));
+        graph.push(json!({
+            "@id": format!("http://example.org/agent/{id}"),
+            "@type": "http://example.org/Agent",
+            "http://example.org/score": score,
+        }));
+    }
+    fluree
+        .insert(twin, &json!({ "@graph": graph }))
+        .await
+        .expect("seed native twin");
+
+    let score = json!(["optional", {"@id": "?s", "ex:score": "?x"}]);
+    let person = json!({"@id": "?s", "@type": "ex:Person"});
+    let alice = json!({"@id": "?s", "ex:name": "alice"});
+    let wildcard = json!({"@id": "?s", "?p": "?o"});
+    // (label, SPARQL query, JSON-LD select, JSON-LD where, rows per ARQ and Oxigraph)
+    let cases = [
+        (
+            "class into wildcard, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s ex:name ?o } OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([person, ["minus", {"@id": "?s", "ex:name": "?o"}], score, wildcard]),
+            0,
+        ),
+        (
+            "class into star, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s a ?n } OPTIONAL { ?s ex:score ?x } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["minus", {"@id": "?s", "@type": "?n"}], score, {"@id": "?s", "ex:name": "?n"}]),
+            0,
+        ),
+        (
+            "constraint into wildcard, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s ex:name \"alice\" . MINUS { ?s a ?o } OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([alice, ["minus", {"@id": "?s", "@type": "?o"}], score, wildcard]),
+            0,
+        ),
+        (
+            "class into wildcard, MINUS only",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s ex:name ?o } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([person, ["minus", {"@id": "?s", "ex:name": "?o"}], wildcard]),
+            0,
+        ),
+        (
+            "class into star, MINUS only",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s a ?n } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["minus", {"@id": "?s", "@type": "?n"}], {"@id": "?s", "ex:name": "?n"}]),
+            0,
+        ),
+        (
+            "constraint into wildcard, MINUS only",
+            "SELECT * WHERE { ?s ex:name \"alice\" . MINUS { ?s a ?o } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([alice, ["minus", {"@id": "?s", "@type": "?o"}], wildcard]),
+            0,
+        ),
+        // The review's P3 and P3b, verbatim. The class triple is written
+        // first, so `?s` is bound when the MINUS runs (Join(Minus(Extend(
+        // BGP(?s a Person), ?k), BGP(?s name "alice")), BGP(?s name ?n)),
+        // §18.2.2) and alice is removed: 4. With no OPTIONAL the scope was
+        // never restored to written order, so the graph source ran the class
+        // below the MINUS, which then removed nothing: 5.
+        (
+            "P3: class, BIND, then MINUS",
+            "SELECT ?s ?n WHERE { ?s a ex:Person . BIND(\"k\" AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["bind", "?k", ["expr", ["str", "k"]]], ["minus", alice], {"@id": "?s", "ex:name": "?n"}]),
+            4,
+        ),
+        (
+            "P3b: class, BIND, MINUS, then OPTIONAL",
+            "SELECT ?s ?n WHERE { ?s a ex:Person . BIND(\"k\" AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n OPTIONAL { ?s ex:score ?x } }",
+            json!(["?s", "?n"]),
+            json!([person, ["bind", "?k", ["expr", ["str", "k"]]], ["minus", alice], {"@id": "?s", "ex:name": "?n"}, score]),
+            4,
+        ),
+        // With the BIND written first, the MINUS's left side is the BIND alone,
+        // whose domain shares nothing with the MINUS, so it removes nothing and
+        // the triple written after it joins every person: 5.
+        (
+            "BIND first, then MINUS",
+            "SELECT * WHERE { BIND(1 AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n }",
+            json!(["?s", "?n", "?k"]),
+            json!([["bind", "?k", "(+ 0 1)"], ["minus", alice], {"@id": "?s", "ex:name": "?n"}]),
+            5,
+        ),
+    ];
+    let count = |v: &Value| {
+        v["results"]["bindings"]
+            .as_array()
+            .or_else(|| v.as_array())
+            .map_or(usize::MAX, Vec::len)
+    };
+    let mut wrong = Vec::new();
+    for (label, query, select, where_clause, expected) in &cases {
+        for from in ["minus-people:main", "minus-twin:main"] {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/> {}",
+                query.replacen(" WHERE", &format!(" FROM <{from}> WHERE"), 1)
+            );
+            let result = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} SPARQL on {from}: {e}"));
+            if count(&result) != *expected {
+                wrong.push(format!("{label} SPARQL on {from}: {} rows", count(&result)));
+            }
+            let jsonld = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": from,
+                "select": select,
+                "where": where_clause,
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&jsonld)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} JSON-LD on {from}: {e}"));
+            if count(&result) != *expected {
+                wrong.push(format!(
+                    "{label} JSON-LD on {from}: {} rows",
+                    count(&result)
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "rows differ from ARQ/Oxigraph:\n{}",
+        wrong.join("\n")
+    );
+}
