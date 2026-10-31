@@ -27,6 +27,9 @@ use crate::retention::removal::OccurrenceRef;
 use crate::retention::worker::now_ms;
 use crate::{ApiError, Fluree, IndexingMode, Result};
 
+/// Erased sets whose branch heads' reach is kept at once.
+const REACHED_SETS: usize = 64;
+
 /// The longest wait before a failed step is tried again (ms).
 const MAX_RETRY_MS: i64 = 3_600_000;
 
@@ -1201,6 +1204,7 @@ impl Fluree {
         branch: &str,
         job: &ErasureJob,
     ) -> Result<Option<Vec<NsRecord>>> {
+        let runtime = self.erasure_runtime()?;
         let name = LedgerId::parse(branch)?;
         let mut records: Vec<_> = self
             .nameservice()
@@ -1214,56 +1218,103 @@ impl Fluree {
         }
         let commits: Vec<&str> = job.commits.iter().map(|c| c.commit.as_str()).collect();
         records.extend(self.copies_holding(&name, &commits).await?);
-        let erased: HashSet<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
-        let from = job.commits.iter().map(|c| c.t).min().unwrap_or(0);
-        let mut unreached = HashSet::new();
+        let erased: std::collections::BTreeSet<ContentId> =
+            commits.iter().filter_map(|c| c.parse().ok()).collect();
+        let key = fluree_db_core::sha256_hex(
+            erased
+                .iter()
+                .map(ContentId::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+                .as_bytes(),
+        );
+        let mut reached = runtime
+            .reached_heads
+            .lock()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let erased: HashSet<ContentId> = erased.into_iter().collect();
         let mut holders = Vec::with_capacity(records.len());
+        let mut heads = Vec::with_capacity(records.len());
         for record in records {
-            if self.reaches(&record, &erased, from, &mut unreached).await? {
+            if let Some(head) = &record.commit_head_id {
+                heads.push(head.clone());
+            }
+            if self.reaches(&record, &erased, &mut reached).await? {
                 holders.push(record);
+            }
+        }
+        let mut kept = runtime.reached_heads.lock();
+        if kept.len() >= REACHED_SETS && !kept.contains_key(&key) {
+            kept.clear();
+        }
+        let kept = kept.entry(key).or_default();
+        for head in heads {
+            if let Some(reaches) = reached.get(&head) {
+                kept.insert(head, *reaches);
             }
         }
         Ok(Some(holders))
     }
 
-    /// Whether `record`'s history reaches one of `erased`, none older than
-    /// `from_t`, through every parent: a transfer of a branch that merged
-    /// one carries it. Commits whose history reaches none are kept in
-    /// `unreached`, since branches share theirs below where they forked.
+    /// Whether `record`'s history reaches one of `erased` through any
+    /// parent: a merge's other parent is the source branch's, whose `t` says
+    /// nothing of the target's, and a transfer of the target carries it.
+    /// What a commit's history reaches is kept in `reached`, for every
+    /// commit decided, so history the branches share is read once; one that
+    /// cannot be read counts as reaching.
     async fn reaches(
         &self,
         record: &NsRecord,
         erased: &HashSet<ContentId>,
-        from_t: i64,
-        unreached: &mut HashSet<ContentId>,
+        reached: &mut HashMap<ContentId, bool>,
     ) -> Result<bool> {
         let Some(head) = record.commit_head_id.clone() else {
             return Ok(false);
         };
-        if record.commit_t < from_t {
-            return Ok(false);
-        }
         let store = self
             .content_store_for_record_or_id(Some(record), &record.storage_namespace())
             .await?;
-        let mut seen = HashSet::new();
-        let mut next = vec![head];
-        while let Some(cid) = next.pop() {
-            if erased.contains(&cid) {
-                return Ok(true);
-            }
-            if unreached.contains(&cid) || !seen.insert(cid.clone()) {
+        // Depth first: a commit is decided once one of its parents reaches,
+        // or every parent is decided.
+        let mut stack: Vec<(ContentId, Option<Vec<ContentId>>)> = vec![(head.clone(), None)];
+        while let Some(top) = stack.len().checked_sub(1) {
+            let cid = stack[top].0.clone();
+            if reached.contains_key(&cid) {
+                stack.pop();
                 continue;
             }
-            let envelope = load_commit_envelope_by_id(store.as_ref(), &cid).await?;
-            // A parent is older than its child, so none past this one is
-            // erased.
-            if envelope.t > from_t {
-                next.extend(envelope.parent_ids().cloned());
+            if erased.contains(&cid) {
+                reached.insert(cid, true);
+                stack.pop();
+                continue;
+            }
+            let Some(parents) = stack[top].1.clone() else {
+                match load_commit_envelope_by_id(store.as_ref(), &cid).await {
+                    Ok(envelope) => stack[top].1 = Some(envelope.parent_ids().cloned().collect()),
+                    Err(e) => {
+                        tracing::debug!(commit = %cid, error = %e, "erasure: an unreadable commit counts as holding");
+                        reached.insert(cid, true);
+                        stack.pop();
+                    }
+                }
+                continue;
+            };
+            if parents.iter().any(|p| reached.get(p) == Some(&true)) {
+                reached.insert(cid, true);
+                stack.pop();
+                continue;
+            }
+            match parents.iter().find(|p| !reached.contains_key(*p)) {
+                Some(next) => stack.push((next.clone(), None)),
+                None => {
+                    reached.insert(cid, false);
+                    stack.pop();
+                }
             }
         }
-        unreached.extend(seen);
-        Ok(false)
+        Ok(reached.get(&head).copied().unwrap_or(true))
     }
 
     /// The `holders` whose history holds one of `job`'s commits above their

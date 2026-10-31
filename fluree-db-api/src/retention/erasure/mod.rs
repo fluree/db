@@ -115,6 +115,14 @@ pub(crate) struct ErasureRuntime {
     pub(crate) for_leader: parking_lot::Mutex<Option<members::ForLeader>>,
     /// Held while this host proves: a proof can take most of its memory.
     pub(crate) proving: tokio::sync::Mutex<()>,
+    /// Per erased set, whether each branch head found so far reaches it: a
+    /// commit's history never changes, so a later walk stops at one.
+    pub(crate) reached_heads: parking_lot::Mutex<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<fluree_db_core::ContentId, bool>,
+        >,
+    >,
 }
 
 /// What reconciling a branch with received erasures took out of its
@@ -148,6 +156,7 @@ impl ErasureRuntime {
             members: Default::default(),
             for_leader: Default::default(),
             proving: Default::default(),
+            reached_heads: Default::default(),
         }
     }
 

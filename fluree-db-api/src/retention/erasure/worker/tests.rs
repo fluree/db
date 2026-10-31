@@ -805,3 +805,121 @@ async fn acceptance_removes_from_a_branch_another_member_made_meanwhile() {
         "the value stays current on the late branch"
     );
 }
+
+/// A branch holds an erased commit it reaches only through a merge's other
+/// parent, whose `t` is the source branch's: higher than the merge's, and
+/// than the branch's head, whatever its head's `t` becomes.
+#[tokio::test]
+async fn a_branch_reaching_an_erased_commit_only_through_a_merge_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    let name = "holders/merge-clock";
+    let main = "holders/merge-clock:main";
+    let side = "holders/merge-clock:side";
+    fluree.create_ledger(name).await.unwrap();
+    insert(
+        &fluree,
+        main,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "original"}),
+    )
+    .await;
+    fluree
+        .create_branch(name, "side", None, None)
+        .await
+        .unwrap();
+    for n in 2..=5 {
+        insert(
+            &fluree,
+            main,
+            json!({"@id": format!("http://example.org/p{n}"), "http://example.org/name": n}),
+        )
+        .await;
+    }
+    let update = |value: &str| {
+        json!({
+            "where": {"@id": "http://example.org/alice", "http://example.org/email": "?old"},
+            "delete": {"@id": "http://example.org/alice", "http://example.org/email": "?old"},
+            "insert": {"@id": "http://example.org/alice", "http://example.org/email": value}
+        })
+    };
+    let source_t = fluree
+        .graph(main)
+        .transact()
+        .update(&update("a@secret"))
+        .commit()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    let source = commit_at(&fluree, main, source_t).await;
+    fluree
+        .graph(side)
+        .transact()
+        .update(&update("public"))
+        .commit()
+        .await
+        .unwrap();
+    // The side keeps its own value: its merge holds none of the secret.
+    let merged = fluree
+        .merge_branch(
+            name,
+            "main",
+            Some("side"),
+            crate::ConflictStrategy::TakeBranch,
+        )
+        .await
+        .unwrap();
+    assert!(!merged.fast_forward);
+    let record = fluree.nameservice().lookup(side).await.unwrap().unwrap();
+    assert!(
+        record.commit_t < source_t,
+        "{} vs {source_t}",
+        record.commit_t
+    );
+    let store = fluree
+        .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+        .await
+        .unwrap();
+    let head = record.commit_head_id.as_ref().unwrap();
+    let merge = fluree_db_core::load_commit_by_id(store.as_ref(), head)
+        .await
+        .unwrap();
+    assert!(merge.parents.contains(&source));
+    assert!(!merge
+        .flakes
+        .iter()
+        .any(|f| f.o == fluree_db_core::FlakeValue::String("a@secret".into())));
+    assert!(!collect_first_parent_cids(store.as_ref(), head, 0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|(_, cid)| cid == &source));
+
+    let receipt = fluree
+        .erase_occurrences(main, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    let job = fluree.job(main, &receipt.request_id).await.unwrap();
+    let holds = async |fluree: &Fluree| {
+        fluree
+            .holders(main, &job)
+            .await
+            .unwrap()
+            .unwrap()
+            .iter()
+            .any(|r| r.ledger_id == side)
+    };
+    assert!(
+        holds(&fluree).await,
+        "while the side's head is below the source's t"
+    );
+    for n in 0..6 {
+        insert(
+            &fluree,
+            side,
+            json!({"@id": format!("http://example.org/s{n}"), "http://example.org/name": n}),
+        )
+        .await;
+    }
+    assert!(holds(&fluree).await, "once the side's head is above it");
+}
