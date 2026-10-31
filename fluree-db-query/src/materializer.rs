@@ -51,9 +51,10 @@ pub enum JoinKey<'a> {
     Lit {
         o_kind: u8,
         o_key: u64,
-        /// `p_id` is only required for NUM_BIG decoding (per-predicate numbig arena).
-        /// For all other literal kinds, it must not affect join-key identity.
-        p_id_for_numbig: Option<u32>,
+        /// `p_id` scopes an arena handle (NUM_BIG, VECTOR_ID). [`Materializer::join_key`]
+        /// decodes arena literals, so it builds this only as `None`; for all
+        /// other literal kinds it must not affect join-key identity.
+        p_id_for_arena: Option<u32>,
         dt_id: u16,
         lang_id: u16,
     },
@@ -97,9 +98,7 @@ impl Hash for FlakeValueKey {
             FlakeValue::Time(t) => t.hash(state),
             FlakeValue::Json(s) => s.hash(state),
             FlakeValue::Vector(v) => {
-                for f in v.iter() {
-                    f.to_bits().hash(state);
-                }
+                fluree_db_core::value::vector_bits_hash(v.iter().map(|f| f.to_bits())).hash(state);
             }
             FlakeValue::Null => {}
             FlakeValue::GYear(v) => v.hash(state),
@@ -138,14 +137,14 @@ impl PartialEq for JoinKey<'_> {
                 JoinKey::Lit {
                     o_kind: k1,
                     o_key: ok1,
-                    p_id_for_numbig: p1,
+                    p_id_for_arena: p1,
                     dt_id: d1,
                     lang_id: l1,
                 },
                 JoinKey::Lit {
                     o_kind: k2,
                     o_key: ok2,
-                    p_id_for_numbig: p2,
+                    p_id_for_arena: p2,
                     dt_id: d2,
                     lang_id: l2,
                 },
@@ -184,13 +183,13 @@ impl Hash for JoinKey<'_> {
             JoinKey::Lit {
                 o_kind,
                 o_key,
-                p_id_for_numbig,
+                p_id_for_arena,
                 dt_id,
                 lang_id,
             } => {
                 o_kind.hash(state);
                 o_key.hash(state);
-                p_id_for_numbig.hash(state);
+                p_id_for_arena.hash(state);
                 dt_id.hash(state);
                 lang_id.hash(state);
             }
@@ -357,6 +356,9 @@ impl Materializer {
                 dtc: dtc.clone(),
             }),
 
+            // An arena handle (NUM_BIG, VECTOR_ID) is not a term identity: it is
+            // scoped per predicate, and the vector arena does not deduplicate.
+            // Key it by its decoded value.
             Binding::EncodedLit {
                 o_kind,
                 o_key,
@@ -364,14 +366,32 @@ impl Materializer {
                 dt_id,
                 lang_id,
                 ..
+            } if fluree_db_core::ObjKind::from_u8(*o_kind).is_arena_handle() => {
+                match crate::group_aggregate::materialize_encoded(binding, Some(&self.graph_view)) {
+                    Binding::Lit { val, dtc, .. } => JoinKey::MaterializedLit(MaterializedLitKey {
+                        val: FlakeValueKey(val),
+                        dtc,
+                    }),
+                    _ => {
+                        return Err(decode_error(
+                            "decode arena literal",
+                            format!("o_kind={o_kind} o_key={o_key} p_id={p_id}"),
+                            format!("dt_id={dt_id} lang_id={lang_id}"),
+                        ))
+                    }
+                }
+            }
+
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                dt_id,
+                lang_id,
+                ..
             } => JoinKey::Lit {
                 o_kind: *o_kind,
                 o_key: *o_key,
-                p_id_for_numbig: if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
-                    Some(*p_id)
-                } else {
-                    None
-                },
+                p_id_for_arena: None,
                 dt_id: *dt_id,
                 lang_id: *lang_id,
             },

@@ -21,7 +21,6 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::o_type::{DecodeKind, OType};
-use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{PropertyStatData, StatsView};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
@@ -234,6 +233,15 @@ pub(crate) fn analyze_cyclic_bgp(
     })
 }
 
+/// The bail reason for an object row [`EncObj::encode`] cannot carry.
+fn object_bail_reason(o_type: u16) -> &'static str {
+    if OType::from_u16(o_type).o_key_is_globally_identifying() {
+        "unsupported-object-binding"
+    } else {
+        "arena-literal-object"
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RawEdgeRow {
     subject: u64,
@@ -244,8 +252,11 @@ struct RawEdgeRow {
 
 /// Join identity of an encoded object value, mirroring the term equality the
 /// fallback operator tree computes for the same rows: refs compare by s_id,
-/// blank nodes by handle, literals by `(o_type, o_key)` with `p_id`
-/// participating only for NUM_BIG (per-predicate arena).
+/// blank nodes by handle, literals by `(o_type, o_key)`. An arena-backed
+/// literal (a big number or a vector) never gets one: its `o_key` is a
+/// per-predicate handle, and the vector arena does not deduplicate, so the
+/// pair is not its identity (see [`OType::o_key_is_globally_identifying`]);
+/// such rows decline the operator to the fallback, which compares by value.
 ///
 /// Keying literals on `o_type` matches `Binding` equality, in two layers:
 ///
@@ -268,11 +279,7 @@ struct RawEdgeRow {
 enum EncIdentity {
     Ref(u64),
     Blank(u64),
-    Lit {
-        o_type: u16,
-        o_key: u64,
-        num_big_p_id: u32,
-    },
+    Lit { o_type: u16, o_key: u64 },
 }
 
 /// Copy-able encoded object for the cyclic join data plane. Hash/Eq/Ord use
@@ -337,6 +344,9 @@ impl EncObj {
     /// temporals, geo/spatial) cannot drift from the scan path's.
     fn encode(o_type: u16, o_key: u64, p_id: u32) -> Option<Self> {
         let ot = OType::from_u16(o_type);
+        if !ot.o_key_is_globally_identifying() {
+            return None;
+        }
         if ot.decode_kind() == DecodeKind::BlankNode {
             // Blank handles compare by o_key; skip the per-row label format!.
             return Some(Self {
@@ -348,15 +358,7 @@ impl EncObj {
         }
         let id = match late_materialized_object_binding(o_type, o_key, p_id, 0, u32::MAX, None) {
             Some(Binding::EncodedSid { s_id, .. }) => EncIdentity::Ref(s_id),
-            Some(Binding::EncodedLit { o_kind, .. }) => EncIdentity::Lit {
-                o_type,
-                o_key,
-                num_big_p_id: if o_kind == ObjKind::NUM_BIG.as_u8() {
-                    p_id
-                } else {
-                    0
-                },
-            },
+            Some(Binding::EncodedLit { .. }) => EncIdentity::Lit { o_type, o_key },
             // The materializer only builds other variants for blank nodes,
             // handled above.
             Some(_) => return None,
@@ -364,11 +366,9 @@ impl EncObj {
             // They have no `EncodedLit` form, but `(o_type, o_key)` is their
             // full term identity within this store view, so they stay in the
             // join; the rows that survive it decode at emit.
-            None if ot.decode_kind() == DecodeKind::StringDict => EncIdentity::Lit {
-                o_type,
-                o_key,
-                num_big_p_id: 0,
-            },
+            None if ot.decode_kind() == DecodeKind::StringDict => {
+                EncIdentity::Lit { o_type, o_key }
+            }
             None => return None,
         };
         Some(Self {
@@ -788,7 +788,7 @@ impl CyclicBgpOperator {
         let mut rows = Vec::with_capacity(raw_rows.len());
         for raw in raw_rows {
             let Some(object) = self.encode_object_for_edge(edge, raw) else {
-                self.log_fast_path_bail("unsupported-object-binding", Some(edge));
+                self.log_fast_path_bail(object_bail_reason(raw.o_type), Some(edge));
                 return Ok(None);
             };
             rows.push((raw.subject, object));
@@ -881,7 +881,7 @@ impl CyclicBgpOperator {
         let mut rows = Vec::with_capacity(raw_rows.len());
         for raw in raw_rows {
             let Some(object) = self.encode_object_for_edge(edge, raw) else {
-                self.log_fast_path_bail("unsupported-object-binding", Some(edge));
+                self.log_fast_path_bail(object_bail_reason(raw.o_type), Some(edge));
                 return Ok(None);
             };
             rows.push((raw.subject, object));
@@ -2773,6 +2773,24 @@ mod tests {
             seen.len() > 10,
             "expected the full encoded o_type set, saw {}",
             seen.len()
+        );
+    }
+
+    /// An arena handle names a value only per predicate (and a vector's is
+    /// not its only handle even there), so the join never keys on one: it
+    /// declines, under a reason of its own.
+    #[test]
+    fn arena_literal_objects_decline_the_join() {
+        for o_type in [OType::VECTOR, OType::NUM_BIG_OVERFLOW] {
+            assert!(
+                EncObj::encode(o_type.as_u16(), 0, 7).is_none(),
+                "{o_type:?}"
+            );
+            assert_eq!(object_bail_reason(o_type.as_u16()), "arena-literal-object");
+        }
+        assert_eq!(
+            object_bail_reason(OType::XSD_BOOLEAN.as_u16()),
+            "unsupported-object-binding"
         );
     }
 

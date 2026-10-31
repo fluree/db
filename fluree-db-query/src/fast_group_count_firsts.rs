@@ -884,6 +884,15 @@ pub(crate) fn group_count_v6(
     cancellation: &QueryCancellation,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
+    // A vector's `o_key` is one fact's arena handle, so equal vectors are
+    // neither one run nor adjacent in POST order
+    // (`OType::o_key_is_predicate_identifying`): the run-length count would
+    // split each value's group. Callers fall back on the error.
+    if store.holds_vectors(g_id, p_id) {
+        return Err(QueryError::Internal(
+            "group count: predicate holds vectors, whose keys are not values".to_string(),
+        ));
+    }
 
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
@@ -1422,6 +1431,11 @@ fn compute_group_by_object_star_topk(
             Ok(Some(crate::binding::Batch::empty(schema)?))
         };
     };
+    // Groups key on `(o_type, o_key)`, which for a vector is one fact's
+    // arena handle, not its value (`OType::o_key_is_predicate_identifying`).
+    if store.holds_vectors(g_id, p_id) {
+        return Ok(None);
+    }
     let mut out = ColumnSet::EMPTY;
     out.insert(ColumnId::SId);
     out.insert(ColumnId::OType);

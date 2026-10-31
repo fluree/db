@@ -1741,6 +1741,24 @@ impl BinaryIndexStore {
             .filter(|&dims| dims != 0)
     }
 
+    /// Whether `(g_id, p_id)` has a vector arena, so its rows may hold vector
+    /// objects. Their `o_key` is not a value identity even within the
+    /// predicate (`OType::o_key_is_predicate_identifying`), so a consumer that
+    /// keys objects on `(o_type, o_key)` declines when this holds.
+    pub fn holds_vectors(&self, g_id: GraphId, p_id: u32) -> bool {
+        self.graph_indexes
+            .get(&g_id)
+            .is_some_and(|gi| gi.vectors.contains_key(&p_id))
+    }
+
+    /// Whether any predicate of `g_id` has a vector arena (see
+    /// [`Self::holds_vectors`]).
+    pub fn graph_holds_vectors(&self, g_id: GraphId) -> bool {
+        self.graph_indexes
+            .get(&g_id)
+            .is_some_and(|gi| !gi.vectors.is_empty())
+    }
+
     /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
     ///
     /// See [`crate::arena::vector::LazyVectorArena::snapshot`] — scan loops
@@ -2539,6 +2557,39 @@ impl BinaryIndexStore {
             .is_some_and(crate::arena::numbig::NumBigArena::is_decimal_only)
     }
 
+    /// Whether any NumBig arena of `g_id` holds one value under several
+    /// handles: a legacy pre-normalization arena, where `1.5` and `1.50` kept
+    /// a handle each. Its rows are then not one key per value even within a
+    /// predicate, so a consumer that relies on that declines.
+    pub fn graph_numbig_has_duplicate_handles(&self, g_id: GraphId) -> bool {
+        self.numbig_arenas(g_id)
+            .any(|(_, arena)| arena.has_duplicate_handles())
+    }
+
+    /// Install `arena` as `(g_id, p_id)`'s NumBig arena. For tests that need
+    /// an arena shape no current build writes, such as a legacy arena with
+    /// scale-variant duplicates.
+    #[doc(hidden)]
+    pub fn set_numbig_arena_for_test(
+        &mut self,
+        g_id: GraphId,
+        p_id: u32,
+        arena: crate::arena::numbig::NumBigArena,
+    ) {
+        self.graph_indexes
+            .entry(g_id)
+            .or_insert_with(|| GraphIndex {
+                orders: HashMap::new(),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            })
+            .numbig
+            .insert(p_id, arena);
+    }
+
     /// Memoizes `prove` per `(graph, predicate)`. An inconclusive (`None`)
     /// proof is not cached, so a transient read failure is retried later.
     pub fn memoized_decimal_only_proof(
@@ -3241,6 +3292,99 @@ pub struct BinaryGraphView {
     /// the life of the store and novelty window the view holds.
     subject_sids: SubjectMemo<Sid>,
     subject_iris: SubjectMemo<Arc<str>>,
+    /// Vectors already decoded through this view, one shared value per
+    /// distinct vector: the arena gives every stored fact its own handle, so
+    /// equal vectors under many handles decode to one allocation.
+    vectors: VectorMemo,
+}
+
+/// Per-view memo of decoded vectors keyed by value, bounded by clearing
+/// rather than evicting. A probe hashes and compares the arena's `f32`
+/// components in place, so a handle whose value was seen allocates nothing.
+struct VectorMemo(std::sync::Mutex<VectorMemoInner>);
+
+#[derive(Default)]
+struct VectorMemoInner {
+    /// Decoded values by the hash of their components ([`VectorMemo::hash`]).
+    by_hash: rustc_hash::FxHashMap<u64, Vec<Arc<[f64]>>>,
+    /// Components held, the bound the memo clears at.
+    components: usize,
+    /// Arena shards read so far, by `(p_id, shard index)`, so a lookup skips
+    /// the shared shard cache's probe.
+    shards: rustc_hash::FxHashMap<(u32, usize), Arc<crate::arena::vector::VectorShard>>,
+}
+
+impl VectorMemo {
+    const MAX_COMPONENTS: usize = 1 << 22;
+
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(VectorMemoInner::default()))
+    }
+
+    fn hash(components: &[f32]) -> u64 {
+        fluree_db_core::value::vector_bits_hash(
+            std::iter::once(components.len() as u64)
+                .chain(components.iter().map(|x| u64::from(x.to_bits()))),
+        )
+    }
+
+    /// The shared value of `handle` in `p_id`'s `arena`, allocating it on the
+    /// first sight of that value. `None` for a handle the arena does not hold.
+    fn get(
+        &self,
+        p_id: u32,
+        arena: &crate::arena::vector::LazyVectorArena,
+        handle: u32,
+    ) -> io::Result<Option<Arc<[f64]>>> {
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
+        let mut memo = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shard = match memo.shards.get(&(p_id, shard_idx)) {
+            Some(shard) => Arc::clone(shard),
+            None => {
+                let shard = arena.shard(shard_idx)?;
+                memo.shards.insert((p_id, shard_idx), Arc::clone(&shard));
+                shard
+            }
+        };
+        Ok(shard
+            .get_f32(offset)
+            .map(|components| Self::get_or_insert(&mut memo, components)))
+    }
+
+    /// The shared value equal to `components` (widened exactly to `f64`),
+    /// allocating it on the first sight of that value.
+    fn get_or_insert(memo: &mut VectorMemoInner, components: &[f32]) -> Arc<[f64]> {
+        let same = |v: &[f64]| {
+            v.len() == components.len()
+                && v.iter()
+                    .zip(components)
+                    .all(|(a, b)| a.to_bits() == f64::from(*b).to_bits())
+        };
+        let hash = Self::hash(components);
+        if let Some(found) = memo
+            .by_hash
+            .get(&hash)
+            .and_then(|bucket| bucket.iter().find(|v| same(v)))
+        {
+            return Arc::clone(found);
+        }
+        if memo.components >= Self::MAX_COMPONENTS {
+            memo.by_hash.clear();
+            memo.components = 0;
+        }
+        let value: Arc<[f64]> = components.iter().map(|&x| f64::from(x)).collect();
+        memo.components += components.len();
+        memo.by_hash
+            .entry(hash)
+            .or_default()
+            .push(Arc::clone(&value));
+        value
+    }
 }
 
 /// Per-view id-to-name memo, bounded by clearing rather than evicting.
@@ -3283,6 +3427,7 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
+            vectors: VectorMemo::new(),
         }
     }
 
@@ -3305,6 +3450,7 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
+            vectors: VectorMemo::new(),
         }
     }
 
@@ -3428,6 +3574,11 @@ impl BinaryGraphView {
                 }
             }
         }
+        if o_kind == ObjKind::VECTOR_ID.as_u8() {
+            if let Some(value) = self.shared_vector(p_id, o_key as u32)? {
+                return Ok(FlakeValue::Vector(value));
+            }
+        }
         // Charge a dict touch for dict-backed ObjKinds when novelty didn't satisfy.
         if o_kind == ObjKind::REF_ID.as_u8()
             || o_kind == ObjKind::LEX_ID.as_u8()
@@ -3534,6 +3685,23 @@ impl BinaryGraphView {
 
     pub fn store(&self) -> &BinaryIndexStore {
         &self.store
+    }
+
+    /// The vector at `handle` in `p_id`'s arena of this view's graph, shared
+    /// with every handle decoded through this view that holds an equal
+    /// vector: one allocation per distinct value, none for a handle that
+    /// repeats one. `None` for a handle the arena does not hold (such as a
+    /// novelty handle), which the store's decode reports.
+    pub fn shared_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<Arc<[f64]>>> {
+        let Some(arena) = self
+            .store
+            .graph_indexes
+            .get(&self.g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        self.vectors.get(p_id, arena, handle)
     }
 
     pub fn clone_store(&self) -> Arc<BinaryIndexStore> {

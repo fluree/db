@@ -422,17 +422,20 @@ pub(crate) fn driver_subject_boundaries(
 /// join key **across two different predicates** (#1652 case 3). True when any
 /// POST leaflet shows either hazard:
 ///
-/// - a `NUM_BIG_OVERFLOW` object: its `o_key` is a handle into a
-///   **per-predicate** arena (see [`OType::o_key_is_globally_identifying`]),
-///   so equal big decimals under two predicates carry unrelated handles and
-///   never compare equal;
+/// - an arena-backed object (`NUM_BIG_OVERFLOW`, `VECTOR`): its `o_key` is a
+///   handle into a **per-predicate** arena (see
+///   [`OType::o_key_is_globally_identifying`]), so equal values under two
+///   predicates carry unrelated handles and never compare equal, and equal
+///   handles under two predicates name unrelated values;
 /// - a list row (`HAS_O_I`): the generic pipeline's list-element bindings join
 ///   neither like plain values nor purely by value, so a key that drops `o_i`
 ///   diverges from it on multiplicity.
 ///
 /// Per-predicate consumers need neither check — their key fixes the `p_id`
-/// that scopes the arena handle, and within one predicate `o_i` only splits a
-/// group it fully contains.
+/// that scopes a NumBig handle, and within one predicate `o_i` only splits a
+/// group it fully contains. Vectors are the exception: their arena does not
+/// deduplicate, so those consumers decline a predicate that
+/// `BinaryIndexStore::holds_vectors`.
 ///
 /// Metadata-first: `HAS_O_I` is a leaflet flag, and a homogeneous leaflet's
 /// o_type is answered by `o_type_const` — no payload touched. A mixed leaflet

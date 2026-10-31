@@ -1161,7 +1161,8 @@ pub fn count_distinct_position_operator(
                 // and so is not an object identity for a NumBig arena handle.
                 // Those terms are counted exactly from the in-memory arenas
                 // (see `count_distinct_numbig_objects`); declining is reserved
-                // for an inconsistent index or the explicit kill switch.
+                // for a graph holding vectors, an inconsistent index or the
+                // explicit kill switch.
                 DistinctPosition::Objects => {
                     let Some(count) = count_distinct_objects(store, ctx.binary_g_id)? else {
                         return Ok(None);
@@ -1272,13 +1273,22 @@ fn numbig_exact_max_entries() -> Option<u64> {
 /// its distinct terms come from [`count_distinct_numbig_objects`], which reads
 /// the arenas rather than the rows.
 ///
-/// The per-predicate distinct-object count is unaffected and stays on its fast
-/// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
-/// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
+/// A graph that holds vectors declines: a vector's `o_key` is a handle into a
+/// per-predicate arena that does not deduplicate, so neither the lead nor the
+/// arena's size counts its distinct values
+/// ([`OType::o_key_is_predicate_identifying`]).
+///
+/// The per-predicate distinct-object count stays on its fast path for every
+/// other predicate: its 14-byte POST lead starts with `p_id`, which scopes a
+/// NumBig handle correctly. So is the distinct-subject count, whose SPOT lead
+/// is `s_id`.
 pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
 ) -> Result<Option<u64>> {
+    if store.graph_holds_vectors(g_id) {
+        return Ok(None);
+    }
     let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
     else {
         return Ok(None);
@@ -1824,11 +1834,18 @@ struct PredicateLeadPartial {
 /// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and POST
 /// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
 /// excluded), so the 14-byte `p+o` prefix defines a group.
+///
+/// `None` for a predicate that holds vectors: a vector's `o_key` is one
+/// fact's handle, not its value's ([`OType::o_key_is_predicate_identifying`]),
+/// so the lead groups count stored facts rather than distinct vectors.
 pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
 ) -> Result<Option<u64>> {
+    if store.holds_vectors(g_id, p_id) {
+        return Ok(None);
+    }
     count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)
 }
 

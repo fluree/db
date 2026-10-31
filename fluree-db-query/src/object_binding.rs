@@ -713,12 +713,13 @@ pub(crate) fn normalize_for_key_cow<'a>(
             None => Cow::Borrowed(binding),
         };
     }
-    // Arena-keyed NUM_BIG values normalize by DECODING: handles are scoped
-    // per (graph, predicate), so the encoded form is not a canonical key for
-    // one value across predicates or against decoded rows (VALUES, BIND,
-    // novelty raw-merge). The decoded BigDecimal/BigInt compares and hashes
-    // by numeric value.
-    if is_numbig_encoded(binding) {
+    // Arena-keyed literals (NUM_BIG, VECTOR_ID) normalize by DECODING:
+    // handles are scoped per (graph, predicate), so the encoded form is not a
+    // canonical key for one value across predicates or against decoded rows
+    // (VALUES, BIND, novelty raw-merge). The vector arena does not
+    // deduplicate either, so one vector stored twice under one predicate has
+    // two handles. The decoded value compares and hashes by value.
+    if is_arena_encoded(binding) {
         if let Some(gv) = gv {
             let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
             if !matches!(materialized, Binding::EncodedLit { .. }) {
@@ -739,7 +740,8 @@ pub(crate) fn normalize_for_key_cow<'a>(
 /// structurally and answers `false` across them.
 ///
 /// Equal bindings answer at once, and two bindings of one form other than
-/// NUM_BIG literals (whose encoded key is scoped per predicate) are two terms;
+/// arena-backed literals (whose encoded key is a per-predicate handle, and for
+/// vectors not deduplicated) are two terms;
 /// only a pair of different forms pays for canonicalization, through the same
 /// [`normalize_for_key_cow`] the keyed equality surfaces use. `norm` is the
 /// caller's, built once ([`equality_norm`]).
@@ -830,14 +832,14 @@ pub(crate) fn same_term_in(
 }
 
 /// The answer [`same_term`] gives without canonicalizing: `true` for equal
-/// bindings, `false` for two of one form (other than NUM_BIG), `None` for a
-/// pair of forms that must be canonicalized to compare.
+/// bindings, `false` for two of one form (other than arena-backed literals),
+/// `None` for a pair of forms that must be canonicalized to compare.
 #[inline]
 fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
     if a == b {
         return Some(true);
     }
-    if std::mem::discriminant(a) == std::mem::discriminant(b) && !is_numbig_encoded(a) {
+    if std::mem::discriminant(a) == std::mem::discriminant(b) && !is_arena_encoded(a) {
         return Some(false);
     }
     None
@@ -845,23 +847,15 @@ fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
 
 /// True if this is an encoded literal whose key is a handle into a per-graph,
 /// per-predicate arena (a big number or a vector): the handle names a value
-/// only within the graph that bound it.
+/// only within the graph and predicate that bound it, and is not the value's
+/// only handle there (the vector arena does not deduplicate), so equality
+/// surfaces key it by decoded value.
 #[inline]
 pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
     matches!(
         binding,
         Binding::EncodedLit { o_kind, .. }
-            if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
-                || *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8()
-    )
-}
-
-/// True if this is an arena-backed (NUM_BIG) encoded literal.
-pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
-    matches!(
-        binding,
-        Binding::EncodedLit { o_kind, .. }
-            if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
+            if fluree_db_core::ObjKind::from_u8(*o_kind).is_arena_handle()
     )
 }
 
