@@ -8,6 +8,8 @@ pub use fluree_vocab::fluree;
 pub use fluree_vocab::rdf;
 pub use fluree_vocab::xsd;
 
+use fluree_db_core::FlakeValue;
+
 /// JSON-LD internal types
 pub mod jsonld {
     /// @json - JSON literal
@@ -46,6 +48,20 @@ pub fn is_inferable_datatype(dt_iri: &str) -> bool {
             | "xsd:decimal"
             | "f:embeddingVector"
     )
+}
+
+/// Whether a JSON-LD-flavored output may print `val` bare, without its
+/// `@type`.
+///
+/// [`is_inferable_datatype`] says the datatype can be recovered from the JSON
+/// kind the value prints as, and that holds only when the value really prints
+/// as that kind. A string-backed value prints as a JSON string, which reads
+/// back as `xsd:string`; under any other datatype it is an ill-typed literal
+/// a write stored before writes refused them (`"landed"^^xsd:integer`), and it
+/// keeps its `@type` so it is not read back as a plain string.
+pub fn may_print_bare(dt_iri: &str, val: &FlakeValue) -> bool {
+    is_inferable_datatype(dt_iri)
+        && (!matches!(val, FlakeValue::String(_)) || matches!(dt_iri, xsd::STRING | "xsd:string"))
 }
 
 /// Whether a literal may be serialized without its `datatype`.
