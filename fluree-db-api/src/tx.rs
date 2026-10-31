@@ -1102,29 +1102,81 @@ pub(crate) fn resolve_shapes_source_g_ids(
     let Some(source) = source else {
         return Ok(vec![0]);
     };
+    Ok(vec![resolve_shacl_graph_source(
+        source,
+        snapshot,
+        "f:shapesSource",
+    )?])
+}
 
+/// Graphs consulted for `sh:class` value membership besides the focus node's
+/// own graph: the shapes-source graph(s) plus each `f:classMembershipSource`,
+/// de-duplicated. Lets a value-set or catalog live in its own named graph.
+pub(crate) fn resolve_class_membership_g_ids(
+    config: Option<&LedgerConfig>,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    shapes_g_ids: &[GraphId],
+) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
+    let mut g_ids = shapes_g_ids.to_vec();
+    let sources = config
+        .and_then(|c| c.shacl.as_ref())
+        .map(|s| s.class_membership_sources.as_slice())
+        .unwrap_or_default();
+    for source in sources {
+        let g_id = resolve_shacl_graph_source(source, snapshot, "f:classMembershipSource")?;
+        if !g_ids.contains(&g_id) {
+            g_ids.push(g_id);
+        }
+    }
+    Ok(g_ids)
+}
+
+/// With a cross-ledger `f:shapesSource`, `sh:class` membership is resolved
+/// against the model ledger, so this ledger's `f:classMembershipSource` graphs
+/// would be silently ignored — reject the combination instead.
+pub(crate) fn reject_class_membership_with_cross_ledger_shapes(
+    config: Option<&LedgerConfig>,
+) -> std::result::Result<(), fluree_db_transact::TransactError> {
+    let listed = config
+        .and_then(|c| c.shacl.as_ref())
+        .is_some_and(|s| !s.class_membership_sources.is_empty());
+    if listed {
+        return Err(fluree_db_transact::TransactError::Parse(
+            "f:classMembershipSource with a cross-ledger f:shapesSource is not yet supported"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve one same-ledger SHACL `GraphSourceRef`; `setting` names it in errors.
+fn resolve_shacl_graph_source(
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    setting: &str,
+) -> std::result::Result<GraphId, fluree_db_transact::TransactError> {
     // Temporal / trust / rollback / cross-ledger dimensions of GraphSourceRef
     // aren't yet supported for SHACL — reject early rather than silently
     // ignoring them. Matches the policy resolver's shape.
     if source.ledger.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with cross-ledger f:ledger reference is not yet supported".into(),
-        ));
+        return Err(fluree_db_transact::TransactError::Parse(format!(
+            "{setting} with cross-ledger f:ledger reference is not yet supported"
+        )));
     }
     if source.at_t.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:atT (temporal pinning) is not yet supported".into(),
-        ));
+        return Err(fluree_db_transact::TransactError::Parse(format!(
+            "{setting} with f:atT (temporal pinning) is not yet supported"
+        )));
     }
     if source.trust_policy.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:trustPolicy is not yet supported".into(),
-        ));
+        return Err(fluree_db_transact::TransactError::Parse(format!(
+            "{setting} with f:trustPolicy is not yet supported"
+        )));
     }
     if source.rollback_guard.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:rollbackGuard is not yet supported".into(),
-        ));
+        return Err(fluree_db_transact::TransactError::Parse(format!(
+            "{setting} with f:rollbackGuard is not yet supported"
+        )));
     }
 
     let g_id = match source.graph_selector.as_deref() {
@@ -1133,13 +1185,12 @@ pub(crate) fn resolve_shapes_source_g_ids(
         None => Some(0u16),
     };
 
-    match g_id {
-        Some(id) => Ok(vec![id]),
-        None => Err(fluree_db_transact::TransactError::Parse(format!(
-            "f:shapesSource graph '{}' not found in this ledger's graph registry",
+    g_id.ok_or_else(|| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "{setting} graph '{}' not found in this ledger's graph registry",
             source.graph_selector.as_deref().unwrap_or("<none>"),
-        ))),
-    }
+        ))
+    })
 }
 
 /// Apply SHACL policy to an already-staged [`StagedLedger`].
@@ -1325,6 +1376,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                     // data D doesn't have. The wire is the authoritative shape
                     // source; the same-ledger `f:shapesSource` resolution is
                     // skipped.
+                    reject_class_membership_with_cross_ledger_shapes(config)?;
                     membership_g_ids = vec![0];
                     // Reuse is only sound when this transaction introduced no
                     // namespaces: the wire compiles against the staged registry,
@@ -1368,7 +1420,8 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                     // Same-ledger path. Resolve `f:shapesSource` into concrete
                     // graph IDs; default to `[0]` when unset.
                     let shapes_g_ids = resolve_shapes_source_g_ids(config, &base.snapshot)?;
-                    membership_g_ids = shapes_g_ids.clone();
+                    membership_g_ids =
+                        resolve_class_membership_g_ids(config, &base.snapshot, &shapes_g_ids)?;
                     cache_source = Some(CachedShapeSource::Local(shapes_g_ids.clone()));
                     shapes_g_ids
                         .iter()

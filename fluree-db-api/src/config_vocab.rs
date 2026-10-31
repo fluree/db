@@ -39,6 +39,7 @@ pub(crate) const CONFIG_EDGES: &[&str] = &[
     config_iris::GRAPH_OVERRIDES,
     config_iris::OVERRIDE_CONTROL,
     config_iris::SHAPES_SOURCE,
+    config_iris::CLASS_MEMBERSHIP_SOURCE,
     config_iris::POLICY_SOURCE,
     config_iris::SCHEMA_SOURCE,
     config_iris::RULES_SOURCE,
@@ -347,6 +348,7 @@ mod tests {
               <urn:c:trust> f:trustMode f:Trusted .
               <urn:c:rg> f:minT 1 .
               <urn:c:shacl> f:shaclEnabled true ; f:shapesSource <urn:c:ref> ;
+                f:classMembershipSource <urn:c:ref> ;
                 f:validationMode f:ValidationWarn ; f:overrideControl f:OverrideAll .
               <urn:c:reasoning> f:reasoningModes <urn:c:modes> ; f:schemaSource <urn:c:ref> ;
                 f:followOwlImports true ; f:reasoningMaxFacts 10 ; f:reasoningMaxSeconds 5 ;

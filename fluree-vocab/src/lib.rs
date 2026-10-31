@@ -2286,6 +2286,10 @@ pub mod config_iris {
     /// `f:shapesSource` — GraphRef pointing to SHACL shapes graph
     pub const SHAPES_SOURCE: &str = "https://ns.flur.ee/db#shapesSource";
 
+    /// `f:classMembershipSource` — GraphRef (repeatable) to an extra graph
+    /// consulted for `sh:class` value membership
+    pub const CLASS_MEMBERSHIP_SOURCE: &str = "https://ns.flur.ee/db#classMembershipSource";
+
     /// `f:validationMode` — IRI: f:ValidationReject or f:ValidationWarn
     pub const VALIDATION_MODE: &str = "https://ns.flur.ee/db#validationMode";
 

@@ -638,9 +638,23 @@ With `f:shapesSource` pointing at `<http://example.org/shapes>`, a record writte
 
 Semantics and limits:
 
-- **Membership graph = focus data graph ∪ the `f:shapesSource` graph.** A value is an instance of the class if it is typed so in either the record's own graph or the vocabulary graph. When shapes live in the default graph, this is just an ordinary local lookup.
+- **Membership graph = focus data graph ∪ the `f:shapesSource` graph ∪ any `f:classMembershipSource` graphs.** A value is an instance of the class if it is typed so in the record's own graph, the vocabulary graph, or a listed membership graph. When shapes live in the default graph, this is just an ordinary local lookup.
 - **Per-transaction caching.** Repeated references to the same value within one transaction are memoized — bulk-inserting many records that share a state pays the membership lookup once.
 - **Cross-ledger too.** When `f:shapesSource` is cross-ledger (`f:ledger`), the controlled vocabulary lives in the model ledger alongside the shapes, and membership is resolved by querying that model ledger live (pinned at its latest committed state at transaction time). So a shared governance model can hold shapes *and* the value-sets they reference, and many data ledgers can point at it.
+
+### Value-sets in their own graph
+
+When the referenced instances live in their own named graph — a product catalog, say, kept apart from both the shapes and the records that reference it — list that graph with `f:classMembershipSource` on `f:shaclDefaults`. It is repeatable, and each value is an `f:GraphRef` like `f:shapesSource`:
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:config:shacl> f:shaclEnabled true ;
+    f:shapesSource [ a f:GraphRef ; f:graphSource [ f:graphSelector <http://example.org/shapes> ] ] ;
+    f:classMembershipSource [ a f:GraphRef ; f:graphSource [ f:graphSelector <http://example.org/catalog> ] ] .
+}
+```
+
+Shapes are still read only from `f:shapesSource`; a membership graph only contributes `rdf:type` triples for `sh:class`. A graph that doesn't exist fails validation with an error rather than being skipped. `f:classMembershipSource` names graphs of the same ledger, so it can't be combined with a cross-ledger `f:shapesSource`, and like `f:shapesSource` it doesn't yet support `f:ledger`, `f:atT`, `f:trustPolicy` or `f:rollbackGuard`.
 
 ## Inline shapes per transaction
 

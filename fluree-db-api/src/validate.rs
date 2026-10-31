@@ -475,6 +475,7 @@ async fn validate_view_inner(
                 cross_overlay.as_ref().expect("just set above"),
                 to_t,
             ));
+            crate::tx::reject_class_membership_with_cross_ledger_shapes(config.as_ref())?;
             membership.push(0);
             // `sh:class` value-sets living alongside M's shapes: probe M's
             // shapes graph after a local membership miss, translating D-term
@@ -485,7 +486,11 @@ async fn validate_view_inner(
             for g_id in &shapes_g_ids {
                 shape_dbs.push(GraphDbRef::new(snapshot, *g_id, novelty, to_t));
             }
-            membership.extend(shapes_g_ids);
+            membership.extend(crate::tx::resolve_class_membership_g_ids(
+                config.as_ref(),
+                snapshot,
+                &shapes_g_ids,
+            )?);
         }
     }
 

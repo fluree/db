@@ -101,10 +101,11 @@ Controls SHACL shape validation at transaction time.
 |-------|------|---------|-------------|
 | `f:shaclEnabled` | boolean | `false` | Enable or disable SHACL validation |
 | `f:shapesSource` | `f:GraphRef` | (none) | Graph containing SHACL shapes |
+| `f:classMembershipSource` | `f:GraphRef` (repeatable) | (none) | Extra graph whose `rdf:type` triples count for `sh:class`; see [Value-sets in their own graph](../guides/cookbook-shacl.md#value-sets-in-their-own-graph) |
 | `f:validationMode` | IRI | `f:ValidationReject` | `f:ValidationReject` (reject invalid data) or `f:ValidationWarn` (log warning, allow) |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
-`f:shapesSource` is non-overridable. `f:shaclEnabled` and `f:validationMode` are overridable per graph.
+`f:shapesSource` and `f:classMembershipSource` are non-overridable. `f:shaclEnabled` and `f:validationMode` are overridable per graph.
 
 Shapes alone never enable SHACL: a graph is validated only when its effective SHACL group (the ledger-wide group merged with the graph's override) sets `f:shaclEnabled true`.
 
