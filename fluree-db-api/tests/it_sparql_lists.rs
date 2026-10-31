@@ -640,7 +640,7 @@ async fn solution_modifiers_read_lists_as_rdf() {
 }
 
 // ---------------------------------------------------------------------------
-// A post-state policy condition reads a list stored as its triples.
+// Policy on a list stored as its triples.
 // ---------------------------------------------------------------------------
 
 async fn update_as(
@@ -698,6 +698,67 @@ async fn allowing_all_but(
     )
     .await
     .expect("policy")
+}
+
+/// A second list on one subject and property is stored as its triples, and a
+/// change to its cells, wherever along the list, is judged as a change to the
+/// owner's property.
+#[tokio::test]
+async fn a_change_to_a_stored_cell_is_judged_as_its_owners() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "owner-deny",
+        "ex:s ex:items (1 2) . ex:t ex:tags (5 6) .",
+    )
+    .await;
+    let ledger = update(
+        &fluree,
+        ledger,
+        "INSERT DATA { ex:s ex:items (3 4) . ex:t ex:tags (7 8) }",
+    )
+    .await;
+    let policy = allowing_all_but(
+        &ledger,
+        json!({
+            "@id": "http://example.org/denyItems",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/items"}],
+            "f:action": "f:modify",
+            "f:allow": false
+        }),
+    )
+    .await;
+    for edit in [
+        "DELETE { ?h rdf:first 3 } INSERT { ?h rdf:first 99 } \
+         WHERE { ex:s ex:items ?h . ?h rdf:first 3 }",
+        "DELETE { ?c rdf:first 4 } WHERE { ex:s ex:items ?h . ?h rdf:first 3 ; rdf:rest ?c }",
+        "DELETE { ?h rdf:rest ?c } INSERT { ?h rdf:rest rdf:nil } \
+         WHERE { ex:s ex:items ?h . ?h rdf:first 3 ; rdf:rest ?c }",
+    ] {
+        let r = update_as(&fluree, ledger.clone(), edit, policy.clone()).await;
+        assert_refused(&r, edit);
+    }
+    let allowed = update_as(
+        &fluree,
+        ledger,
+        "DELETE { ?h rdf:first 7 } INSERT { ?h rdf:first 99 } \
+         WHERE { ex:t ex:tags ?h . ?h rdf:first 7 }",
+        policy,
+    )
+    .await
+    .expect("a list on another property may be edited")
+    .ledger;
+    let firsts = support::query_sparql(
+        &fluree,
+        &allowed,
+        &format!("{PREFIXES}SELECT ?x WHERE {{ ex:t ex:tags ?h . ?h rdf:first ?x }}"),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&allowed.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(firsts, json!([[99]]), "the edit reached the stored cell");
 }
 
 /// A post-state condition reads everything the write stores: a list whose
