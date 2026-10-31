@@ -226,6 +226,84 @@ impl Segment {
         }
     }
 
+    /// Merge segments into one, as [`Self::build`] of their flakes in this
+    /// order would: each of the four orders is a k-way merge of the parts'
+    /// own sorted orders rather than a fresh sort, so a tier merge costs
+    /// O(n log k) comparisons instead of O(n log n), four times over. A part
+    /// no one else holds gives up its flakes; a shared one is copied. The
+    /// parts must hold at most [`MAX_SEGMENT_FLAKES`] between them.
+    fn merge(parts: Vec<Arc<Segment>>) -> Self {
+        let mut bases: Vec<u32> = Vec::with_capacity(parts.len());
+        let mut total = 0usize;
+        for part in &parts {
+            bases.push(total as u32);
+            total += part.flakes.len();
+        }
+        debug_assert!(total <= MAX_SEGMENT_FLAKES);
+        let merge_order = |index: IndexType| -> Vec<u32> {
+            let mut out = Vec::with_capacity(total);
+            let mut next = vec![0usize; parts.len()];
+            let head = |i: usize, at: usize| {
+                parts[i].order(index).get(at).map(|&local| MergeHead {
+                    flake: &parts[i].flakes[local as usize],
+                    stream: i,
+                    seg_idx: i,
+                    index,
+                })
+            };
+            let mut heap: BinaryHeap<MergeHead<'_>> =
+                (0..parts.len()).filter_map(|i| head(i, 0)).collect();
+            while let Some(top) = heap.pop() {
+                let i = top.stream;
+                out.push(bases[i] + parts[i].order(index)[next[i]]);
+                next[i] += 1;
+                if let Some(h) = head(i, next[i]) {
+                    heap.push(h);
+                }
+            }
+            out
+        };
+        let ((spot, psot), (post, opst)) = rayon::join(
+            || {
+                rayon::join(
+                    || merge_order(IndexType::Spot),
+                    || merge_order(IndexType::Psot),
+                )
+            },
+            || {
+                rayon::join(
+                    || merge_order(IndexType::Post),
+                    || merge_order(IndexType::Opst),
+                )
+            },
+        );
+
+        let mut min_t = i64::MAX;
+        let mut max_t = i64::MIN;
+        let mut size = 0usize;
+        let mut flakes = Vec::with_capacity(total);
+        for part in parts {
+            min_t = min_t.min(part.min_t);
+            max_t = max_t.max(part.max_t);
+            size += part.size;
+            match Arc::try_unwrap(part) {
+                Ok(part) => flakes.extend(part.flakes),
+                Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
+            }
+        }
+        Segment {
+            seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            flakes,
+            spot,
+            psot,
+            post,
+            opst,
+            min_t,
+            max_t,
+            size,
+        }
+    }
+
     /// The flakes after `cutoff_t`, as a segment. Each of the four orders is
     /// filtered rather than re-sorted — dropping flakes leaves the survivors
     /// in order — so trimming a large segment at an index publish costs a
@@ -854,30 +932,38 @@ impl Novelty {
             // sum to class K+1 exactly.
             let taken = std::mem::take(segs);
             let mut keep: Vec<Arc<Segment>> = Vec::new();
-            let mut flakes: Vec<Flake> = Vec::new();
-            let mut merged = 0usize;
+            let mut parts: Vec<Arc<Segment>> = Vec::with_capacity(tier_width);
             for seg in taken {
-                if merged < tier_width && size_class(seg.flakes.len(), tier_width) == target_class {
-                    match Arc::try_unwrap(seg) {
-                        Ok(s) => flakes.extend(s.flakes),
-                        Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
-                    }
-                    merged += 1;
+                if parts.len() < tier_width
+                    && size_class(seg.flakes.len(), tier_width) == target_class
+                {
+                    parts.push(seg);
                 } else {
                     keep.push(seg);
                 }
             }
-            // Chunk the merged flakes at MAX_SEGMENT_FLAKES (matching
-            // set_graph_segments) so a tier merge whose sum
-            // exceeds the local-index width can't silently truncate FlakeIds in
-            // release. (A single class-(K+1) result above the cap becomes a few
-            // segments instead; the cascade handles them on later calls.)
-            while flakes.len() > MAX_SEGMENT_FLAKES {
-                let tail = flakes.split_off(MAX_SEGMENT_FLAKES);
+            if parts.iter().map(|part| part.flakes.len()).sum::<usize>() <= MAX_SEGMENT_FLAKES {
+                keep.push(Arc::new(Segment::merge(parts)));
+            } else {
+                let mut flakes: Vec<Flake> = Vec::new();
+                for part in parts {
+                    match Arc::try_unwrap(part) {
+                        Ok(s) => flakes.extend(s.flakes),
+                        Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
+                    }
+                }
+                // Chunk the merged flakes at MAX_SEGMENT_FLAKES (matching
+                // set_graph_segments) so a tier merge whose sum
+                // exceeds the local-index width can't silently truncate FlakeIds in
+                // release. (A single class-(K+1) result above the cap becomes a few
+                // segments instead; the cascade handles them on later calls.)
+                while flakes.len() > MAX_SEGMENT_FLAKES {
+                    let tail = flakes.split_off(MAX_SEGMENT_FLAKES);
+                    keep.push(Arc::new(Segment::build(flakes, true)));
+                    flakes = tail;
+                }
                 keep.push(Arc::new(Segment::build(flakes, true)));
-                flakes = tail;
             }
-            keep.push(Arc::new(Segment::build(flakes, true)));
             *segs = keep;
             merges += 1;
             // Move up so the lowest class is touched at most once per call.
@@ -1742,6 +1828,67 @@ mod tests {
             op,
             None,
         )
+    }
+
+    /// Merging sorted segments gives every order the flake sequence a fresh
+    /// sort of all their flakes gives, whether a part is moved or shared.
+    #[test]
+    fn segment_merge_matches_building_from_all_flakes() {
+        let flakes: Vec<Flake> = (0..4_000i64)
+            .map(|i| {
+                let k = (i * 7_919) % 4_001;
+                make_flake(
+                    (k % 13) as u16,
+                    (k % 7) as u16,
+                    k % 97,
+                    1 + i % 50,
+                    i % 5 != 0,
+                )
+            })
+            .collect();
+        let parts: Vec<Arc<Segment>> = flakes
+            .chunks(250)
+            .map(|chunk| Arc::new(Segment::build(chunk.to_vec(), false)))
+            .collect();
+        let held_by_a_reader = Arc::clone(&parts[3]);
+        let merged = Segment::merge(parts);
+        drop(held_by_a_reader);
+        let built = Segment::build(flakes, false);
+
+        assert_eq!(merged.flakes.len(), built.flakes.len());
+        assert_eq!(
+            (merged.min_t, merged.max_t, merged.size),
+            (built.min_t, built.max_t, built.size)
+        );
+        for index in [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ] {
+            let got: Vec<&Flake> = merged
+                .order(index)
+                .iter()
+                .map(|&i| &merged.flakes[i as usize])
+                .collect();
+            let want: Vec<&Flake> = built
+                .order(index)
+                .iter()
+                .map(|&i| &built.flakes[i as usize])
+                .collect();
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| index.compare(a, b) == Ordering::Equal),
+                "{index:?} order differs from a fresh sort"
+            );
+            let mut seen = merged.order(index).to_vec();
+            seen.sort_unstable();
+            assert!(
+                seen.iter().copied().eq(0..merged.flakes.len() as u32),
+                "{index:?} is a permutation"
+            );
+        }
     }
 
     fn make_flake_with_meta(
