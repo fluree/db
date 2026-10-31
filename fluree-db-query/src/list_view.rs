@@ -219,26 +219,6 @@ impl ListView {
         Sid::new(BLANK_NODE, format!("l{n}-{k}"))
     }
 
-    /// The list and position `sid` names, when it is a cell this request
-    /// named.
-    pub fn cell_of(&self, sid: &Sid) -> Option<(Owner, usize)> {
-        self.decode(sid)
-    }
-
-    /// The members of `owner`'s list as this request read them, in position
-    /// order: cell `k` holds member `k`.
-    pub fn members_of(&self, owner: &Owner) -> Option<Vec<Flake>> {
-        let reads = self
-            .reads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reads
-            .values()
-            .flat_map(|lists| lists.iter())
-            .find(|(o, _)| o == owner)
-            .map(|(_, members)| members.clone())
-    }
-
     /// The list and position `sid` names, when it is a cell of this request.
     fn decode(&self, sid: &Sid) -> Option<(Owner, usize)> {
         if sid.namespace_code != BLANK_NODE {

@@ -737,7 +737,7 @@ pub async fn stage_with_graph_delta(
         // A write can state a list as a chain of the blank nodes it mints,
         // which is stored as the list it spells (`crate::list_edits`).
         let mut list_edits = crate::list_edits::ListEdits::writes_chain(&txn.insert_templates)
-            .then(|| crate::list_edits::ListEdits::new(None, &txn_id));
+            .then(|| crate::list_edits::ListEdits::new(&txn_id));
         let pure_retract = pure_delete && list_edits.is_none();
 
         // Every graph the update writes, fixed or bound per solution, resolves
@@ -911,18 +911,11 @@ pub async fn stage_with_graph_delta(
         let mut lists = generator.take_lists();
         drop(generator);
 
-        // What storing edited lists again stages without changing them as
-        // RDF, which no modify policy judges (see `crate::list_edits`).
-        let mut unjudged: HashSet<(Option<Sid>, bool, Flake)> = HashSet::new();
         if let Some(edits) = list_edits.take() {
             let routing = &reverse_graph;
-            let stored = edits
-                .store(&ledger, |f| resolve_flake_graph_id(f, routing), new_t)
-                .await?;
-            acc.push_retractions(stored.retractions);
+            let stored = edits.store(&ledger, |f| resolve_flake_graph_id(f, routing), new_t)?;
             acc.push_assertions(stored.assertions);
             lists.extend(stored.lists);
-            unjudged.extend(stored.unjudged.into_iter().map(|f| (f.g.clone(), f.op, f)));
         }
 
         // Graph-sync wave: retract every current fact of the target graph
@@ -1146,18 +1139,10 @@ pub async fn stage_with_graph_delta(
                         all.extend(hidden);
                         std::borrow::Cow::Owned(all)
                     };
-                let judged = without_unjudged(&all, &unjudged);
                 let policy_span = tracing::debug_span!("policy_enforce");
                 async {
-                    enforce_modify_policies(
-                        &judged,
-                        &all,
-                        policy,
-                        &ledger,
-                        options.tracker,
-                        &reverse_graph,
-                    )
-                    .await
+                    enforce_modify_policies(&all, policy, &ledger, options.tracker, &reverse_graph)
+                        .await
                 }
                 .instrument(policy_span)
                 .await?;
@@ -2067,7 +2052,6 @@ async fn stage_graph_mgmt(
                 };
                 enforce_modify_policies(
                     &all,
-                    &all,
                     policy,
                     &ledger,
                     options.tracker,
@@ -2462,15 +2446,8 @@ pub async fn stage_flakes(
         if let Some(policy) = options.policy_ctx {
             if !policy.wrapper().is_root() {
                 tracing::debug!("enforcing modify policies on pre-built flakes");
-                enforce_modify_policies(
-                    &flakes,
-                    &flakes,
-                    policy,
-                    &ledger,
-                    options.tracker,
-                    &reverse_graph,
-                )
-                .await?;
+                enforce_modify_policies(&flakes, policy, &ledger, options.tracker, &reverse_graph)
+                    .await?;
             }
         }
 
@@ -2561,22 +2538,6 @@ async fn hidden_restatements(
     Ok(hidden)
 }
 
-/// `all` without the facts a write stages but leaves unchanged as RDF.
-fn without_unjudged<'a>(
-    all: &'a [Flake],
-    unjudged: &HashSet<(Option<Sid>, bool, Flake)>,
-) -> std::borrow::Cow<'a, [Flake]> {
-    if unjudged.is_empty() {
-        return std::borrow::Cow::Borrowed(all);
-    }
-    std::borrow::Cow::Owned(
-        all.iter()
-            .filter(|f| !unjudged.contains(&(f.g.clone(), f.op, (*f).clone())))
-            .cloned()
-            .collect(),
-    )
-}
-
 /// A list's cells hold its owner's members, so a change to a stored cell's
 /// `rdf:first` or `rdf:rest` among `flakes` is judged also as a change to
 /// the owner's edge to the list, `owner p head`, as the pre-state holds it:
@@ -2660,22 +2621,21 @@ async fn list_owner_checks(
     Ok(checks)
 }
 
-/// Judge `flakes` under `policy`, where `staged` is everything the write
-/// stages: the post-state a condition reads. A change to a stored list cell
-/// is judged also as a change to the list's owner ([`list_owner_checks`]).
+/// Judge `staged`, everything the write stages and the post-state a
+/// condition reads, under `policy`. A change to a stored list cell is judged
+/// also as a change to the list's owner ([`list_owner_checks`]).
 async fn enforce_modify_policies(
-    flakes: &[Flake],
     staged: &[Flake],
     policy: &PolicyContext,
     ledger: &LedgerState,
     tracker: Option<&Tracker>,
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> Result<()> {
-    let owner_checks = list_owner_checks(ledger, flakes, reverse_graph).await?;
+    let owner_checks = list_owner_checks(ledger, staged, reverse_graph).await?;
     let flakes: std::borrow::Cow<'_, [Flake]> = if owner_checks.is_empty() {
-        std::borrow::Cow::Borrowed(flakes)
+        std::borrow::Cow::Borrowed(staged)
     } else {
-        std::borrow::Cow::Owned(flakes.iter().cloned().chain(owner_checks).collect())
+        std::borrow::Cow::Owned(staged.iter().cloned().chain(owner_checks).collect())
     };
     let flakes: &[Flake] = &flakes;
     let needs_classes = policy.wrapper().has_class_policies();
@@ -3023,12 +2983,6 @@ async fn stream_where_into_accumulator(
         // This also assigns VarIds to any variables referenced in WHERE patterns.
         lower_where_patterns(&txn.where_patterns, &ledger.snapshot, &mut txn.vars)?
     };
-    if let Some(view) = list_edits.as_deref().and_then(|edits| edits.view()) {
-        query_patterns =
-            fluree_db_query::list_view::rewrite_patterns(query_patterns, view, &|iri: &str| {
-                ledger.snapshot.encode_iri(iri)
-            });
-    }
 
     // If VALUES clause present, prepend it as first pattern (seeds the join).
     //
@@ -3442,11 +3396,8 @@ async fn stream_where_into_accumulator(
         );
         let intents = {
             let _g = delete_span.enter();
-            let mut intents =
+            let intents =
                 generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?;
-            if let Some(edits) = list_edits.as_deref_mut() {
-                intents = edits.divert_intents(intents);
-            }
             route_var_graphs(
                 ledger,
                 generator.written_graphs(),

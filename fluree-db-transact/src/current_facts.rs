@@ -218,12 +218,9 @@ impl RetractIntent {
         Self { flake, witnessed }
     }
 
+    #[cfg(test)]
     pub(crate) fn flake(&self) -> &Flake {
         &self.flake
-    }
-
-    pub(crate) fn into_flake(self) -> Flake {
-        self.flake
     }
 }
 
