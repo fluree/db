@@ -999,6 +999,18 @@ async fn onclass_modify_denies_exclusive_property_on_non_instance() {
     );
 }
 
+/// A modify-policy refusal, not a failure for some other reason.
+fn assert_policy_refusal(refused: &fluree_db_api::TrackedErrorResponse) {
+    assert_eq!(refused.status, 403, "{}", refused.error);
+    assert!(
+        refused
+            .error
+            .contains("Policy enforcement prevents modification"),
+        "{}",
+        refused.error
+    );
+}
+
 /// A schema write is judged by modify policy like any other. View policy
 /// targets widen through the property and class hierarchy, so an identity
 /// that may write nothing could otherwise add `ex:ssn rdfs:subPropertyOf
@@ -1113,11 +1125,11 @@ async fn schema_writes_follow_modify_policy() {
             TrackedTransactionInput::new(TxnType::Update, &txn, TxnOpts::default(), &writer);
         let refused = fluree
             .transact_tracked_with_policy(ledger.clone(), input, CommitOpts::default(), &cfg)
-            .await;
-        assert!(
-            refused.is_err(),
-            "{edge}: an identity that may modify nothing wrote it"
-        );
+            .await
+            .expect_err(&format!(
+                "{edge}: an identity that may modify nothing wrote it"
+            ));
+        assert_policy_refusal(&refused);
 
         let widened = fluree.update(ledger.clone(), &txn).await.unwrap().ledger;
         assert_eq!(

@@ -4928,13 +4928,20 @@ INSERT DATA { <http://example.org/MyClass> a rdfs:Class }",
     .await
     .expect("build policy context");
 
-    let result = fluree
+    let err = fluree
         .stage_owned(ledger.clone())
         .txn(Txn::clear_default_graph())
         .policy(policy_ctx)
         .execute()
-        .await;
-    assert!(result.is_err(), "a view-only identity cleared the ontology");
+        .await
+        .map(|_| ())
+        .expect_err("a view-only identity cleared the ontology");
+    assert_eq!(err.status_code(), 403, "{err}");
+    assert!(
+        err.to_string()
+            .contains("Policy enforcement prevents modification"),
+        "{err}"
+    );
     assert_eq!(
         count_in_default(&fluree, &ledger).await,
         1,
