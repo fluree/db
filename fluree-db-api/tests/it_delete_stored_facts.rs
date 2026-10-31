@@ -1688,6 +1688,44 @@ async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// ADD of a list into a graph holding its own list on the same subject and
+/// property is refused with one answer whether or not that graph already
+/// holds the list beside it, as a chain: the chain is restated, not skipped
+/// unseen, so an identity that cannot view it learns nothing of it. One
+/// that can commits nothing.
+#[tokio::test]
+async fn adding_a_list_held_as_a_chain_restates_it() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for dest_holds in [false, true] {
+            let seed = format!(
+                "INSERT DATA {{ GRAPH <{G1}> {{ ex:alice ex:items (1 2) }} \
+                 GRAPH <{G2}> {{ ex:alice ex:items (3 4) }} }}"
+            );
+            let (_d, fluree, mut ledger) = seeded_with("chain-restate", &seed, indexed).await;
+            let add = format!("ADD <{G1}> TO <{G2}>");
+            if dest_holds {
+                ledger = sparql_update(&fluree, ledger, &add).await.ledger;
+            }
+            let t = ledger.t();
+            let policy = name_only(&ledger).await;
+            let r = sparql_update_as(&fluree, ledger.clone(), &add, policy).await;
+            failures.extend(not_refused(
+                r,
+                &format!("dest_holds={dest_holds}, indexed={indexed}"),
+            ));
+            if dest_holds {
+                let policy = view_all_modify_name(&ledger).await;
+                let r = sparql_update_as(&fluree, ledger, &add, policy)
+                    .await
+                    .expect("restating a viewable chain");
+                no_commit(&r, t, &format!("viewable, indexed={indexed}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// A destination fact the identity can view, restated by ADD or COPY,
 /// commits nothing without modify permission, as before; as root as well.
 #[tokio::test]

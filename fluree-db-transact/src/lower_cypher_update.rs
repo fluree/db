@@ -273,7 +273,6 @@ impl<'a> CypherLowering<'a> {
             txn_meta: Vec::new(),
             write_graphs: Default::default(),
             namespace_delta: std::collections::HashMap::new(),
-            rdf_list_view: false,
             graph_mgmt: None,
             sync_graph: None,
         }

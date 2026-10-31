@@ -544,6 +544,28 @@ pub async fn prepare_execution_with_config(
             build_operator_tree(&rewritten_query, stats_view, &planning)?
         };
 
+        // A CONSTRUCT writes the list entries its template restates
+        // (`crate::list_entries`), for a ledger that may hold list members
+        // and a template triple whose predicate may hold them.
+        let operator = match &rewritten_query.output {
+            crate::ir::QueryOutput::Construct(template)
+                if template.writes_list_entries()
+                    && !rewritten_query.rdf_list_view
+                    && !planning.is_history() =>
+            {
+                match crate::list_view::view_for(db.snapshot, db.overlay, binary_store)? {
+                    Some(view) => crate::list_entries::ListEntriesOperator::over(
+                        operator,
+                        template,
+                        view,
+                        &|iri| db.snapshot.encode_iri(iri),
+                    ),
+                    None => operator,
+                }
+            }
+            _ => operator,
+        };
+
         Ok(PreparedExecution {
             operator,
             derived_overlay: derived_outcome.overlay,

@@ -160,12 +160,14 @@ impl Fluree {
                         &primary.snapshot,
                         primary.default_context.as_ref(),
                         sparql,
+                        options.rdf_list_view(),
                     )?,
                     None => parse_sparql_to_ir(
                         sparql,
                         &primary.snapshot,
                         primary.default_context.as_ref(),
                         options.sparql_params(&input)?,
+                        options.rdf_list_view(),
                     )?,
                 }
             }
@@ -281,6 +283,7 @@ impl Fluree {
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 options.sparql_params(&input)?,
+                options.rdf_list_view(),
             )?,
         };
 
@@ -405,12 +408,14 @@ impl Fluree {
                         &primary.snapshot,
                         primary.default_context.as_ref(),
                         sparql,
+                        options.rdf_list_view(),
                     ),
                     None => parse_sparql_to_ir(
                         sparql,
                         &primary.snapshot,
                         primary.default_context.as_ref(),
                         params,
+                        options.rdf_list_view(),
                     ),
                 };
                 lowered
@@ -522,6 +527,7 @@ impl Fluree {
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 params,
+                options.rdf_list_view(),
             )
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
         };

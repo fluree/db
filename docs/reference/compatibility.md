@@ -132,6 +132,8 @@ Why: before this, a parsed value kept its offset and source lexical while it sat
 
 **Arithmetic over offset-carrying `xsd:date` / `xsd:time` operands (deviation from XPath):** follows from the paragraph above. XPath anchors each such operand in its own timezone; Fluree has already discarded it, so `"2026-01-01+05:00" - "2026-01-01Z"` is `PT0S` where XPath says `-PT5H`, and XPath's own `op:subtract-times` example `"17:00:00-06:00" - "08:00:00+09:00"` answers `PT9H` rather than `P1D`. `xsd:dateTime` arithmetic matches XPath exactly, since the instant is the value. Pinned across both storage lanes by `it_temporal_lane_stability`.
 
+**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it (W3C tests `list-2` to `list-4`). The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
+
 **Dataset clauses (§13.2):** A `FROM` / `FROM NAMED` clause defines the query's dataset exhaustively — the default graph is the union of the `FROM` clauses, and `GRAPH ?g` ranges over exactly the `FROM NAMED` graphs. `FROM NAMED` with no `FROM` therefore gives an **empty default graph**. **Changed in 4.1.4:** the HTTP endpoints now implement this; earlier releases substituted a ledger's default graph, and separately enumerated the ledger alias as an extra named graph, which duplicated every `GRAPH ?g` solution. The embedded Rust API was already conformant, so this removes a divergence between surfaces rather than introducing one. The change covers all four HTTP query surfaces — ledger-scoped and connection-scoped `/query`, plus both streaming routes — and the JSON-LD `fromNamed` form follows the identical semantics, so byte-equivalent SPARQL and JSON-LD queries return the same result. A query with no dataset clause keeps its existing behavior. Requests that name only named graphs while also carrying patterns outside `GRAPH { ... }` / `["graph", ...]` receive an `x-fdb-warning` response header. See [Datasets and named graphs](../concepts/datasets-and-named-graphs.md#http-endpoints-and-default-graph-behavior).
 
 **`x-fdb-warning` is a permanent advisory, not a migration aid.** It has no sunset and no opt-out. It describes a query *shape* whose §13.2 semantics are perennially surprising — naming only named graphs and then matching outside them — so it fires on every query surface wherever that shape appears, including the connection-scoped route where §13.2 was already in force before 4.1.4 and no behavior changed. It is named `warning` rather than `deprecation` deliberately: nothing it points at is going away. The response body and status are unaffected — the status is always the one the request earned on its own — so clients should treat the header as informational and must not key error handling on its presence.
@@ -164,6 +166,11 @@ Differences from the specification:
   `CREATE` of an existing graph is not an error
 - The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
   management operations
+- A list is written and deleted through its members: deleting a value deletes
+  every entry of a list that holds it, and a list's cells cannot be edited one
+  by one ([Writing lists](../query/sparql.md#writing-lists))
+- `ADD` of a list the destination already holds restates it, and so does
+  `ADD` of the same list again beside another list there
 
 See [SPARQL UPDATE](../query/sparql.md#sparql-update-restrictions). JSON-LD
 transactions remain available as an alternative write surface.
@@ -399,6 +406,10 @@ No stored format changes, and no migration is needed. Two kinds of earlier data 
 - **Edges written through a reverse-defined term** (a context term with `"@reverse"`). With `"childOf": {"@reverse": "ex:child"}`, the node `{"@id": "ex:kid", "childOf": {"@id": "ex:mom"}}` means `ex:mom ex:child ex:kid`. Earlier releases stored `ex:kid ex:child ex:mom`, as if the term were not reversed. The term is now read as JSON-LD defines it, so the same document no longer reaches an edge an earlier release stored: deleting with it does nothing. To repair a predicate that was written only through a reverse term, flip its edges once, for example `DELETE { ?s ex:child ?o } INSERT { ?o ex:child ?s } WHERE { ?s ex:child ?o }`. If it was also written in the forward direction, select only the edges the reverse term wrote.
 
 `@annotation` on a value of a reverse property (inside `@reverse`, or under a reverse-defined term) now annotates the edge in the direction it is stored.
+
+#### Deleting a value a list repeats deletes every entry holding it
+
+A delete naming a value, without a list position, used to delete the first entry of a list holding it, unless its WHERE clause handed each stored entry over (`DELETE { ex:s ex:items ?o } WHERE { ex:s ex:items ?o FILTER(?o = 1) }`), which deleted every one. It now deletes every entry of a list that holds the value, and the value where it is also stored beside the list, however it is written: SPARQL `DELETE DATA`, `DELETE WHERE`, a WHERE with `VALUES`, and a JSON-LD `delete`. A value that is no list entry is deleted as before. To remove one entry of a list that repeats a value, upsert the list.
 
 #### `fluree-track-policy` is now parsed by the server
 
