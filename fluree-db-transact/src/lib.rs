@@ -32,6 +32,7 @@
 //! ```
 
 pub mod address;
+mod cell_edits;
 pub mod commit;
 pub mod commit_flakes;
 pub mod current_facts;

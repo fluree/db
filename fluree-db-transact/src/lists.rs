@@ -58,6 +58,11 @@ impl PendingList {
         Self { members, cells }
     }
 
+    /// The members, in position order.
+    pub fn members(&self) -> &[Flake] {
+        &self.members
+    }
+
     fn owner(&self) -> Option<Owner> {
         let first = self.members.first()?;
         Some((first.g.clone(), first.s.clone(), first.p.clone()))

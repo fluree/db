@@ -989,7 +989,7 @@ mod tests {
                     ("10", false, None, false, false, None)
                 }
                 "reasoning-time" => ("2026-01-01T00:00:00Z", false, None, false, false, None),
-                "include-system-facts" | "union-default-graph" => {
+                "include-system-facts" | "union-default-graph" | "rdf-lists" => {
                     ("true", false, None, false, false, None)
                 }
                 "event-time" => ("2020-01-01T00:00:00Z", true, None, false, false, None),

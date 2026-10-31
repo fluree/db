@@ -551,7 +551,7 @@ pub async fn stage_with_graph_delta(
             retraction_count = tracing::field::Empty,
             assertion_count = tracing::field::Empty,
         );
-        let stream_stats = async {
+        let mut stream_stats = async {
             let stats = stream_where_into_accumulator(
                 &ledger,
                 &mut txn,
@@ -620,6 +620,22 @@ pub async fn stage_with_graph_delta(
             let stored = edits.store(&ledger, |f| resolve_flake_graph_id(f, routing), new_t)?;
             acc.push_assertions(stored.assertions);
             lists.extend(stored.lists);
+        }
+
+        // The cells the templates edit, against the lists the WHERE read
+        // (`crate::cell_edits`).
+        if let Some(cells) = stream_stats.cells.take() {
+            cells.check_lists(&lists)?;
+            let writes = cells.resolve(new_t)?;
+            if !writes.retractions.is_empty() {
+                acc.push_retractions(writes.retractions);
+            }
+            if !writes.assertions.is_empty() {
+                acc.push_assertions(writes.assertions);
+            }
+            if options.policy_ctx.is_some_and(|p| !p.wrapper().is_root()) {
+                stream_stats.unmatched_intents.extend(writes.unmatched);
+            }
         }
 
         // Graph-sync wave: retract every current fact of the target graph
@@ -2230,6 +2246,8 @@ struct WhereStreamStats {
     /// DELETE intents that named no stored fact, as instantiated. Collected
     /// only under a non-root policy, for the modify-policy check.
     unmatched_intents: Vec<Flake>,
+    /// The list cells the templates edit, when the WHERE reads lists as RDF.
+    cells: Option<crate::cell_edits::CellEdits>,
 }
 
 /// Stream the WHERE result into `acc`, projecting → materializing encoded
@@ -2596,6 +2614,22 @@ async fn stream_where_into_accumulator(
             }
         });
     }
+    // Under `rdf-lists` the WHERE reads every list as RDF, an owner edge to
+    // a chain of cells, and the templates' edits to those cells are held
+    // (`crate::cell_edits`).
+    let mut cells = None;
+    if txn.opts.rdf_lists == Some(true) {
+        if let Some(view) =
+            fluree_db_query::list_view::view_for(base_db.snapshot, base_db.overlay, None)?
+        {
+            query_patterns =
+                fluree_db_query::list_view::rewrite_patterns(query_patterns, &view, &|iri| {
+                    ledger.snapshot.encode_iri(iri)
+                });
+            cells = Some(crate::cell_edits::CellEdits::new(view));
+        }
+    }
+
     // Which DELETE templates a WHERE triple witnesses, and whether the
     // ledger can hold a list position at all: together they decide which
     // retractions need no read (see `DeleteResolver`).
@@ -2694,7 +2728,13 @@ async fn stream_where_into_accumulator(
                 fixed_graph_iris,
                 reverse_graph,
             )?;
-            intents
+            match cells.as_mut() {
+                Some(cells) => {
+                    let routing: &HashMap<Sid, GraphId> = reverse_graph;
+                    cells.take_deletes(intents, |f| resolve_flake_graph_id(f, routing))?
+                }
+                None => intents,
+            }
         };
         // Resolve BEFORE push (see the doc comment above).
         let routing: &HashMap<Sid, GraphId> = reverse_graph;
@@ -2721,15 +2761,19 @@ async fn stream_where_into_accumulator(
             let assertions = {
                 let _g = insert_span.enter();
                 let mut a = generator.generate_assertions(&txn.insert_templates, &batch)?;
-                if let Some(edits) = list_edits.as_deref_mut() {
-                    a = edits.divert_assertions(a);
-                }
                 route_var_graphs(
                     ledger,
                     generator.written_graphs(),
                     fixed_graph_iris,
                     reverse_graph,
                 )?;
+                if let Some(cells) = cells.as_mut() {
+                    let routing: &HashMap<Sid, GraphId> = reverse_graph;
+                    a = cells.take_inserts(a, |f| resolve_flake_graph_id(f, routing))?;
+                }
+                if let Some(edits) = list_edits.as_deref_mut() {
+                    a = edits.divert_assertions(a);
+                }
                 insert_span.record("assertion_count", a.len() as u64);
                 a
             };
@@ -2756,6 +2800,7 @@ async fn stream_where_into_accumulator(
         retraction_count,
         assertion_count,
         unmatched_intents,
+        cells,
     })
 }
 

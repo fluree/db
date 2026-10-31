@@ -311,6 +311,22 @@ Specifies which ledger(s) to query:
 }
 ```
 
+**Lists as RDF:** `opts.rdfLists: true` reads every list as the RDF list it denotes, an owner edge to a chain of `rdf:first`/`rdf:rest` cells, as `# PRAGMA rdf-lists: true` does in SPARQL (see [Reading lists as RDF](sparql.md#reading-lists-as-rdf)). A property's list is then its head cell, a blank node:
+
+```json
+{
+  "@context": { "ex": "http://example.org/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#" },
+  "opts": { "rdfLists": true },
+  "select": ["?first"],
+  "where": [
+    { "@id": "ex:s", "ex:items": "?head" },
+    { "@id": "?head", "rdf:first": "?first" }
+  ]
+}
+```
+
+A graph crawl (`{"?s": ["*"]}`) reads a subject's stored triples, which a cell has none of, so it is refused with a `400` under `rdfLists`; select variables instead. A value that is not a boolean is refused too.
+
 ### where
 
 The `where` clause contains query patterns:
@@ -1114,7 +1130,7 @@ Multiple alternative steps are supported: `"(ex:a|ex:b)/(ex:c|ex:d)"` expands to
 
 Each step may be a simple predicate (`ex:p`), an inverse simple predicate (`^ex:p`), an alternative of simple predicates (`(ex:a|ex:b)`), or a modifier applied to a simple predicate (`ex:p+`, `ex:p*`, `ex:p?`). Nested sequences are not allowed inside sequence steps.
 
-`"ex:items/rdf:rest*/rdf:first"` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would. A plain value of `ex:items` is not a member. No other path reaches into a list's `rdf:first`/`rdf:rest` cells.
+`"ex:items/rdf:rest*/rdf:first"` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would. A plain value of `ex:items` is not a member. No other path reaches into a list's `rdf:first`/`rdf:rest` cells, unless the query reads lists as RDF (`opts.rdfLists`).
 
 **Rules:**
 

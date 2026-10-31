@@ -83,6 +83,21 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
+    // A crawl reads a subject's stored triples, which a list's cells are not.
+    if ast.options.rdf_lists
+        && ast
+            .select
+            .columns()
+            .iter()
+            .any(|c| matches!(c, UnresolvedColumn::Hydration(_)))
+    {
+        return Err(ParseError::InvalidOption(
+            "opts.rdfLists reads lists as RDF cells, which a graph crawl cannot expand; \
+             select variables instead"
+                .to_string(),
+        ));
+    }
+
     // Lower the projection (columns + shape). For `Expr` columns this only
     // registers the alias VarId; the expression itself is desugared below.
     let projection = lower_projection(&ast.select, encoder, vars)?;
@@ -167,7 +182,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         union_default_graph: ast.options.union_default_graph,
         cypher_vocab: None,
         unmatched_optional: Default::default(),
-        rdf_list_view: false,
+        rdf_list_view: ast.options.rdf_lists,
     })
 }
 

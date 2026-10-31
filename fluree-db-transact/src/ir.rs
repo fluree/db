@@ -903,6 +903,14 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
 
+    /// Read and edit lists as the RDF lists they denote: the WHERE matches a
+    /// compact list as an owner edge to a chain of `rdf:first`/`rdf:rest`
+    /// cells, and the templates edit those cells (`crate::cell_edits`). Set
+    /// by `# PRAGMA rdf-lists: true`, or read from the transaction JSON's
+    /// `opts.rdfLists` when `None` here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rdf_lists: Option<bool>,
+
     /// Skolemization id override for blank-node minting in this transaction.
     ///
     /// When set, staging uses this id instead of a generated timestamp in the

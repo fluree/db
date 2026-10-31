@@ -21,6 +21,8 @@ mod it_enforce_unique_upsert_indexed;
 mod it_export_lists;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
+#[path = "it_list_cell_edits.rs"]
+mod it_list_cell_edits;
 #[path = "it_list_identity.rs"]
 mod it_list_identity;
 #[path = "it_overflow_iri_delete_index.rs"]

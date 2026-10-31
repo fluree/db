@@ -194,6 +194,18 @@ impl Retraction {
         self.0
     }
 
+    /// Retract at `t` a list member the WHERE read through its list view
+    /// (`fluree_db_query::list_view::ListView::read_members`), a stored fact,
+    /// in `graph` (`None` for the default graph; see `crate::cell_edits`).
+    pub(crate) fn of_list_member(member: &Flake, graph: Option<Sid>, t: i64) -> Self {
+        Retraction(Flake {
+            g: graph,
+            t,
+            op: false,
+            ..member.clone()
+        })
+    }
+
     /// Any flake, for unit tests of the retraction consumers.
     #[cfg(test)]
     pub(crate) fn for_test(flake: Flake) -> Self {
@@ -219,7 +231,6 @@ impl RetractIntent {
         Self { flake, witnessed }
     }
 
-    #[cfg(test)]
     pub(crate) fn flake(&self) -> &Flake {
         &self.flake
     }

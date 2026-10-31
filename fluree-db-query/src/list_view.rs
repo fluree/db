@@ -221,7 +221,7 @@ impl ListView {
     }
 
     /// The list and position `sid` names, when it is a cell of this request.
-    fn decode(&self, sid: &Sid) -> Option<(Owner, usize)> {
+    pub fn decode(&self, sid: &Sid) -> Option<(Owner, usize)> {
         if sid.namespace_code != BLANK_NODE {
             return None;
         }
@@ -232,6 +232,25 @@ impl ListView {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some((table.owners.get(n)?.clone(), k))
+    }
+
+    /// The members of each list of `owners` this request has read, in
+    /// position order: member `k` is the one cell `k` of the list names.
+    pub fn read_members(&self, owners: &HashSet<Owner>) -> HashMap<Owner, Vec<Flake>> {
+        let reads = self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = HashMap::with_capacity(owners.len());
+        for (owner, members) in reads.values().flat_map(|lists| lists.iter()) {
+            if owners.contains(owner) && !out.contains_key(owner) {
+                out.insert(owner.clone(), members.clone());
+                if out.len() == owners.len() {
+                    break;
+                }
+            }
+        }
+        out
     }
 }
 

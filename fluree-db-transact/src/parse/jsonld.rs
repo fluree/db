@@ -120,6 +120,25 @@ fn parse_rooted(
             .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
     }
 
+    // Lists read and edited as RDF (`opts.rdfLists`), same precedence; a value
+    // that is not a boolean is refused rather than read as `false`.
+    if opts.rdf_lists.is_none() {
+        opts.rdf_lists = match json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("rdfLists"))
+        {
+            None => None,
+            Some(Value::Bool(on)) => Some(*on),
+            Some(other) => {
+                return Err(TransactError::Parse(format!(
+                    "opts.rdfLists must be true or false, got {other}"
+                )))
+            }
+        };
+    }
+
     // The request's own constraints (`opts.shapes`, `opts.uniqueProperties`),
     // same precedence. Read here, where every surface parses a JSON
     // transaction (the server, the embedded API, the CLI), so none drops them

@@ -755,6 +755,8 @@ impl Fluree {
                 .named
                 .values()
                 .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+        reject_rdf_lists_across_ledgers(is_single_ledger_dataset, executable)
+            .map_err(ApiError::invalid_query)?;
 
         let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
@@ -942,6 +944,8 @@ impl Fluree {
                 .named
                 .values()
                 .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+        reject_rdf_lists_across_ledgers(is_single_ledger_dataset, executable)
+            .map_err(fluree_db_query::QueryError::InvalidQuery)?;
 
         let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
@@ -1077,6 +1081,23 @@ fn reject_reasoning_in_history_mode(
              (a from–to time range); remove the reasoning mode or query a \
              single point in time"
             .to_string());
+    }
+    Ok(())
+}
+
+/// Refuse a query that reads lists as RDF (`rdf-lists`) over a dataset
+/// spanning ledgers: their subjects are not comparable, so such a dataset
+/// reads a list's members as values.
+fn reject_rdf_lists_across_ledgers(
+    single_ledger: bool,
+    executable: &ExecutableQuery,
+) -> std::result::Result<(), String> {
+    if !single_ledger && executable.query.rdf_list_view {
+        return Err(
+            "rdf-lists reads lists as RDF over one ledger; this dataset spans \
+             several, and reads a list's members as values of its property"
+                .to_string(),
+        );
     }
     Ok(())
 }

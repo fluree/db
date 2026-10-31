@@ -85,6 +85,10 @@ pub struct Pragmas {
     /// `f:unionDefaultGraph` says (JSON-LD `opts.unionDefaultGraph`). Queries
     /// only.
     pub union_default_graph: Option<bool>,
+    /// `# PRAGMA rdf-lists: true` — read every list as the RDF list it
+    /// denotes, an owner edge to a chain of `rdf:first`/`rdf:rest` cells, and
+    /// in an update, edit those cells (JSON-LD `opts.rdfLists`).
+    pub rdf_lists: Option<bool>,
     /// `# PRAGMA meta: true | false | time, fuel, policy` — report tracking
     /// metadata (JSON-LD `opts.meta`).
     pub meta: Option<MetaPragma>,

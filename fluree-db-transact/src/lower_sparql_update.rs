@@ -764,6 +764,9 @@ fn with_pragma_txn_opts(ast: &SparqlAst, mut opts: TxnOpts) -> TxnOpts {
     if opts.unique_properties.is_none() {
         opts.unique_properties = ast.pragmas.unique_properties.clone();
     }
+    if opts.rdf_lists.is_none() {
+        opts.rdf_lists = ast.pragmas.rdf_lists;
+    }
     opts
 }
 

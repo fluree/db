@@ -133,7 +133,7 @@ Why: before this, a parsed value kept its offset and source lexical while it sat
 
 **Arithmetic over offset-carrying `xsd:date` / `xsd:time` operands (deviation from XPath):** follows from the paragraph above. XPath anchors each such operand in its own timezone; Fluree has already discarded it, so `"2026-01-01+05:00" - "2026-01-01Z"` is `PT0S` where XPath says `-PT5H`, and XPath's own `op:subtract-times` example `"17:00:00-06:00" - "08:00:00+09:00"` answers `PT9H` rather than `P1D`. `xsd:dateTime` arithmetic matches XPath exactly, since the instant is the value. Pinned across both storage lanes by `it_temporal_lane_stability`.
 
-**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it (W3C tests `list-2` to `list-4`). The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
+**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so a `( ?x ?y )` pattern finds nothing for it (W3C tests `list-2` to `list-4`). The one exception is `ex:items/rdf:rest*/rdf:first`, which reaches each member. A request that sets `# PRAGMA rdf-lists: true` (JSON-LD `opts.rdfLists`) reads every list as RDF, cells included. The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
 
 **Dataset clauses (§13.2):** A `FROM` / `FROM NAMED` clause defines the query's dataset exhaustively — the default graph is the union of the `FROM` clauses, and `GRAPH ?g` ranges over exactly the `FROM NAMED` graphs. `FROM NAMED` with no `FROM` therefore gives an **empty default graph**. **Changed in 4.1.4:** the HTTP endpoints now implement this; earlier releases substituted a ledger's default graph, and separately enumerated the ledger alias as an extra named graph, which duplicated every `GRAPH ?g` solution. The embedded Rust API was already conformant, so this removes a divergence between surfaces rather than introducing one. The change covers all four HTTP query surfaces — ledger-scoped and connection-scoped `/query`, plus both streaming routes — and the JSON-LD `fromNamed` form follows the identical semantics, so byte-equivalent SPARQL and JSON-LD queries return the same result. A query with no dataset clause keeps its existing behavior. Requests that name only named graphs while also carrying patterns outside `GRAPH { ... }` / `["graph", ...]` receive an `x-fdb-warning` response header. See [Datasets and named graphs](../concepts/datasets-and-named-graphs.md#http-endpoints-and-default-graph-behavior).
 
@@ -168,8 +168,10 @@ Differences from the specification:
 - The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
   management operations
 - A list is written and deleted through its members: deleting a value deletes
-  every entry of a list that holds it, and a list's cells cannot be edited one
-  by one ([Writing lists](../query/sparql.md#writing-lists))
+  every entry of a list that holds it ([Writing lists](../query/sparql.md#writing-lists)).
+  Under `# PRAGMA rdf-lists: true`, an update can replace a member through its
+  cell's `rdf:first`; other cell edits are refused
+  ([Editing a list through its cells](../query/sparql.md#editing-a-list-through-its-cells))
 - Inserting a list a subject and property already hold, the same members in
   the same order, restates it rather than adding a second list there
 - `ADD` of a list the destination already holds restates it, and so does

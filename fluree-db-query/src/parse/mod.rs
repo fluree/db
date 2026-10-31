@@ -350,6 +350,7 @@ fn parse_query_body(
         // just `includeSystemFacts`; extend here as more land.
         query.options.include_system_facts = options::parse_include_system_facts(obj);
         query.options.union_default_graph = options::parse_union_default_graph(obj)?;
+        query.options.rdf_lists = options::parse_rdf_lists(obj)?;
         return Ok((query, SelectMode::Ask));
     }
 

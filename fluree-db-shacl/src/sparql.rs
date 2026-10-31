@@ -679,6 +679,13 @@ async fn run_sparql_constraint(
         .parsed
         .as_ref()
         .map_err(|e| constraint_failure(e.clone()))?;
+    if ast.pragmas.rdf_lists == Some(true) {
+        return Err(constraint_failure(
+            "# PRAGMA rdf-lists does not apply to an sh:select query, which reads a list's \
+             members as values of its property"
+                .to_string(),
+        ));
+    }
 
     // Lower against the staged registry when one is provided, else the data
     // snapshot — a fresh `VarRegistry` per call keeps compiled shapes

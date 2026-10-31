@@ -5,7 +5,7 @@
 use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
 use crate::dataset::{DataSet, MemberKind};
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::ir::Query;
@@ -532,6 +532,13 @@ pub async fn prepare_execution_with_config(
             // that may hold list members: the whole query in it, or only its
             // `p/rdf:rest*/rdf:first` walks. History reads keep the stored rows.
             let whole_view = query.query.rdf_list_view;
+            if whole_view && planning.is_history() {
+                return Err(QueryError::UnsupportedFeature(
+                    "rdf-lists reads the lists of one point in time; a history query \
+                     (a from–to range) reads their stored members"
+                        .to_string(),
+                ));
+            }
             let walks = !whole_view && crate::list_view::query_has_list_walk(&query.query);
             let list_view = if (whole_view || walks) && !planning.is_history() {
                 crate::list_view::view_for(db.snapshot, db.overlay, binary_store)?
