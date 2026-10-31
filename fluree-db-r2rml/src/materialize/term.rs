@@ -575,6 +575,23 @@ pub fn column_is_orderable(batch: &ColumnBatch, column_name: &str) -> bool {
     )
 }
 
+/// A whole column as the lexical forms [`materialize_object_from_batch`] gives
+/// its cells: a `String` column of what an un-annotated `rr:column` renders
+/// (`10`, `-0`, `0.050000000`, `2024-01-01T00:00:00Z`, hex bytes), nulls kept.
+/// A string column comes back borrowed. For a lane that keys or compares an
+/// un-annotated column by its `xsd:string` value without materializing terms:
+/// the rendering is this module's own, so the lane cannot drift from it.
+pub fn lexical_column(col: &Column) -> std::borrow::Cow<'_, Column> {
+    match col {
+        Column::String(_) => std::borrow::Cow::Borrowed(col),
+        _ => std::borrow::Cow::Owned(Column::String(
+            (0..col.len())
+                .map(|row| column_to_string(col, row))
+                .collect(),
+        )),
+    }
+}
+
 /// Convert a Column value at a row index to a String
 fn column_to_string(col: &Column, row_idx: usize) -> Option<String> {
     match col {
@@ -1494,6 +1511,46 @@ mod tests {
                     fluree_graph_ir::parse_xsd_double(lexical).is_some(),
                     "{lexical} reads back as an xsd:double"
                 );
+            }
+        }
+    }
+
+    /// `lexical_column` gives every cell the lexical form the object
+    /// materializer gives it, for every physical type, nulls included.
+    #[test]
+    fn lexical_column_matches_the_object_materializer() {
+        let columns = [
+            Column::Boolean(vec![Some(true), None, Some(false)]),
+            Column::Int32(vec![Some(10), None, Some(-3)]),
+            Column::Int64(vec![Some(9_007_199_254_740_993), None, Some(9)]),
+            Column::Float32(vec![Some(-0.0), None, Some(0.1)]),
+            Column::Float64(vec![Some(f64::NAN), None, Some(1e21)]),
+            Column::String(vec![Some("b".into()), None, Some(String::new())]),
+            Column::Bytes(vec![Some(vec![0, 1]), None, Some(vec![])]),
+            Column::Date(vec![Some(-1), None, Some(19_731)]),
+            Column::Timestamp(vec![Some(-1), None, Some(1)]),
+            Column::TimestampTz(vec![Some(500_000), None, Some(0)]),
+            Column::Decimal {
+                values: vec![Some(50_000_000), None, Some(-500_000_000)],
+                precision: 38,
+                scale: 9,
+            },
+        ];
+        for col in columns {
+            let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                name: "c".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            }]));
+            let batch = ColumnBatch::new(schema, vec![col.clone()]).unwrap();
+            let Column::String(lexical) = lexical_column(&col).into_owned() else {
+                panic!("not a string column: {col:?}");
+            };
+            let om = ObjectMap::column("c");
+            for (row, lex) in lexical.iter().enumerate() {
+                let term = materialize_object_from_batch(&om, &batch, row).unwrap();
+                assert_eq!(term, lex.clone().map(RdfTerm::string), "{col:?} row {row}");
             }
         }
     }

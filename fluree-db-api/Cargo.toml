@@ -255,6 +255,15 @@ name = "it_sql_pushdown_lane"
 path = "tests/it_sql_pushdown_lane.rs"
 required-features = ["sql", "native"]
 
+# Un-annotated R2RML columns: every lane (fused aggregate, scan pushdowns, SQL
+# block and aggregate lanes) against the generic pipeline, over the local
+# Iceberg `cells` fixture and a fake Trino endpoint. Own binary: it flips the
+# process-wide fast-path switch and asserts the absence of routing stamps.
+[[test]]
+name = "it_r2rml_untyped_columns"
+path = "tests/it_r2rml_untyped_columns.rs"
+required-features = ["sql", "native"]
+
 [[test]]
 name = "grp_index"
 path = "tests/grp_index.rs"
