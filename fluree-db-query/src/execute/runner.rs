@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;
-use super::reasoning_prep::{compute_derived_facts, schema_hierarchy_with_overlay};
+use super::reasoning_prep::compute_derived_facts;
 use super::rewrite_glue::rewrite_query_patterns;
 
 /// Remove exact duplicate triple patterns inside conjunctive blocks.
@@ -335,8 +335,12 @@ pub async fn prepare_execution_with_config(
             }
 
             // Step 1: Compute schema hierarchy from overlay
-            let hierarchy =
-                schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t).await?;
+            let hierarchy = fluree_db_core::compute_schema_hierarchy_with_overlay(
+                db.snapshot,
+                effective_overlay,
+                db.t,
+            )
+            .await?;
 
             tracing::debug!(
                 rdfs = reasoning.rdfs,

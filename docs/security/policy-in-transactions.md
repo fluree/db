@@ -89,6 +89,44 @@ Enforcement is also independent of the **wire format**: the check runs on the st
 
 Class targeting on the write side is **exact**: an `f:onClass` modify policy governs *every* flake whose subject is an instance of the class — including properties the class has never carried before. (Read-side class targeting uses the committed class→property index; write-side targeting matches by the subject's classes directly, since a write may introduce class/property combinations no committed data predicts.)
 
+### Schema writes
+
+Schema triples — `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`, and `rdf:type` declaring a class or property — are checked against `f:modify` like any other flake. A policy on a class or property also covers its subclasses or subproperties, so the hierarchy is part of what policy protects. Every identity can still read the schema; view policy lets it through.
+
+An identity with `f:defaultAllow` needs nothing more. A restricted identity that maintains the ontology needs a grant for the schema triples it writes: the four schema properties, and `rdf:type` whose value is a class or property type.
+
+```json
+[
+  {
+    "@id": "ex:ontologyEdges",
+    "f:action": {"@id": "f:modify"},
+    "f:allow": true,
+    "f:onProperty": [
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#subClassOf"},
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"},
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#domain"},
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#range"}
+    ]
+  },
+  {
+    "@id": "ex:ontologyTerms",
+    "f:action": {"@id": "f:modify"},
+    "f:onProperty": [{"@id": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"}],
+    "f:query": {
+      "@type": "https://ns.flur.ee/db#sparql",
+      "@value": "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX owl: <http://www.w3.org/2002/07/owl#> ASK { FILTER($value IN (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty)) }"
+    }
+  }
+]
+```
+
+The holder can declare a class or property, new or existing, and write its hierarchy, domain and range. It cannot give a subject any other type, or write any other property. Two grants that look close don't do this:
+
+- `f:onProperty rdf:type` without the condition lets its holder retype any data subject.
+- An `f:onClass rdfs:Class` grant covers every property of a class subject, not only its schema triples, and as bare `f:modify` it never covers a class being declared, since bare class targeting reads the subject's classes before the transaction.
+
+A grant on `rdfs:subPropertyOf` or `rdfs:subClassOf` lets its holder put any property or class under any other, `ex:ssn rdfs:subPropertyOf ex:name` included, and so widen what a policy on the parent lets others read. Give it only to an identity trusted with what policies allow.
+
 ## Write verbs
 
 `f:action` accepts three write verbs — `f:create`, `f:update`, `f:delete` — that refine `f:modify` by the subject's **lifecycle** within the transaction:

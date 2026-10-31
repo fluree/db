@@ -317,8 +317,10 @@ posture, and cannot be varied to probe for the existence of any particular row.
 
 **What `denies_all_data` does not say.** It does not mean the result is empty.
 Schema flakes — `rdf:type` with a schema-class object, `rdfs:subClassOf`,
-`rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range` — bypass policy entirely, so
-a query over the ontology still returns rows under a total data denial. Read it
+`rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range` — bypass view policy, so a
+query over the ontology still returns rows under a total data denial. (Writing
+them does not bypass modify policy: see
+[Schema writes](policy-in-transactions.md#schema-writes).) Read it
 as "no *data* flake could have been returned", not "nothing was returned".
 
 **Reading an empty result.** With tracking on:
