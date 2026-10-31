@@ -3666,7 +3666,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-ontology"
-version = "4.2.4"
+version = "4.2.5"
 dependencies = [
  "fluree-graph-format",
  "fluree-graph-ir",
