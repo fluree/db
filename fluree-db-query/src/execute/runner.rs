@@ -545,7 +545,8 @@ pub async fn prepare_execution_with_config(
         };
 
         // A CONSTRUCT writes the list entries its template restates
-        // (`crate::list_entries`), for a ledger that may hold list members.
+        // (`crate::list_entries`), for a ledger that may hold list members
+        // and a template triple whose predicate may hold them.
         let operator = match &rewritten_query.output {
             crate::ir::QueryOutput::Construct(template)
                 if template.writes_list_entries()
@@ -553,9 +554,12 @@ pub async fn prepare_execution_with_config(
                     && !planning.is_history() =>
             {
                 match crate::list_view::view_for(db.snapshot, db.overlay, binary_store)? {
-                    Some(view) => Box::new(crate::list_entries::ListEntriesOperator::new(
-                        operator, template, view,
-                    )),
+                    Some(view) => crate::list_entries::ListEntriesOperator::over(
+                        operator,
+                        template,
+                        view,
+                        &|iri| db.snapshot.encode_iri(iri),
+                    ),
                     None => operator,
                 }
             }

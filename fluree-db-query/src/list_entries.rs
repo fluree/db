@@ -7,7 +7,10 @@
 //! [`ListEntriesOperator`], above the whole plan, binds for each solution the
 //! positions of the entries of the owner's list that hold the triple's
 //! object, and whether the owner also holds the object beside the list. A
-//! value names every entry holding it, as a delete naming it does.
+//! value names every entry holding it, as a delete naming it does. A triple
+//! on a predicate that holds no list costs a row nothing beyond a look at
+//! its predicate, and a template whose every such triple has one is not
+//! wrapped at all.
 //!
 //! A list is read from the query's default graph. An owner holding lists in
 //! more than one of its graphs, like every owner over a dataset spanning
@@ -55,24 +58,40 @@ struct Held {
 }
 
 impl ListEntriesOperator {
-    pub fn new(child: BoxedOperator, template: &ConstructTemplate, view: Arc<ListView>) -> Self {
+    /// `child` with the list entries of `template`'s marked triples bound,
+    /// or `child` itself when none of them can match a list: each has a
+    /// constant predicate holding none (`encode` names an IRI predicate).
+    pub fn over(
+        child: BoxedOperator,
+        template: &ConstructTemplate,
+        view: Arc<ListView>,
+        encode: &dyn Fn(&str) -> Option<Sid>,
+    ) -> BoxedOperator {
         let marked: Vec<_> = (0..template.patterns().len())
             .filter_map(|k| Some((template.patterns()[k].clone(), template.list_entries(k)?)))
+            .filter(|(t, _)| match &t.p {
+                Ref::Var(_) => true,
+                Ref::Sid(p) => view.may_hold_lists(p),
+                Ref::Iri(iri) => encode(iri).is_some_and(|p| view.may_hold_lists(&p)),
+            })
             .collect();
+        if marked.is_empty() {
+            return child;
+        }
         let mut schema = child.schema().to_vec();
         schema.extend(
             marked
                 .iter()
                 .flat_map(|(_, vars)| [vars.positions, vars.beside]),
         );
-        Self {
+        Box::new(Self {
             child,
             marked,
             view,
             schema: schema.into(),
             held: HashMap::new(),
             bound: HashSet::new(),
-        }
+        })
     }
 
     /// `batch` with the list entries of each marked template triple bound.
@@ -88,10 +107,18 @@ impl ListEntriesOperator {
             let t = self.marked[k].0.clone();
             let mut positions = Vec::with_capacity(len);
             let mut beside = Vec::with_capacity(len);
+            // A predicate bound to an index id is checked on the id alone.
+            let ids = t.p.as_var().and_then(|v| batch.column(v));
             for row in 0..len {
-                let found = match &graphs {
-                    Some(graphs) => self.entries(ctx, graphs, &batch, row, &t).await?,
-                    None => None,
+                let named = match ids.map(|ids| &ids[row]) {
+                    Some(Binding::EncodedPid { p_id }) if !self.view.may_hold_lists_id(*p_id) => {
+                        None
+                    }
+                    _ => self.named(ctx, &batch, row, &t),
+                };
+                let found = match (&graphs, named) {
+                    (Some(graphs), Some(named)) => self.entries(ctx, graphs, named).await?,
+                    _ => None,
                 };
                 match found {
                     Some((at, also)) => {
@@ -112,27 +139,34 @@ impl ListEntriesOperator {
         Ok(Batch::from_parts(Arc::clone(&self.schema), columns, len)?)
     }
 
-    /// The positions of the entries holding row `row`'s object of `t`, none
+    /// The owner and value row `row` names in `t`, when its predicate may
+    /// hold lists. Checked before any read, so a row on any other predicate
+    /// costs a look at its predicate.
+    fn named(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        batch: &Batch,
+        row: usize,
+        t: &TriplePattern,
+    ) -> Option<(Sid, Sid, Binding)> {
+        let p = node(ctx, batch, row, &t.p)?;
+        if !self.view.may_hold_lists(&p) {
+            return None;
+        }
+        let o = t.o.as_var().and_then(|v| batch.get(row, v))?;
+        let s = node(ctx, batch, row, &t.s)?;
+        Some((s, p, decoded(ctx, o)))
+    }
+
+    /// The positions of the entries of `s`'s list on `p` holding `o`, none
     /// when an earlier solution named them, and whether the owner holds it
     /// beside them; `None` when no entry does.
     async fn entries(
         &mut self,
         ctx: &ExecutionContext<'_>,
         graphs: &[PathGraph<'_>],
-        batch: &Batch,
-        row: usize,
-        t: &TriplePattern,
+        (s, p, o): (Sid, Sid, Binding),
     ) -> Result<Option<(Vec<Binding>, bool)>> {
-        let (Some(s), Some(p)) = (node(ctx, batch, row, &t.s), node(ctx, batch, row, &t.p)) else {
-            return Ok(None);
-        };
-        if !self.view.may_hold_lists(&p) {
-            return Ok(None);
-        }
-        let Some(o) = t.o.as_var().and_then(|v| batch.get(row, v)) else {
-            return Ok(None);
-        };
-        let o = decoded(ctx, o);
         let held = match self.held.get(&(s.clone(), p.clone())) {
             Some(held) => held.clone(),
             None => {

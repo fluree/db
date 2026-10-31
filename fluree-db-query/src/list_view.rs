@@ -51,6 +51,8 @@ pub struct ListView {
     /// Predicates whose values include list members; `None` when that is
     /// not known, and any may.
     predicates: Option<HashSet<Sid>>,
+    /// The index ids of `predicates`, sorted; `None` when they are not known.
+    predicate_ids: Option<Vec<u32>>,
     /// The lists this request has named a cell of: list `n` is `owners[n]`.
     lists: Mutex<ListTable>,
     /// The lists each read of this request found, so a walk along a list's
@@ -106,8 +108,20 @@ impl ListView {
         if predicates.as_ref().is_some_and(HashSet::is_empty) {
             return Ok(None);
         }
+        let predicate_ids = match (&predicates, store) {
+            (Some(predicates), Some(store)) => {
+                let mut ids: Vec<u32> = predicates
+                    .iter()
+                    .filter_map(|p| store.predicate_id_for_sid(p))
+                    .collect();
+                ids.sort_unstable();
+                Some(ids)
+            }
+            _ => None,
+        };
         Ok(Some(Arc::new(Self {
             predicates,
+            predicate_ids,
             lists: Mutex::new(ListTable::default()),
             reads: Mutex::new(HashMap::new()),
             subjects: Mutex::new(HashMap::new()),
@@ -171,6 +185,14 @@ impl ListView {
 
     pub(crate) fn may_hold_lists(&self, p: &Sid) -> bool {
         self.predicates.as_ref().is_none_or(|ps| ps.contains(p))
+    }
+
+    /// [`Self::may_hold_lists`] for the predicate with index id `p_id`,
+    /// without decoding it.
+    pub(crate) fn may_hold_lists_id(&self, p_id: u32) -> bool {
+        self.predicate_ids
+            .as_ref()
+            .is_none_or(|ids| ids.binary_search(&p_id).is_ok())
     }
 
     /// Whether a triple on predicate `p` can be a list triple: an owner edge
