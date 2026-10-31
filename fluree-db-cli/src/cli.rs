@@ -1413,6 +1413,12 @@ pub enum Commands {
         action: OntologyAction,
     },
 
+    /// Catalog tools for document extraction: records an extraction model links names to
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
+
     /// Developer memory — store and recall facts, decisions, constraints
     Memory {
         #[command(subcommand)]
@@ -2644,17 +2650,23 @@ pub enum DocsAction {
 pub enum OntologyAction {
     /// Write an ontology in the shape an extraction model reads well
     ///
-    /// Reads an RDF ontology (Turtle or JSON-LD) and writes it with what the
-    /// model reads made explicit: SKOS labels and definitions moved into
-    /// rdfs:label and rdfs:comment, a label made from the IRI where there is
-    /// none, OWL restrictions and other blank-node constructs dropped, and OWL
-    /// axioms and annotation property declarations (which a reader would read
-    /// as catalog records) dropped.
-    /// Domains, ranges and other axioms are kept. With --seed, a large
-    /// vocabulary is sliced to the classes the seeds reach first.
+    /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), or
+    /// SQL DDL (.sql). Tables become classes and columns properties, labelled
+    /// in words (`employer_id` reads "employer"); foreign keys become
+    /// relations; enumerated columns become a class with a catalog record per
+    /// value; primary keys are left out.
+    ///
+    /// From RDF (Turtle or JSON-LD): the ontology with what the model reads
+    /// made explicit: SKOS labels and definitions moved into rdfs:label and
+    /// rdfs:comment, identifier-style labels in words, OWL restrictions and
+    /// other blank-node constructs dropped, and OWL axioms and annotation
+    /// property declarations (which a reader would read as catalog records)
+    /// dropped. With --seed, a large vocabulary is
+    /// sliced to the classes the seeds reach first.
     ///
     /// Examples:
-    ///   fluree ontology from fibo-module.ttl > ontology.ttl
+    ///   fluree ontology from schema.sql > ontology.ttl
+    ///   fluree ontology from accounts.csv --base https://example.com/crm/ > ontology.ttl
     ///   fluree ontology from schemaorg.jsonld --seed schema:Person,schema:Organization > ontology.ttl
     #[command(verbatim_doc_comment)]
     From(OntologyFromArgs),
@@ -2716,9 +2728,99 @@ pub struct OntologyFromArgs {
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
+    /// Write enumerated columns' records here instead of with the ontology
+    #[arg(long, value_name = "FILE")]
+    pub catalog_out: Option<PathBuf>,
+
+    /// Namespace for the IRIs minted from tables (default:
+    /// https://example.com/<file name>/)
+    #[arg(long, value_name = "IRI")]
+    pub base: Option<String>,
+
+    /// A text column with at most this many distinct values, each repeated,
+    /// becomes a class with a record per value (0: never; CSV and workbooks)
+    #[arg(long, default_value_t = 12, value_name = "N")]
+    pub enum_max: usize,
+
     /// The input's format, when its extension doesn't say
     #[arg(long, value_enum)]
     pub input_format: Option<OntologyInputFormat>,
+}
+
+/// `fluree catalog` subcommands.
+#[derive(Subcommand)]
+pub enum CatalogAction {
+    /// Write a catalog of SKOS records from a CSV file or a workbook sheet
+    ///
+    /// Each row becomes a record of --class: skos:prefLabel from --label,
+    /// skos:altLabel from --alt columns (several in a cell split on ; or |;
+    /// email addresses go to skos:hiddenLabel), skos:hiddenLabel from --code
+    /// columns, and skos:definition from --definition or written from
+    /// --describe columns. Reports the catalog's size against what one
+    /// extraction window holds, since the whole catalog goes in every window.
+    ///
+    /// Examples:
+    ///   fluree catalog from accounts.csv --class Organization --label name --alt aliases > accounts.ttl
+    ///   fluree catalog from crm.xlsx --sheet Accounts --class organization --ontology ontology.ttl --label Name --code "Account No" > accounts.ttl
+    #[command(verbatim_doc_comment)]
+    From(CatalogFromArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CatalogFromArgs {
+    /// The rows: a CSV file (.csv, .tsv) or a workbook (.xlsx)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// The class every record is typed with: an IRI, or a name (resolved
+    /// against --ontology when given, else minted under --base)
+    #[arg(long, value_name = "CLASS")]
+    pub class: String,
+
+    /// The column holding each record's name
+    #[arg(long, value_name = "COLUMN")]
+    pub label: String,
+
+    /// Columns holding other names for it (repeatable)
+    #[arg(long, value_name = "COLUMN")]
+    pub alt: Vec<String>,
+
+    /// Columns holding codes a document may use for it, such as account
+    /// numbers or tickers (repeatable)
+    #[arg(long, value_name = "COLUMN")]
+    pub code: Vec<String>,
+
+    /// The column holding a short description
+    #[arg(long, value_name = "COLUMN", conflicts_with = "describe")]
+    pub definition: Option<String>,
+
+    /// Columns to write a description from, as "column: value; ..."
+    #[arg(long, value_delimiter = ',', value_name = "COLUMNS")]
+    pub describe: Vec<String>,
+
+    /// The column holding each record's id, for its IRI (default: the label)
+    #[arg(long, value_name = "COLUMN")]
+    pub id: Option<String>,
+
+    /// Namespace for record IRIs (default: https://example.com/<file name>/)
+    #[arg(long, value_name = "IRI")]
+    pub base: Option<String>,
+
+    /// An ontology to find --class in, by IRI, prefixed name or label
+    #[arg(long, value_name = "FILE")]
+    pub ontology: Option<PathBuf>,
+
+    /// The workbook sheet to read (default: the first)
+    #[arg(long, value_name = "NAME")]
+    pub sheet: Option<String>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t)]
+    pub format: OntologyOutputFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

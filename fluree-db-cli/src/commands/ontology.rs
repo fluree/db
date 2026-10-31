@@ -1,18 +1,26 @@
-//! `fluree ontology` — ontology tools for document extraction.
+//! `fluree ontology` and `fluree catalog` — ontology and catalog tools for
+//! document extraction.
 //!
-//! `check` reports what an HTTP reader will and won't read of an
-//! ontology (and catalog), applying the model's input policy locally;
-//! `from` writes an ontology in the shape the model reads well. Both read
-//! files only: no project, no ledger, nothing sent anywhere. The logic is in
-//! `fluree-db-ontology`; this module reads the files and prints.
+//! `ontology check` reports what an HTTP reader will and won't read of an
+//! ontology (and catalog), applying its input policy locally;
+//! `ontology from` writes an ontology in the shape the model reads well, from
+//! RDF or from tables (CSV, a workbook, SQL DDL); `catalog from` writes SKOS
+//! records from rows. All read files only: no project, no ledger, nothing
+//! sent anywhere. The logic is in `fluree-db-ontology`; this module reads the
+//! files and prints.
 
 use crate::cli::{
-    OntologyAction, OntologyCheckArgs, OntologyFromArgs, OntologyInputFormat, OntologyOutputFormat,
+    CatalogAction, CatalogFromArgs, OntologyAction, OntologyCheckArgs, OntologyFromArgs,
+    OntologyInputFormat, OntologyOutputFormat,
 };
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
+use fluree_db_ontology::catalog::{self, CatalogOptions};
 use fluree_db_ontology::check::thousands;
+use fluree_db_ontology::convert::{self, tabular, EmitOptions};
+use fluree_db_ontology::estimate::{MAX_TEXT_CHARS, TOKENS_PER_WINDOW};
 use fluree_db_ontology::read::Parsed;
+use fluree_db_ontology::read::Quad;
 use fluree_db_ontology::vocab::{WELL_KNOWN_PREFIXES, XT_INSTANCES};
 use fluree_db_ontology::write::{self, OutputFormat};
 use fluree_db_ontology::{check, CheckOptions, Finding, RdfFormat, Report};
@@ -289,22 +297,212 @@ fn print_finding(f: &Finding, names: &Names, mark: String) {
     }
 }
 
+/// What `ontology from` reads a file as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Rdf,
+    Csv,
+    Workbook,
+    Sql,
+}
+
+fn source(path: &Path, flag: Option<OntologyInputFormat>) -> Source {
+    if flag.is_some() {
+        return Source::Rdf;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("csv" | "tsv") => Source::Csv,
+        Some("xlsx" | "xlsm") => Source::Workbook,
+        Some("sql" | "ddl") => Source::Sql,
+        _ => Source::Rdf,
+    }
+}
+
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ontology")
+        .to_string()
+}
+
+/// `https://example.com/<file name>/`, for IRIs minted without `--base`.
+fn default_base(path: &Path) -> String {
+    format!("https://example.com/{}/", convert::slug(&file_stem(path)))
+}
+
+/// A prefix for the minted namespace: the file name's letters, else `ex`.
+fn base_prefix(path: &Path) -> String {
+    let letters: String = file_stem(path)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if letters.starts_with(|c: char| c.is_ascii_alphabetic()) && letters.len() <= 12 {
+        letters
+    } else {
+        "ex".to_string()
+    }
+}
+
+fn output_format(format: OntologyOutputFormat) -> OutputFormat {
+    match format {
+        OntologyOutputFormat::Turtle => OutputFormat::Turtle,
+        OntologyOutputFormat::Jsonld => OutputFormat::JsonLd,
+    }
+}
+
+/// Serialize and write to `path`, or to stdout.
+fn emit(
+    quads: &[Quad],
+    prefixes: &BTreeMap<String, String>,
+    format: OutputFormat,
+    path: Option<&Path>,
+) -> CliResult<()> {
+    let text = write::serialize(quads, prefixes, format)
+        .map_err(|e| CliError::Input(format!("failed to write RDF: {e}")))?;
+    match path {
+        Some(path) => std::fs::write(path, &text)
+            .map_err(|e| CliError::Input(format!("failed to write {}: {e}", path.display()))),
+        None => {
+            print!("{text}");
+            Ok(())
+        }
+    }
+}
+
+fn read_bytes(path: &Path) -> CliResult<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))
+}
+
+fn read_sheets(path: &Path) -> CliResult<Vec<tabular::Sheet>> {
+    let failed = |e: tabular::TabularError| CliError::Input(format!("{}: {e}", path.display()));
+    match source(path, None) {
+        Source::Workbook => tabular::read_xlsx(&read_bytes(path)?).map_err(failed),
+        _ => Ok(vec![
+            tabular::read_csv(&read_text(path)?, &file_stem(path)).map_err(failed)?
+        ]),
+    }
+}
+
+fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
+    if !args.seed.is_empty() {
+        return Err(CliError::Usage(
+            "--seed slices an RDF vocabulary; it doesn't apply to tables".into(),
+        ));
+    }
+    let base = args
+        .base
+        .clone()
+        .unwrap_or_else(|| default_base(&args.file));
+    let mut notes = Vec::new();
+    let model = match kind {
+        Source::Sql => {
+            let (model, skipped) = convert::sql::read(&read_text(&args.file)?)
+                .map_err(|e| CliError::Input(format!("{}: {e}", args.file.display())))?;
+            if skipped > 0 {
+                notes.push(format!(
+                    "{skipped} statement(s) no SQL dialect could parse were skipped"
+                ));
+            }
+            model
+        }
+        _ => tabular::model(&read_sheets(&args.file)?, args.enum_max),
+    };
+    let out = convert::emit(&model, &EmitOptions { base: base.clone() });
+    // an empty ontology is never a result: say what was found instead
+    if out.classes == 0 {
+        return Err(CliError::Input(format!(
+            "{}: no tables found to make classes from",
+            args.file.display()
+        )));
+    }
+    notes.extend(out.notes.iter().cloned());
+    let declared = vec![(base_prefix(&args.file), base.clone())];
+    let format = output_format(args.format);
+    match &args.catalog_out {
+        Some(path) => {
+            emit(
+                &out.ontology,
+                &write::used_prefixes(&out.ontology, &declared),
+                format,
+                args.output.as_deref(),
+            )?;
+            emit(
+                &out.catalog,
+                &write::used_prefixes(&out.catalog, &declared),
+                format,
+                Some(path),
+            )?;
+        }
+        None => {
+            let all: Vec<Quad> = out.ontology.iter().chain(&out.catalog).cloned().collect();
+            emit(
+                &all,
+                &write::used_prefixes(&all, &declared),
+                format,
+                args.output.as_deref(),
+            )?;
+        }
+    }
+
+    let mut summary = format!(
+        "{}, {}",
+        count(out.classes, "class", "classes"),
+        count(out.properties, "property", "properties")
+    );
+    if out.enum_classes > 0 {
+        summary.push_str(&format!(
+            "; {} made {}, with {}",
+            count(out.enum_classes, "enumerated column", "enumerated columns"),
+            if out.enum_classes == 1 {
+                "a class"
+            } else {
+                "classes"
+            },
+            count(out.records, "catalog record", "catalog records")
+        ));
+    }
+    if out.keys_left_out > 0 {
+        summary.push_str(&format!(
+            "; {} left out",
+            count(
+                out.keys_left_out,
+                "primary key column",
+                "primary key columns"
+            )
+        ));
+    }
+    eprintln!("{summary}");
+    for note in notes {
+        eprintln!("{note}");
+    }
+    if args.base.is_none() {
+        eprintln!("IRIs minted under {base}; set --base to your own namespace");
+    }
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
+    Ok(())
+}
+
 fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
+    let kind = source(&args.file, args.input_format);
+    if kind != Source::Rdf {
+        return run_from_tables(args, kind);
+    }
     let (parsed, _) = parse_file(&args.file, args.input_format)?;
     let out = write::rewrite(&parsed, &args.seed, args.depth)
         .map_err(|e| CliError::Usage(e.to_string()))?;
-    let format = match args.format {
-        OntologyOutputFormat::Turtle => OutputFormat::Turtle,
-        OntologyOutputFormat::Jsonld => OutputFormat::JsonLd,
-    };
     let prefixes = write::used_prefixes(&out.quads, &parsed.prefixes);
-    let text = write::serialize(&out.quads, &prefixes, format)
-        .map_err(|e| CliError::Input(format!("failed to write the ontology: {e}")))?;
-    match &args.output {
-        Some(path) => std::fs::write(path, &text)
-            .map_err(|e| CliError::Input(format!("failed to write {}: {e}", path.display())))?,
-        None => print!("{text}"),
-    }
+    emit(
+        &out.quads,
+        &prefixes,
+        output_format(args.format),
+        args.output.as_deref(),
+    )?;
 
     let mut summary = format!(
         "{}, {}",
@@ -334,5 +532,121 @@ fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
         eprintln!("rewritten: {}", changes.join("; "));
     }
     eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
+    Ok(())
+}
+
+pub fn run_catalog(action: CatalogAction) -> CliResult<()> {
+    match action {
+        CatalogAction::From(args) => run_catalog_from(&args),
+    }
+}
+
+fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
+    let sheets = read_sheets(&args.file)?;
+    let sheet = match &args.sheet {
+        Some(name) => sheets
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "{} has no sheet {name:?} (its sheets: {})",
+                    args.file.display(),
+                    sheets
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?,
+        None => sheets
+            .first()
+            .ok_or_else(|| CliError::Input(format!("{} has no table", args.file.display())))?,
+    };
+    let base = args
+        .base
+        .clone()
+        .unwrap_or_else(|| default_base(&args.file));
+    // the ontology's prefixes, so its class reads as it does there
+    let mut declared = Vec::new();
+    let class = match &args.ontology {
+        Some(path) => {
+            let (parsed, _) = parse_file(path, None)?;
+            let ontology = parsed.split().ontology;
+            declared.extend(parsed.prefixes.iter().cloned());
+            fluree_db_ontology::slice::resolve_seed(&args.class, &ontology, &parsed.prefixes)
+                .map_err(|e| CliError::Usage(e.to_string().replace("--seed", "--class")))?
+        }
+        None if args.class.contains("://") || args.class.starts_with("urn:") => args.class.clone(),
+        None => format!(
+            "{base}{}",
+            convert::pascal(&convert::class_label(&args.class))
+        ),
+    };
+    let options = CatalogOptions {
+        class: class.clone(),
+        label: args.label.clone(),
+        alt: args.alt.clone(),
+        code: args.code.clone(),
+        definition: args.definition.clone(),
+        describe: args.describe.clone(),
+        id: args.id.clone(),
+        base: base.clone(),
+    };
+    let out = catalog::from_sheet(sheet, &options).map_err(|e| CliError::Usage(e.to_string()))?;
+    declared.push((base_prefix(&args.file), base.clone()));
+    emit(
+        &out.quads,
+        &write::used_prefixes(&out.quads, &declared),
+        output_format(args.format),
+        args.output.as_deref(),
+    )?;
+
+    let mut summary = format!("{} of <{class}>", count(out.records, "record", "records"));
+    if out.merged > 0 {
+        summary.push_str(&format!(
+            "; {} folded into an earlier record with the same id",
+            count(out.merged, "row", "rows")
+        ));
+    }
+    if out.kept_apart > 0 {
+        summary.push_str(&format!(
+            "; {} kept apart from another whose id reads alike in an IRI (suffixed)",
+            count(out.kept_apart, "record", "records")
+        ));
+    }
+    if out.without_label > 0 {
+        summary.push_str(&format!(
+            "; {} without a name left out",
+            count(out.without_label, "row", "rows")
+        ));
+    }
+    eprintln!("{summary}");
+    let e = &out.estimate;
+    eprintln!(
+        "About {} serialized tokens, repeated in every extraction window (a window holds {} with the ontology and the text).",
+        thousands(e.catalog_tokens),
+        thousands(TOKENS_PER_WINDOW)
+    );
+    if e.tokens > TOKENS_PER_WINDOW {
+        eprintln!(
+            "{}",
+            "warning: this catalog alone is more than one window holds; send the records the documents need, or split it by class".yellow()
+        );
+    } else if e.document_chars < MAX_TEXT_CHARS {
+        eprintln!(
+            "{}",
+            format!(
+                "warning: with this catalog a window has room for about {} characters of text",
+                thousands(e.document_chars)
+            )
+            .yellow()
+        );
+    }
+    if args.base.is_none() {
+        eprintln!("IRIs minted under {base}; set --base to your own namespace");
+    }
+    if args.ontology.is_none() && !(args.class.contains("://") || args.class.starts_with("urn:")) {
+        eprintln!("class minted as <{class}>; pass --ontology to use your ontology's class");
+    }
     Ok(())
 }

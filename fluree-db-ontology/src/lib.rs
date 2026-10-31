@@ -23,9 +23,14 @@
 //!   seed set;
 //! - [`estimate`] approximates the serialized tokens an ontology and catalog
 //!   cost per window;
-//! - [`write`] serializes the result as Turtle or JSON-LD.
+//! - [`write`] serializes the result as Turtle or JSON-LD;
+//! - [`convert`] makes an ontology from tables: CSV and workbook headers,
+//!   SQL DDL;
+//! - [`catalog`] makes a catalog of SKOS records from rows.
 
+pub mod catalog;
 pub mod check;
+pub mod convert;
 pub mod estimate;
 pub mod policy;
 pub mod read;
