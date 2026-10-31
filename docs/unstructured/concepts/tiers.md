@@ -25,7 +25,7 @@ Three slots, each an OpenAI-compatible endpoint you point at anything: Ollama, v
 |---|---|---|
 | `embedding` | one vector per chunk; enables vector search | — |
 | `vlm` | reading crops of pages and regions the parser could not | `llm` |
-| `llm` | entity and relation extraction against `--model` | — |
+| `llm` | entity and relation extraction against `--ontology` | — |
 
 This is the most setup and the fewest features, and it is fully yours: no account, and no data leaves the machine unless a slot points at a hosted API. See [Local models](../guides/local-models.md).
 

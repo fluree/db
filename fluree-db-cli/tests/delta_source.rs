@@ -109,3 +109,77 @@ fn at_pins_a_graph_source_query_to_a_table_version() {
         .failure()
         .stderr(predicate::str::contains("no transaction numbers"));
 }
+
+/// A table mapped as a graph source is a catalog like any ledger: `doc
+/// ingest --catalog` reads its labels through the mapping, and a mention
+/// keeps the IRI the mapping mints.
+#[test]
+fn doc_ingest_reads_a_catalog_from_a_mapped_table() {
+    const STORES: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+<http://example.org/mapping#Store> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "dim_store" ] ;
+  rr:subjectMap [ rr:template "http://example.org/store/{store_id}" ;
+                  rr:class <https://schema.org/Organization> ] ;
+  rr:predicateObjectMap [
+    rr:predicate skos:prefLabel ;
+    rr:objectMap [ rr:column "name" ]
+  ] .
+"#;
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    std::fs::write(tmp.path().join("stores.ttl"), STORES).unwrap();
+    fluree_cmd(&tmp)
+        .args([
+            "delta",
+            "map",
+            "stores",
+            "--root",
+            &fixtures(),
+            "--r2rml",
+            "stores.ttl",
+        ])
+        .assert()
+        .success();
+    std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    std::fs::write(
+        tmp.path().join("docs/memo.md"),
+        "# Weekly note\n\nThe East shop beat the West shop on returns this week.\n",
+    )
+    .unwrap();
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--catalog",
+            "stores#schema:Organization",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "entities   stores#schema:Organization: 3 label(s)",
+        ))
+        .stdout(predicate::str::contains(
+            "2 mention(s) of 2 entities (0 new)",
+        ));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "--format",
+            "json",
+            "--sparql",
+            "SELECT ?e WHERE { ?m a <https://ns.flur.ee/doc#Mention> ; \
+             <http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#entity> ?e }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("http://example.org/store/1"))
+        .stdout(predicate::str::contains("http://example.org/store/2"));
+}

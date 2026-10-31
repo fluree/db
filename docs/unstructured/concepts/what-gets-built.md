@@ -37,7 +37,7 @@ A `doc:SourceDocument` at the document's IRI records the file: `doc:fileName`, `
 
 ## Entities, mentions and relations
 
-With `--model` and/or `--entities`, the same commit also holds what the document is about. A `doc:Mention` is a span of a chunk naming an entity: `nif:beginIndex` / `nif:endIndex` into the chunk's text, `nif:anchorOf`, `nif:referenceContext` (the chunk), `nif:entity` (the entity, under the IRI it already has in your `--entities` source), and `doc:sourceElement`. A `doc:Relation` is one statement the language model reported, reified with `rdf:subject`, `rdf:predicate`, `rdf:object`, its excerpt and the gate's verdict; admitted relations are also written as plain edges. An entity no source knew is minted as `doc:Entity` with `schema:name`, `skos:altLabel`, `doc:nerLabel` and any attributes the ontology admits. See [Entities and relations](entities-and-relations.md).
+With `--ontology` and/or `--entities`, the same commit also holds what the document is about. A `doc:Mention` is a span of a chunk naming an entity: `nif:beginIndex` / `nif:endIndex` into the chunk's text, `nif:anchorOf`, `nif:referenceContext` (the chunk), `nif:entity` (the entity, under the IRI it already has in your `--entities` source), and `doc:sourceElement`. A `doc:Relation` is one statement the language model reported, reified with `rdf:subject`, `rdf:predicate`, `rdf:object`, its excerpt and the gate's verdict; admitted relations are also written as plain edges. An entity no source knew is minted as `doc:Entity` with `schema:name`, `skos:altLabel`, `doc:nerLabel` and any attributes the ontology admits. See [Entities and relations](entities-and-relations.md).
 
 ## IRIs
 

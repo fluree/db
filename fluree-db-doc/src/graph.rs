@@ -325,7 +325,7 @@ pub fn relation_support_query(subject: &str, predicate: &str, object: &str) -> V
 ///
 /// Minted IRIs are hex and document IRIs are percent-encoded, but gazetteer
 /// and model IRIs come from operator-supplied files (`--entities`,
-/// `--model`). One carrying `>` would close the brackets and splice extra
+/// `--ontology`). One carrying `>` would close the brackets and splice extra
 /// triples into a `DELETE DATA` on the target ledger.
 pub fn sparql_iri_safe(iri: &str) -> bool {
     !iri.is_empty()
