@@ -415,6 +415,11 @@ path = "tests/it_repeated_var_fast_path_guards.rs"
 name = "it_count_star_row_multiplicity"
 path = "tests/it_count_star_row_multiplicity.rs"
 
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_sparql_list_single_pass"
+path = "tests/it_sparql_list_single_pass.rs"
+
 # Own binary: toggles the process-global fast-path kill switch and asserts
 # fast-path routing.
 [[test]]
