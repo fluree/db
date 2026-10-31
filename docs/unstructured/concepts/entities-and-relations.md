@@ -124,9 +124,9 @@ On the document node rather than baked onto the edge, and that is the whole poin
 
 Store the factors and multiply at query time. That way each one can be corrected on its own.
 
-A re-ingest of the document leaves your triples alone. It retracts what the pipeline itself wrote — the `doc:`, `nif:` and `po:` terms, `rdf:type`, the reification triple and `rdfs:label` — and nothing else, on the document node and on every node stamped with it. Anything in your own vocabulary survives.
+A re-ingest of the document leaves your triples alone. It retracts what the pipeline itself wrote — the `doc:`, `nif:` and `po:` terms, `rdf:type`, the reification triple, `rdfs:label`, and `dcterms:title`, `dcterms:creator`, `dcterms:created` and `dcterms:modified` — and nothing else, on the document node and on every node stamped with it. Anything in your own vocabulary survives.
 
-**`doc:`, `nif:` and `po:` are reserved.** The boundary is the predicate, not who wrote it: a predicate in one of those three namespaces, on the document node or on any node stamped with it, is pipeline-owned and a re-ingest will retract it — including one you added yourself. So curate under your own namespace (`ex:trust`, above), not under `doc:`. `rdfs:label` and extra `@type` values on a pipeline node are reserved for the same reason: the emitters write both.
+**`doc:`, `nif:` and `po:` are reserved.** The boundary is the predicate, not who wrote it: a predicate in one of those three namespaces, on the document node or on any node stamped with it, is pipeline-owned and a re-ingest will retract it — including one you added yourself. So curate under your own namespace (`ex:trust`, above), not under `doc:`. `rdfs:label`, those four `dcterms:` terms and extra `@type` values on a pipeline node are reserved for the same reason: the emitters write them.
 
 ### Trust filtering is a query concern, not a policy one
 

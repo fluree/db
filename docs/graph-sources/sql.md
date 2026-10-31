@@ -464,7 +464,7 @@ A SQL source has no snapshot: every query reads the tables as they are at that
 moment. Consequently
 
 - `as-of` time travel is not available on a SQL source;
-- [materialization](iceberg.md#materialization) into a twin ledger and
+- [materialization](iceberg.md#materialization-into-a-native-ledger) into a twin ledger and
   `fluree iceberg track` are **not yet supported** for SQL sources — both are
   built on Iceberg snapshot windows, and a mutable table has no delta between
   two reads. Attempting either returns a clear error naming the source. A

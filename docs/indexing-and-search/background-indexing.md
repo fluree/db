@@ -139,7 +139,7 @@ Query for ex:alice's properties:
 
 Background indexing is **on by default**. Indexing is triggered based on novelty size thresholds:
 
-- Enable/disable background indexing: `--indexing-enabled` / `FLUREE_INDEXING_ENABLED` (default `true`; disable only when a peer/indexer process owns this storage)
+- Enable/disable background indexing: `--indexing-enabled` / `FLUREE_INDEXING_ENABLED` (default `true`; disable only when a peer/indexer process owns this storage, which file storage does not allow: see [One process per directory](../operations/storage.md#one-process-per-directory))
 - Trigger threshold (soft): `--reindex-min-bytes` / `FLUREE_REINDEX_MIN_BYTES`
 - Backpressure threshold (hard): `--reindex-max-bytes` / `FLUREE_REINDEX_MAX_BYTES`
 

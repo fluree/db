@@ -43,9 +43,10 @@ combination. They are listed here from lightest to most powerful:
 
 Modes can be combined freely. For example, `["rdfs", "owl2rl", "datalog"]`
 first materializes OWL 2 RL entailments, then runs your Datalog rules over the
-combined base + OWL-derived data, and finally applies RDFS query rewriting on
-top. This layering lets you start simple (RDFS) and add more powerful inference
-only where you need it.
+combined base + OWL-derived data. OWL 2 RL materializes everything RDFS query
+rewriting would add, so with `owl2rl` on the rewrite is skipped. This layering
+lets you start simple (RDFS) and add more powerful inference only where you
+need it.
 
 ## How it works
 
@@ -88,7 +89,10 @@ enforces configurable limits, checked as facts are derived:
 | Memory | Derived from the fact limit | Materialization stops; partial results used |
 
 When a budget is exceeded the query still runs — but over an **incomplete**
-closure, so results may be missing entailments. A capped materialization is
+closure, so results may be missing entailments. A datalog program that negates
+or aggregates is the exception: a cap that leaves such a rule unfinished fails
+the query with an error naming the rule, since the rule would answer from
+partial input. A capped materialization is
 surfaced in tracked query responses (the `reasoning` block /
 `x-fdb-reasoning` header) and logged as a server WARN. The fact and time
 limits are configurable per ledger (`f:reasoningMaxFacts` /

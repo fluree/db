@@ -627,11 +627,13 @@ WHERE {
 
 ### Connection-Bound Mode
 
-When querying across multiple ledgers, use SERVICE to select which ledger each pattern executes against:
+When querying across multiple ledgers, use SERVICE to select which ledger each pattern executes against. Each ledger a SERVICE names must be in the query's dataset, so list it with `FROM NAMED`:
 
 ```sparql
 -- Connection-bound: SERVICE selects the target ledger
 SELECT ?name ?stock
+FROM NAMED <sales:main>
+FROM NAMED <inventory:main>
 WHERE {
   SERVICE <fluree:ledger:sales:main> {
     GRAPH <http://example.org/graphs/products> {

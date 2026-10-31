@@ -227,7 +227,9 @@ people.query("""
 - `fluree.Vector` holds an embedding (stored as float32); a one-dimensional
   numpy array works anywhere a `Vector` does, as a value or a parameter.
   Vectors come back from queries as `Vector`, and `numpy.asarray(v)` gives
-  a float32 array.
+  a float32 array. In each graph, all the vectors of one property have the
+  length of the first one it received, even after they are retracted; a
+  write that breaks that raises `InvalidRequestError`.
 - `cosineSimilarity`, `dotProduct` and `euclideanDistance` score vectors;
   `dotProduct` over normalized embeddings is the fastest.
 
