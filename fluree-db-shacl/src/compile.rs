@@ -7,10 +7,12 @@ use crate::constraints::{Constraint, NestedShape, NodeConstraint};
 use crate::error::Result;
 use crate::path::{resolve_sh_path, PropertyPath};
 use crate::predicates;
-use fluree_db_core::{Flake, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, Sid};
+use fluree_db_core::{
+    Flake, FlakeMeta, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, Sid,
+};
 use fluree_vocab::namespaces::{RDF, SHACL};
 use fluree_vocab::rdf_names;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Unique identifier for a shape
@@ -170,6 +172,35 @@ struct ShapeMetadata {
     description: Option<String>,
 }
 
+/// The values of `sh:and`, `sh:or` or `sh:xone` on a shape. Each value is a
+/// list of shapes, and each list is a constraint of its own: two `sh:or`
+/// lists are two disjunctions, not one. Shapes written as values with no list
+/// (a JSON-LD array without `@list`) are read as one list together.
+#[derive(Default)]
+struct ShapeLists {
+    /// The values read in the current graph, each with its list when it is a
+    /// compact list member. Grouped into `lists` once the graph is read.
+    read: Vec<(Option<u32>, Sid)>,
+    lists: Vec<Vec<Sid>>,
+    /// Which of `lists` holds the shapes written as values with no list.
+    plain: Option<usize>,
+}
+
+impl ShapeLists {
+    fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.lists.is_empty()
+    }
+}
+
+/// The list `flake`'s object is a compact member of, if it is one.
+fn list_of(flake: &Flake) -> Option<u32> {
+    flake
+        .m
+        .as_ref()
+        .and_then(FlakeMeta::place)
+        .map(|(list, _)| list)
+}
+
 /// Intermediate representation during compilation
 #[derive(Default)]
 struct ShapeData {
@@ -185,13 +216,12 @@ struct ShapeData {
     node_shapes: Vec<Sid>,
     /// sh:not - reference to a shape that must NOT match
     not_shape: Option<Sid>,
-    /// sh:and - shape references (an RDF list head among them is expanded
-    /// during list processing)
-    and_shapes: Vec<Sid>,
-    /// sh:or - shape references, as for `and_shapes`
-    or_shapes: Vec<Sid>,
-    /// sh:xone - shape references, as for `and_shapes`
-    xone_shapes: Vec<Sid>,
+    /// sh:and - lists of shape references
+    and_shapes: ShapeLists,
+    /// sh:or - lists of shape references, each a disjunction of its own
+    or_shapes: ShapeLists,
+    /// sh:xone - lists of shape references, each its own exactly-one
+    xone_shapes: ShapeLists,
     severity: Severity,
     name: Option<String>,
     description: Option<String>,
@@ -684,11 +714,12 @@ impl ShapeCompiler {
         }
 
         // sh:and / sh:or / sh:xone members. A JSON-LD @list or a Turtle
-        // collection arrives as one flake per member; an RDF collection
-        // stored as an rdf:first / rdf:rest spine (as a SPARQL UPDATE writes
-        // `( … )`) arrives as one flake whose object is the spine's head.
-        // A member that heads a list in this graph is replaced by the list's
-        // members, as for sh:ignoredProperties.
+        // collection arrives as one flake per member, placed in its list; an
+        // RDF collection stored as an rdf:first / rdf:rest spine (as a SPARQL
+        // UPDATE writes `( … )`) arrives as one flake whose object is the
+        // spine's head. A member that heads a list in this graph is replaced,
+        // in its own list, by that list's members, as for
+        // sh:ignoredProperties.
         let logical: Vec<Sid> = self
             .shapes
             .iter()
@@ -706,22 +737,37 @@ impl ShapeCompiler {
                 std::mem::take(&mut sd.or_shapes),
                 std::mem::take(&mut sd.xone_shapes),
             ];
-            for members in &mut lists {
-                let mut expanded = Vec::with_capacity(members.len());
-                for member in members.drain(..) {
-                    let values =
-                        traverse_rdf_list(db, &member, &rdf_first, &rdf_rest, &rdf_nil).await?;
-                    if values.is_empty() {
-                        // Not a list head in this graph — a shape reference.
-                        expanded.push(member);
-                    } else {
-                        expanded.extend(values.into_iter().filter_map(|v| match v {
-                            FlakeValue::Ref(sid) => Some(sid),
-                            _ => None,
-                        }));
+            for term in &mut lists {
+                // Lists read from earlier graphs, whose spines may live here.
+                for members in &mut term.lists {
+                    let mut expanded = Vec::with_capacity(members.len());
+                    for member in members.drain(..) {
+                        match spine_members(db, &member, &rdf_first, &rdf_rest, &rdf_nil).await? {
+                            Some(spine) => expanded.extend(spine),
+                            None => expanded.push(member),
+                        }
+                    }
+                    *members = expanded;
+                }
+                let mut compact: BTreeMap<u32, Vec<Sid>> = BTreeMap::new();
+                for (list, value) in std::mem::take(&mut term.read) {
+                    let spine = spine_members(db, &value, &rdf_first, &rdf_rest, &rdf_nil).await?;
+                    match (list, spine) {
+                        (Some(list), spine) => compact
+                            .entry(list)
+                            .or_default()
+                            .extend(spine.unwrap_or_else(|| vec![value])),
+                        (None, Some(spine)) => term.lists.push(spine),
+                        (None, None) => match term.plain {
+                            Some(at) => term.lists[at].push(value),
+                            None => {
+                                term.plain = Some(term.lists.len());
+                                term.lists.push(vec![value]);
+                            }
+                        },
                     }
                 }
-                *members = expanded;
+                term.lists.extend(compact.into_values());
             }
             let [and_shapes, or_shapes, xone_shapes] = lists;
             if let Some(sd) = self.shapes.get_mut(&shape_id) {
@@ -988,27 +1034,27 @@ impl ShapeCompiler {
                 }
             }
             name if name == predicates::AND => {
-                // Accumulate shape references directly (JSON-LD @list expands to individual flakes)
                 if let FlakeValue::Ref(shape_ref) = &flake.o {
                     self.get_or_create_shape(&flake.s)
                         .and_shapes
-                        .push(shape_ref.clone());
+                        .read
+                        .push((list_of(flake), shape_ref.clone()));
                 }
             }
             name if name == predicates::OR => {
-                // Accumulate shape references directly (JSON-LD @list expands to individual flakes)
                 if let FlakeValue::Ref(shape_ref) = &flake.o {
                     self.get_or_create_shape(&flake.s)
                         .or_shapes
-                        .push(shape_ref.clone());
+                        .read
+                        .push((list_of(flake), shape_ref.clone()));
                 }
             }
             name if name == predicates::XONE => {
-                // Accumulate shape references directly (JSON-LD @list expands to individual flakes)
                 if let FlakeValue::Ref(shape_ref) = &flake.o {
                     self.get_or_create_shape(&flake.s)
                         .xone_shapes
-                        .push(shape_ref.clone());
+                        .read
+                        .push((list_of(flake), shape_ref.clone()));
                 }
             }
 
@@ -1569,34 +1615,45 @@ fn build_logical_constraints(
         ))));
     }
 
-    if !data.and_shapes.is_empty() {
-        let nested = data
-            .and_shapes
-            .iter()
-            .map(|sid| Arc::new(build_nested_shape(sid, ps_map)))
-            .collect();
-        constraints.push(NodeConstraint::And(nested));
-    }
-
-    if !data.or_shapes.is_empty() {
-        let nested = data
-            .or_shapes
-            .iter()
-            .map(|sid| Arc::new(build_nested_shape(sid, ps_map)))
-            .collect();
-        constraints.push(NodeConstraint::Or(nested));
-    }
-
-    if !data.xone_shapes.is_empty() {
-        let nested = data
-            .xone_shapes
-            .iter()
-            .map(|sid| Arc::new(build_nested_shape(sid, ps_map)))
-            .collect();
-        constraints.push(NodeConstraint::Xone(nested));
+    for (term, constraint) in [
+        (
+            &data.and_shapes,
+            NodeConstraint::And as fn(_) -> NodeConstraint,
+        ),
+        (&data.or_shapes, NodeConstraint::Or),
+        (&data.xone_shapes, NodeConstraint::Xone),
+    ] {
+        for members in term.lists.iter().filter(|members| !members.is_empty()) {
+            let nested = members
+                .iter()
+                .map(|sid| Arc::new(build_nested_shape(sid, ps_map)))
+                .collect();
+            constraints.push(constraint(nested));
+        }
     }
 
     constraints
+}
+
+/// The shapes of the `rdf:first` / `rdf:rest` spine `head` starts in `db`,
+/// or `None` when it starts none there, as a shape does.
+async fn spine_members(
+    db: GraphDbRef<'_>,
+    head: &Sid,
+    rdf_first: &Sid,
+    rdf_rest: &Sid,
+    rdf_nil: &Sid,
+) -> Result<Option<Vec<Sid>>> {
+    let values = traverse_rdf_list(db, head, rdf_first, rdf_rest, rdf_nil).await?;
+    Ok((!values.is_empty()).then(|| {
+        values
+            .into_iter()
+            .filter_map(|v| match v {
+                FlakeValue::Ref(sid) => Some(sid),
+                _ => None,
+            })
+            .collect()
+    }))
 }
 
 /// Traverse an RDF list and collect all values

@@ -281,6 +281,21 @@ async fn add_merges_a_second_list_copy_replaces() {
     assert_eq!(in_graph(&ledger, "g1").await, [[1, 2]]);
 }
 
+/// Inserts `ttl` into ledger `id` as it stands, or the refusal's text.
+#[cfg(feature = "shacl")]
+async fn insert_or_refusal(
+    fluree: &fluree_db_api::Fluree,
+    id: &str,
+    ttl: &str,
+) -> Result<(), String> {
+    let ledger = fluree.ledger(id).await.expect("load");
+    fluree
+        .insert_turtle(ledger, &format!("@prefix ex: <{EX}> .\n{ttl}"))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Two lists on a SHACL path term are two values, not one path: a shape whose
 /// `sh:path`, `sh:alternativePath`, or path operator holds two lists is
 /// malformed, as one with two `sh:path` values is, in novelty and in the
@@ -312,13 +327,12 @@ async fn two_lists_on_a_shacl_path_term_are_two_values() {
     let write = |focus: String, class: &'static str| {
         let fluree = &fluree;
         async move {
-            let ledger = fluree.ledger(id).await.expect("load");
-            let ttl = format!("@prefix ex: <{EX}> .\nex:{focus} a ex:{class} ; ex:a ex:n1 .");
-            fluree
-                .insert_turtle(ledger, &ttl)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            insert_or_refusal(
+                fluree,
+                id,
+                &format!("ex:{focus} a ex:{class} ; ex:a ex:n1 ."),
+            )
+            .await
         }
     };
 
@@ -334,6 +348,64 @@ async fn two_lists_on_a_shacl_path_term_are_two_values() {
                 .await
                 .expect_err(&format!("{lane}: {class}'s two lists made one path"));
             assert!(err.contains("multiple"), "{lane} {class}: {err}");
+        }
+    }
+}
+
+/// Each `sh:or`, `sh:xone` or `sh:and` list on a shape is a constraint of its
+/// own: `sh:or (ex:A ex:B), (ex:C ex:D)` needs one of A or B and one of C or
+/// D, not one of the four, whether a list is compact or a stored chain (the
+/// `ex:note` keeps `_:c` a chain). In novelty and in the index.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn each_logical_list_on_a_shape_is_its_own_constraint() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/list-identity/shacl-logical:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    let ledger = support::enable_shacl(&fluree, ledger).await;
+    turtle(
+        &fluree,
+        ledger,
+        r"@prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        ex:A a sh:NodeShape ; sh:property [ sh:path ex:a ; sh:minCount 1 ] .
+        ex:B a sh:NodeShape ; sh:property [ sh:path ex:b ; sh:minCount 1 ] .
+        ex:C a sh:NodeShape ; sh:property [ sh:path ex:c ; sh:minCount 1 ] .
+        ex:D a sh:NodeShape ; sh:property [ sh:path ex:d ; sh:minCount 1 ] .
+        ex:Or sh:targetClass ex:OrThing ; sh:or (ex:A ex:B), (ex:C ex:D) .
+        ex:Xone sh:targetClass ex:XoneThing ; sh:xone (ex:A ex:B), (ex:C ex:D) .
+        ex:And sh:targetClass ex:AndThing ; sh:and (ex:A ex:B), (ex:C ex:D) .
+        ex:Mixed sh:targetClass ex:MixedThing ; sh:or (ex:A ex:B), _:c .
+        _:c rdf:first ex:C ; rdf:rest _:d ; ex:note 0 .
+        _:d rdf:first ex:D ; rdf:rest rdf:nil .",
+    )
+    .await;
+
+    // A focus of each class, the properties it has, and whether it conforms.
+    let cases = [
+        ("OrThing", "a", false),
+        ("OrThing", "a c", true),
+        ("XoneThing", "a c", true),
+        ("XoneThing", "a", false),
+        ("AndThing", "a b c", false),
+        ("AndThing", "a b c d", true),
+        ("MixedThing", "a", false),
+        ("MixedThing", "a c", true),
+    ];
+    for lane in ["novelty", "indexed"] {
+        if lane == "indexed" {
+            support::rebuild_and_publish_index(&fluree, id).await;
+        }
+        for (n, (class, props, conforms)) in cases.into_iter().enumerate() {
+            let values: String = props.split(' ').map(|p| format!(" ; ex:{p} 1")).collect();
+            let written =
+                insert_or_refusal(&fluree, id, &format!("ex:{lane}{n} a ex:{class}{values} ."))
+                    .await;
+            assert_eq!(
+                written.is_ok(),
+                conforms,
+                "{lane}: {class} with {props}: {written:?}"
+            );
         }
     }
 }
