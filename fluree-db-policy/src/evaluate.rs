@@ -3,7 +3,7 @@
 //! This module implements the core policy evaluation:
 //! - **Deny Overrides** combining: if any matching policy denies, access is denied
 //! - Required subset filtering AFTER class-applicability filter
-//! - Schema flake bypass (schema flakes always allowed)
+//! - Schema flake bypass on view only (writing one is judged like any other)
 //! - Identity grounding via random never-match IRI
 //! - Targeted `f:query` policies: if query returns false, deny (don't fall through)
 
@@ -1578,5 +1578,75 @@ mod tests {
             .unwrap();
 
         assert!(result);
+    }
+
+    /// The schema exemption lives in the view entry points, not the shared
+    /// evaluators: under deny-all sets, a schema flake is visible but its
+    /// write is denied.
+    #[tokio::test]
+    async fn schema_flakes_bypass_view_policy_only() {
+        let deny_all = |action: PolicyAction| {
+            let mut deny_all = make_deny_restriction("deny-all", make_sid(RDFS, "subClassOf"));
+            deny_all.target_mode = TargetMode::Default;
+            deny_all.targets.clear();
+            deny_all.action = action;
+            let mut set = PolicySet::new();
+            set.restrictions.push(deny_all);
+            set.defaults.push(0);
+            set
+        };
+        let wrapper = PolicyWrapper::new(
+            deny_all(PolicyAction::View),
+            deny_all(PolicyAction::Modify),
+            false,
+            false,
+            std::collections::HashMap::new(),
+        );
+        let ctx = PolicyContext::new(wrapper, None);
+        let subject = make_sid(100, "Person");
+        let property = make_sid(RDFS, "subClassOf");
+        let object = FlakeValue::Ref(make_sid(100, "Thing"));
+        let tracker = Tracker::disabled();
+
+        let viewed = ctx
+            .allow_view_flake_async(&subject, &property, &object, &[], &SourceExecutor, &tracker)
+            .await
+            .unwrap();
+        assert!(viewed, "view lets a schema flake through");
+        let viewed = ctx
+            .allow_view_flake_async_detailed(
+                &subject,
+                &property,
+                &object,
+                &[],
+                &SourceExecutor,
+                &tracker,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(viewed, PolicyDecision::Allowed { .. }));
+
+        let write = WriteFlakeInfo {
+            lifecycle: crate::types::WriteVerb::Create,
+            op: true,
+            pre_classes: &[],
+            union_classes: &[],
+            type_object_class: None,
+        };
+        let written = ctx
+            .allow_modify_flake_write_async_detailed(
+                &subject,
+                &property,
+                &object,
+                write,
+                &SourceExecutor,
+                &tracker,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(written, PolicyDecision::Denied { .. }),
+            "modify judges a schema flake like any other"
+        );
     }
 }
