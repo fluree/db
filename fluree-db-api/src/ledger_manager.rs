@@ -1317,6 +1317,9 @@ pub(crate) async fn load_and_attach_binary_store(
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
+    // Populated from all of novelty, so it covers novelty.
+    let novelty_t = state.novelty.t;
+    Arc::make_mut(&mut state.dict_novelty).mark_covered_through(novelty_t);
 
     let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);

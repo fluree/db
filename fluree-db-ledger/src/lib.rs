@@ -316,6 +316,8 @@ impl LedgerState {
 
         let head_index_id = record.index_head_id.clone();
         let novelty_t = snapshot.t;
+        // Nothing after the index: the empty novelty is covered.
+        dict_novelty.mark_covered_through(novelty_t);
         Ok(Self {
             snapshot: Arc::new(snapshot),
             novelty: Arc::new(Novelty::new(novelty_t)),
@@ -470,16 +472,21 @@ impl LedgerState {
         // identity-key sort + linear set-semantics dedup + four index
         // sorts, totaling `O(N log N)` regardless of M.
         novelty.bulk_apply_commits(commit_batches, &reverse_graph)?;
+        // Every commit after the index was populated above, oldest first.
+        dict_novelty.mark_covered_through(novelty.t);
 
         Ok((novelty, Some(head_cid.clone()), head_temporal))
     }
 
     /// Create a new ledger state from components
     pub fn new(snapshot: LedgerSnapshot, novelty: Novelty) -> Self {
-        let dict_novelty = DictNovelty::with_watermarks(
+        let mut dict_novelty = DictNovelty::with_watermarks(
             snapshot.subject_watermarks.clone(),
             snapshot.string_watermark,
         );
+        dict_novelty
+            .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
+        dict_novelty.mark_covered_through(novelty.t);
         let mut runtime_small_dicts = RuntimeSmallDicts::new();
         runtime_small_dicts
             .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
@@ -642,6 +649,7 @@ impl LedgerState {
                 new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
+        new_dict_novelty.mark_covered_through(new_novelty.t);
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
         if has_remaining_novelty {
@@ -793,6 +801,7 @@ impl LedgerState {
                         self.novelty.iter_flakes(fluree_db_core::IndexType::Post),
                     );
                 }
+                rebuilt.mark_covered_through(self.novelty.t);
                 self.dict_novelty = Arc::new(rebuilt);
                 Arc::new(runtime)
             }
@@ -860,9 +869,13 @@ impl LedgerState {
         // shape `apply_single_commit` provides.
         self.novelty.can_apply(&flakes, &reverse_graph)?;
 
+        let covered = self.dict_novelty.covers(self.novelty.t);
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&flakes);
         Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+        if covered {
+            Arc::make_mut(&mut self.dict_novelty).mark_covered_through(self.novelty.t);
+        }
 
         Ok(())
     }
@@ -990,9 +1003,13 @@ impl LedgerState {
         // uniquely owns them (Arc::make_mut), copy-on-write only when a reader or
         // cache still holds the prior Arc. Matches the snapshot handling above and
         // avoids the unconditional deep clone the previous clone-then-swap forced.
+        let covered = self.dict_novelty.covers(self.novelty.t);
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&all_flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&all_flakes);
         Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        if covered {
+            Arc::make_mut(&mut self.dict_novelty).mark_covered_through(self.novelty.t);
+        }
 
         // Update state
         self.head_commit_id = Some(commit_id.clone());

@@ -1439,6 +1439,8 @@ fn apply_pushed_commits_to_state(
         .as_ref()
         .and_then(|te| te.0.as_ref().downcast_ref::<BinaryIndexStore>());
 
+    // The dictionary keeps covering novelty only if it did before the push.
+    let covered = dict_novelty.covers(novelty.t);
     for (t, flakes) in accepted_all_flakes {
         // Populate dict novelty similarly to transact commit path.
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
@@ -1458,6 +1460,9 @@ fn apply_pushed_commits_to_state(
             })?;
     }
 
+    if covered {
+        Arc::make_mut(&mut dict_novelty).mark_covered_through(novelty.t);
+    }
     base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
     base.runtime_small_dicts = runtime_small_dicts;

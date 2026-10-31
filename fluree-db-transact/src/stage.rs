@@ -2108,7 +2108,6 @@ fn subjects_with_prior_rows(
     ledger: &LedgerState,
     candidates: &[(GraphId, Sid)],
 ) -> Option<HashSet<(GraphId, Sid)>> {
-    use fluree_db_core::comparator::IndexType;
     use fluree_db_query::BinaryRangeProvider;
 
     let binary_store = ledger
@@ -2157,22 +2156,50 @@ fn subjects_with_prior_rows(
     }
 
     for (g_id, subjects) in want_novelty {
-        ledger.novelty.for_each_overlay_flake(
-            g_id,
-            IndexType::Spot,
-            None,
-            None,
-            true,
-            ledger.t(),
-            &mut |flake| {
-                if subjects.contains(&flake.s) {
-                    present.insert((g_id, flake.s.clone()));
-                }
-            },
-        );
+        for sid in subjects {
+            if novelty_holds_subject(ledger, g_id, sid) {
+                present.insert((g_id, sid.clone()));
+            }
+        }
     }
 
     Some(present)
+}
+
+/// Whether graph `g_id`'s novelty holds a flake with subject `subject`.
+///
+/// A dictionary novelty that covers the ledger's novelty
+/// ([`DictNovelty::covers`](fluree_db_core::DictNovelty::covers)) holds every
+/// subject of a novelty flake that the persisted dictionary does not, so a
+/// subject in neither is in no novelty flake: the miss settles it with no
+/// read. Otherwise, and for a hit (the dictionary novelty spans every graph,
+/// and names ref objects too), a seek bounded to the subject decides, never a
+/// walk of the graph's novelty.
+fn novelty_holds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
+    use fluree_db_core::comparator::IndexType;
+
+    let dict = &ledger.dict_novelty;
+    if dict.covers(ledger.novelty.t)
+        && dict
+            .subjects
+            .find_subject(subject.namespace_code, &subject.name)
+            .is_none()
+    {
+        return false;
+    }
+    let lo = Flake::min_for_subject(subject.clone());
+    let hi = Flake::max_for_subject(subject.clone());
+    let mut found = false;
+    ledger.novelty.for_each_overlay_flake(
+        g_id,
+        IndexType::Spot,
+        Some(&lo),
+        Some(&hi),
+        false,
+        ledger.t(),
+        &mut |_| found = true,
+    );
+    found
 }
 
 /// Re-attach the graph to flakes read back through a scan.
@@ -3774,7 +3801,7 @@ fn upsert_replacement_slots(
 /// Subjects absent from both the persisted subject dictionary and novelty
 /// are skipped without any read: they cannot have values. Bulk upserts of
 /// new entities are exactly that shape, and the check is two dictionary
-/// probes per subject plus at most one novelty walk per graph (#1549).
+/// probes per subject plus a dictionary-novelty probe (#1549).
 ///
 /// Retractions carry the graph Sid of the payload's graph, so they cancel
 /// the payload's assertions in that graph.
@@ -3785,7 +3812,6 @@ async fn generate_upsert_deletions(
     graph_sids: &HashMap<String, Sid>,
     generator: &mut FlakeGenerator<'_>,
 ) -> Result<Vec<Retraction>> {
-    use fluree_db_core::IndexType;
     use fluree_db_query::BinaryRangeProvider;
 
     let subject_groups = upsert_replacement_slots(txn, generator);
@@ -3817,14 +3843,9 @@ async fn generate_upsert_deletions(
         })
         .collect();
 
-    // Novelty presence, resolved lazily: the per-graph set is built by a
-    // filtered overlay walk only when a subject misses the base dictionary
-    // (see the skip below), so upserts whose subjects all resolve in the
-    // persisted dictionary never pay it. The walk is O(novelty flakes in the
-    // graph), and novelty is bounded by `reindex_max_bytes` — up to 20% of
-    // system RAM when indexing lags — which is why it runs at most once per
-    // graph, and only on demand. It is authoritative in Sid space, needing
-    // no dictionary translation.
+    // Novelty presence is decided per subject, and only for a subject that
+    // misses the base dictionary (see the skip below): see
+    // [`novelty_holds_subject`].
     //
     // Genesis, or nothing indexed yet: novelty is the only place a subject
     // can exist, so the presence check below is authoritative on its own.
@@ -3839,16 +3860,6 @@ async fn generate_upsert_deletions(
     // failure instead of silently skipping every retraction.
     let base_index_absent = ledger.snapshot.range_provider.is_none() && ledger.snapshot.t == 0;
     let can_decide_absence = binary_store.is_some() || base_index_absent;
-
-    let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
-    if can_decide_absence {
-        for (subject, txn_g) in subject_groups.keys() {
-            if let Some(Some(ledger_g)) = ledger_g_for_txn_g.get(txn_g) {
-                per_g_subjects.entry(*ledger_g).or_default().insert(subject);
-            }
-        }
-    }
-    let mut novelty_present: HashMap<u16, HashSet<Sid>> = HashMap::new();
 
     // Persisted presence: the subject reverse dictionary is authoritative
     // under canonical namespace encoding (see `fluree_db_core::ns_encoding`)
@@ -3916,32 +3927,13 @@ async fn generate_upsert_deletions(
         let effective_g_id = ledger_g_id.unwrap_or(0);
 
         // Skip subjects with no persisted or novelty presence entirely. The
-        // base dictionary is a point probe, so it is consulted first; the
-        // per-graph novelty set is built on the first dictionary miss only.
-        if can_decide_absence && !subject_in_base(subject) {
-            let present = novelty_present.entry(effective_g_id).or_insert_with(|| {
-                let mut set = HashSet::new();
-                if let Some(subjects) = per_g_subjects.get(&effective_g_id) {
-                    ledger.novelty.for_each_overlay_flake(
-                        effective_g_id,
-                        IndexType::Spot,
-                        None,
-                        None,
-                        true,
-                        ledger.t(),
-                        &mut |flake| {
-                            if subjects.contains(&flake.s) && !set.contains(&flake.s) {
-                                set.insert(flake.s.clone());
-                            }
-                        },
-                    );
-                }
-                set
-            });
-            if !present.contains(subject) {
-                skipped_subjects += 1;
-                continue;
-            }
+        // base dictionary is a point probe, so it is consulted first.
+        if can_decide_absence
+            && !subject_in_base(subject)
+            && !novelty_holds_subject(ledger, effective_g_id, subject)
+        {
+            skipped_subjects += 1;
+            continue;
         }
 
         slots.extend(predicates.iter().map(|p| Slot {

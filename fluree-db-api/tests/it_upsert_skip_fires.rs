@@ -119,3 +119,81 @@ async fn upsert_indexed_skip_fires_for_per_subject_namespace_subjects() {
         })
         .await;
 }
+
+/// A ledger loaded from storage with an index and leftover novelty keeps its
+/// dictionary novelty covering that novelty, through the load and through
+/// later commits, so upserts of new subjects settle absence with a
+/// dictionary probe instead of a seek per subject.
+#[tokio::test(flavor = "current_thread")]
+async fn indexed_ledger_load_keeps_dictionary_coverage() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 0,
+        reindex_max_bytes: 1_000_000,
+    };
+    let ledger_id = "it/indexed-dict-coverage:main";
+
+    let mut fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    local
+        .run_until(async {
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+            let r1 = fluree
+                .upsert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "urn:it:seed:aaaa", "ex:name": "S1"}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, r1.receipt.t).await;
+        })
+        .await;
+    // A commit after the index, left in novelty.
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    fluree
+        .upsert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "urn:it:seed:bbbb", "ex:name": "S2"}),
+        )
+        .await
+        .unwrap();
+    drop(fluree);
+
+    let fluree = FlureeBuilder::file(path).build().expect("reopen");
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    assert!(
+        ledger.snapshot.range_provider.is_some(),
+        "loaded with its index"
+    );
+    assert!(
+        !ledger.novelty.is_empty(),
+        "loaded with novelty after the index"
+    );
+    assert!(
+        ledger.dict_novelty.covers(ledger.novelty.t),
+        "the load's dictionary novelty covers novelty"
+    );
+    let r = fluree
+        .upsert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "urn:it:new:cccc", "ex:name": "N1"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        r.ledger.dict_novelty.covers(r.ledger.novelty.t),
+        "and still covers it after a commit"
+    );
+}
