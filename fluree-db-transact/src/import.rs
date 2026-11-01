@@ -283,7 +283,10 @@ mod inner {
                 crate::parse::jsonld::GraphRole::Data,
                 &mut fluree_db_query::VarRegistry::new(),
             )?,
-            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id, ledger_id)?,
+            GraphNameRef::NamedGraph(id) => {
+                let id = fluree_graph_json_ld::iri_named_graph(id).map_err(TransactError::Parse)?;
+                crate::parse::jsonld::named_graph(id, id, ledger_id)?
+            }
         };
         let iri = match &graph {
             GraphName::Default => return Ok(None),
