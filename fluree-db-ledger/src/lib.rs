@@ -660,7 +660,7 @@ impl LedgerState {
 
         // Update state
         self.snapshot = Arc::new(new_snapshot);
-        self.novelty = Arc::new(new_novelty);
+        drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
         self.dict_novelty = Arc::new(new_dict_novelty);
         self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
         self.head_index_id = Some(index_id.clone());
@@ -769,7 +769,10 @@ impl LedgerState {
         // dictionary novelty, and while it lives the retire below would copy
         // the whole dictionary instead of trimming it in place.
         self.snapshot = Arc::new(merged_snapshot);
-        self.novelty = Arc::new(new_novelty);
+        // Freeing the flakes the trim dropped, often most of novelty, is the
+        // costliest part of an install when nothing else holds them, and it
+        // needs no lock: let a background thread do it.
+        drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
         let merge_us = phase.elapsed().as_micros() as u64;
         let phase = fluree_db_core::clock::Instant::now();
 
@@ -1105,6 +1108,21 @@ impl LedgerState {
             None
         }
     }
+}
+
+/// Drop `value` on a short-lived thread, so the caller (holding a ledger
+/// lock) does not pay for freeing it. Dropped in place where threads are
+/// unavailable or cannot be spawned.
+fn drop_off_thread<T: Send + 'static>(value: T) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // A failed spawn hands the closure, and so `value`, back to be dropped.
+        let _ = std::thread::Builder::new()
+            .name("fluree-drop".into())
+            .spawn(move || drop(value));
+    }
+    #[cfg(target_arch = "wasm32")]
+    drop(value);
 }
 
 #[cfg(test)]
