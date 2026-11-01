@@ -210,7 +210,7 @@ async fn rdf_lists_is_refused_where_it_cannot_be_honored() {
             .sparql(&across)
             .execute_formatted()
             .await,
-        "spans",
+        "several ledgers",
     );
     let across = across.replace("# PRAGMA rdf-lists: true\n", "");
     let members = fluree
@@ -221,6 +221,39 @@ async fn rdf_lists_is_refused_where_it_cannot_be_honored() {
         .expect("members across ledgers");
     let rows = members["results"]["bindings"].as_array().map(Vec::len);
     assert_eq!(rows, Some(3), "{members}");
+
+    // One ledger at two times: the list is only at t:2.
+    let times = create(&fluree, "rdf-lists-times", "ex:s ex:marker 0 .").await;
+    fluree
+        .graph(&times)
+        .transact()
+        .insert_turtle("@prefix ex: <http://example.org/> .\nex:s ex:items (1 2) .")
+        .commit()
+        .await
+        .expect("t:2");
+    let firsts = |from: &str| {
+        format!(
+            "# PRAGMA rdf-lists: true\n{PREFIX}\
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             SELECT ?v {from} WHERE {{ ex:s ex:items ?h . ?h rdf:first ?v }}"
+        )
+    };
+    let at_two = fluree
+        .query_from()
+        .sparql(&firsts(&format!("FROM <{times}@t:2>")))
+        .execute_formatted()
+        .await
+        .expect("one time");
+    let rows = at_two["results"]["bindings"].as_array().map(Vec::len);
+    assert_eq!(rows, Some(1), "{at_two}");
+    refused(
+        fluree
+            .query_from()
+            .sparql(&firsts(&format!("FROM <{times}@t:1> FROM <{times}@t:2>")))
+            .execute_formatted()
+            .await,
+        "several points in time",
+    );
 
     let crawl = json!({
         "@context": {"ex": "http://example.org/"},

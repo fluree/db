@@ -354,10 +354,110 @@ async fn other_cell_edits_are_refused() {
             "INSERT { ex:t ex:items ( ?h ) } WHERE { ex:s ex:items ?h . ?h rdf:first 1 }",
             "not a value",
         ),
+        (
+            "INSERT { ex:t ?h 7 } WHERE { ex:s ex:items ?h . ?h rdf:first 1 }",
+            "not a property",
+        ),
+        (
+            "DELETE { ex:t ?h 7 } WHERE { ex:s ex:items ?h . ?h rdf:first 1 }",
+            "not a property",
+        ),
+        (
+            "INSERT { ex:t ex:says <<( ex:a ?h 1 )>> } WHERE { ex:s ex:items ?h . ?h rdf:first 1 }",
+            "not a value",
+        ),
     ];
     for (body, expected) in cases {
         refused(&fluree, &id, body, expected).await;
     }
+}
+
+/// A cell's new member is in its list, so a list the same write states takes
+/// the next id past it, or is that list when it holds the same members.
+#[tokio::test]
+async fn a_list_written_beside_a_cell_edit_counts_the_edited_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let replace = "DELETE { ?h rdf:first ?old } INSERT { ?h rdf:first ?new . ex:s ex:items ?list }
+                   WHERE { ex:s ex:items ?h . ?h rdf:first ?old }";
+    let cases = [
+        ("(1)", "2", "(3)", vec![at(0, 0, "2"), at(1, 0, "3")]),
+        ("(1)", "2", "(1)", vec![at(0, 0, "2"), at(1, 0, "1")]),
+        ("(1)", "2", "(2)", vec![at(0, 0, "2")]),
+    ];
+    for (n, (stored, new, list, expected)) in cases.into_iter().enumerate() {
+        let id = create(
+            &fluree,
+            &format!("beside-{n}"),
+            &format!("ex:s ex:items {stored} ."),
+        )
+        .await;
+        let body = replace
+            .replace("?new", new)
+            .replace("ex:s ex:items ?list", &format!("ex:s ex:items {list}"));
+        edit(&fluree, &id, &body).await;
+        assert_eq!(
+            held(&load(&fluree, &id).await, 0, "s", "items").await,
+            expected,
+            "{body}"
+        );
+    }
+}
+
+/// Read as RDF, a list's members are its cells' `rdf:first`s, not values of
+/// its property: a delete naming a value takes the plain value alone, however
+/// it is written, and a list in a DELETE template is refused.
+#[tokio::test]
+async fn rdf_lists_deletes_a_propertys_plain_values_alone() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "plain-deletes", "ex:s ex:items (1 2), 1, 3 .").await;
+    edit(
+        &fluree,
+        &id,
+        "DELETE { ex:s ex:items 1 } WHERE { ex:s ex:items ?h . ?h rdf:first 1 }",
+    )
+    .await;
+    let list = [at(0, 0, "1"), at(0, 1, "2")];
+    let ledger = load(&fluree, &id).await;
+    assert_eq!(
+        held(&ledger, 0, "s", "items").await,
+        [list[0].clone(), list[1].clone(), plain("3")]
+    );
+    edit(&fluree, &id, "DELETE DATA { ex:s ex:items 2 }").await;
+    edit(
+        &fluree,
+        &id,
+        "DELETE { ex:s ex:items ?v } WHERE { ex:s ex:items ?v FILTER(isLiteral(?v)) }",
+    )
+    .await;
+    assert_eq!(held(&load(&fluree, &id).await, 0, "s", "items").await, list);
+
+    let deleted_list = json!({
+        "@context": {"ex": EX},
+        "delete": {"@id": "ex:s", "ex:items": {"@list": [1, 2]}},
+        "opts": {"rdfLists": true}
+    });
+    let err = fluree
+        .graph(&id)
+        .transact()
+        .update(&deleted_list)
+        .commit()
+        .await
+        .expect_err("a list deleted");
+    assert!(
+        err.to_string().contains("a list in a DELETE template"),
+        "{err}"
+    );
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert_eq!(held(&load(&fluree, &id).await, 0, "s", "items").await, list);
+
+    // Members are values without the view.
+    update(&fluree, &id, "DELETE DATA { ex:s ex:items 1 }", None)
+        .await
+        .expect("member delete");
+    assert_eq!(
+        held(&load(&fluree, &id).await, 0, "s", "items").await,
+        [at(0, 1, "2")]
+    );
 }
 
 /// A cell is in the graph of its list: its `rdf:first` is replaced there, and
@@ -508,7 +608,7 @@ async fn modify_policy_judges_a_cell_edit_on_its_owners_property() {
 }
 
 /// The JSON-LD twin: `opts.rdfLists` reads and edits cells as the pragma
-/// does, and a value that is not a boolean is refused.
+/// does, and a value that is not a boolean, or an upsert, is refused.
 #[tokio::test]
 async fn opts_rdf_lists_edits_cells_in_json_ld() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -562,6 +662,27 @@ async fn opts_rdf_lists_edits_cells_in_json_ld() {
         .await
         .expect_err("a cell in a stated list");
     assert!(err.to_string().contains("names a list cell"), "{err}");
+
+    // An upsert replaces the property's values, its lists' owner edges among
+    // them.
+    let upsert = json!({
+        "@context": {"ex": EX},
+        "@id": "ex:s",
+        "ex:items": 9,
+        "opts": {"rdfLists": true}
+    });
+    let err = fluree
+        .graph(&id)
+        .transact()
+        .upsert(&upsert)
+        .commit()
+        .await
+        .expect_err("an upsert");
+    assert!(
+        err.to_string().contains("does not apply to an upsert"),
+        "{err}"
+    );
+    assert_eq!(err.status_code(), 400, "{err}");
     let ledger = load(&fluree, &id).await;
     assert_eq!(
         held(&ledger, 0, "s", "items").await,

@@ -309,7 +309,7 @@ SELECT ?o WHERE { ex:s ex:items ?o FILTER(!isBlank(?o)) }              # ex:c
 
 - The cells are blank nodes this request names. Their labels mean nothing to another request.
 - An update reads its WHERE the same way, and can [replace a list member through its cell](#editing-a-list-through-its-cells). A `SELECT` under the pragma previews what such an update's WHERE matches.
-- A request that cannot read lists this way is refused with a `400`, never answered with members as values: a history query (a `FROM … TO` range), a dataset spanning ledgers, and, in JSON-LD, a graph crawl (`{"?s": ["*"]}`), which reads a subject's stored triples. A policy query, a rule or an `sh:select` with the pragma is refused too: each reads lists as members.
+- A request that cannot read lists this way is refused with a `400`, never answered with members as values: a history query (a `FROM … TO` range), a dataset reading several ledgers or one ledger at several times, and, in JSON-LD, a graph crawl (`{"?s": ["*"]}`), which reads a subject's stored triples. A policy query, a rule or an `sh:select` with the pragma is refused too: each reads lists as members.
 
 ## Query Modifiers
 
@@ -1412,10 +1412,11 @@ WHERE { ex:alice ex:colors/rdf:rest* ?cell . ?cell rdf:first "green" }   # ("nav
   - a cell left with no `rdf:first`, or with two;
   - an `rdf:rest` written, or a list's owner edge deleted;
   - another property on a cell;
-  - a cell as a value, including as a member of a list the update writes;
+  - a cell as a value, including as a member of a list the update writes, or as a property;
   - a cell written in a graph other than its list's.
   
-  To insert, remove or reorder members, write the list again.
+  To insert, remove or reorder members, write the list again in an update without the pragma.
+- A list's members are its cells' `rdf:first`s, not values of its property, so a delete naming a value of the property deletes its plain value alone: `DELETE DATA { ex:alice ex:colors "red" }` leaves the list as it is. A list in a DELETE template, which in this view is a chain of new blank nodes, is refused.
 - Modify policy judges a replacement as a change to the property holding the list, not to `rdf:first`.
 - A list stored as its triples is triples: its `rdf:first` and `rdf:rest` are written as any triple is.
 

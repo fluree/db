@@ -1231,6 +1231,8 @@ pub(crate) struct DeleteResolver<'l> {
     /// naming the same term again names the same entries, so it adds nothing
     /// (`SlotFacts::named_all`). A value no list holds is never kept here.
     expanded: HashSet<(SlotKey, Flake)>,
+    /// Whether a slot is its plain values alone ([`Self::reading_lists_as_rdf`]).
+    plain_only: bool,
     /// [`NARROW_SLOT`], or another bound for tests.
     narrow_slot: usize,
     /// A fixed [`Self::point_bound`] for tests (`Some(0)`: never).
@@ -1248,9 +1250,18 @@ impl<'l> DeleteResolver<'l> {
             wide_index: HashMap::new(),
             taken: HashMap::new(),
             expanded: HashSet::new(),
+            plain_only: false,
             narrow_slot: NARROW_SLOT,
             point_bound_override: None,
         }
+    }
+
+    /// The resolver of a write reading lists as RDF (`rdf-lists`), where a
+    /// list's members are its cells' `rdf:first`s: an intent names only the
+    /// plain values of its slot.
+    pub(crate) fn reading_lists_as_rdf(mut self) -> Self {
+        self.plain_only = true;
+        self
     }
 
     /// For each slot this batch reads (`at`'s `Read` places), the values
@@ -1432,7 +1443,10 @@ impl<'l> DeleteResolver<'l> {
         let read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
         let mut read: Vec<ReadSlot> = Vec::with_capacity(to_read.len());
         let mut narrow: Vec<(SlotKey, SlotFacts)> = Vec::with_capacity(to_read.len());
-        for ((slot, facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {
+        for ((slot, mut facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {
+            if self.plain_only {
+                facts.retain(|f| place_of(&f.flake).is_none());
+            }
             let facts = SlotFacts::new(slot.g_id, slot.p.clone(), facts, self.narrow_slot);
             let key = (slot.g_id, slot.s, slot.p);
             // Facts read by value are not the slot: they stay with the batch.

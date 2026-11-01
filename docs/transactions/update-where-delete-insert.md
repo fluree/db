@@ -562,7 +562,7 @@ With `"opts": {"rdfLists": true}`, the `where` reads every list as RDF (an owner
 }
 ```
 
-This replaces the first member of `ex:alice`'s list in place, leaving the list's other members and the property's other lists as they are. Any other write naming a cell is refused with a `400`. That includes a cell left with no `rdf:first` or with two, an `rdf:rest` change, another property on a cell, and a cell used as a value. To insert, remove or reorder members, write the list again. See [Editing a list through its cells](../query/sparql.md#editing-a-list-through-its-cells) for the rules.
+This replaces the first member of `ex:alice`'s list in place, leaving the list's other members and the property's other lists as they are. Any other write naming a cell is refused with a `400`. That includes a cell left with no `rdf:first` or with two, an `rdf:rest` change, another property on a cell, and a cell used as a value or a property. A `delete` naming a value of the property deletes its plain value alone, since a list's members are its cells' `rdf:first`s, and a list in `delete` is refused, as is an upsert, which replaces a property's values and so the lists it holds. To insert, remove or reorder members, write the list again in an update without `rdfLists`. See [Editing a list through its cells](../query/sparql.md#editing-a-list-through-its-cells) for the rules.
 
 ## Complex Updates
 

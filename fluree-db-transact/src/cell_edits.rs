@@ -11,11 +11,13 @@
 //! member is unchanged. Every other edit naming a cell is refused: a cell left
 //! with no `rdf:first` or with two, an `rdf:rest` or owner edge written, a
 //! triple about a cell on any other predicate or in another graph, and a cell
-//! as a value or a graph. Lists stored as explicit `rdf:first`/`rdf:rest`
-//! chains are stored nodes, written as any triple is.
+//! as a value, a predicate or a graph. So is a list in a DELETE template,
+//! which in this view is a chain of new blank nodes. Lists stored as explicit
+//! `rdf:first`/`rdf:rest` chains are stored nodes, written as any triple is.
 
 use crate::current_facts::{RetractIntent, Retraction};
 use crate::error::{Result, TransactError};
+use crate::ir::TripleTemplate;
 use crate::lists::PendingList;
 use fluree_db_core::namespaces::{is_rdf_first, is_rdf_rest};
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
@@ -133,13 +135,16 @@ impl CellEdits {
     fn value_names_cell(&self, o: &FlakeValue) -> bool {
         match o {
             FlakeValue::Ref(sid) => self.is_cell(sid),
-            FlakeValue::TripleTerm(t) => self.is_cell(&t.s) || self.value_names_cell(&t.o),
+            FlakeValue::TripleTerm(t) => {
+                self.is_cell(&t.s) || self.is_cell(&t.p) || self.value_names_cell(&t.o)
+            }
             _ => false,
         }
     }
 
     fn names_cell(&self, flake: &Flake) -> bool {
         self.is_cell(&flake.s)
+            || self.is_cell(&flake.p)
             || flake.g.as_ref().is_some_and(|g| self.is_cell(g))
             || self.value_names_cell(&flake.o)
     }
@@ -150,6 +155,9 @@ impl CellEdits {
         insert: bool,
         graph_of: &impl Fn(&Flake) -> Result<GraphId>,
     ) -> Result<()> {
+        if self.is_cell(&flake.p) {
+            return Err(refused("a list cell is not a property"));
+        }
         let owner = match self.view.decode(&flake.s) {
             Some((owner, _)) if !self.value_names_cell(&flake.o) => owner,
             _ if is_rdf_rest(&flake.p) => return Err(rest_refused()),
@@ -292,6 +300,19 @@ fn member_at(member: &Flake, graph: Option<&Sid>, term: &Term, t: i64, op: bool)
         Some(g) => Flake::new_in_graph(g.clone(), s, p, o, dt, t, op, m),
         None => Flake::new(s, p, o, dt, t, op, m),
     })
+}
+
+/// Refuse a list in a DELETE template: read as RDF it is a chain of new
+/// blank nodes, which no stored list is.
+pub(crate) fn refuse_deleted_lists(templates: &[TripleTemplate]) -> Result<()> {
+    if templates.iter().any(|t| t.list_index.is_some()) {
+        return Err(refused(
+            "a list in a DELETE template is a chain of new blank nodes, which matches no \
+             stored list; edit a list through its cells (removing a list member is not \
+             supported yet)",
+        ));
+    }
+    Ok(())
 }
 
 fn refused(why: &str) -> TransactError {

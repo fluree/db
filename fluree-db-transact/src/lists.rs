@@ -246,18 +246,21 @@ pub fn chain_lists(
 /// `retracted` says whether the transaction retracts a stored fact, and must
 /// be asked before retractions cancel against assertions: an upsert that
 /// restates a stored list retracts its members and asserts them again.
-/// Subjects that are blank nodes minted by transaction `txn_id` hold nothing
-/// stored, and are not read.
+/// `asserted` are the list members the transaction asserts outside `lists`,
+/// at places of the lists held (a cell's new member), which those lists then
+/// hold. Subjects that are blank nodes minted by transaction `txn_id` hold
+/// nothing stored, and are not read.
 pub async fn store_lists(
     ledger: &LedgerState,
     lists: Vec<PendingList>,
     txn_id: &str,
     retracted: impl Fn(&Flake) -> bool,
+    asserted: &[Flake],
 ) -> Result<Vec<Flake>> {
     if lists.is_empty() {
         return Ok(Vec::new());
     }
-    let held = lists_held(ledger, &lists, txn_id, retracted).await?;
+    let held = lists_held(ledger, &lists, txn_id, retracted, asserted).await?;
     Ok(encode(lists, held))
 }
 
@@ -371,12 +374,14 @@ fn same_members(a: &[Flake], b: &[Flake]) -> bool {
 }
 
 /// The lists the ledger holds on the owners of `lists`, leaving out the
-/// members, and the chains' edges, the transaction retracts.
+/// members, and the chains' edges, the transaction retracts, and with the
+/// members it asserts at their places (see [`store_lists`]).
 async fn lists_held(
     ledger: &LedgerState,
     lists: &[PendingList],
     txn_id: &str,
     retracted: impl Fn(&Flake) -> bool,
+    asserted: &[Flake],
 ) -> Result<HashMap<Owner, Held>> {
     if ListFree::check(ledger).is_some() {
         return Ok(HashMap::new());
@@ -399,6 +404,11 @@ async fn lists_held(
     }
     let read: Vec<Slot> = slots.iter().map(|(_, slot)| slot.clone()).collect();
     let facts = CurrentFacts::new(ledger).of_slots(&read).await?;
+    let mut asserted_on: HashMap<Owner, Vec<&Flake>> = HashMap::new();
+    for f in asserted {
+        let owner = (f.g.clone(), f.s.clone(), f.p.clone());
+        asserted_on.entry(owner).or_default().push(f);
+    }
     let mut held = HashMap::new();
     for ((owner, slot), facts) in slots.into_iter().zip(facts) {
         let mut here = Held::default();
@@ -438,6 +448,11 @@ async fn lists_held(
                 ));
             }
             here.chains.push(chain);
+        }
+        for f in asserted_on.remove(&owner).unwrap_or_default() {
+            if let Some((list, _)) = f.m.as_ref().and_then(FlakeMeta::place) {
+                here.compact.entry(list).or_default().push(f.clone());
+            }
         }
         for members in here.compact.values_mut() {
             members.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
