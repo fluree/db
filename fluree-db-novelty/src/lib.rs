@@ -68,6 +68,8 @@ pub use runtime_stats::{
 };
 pub use stats::current_stats;
 
+#[cfg(test)]
+use fact_state::fact_state_key;
 use fact_state::NoveltyFactState;
 use fluree_db_core::{Flake, GraphId, IndexType, Sid, CONFIG_GRAPH_ID};
 use std::cmp::Ordering;
@@ -142,6 +144,11 @@ pub const MAX_SEGMENT_FLAKES: usize = FlakeId::LOCAL_MASK as usize + 1;
 
 /// Maximum segments a single graph can hold before a reindex is required.
 pub const MAX_SEGMENTS: usize = FlakeId::SEG_MASK as usize + 1;
+
+/// Stale fact-state entries a commit sweeps per flake it records, and at
+/// least: enough to clear a trim's leftovers well before the next one.
+const FACT_SWEEP_PER_FLAKE: usize = 4;
+const FACT_SWEEP_MIN: usize = 4096;
 
 /// Default tier width for [`Novelty::tier_compact`]: merge a size class once it
 /// holds this many segments. Bounds read fan-out to ~`tier_width · log` of the
@@ -1123,11 +1130,20 @@ impl Novelty {
         // index. `record` resolves lifecycle order-independently (highest-t
         // wins, same-t assert wins), so batch order doesn't matter. After the
         // keep loop, so within-batch dedup decisions saw only prior state.
+        let mut recorded = 0usize;
         for (&g_id, batch) in &per_graph {
             for flake in batch {
                 self.fact_state.record(g_id, flake);
             }
+            recorded += batch.len();
         }
+        // Clear what the last trim left stale, a few entries per flake
+        // committed (see `clear_up_to`).
+        self.fact_state.sweep(
+            recorded
+                .saturating_mul(FACT_SWEEP_PER_FLAKE)
+                .max(FACT_SWEEP_MIN),
+        );
 
         if deduped > 0 {
             tracing::debug!(
@@ -1381,20 +1397,16 @@ impl Novelty {
 
         self.recompute_totals();
 
-        // Rebuild the current-state index from survivors. Per graph, record in
-        // SPOT order (t-ascending within an identity) so the latest op wins.
-        // slice_for_range returns an owned Vec, so the &self borrow ends before
-        // the &mut fact_state writes.
-        let mut fs = NoveltyFactState::new();
-        for g in 0..self.graphs.len() {
-            if self.graphs[g].as_ref().is_some_and(|s| !s.is_empty()) {
-                let ids = self.slice_for_range(g as GraphId, IndexType::Spot, None, None, true);
-                for id in ids {
-                    fs.record(g as GraphId, self.get_flake(id));
-                }
-            }
-        }
-        self.fact_state = fs;
+        // The current-state index loses the ops the trim dropped. Moving its
+        // cutoff answers as rebuilding it from the survivors would, without
+        // a pass over them under the ledger write lock at every index publish;
+        // commits sweep the stale entries out afterwards.
+        let graphs = &self.graphs;
+        self.fact_state.trim_through(cutoff_t, |g| {
+            graphs
+                .get(g as usize)
+                .is_none_or(|segs| segs.as_ref().is_none_or(Vec::is_empty))
+        });
 
         self.epoch += 1;
         self.refresh_content_version();
@@ -1540,6 +1552,7 @@ impl Novelty {
     ///
     /// Crate-internal: the owned ids it returns are read-scoped (see
     /// [`Self::get_flake`]). External readers use [`Self::range_flakes`].
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn slice_for_range(
         &self,
@@ -1577,6 +1590,7 @@ impl Novelty {
     /// `pub(crate)` makes that hazard unreachable from other crates — external
     /// readers use the borrow-safe [`Self::range_flakes`] / [`Self::iter_flakes`]
     /// / `for_each_overlay_flake` which yield `&Flake` directly.
+    #[cfg(test)]
     pub(crate) fn get_flake(&self, id: FlakeId) -> &Flake {
         let segs = self.graphs[id.graph()]
             .as_ref()
@@ -1828,6 +1842,74 @@ mod tests {
             op,
             None,
         )
+    }
+
+    /// The fact state after a trim answers as one rebuilt from the surviving
+    /// flakes, before its stale entries are swept and after.
+    #[test]
+    fn trimmed_fact_state_answers_as_a_rebuild_from_survivors() {
+        let mut n = Novelty::new(0);
+        // Identities re-asserted, retracted and re-asserted across commits,
+        // so some end on ops the trim drops and some on ops it keeps.
+        for t in 1..=40i64 {
+            // Early commits write keys 0..60, later ones 30..90: keys below
+            // 30 end on ops the trim at 25 drops.
+            let base = if t <= 25 { 0 } else { 30 };
+            let batch: Vec<Flake> = (0..40i64)
+                .map(|i| {
+                    let k = base + (i * 31 + t * 17) % 60;
+                    make_flake((k % 9) as u16, (k % 5) as u16, k, t, (i + t) % 3 != 0)
+                })
+                .collect();
+            n.apply_commit(batch, t, &HashMap::new()).unwrap();
+        }
+        let universe: Vec<Flake> = (0..90i64)
+            .map(|k| make_flake((k % 9) as u16, (k % 5) as u16, k, 0, true))
+            .collect();
+        let rebuilt = |n: &Novelty| {
+            let mut fs = NoveltyFactState::new();
+            for id in n.slice_for_range(0, IndexType::Spot, None, None, true) {
+                fs.record(0, n.get_flake(id));
+            }
+            fs
+        };
+        let answers = |fs: &NoveltyFactState| -> Vec<bool> {
+            universe.iter().map(|f| fs.is_asserted(0, f)).collect()
+        };
+
+        n.clear_up_to(25);
+        let want = answers(&rebuilt(&n));
+        assert_eq!(answers(&n.fact_state), want, "unswept");
+        assert!(want.iter().any(|&a| a) && want.iter().any(|&a| !a));
+        let stale_asserted = universe[..30]
+            .iter()
+            .filter(|f| {
+                n.fact_state.graphs[0]
+                    .as_ref()
+                    .unwrap()
+                    .get(&fact_state_key(f))
+                    .is_some_and(|&(_, op)| op)
+            })
+            .count();
+        assert!(
+            stale_asserted > 0,
+            "the trim leaves stale asserted entries to ignore"
+        );
+        n.fact_state.sweep(usize::MAX);
+        assert_eq!(answers(&n.fact_state), want, "swept");
+        n.apply_commit(vec![make_flake(1, 1, 1, 41, true)], 41, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            answers(&n.fact_state),
+            answers(&rebuilt(&n)),
+            "after a later commit"
+        );
+
+        // Trimming everything leaves no map to hold the indexed facts.
+        n.clear_up_to(41);
+        assert!(n.is_empty());
+        assert!(n.fact_state.graphs.iter().all(Option::is_none));
+        assert!(answers(&n.fact_state).iter().all(|&a| !a));
     }
 
     /// Merging sorted segments gives every order the flake sequence a fresh
