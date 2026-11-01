@@ -3724,6 +3724,7 @@ dependencies = [
  "fluree-db-query",
  "fluree-db-sparql",
  "fluree-vocab",
+ "mimalloc",
  "pyo3",
  "pythonize",
  "serde",
