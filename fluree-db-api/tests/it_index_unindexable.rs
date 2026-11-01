@@ -5,7 +5,9 @@
 //!
 //! The data is `tests/fixtures/vector-lengths-4.2.3`: a ledger the v4.2.3 CLI
 //! wrote, indexed at t=1, holding at t=2 a vector of another length on the
-//! same property. The index keeps one vector length per property.
+//! same property. The index keeps one vector length per property. The first
+//! build over that v4.2.3 index is a full rebuild, so the incremental case
+//! first rebuilds the index at t=1 in this build's format.
 //!
 //! Own test binary: asserts which build path ran through span capture, which
 //! is thread-local and process-shared (see `it_upsert_skip_fires`).
@@ -35,10 +37,51 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     }
 }
 
-/// Index the fixture with the background indexer under `config`, then write
-/// with no room left in novelty. Returns the build's outcome, the ledger's
-/// index status after it, and the write's refusal.
+/// The index the fixture's build to t=2 starts from.
+#[derive(Clone, Copy)]
+enum Base {
+    /// The v4.2.3 index at t=1. A build over an earlier format is a full
+    /// rebuild.
+    AsWritten,
+    /// That index rebuilt at t=1 in this build's format, so the build to t=2
+    /// can go incremental.
+    Current,
+}
+
+/// Replace the fixture's index at t=1 with one rebuilt in this build's format.
+async fn rebuild_the_base(fluree: &Fluree) {
+    let record = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .unwrap()
+        .expect("ledger record");
+    let store = fluree.content_store(&fluree.storage_namespace(LEDGER).await.unwrap());
+    let head =
+        fluree_db_core::load_commit_by_id(store.as_ref(), record.commit_head_id.as_ref().unwrap())
+            .await
+            .expect("head commit");
+    let mut at_1 = record.clone();
+    at_1.commit_head_id = head.parent_ids().next().cloned();
+    at_1.commit_t = 1;
+    let built =
+        fluree_db_indexer::rebuild_index_from_commits(store, LEDGER, &at_1, IndexerConfig::small())
+            .await
+            .expect("rebuild at t=1");
+    fluree
+        .nameservice_mode()
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_allow_equal_fenced(LEDGER, record.fence, 1, &built.root_id)
+        .await
+        .expect("publish the rebuilt index");
+}
+
+/// Index the fixture from `base` with the background indexer under `config`,
+/// then write with no room left in novelty. Returns the build's outcome, the
+/// ledger's index status after it, and the write's refusal.
 async fn index_the_fixture(
+    base: Base,
     config: IndexerConfig,
 ) -> (
     IndexOutcome,
@@ -49,9 +92,16 @@ async fn index_the_fixture(
         .join("tests/fixtures/vector-lengths-4.2.3/storage");
     let tmp = tempfile::TempDir::new().expect("tempdir");
     copy_dir(&fixture, tmp.path());
+    // No default indexer: the worker below is the only one, and it starts
+    // after the base is rebuilt (its startup sweep builds a ledger behind its
+    // commits).
     let mut fluree: Fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .without_indexing()
         .build()
         .expect("build");
+    if let Base::Current = base {
+        rebuild_the_base(&fluree).await;
+    }
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         fluree
@@ -110,7 +160,7 @@ fn assert_halted(outcome: &IndexOutcome, status: &fluree_db_api::IndexStatusResu
 #[tokio::test(flavor = "current_thread")]
 async fn an_incremental_build_halts_without_falling_back() {
     let (spans, _guard) = span_capture::init_test_tracing();
-    let (outcome, status, refused) = index_the_fixture(IndexerConfig::small()).await;
+    let (outcome, status, refused) = index_the_fixture(Base::Current, IndexerConfig::small()).await;
     assert_halted(&outcome, &status);
     assert!(spans.has_event(INCREMENTAL), "the incremental path ran");
     // A write refused for want of room in novelty is logged with the halt.
@@ -141,7 +191,18 @@ async fn a_full_rebuild_halts() {
         incremental_enabled: false,
         ..IndexerConfig::small()
     };
-    let (outcome, status, _) = index_the_fixture(config).await;
+    let (outcome, status, _) = index_the_fixture(Base::Current, config).await;
+    assert_halted(&outcome, &status);
+    assert!(spans.has_event(REBUILD), "the full rebuild path ran");
+    assert!(!spans.has_event(INCREMENTAL));
+}
+
+/// The first build over the v4.2.3 index is a full rebuild, which halts the
+/// same way.
+#[tokio::test(flavor = "current_thread")]
+async fn a_build_over_an_earlier_format_rebuilds_and_halts() {
+    let (spans, _guard) = span_capture::init_test_tracing();
+    let (outcome, status, _) = index_the_fixture(Base::AsWritten, IndexerConfig::small()).await;
     assert_halted(&outcome, &status);
     assert!(spans.has_event(REBUILD), "the full rebuild path ran");
     assert!(!spans.has_event(INCREMENTAL));
