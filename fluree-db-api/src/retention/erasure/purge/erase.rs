@@ -79,6 +79,12 @@ impl Fluree {
                     .await?
             }
         };
+        let captured = &self
+            .captured_on(store.as_ref(), record.commit_head_id.as_ref(), captured)
+            .await?;
+        if !captured.iter().any(|c| c.flake.t <= record.index_t) {
+            return Ok(Erased::Nothing);
+        }
         let state = self
             .load_queryable_state_with_store(store.clone(), record.clone())
             .await?;

@@ -1561,13 +1561,18 @@ impl Fluree {
                 .flakes
                 .iter()
                 .zip(&removal.removals)
-                .map(|(flake, entry)| Captured {
-                    flake: flake.clone(),
-                    // Retracted since its index, an assertion is current
-                    // there: the erased retraction no longer hides it.
-                    current_until: flake.op.then(|| entry.until_t.unwrap_or(i64::MAX)),
+                .map(|(flake, entry)| {
+                    Ok(Captured {
+                        flake: flake.clone(),
+                        commit: entry.commit.parse().map_err(|_| {
+                            ApiError::internal(format!("not a commit id: {}", entry.commit))
+                        })?,
+                        // Retracted since its index, an assertion is current
+                        // there: the erased retraction no longer hides it.
+                        current_until: flake.op.then(|| entry.until_t.unwrap_or(i64::MAX)),
+                    })
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             let scope_t = removal.scope_t;
             self.record_received_removal(removal).await?;
             // Its unindexed commits read as the erasures will have them.

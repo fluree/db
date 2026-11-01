@@ -184,9 +184,12 @@ impl Fluree {
                 .load_queryable_state_with_store(store.clone(), record.clone())
                 .await?;
             let snapshot = &state.snapshot;
+            let own = self
+                .captured_on(store.as_ref(), record.commit_head_id.as_ref(), captured)
+                .await?;
             // Each erased assertion, as of when it was made: an index holding
             // its history replays it there.
-            for c in captured.iter().filter(|c| c.flake.op) {
+            for c in own.iter().filter(|c| c.flake.op) {
                 let g_id = match &c.flake.g {
                     None => 0,
                     Some(g) => match snapshot

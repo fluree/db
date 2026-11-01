@@ -8,10 +8,12 @@
 use std::sync::Arc;
 
 use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, ErasureStage, Verifier};
-use fluree_db_api::retention::FactSelector;
-use fluree_db_api::{ApiError, Fluree, FlureeBuilder, ReindexOptions};
+use fluree_db_api::retention::{FactSelector, OccurrenceRef};
+use fluree_db_api::{ApiError, ConflictStrategy, Fluree, FlureeBuilder, ReindexOptions};
 use fluree_db_core::commit::codec::replacement::is_replacement;
-use fluree_db_core::{collect_first_parent_cids, load_commit_by_id, ContentId, ContentStore};
+use fluree_db_core::{
+    collect_first_parent_cids, load_commit_by_id, ContentId, ContentStore, FlakeValue,
+};
 use fluree_db_erasure::testing::NativeProver;
 use serde_json::{json, Value as JsonValue};
 
@@ -3314,3 +3316,127 @@ async fn a_purge_rebuild_announces_a_refresh() {
 
 #[path = "it_retention_erasure_transfer.rs"]
 mod transfer;
+
+/// Main and `side` each assert Alice's email at the same `t`, in commits of
+/// their own, and `late` branches from main after; `side` then merges main
+/// (having replaced its value first, with `replace`). Main's occurrence is
+/// erased and published: `side` reaches its commit only through the merge's
+/// other parent, so its index holds its own commit at that `t`. Returns
+/// main, `side`, `late` and that `t`.
+async fn independent_occurrences(
+    fluree: &Fluree,
+    name: &str,
+    replace: bool,
+) -> (String, String, String, i64) {
+    let main = ledger(fluree, name).await;
+    insert(
+        fluree,
+        &main,
+        json!({"@context": ctx(), "@id": "ex:seed", "ex:x": 0}),
+    )
+    .await;
+    fluree
+        .create_branch(name, "side", None, None)
+        .await
+        .unwrap();
+    let side = format!("{name}:side");
+    let alice = |marker: &str| json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret", "ex:marker": marker});
+    let t = insert(fluree, &main, alice("main")).await;
+    assert_eq!(insert(fluree, &side, alice("side")).await, t);
+    fluree
+        .create_branch(name, "late", None, None)
+        .await
+        .unwrap();
+    let late = format!("{name}:late");
+    if replace {
+        fluree
+            .graph(&side)
+            .transact()
+            .update(&json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:alice", "ex:email": "a@secret"},
+                "insert": {"@id": "ex:alice", "ex:email": "public"}
+            }))
+            .commit()
+            .await
+            .unwrap();
+    }
+    let merged = fluree
+        .merge_branch(name, "main", Some("side"), ConflictStrategy::TakeBranch)
+        .await
+        .unwrap();
+    assert!(!merged.fast_forward);
+
+    let original = commit_at(fluree, &main, t).await;
+    let store = store_of(fluree, &main).await;
+    let commit = load_commit_by_id(store.as_ref(), &original).await.unwrap();
+    let (slot, _) = commit
+        .occurrences()
+        .find(|(_, f)| f.o == FlakeValue::String("a@secret".into()))
+        .unwrap();
+    let occurrences = vec![OccurrenceRef {
+        commit: original.to_string(),
+        slot,
+    }];
+    fluree
+        .erase_occurrences(
+            &main,
+            ErasureRequest {
+                occurrences,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    for id in [&main, &side, &late] {
+        reindex(fluree, id).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(&main).await.unwrap().published, 1);
+    (main, side, late, t)
+}
+
+/// A purge erases from a branch's index only the occurrences of its own
+/// first-parent commits: `side`'s history keeps the same fact asserted at
+/// the same `t` by a commit of its own, while `late`'s index, which holds
+/// main's commit, is found holding it until the purge.
+#[tokio::test]
+async fn a_purge_keeps_a_branchs_own_history_of_the_same_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let (main, side, late, t) = independent_occurrences(&fluree, "it/own-history", true).await;
+    let at_t = || {
+        historical(
+            &fluree,
+            &side,
+            format!("{side}@t:{t}"),
+            None,
+            json!({"@id": "ex:alice", "ex:email": "?x"}),
+        )
+    };
+    assert_eq!(at_t().await.unwrap(), [json!("a@secret")]);
+    let scan = fluree.inspect_purge(&main).await.unwrap().scan;
+    assert_eq!(scan.indexed, [late, main.clone()], "{scan:?}");
+
+    assert_eq!(purge_until_purged(&fluree, &main).await.1, 1);
+    assert_eq!(at_t().await.unwrap(), [json!("a@secret")]);
+    assert_eq!(
+        objects(&fluree, &side, "ex:alice", "ex:email").await,
+        [json!("public")]
+    );
+}
+
+/// A branch's own current value, the same fact an erased commit it reaches
+/// through a merge asserted at the same `t`, neither blocks the purge nor
+/// leaves its index.
+#[tokio::test]
+async fn a_purge_keeps_a_branchs_own_current_value_of_the_same_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let (main, side, _, _) = independent_occurrences(&fluree, "it/own-current", false).await;
+    assert_eq!(purge_until_purged(&fluree, &main).await.1, 1);
+    assert_eq!(
+        objects(&fluree, &side, "ex:alice", "ex:email").await,
+        [json!("a@secret")]
+    );
+}

@@ -312,12 +312,39 @@ impl Fluree {
                 if let Some(flake) = decoded.at_slot(slot) {
                     captured.push(Captured {
                         flake: flake.clone(),
+                        commit: cid.clone(),
                         current_until: None,
                     });
                 }
             }
         }
         Ok(captured)
+    }
+
+    /// Of `captured`, what `head`'s index can hold: the occurrences of its
+    /// first-parent commits. A commit it reaches only through a merge's
+    /// other parent is in its index as the merge's flakes, and another
+    /// commit at that commit's `t` may assert the same fact.
+    pub(crate) async fn captured_on(
+        &self,
+        store: &dyn fluree_db_core::ContentStore,
+        head: Option<&ContentId>,
+        captured: &[Captured],
+    ) -> Result<Vec<Captured>> {
+        let (Some(head), Some(from)) = (head, captured.iter().map(|c| c.flake.t).min()) else {
+            return Ok(Vec::new());
+        };
+        let chain: std::collections::HashSet<ContentId> =
+            collect_first_parent_cids(store, head, from - 1)
+                .await?
+                .into_iter()
+                .map(|(_, cid)| cid)
+                .collect();
+        Ok(captured
+            .iter()
+            .filter(|c| chain.contains(&c.commit))
+            .cloned()
+            .collect())
     }
 
     /// The oldest bytes of `cid` still stored: a copy of its original, or
@@ -368,6 +395,8 @@ pub(crate) struct SourceOver {
 #[derive(Clone, Debug)]
 pub(crate) struct Captured {
     pub(crate) flake: Flake,
+    /// The erased commit that holds it.
+    pub(crate) commit: ContentId,
     /// For an assertion a holder had not retracted before its index: the
     /// `t` of the retraction that ended it (`i64::MAX` while current). An
     /// index built before then holds it as current, not only in history.
