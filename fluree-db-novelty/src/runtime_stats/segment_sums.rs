@@ -5,7 +5,10 @@
 //! are visited in, beyond the zero clamp each count gets (here applied once,
 //! to the sum, where the walk applies it per flake; the two differ only where
 //! a running count would dip below zero). Novelty segments are immutable, so
-//! each segment's sums are computed once and kept. A commit adds a segment,
+//! each segment's sums are computed once and kept with the segment, freed
+//! when it is (an index publish trims it, compaction merges it away). They
+//! hold no copy of a value: a distinct-value count keys on a hash of the
+//! value, and subjects share the segment's own `Sid`s. A commit adds a segment,
 //! and the view the next transaction plans with sums K segment deltas instead
 //! of walking every novelty flake: the walk made planning, and so every
 //! transaction WHERE and every query after a commit, O(novelty).
@@ -20,11 +23,15 @@ use crate::{Novelty, Segment};
 use fluree_db_core::{is_rdf_type, Flake, FlakeValue, GraphId, IndexStats, LedgerSnapshot, Sid};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+
+/// A segment's planner sums, under the ndv scope they were computed for.
+#[derive(Default)]
+pub(crate) struct SegmentSumsSlot(Mutex<Option<(u64, Arc<SegmentSums>)>>);
 
 /// One segment's planner sums.
 #[derive(Default)]
-struct SegmentSums {
+pub(crate) struct SegmentSums {
     flakes: i64,
     graph_flakes: HashMap<GraphId, i64>,
     classes: HashMap<Sid, i64>,
@@ -49,14 +56,24 @@ struct GraphPropertySums {
     observed: Vec<u8>,
 }
 
+/// Per value (keyed by [`value_key`]) and per subject, the net count.
 #[derive(Default)]
 struct NdvSums {
-    values: HashMap<(FlakeValue, Sid), i64>,
+    values: HashMap<u64, i64>,
     subjects: HashMap<Sid, i64>,
 }
 
-/// [`NdvSums`] merged across segments, borrowing their keys.
-type NdvRefs<'a> = (HashMap<&'a (FlakeValue, Sid), i64>, HashMap<&'a Sid, i64>);
+/// [`NdvSums`] merged across segments.
+type NdvRefs<'a> = (HashMap<u64, i64>, HashMap<&'a Sid, i64>);
+
+/// A value's identity for distinct-value counting: a hash of the term, so
+/// sums hold no copy of a string or vector. Distinct values sharing a hash
+/// count once, which an estimate tolerates.
+fn value_key(flake: &Flake) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (&flake.o, &flake.dt).hash(&mut hasher);
+    hasher.finish()
+}
 
 impl SegmentSums {
     /// What the walk in `assemble_fast_stats_inner` does per flake under the
@@ -80,9 +97,7 @@ impl SegmentSums {
             let tag = runtime_datatype_tag(flake);
             if !indexed_ndv.contains(&(flake.p.namespace_code, &*flake.p.name)) {
                 let ndv = sums.ndv.entry(flake.p.clone()).or_default();
-                *ndv.values
-                    .entry((flake.o.clone(), flake.dt.clone()))
-                    .or_insert(0) += delta;
+                *ndv.values.entry(value_key(flake)).or_insert(0) += delta;
                 *ndv.subjects.entry(flake.s.clone()).or_insert(0) += delta;
             }
             let property = sums.properties.entry(flake.p.clone()).or_default();
@@ -104,69 +119,30 @@ impl SegmentSums {
         }
         sums
     }
-
-    /// Map entries held, the cache's measure of size.
-    fn weight(&self) -> usize {
-        1 + self.graph_flakes.len()
-            + self.classes.len()
-            + self.properties.len()
-            + self.graph_properties.len()
-            + self
-                .ndv
-                .values()
-                .map(|ndv| ndv.values.len() + ndv.subjects.len())
-                .sum::<usize>()
-    }
 }
 
-/// Segment sums by `(segment id, ndv scope)`. Segment ids are process-unique
-/// and a segment never changes, so an entry never goes stale; the ndv scope
-/// is the set of predicates the index has no ndv for, which the sums depend
-/// on. Cleared whole when it grows past [`CACHE_MAX_WEIGHT`]: an entry costs
-/// one pass over its segment to rebuild.
-struct SumsCache {
-    entries: HashMap<(u64, u64), Arc<SegmentSums>>,
-    weight: usize,
-}
-
-const CACHE_MAX_WEIGHT: usize = 4 << 20;
-
-fn cache() -> &'static Mutex<SumsCache> {
-    static CACHE: OnceLock<Mutex<SumsCache>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(SumsCache {
-            entries: HashMap::new(),
-            weight: 0,
-        })
-    })
-}
-
+/// `segment`'s sums under `ndv_scope`, computed on first use and kept in the
+/// segment.
 fn segment_sums(
     segment: &Segment,
     ndv_scope: u64,
     snapshot: &LedgerSnapshot,
     indexed_ndv: &HashSet<(u16, &str)>,
 ) -> Arc<SegmentSums> {
-    let key = (segment.seg_id, ndv_scope);
-    if let Some(hit) = cache()
+    let slot = &segment.planner_sums.0;
+    if let Some((scope, sums)) = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entries
-        .get(&key)
+        .as_ref()
     {
-        return Arc::clone(hit);
+        if *scope == ndv_scope {
+            return Arc::clone(sums);
+        }
     }
     let sums = Arc::new(SegmentSums::of(&segment.flakes, snapshot, indexed_ndv));
-    let mut cache = cache()
+    *slot
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cache.weight + sums.weight() > CACHE_MAX_WEIGHT {
-        cache.entries.clear();
-        cache.weight = 0;
-    }
-    if cache.entries.insert(key, Arc::clone(&sums)).is_none() {
-        cache.weight += sums.weight();
-    }
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((ndv_scope, Arc::clone(&sums)));
     sums
 }
 
@@ -255,7 +231,7 @@ pub(super) fn planner_stats(
                 continue;
             }
             let acc = ndv_acc.entry((p.namespace_code, &*p.name)).or_default();
-            for (value, &delta) in &ndv.values {
+            for (&value, &delta) in &ndv.values {
                 *acc.0.entry(value).or_insert(0) += delta;
             }
             for (subject, &delta) in &ndv.subjects {

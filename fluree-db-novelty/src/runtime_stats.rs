@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 mod segment_sums;
+pub(crate) use segment_sums::SegmentSumsSlot;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StatsAssemblyError {

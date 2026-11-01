@@ -173,6 +173,9 @@ static NEXT_SEG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 struct Segment {
     /// Process-global unique id; stable cache identity (see [`NEXT_SEG_ID`]).
     seg_id: u64,
+    /// The planner stats sums of this segment's flakes, computed on first
+    /// use and kept with the segment: see `runtime_stats::segment_sums`.
+    planner_sums: runtime_stats::SegmentSumsSlot,
     flakes: Vec<Flake>,
     spot: Vec<u32>,
     psot: Vec<u32>,
@@ -222,6 +225,7 @@ impl Segment {
 
         Segment {
             seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            planner_sums: Default::default(),
             flakes,
             spot,
             psot,
@@ -300,6 +304,7 @@ impl Segment {
         }
         Segment {
             seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            planner_sums: Default::default(),
             flakes,
             spot,
             psot,
@@ -344,6 +349,7 @@ impl Segment {
         };
         Some(Segment {
             seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            planner_sums: Default::default(),
             spot: filter(&self.spot),
             psot: filter(&self.psot),
             post: filter(&self.post),
