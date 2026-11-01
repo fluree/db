@@ -31,6 +31,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use super::new_terms::{NewTermWriter, NewTerms};
 use super::vocab_file::{StringVocabReader, SubjectVocabReader};
 
 // ============================================================================
@@ -380,9 +381,9 @@ pub struct SeededSubjectMerge {
     pub total_unique: u64,
     /// How many of them the existing dictionary already held.
     pub existing: u64,
-    /// The rest, numbered above the existing watermarks: sorted by
-    /// `(ns_code, local_id)`, and so by reverse key too.
-    pub new_subjects: Vec<(u16, u64, Vec<u8>)>,
+    /// The rest, numbered above the existing watermarks, as sid64 →
+    /// suffix: sorted by sid64, and so by reverse key too.
+    pub new_subjects: NewTerms,
     /// Per-namespace watermarks after numbering `new_subjects`.
     pub watermarks: Vec<u64>,
     /// Whether any new local id exceeds `u16::MAX`.
@@ -393,14 +394,15 @@ pub struct SeededSubjectMerge {
 /// `lookup` finds keeps its id, and the rest are numbered from
 /// `watermarks[ns_code] + 1` up, as an incremental index build numbers them.
 ///
-/// Writes the per-chunk remap tables and no forward dictionary; the new
-/// subjects are returned for the caller to add to the existing one. The
-/// remaps are not monotone, so a chunk stream remapped through them is no
-/// longer sorted (see `relocalize_sorted_commit`).
+/// Writes the per-chunk remap tables and, to `new_subjects_path`, the new
+/// subjects for the caller to add to the existing dictionary. The remaps
+/// are not monotone, so a chunk stream remapped through them is no longer
+/// sorted (see `relocalize_sorted_commit`).
 pub fn merge_subject_vocabs_seeded(
     vocab_paths: &[PathBuf],
     chunk_ids: &[usize],
     remap_dir: &Path,
+    new_subjects_path: &Path,
     watermarks: &[u64],
     lookup: &mut ExistingIdLookup<'_>,
 ) -> io::Result<SeededSubjectMerge> {
@@ -408,6 +410,7 @@ pub fn merge_subject_vocabs_seeded(
         vocab_paths,
         chunk_ids,
         remap_dir,
+        new_subjects_path,
         watermarks,
         lookup,
         SEEDED_LOOKUP_BATCH,
@@ -418,6 +421,7 @@ fn merge_subjects_seeded_batched(
     vocab_paths: &[PathBuf],
     chunk_ids: &[usize],
     remap_dir: &Path,
+    new_subjects_path: &Path,
     watermarks: &[u64],
     lookup: &mut ExistingIdLookup<'_>,
     batch_size: usize,
@@ -454,13 +458,11 @@ fn merge_subjects_seeded_batched(
         }
     }
 
-    let mut out = SeededSubjectMerge {
-        total_unique: 0,
-        existing: 0,
-        new_subjects: Vec::new(),
-        watermarks: watermarks.to_vec(),
-        needs_wide: false,
-    };
+    let mut total_unique = 0u64;
+    let mut existing_count = 0u64;
+    let mut watermarks = watermarks.to_vec();
+    let mut needs_wide = false;
+    let mut new_subjects = NewTermWriter::create(new_subjects_path)?;
     // Unique keys awaiting a lookup, and every remap write that waits on
     // them as `(chunk_id, local_id, index into batch)`, in merge order.
     let mut batch: Vec<(u16, Vec<u8>)> = Vec::with_capacity(batch_size);
@@ -468,8 +470,7 @@ fn merge_subjects_seeded_batched(
 
     let mut resolve = |batch: &mut Vec<(u16, Vec<u8>)>,
                        writes: &mut Vec<(usize, u64, usize)>,
-                       remaps: &mut [SeqRemapU64],
-                       out: &mut SeededSubjectMerge|
+                       remaps: &mut [SeqRemapU64]|
      -> io::Result<()> {
         let keys: Vec<Vec<u8>> = batch
             .iter()
@@ -480,19 +481,20 @@ fn merge_subjects_seeded_batched(
         for ((ns_code, suffix), existing) in batch.drain(..).zip(found) {
             let sid64 = match existing {
                 Some(sid64) => {
-                    out.existing += 1;
+                    existing_count += 1;
                     sid64
                 }
                 None => {
                     let ns = ns_code as usize;
-                    if out.watermarks.len() <= ns {
-                        out.watermarks.resize(ns + 1, 0);
+                    if watermarks.len() <= ns {
+                        watermarks.resize(ns + 1, 0);
                     }
-                    out.watermarks[ns] += 1;
-                    let local_id = out.watermarks[ns];
-                    out.needs_wide |= local_id > u16::MAX as u64;
-                    out.new_subjects.push((ns_code, local_id, suffix));
-                    SubjectId::new(ns_code, local_id).as_u64()
+                    watermarks[ns] += 1;
+                    let local_id = watermarks[ns];
+                    needs_wide |= local_id > u16::MAX as u64;
+                    let sid64 = SubjectId::new(ns_code, local_id).as_u64();
+                    new_subjects.push(sid64, &suffix)?;
+                    sid64
                 }
             };
             sids.push(sid64);
@@ -509,9 +511,9 @@ fn merge_subjects_seeded_batched(
             .is_some_and(|(ns, suf)| *ns == entry.ns_code && *suf == entry.suffix);
         if !is_dup {
             if batch.len() == batch_size {
-                resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+                resolve(&mut batch, &mut writes, &mut remaps)?;
             }
-            out.total_unique += 1;
+            total_unique += 1;
             batch.push((entry.ns_code, entry.suffix));
         }
         writes.push((entry.chunk_id, entry.local_id, batch.len() - 1));
@@ -525,16 +527,23 @@ fn merge_subjects_seeded_batched(
             }));
         }
     }
-    resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+    resolve(&mut batch, &mut writes, &mut remaps)?;
 
     for remap in remaps {
         remap.finish()?;
     }
+    let out = SeededSubjectMerge {
+        total_unique,
+        existing: existing_count,
+        new_subjects: new_subjects.finish()?,
+        watermarks,
+        needs_wide,
+    };
 
     tracing::info!(
         unique_subjects = out.total_unique,
         existing = out.existing,
-        new = out.new_subjects.len(),
+        new = out.new_subjects.count,
         "seeded vocab merge: subjects done"
     );
     Ok(out)
@@ -549,7 +558,7 @@ pub struct SeededStringMerge {
     pub existing: u64,
     /// The rest, numbered from `watermark + 1` up: sorted by id, and so
     /// by value too.
-    pub new_strings: Vec<(u32, Vec<u8>)>,
+    pub new_strings: NewTerms,
     /// The string watermark after numbering `new_strings`.
     pub watermark: u32,
 }
@@ -560,6 +569,7 @@ pub fn merge_string_vocabs_seeded(
     vocab_paths: &[PathBuf],
     chunk_ids: &[usize],
     remap_dir: &Path,
+    new_strings_path: &Path,
     watermark: u32,
     lookup: &mut ExistingIdLookup<'_>,
 ) -> io::Result<SeededStringMerge> {
@@ -567,6 +577,7 @@ pub fn merge_string_vocabs_seeded(
         vocab_paths,
         chunk_ids,
         remap_dir,
+        new_strings_path,
         watermark,
         lookup,
         SEEDED_LOOKUP_BATCH,
@@ -577,6 +588,7 @@ fn merge_strings_seeded_batched(
     vocab_paths: &[PathBuf],
     chunk_ids: &[usize],
     remap_dir: &Path,
+    new_strings_path: &Path,
     watermark: u32,
     lookup: &mut ExistingIdLookup<'_>,
     batch_size: usize,
@@ -609,37 +621,34 @@ fn merge_strings_seeded_batched(
         }
     }
 
-    let mut out = SeededStringMerge {
-        total_unique: 0,
-        existing: 0,
-        new_strings: Vec::new(),
-        watermark,
-    };
+    let mut total_unique = 0u64;
+    let mut existing_count = 0u64;
+    let mut watermark = watermark;
+    let mut new_strings = NewTermWriter::create(new_strings_path)?;
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
     let mut writes: Vec<(usize, u64, usize)> = Vec::new();
 
     let mut resolve = |batch: &mut Vec<Vec<u8>>,
                        writes: &mut Vec<(usize, u64, usize)>,
-                       remaps: &mut [SeqRemapU32],
-                       out: &mut SeededStringMerge|
+                       remaps: &mut [SeqRemapU32]|
      -> io::Result<()> {
         let found = lookup(batch)?;
         let mut ids = Vec::with_capacity(batch.len());
         for (value, existing) in batch.drain(..).zip(found) {
             let id = match existing {
                 Some(id) => {
-                    out.existing += 1;
+                    existing_count += 1;
                     id
                 }
                 None => {
-                    out.watermark = out.watermark.checked_add(1).ok_or_else(|| {
+                    watermark = watermark.checked_add(1).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             "string id overflow (>4B unique strings)",
                         )
                     })?;
-                    out.new_strings.push((out.watermark, value));
-                    u64::from(out.watermark)
+                    new_strings.push(u64::from(watermark), &value)?;
+                    u64::from(watermark)
                 }
             };
             ids.push(id);
@@ -654,9 +663,9 @@ fn merge_strings_seeded_batched(
         let is_dup = batch.last().is_some_and(|k| *k == entry.key);
         if !is_dup {
             if batch.len() == batch_size {
-                resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+                resolve(&mut batch, &mut writes, &mut remaps)?;
             }
-            out.total_unique += 1;
+            total_unique += 1;
             batch.push(entry.key);
         }
         writes.push((entry.chunk_id, u64::from(entry.local_id), batch.len() - 1));
@@ -669,16 +678,22 @@ fn merge_strings_seeded_batched(
             }));
         }
     }
-    resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+    resolve(&mut batch, &mut writes, &mut remaps)?;
 
     for remap in remaps {
         remap.finish()?;
     }
+    let out = SeededStringMerge {
+        total_unique,
+        existing: existing_count,
+        new_strings: new_strings.finish()?,
+        watermark,
+    };
 
     tracing::info!(
         unique_strings = out.total_unique,
         existing = out.existing,
-        new = out.new_strings.len(),
+        new = out.new_strings.count,
         "seeded vocab merge: strings done"
     );
     Ok(out)
@@ -958,6 +973,16 @@ mod tests {
 
     // ---- Seeded merge tests ----
 
+    fn read_terms(terms: &NewTerms) -> Vec<(u64, Vec<u8>)> {
+        let mut reader = terms.reader().unwrap();
+        let mut out = Vec::new();
+        while let Some((id, value)) = reader.next_term().unwrap() {
+            out.push((id, value.to_vec()));
+        }
+        assert_eq!(out.len() as u64, terms.count);
+        out
+    }
+
     /// An existing dictionary for a seeded merge: reverse key → id.
     fn existing_lookup(
         existing: HashMap<Vec<u8>, u64>,
@@ -995,6 +1020,7 @@ mod tests {
             &[voc0, voc1],
             &[0, 1],
             &remap_dir,
+            &dir.join("subjects.new"),
             &watermarks,
             &mut lookup,
             1,
@@ -1004,11 +1030,11 @@ mod tests {
         assert_eq!(merged.total_unique, 4);
         assert_eq!(merged.existing, 1);
         assert_eq!(
-            merged.new_subjects,
+            read_terms(&merged.new_subjects),
             vec![
-                (5, 8, b"Alice".to_vec()),
-                (5, 9, b"Carol".to_vec()),
-                (9, 1, b"x".to_vec()),
+                (SubjectId::new(5, 8).as_u64(), b"Alice".to_vec()),
+                (SubjectId::new(5, 9).as_u64(), b"Carol".to_vec()),
+                (SubjectId::new(9, 1).as_u64(), b"x".to_vec()),
             ]
         );
         assert_eq!(merged.watermarks[5], 9);
@@ -1041,14 +1067,21 @@ mod tests {
         let voc1 = make_string_vocab(&dir, 1, &[b"apple", b"pear"]);
         let mut lookup = existing_lookup(HashMap::from([(b"kiwi".to_vec(), 2)]));
 
-        let merged =
-            merge_strings_seeded_batched(&[voc0, voc1], &[0, 1], &remap_dir, 40, &mut lookup, 1)
-                .unwrap();
+        let merged = merge_strings_seeded_batched(
+            &[voc0, voc1],
+            &[0, 1],
+            &remap_dir,
+            &dir.join("strings.new"),
+            40,
+            &mut lookup,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(merged.total_unique, 3);
         assert_eq!(merged.existing, 1);
         assert_eq!(
-            merged.new_strings,
+            read_terms(&merged.new_strings),
             vec![(41, b"apple".to_vec()), (42, b"pear".to_vec())]
         );
         assert_eq!(merged.watermark, 42);

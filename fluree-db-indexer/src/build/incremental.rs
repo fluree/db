@@ -4034,19 +4034,7 @@ pub async fn apply_dict_novelty(
         };
         use fluree_db_binary_index::PackBranchEntry;
 
-        let mut compaction_budget = if compaction_enabled() {
-            CompactionBudget::new()
-        } else {
-            CompactionBudget::disabled()
-        };
-        let mut pack_sizes = PackSizeCache::new();
-        // Every pack CID this cycle uploads, so any that compaction consumes
-        // before publication can be garbaged explicitly.
-        let mut uploaded_pack_cids: Vec<ContentId> = Vec::new();
-        // Streams compacted alongside their own novelty; the rest are swept
-        // afterwards with whatever budget survives.
-        let mut compacted_streams: std::collections::HashSet<Option<u16>> =
-            std::collections::HashSet::new();
+        let mut appends = ForwardPackAppends::default();
 
         // String forward packs.
         // Invariant: new_strings is sorted by string_id ascending (enforced by resolver).
@@ -4075,37 +4063,20 @@ pub async fn apply_dict_novelty(
                     .put(kind, &pack.bytes)
                     .await
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
-                uploaded_pack_cids.push(pack_cid.clone());
+                appends.record(&pack_cid, pack.bytes.len());
                 updated_refs.push(PackBranchEntry {
                     first_id: pack.first_id,
                     last_id: pack.last_id,
                     pack_cid,
                 });
             }
-
-            uploaded_pack_cids.extend(
-                compact_forward_packs(
-                    content_store,
-                    kind,
-                    &mut updated_refs,
-                    &mut pack_sizes,
-                    &mut compaction_budget,
-                    CompactionSpans::default(),
-                    "string",
-                )
-                .await?,
-            );
-            compacted_streams.insert(None);
-
-            let total_packs = updated_refs.len();
             new_dict_refs.forward_packs.string_fwd_packs = updated_refs;
+            appends.streams.push(None);
 
             tracing::debug!(
                 new_packs = pack_result.new_packs.len(),
                 new_strings = new_strings.len(),
-                total_packs,
-                "V6 Phase 3: string forward packs updated"
+                "V6 Phase 3: string forward packs appended"
             );
         }
 
@@ -4135,14 +4106,7 @@ pub async fn apply_dict_novelty(
             };
 
             for (ns_code, entries) in &by_ns {
-                // Find existing refs for this namespace.
-                let existing_ns_refs: Vec<PackBranchEntry> = new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter()
-                    .find(|(ns, _)| ns == ns_code)
-                    .map(|(_, refs)| refs.clone())
-                    .unwrap_or_default();
+                let refs = subject_ns_packs_mut(&mut new_dict_refs, *ns_code);
 
                 let entry_refs: Vec<(u64, &[u8])> = entries
                     .iter()
@@ -4151,164 +4115,223 @@ pub async fn apply_dict_novelty(
 
                 let pack_result = build_incremental_subject_packs_for_ns(
                     *ns_code,
-                    &existing_ns_refs,
+                    refs,
                     &entry_refs,
                 )
                 .map_err(|e| {
                     IndexerError::StorageWrite(format!("subject fwd pack build ns={ns_code}: {e}"))
                 })?;
 
-                // Upload new packs and build updated refs.
-                let mut updated_refs = existing_ns_refs;
+                // Upload new packs and append their refs.
                 for pack in &pack_result.new_packs {
                     let pack_cid = content_store
                         .put(kind, &pack.bytes)
                         .await
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
-                    uploaded_pack_cids.push(pack_cid.clone());
-                    updated_refs.push(PackBranchEntry {
+                    appends.record(&pack_cid, pack.bytes.len());
+                    refs.push(PackBranchEntry {
                         first_id: pack.first_id,
                         last_id: pack.last_id,
                         pack_cid,
                     });
                 }
-
-                uploaded_pack_cids.extend(
-                    compact_forward_packs(
-                        content_store,
-                        kind,
-                        &mut updated_refs,
-                        &mut pack_sizes,
-                        &mut compaction_budget,
-                        CompactionSpans::default(),
-                        &format!("subject ns={ns_code}"),
-                    )
-                    .await?,
-                );
-                compacted_streams.insert(Some(*ns_code));
-
-                let total_packs = updated_refs.len();
-
-                // Update or insert namespace entry.
-                if let Some(entry) = new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter_mut()
-                    .find(|(ns, _)| ns == ns_code)
-                {
-                    entry.1 = updated_refs;
-                } else {
-                    new_dict_refs
-                        .forward_packs
-                        .subject_fwd_ns_packs
-                        .push((*ns_code, updated_refs));
-                }
+                appends.streams.push(Some(*ns_code));
 
                 tracing::debug!(
                     ns_code,
                     new_packs = pack_result.new_packs.len(),
                     new_subjects = entries.len(),
-                    total_packs,
-                    "V6 Phase 3: subject forward packs updated"
+                    "V6 Phase 3: subject forward packs appended"
                 );
             }
         }
 
-        // Maintenance: a stream that received no novelty this cycle still
-        // carries whatever fragmentation it accumulated, and its packs are
-        // still loaded and mapped with the index. A namespace that goes quiet
-        // would otherwise keep its tiny packs forever. Sweep those with the
-        // leftover budget.
-        //
-        // Coverage rotates with `index_t` so that a ledger with more streams
-        // than one cycle's budget can service still reaches all of them over
-        // time, without persisting a cursor anywhere.
-        {
-            let mut pending: Vec<Option<u16>> = Vec::new();
-            if !compacted_streams.contains(&None) {
-                pending.push(None);
-            }
-            pending.extend(
-                new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter()
-                    .map(|(ns, _)| Some(*ns))
-                    .filter(|key| !compacted_streams.contains(key)),
-            );
-
-            if !pending.is_empty() {
-                let offset = (base_index_t.unsigned_abs() as usize) % pending.len();
-                pending.rotate_left(offset);
-            }
-
-            for key in pending {
-                if compaction_budget.exhausted() {
-                    break;
-                }
-                let (kind, label, refs) = match key {
-                    None => (
-                        ContentKind::DictBlob {
-                            dict: fluree_db_core::DictKind::StringForward,
-                        },
-                        "string (maintenance)".to_string(),
-                        &mut new_dict_refs.forward_packs.string_fwd_packs,
-                    ),
-                    Some(ns_code) => {
-                        let Some(entry) = new_dict_refs
-                            .forward_packs
-                            .subject_fwd_ns_packs
-                            .iter_mut()
-                            .find(|(ns, _)| *ns == ns_code)
-                        else {
-                            continue;
-                        };
-                        (
-                            ContentKind::DictBlob {
-                                dict: fluree_db_core::DictKind::SubjectForward,
-                            },
-                            format!("subject ns={ns_code} (maintenance)"),
-                            &mut entry.1,
-                        )
-                    }
-                };
-
-                uploaded_pack_cids.extend(
-                    compact_forward_packs(
-                        content_store,
-                        kind,
-                        refs,
-                        &mut pack_sizes,
-                        &mut compaction_budget,
-                        CompactionSpans::default(),
-                        &label,
-                    )
-                    .await?,
-                );
-            }
-        }
-
-        // Packs created and consumed within this cycle are referenced by no
-        // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
-        let transient = unreferenced_uploads(
-            &uploaded_pack_cids,
-            &new_dict_refs.forward_packs,
-            &base_dict_refs.forward_packs,
+        replaced_cids.extend(
+            compact_forward_streams(
+                content_store,
+                &mut new_dict_refs,
+                &base_dict_refs.forward_packs,
+                base_index_t,
+                appends,
+            )
+            .await?,
         );
-        if !transient.is_empty() {
-            tracing::debug!(
-                count = transient.len(),
-                "V6 Phase 3: forward packs created and compacted within one cycle"
-            );
-            replaced_cids.extend(transient);
-        }
     }
 
     Ok(DictNoveltyUpdate {
         dict_refs: new_dict_refs,
         replaced_cids,
     })
+}
+
+/// Forward packs one cycle appended, awaiting [`compact_forward_streams`].
+#[derive(Default)]
+pub(super) struct ForwardPackAppends {
+    /// Every pack uploaded, so any that compaction consumes before
+    /// publication can be garbaged explicitly.
+    uploaded: Vec<ContentId>,
+    sizes: PackSizeCache,
+    /// The streams appended to, in the order they are compacted: `None`
+    /// for strings, `Some(ns_code)` for a subject namespace.
+    pub(super) streams: Vec<Option<u16>>,
+}
+
+impl ForwardPackAppends {
+    pub(super) fn record(&mut self, cid: &ContentId, encoded_len: usize) {
+        self.sizes.insert(cid.clone(), encoded_len as u64);
+        self.uploaded.push(cid.clone());
+    }
+}
+
+/// The subject forward pack routing for `ns_code`, created empty if the
+/// namespace has none yet.
+pub(super) fn subject_ns_packs_mut(
+    dict_refs: &mut fluree_db_binary_index::DictRefs,
+    ns_code: u16,
+) -> &mut Vec<fluree_db_binary_index::PackBranchEntry> {
+    let streams = &mut dict_refs.forward_packs.subject_fwd_ns_packs;
+    let at = match streams.iter().position(|(ns, _)| *ns == ns_code) {
+        Some(at) => at,
+        None => {
+            streams.push((ns_code, Vec::new()));
+            streams.len() - 1
+        }
+    };
+    &mut streams[at].1
+}
+
+/// Compact the forward-pack streams a cycle appended to, then sweep the
+/// rest with whatever budget survives. Returns the packs created and
+/// consumed within the cycle, which no root references.
+pub(super) async fn compact_forward_streams(
+    content_store: &dyn ContentStore,
+    dict_refs: &mut fluree_db_binary_index::DictRefs,
+    base: &fluree_db_binary_index::DictPackRefs,
+    base_index_t: i64,
+    appends: ForwardPackAppends,
+) -> Result<Vec<ContentId>> {
+    let ForwardPackAppends {
+        mut uploaded,
+        sizes: mut pack_sizes,
+        streams,
+    } = appends;
+    let mut compaction_budget = if compaction_enabled() {
+        CompactionBudget::new()
+    } else {
+        CompactionBudget::disabled()
+    };
+
+    fn stream_refs(
+        dict_refs: &mut fluree_db_binary_index::DictRefs,
+        key: Option<u16>,
+    ) -> Option<(
+        ContentKind,
+        &mut Vec<fluree_db_binary_index::PackBranchEntry>,
+    )> {
+        match key {
+            None => Some((
+                ContentKind::DictBlob {
+                    dict: fluree_db_core::DictKind::StringForward,
+                },
+                &mut dict_refs.forward_packs.string_fwd_packs,
+            )),
+            Some(ns_code) => dict_refs
+                .forward_packs
+                .subject_fwd_ns_packs
+                .iter_mut()
+                .find(|(ns, _)| *ns == ns_code)
+                .map(|(_, refs)| {
+                    (
+                        ContentKind::DictBlob {
+                            dict: fluree_db_core::DictKind::SubjectForward,
+                        },
+                        refs,
+                    )
+                }),
+        }
+    }
+    fn stream_label(key: Option<u16>) -> String {
+        match key {
+            None => "string".to_string(),
+            Some(ns_code) => format!("subject ns={ns_code}"),
+        }
+    }
+
+    // Streams compacted alongside their own novelty.
+    for &key in &streams {
+        let Some((kind, refs)) = stream_refs(dict_refs, key) else {
+            continue;
+        };
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind,
+                refs,
+                &mut pack_sizes,
+                &mut compaction_budget,
+                CompactionSpans::default(),
+                &stream_label(key),
+            )
+            .await?,
+        );
+    }
+
+    // Maintenance: a stream that received no novelty this cycle still
+    // carries whatever fragmentation it accumulated, and its packs are
+    // still loaded and mapped with the index. A namespace that goes quiet
+    // would otherwise keep its tiny packs forever. Sweep those with the
+    // leftover budget.
+    //
+    // Coverage rotates with `index_t` so that a ledger with more streams
+    // than one cycle's budget can service still reaches all of them over
+    // time, without persisting a cursor anywhere.
+    let mut pending: Vec<Option<u16>> = Vec::new();
+    if !streams.contains(&None) {
+        pending.push(None);
+    }
+    pending.extend(
+        dict_refs
+            .forward_packs
+            .subject_fwd_ns_packs
+            .iter()
+            .map(|(ns, _)| Some(*ns))
+            .filter(|key| !streams.contains(key)),
+    );
+    if !pending.is_empty() {
+        let offset = (base_index_t.unsigned_abs() as usize) % pending.len();
+        pending.rotate_left(offset);
+    }
+    for key in pending {
+        if compaction_budget.exhausted() {
+            break;
+        }
+        let Some((kind, refs)) = stream_refs(dict_refs, key) else {
+            continue;
+        };
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind,
+                refs,
+                &mut pack_sizes,
+                &mut compaction_budget,
+                CompactionSpans::default(),
+                &format!("{} (maintenance)", stream_label(key)),
+            )
+            .await?,
+        );
+    }
+
+    // Packs created and consumed within this cycle are referenced by no
+    // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
+    let transient = unreferenced_uploads(&uploaded, &dict_refs.forward_packs, base);
+    if !transient.is_empty() {
+        tracing::debug!(
+            count = transient.len(),
+            "V6 Phase 3: forward packs created and compacted within one cycle"
+        );
+    }
+    Ok(transient)
 }
 
 /// Byte/object counts from a single leaf-blob upload, accumulated for tracing.

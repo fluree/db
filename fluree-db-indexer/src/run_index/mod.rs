@@ -40,6 +40,7 @@ pub use build::shared_pool;
 
 pub use vocab::dict_io;
 pub use vocab::dict_merge;
+pub use vocab::new_terms::{NewTermReader, NewTermWriter, NewTerms};
 pub use vocab::vocab_file;
 pub use vocab::vocab_merge;
 

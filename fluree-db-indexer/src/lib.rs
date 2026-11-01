@@ -470,7 +470,8 @@ pub async fn index_novelty(
     .await
 }
 
-pub use build::incremental::{apply_dict_novelty, predicate_sids, DictNoveltyUpdate};
+pub use build::dict_extend::extend_dicts;
+pub use build::incremental::{predicate_sids, DictNoveltyUpdate};
 pub use build::upload_dicts::{upload_numbig_arenas_from_disk, upload_vector_arenas_from_disk};
 
 /// Upload index artifacts (FLI3 leaves, FHS1 sidecars, FBR3 branches) to CAS.

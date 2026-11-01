@@ -16,7 +16,7 @@
 //! import started from. Both heads are published at the end, the commit
 //! head first and only if it has not moved.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use fluree_db_binary_index::format::index_root::NamedGraphRouting;
 use fluree_db_binary_index::{BinaryIndexStore, IndexRoot};
 use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, Storage};
 use fluree_db_indexer::run_index::resolver::SharedResolverState;
-use fluree_db_indexer::run_index::IncrementalNovelty;
+use fluree_db_indexer::run_index::{IncrementalNovelty, NewTerms};
 use fluree_db_transact::NamespaceRegistry;
 
 use crate::import::{ImportConfig, ImportError, ImportResult, ImportSource};
@@ -69,15 +69,20 @@ impl GraphImportSeed {
     }
 }
 
+/// Where in its run directory an import into an existing ledger writes the
+/// subjects and strings the ledger's dictionaries lack.
+pub(crate) const NEW_SUBJECTS_FILE: &str = "subjects.new";
+pub(crate) const NEW_STRINGS_FILE: &str = "strings.new";
+
 /// How an import into an existing ledger grew its dictionaries.
 pub(crate) struct SeededDicts {
-    /// New subjects, sorted by `(ns_code, local_id)`.
-    pub new_subjects: Vec<(u16, u64, Vec<u8>)>,
+    /// New subjects, sid64 → namespace-stripped suffix.
+    pub new_subjects: NewTerms,
     pub subject_watermarks: Vec<u64>,
     /// Whether a new local id exceeds `u16::MAX`.
     pub needs_wide: bool,
-    /// New strings, sorted by id.
-    pub new_strings: Vec<(u32, Vec<u8>)>,
+    /// New strings, string id → value.
+    pub new_strings: NewTerms,
     pub string_watermark: u32,
     /// The ledger's predicates, datatypes and graphs after the import, in
     /// id order (graph dict id + 1 = g_id).
@@ -150,13 +155,12 @@ pub(crate) async fn splice_graph_into_index(
 
     // ---- Dictionaries ----
     let dicts = graph.dicts;
-    let dict_update = fluree_db_indexer::apply_dict_novelty(
+    let dict_update = fluree_db_indexer::extend_dicts(
         cs.as_ref(),
         &base.dict_refs,
         base.index_t,
         &dicts.new_subjects,
         &dicts.new_strings,
-        None,
     )
     .await
     .map_err(upload_error)?;
@@ -201,10 +205,11 @@ pub(crate) async fn splice_graph_into_index(
             .flat_map(|g| &g.properties)
             .any(|p| is_reifies(p.p_id))
     });
+    let new_classes = new_class_names(seed, &graph.stats, &dicts.new_subjects)?;
     let stats = graph_stats(
         seed,
         &graph.stats,
-        &dicts,
+        &new_classes,
         &predicate_sids,
         &graph.language_tags,
         &namespace_codes,
@@ -298,15 +303,67 @@ pub(crate) async fn splice_graph_into_index(
     })
 }
 
+/// The suffixes of the graph's classes, and of the classes its references
+/// point at, that are new to the ledger: only the import's own new
+/// subjects name them yet.
+fn new_class_names(
+    seed: &GraphImportSeed,
+    stats: &Option<(
+        fluree_db_indexer::stats::IdStatsResult,
+        Option<fluree_db_indexer::stats::SpotClassStats>,
+    )>,
+    new_subjects: &NewTerms,
+) -> std::io::Result<HashMap<u64, String>> {
+    let mut names = HashMap::new();
+    let Some((_, Some(class_stats))) = stats else {
+        return Ok(names);
+    };
+    let watermarks = &seed.base_root.subject_watermarks;
+    let is_new = |sid64: &u64| {
+        let id = fluree_db_core::subject_id::SubjectId::from_u64(*sid64);
+        watermarks
+            .get(id.ns_code() as usize)
+            .is_none_or(|&watermark| id.local_id() > watermark)
+    };
+    let in_graph = |&(g_id, _): &(u16, u64)| g_id == seed.g_id;
+    let classes = class_stats
+        .class_counts
+        .keys()
+        .filter(|key| in_graph(key))
+        .map(|&(_, class)| class);
+    let targets = class_stats
+        .class_prop_refs
+        .iter()
+        .filter(|(key, _)| in_graph(key))
+        .flat_map(|(_, by_property)| by_property.values())
+        .flat_map(|by_target| by_target.keys().copied());
+    let mut wanted: BTreeSet<u64> = classes.chain(targets).filter(is_new).collect();
+
+    // The file is in sid64 order, so the scan stops past the last wanted.
+    let Some(&last) = wanted.last() else {
+        return Ok(names);
+    };
+    let mut reader = new_subjects.reader()?;
+    while let Some((sid64, suffix)) = reader.next_term()? {
+        if sid64 > last {
+            break;
+        }
+        if wanted.remove(&sid64) {
+            names.insert(sid64, String::from_utf8_lossy(suffix).into_owned());
+        }
+    }
+    Ok(names)
+}
+
 /// The new graph's stats entry, its classes named through the ledger's
-/// dictionary and the import's new subjects.
+/// dictionary and `new_classes`.
 fn graph_stats(
     seed: &GraphImportSeed,
     stats: &Option<(
         fluree_db_indexer::stats::IdStatsResult,
         Option<fluree_db_indexer::stats::SpotClassStats>,
     )>,
-    dicts: &SeededDicts,
+    new_classes: &HashMap<u64, String>,
     predicate_sids: &[(u16, String)],
     language_tags: &[String],
     namespace_codes: &BTreeMap<u16, String>,
@@ -319,14 +376,9 @@ fn graph_stats(
         .cloned()?;
     if let Some(class_stats) = class_stats {
         let mut resolve = |sid64: u64| -> Option<Sid> {
-            let id = fluree_db_core::subject_id::SubjectId::from_u64(sid64);
-            let (ns_code, local_id) = (id.ns_code(), id.local_id());
-            let found = dicts
-                .new_subjects
-                .binary_search_by(|(ns, local, _)| (*ns, *local).cmp(&(ns_code, local_id)));
-            if let Ok(i) = found {
-                let suffix = std::str::from_utf8(&dicts.new_subjects[i].2).ok()?;
-                return Some(Sid::new(ns_code, suffix));
+            let ns_code = fluree_db_core::subject_id::SubjectId::from_u64(sid64).ns_code();
+            if let Some(suffix) = new_classes.get(&sid64) {
+                return Some(Sid::new(ns_code, suffix.as_str()));
             }
             let iri = seed.base_store.resolve_subject_iri(sid64).ok()?;
             let prefix = namespace_codes.get(&ns_code).map_or("", String::as_str);

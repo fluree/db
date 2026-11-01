@@ -6108,7 +6108,8 @@ where
     let run_dir_for_subj = run_dir_path.clone();
     let remap_dir_for_subj = remap_dir_path.clone();
     // Over an existing ledger, its dictionaries name the terms they already
-    // hold, and only the rest are numbered; nothing is written to `run_dir`.
+    // hold, and only the rest are numbered, written to `run_dir` as the
+    // terms to add to them.
     let subject_seed = seed.map(|seed| {
         (
             Arc::clone(&seed.subject_tree),
@@ -6135,6 +6136,7 @@ where
                     &subj_vocab_paths_for_task,
                     &chunk_ids_for_subj,
                     &remap_dir_for_subj,
+                    &run_dir_for_subj.join(crate::graph_import::NEW_SUBJECTS_FILE),
                     &watermarks,
                     &mut lookup,
                 )
@@ -6190,6 +6192,7 @@ where
                     &str_vocab_paths_for_task,
                     &chunk_ids_for_str,
                     &remap_dir_for_str,
+                    &run_dir_for_str.join(crate::graph_import::NEW_STRINGS_FILE),
                     watermark,
                     &mut lookup,
                 )
