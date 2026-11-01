@@ -362,6 +362,329 @@ pub fn merge_string_vocabs(
 }
 
 // ============================================================================
+// Seeded merges (extend an existing dictionary)
+// ============================================================================
+
+/// Resolves a batch of reverse-dictionary keys against an existing
+/// dictionary: the id each key already has, in key order. Keys arrive
+/// sorted, a batch at a time.
+pub type ExistingIdLookup<'a> = dyn FnMut(&[Vec<u8>]) -> io::Result<Vec<Option<u64>>> + 'a;
+
+/// Unique keys a seeded merge resolves per [`ExistingIdLookup`] call.
+const SEEDED_LOOKUP_BATCH: usize = 16 * 1024;
+
+/// Result of [`merge_subject_vocabs_seeded`].
+#[derive(Debug)]
+pub struct SeededSubjectMerge {
+    /// Number of globally unique subjects in the merged vocabularies.
+    pub total_unique: u64,
+    /// How many of them the existing dictionary already held.
+    pub existing: u64,
+    /// The rest, numbered above the existing watermarks: sorted by
+    /// `(ns_code, local_id)`, and so by reverse key too.
+    pub new_subjects: Vec<(u16, u64, Vec<u8>)>,
+    /// Per-namespace watermarks after numbering `new_subjects`.
+    pub watermarks: Vec<u64>,
+    /// Whether any new local id exceeds `u16::MAX`.
+    pub needs_wide: bool,
+}
+
+/// [`merge_subject_vocabs`] over an existing dictionary: a subject
+/// `lookup` finds keeps its id, and the rest are numbered from
+/// `watermarks[ns_code] + 1` up, as an incremental index build numbers them.
+///
+/// Writes the per-chunk remap tables and no forward dictionary; the new
+/// subjects are returned for the caller to add to the existing one. The
+/// remaps are not monotone, so a chunk stream remapped through them is no
+/// longer sorted (see `relocalize_sorted_commit`).
+pub fn merge_subject_vocabs_seeded(
+    vocab_paths: &[PathBuf],
+    chunk_ids: &[usize],
+    remap_dir: &Path,
+    watermarks: &[u64],
+    lookup: &mut ExistingIdLookup<'_>,
+) -> io::Result<SeededSubjectMerge> {
+    merge_subjects_seeded_batched(
+        vocab_paths,
+        chunk_ids,
+        remap_dir,
+        watermarks,
+        lookup,
+        SEEDED_LOOKUP_BATCH,
+    )
+}
+
+fn merge_subjects_seeded_batched(
+    vocab_paths: &[PathBuf],
+    chunk_ids: &[usize],
+    remap_dir: &Path,
+    watermarks: &[u64],
+    lookup: &mut ExistingIdLookup<'_>,
+    batch_size: usize,
+) -> io::Result<SeededSubjectMerge> {
+    use fluree_db_binary_index::dict::reverse_leaf::subject_reverse_key;
+    use fluree_db_core::subject_id::SubjectId;
+
+    let k = vocab_paths.len();
+    assert_eq!(
+        chunk_ids.len(),
+        k,
+        "chunk_ids must match vocab_paths length"
+    );
+
+    let mut readers: Vec<SubjectVocabReader> = Vec::with_capacity(k);
+    let mut remaps: Vec<SeqRemapU64> = Vec::with_capacity(k);
+    for (i, path) in vocab_paths.iter().enumerate() {
+        let reader = SubjectVocabReader::open(path)?;
+        let entry_count = reader.header().entry_count;
+        let remap_path = remap_dir.join(format!("subjects_{:05}.rmp", chunk_ids[i]));
+        remaps.push(SeqRemapU64::create(&remap_path, entry_count)?);
+        readers.push(reader);
+    }
+
+    let mut heap: BinaryHeap<Reverse<SubjectHeapEntry>> = BinaryHeap::with_capacity(k);
+    for (chunk_id, reader) in readers.iter_mut().enumerate() {
+        if let Some(entry) = reader.next_entry()? {
+            heap.push(Reverse(SubjectHeapEntry {
+                ns_code: entry.ns_code,
+                suffix: entry.suffix,
+                local_id: entry.local_id,
+                chunk_id,
+            }));
+        }
+    }
+
+    let mut out = SeededSubjectMerge {
+        total_unique: 0,
+        existing: 0,
+        new_subjects: Vec::new(),
+        watermarks: watermarks.to_vec(),
+        needs_wide: false,
+    };
+    // Unique keys awaiting a lookup, and every remap write that waits on
+    // them as `(chunk_id, local_id, index into batch)`, in merge order.
+    let mut batch: Vec<(u16, Vec<u8>)> = Vec::with_capacity(batch_size);
+    let mut writes: Vec<(usize, u64, usize)> = Vec::new();
+
+    let mut resolve = |batch: &mut Vec<(u16, Vec<u8>)>,
+                       writes: &mut Vec<(usize, u64, usize)>,
+                       remaps: &mut [SeqRemapU64],
+                       out: &mut SeededSubjectMerge|
+     -> io::Result<()> {
+        let keys: Vec<Vec<u8>> = batch
+            .iter()
+            .map(|(ns, suffix)| subject_reverse_key(*ns, suffix))
+            .collect();
+        let found = lookup(&keys)?;
+        let mut sids = Vec::with_capacity(batch.len());
+        for ((ns_code, suffix), existing) in batch.drain(..).zip(found) {
+            let sid64 = match existing {
+                Some(sid64) => {
+                    out.existing += 1;
+                    sid64
+                }
+                None => {
+                    let ns = ns_code as usize;
+                    if out.watermarks.len() <= ns {
+                        out.watermarks.resize(ns + 1, 0);
+                    }
+                    out.watermarks[ns] += 1;
+                    let local_id = out.watermarks[ns];
+                    out.needs_wide |= local_id > u16::MAX as u64;
+                    out.new_subjects.push((ns_code, local_id, suffix));
+                    SubjectId::new(ns_code, local_id).as_u64()
+                }
+            };
+            sids.push(sid64);
+        }
+        for (chunk_id, local_id, key) in writes.drain(..) {
+            remaps[chunk_id].set(local_id, sids[key])?;
+        }
+        Ok(())
+    };
+
+    while let Some(Reverse(entry)) = heap.pop() {
+        let is_dup = batch
+            .last()
+            .is_some_and(|(ns, suf)| *ns == entry.ns_code && *suf == entry.suffix);
+        if !is_dup {
+            if batch.len() == batch_size {
+                resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+            }
+            out.total_unique += 1;
+            batch.push((entry.ns_code, entry.suffix));
+        }
+        writes.push((entry.chunk_id, entry.local_id, batch.len() - 1));
+
+        if let Some(next) = readers[entry.chunk_id].next_entry()? {
+            heap.push(Reverse(SubjectHeapEntry {
+                ns_code: next.ns_code,
+                suffix: next.suffix,
+                local_id: next.local_id,
+                chunk_id: entry.chunk_id,
+            }));
+        }
+    }
+    resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+
+    for remap in remaps {
+        remap.finish()?;
+    }
+
+    tracing::info!(
+        unique_subjects = out.total_unique,
+        existing = out.existing,
+        new = out.new_subjects.len(),
+        "seeded vocab merge: subjects done"
+    );
+    Ok(out)
+}
+
+/// Result of [`merge_string_vocabs_seeded`].
+#[derive(Debug)]
+pub struct SeededStringMerge {
+    /// Number of globally unique strings in the merged vocabularies.
+    pub total_unique: u64,
+    /// How many of them the existing dictionary already held.
+    pub existing: u64,
+    /// The rest, numbered from `watermark + 1` up: sorted by id, and so
+    /// by value too.
+    pub new_strings: Vec<(u32, Vec<u8>)>,
+    /// The string watermark after numbering `new_strings`.
+    pub watermark: u32,
+}
+
+/// [`merge_string_vocabs`] over an existing dictionary, as
+/// [`merge_subject_vocabs_seeded`] is over subjects.
+pub fn merge_string_vocabs_seeded(
+    vocab_paths: &[PathBuf],
+    chunk_ids: &[usize],
+    remap_dir: &Path,
+    watermark: u32,
+    lookup: &mut ExistingIdLookup<'_>,
+) -> io::Result<SeededStringMerge> {
+    merge_strings_seeded_batched(
+        vocab_paths,
+        chunk_ids,
+        remap_dir,
+        watermark,
+        lookup,
+        SEEDED_LOOKUP_BATCH,
+    )
+}
+
+fn merge_strings_seeded_batched(
+    vocab_paths: &[PathBuf],
+    chunk_ids: &[usize],
+    remap_dir: &Path,
+    watermark: u32,
+    lookup: &mut ExistingIdLookup<'_>,
+    batch_size: usize,
+) -> io::Result<SeededStringMerge> {
+    let k = vocab_paths.len();
+    assert_eq!(
+        chunk_ids.len(),
+        k,
+        "chunk_ids must match vocab_paths length"
+    );
+
+    let mut readers: Vec<StringVocabReader> = Vec::with_capacity(k);
+    let mut remaps: Vec<SeqRemapU32> = Vec::with_capacity(k);
+    for (i, path) in vocab_paths.iter().enumerate() {
+        let reader = StringVocabReader::open(path)?;
+        let entry_count = reader.header().entry_count;
+        let remap_path = remap_dir.join(format!("strings_{:05}.rmp", chunk_ids[i]));
+        remaps.push(SeqRemapU32::create(&remap_path, entry_count)?);
+        readers.push(reader);
+    }
+
+    let mut heap: BinaryHeap<Reverse<StringHeapEntry>> = BinaryHeap::with_capacity(k);
+    for (chunk_id, reader) in readers.iter_mut().enumerate() {
+        if let Some(entry) = reader.next_entry()? {
+            heap.push(Reverse(StringHeapEntry {
+                key: entry.string_bytes,
+                local_id: entry.local_id,
+                chunk_id,
+            }));
+        }
+    }
+
+    let mut out = SeededStringMerge {
+        total_unique: 0,
+        existing: 0,
+        new_strings: Vec::new(),
+        watermark,
+    };
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
+    let mut writes: Vec<(usize, u64, usize)> = Vec::new();
+
+    let mut resolve = |batch: &mut Vec<Vec<u8>>,
+                       writes: &mut Vec<(usize, u64, usize)>,
+                       remaps: &mut [SeqRemapU32],
+                       out: &mut SeededStringMerge|
+     -> io::Result<()> {
+        let found = lookup(batch)?;
+        let mut ids = Vec::with_capacity(batch.len());
+        for (value, existing) in batch.drain(..).zip(found) {
+            let id = match existing {
+                Some(id) => {
+                    out.existing += 1;
+                    id
+                }
+                None => {
+                    out.watermark = out.watermark.checked_add(1).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "string id overflow (>4B unique strings)",
+                        )
+                    })?;
+                    out.new_strings.push((out.watermark, value));
+                    u64::from(out.watermark)
+                }
+            };
+            ids.push(id);
+        }
+        for (chunk_id, local_id, key) in writes.drain(..) {
+            remaps[chunk_id].set(local_id, ids[key])?;
+        }
+        Ok(())
+    };
+
+    while let Some(Reverse(entry)) = heap.pop() {
+        let is_dup = batch.last().is_some_and(|k| *k == entry.key);
+        if !is_dup {
+            if batch.len() == batch_size {
+                resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+            }
+            out.total_unique += 1;
+            batch.push(entry.key);
+        }
+        writes.push((entry.chunk_id, u64::from(entry.local_id), batch.len() - 1));
+
+        if let Some(next) = readers[entry.chunk_id].next_entry()? {
+            heap.push(Reverse(StringHeapEntry {
+                key: next.string_bytes,
+                local_id: next.local_id,
+                chunk_id: entry.chunk_id,
+            }));
+        }
+    }
+    resolve(&mut batch, &mut writes, &mut remaps, &mut out)?;
+
+    for remap in remaps {
+        remap.finish()?;
+    }
+
+    tracing::info!(
+        unique_strings = out.total_unique,
+        existing = out.existing,
+        new = out.new_strings.len(),
+        "seeded vocab merge: strings done"
+    );
+    Ok(out)
+}
+
+// ============================================================================
 // Sequential remap writers
 // ============================================================================
 //
@@ -631,6 +954,109 @@ mod tests {
         let path = dir.join(format!("chunk_{chunk_id:05}.strings.voc"));
         dict.sort_and_write_sorted_vocab(&path).unwrap();
         path
+    }
+
+    // ---- Seeded merge tests ----
+
+    /// An existing dictionary for a seeded merge: reverse key → id.
+    fn existing_lookup(
+        existing: HashMap<Vec<u8>, u64>,
+    ) -> impl FnMut(&[Vec<u8>]) -> io::Result<Vec<Option<u64>>> {
+        move |keys: &[Vec<u8>]| {
+            assert!(
+                keys.windows(2).all(|w| w[0] < w[1]),
+                "batches arrive sorted"
+            );
+            Ok(keys.iter().map(|k| existing.get(k).copied()).collect())
+        }
+    }
+
+    #[test]
+    fn seeded_subject_merge_keeps_existing_ids_and_numbers_the_rest() {
+        use fluree_db_binary_index::dict::reverse_leaf::subject_reverse_key;
+        use fluree_db_core::subject_id::SubjectId;
+
+        let dir = temp_dir("subj_seeded");
+        let remap_dir = dir.join("remap");
+        std::fs::create_dir_all(&remap_dir).unwrap();
+
+        let voc0 = make_subject_vocab(&dir, 0, &[(5, b"Alice"), (5, b"Bob"), (9, b"x")]);
+        let voc1 = make_subject_vocab(&dir, 1, &[(5, b"Alice"), (5, b"Carol"), (9, b"x")]);
+
+        // Bob is already in the ledger as local id 3; ns 5's watermark is 7.
+        let bob = SubjectId::new(5, 3).as_u64();
+        let mut lookup = existing_lookup(HashMap::from([(subject_reverse_key(5, b"Bob"), bob)]));
+        let mut watermarks = vec![0u64; 6];
+        watermarks[5] = 7;
+
+        // A batch of one forces a lookup at every unique key, with the
+        // cross-chunk duplicates of `Alice` and `x` straddling batches.
+        let merged = merge_subjects_seeded_batched(
+            &[voc0, voc1],
+            &[0, 1],
+            &remap_dir,
+            &watermarks,
+            &mut lookup,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(merged.total_unique, 4);
+        assert_eq!(merged.existing, 1);
+        assert_eq!(
+            merged.new_subjects,
+            vec![
+                (5, 8, b"Alice".to_vec()),
+                (5, 9, b"Carol".to_vec()),
+                (9, 1, b"x".to_vec()),
+            ]
+        );
+        assert_eq!(merged.watermarks[5], 9);
+        assert_eq!(merged.watermarks[9], 1);
+        assert!(!merged.needs_wide);
+
+        let remap0 = MmapSubjectRemap::open(remap_dir.join("subjects_00000.rmp")).unwrap();
+        let remap1 = MmapSubjectRemap::open(remap_dir.join("subjects_00001.rmp")).unwrap();
+        let alice = SubjectId::new(5, 8).as_u64();
+        let carol = SubjectId::new(5, 9).as_u64();
+        let x = SubjectId::new(9, 1).as_u64();
+        // Chunk-local ids are sorted positions: Alice, Bob, x / Alice, Carol, x.
+        assert_eq!(
+            (0..3).map(|i| remap0.get(i).unwrap()).collect::<Vec<_>>(),
+            [alice, bob, x]
+        );
+        assert_eq!(
+            (0..3).map(|i| remap1.get(i).unwrap()).collect::<Vec<_>>(),
+            [alice, carol, x]
+        );
+    }
+
+    #[test]
+    fn seeded_string_merge_keeps_existing_ids_and_numbers_the_rest() {
+        let dir = temp_dir("str_seeded");
+        let remap_dir = dir.join("remap");
+        std::fs::create_dir_all(&remap_dir).unwrap();
+
+        let voc0 = make_string_vocab(&dir, 0, &[b"apple", b"kiwi"]);
+        let voc1 = make_string_vocab(&dir, 1, &[b"apple", b"pear"]);
+        let mut lookup = existing_lookup(HashMap::from([(b"kiwi".to_vec(), 2)]));
+
+        let merged =
+            merge_strings_seeded_batched(&[voc0, voc1], &[0, 1], &remap_dir, 40, &mut lookup, 1)
+                .unwrap();
+
+        assert_eq!(merged.total_unique, 3);
+        assert_eq!(merged.existing, 1);
+        assert_eq!(
+            merged.new_strings,
+            vec![(41, b"apple".to_vec()), (42, b"pear".to_vec())]
+        );
+        assert_eq!(merged.watermark, 42);
+
+        let remap0 = MmapStringRemap::open(remap_dir.join("strings_00000.rmp")).unwrap();
+        let remap1 = MmapStringRemap::open(remap_dir.join("strings_00001.rmp")).unwrap();
+        assert_eq!((remap0.get(0).unwrap(), remap0.get(1).unwrap()), (41, 2));
+        assert_eq!((remap1.get(0).unwrap(), remap1.get(1).unwrap()), (41, 42));
     }
 
     // ---- Subject merge tests ----
