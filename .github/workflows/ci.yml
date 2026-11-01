@@ -362,7 +362,7 @@ jobs:
           - os: ubuntu-24.04
             rustflags: "-C link-arg=-fuse-ld=mold"
           # mold is Linux-only; clear the workflow-level linker flag.
-          - os: macos-15
+          - os: macos-26
             rustflags: ""
           - os: windows-2025
             rustflags: ""
@@ -370,6 +370,8 @@ jobs:
     timeout-minutes: 60
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
+      # .cargo/config.toml's value; maturin reads it to tag the macOS wheel.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - if: runner.os == 'Windows'
         run: git config --global core.longpaths true

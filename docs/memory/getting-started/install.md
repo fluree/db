@@ -31,7 +31,7 @@ Open a **new** PowerShell session and verify with `fluree --version`. The binary
 # Linux x86_64
 curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-x86_64-unknown-linux-gnu.tar.xz | tar xJ
 
-# macOS aarch64
+# macOS aarch64 (macOS 14 or later)
 curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-aarch64-apple-darwin.tar.xz | tar xJ
 ```
 

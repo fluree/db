@@ -35,11 +35,14 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: asset-publisher-8-core
           - target: aarch64-apple-darwin
-            runner: macos-14-xlarge
+            runner: macos-26-xlarge
           - target: x86_64-pc-windows-msvc
             runner: standalone-release-windows-x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
+    env:
+      # .cargo/config.toml's value; maturin reads it to tag the macOS wheel.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - name: Enable long paths
         run: git config --global core.longpaths true

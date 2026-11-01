@@ -507,6 +507,10 @@ The `Garbage collection complete` log line's `retained_count` is replaced by `re
 
 The first `fluree doc ingest` after the upgrade re-parses and re-ingests every document once, and the ledger moves to the new graph shape: `doco:Document` becomes `foaf:Document`, `doco:ListItem` goes away, and every chunk, mention, relation and structure-node IRI moves. The previous extraction is retracted in full. A triple you added to a chunk or relation node stays on that node's old IRI. Triples on the document node are unaffected, since its IRI doesn't move. An embedding model whose width differs from the one the ledger holds is refused ([Mixing models](../unstructured/concepts/vector-search.md#mixing-models)). See [What gets built](../unstructured/concepts/what-gets-built.md).
 
+#### macOS builds need macOS 14 or later
+
+The CLI binary and the Python wheel for Apple silicon are built for macOS 14 (Sonoma) and later; earlier releases ran on macOS 11. On an older macOS the CLI does not start, and `pip install fluree` finds no wheel to install.
+
 #### `fluree-track-policy` is now parsed by the server
 
 Previously the server recognised `fluree-track-meta`, `fluree-track-fuel`, and
@@ -600,7 +604,7 @@ Fluree works with:
 
 **Server:**
 - Linux (x86_64, aarch64)
-- macOS (Intel, Apple Silicon)
+- macOS 14 or later (Apple silicon)
 - Windows (x86_64)
 
 **Clients:**

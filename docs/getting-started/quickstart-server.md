@@ -44,7 +44,7 @@ Download the latest release for your platform from [GitHub Releases](https://git
 curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-x86_64-unknown-linux-gnu.tar.xz | tar xJ
 chmod +x fluree-db-cli-x86_64-unknown-linux-gnu/fluree
 
-# macOS (Apple Silicon)
+# macOS 14 or later (Apple Silicon)
 curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-aarch64-apple-darwin.tar.xz | tar xJ
 chmod +x fluree-db-cli-aarch64-apple-darwin/fluree
 ```
