@@ -50,10 +50,7 @@ fn assert_contention(err: &ApiError) {
 #[tokio::test(flavor = "current_thread")]
 async fn a_staged_write_that_loses_every_race_is_commit_contention() {
     let (spans, _guard) = crate::support::span_capture::init_test_tracing();
-    // `contended` commits once, through the same callsites; a sibling test
-    // can pin their interest to "never" while the subscriber installs.
     let fluree = contended().await;
-    tracing::callsite::rebuild_interest_cache();
     let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
     let before = spans.find_spans("txn_attempts").len();
 

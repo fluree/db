@@ -56,7 +56,7 @@ Query parameters:
 | `graph` | Target named graph IRI — the sync scope. **Omit it to sync the default graph** |
 | `default` | Target the default graph explicitly (a bare key: `?default`); the same as omitting `graph`. Passing both is a `400` |
 | `dryRun=true` | Stage and report the delta (`asserted`/`retracted` counts) without committing — under the same policy, header, and inline-constraint inputs the real run uses, so it reports what the real run would do (or fails the way it would) |
-| `allowEmpty=true` | Confirm an empty payload (`"@graph": []`, or an RDF document with no triples), which clears the graph |
+| `allowEmpty=true` | Confirm an empty payload (`[]` or `"@graph": []`, or an RDF document with no triples), which clears the graph |
 
 ### Payload formats
 
@@ -142,7 +142,7 @@ applies on every entry point.
 
 ## Safety rails
 
-- **Empty payload requires opt-in.** `"@graph": []`, or a Turtle / TriG
+- **Empty payload requires opt-in.** `[]` or `"@graph": []`, or a Turtle / TriG
   document with no triples, means "the graph's desired contents are empty"
   — i.e. clear the graph. Without `allowEmpty`, it is rejected, so a
   truncated export cannot silently wipe the graph.

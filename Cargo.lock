@@ -3465,7 +3465,9 @@ dependencies = [
  "ciborium",
  "crossbeam-epoch",
  "fluree-db-core",
+ "fluree-db-novelty",
  "fluree-db-spatial",
+ "fluree-test-support",
  "fluree-vocab",
  "futures",
  "hex",
@@ -3554,6 +3556,7 @@ dependencies = [
  "fluree-db-nameservice",
  "fluree-db-nameservice-sync",
  "fluree-db-novelty",
+ "fluree-db-ontology",
  "fluree-db-query",
  "fluree-db-r2rml",
  "fluree-db-server",
@@ -3891,6 +3894,7 @@ dependencies = [
  "fluree-db-novelty",
  "fluree-db-spatial",
  "fluree-db-stats",
+ "fluree-test-support",
  "fluree-vocab",
  "futures",
  "hex",
@@ -3910,6 +3914,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber 0.3.22",
  "uuid",
  "xxhash-rust",
  "zstd",
@@ -4032,6 +4037,20 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "fluree-db-ontology"
+version = "5.0.0-alpha.1"
+dependencies = [
+ "fluree-graph-format",
+ "fluree-graph-ir",
+ "fluree-graph-json-ld",
+ "fluree-graph-turtle",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4288,6 +4307,7 @@ dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
  "fluree-db-query",
+ "fluree-graph-ir",
  "fluree-graph-json-ld",
  "fluree-vocab",
  "insta",
@@ -4443,6 +4463,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smallvec",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -4614,6 +4635,7 @@ name = "fluree-graph-turtle"
 version = "5.0.0-alpha.1"
 dependencies = [
  "fluree-graph-ir",
+ "fluree-test-support",
  "fluree-vocab",
  "rustc-hash",
  "serde_json",
@@ -4710,6 +4732,7 @@ name = "fluree-test-support"
 version = "5.0.0-alpha.1"
 dependencies = [
  "toml",
+ "tracing",
 ]
 
 [[package]]

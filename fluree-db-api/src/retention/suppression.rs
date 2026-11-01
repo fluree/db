@@ -86,6 +86,17 @@ fn collect(
                 }
                 None => false,
             },
+            // Its values may be a list's members, read through the list's
+            // cells.
+            Pattern::ListView(lv) => match iri(&lv.triple.p, snapshot) {
+                Some(p) => {
+                    out.push((iri(&lv.triple.s, snapshot), p));
+                    out.push((None, fluree_vocab::rdf::FIRST.to_string()));
+                    out.push((None, fluree_vocab::rdf::REST.to_string()));
+                    true
+                }
+                None => false,
+            },
             // A path's steps past the first, and an inverse step, read
             // subjects other than the constant one: its predicates count for
             // every subject.

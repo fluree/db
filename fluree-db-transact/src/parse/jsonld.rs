@@ -26,7 +26,8 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_with_context_policy, parse_context, GraphValue, ParsedContext,
+    classify_graph_value, expand_with_context_policy, is_keyword_form, node_graph, parse_context,
+    GraphValue, NodeGraph, ParsedContext,
 };
 use fluree_vocab::{
     rdf::{self, TYPE},
@@ -307,7 +308,7 @@ pub fn parse_sync_transaction(
 /// Parsing is exactly insert parsing (same context handling, annotation
 /// lowering, txn-meta extraction) with `graph` as the root scope. Differences
 /// from insert:
-/// - an explicitly empty document (`"@graph": []`) parses to an empty
+/// - an empty document ([`is_empty_document`]) parses to an empty
 ///   transaction instead of an error;
 /// - a payload that addresses any other graph itself (a graph selector naming
 ///   another graph, or a named-graph object) is rejected: the scope is
@@ -319,18 +320,7 @@ pub fn parse_graph_insert(
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
 ) -> Result<Txn> {
-    // `{"@graph": []}`: an envelope with no nodes. (With an `@id` the same
-    // value is an empty JSON-LD named graph, which a graph write refuses.)
-    let explicitly_empty = json.as_object().is_some_and(|obj| {
-        matches!(
-            fluree_graph_json_ld::doc_shape(obj),
-            Ok(fluree_graph_json_ld::DocShape::Envelope)
-        ) && obj
-            .get("@graph")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    });
-    if explicitly_empty {
+    if is_empty_document(json) {
         let mut txn = Txn::insert().with_opts(opts);
         if let GraphName::Iri(iri) = request_graph_name(graph)? {
             txn.write_graphs.insert(iri.as_str().to_string());
@@ -347,6 +337,25 @@ pub fn parse_graph_insert(
         ledger_id,
         Some(graph),
     )
+}
+
+/// Whether a JSON-LD write document holds no nodes: `[]`, or an envelope
+/// whose `@graph` is `[]`. (With an `@id`, an empty `@graph` is an empty
+/// JSON-LD named graph, which a graph write refuses.)
+pub fn is_empty_document(json: &Value) -> bool {
+    match json {
+        Value::Array(nodes) => nodes.is_empty(),
+        Value::Object(obj) => {
+            matches!(
+                fluree_graph_json_ld::doc_shape(obj),
+                Ok(fluree_graph_json_ld::DocShape::Envelope)
+            ) && obj
+                .get("@graph")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        }
+        _ => false,
+    }
 }
 
 /// The graph a graph insert / sync request names, as a write-side name.
@@ -368,6 +377,16 @@ fn strict_compact_iri(opts: &TxnOpts, json: &Value) -> bool {
             json.as_object().and_then(parse_strict_compact_iri_opt)
         })
         .unwrap_or(true)
+}
+
+/// Whether an expanded document names a node with `@id`. When it yields no
+/// triples, such a node has only its `@id`.
+fn names_a_node(expanded: &Value) -> bool {
+    match expanded {
+        Value::Array(items) => items.iter().any(names_a_node),
+        Value::Object(obj) => obj.contains_key("@id") || obj.values().any(names_a_node),
+        _ => false,
+    }
 }
 
 /// Parse an insert or upsert document.
@@ -425,6 +444,11 @@ fn parse_data(
         }
     };
     if templates.is_empty() {
+        if !names_a_node(&expanded) {
+            return Err(TransactError::Parse(
+                "the payload has no triples; there is nothing to add".to_string(),
+            ));
+        }
         let (verb, noun) = match txn_type {
             TxnType::Upsert => ("Upsert", "upsert"),
             _ => ("Insert", "insert"),
@@ -738,12 +762,17 @@ fn parse_update_clauses(
         );
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
-            return Err(TransactError::Parse(
-                "insert must contain at least one predicate or @type (an object with only @id is not a valid insert)"
-                    .to_string(),
-            ));
+            // As with delete: `"insert": []` is a no-op, an empty node is not.
+            if matches!(insert_val, Value::Array(arr) if arr.is_empty()) {
+                Vec::new()
+            } else {
+                return Err(TransactError::Parse(
+                    "insert must contain at least one predicate or @type".to_string(),
+                ));
+            }
+        } else {
+            templates
         }
-        templates
     } else {
         Vec::new()
     };
@@ -1003,6 +1032,8 @@ fn expand_update_graph_iri(v: &Value, context: &ParsedContext, strict: bool) -> 
 #[derive(Debug, Default)]
 struct BlankIssuer {
     next: usize,
+    /// Lists issued, for [`TripleTemplate::list_id`].
+    lists: u32,
     /// Numbers of user `_:bN` labels to skip (the re-parse).
     skip: std::collections::HashSet<usize>,
     /// Numbers of the user `_:bN` labels seen in this parse.
@@ -1011,6 +1042,12 @@ struct BlankIssuer {
 }
 
 impl BlankIssuer {
+    /// A list id unique in the document.
+    fn issue_list(&mut self) -> u32 {
+        self.lists += 1;
+        self.lists - 1
+    }
+
     fn issue(&mut self) -> TemplateTerm {
         while self.skip.contains(&self.next) {
             self.next += 1;
@@ -1061,7 +1098,7 @@ impl BlankIssuer {
 
 /// Which graph names a selector may use, by where it was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GraphRole {
+pub(crate) enum GraphRole {
     /// Insert / upsert / graph-insert data: there is no WHERE, so a graph
     /// cannot be a variable.
     Data,
@@ -1129,109 +1166,34 @@ impl<'a> TemplateParseCtx<'a> {
         )?)
     }
 
-    /// Resolve a graph name written in this document. Every position (a node
-    /// selector, a `["graph", g, …]` item, the update `graph` key, and a
-    /// node-level `@graph` in `where`) classifies the name by the one order
-    /// in [`classify_written_graph_name`]; here that means:
-    ///
-    /// 1. `?name` is a WHERE variable, in update templates only.
-    /// 2. A `fromNamed` alias names its IRI (checked before the keywords, so
-    ///    an alias named `config` keeps meaning its IRI).
-    /// 3. A keyword: `default` is the default graph, `config` this ledger's
-    ///    config graph; `txn-meta` is not a write target.
-    /// 4. Anything else expands as a node identifier (`@id`-style,
-    ///    `@base`-relative) and must be an absolute IRI.
-    ///
-    /// A name that expands to no absolute IRI (no scheme, as `mydb#config`, or
-    /// under strict compact-IRI checking a prefix the `@context` does not
-    /// define, as `mydb:main`) but is an address of the ledger being written is
-    /// that address ([`GraphName::Address`]), the way a `from` source reads;
-    /// any other is refused as it is.
+    /// Resolve a graph name written in this document, by
+    /// [`resolve_written_graph`].
     fn resolve_graph_name(&mut self, raw: &str, role: GraphRole) -> Result<GraphName> {
-        use fluree_db_query::parse::WrittenGraphName as W;
-        let written = match fluree_db_query::parse::classify_written_graph_name(
+        resolve_written_graph(
             raw,
             self.from_named_aliases,
             self.context,
             self.strict_compact_iri,
-        ) {
-            Ok(written) => written,
-            Err(refused) => {
-                return AddressName::parse(raw, self.ledger_id)
-                    .map(GraphName::Address)
-                    .ok_or_else(|| refused.into())
-            }
-        };
-        match written {
-            W::Var(var) => match role {
-                GraphRole::UpdateTemplate => Ok(GraphName::Var(self.vars.get_or_insert(var))),
-                GraphRole::Data => Err(TransactError::Parse(format!(
-                    "graph {raw:?} is a variable; a variable graph names the graph a \"where\" \
-                     binds, so it is only valid in an update's insert or delete"
-                ))),
-                GraphRole::UpdateDefault => Err(TransactError::Parse(format!(
-                    "the update \"graph\" key names the transaction's default graph and takes \
-                     a graph IRI, not the variable {raw:?}"
-                ))),
-            },
-            W::Alias { iri, .. } => self.named_graph(raw, iri),
-            W::Default => Ok(GraphName::Default),
-            W::Config => self.named_graph(
-                raw,
-                &fluree_db_core::graph_registry::config_graph_iri(self.ledger_id),
-            ),
-            W::TxnMeta => Err(TransactError::Parse(format!(
-                "graph \"txn-meta\" names the reserved system graph <{}>, which is not a write \
-                 target; transaction metadata goes in the \"txn-meta\" sidecar",
-                fluree_db_core::graph_registry::txn_meta_graph_iri(self.ledger_id)
-            ))),
-            W::Expanded(iri) => self.named_graph(raw, &iri),
-        }
+            self.ledger_id,
+            role,
+            self.vars,
+        )
     }
 
-    /// The scope of a JSON-LD named graph's content: the graph the owning
-    /// node's (expanded) `@id` names. The name must be an IRI: Fluree has no
-    /// blank-node graph names, a variable cannot name one, and a graph object
-    /// without an `@id` is only meaningful as the top-level envelope. The
-    /// name is checked even for empty content; `None` then, so an empty graph
-    /// is not registered as a write target.
-    fn named_graph_scope(&mut self, id: Option<&Value>, empty: bool) -> Result<Option<GraphScope>> {
-        let Some(Value::String(iri)) = id else {
-            return Err(TransactError::Parse(
-                "a node object with `@graph` content is a JSON-LD named graph and needs an `@id` \
-                 naming the graph; only the top-level envelope may omit it"
-                    .to_string(),
-            ));
-        };
-        if iri.starts_with("_:") || iri.starts_with('?') {
-            return Err(TransactError::Parse(format!(
-                "a JSON-LD named graph must be named by an IRI, not {iri:?}"
-            )));
-        }
+    /// The scope of a JSON-LD named graph's content: the graph `name`, the
+    /// owning node's (expanded) `@id` ([`node_graph`] has checked it is not
+    /// a blank node or a variable), names. It must be an absolute IRI or an
+    /// address of this ledger. The name is checked even for empty content;
+    /// `None` then, so an empty graph is not registered as a write target.
+    fn named_graph_scope(&mut self, name: &str, empty: bool) -> Result<Option<GraphScope>> {
         if self.fixed_root.is_some() {
             return Err(TransactError::Parse(
                 "payload must not address named graphs; the target graph is given by the request"
                     .to_string(),
             ));
         }
-        let name = self.named_graph(iri, iri)?;
+        let name = named_graph(name, name, self.ledger_id)?;
         Ok((!empty).then(|| self.write_graphs.scope(name)))
-    }
-
-    /// A graph named by `raw`, resolved to `iri`: that IRI when it is
-    /// absolute, else the address of this ledger `iri` is
-    /// ([`GraphName::Address`]).
-    fn named_graph(&self, raw: &str, iri: &str) -> Result<GraphName> {
-        GraphIri::parse(iri).map(GraphName::Iri).or_else(|e| {
-            AddressName::parse(iri, self.ledger_id)
-                .map(GraphName::Address)
-                .ok_or_else(|| {
-                    TransactError::Parse(format!(
-                        "graph {raw:?} does not name an absolute IRI ({e}); use a full IRI, a \
-                         compact IRI whose prefix the @context defines, \"default\", or \"config\""
-                    ))
-                })
-        })
     }
 
     /// The scope a graph selector written in this clause opens.
@@ -1247,6 +1209,94 @@ impl<'a> TemplateParseCtx<'a> {
             _ => Ok(scope),
         }
     }
+}
+
+/// Resolve a graph name written in a JSON-LD document, for writing. Every
+/// position (a node selector, a `["graph", g, …]` item, the update `graph`
+/// key, a node-level `@graph` in `where`, and a bulk import's selectors)
+/// classifies the name by the one order in [`classify_written_graph_name`];
+/// for writing that means:
+///
+/// 1. `?name` is a WHERE variable, in update templates only.
+/// 2. A `fromNamed` alias names its IRI (checked before the keywords, so
+///    an alias named `config` keeps meaning its IRI).
+/// 3. A keyword: `default` is the default graph, `config` this ledger's
+///    config graph; `txn-meta` is not a write target.
+/// 4. Anything else expands as a node identifier (`@id`-style,
+///    `@base`-relative) and must be an absolute IRI.
+///
+/// A name that expands to no absolute IRI (no scheme, as `mydb#config`, or
+/// under strict compact-IRI checking a prefix the `@context` does not
+/// define, as `mydb:main`) but is an address of the ledger being written is
+/// that address ([`GraphName::Address`]), the way a `from` source reads;
+/// any other is refused as it is.
+///
+/// [`classify_written_graph_name`]: fluree_db_query::parse::classify_written_graph_name
+pub(crate) fn resolve_written_graph(
+    raw: &str,
+    aliases: &HashMap<String, String>,
+    context: &ParsedContext,
+    strict_compact_iri: bool,
+    ledger_id: &str,
+    role: GraphRole,
+    vars: &mut VarRegistry,
+) -> Result<GraphName> {
+    use fluree_db_query::parse::WrittenGraphName as W;
+    let written = match fluree_db_query::parse::classify_written_graph_name(
+        raw,
+        aliases,
+        context,
+        strict_compact_iri,
+    ) {
+        Ok(written) => written,
+        Err(refused) => {
+            return AddressName::parse(raw, ledger_id)
+                .map(GraphName::Address)
+                .ok_or_else(|| refused.into())
+        }
+    };
+    match written {
+        W::Var(var) => match role {
+            GraphRole::UpdateTemplate => Ok(GraphName::Var(vars.get_or_insert(var))),
+            GraphRole::Data => Err(TransactError::Parse(format!(
+                "graph {raw:?} is a variable; a variable graph names the graph a \"where\" \
+                 binds, so it is only valid in an update's insert or delete"
+            ))),
+            GraphRole::UpdateDefault => Err(TransactError::Parse(format!(
+                "the update \"graph\" key names the transaction's default graph and takes \
+                 a graph IRI, not the variable {raw:?}"
+            ))),
+        },
+        W::Alias { iri, .. } => named_graph(raw, iri, ledger_id),
+        W::Default => Ok(GraphName::Default),
+        W::Config => named_graph(
+            raw,
+            &fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+            ledger_id,
+        ),
+        W::TxnMeta => Err(TransactError::Parse(format!(
+            "graph \"txn-meta\" names the reserved system graph <{}>, which is not a write \
+             target; transaction metadata goes in the \"txn-meta\" sidecar",
+            fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id)
+        ))),
+        W::Expanded(iri) => named_graph(raw, &iri, ledger_id),
+    }
+}
+
+/// A graph named by `raw`, resolved to `iri`: that IRI when it is absolute,
+/// else the address of the ledger `ledger_id` that `iri` is
+/// ([`GraphName::Address`]).
+pub(crate) fn named_graph(raw: &str, iri: &str, ledger_id: &str) -> Result<GraphName> {
+    GraphIri::parse(iri).map(GraphName::Iri).or_else(|e| {
+        AddressName::parse(iri, ledger_id)
+            .map(GraphName::Address)
+            .ok_or_else(|| {
+                TransactError::Parse(format!(
+                    "graph {raw:?} does not name an absolute IRI ({e}); use a full IRI, a \
+                     compact IRI whose prefix the @context defines, \"default\", or \"config\""
+                ))
+            })
+    })
 }
 
 /// First blank-node label appearing in any template term, if one exists.
@@ -1717,19 +1767,18 @@ fn parse_expanded_object_with_ctx(
     // A JSON-LD 1.1 named graph (`{"@id": G, "@graph": [nodes]}`): the node's
     // own properties stay in the enclosing scope, and the content nodes are
     // written to the graph its `@id` names (after the properties, below).
-    let mut named_graph_content: Option<&[Value]> = None;
+    let mut named_graph_content: Option<(&str, &[Value])> = None;
     let own_scope: GraphScope;
-    let scope: &GraphScope = match obj.get("@graph").map(classify_graph_value) {
-        None => scope,
-        Some(GraphValue::Selector(raw)) => {
+    let scope: &GraphScope = match node_graph(obj).map_err(TransactError::Parse)? {
+        NodeGraph::Enclosing => scope,
+        NodeGraph::Selector(raw) => {
             own_scope = ctx.selector_scope(raw)?;
             &own_scope
         }
-        Some(GraphValue::Content(nodes)) => {
-            named_graph_content = Some(nodes);
+        NodeGraph::NamedGraph { name, content } => {
+            named_graph_content = Some((name, content));
             scope
         }
-        Some(GraphValue::Invalid(why)) => return Err(TransactError::Parse(why.to_string())),
     };
 
     // Get subject from @id (already expanded IRI or variable); a node
@@ -1791,6 +1840,7 @@ fn parse_expanded_object_with_ctx(
                         object,
                         None,
                         None,
+                        None,
                     );
                 } else {
                     return Err(TransactError::Parse(format!(
@@ -1801,9 +1851,11 @@ fn parse_expanded_object_with_ctx(
             continue;
         }
 
-        if key == TYPE {
+        // `rdf:type` as a key writes types `@type` can't hold: an annotated
+        // one, or a list. A literal value would type the node with a string.
+        if key == TYPE && !holds_only_nodes(value) {
             return Err(TransactError::Parse(format!(
-                "\"{TYPE}\" is not a valid predicate IRI. Please use the JSON-LD \"@type\" keyword instead."
+                "\"{TYPE}\" takes node objects or a @list of them, not a literal. Please use the JSON-LD \"@type\" keyword instead."
             )));
         }
 
@@ -1824,12 +1876,13 @@ fn parse_expanded_object_with_ctx(
                 parsed_value.term,
                 parsed_value.dtc,
                 parsed_value.list_index,
+                parsed_value.list_id,
             );
         }
     }
 
-    if let Some(nodes) = named_graph_content {
-        if let Some(graph) = ctx.named_graph_scope(obj.get("@id"), nodes.is_empty())? {
+    if let Some((name, nodes)) = named_graph_content {
+        if let Some(graph) = ctx.named_graph_scope(name, nodes.is_empty())? {
             for node in nodes {
                 parse_expanded_object_with_ctx(node, &graph, ctx, out)?;
             }
@@ -1839,11 +1892,17 @@ fn parse_expanded_object_with_ctx(
     Ok(subject)
 }
 
-/// A key spelled like a JSON-LD keyword (`@` then letters). Keys that
-/// merely start with `@` (`@odata.etag`) are ordinary property names.
-fn is_keyword_form(key: &str) -> bool {
-    key.strip_prefix('@')
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphabetic()))
+/// Whether an expanded property value holds only node objects, directly or
+/// in a `@list`.
+fn holds_only_nodes(value: &Value) -> bool {
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    items.into_iter().all(|item| match item.get("@list") {
+        Some(list) => holds_only_nodes(list),
+        None => item.as_object().is_some_and(|m| !m.contains_key("@value")),
+    })
 }
 
 /// The node objects of an `@included` value (one node or an array of them).
@@ -1913,6 +1972,7 @@ fn parse_reverse_properties(
                     subject,
                     predicate.clone(),
                     owner.clone(),
+                    None,
                     None,
                     None,
                 );
@@ -1987,6 +2047,8 @@ struct ParsedValue {
     term: TemplateTerm,
     dtc: Option<DatatypeConstraint>,
     list_index: Option<i32>,
+    /// The `@list` this value is a member of (see [`TripleTemplate::list_id`]).
+    list_id: Option<u32>,
 }
 
 impl ParsedValue {
@@ -1995,6 +2057,7 @@ impl ParsedValue {
             term,
             dtc: None,
             list_index: None,
+            list_id: None,
         }
     }
 
@@ -2447,6 +2510,7 @@ fn parse_list_value_with_ctx(
     let first = &items[0];
     let mut parsed = parse_single_list_item_with_ctx(first, scope, ctx, out)?;
     parsed.list_index = Some(0);
+    parsed.list_id = Some(ctx.blanks.issue_list());
     Ok(parsed)
 }
 
@@ -2478,10 +2542,12 @@ fn parse_list_values_with_ctx(
     }
 
     // Parse each item with its index
+    let list = ctx.blanks.issue_list();
     let mut results = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let mut parsed = parse_single_list_item_with_ctx(item, scope, ctx, out)?;
         parsed.list_index = Some(index as i32);
+        parsed.list_id = Some(list);
         results.push(parsed);
     }
 
@@ -2676,6 +2742,39 @@ mod tests {
 
         // Check that http://example.org/ was registered
         assert!(ns_registry.has_prefix("http://example.org/"));
+    }
+
+    /// `rdf:type` as a key writes the type `@type` would, also as a list,
+    /// and refuses a literal, which would type the node with a string.
+    #[test]
+    fn rdf_type_takes_nodes_but_not_literals() {
+        let ctx = json!({
+            "ex": "http://example.org/",
+            "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        });
+        let typed = |value: Value| {
+            parse_doc(
+                &json!({"@context": ctx, "@id": "ex:s", "rdf:type": value}),
+                TxnType::Insert,
+            )
+            .map(|txn| format!("{:?}", txn.insert_templates))
+        };
+        let keyword = parse_doc(
+            &json!({"@context": ctx, "@id": "ex:s", "@type": "ex:A"}),
+            TxnType::Insert,
+        )
+        .map(|txn| format!("{:?}", txn.insert_templates))
+        .unwrap();
+        assert_eq!(typed(json!({"@id": "ex:A"})).unwrap(), keyword);
+        assert!(typed(json!({"@list": [{"@id": "ex:A"}, {"@id": "ex:B"}]})).is_ok());
+        for literal in [
+            json!("ex:A"),
+            json!({"@list": ["ex:A"]}),
+            json!([{"@id": "ex:A"}, "ex:B"]),
+        ] {
+            let err = typed(literal.clone()).unwrap_err().to_string();
+            assert!(err.contains("\"@type\" keyword"), "{literal}: {err}");
+        }
     }
 
     #[test]

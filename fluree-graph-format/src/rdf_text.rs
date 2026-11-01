@@ -24,13 +24,13 @@
 //! Turtle and TriG write a well-formed RDF collection as `( … )`; see
 //! [`Collections`].
 
+use crate::collections::{blank_nodes_in_several_graphs, Collections};
 use crate::PrefixMap;
 use fluree_graph_ir::datatype::iri as dt_iri;
 use fluree_graph_ir::{
     push_canonical_xsd_double, syntax, Dataset, Datatype, Graph, LiteralValue, Term, Triple,
 };
-use fluree_vocab::rdf;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 /// A literal's language tag is not a valid `LANGTAG`, so it cannot be written.
@@ -126,8 +126,7 @@ pub fn format_turtle(graph: &Graph, prefixes: &PrefixMap) -> Result<String, Inva
     check_lang_tags(graph)?;
     let mut out = String::with_capacity(graph.len() * BYTES_PER_TRIPLE / 2);
     prefixes.push_declarations(&mut out);
-    let lists = Collections::find(graph, &HashSet::new());
-    push_turtle_graph(&mut out, graph, &lists, prefixes, "");
+    push_turtle_graph(&mut out, graph, prefixes, &HashSet::new(), "");
     Ok(out)
 }
 
@@ -139,9 +138,8 @@ pub fn format_trig(dataset: &Dataset, prefixes: &PrefixMap) -> Result<String, In
     }
     let mut out = String::with_capacity(dataset.len() * BYTES_PER_TRIPLE / 2);
     prefixes.push_declarations(&mut out);
-    let elsewhere = blank_nodes_in_several_graphs(dataset);
-    let lists = Collections::find(&dataset.default, &elsewhere);
-    push_turtle_graph(&mut out, &dataset.default, &lists, prefixes, "");
+    let shared = blank_nodes_in_several_graphs(dataset);
+    push_turtle_graph(&mut out, &dataset.default, prefixes, &shared, "");
     for (name, graph) in &dataset.named {
         if !out.is_empty() && !out.ends_with("\n\n") {
             out.push('\n');
@@ -149,175 +147,43 @@ pub fn format_trig(dataset: &Dataset, prefixes: &PrefixMap) -> Result<String, In
         out.push_str("GRAPH ");
         push_turtle_term(&mut out, name, prefixes);
         out.push_str(" {\n");
-        let lists = Collections::find(graph, &elsewhere);
-        push_turtle_graph(&mut out, graph, &lists, prefixes, "    ");
+        push_turtle_graph(&mut out, graph, prefixes, &shared, "    ");
         out.push_str("}\n");
     }
     Ok(out)
 }
 
-/// Well-formed RDF collections in one graph, which Turtle and TriG write as
-/// `( … )`.
-///
-/// A list qualifies when every node of it is a blank node with exactly one
-/// `rdf:first`, one `rdf:rest` and no other triple, used by exactly one triple
-/// (the one holding the list, or the `rdf:rest` before it), and appearing in
-/// no reification, triple term or other graph; and its `rdf:rest` chain ends
-/// in `rdf:nil`. Written as `( … )`, such a list reads back as the same
-/// triples, and a ledger's Turtle reader stores it as an ordered list, as it
-/// stores a document's own `( … )`. Anything else keeps its triples.
-///
-/// Only `Term::BlankNode`s qualify: a stored `_:fdb-…` node, written as an
-/// IRI term, keeps the label that resolves back to it.
-#[derive(Default)]
-struct Collections<'a> {
-    /// Each list's items, by its first node.
-    items: HashMap<&'a Term, Vec<&'a Term>>,
-    /// Every node of every list: written inside its list, not as a subject.
-    nodes: HashSet<&'a Term>,
-}
-
-impl<'a> Collections<'a> {
-    /// The lists in `graph`. `elsewhere` holds blank nodes another graph of
-    /// the dataset also uses, which must keep their labels.
-    fn find(graph: &'a Graph, elsewhere: &HashSet<&'a Term>) -> Self {
-        let is = |t: &Triple, iri: &str| t.predicate().as_iri() == Some(iri);
-        if !graph.iter().any(|t| is(t, rdf::FIRST)) {
-            return Self::default();
-        }
-
-        #[derive(Default)]
-        struct Node<'a> {
-            first: Vec<&'a Term>,
-            rest: Vec<&'a Term>,
-            other: bool,
-            used_by: Vec<&'a Triple>,
-        }
-        let mut nodes: HashMap<&Term, Node> = HashMap::new();
-        let mut pinned: HashSet<&Term> = HashSet::new();
-        for t in graph.iter() {
-            if matches!(t.subject(), Term::BlankNode(_)) {
-                let node = nodes.entry(t.subject()).or_default();
-                if is(t, rdf::FIRST) {
-                    node.first.push(t.object());
-                } else if is(t, rdf::REST) {
-                    node.rest.push(t.object());
-                } else {
-                    node.other = true;
+impl Collections<'_> {
+    /// Write `term`, spelling a collection head as `( … )`.
+    fn push_term(&self, out: &mut String, term: &Term, prefixes: &PrefixMap) {
+        match self.heads.get(term) {
+            Some(items) => {
+                out.push('(');
+                for item in items {
+                    out.push(' ');
+                    self.push_term(out, item, prefixes);
                 }
+                out.push_str(" )");
             }
-            match t.object() {
-                o @ Term::BlankNode(_) => nodes.entry(o).or_default().used_by.push(t),
-                o @ Term::TripleTerm(_) => blank_nodes(o, &mut pinned),
-                _ => {}
-            }
+            None => push_turtle_term(out, term, prefixes),
         }
-        for r in graph.reifications() {
-            blank_nodes(&r.reifier, &mut pinned);
-            for term in [r.triple.subject(), r.triple.predicate(), r.triple.object()] {
-                blank_nodes(term, &mut pinned);
-            }
-        }
-
-        let qualifies = |n: &Term| {
-            nodes.get(n).is_some_and(|node| {
-                node.first.len() == 1
-                    && node.rest.len() == 1
-                    && !node.other
-                    && node.used_by.len() == 1
-                    && !pinned.contains(n)
-                    && !elsewhere.contains(n)
-            })
-        };
-        let mut lists = Self::default();
-        for (&head, node) in &nodes {
-            // A node an `rdf:rest` uses is inside a list, never its head.
-            if !qualifies(head) || is(node.used_by[0], rdf::REST) {
-                continue;
-            }
-            let mut items = Vec::new();
-            let mut spine = Vec::new();
-            let mut n = head;
-            let complete = loop {
-                let node = &nodes[n];
-                items.push(node.first[0]);
-                spine.push(n);
-                let next = node.rest[0];
-                if next.as_iri() == Some(rdf::NIL) {
-                    break true;
-                }
-                // `next` is used only by this `rdf:rest`, so the walk can't
-                // come back around.
-                if !qualifies(next) {
-                    break false;
-                }
-                n = next;
-            };
-            if complete {
-                lists.nodes.extend(spine);
-                lists.items.insert(head, items);
-            }
-        }
-        lists
     }
 }
 
-/// Every blank node in `term`, inside triple terms too.
-fn blank_nodes<'a>(term: &'a Term, out: &mut HashSet<&'a Term>) {
-    match term {
-        Term::BlankNode(_) => {
-            out.insert(term);
-        }
-        Term::TripleTerm(parts) => parts.iter().for_each(|part| blank_nodes(part, out)),
-        _ => {}
-    }
-}
-
-/// Blank nodes used in more than one graph of `dataset`, and blank graph
-/// names. TriG scopes a blank node to the whole document, so these can't
-/// be written as part of a list.
-fn blank_nodes_in_several_graphs(dataset: &Dataset) -> HashSet<&Term> {
-    let mut several = HashSet::new();
-    if dataset.named.is_empty() {
-        return several;
-    }
-    let mut seen: HashMap<&Term, usize> = HashMap::new();
-    for (i, (name, graph)) in dataset.graphs().enumerate() {
-        if let Some(name) = name {
-            blank_nodes(name, &mut several);
-        }
-        let mut here = HashSet::new();
-        for t in graph.iter() {
-            blank_nodes(t.subject(), &mut here);
-            blank_nodes(t.object(), &mut here);
-        }
-        for r in graph.reifications() {
-            blank_nodes(&r.reifier, &mut here);
-            blank_nodes(r.triple.subject(), &mut here);
-            blank_nodes(r.triple.object(), &mut here);
-        }
-        for blank in here {
-            if *seen.entry(blank).or_insert(i) != i {
-                several.insert(blank);
-            }
-        }
-    }
-    several
-}
-
-fn push_turtle_graph(
+fn push_turtle_graph<'g>(
     out: &mut String,
-    graph: &Graph,
-    lists: &Collections<'_>,
+    graph: &'g Graph,
     prefixes: &PrefixMap,
+    shared: &HashSet<&'g Term>,
     indent: &str,
 ) {
     // Reifiers by the triple they reify; the ones whose triple the graph
     // does not hold are written as `r rdf:reifies <<( s p o )>>` at the end.
     let mut reifiers = graph.reifiers_by_triple();
+    let collections = Collections::of(graph, &reifiers, shared);
     let triples = graph.triples();
-    let mut blocks = 0;
     let mut start = 0;
+    let mut written = 0;
     while start < triples.len() {
         let subject = triples[start].subject();
         let end = start
@@ -326,14 +192,14 @@ fn push_turtle_graph(
                 .position(|t| t.subject() != subject)
                 .unwrap_or(triples.len() - start);
         let block = &triples[start..end];
-        if !lists.nodes.is_empty() && lists.nodes.contains(subject) {
+        if collections.cells.contains(subject) {
             start = end;
             continue;
         }
-        if blocks > 0 {
+        if written > 0 {
             out.push('\n');
         }
-        blocks += 1;
+        written += 1;
         out.push_str(indent);
         push_turtle_term(out, subject, prefixes);
 
@@ -360,7 +226,7 @@ fn push_turtle_graph(
                 out.push(' ');
                 predicate = Some(t.predicate());
             }
-            push_turtle_object(out, t.object(), lists, prefixes);
+            collections.push_term(out, t.object(), prefixes);
             // `remove` hashes even on an empty map; most graphs have no reifiers.
             let rs = if reifiers.is_empty() {
                 None
@@ -397,31 +263,6 @@ fn push_turtle_graph(
         out.push(' ');
         push_turtle_term(out, t.object(), prefixes);
         out.push_str(" )>> .\n");
-    }
-}
-
-/// Append an object: a list as `( … )`, anything else as a term.
-fn push_turtle_object(
-    out: &mut String,
-    term: &Term,
-    lists: &Collections<'_>,
-    prefixes: &PrefixMap,
-) {
-    let items = if lists.items.is_empty() {
-        None
-    } else {
-        lists.items.get(term)
-    };
-    match items {
-        Some(items) => {
-            out.push('(');
-            for item in items {
-                out.push(' ');
-                push_turtle_object(out, item, lists, prefixes);
-            }
-            out.push_str(" )");
-        }
-        None => push_turtle_term(out, term, prefixes),
     }
 }
 
@@ -557,20 +398,14 @@ fn push_literal_suffix(
 
 fn push_blank(out: &mut String, label: &str) {
     out.push_str("_:");
-    if syntax::is_blank_node_label(label) {
-        out.push_str(label);
-    } else {
-        out.push('x');
-        for b in label.bytes() {
-            let _ = write!(out, "{b:02x}");
-        }
-    }
+    syntax::push_blank_label(out, label);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use fluree_graph_ir::Datatype;
+    use fluree_vocab::rdf;
     use serde_json::json;
 
     const EX: &str = "http://example.org/";
@@ -948,7 +783,7 @@ mod tests {
     fn turtle_keeps_the_triples_of_a_chain_that_is_not_a_list() {
         let one_two = [Term::integer(1), Term::integer(2)];
         type Change = fn(&mut Graph);
-        let cases: [(&str, Change); 4] = [
+        let cases: [(&str, Change); 3] = [
             ("a node with another property", |g| {
                 g.add_triple(Term::blank("a1"), ex("note"), Term::string("x"));
             }),
@@ -970,14 +805,6 @@ mod tests {
                 }
                 g.add_triple(Term::blank("a1"), Term::iri(rdf::REST), ex("elsewhere"));
             }),
-            ("a reified spine triple", |g| {
-                g.add_reification(
-                    Term::blank("a0"),
-                    Term::iri(rdf::FIRST),
-                    Term::integer(1),
-                    ex("r"),
-                );
-            }),
         ];
         let prefixes = PrefixMap::from_context(&json!({ "ex": EX }));
         for (case, change) in cases {
@@ -988,6 +815,22 @@ mod tests {
             let ttl = format_turtle(&g, &prefixes).unwrap();
             assert!(!ttl.contains('('), "{case}:\n{ttl}");
         }
+
+        // A reified cell keeps its triples, and its annotation; the
+        // well-formed tail after it still folds, as JSON-LD's list
+        // conversion folds it.
+        let mut g = Graph::new();
+        add_list(&mut g, ex("s"), ex("list"), &one_two, "a");
+        g.add_reification(
+            Term::blank("a0"),
+            Term::iri(rdf::FIRST),
+            Term::integer(1),
+            ex("r"),
+        );
+        g.canonicalize();
+        let ttl = format_turtle(&g, &prefixes).unwrap();
+        assert!(ttl.contains("ex:list _:a0"), "{ttl}");
+        assert!(ttl.contains("1 ~ ex:r"), "{ttl}");
 
         // A stored blank node (`_:fdb-…`, an IRI term) keeps its label.
         let mut g = Graph::new();
@@ -1029,6 +872,83 @@ mod tests {
         assert!(trig.contains("ex:list ( 1 )"), "{trig}");
         assert!(trig.contains("ex:shared _:b0"), "{trig}");
         assert!(trig.contains("ex:p _:b0"), "{trig}");
+    }
+
+    /// `ex:s ex:items` a two-cell list whose cells are labelled `cell`.
+    fn list(g: &mut Graph, cell: impl Fn(usize) -> Term) {
+        let rest = |k: usize| {
+            if k == 1 {
+                Term::iri(dt_iri::RDF_NIL)
+            } else {
+                cell(k + 1)
+            }
+        };
+        g.add_triple(ex("s"), ex("items"), cell(0));
+        for k in 0..2 {
+            g.add_triple(
+                cell(k),
+                Term::iri(dt_iri::RDF_FIRST),
+                Term::integer(k as i64 + 1),
+            );
+            g.add_triple(cell(k), Term::iri(dt_iri::RDF_REST), rest(k));
+        }
+    }
+
+    #[test]
+    fn turtle_writes_a_chain_of_unnamed_cells_as_a_collection() {
+        let prefixes = PrefixMap::from_context(&json!({ "ex": EX }));
+        let mut g = Graph::new();
+        list(&mut g, |k| Term::iri(format!("_:l0-{k}")));
+        g.canonicalize();
+        let ttl = format_turtle(&g, &prefixes).unwrap();
+        assert_eq!(
+            ttl,
+            "@prefix ex: <http://example.org/> .\n\nex:s ex:items ( 1 2 ) .\n"
+        );
+
+        // The parser reads a collection back as list members.
+        let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+        fluree_graph_turtle::parse(&ttl, &mut sink).unwrap();
+        let mut members: Vec<_> = sink.into_graph().iter().map(Triple::list_index).collect();
+        members.sort();
+        assert_eq!(members, [Some(0), Some(1)], "{ttl}");
+    }
+
+    /// A cell a second triple names, or a stored cell's stable label, is
+    /// written as triples.
+    #[test]
+    fn turtle_keeps_cells_something_else_names() {
+        let prefixes = PrefixMap::from_context(&json!({ "ex": EX }));
+        let mut named_twice = Graph::new();
+        list(&mut named_twice, |k| Term::blank(format!("c{k}")));
+        named_twice.add_triple(ex("t"), ex("tail"), Term::blank("c1"));
+        named_twice.canonicalize();
+        let ttl = format_turtle(&named_twice, &prefixes).unwrap();
+        assert!(!ttl.contains('('), "{ttl}");
+        assert!(ttl.contains("ex:t ex:tail _:c1 ."), "{ttl}");
+
+        let mut stored = Graph::new();
+        list(&mut stored, |k| Term::iri(format!("_:fdb-7-c{k}")));
+        stored.canonicalize();
+        let ttl = format_turtle(&stored, &prefixes).unwrap();
+        assert!(!ttl.contains('('), "{ttl}");
+
+        // TriG labels span graphs: a cell another graph names stays.
+        let mut d = Dataset::new();
+        list(d.graph_mut(None), |k| Term::blank(format!("c{k}")));
+        d.graph_mut(Some(&ex("g1")))
+            .add_triple(ex("t"), ex("tail"), Term::blank("c1"));
+        d.canonicalize();
+        let trig = format_trig(&d, &prefixes).unwrap();
+        assert!(!trig.contains('('), "{trig}");
+        let mut alone = Dataset::new();
+        list(alone.graph_mut(None), |k| Term::blank(format!("c{k}")));
+        alone
+            .graph_mut(Some(&ex("g1")))
+            .add_triple(ex("t"), ex("p"), ex("o"));
+        alone.canonicalize();
+        let trig = format_trig(&alone, &prefixes).unwrap();
+        assert!(trig.contains("ex:s ex:items ( 1 2 ) ."), "{trig}");
     }
 
     #[test]

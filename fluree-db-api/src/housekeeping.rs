@@ -15,11 +15,14 @@
 //!
 //! With an interval set, it also runs the orphan sweep. Where the instance
 //! collects, it collects commit and transaction garbage and reconciles the
-//! ledgers due, in a task of its own, within a time budget per pass.
+//! ledgers due, in a task of its own, within a time budget per pass. And a
+//! ledger whose commits and index have not moved since the last tick has its
+//! pooled delta folded into its base, once per index root: otherwise the
+//! delta would wait for the ledger's next write.
 
-use crate::admin::{DropMode, DropStatus};
+use crate::admin::{DropMode, DropStatus, PoolCompaction};
 use crate::Fluree;
-use fluree_db_core::{InstanceId, LedgerName};
+use fluree_db_core::{ContentId, InstanceId, LedgerId, LedgerName};
 use fluree_db_indexer::Housekeeping;
 use fluree_db_nameservice::{lifecycle, BindingState, DroppedState, Fence, NameServiceError};
 use std::collections::HashMap;
@@ -72,6 +75,9 @@ pub struct HousekeepingOptions {
     /// How long one garbage pass may spend collecting, and then
     /// reconciling, half of the latter pausing between steps.
     pub reconcile_budget: Duration,
+    /// Fold the pooled delta of a ledger idle since the last tick into its
+    /// base.
+    pub compact_idle_pool_deltas: bool,
 }
 
 impl Default for HousekeepingOptions {
@@ -86,6 +92,7 @@ impl Default for HousekeepingOptions {
             ),
             reconcile_interval: Duration::from_secs(24 * 60 * 60),
             reconcile_budget: Duration::from_secs(30),
+            compact_idle_pool_deltas: true,
         }
     }
 }
@@ -100,6 +107,15 @@ struct Seen {
 
 type Observed = HashMap<Unfinished, Seen>;
 
+/// A ledger's position at the last tick, and the index root whose pooled
+/// delta was last looked at.
+#[derive(Clone, Debug)]
+struct IndexSeen {
+    commit_t: i64,
+    head: ContentId,
+    checked: Option<ContentId>,
+}
+
 struct LifecycleHousekeeping {
     fluree: Weak<Fluree>,
     options: HousekeepingOptions,
@@ -109,6 +125,7 @@ struct LifecycleHousekeeping {
     last_garbage: parking_lot::Mutex<Instant>,
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     collecting: Arc<std::sync::atomic::AtomicBool>,
+    indexes: parking_lot::Mutex<HashMap<LedgerId, IndexSeen>>,
 }
 
 #[async_trait::async_trait]
@@ -150,6 +167,7 @@ impl Housekeeping for LifecycleHousekeeping {
         self.sweep_if_due(&fluree).await;
         #[cfg(feature = "native")]
         self.collect_if_due(&fluree).await;
+        self.compact_idle_pool_deltas(&fluree).await;
     }
 }
 
@@ -190,6 +208,51 @@ impl LifecycleHousekeeping {
             let _clear = Clear(collecting);
             collect_and_reconcile(&fluree, &options).await;
         });
+    }
+
+    async fn compact_idle_pool_deltas(&self, fluree: &Fluree) {
+        if !self.options.compact_idle_pool_deltas {
+            return;
+        }
+        let records = match fluree.nameservice().all_records().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!(error = %e, "idle pool compaction: cannot list the nameservice");
+                return;
+            }
+        };
+        let previous = std::mem::take(&mut *self.indexes.lock());
+        let mut seen = HashMap::new();
+        for record in records.into_iter().filter(|r| !r.retracted) {
+            let Some(head) = record.index_head_id.clone() else {
+                continue;
+            };
+            let before = previous.get(&record.ledger_id);
+            let mut checked = before.and_then(|b| b.checked.clone());
+            let idle = record.index_t >= record.commit_t
+                && before.is_some_and(|b| b.commit_t == record.commit_t && b.head == head);
+            if idle && checked.as_ref() != Some(&head) {
+                match fluree.compact_pool_deltas(&record.ledger_id).await {
+                    // The new root is seen, and checked, on later ticks.
+                    Ok(PoolCompaction::Compacted) => {}
+                    Ok(PoolCompaction::NoDelta) => checked = Some(head.clone()),
+                    // Tried again on the next idle tick.
+                    Ok(PoolCompaction::Deferred) => {}
+                    Err(e) => {
+                        warn!(ledger_id = %record.ledger_id, error = %e, "idle pool compaction failed");
+                    }
+                }
+            }
+            seen.insert(
+                record.ledger_id,
+                IndexSeen {
+                    commit_t: record.commit_t,
+                    head,
+                    checked,
+                },
+            );
+        }
+        *self.indexes.lock() = seen;
     }
 
     async fn sweep_if_due(&self, fluree: &Fluree) {
@@ -478,6 +541,7 @@ impl Fluree {
             last_sweep: parking_lot::Mutex::new(Instant::now()),
             last_garbage: parking_lot::Mutex::new(Instant::now()),
             collecting: Arc::default(),
+            indexes: parking_lot::Mutex::default(),
         })
     }
 

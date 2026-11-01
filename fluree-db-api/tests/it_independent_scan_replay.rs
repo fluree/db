@@ -209,7 +209,7 @@ async fn independent_scans_preserve_multiplicity_filters_and_fallbacks() {
             &json!({
                 "@context":{"ex":"http://example.org/"},
                 "@graph":[
-                    {"@id":"ex:a", "ex:driver":1, "ex:items":{"@list":[10,10,20]},
+                    {"@id":"ex:a", "ex:driver":1, "ex:items":[10, 11, 20],
                      "ex:edge":{"@id":"ex:b","@annotation":{"ex:source":"one"}}},
                     {"@id":"ex:b", "ex:driver":2,
                      "ex:edge":{"@id":"ex:c","@annotation":{"ex:source":"two"}}},
@@ -278,7 +278,7 @@ async fn independent_scans_preserve_multiplicity_filters_and_fallbacks() {
             .iter()
             .filter(|r| r["o"]["value"] == "10")
             .count(),
-        6
+        3
     );
     check(
         &fluree,
@@ -389,8 +389,8 @@ async fn independent_scans_preserve_multiplicity_filters_and_fallbacks() {
             &json!({"@context":{"ex":"http://example.org/"},
         "@graph":[{"@id":"ex:a","ex:driver":1}, {"@id":"ex:b","ex:driver":2},
         {"@id":"ex:c","ex:driver":3}, {"@id":"ex:wide",
-        "ex:fits":{"@list":(0..8192).collect::<Vec<_>>()},
-        "ex:overflows":{"@list":(0..8193).collect::<Vec<_>>()}}]}),
+        "ex:fits":(0..8192).collect::<Vec<_>>(),
+        "ex:overflows":(0..8193).collect::<Vec<_>>()}]}),
         )
         .await
         .unwrap();
@@ -442,6 +442,61 @@ async fn independent_scans_preserve_multiplicity_filters_and_fallbacks() {
         false,
     )
     .await;
+}
+
+/// A list's members are values of their predicate in JSON-LD, so equal
+/// members at different positions are separate rows, and the replay keeps
+/// each for every left row. (SPARQL reads a list as its head and cells.)
+#[tokio::test(flavor = "current_thread")]
+async fn independent_scans_keep_list_members_in_json_ld() {
+    let _serial = SERIAL.lock().await;
+    assert!(std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none());
+    let _reset = Reset;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let alias = "replay/lists:main";
+    let ledger = fluree.create_ledger(alias).await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context":{"ex":"http://example.org/"},
+        "@graph":[{"@id":"ex:a","ex:driver":1,"ex:items":{"@list":[10,10,20]}},
+        {"@id":"ex:b","ex:driver":2}, {"@id":"ex:c","ex:driver":3}]}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .reindex(alias, ReindexOptions::default())
+        .await
+        .unwrap();
+    let ledger = fluree.ledger(alias).await.unwrap();
+    let query = json!({"@context":{"ex":"http://example.org/"},
+        "select":["?l","?s","?o"], "where":[
+            {"@id":"?l","ex:driver":"?n"}, {"@id":"?s","ex:items":"?o"}]});
+    let (spans, guard) = support::span_capture::init_test_tracing();
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_sparql_json(&ledger.snapshot)
+        .unwrap();
+    assert!(spans.has_event(EVENT));
+    drop(guard);
+    let bindings = rows["results"]["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 9);
+    assert_eq!(
+        bindings.iter().filter(|r| r["o"]["value"] == "10").count(),
+        6
+    );
+    set_fast_paths_disabled(true);
+    let generic = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_sparql_json(&ledger.snapshot)
+        .unwrap();
+    set_fast_paths_disabled(false);
+    assert_eq!(normalized(&rows), normalized(&generic));
 }
 
 /// Reproducible local A/B probe benchmark. Run separately in dev-fast/release;

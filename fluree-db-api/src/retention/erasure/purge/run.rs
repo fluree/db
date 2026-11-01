@@ -509,7 +509,7 @@ impl Fluree {
         let ns = self.publisher()?;
         let clustered = self.collected_by_cluster();
         let mut jobs = Vec::new();
-        for record in self.nameservice().list_branches(name.as_str()).await? {
+        for record in self.nameservice().branch_records(name.as_str()).await? {
             if record.retracted {
                 continue;
             }
@@ -802,9 +802,10 @@ impl Fluree {
             min_time_garbage_mins: Some(0),
             ..Default::default()
         };
-        let Some(plan) = plan_garbage(store.as_ref(), root, &config).await? else {
+        let plan = plan_garbage(store.as_ref(), root, &config).await?;
+        if plan.is_empty() {
             return Ok(());
-        };
+        }
         let mut windows = Vec::new();
         for ((handle, alive), guard) in indexers.iter().zip(&guards) {
             let window = match alive {

@@ -14,14 +14,10 @@
 //! deleting the call site, or making the guard reject a shape it should accept
 //! all fail here.
 //!
-//! Kept as the ONLY test in its own `[[test]]` binary, the same convention as
-//! `it_minmax_fast_path_fired` and `it_cyclic_bgp_probe`, and for the same two
-//! reasons: tracing's callsite-interest cache is process-global, so a callsite
-//! hit while another dispatcher registers can briefly see stale interest and
-//! drop the event; and `set_default` capture is thread-local, so the assertion
-//! is sound only while the asserted event is emitted on this thread. A
-//! standalone binary removes both under bare `cargo test`, which is what a
-//! contributor reaches for first. nextest already isolates per process.
+//! Its own `[[test]]` binary predates the shared capture helper, which keeps a
+//! sibling test from leaving these callsites disabled. The capture is still
+//! thread-local, so the assertion is sound only while the asserted event is
+//! emitted on this thread.
 
 mod support;
 

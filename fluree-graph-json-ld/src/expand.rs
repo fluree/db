@@ -942,15 +942,12 @@ pub(crate) fn node_impl(
             // JSON-LD named graph, and a graph *selector* marks a node, not a
             // wrapper. Both expand as a node, which keeps the `@id`, the
             // properties and the `@graph` entry.
-            let has_id = map.contains_key("@id") || map.contains_key("id");
-            if let Some(graph) = map.get("@graph") {
-                if crate::graph_shape::is_envelope_graph(graph, has_id)? {
-                    return expand_envelope(map, "@graph", graph, context, strict);
-                }
-            } else if let Some(graph) = map.get("graph").filter(|_| !has_id) {
-                // Legacy bare `graph` envelope key. The transaction paths strip
-                // it before expansion (it is a reserved routing key there).
-                return expand_envelope(map, "graph", graph, context, strict);
+            //
+            // A legacy bare `graph` key on an object with no `@id` is an
+            // envelope too. The transaction paths strip it before expansion
+            // (it is a reserved routing key there).
+            if let Some(key) = crate::graph_shape::envelope_graph_key(map)? {
+                return expand_envelope(map, key, &map[key], context, strict);
             }
 
             expand_node_internal(node_map, context, &Path::ROOT, strict)

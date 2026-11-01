@@ -15,6 +15,8 @@ mod graph_store_http;
 mod graphql_http_integration;
 #[path = "iceberg_track_durability.rs"]
 mod iceberg_track_durability;
+#[path = "index_maintenance_http.rs"]
+mod index_maintenance_http;
 #[path = "integration.rs"]
 mod integration;
 #[path = "mcp_agent_json.rs"]

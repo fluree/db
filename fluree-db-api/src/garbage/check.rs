@@ -483,7 +483,7 @@ fn for_each_row(
     let Some(p_id) = index.sid_to_p_id(p) else {
         return Ok(());
     };
-    let Some(branch) = index.branch_for_order(TXN_META_GRAPH_ID, RunSortOrder::Psot) else {
+    let Some(branch) = index.dedicated_branch(TXN_META_GRAPH_ID, RunSortOrder::Psot) else {
         return Ok(());
     };
     let bound = |s_id: u64, o_key: u64, rest: u32, o_type: u16| RunRecordV2 {

@@ -672,6 +672,9 @@ where
 
                 // Sort by (g_id, SPOT).
                 records.sort_unstable_by(fluree_db_binary_index::format::run_record::cmp_g_spot);
+                let graph_events = crate::run_index::build::graph_scope::graph_event_counts(
+                    records.iter().map(|r| (r.g_id, r.op)),
+                );
 
                 // Write sorted commit file (.fsc) via SpoolWriter.
                 let fsc_path = commits_dir.join(format!("chunk_{ci:05}.fsc"));
@@ -727,6 +730,7 @@ where
                     types_map_path: Some(types_path),
                     duplicates_removed: 0,
                     term_table: None,
+                    graph_events,
                 });
             }
 
@@ -766,6 +770,7 @@ where
                         types_map_path: None,
                         duplicates_removed: 0,
                         term_table: None,
+                        graph_events: Vec::new(),
                     });
                 } else {
                     let _ = std::fs::remove_file(&fsc_path);
@@ -899,10 +904,10 @@ where
             // Collect all graph IDs: g_id 0 (default) + named graphs (1+).
             // Graph IRI list maps dict_index → graph IRI, where g_id = dict_index + 1
             // (g_id=0 is always the default graph, g_id=1 is always txn-meta).
-            let all_g_ids: Vec<u16> = {
-                let mut ids = vec![0u16]; // default graph
+            let all_g_ids: Vec<fluree_db_core::GraphId> = {
+                let mut ids = vec![0]; // default graph
                 for g_idx in 0..shared.graphs.len() {
-                    let g_id = (g_idx + 1) as u16;
+                    let g_id = (g_idx + 1) as fluree_db_core::GraphId;
                     if !ids.contains(&g_id) {
                         ids.push(g_id);
                     }
@@ -910,9 +915,39 @@ where
                 ids
             };
 
+            // Small user named graphs share the pooled tree, built in one pass
+            // with their history; the default graph, the system graphs and
+            // large named graphs keep a tree each.
+            let user_g_ids: Vec<fluree_db_core::GraphId> = all_g_ids
+                .iter()
+                .copied()
+                .filter(|&g| g >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+                .collect();
+            let placement = crate::run_index::build::graph_scope::PlacementPolicy::new(
+                &config.graph_placement,
+                |iri| shared.graphs.get(iri).map(|id| id + 1),
+            );
+            let (_, pooled_g_ids) = crate::run_index::build::graph_scope::place_named_graphs(
+                &placement,
+                &user_g_ids,
+                &sorted_commit_infos,
+            );
+            let pool = (!pooled_g_ids.is_empty()).then(|| {
+                std::sync::Arc::new(crate::run_index::build::graph_scope::PoolGraphs::new(
+                    pooled_g_ids.iter().copied(),
+                ))
+            });
+            let builds: Vec<(fluree_db_core::GraphId, Option<std::sync::Arc<_>>)> = all_g_ids
+                .iter()
+                .copied()
+                .filter(|g| !pool.as_ref().is_some_and(|p| p.contains(*g)))
+                .map(|g| (g, None))
+                .chain(pool.clone().map(|p| (0, Some(p))))
+                .collect();
+
             tracing::info!(
                 graph_count = all_g_ids.len(),
-                g_ids = ?all_g_ids,
+                pooled = pooled_g_ids.len(),
                 "V3 rebuild: building indexes for all graphs"
             );
 
@@ -926,8 +961,11 @@ where
             let mut total_remap_ms = 0u128;
             let mut total_build_ms = 0u128;
 
-            for &g_id in &all_g_ids {
-                let v3_run_dir = run_dir.join(format!("v3_runs_g{g_id}"));
+            for (g_id, build_pool) in builds {
+                let v3_run_dir = match build_pool {
+                    Some(_) => run_dir.join("v3_runs_pool"),
+                    None => run_dir.join(format!("v3_runs_g{g_id}")),
+                };
                 std::fs::create_dir_all(&v3_run_dir)
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
@@ -936,7 +974,12 @@ where
                     index_dir: index_dir.clone(),
                     g_id,
                     leaflet_target_rows: config.leaflet_rows,
-                    leaf_target_rows: config.leaf_rows,
+                    leaf_target_rows: match build_pool {
+                        Some(_) => crate::run_index::build::graph_scope::pooled_leaf_rows(
+                            config.leaflet_rows,
+                        ),
+                        None => config.leaf_rows,
+                    },
                     zstd_level: 1,
                     run_budget_bytes: config.run_budget_bytes,
                     worker_count: 1,
@@ -952,7 +995,13 @@ where
                     build_progress: None,
                     stage_marker: None,
                     term_builder: None,
-                    history_drop: shared.history_drop_for(&config.history_suppression, g_id),
+                    // Retention's history drop is per graph, and the pool
+                    // holds many.
+                    history_drop: match build_pool {
+                        Some(_) => None,
+                        None => shared.history_drop_for(&config.history_suppression, g_id),
+                    },
+                    pool: build_pool.clone(),
                 };
 
                 let v3_result = crate::build_indexes_from_remapped_commits(
@@ -971,7 +1020,7 @@ where
                     "Phase D-V3: graph indexes built"
                 );
 
-                if g_id == 0 {
+                if g_id == 0 && build_pool.is_none() {
                     total_rows = v3_result.total_rows;
                 }
                 total_remap_ms += v3_result.remap_elapsed.as_millis();
@@ -1009,10 +1058,15 @@ where
             //
             // Uses two separate passes over the .fsc files:
             //   Pass 1 (HLL): feeds ALL records to IdStatsHook in HLL-only mode
-            //                  (no per-subject maps — bounded memory).
-            //   Pass 2 (class): k-way merges .fsc files, deduplicates, feeds
-            //                   winning assertions to SpotClassStatsCollector
-            //                   (O(1) per-subject, class-level accumulators).
+            //                  (no per-subject maps — bounded memory). It
+            //                  observes them for the sketches only: counts
+            //                  from an op's sign miscount a same-`t` pair or a
+            //                  retraction of a fact never asserted.
+            //   Pass 2 (class + counts): k-way merges .fsc files, deduplicates,
+            //                   feeds winning assertions to
+            //                   SpotClassStatsCollector (O(1) per-subject,
+            //                   class-level accumulators) and counts them, one
+            //                   per fact the index holds, in the IdStatsHook.
             //
             // This replaces the old approach that accumulated ~16 GB of per-subject
             // HashMaps. Total stats-phase memory is now ~200 MB - 1 GB.
@@ -1035,21 +1089,9 @@ where
                         &record, &registry,
                     );
                     let sr = crate::stats::stats_record_from_v2(&v2, record.op);
-                    stats_hook.on_record(&sr);
+                    stats_hook.observe_record(&sr);
                 }
             }
-
-            // Upload HLL sketches to CAS.
-            let sketch_ref = super::upload::upload_stats_sketch(
-                &content_store,
-                commit_t,
-                stats_hook.properties(),
-            )
-            .await?
-            .map(|(cid, _)| cid);
-
-            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
-            let id_stats_result = stats_hook.finalize();
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
@@ -1091,7 +1133,9 @@ where
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
                 // Iterate with dedup: next_deduped() returns the winning record
-                // per identity group (highest t wins). Feed assertions to collector.
+                // per identity group (highest t, and at one t the assert): an
+                // assertion is a fact the index holds. Feed it to the collector
+                // and count it.
                 //
                 // Link counts come from here, not from pass 1: a commit chain can
                 // re-assert a live link (a bulk import restating an annotation),
@@ -1110,6 +1154,7 @@ where
                             *live_term_rows.entry((winner.p_id, inner)).or_insert(0) += 1;
                         }
                         collector.on_record(&winner);
+                        stats_hook.count_present(&crate::stats::stats_record_from_v2(&winner, op));
                     }
                 }
                 let live_term_rows: Vec<(u32, u32, u64)> = live_term_rows
@@ -1119,6 +1164,18 @@ where
 
                 (collector.finish(), live_term_rows)
             };
+
+            // Upload HLL sketches (counts included) to CAS.
+            let sketch_ref = super::upload::upload_stats_sketch(
+                &content_store,
+                commit_t,
+                stats_hook.properties(),
+            )
+            .await?
+            .map(|(cid, _)| cid);
+
+            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
+            let id_stats_result = stats_hook.finalize();
 
             // ---- Build IndexStats for FIR6 root ----
             let trie_for_stats =
@@ -1311,12 +1368,12 @@ where
             let graph_arenas: Vec<GraphArenaRefs> = {
                 let mut graph_ids = std::collections::BTreeSet::new();
                 for g_id_str in uploaded_dicts.numbig.keys() {
-                    if let Ok(g_id) = g_id_str.parse::<u16>() {
+                    if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                         graph_ids.insert(g_id);
                     }
                 }
                 for g_id_str in uploaded_dicts.vectors.keys() {
-                    if let Ok(g_id) = g_id_str.parse::<u16>() {
+                    if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                         graph_ids.insert(g_id);
                     }
                 }
@@ -1370,6 +1427,7 @@ where
                 predicate_sids,
                 uploaded_dicts,
                 v3_uploaded,
+                pooled_graphs: pooled_g_ids,
                 graph_arenas,
                 datatype_iris,
                 language_tags,

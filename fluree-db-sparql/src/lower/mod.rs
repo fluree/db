@@ -425,6 +425,7 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 // predicate — adapters / search calls / leaf nodes.
                 // f:reifies* predicates can't appear inside them.
                 Pattern::Filter(_)
+                | Pattern::ListView(_)
                 | Pattern::Bind { .. }
                 | Pattern::Unwind { .. }
                 | Pattern::IndexSearch(_)
@@ -660,6 +661,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     union_default_graph: None,
                     cypher_vocab: None,
                     unmatched_optional: Default::default(),
+                    rdf_list_view: false,
                 })
             }
             QueryBody::Construct(construct_query) => self.lower_construct(construct_query),
@@ -5065,6 +5067,20 @@ mod pragma_tests {
                 None,
                 "{form}"
             );
+        }
+    }
+
+    /// Every query form reads a list's members as values of its property;
+    /// SPARQL has no way to ask for its RDF cells.
+    #[test]
+    fn every_query_form_reads_list_members() {
+        for form in [
+            "SELECT * WHERE { ?s ?p ?o }",
+            "ASK { ?s ?p ?o }",
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "DESCRIBE ?s WHERE { ?s ?p ?o }",
+        ] {
+            assert!(!lower_query(form).unwrap().rdf_list_view, "{form}");
         }
     }
 

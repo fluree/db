@@ -25,10 +25,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use fluree_db_core::ledger_config::{
-    DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
-    OntologyImportBinding, OverrideControl, PolicyDefaults, QueryDefaults, ReasoningDefaults,
-    ResolvedConfig, RetentionDefaults, RetentionProperty, RollbackGuard, ServingDefaults,
-    ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
+    DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphPlacement,
+    GraphSourceRef, IndexingDefaults, LedgerConfig, OntologyImportBinding, OverrideControl,
+    PolicyDefaults, QueryDefaults, ReasoningDefaults, ResolvedConfig, RetentionDefaults,
+    RetentionProperty, RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode,
+    TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -109,6 +110,7 @@ pub async fn resolve_ledger_config(
     let retention = read_retention_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let query = read_query_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let indexing = read_indexing_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
 
     Ok(Some(LedgerConfig {
@@ -122,6 +124,7 @@ pub async fn resolve_ledger_config(
         retention,
         serving,
         query,
+        indexing,
         graph_overrides,
     }))
 }
@@ -960,6 +963,18 @@ pub fn configured_fulltext_properties_for_indexer(
     out
 }
 
+/// The ledger config an index build reads: configured full-text properties
+/// and named-graph placement.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn indexing_config_for_indexer(
+    config: &LedgerConfig,
+) -> fluree_db_indexer::LedgerIndexingConfig {
+    fluree_db_indexer::LedgerIndexingConfig {
+        fulltext_properties: configured_fulltext_properties_for_indexer(config),
+        graph_placement: fluree_db_core::ledger_config::GraphPlacementIntent::from_config(config),
+    }
+}
+
 // ============================================================================
 // Public: Per-subsystem merge functions (request-scoped)
 // ============================================================================
@@ -1621,7 +1636,8 @@ async fn read_iri_field(
 
 /// Read a multi-value IRI list field from a subject at the config graph.
 ///
-/// Each value is an IRI reference (not a string literal). Returns decoded IRI strings.
+/// Each value is an IRI reference (not a string literal), written as
+/// repeated objects or as an RDF list. Returns decoded IRI strings.
 async fn read_iri_list_field(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
@@ -1634,21 +1650,60 @@ async fn read_iri_list_field(
         None => return Ok(None),
     };
 
-    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
-    let mut values = Vec::new();
-    for binding in bindings {
-        if let Some(sid) = binding.as_sid() {
-            if let Some(iri) = snapshot.decode_sid(sid) {
-                values.push(iri);
-            }
-        }
-    }
+    let values: Vec<String> = config_values(snapshot, overlay, to_t, subject_sid, &pred_sid)
+        .await?
+        .into_iter()
+        .filter_map(|value| match value {
+            fluree_db_core::FlakeValue::Ref(sid) => snapshot.decode_sid(&sid),
+            _ => None,
+        })
+        .collect();
 
     if values.is_empty() {
         Ok(None)
     } else {
         Ok(Some(values))
     }
+}
+
+/// The values of `subject_sid`'s `predicate_sid` in the config graph, with
+/// each RDF list among them — compact or an `rdf:first`/`rdf:rest` chain —
+/// replaced by its members.
+async fn config_values(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    predicate_sid: &Sid,
+) -> Result<Vec<fluree_db_core::FlakeValue>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+
+    let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
+    let flakes = db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(subject_sid.clone()),
+                p: Some(predicate_sid.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let read = fluree_db_core::rdf_list::read_lists(db, &flakes).await?;
+    if read.malformed > 0 {
+        tracing::warn!(
+            malformed = read.malformed,
+            "config list is not a well-formed RDF collection; ignoring it"
+        );
+    }
+    Ok(read
+        .lists
+        .into_iter()
+        .flatten()
+        .chain(read.values)
+        .collect())
 }
 
 /// Read `f:reasoningModes`, accepting every shape users naturally write:
@@ -1677,27 +1732,15 @@ async fn read_reasoning_modes_field(
         None => return Ok(None),
     };
 
-    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
-    let mut values = Vec::new();
-    for binding in bindings {
-        if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
-            values.push(s.to_string());
-            continue;
-        }
-        let Some(sid) = binding.as_sid() else {
-            continue;
-        };
-        // An object ref is either a mode IRI or the head of an RDF
-        // collection. Distinguish by probing `rdf:first`.
-        match read_rdf_list_values(snapshot, overlay, to_t, sid).await? {
-            Some(items) => values.extend(items),
-            None => {
-                if let Some(iri) = snapshot.decode_sid(sid) {
-                    values.push(iri);
-                }
-            }
-        }
-    }
+    let values: Vec<String> = config_values(snapshot, overlay, to_t, subject_sid, &pred_sid)
+        .await?
+        .into_iter()
+        .filter_map(|value| match value {
+            fluree_db_core::FlakeValue::String(s) => Some(s),
+            fluree_db_core::FlakeValue::Ref(sid) => snapshot.decode_sid(&sid),
+            _ => None,
+        })
+        .collect();
 
     if values.is_empty() {
         Ok(None)
@@ -1705,66 +1748,6 @@ async fn read_reasoning_modes_field(
         Ok(Some(values))
     }
 }
-
-/// Walk an RDF collection (`rdf:first`/`rdf:rest`.. `rdf:nil`) starting at
-/// `head`, returning each element as a string (string literals verbatim,
-/// IRI refs decoded). Returns `Ok(None)` when `head` is not a list node
-/// (no `rdf:first`), so callers can fall back to treating it as a plain
-/// IRI value.
-async fn read_rdf_list_values(
-    snapshot: &LedgerSnapshot,
-    overlay: &dyn OverlayProvider,
-    to_t: i64,
-    head: &Sid,
-) -> Result<Option<Vec<String>>> {
-    use fluree_vocab::rdf;
-
-    let (Some(first_sid), Some(rest_sid)) = (
-        try_encode(snapshot, rdf::FIRST),
-        try_encode(snapshot, rdf::REST),
-    ) else {
-        return Ok(None);
-    };
-
-    let mut node = head.clone();
-    let mut values = Vec::new();
-    let mut is_list = false;
-    // Bounded walk: a malformed cyclic list must not spin forever.
-    for _ in 0..MAX_RDF_LIST_LEN {
-        let firsts = query_config_predicate(snapshot, overlay, to_t, &node, &first_sid).await?;
-        if firsts.is_empty() {
-            return if is_list { Ok(Some(values)) } else { Ok(None) };
-        }
-        is_list = true;
-        for binding in &firsts {
-            if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
-                values.push(s.to_string());
-            } else if let Some(sid) = binding.as_sid() {
-                if let Some(iri) = snapshot.decode_sid(sid) {
-                    values.push(iri);
-                }
-            }
-        }
-        let rests = query_config_predicate(snapshot, overlay, to_t, &node, &rest_sid).await?;
-        let Some(next) = rests.iter().find_map(|b| b.as_sid().cloned()) else {
-            return Ok(Some(values));
-        };
-        if snapshot.decode_sid(&next).as_deref() == Some(rdf::NIL) {
-            return Ok(Some(values));
-        }
-        node = next;
-    }
-    tracing::warn!(
-        "f:reasoningModes RDF collection exceeded {MAX_RDF_LIST_LEN} entries \
-         (malformed or cyclic list?); truncating"
-    );
-    Ok(Some(values))
-}
-
-/// Upper bound on RDF-collection length when walking `f:reasoningModes`
-/// lists; there are only a handful of reasoning modes, so anything near
-/// this is a malformed (likely cyclic) list.
-const MAX_RDF_LIST_LEN: usize = 64;
 
 /// Read an integer field from a subject at the config graph.
 async fn read_i64_field(
@@ -2629,6 +2612,48 @@ async fn read_retention_scalar<T>(
     }
 }
 
+/// Read indexing defaults from a parent subject (LedgerConfig or GraphConfig).
+///
+/// `f:indexingDefaults` points to a group with `f:graphPlacement`
+/// (`f:PlacementAuto` / `f:PlacementDedicated`). It carries no override
+/// control: requests never choose index layout.
+async fn read_indexing_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<IndexingDefaults>> {
+    let Some(group_sid) = read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::INDEXING_DEFAULTS,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let placement = read_iri_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::GRAPH_PLACEMENT,
+    )
+    .await?;
+    let graph_placement = match placement.as_deref() {
+        None => None,
+        Some(iri) if iri == config_iris::PLACEMENT_AUTO => Some(GraphPlacement::Auto),
+        Some(iri) if iri == config_iris::PLACEMENT_DEDICATED => Some(GraphPlacement::Dedicated),
+        Some(iri) => {
+            tracing::warn!(value = iri, "unknown f:graphPlacement value — ignoring");
+            None
+        }
+    };
+    Ok(Some(IndexingDefaults { graph_placement }))
+}
+
 /// Read per-graph config overrides (`f:graphOverrides`).
 async fn read_graph_overrides(
     snapshot: &LedgerSnapshot,
@@ -2679,6 +2704,7 @@ async fn read_single_graph_config(
     let transact = read_transact_defaults(snapshot, overlay, to_t, gc_sid).await?;
     let full_text = read_fulltext_defaults(snapshot, overlay, to_t, gc_sid).await?;
     let retention = read_retention_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let indexing = read_indexing_defaults(snapshot, overlay, to_t, gc_sid).await?;
 
     Ok(Some(GraphConfig {
         target_graph,
@@ -2689,6 +2715,7 @@ async fn read_single_graph_config(
         transact,
         full_text,
         retention,
+        indexing,
     }))
 }
 
@@ -3072,6 +3099,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3102,6 +3130,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3131,6 +3160,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3161,6 +3191,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3192,6 +3223,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3308,6 +3340,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3346,6 +3379,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3374,6 +3408,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3401,6 +3436,7 @@ mod tests {
                 transact: None,
                 full_text: None,
                 retention: None,
+                indexing: None,
             }],
             ..Default::default()
         };

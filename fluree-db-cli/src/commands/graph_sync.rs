@@ -181,10 +181,7 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
     // The empty-payload gate is enforced server-side too; checking here
     // gives a precise message before any network or staging work.
     let explicitly_empty = match &payload {
-        SyncPayload::JsonLd(json) => json
-            .get("@graph")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty),
+        SyncPayload::JsonLd(json) => GraphPayload::JsonLd(json).is_explicitly_empty_jsonld(),
         SyncPayload::Rdf { .. } => false,
     };
     if explicitly_empty && !a.allow_empty {

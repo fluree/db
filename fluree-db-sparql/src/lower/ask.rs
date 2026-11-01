@@ -55,6 +55,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         })
     }
 }

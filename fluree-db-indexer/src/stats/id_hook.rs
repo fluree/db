@@ -98,6 +98,30 @@ impl IdPropertyHll {
         self.historical_tag_bits[(tag >> 6) as usize] |= 1u64 << (tag & 63);
     }
 
+    /// A record's monotone part: the NDV sketches (assertions only), the
+    /// last-modified `t` and the historical tag set.
+    #[inline]
+    fn observe(&mut self, rec: &StatsRecord) {
+        // HLL: only insert on assertions (NDV is monotone)
+        if rec.op {
+            self.values_hll.insert_hash(rec.o_hash);
+            self.subjects_hll.insert_hash(subject_hash(rec.s_id));
+        }
+        if rec.t > self.last_modified_t {
+            self.last_modified_t = rec.t;
+        }
+        // Historical tag set: every record's tag, regardless of op or delta.
+        self.note_historical_tag(rec.dt.as_u8());
+    }
+
+    /// A record's counted part: the property's count and its datatype's
+    /// count move by `delta`.
+    #[inline]
+    fn add_count(&mut self, rec: &StatsRecord, delta: i64) {
+        self.count += delta;
+        *self.datatypes.entry(rec.dt.as_u8()).or_insert(0) += delta;
+    }
+
     /// Union prior historical tags into this entry (incremental seeding).
     pub fn seed_historical_tags(&mut self, tags: impl IntoIterator<Item = u8>) {
         for tag in tags {
@@ -445,37 +469,50 @@ impl IdStatsHook {
         self.apply_record(rec, delta);
     }
 
+    /// Observe a record without counting it: the monotone accumulators (HLL
+    /// sketches, `last_modified_t`, historical datatype tags) see it, and
+    /// counts move only through [`Self::count_present`], so it touches no
+    /// count map. For a full rebuild,
+    /// whose event log can hold what an op's sign miscounts: a retraction
+    /// and an assertion of one fact at one `t` (which leave the fact
+    /// present), or a retraction of a fact never asserted.
+    pub fn observe_record(&mut self, rec: &StatsRecord) {
+        self.flake_count += 1;
+        self.property_mut(rec).observe(rec);
+    }
+
+    /// Count one fact the built index holds: its graph, property, datatype
+    /// and class counts each gain one. Only for an [`Self::new_hll_only`]
+    /// hook, whose per-subject maps are off; the monotone accumulators saw
+    /// the fact's records through [`Self::observe_record`].
+    pub fn count_present(&mut self, rec: &StatsRecord) {
+        debug_assert!(self.hll_only, "count_present is for HLL-only hooks");
+        *self.graph_flakes.entry(rec.g_id).or_insert(0) += 1;
+        self.property_mut(rec).add_count(rec, 1);
+        if self.rdf_type_p_id == Some(rec.p_id) && rec.o_kind == 0x05 {
+            *self.class_counts.entry((rec.g_id, rec.o_key)).or_insert(0) += 1;
+        }
+    }
+
+    #[inline]
+    fn property_mut(&mut self, rec: &StatsRecord) -> &mut IdPropertyHll {
+        self.properties
+            .entry(GraphPropertyKey {
+                g_id: rec.g_id,
+                p_id: rec.p_id,
+            })
+            .or_insert_with(IdPropertyHll::new)
+    }
+
     fn apply_record(&mut self, rec: &StatsRecord, delta: i64) {
         self.flake_count += 1;
 
         // Track per-graph flake count
         *self.graph_flakes.entry(rec.g_id).or_insert(0) += delta;
 
-        let key = GraphPropertyKey {
-            g_id: rec.g_id,
-            p_id: rec.p_id,
-        };
-        let hll = self
-            .properties
-            .entry(key)
-            .or_insert_with(IdPropertyHll::new);
-
-        hll.count += delta;
-
-        // HLL: only insert on assertions (NDV is monotone)
-        if rec.op {
-            hll.values_hll.insert_hash(rec.o_hash);
-            hll.subjects_hll.insert_hash(subject_hash(rec.s_id));
-        }
-
-        if rec.t > hll.last_modified_t {
-            hll.last_modified_t = rec.t;
-        }
-
-        // Track datatype usage
-        *hll.datatypes.entry(rec.dt.as_u8()).or_insert(0) += delta;
-        // Historical tag set: every record's tag, regardless of op or delta.
-        hll.note_historical_tag(rec.dt.as_u8());
+        let hll = self.property_mut(rec);
+        hll.add_count(rec, delta);
+        hll.observe(rec);
 
         if rec.o_kind == fluree_db_core::value_id::ObjKind::TRIPLE_TERM.as_u8() {
             let inner = fluree_db_core::triple_term::term_handle_p_id(rec.o_key);
@@ -1228,5 +1265,25 @@ mod tests {
         assert!(
             crate::stats::link_stat_entries(&[(3, 7, 2)], None, |_| (0, String::new())).is_empty()
         );
+    }
+
+    /// A rebuild observes every record for the sketches but counts only the
+    /// facts the index holds: a same-`t` retraction and assertion of a fact
+    /// absent before them count once, where their op signs net to zero.
+    #[test]
+    fn observed_records_count_nothing_and_present_facts_count_once() {
+        let mut hook = IdStatsHook::new_hll_only();
+        hook.observe_record(&record(false, 5));
+        hook.observe_record(&record(true, 5));
+        assert_eq!(property_count(&hook), 0, "observing counts nothing");
+        let key = GraphPropertyKey { g_id: 0, p_id: 1 };
+        assert_eq!(
+            hook.properties()[&key].last_modified_t,
+            5,
+            "but the sketch saw it"
+        );
+        hook.count_present(&record(true, 5));
+        assert_eq!(property_count(&hook), 1);
+        assert_eq!(hook.graph_flakes_mut()[&0], 1);
     }
 }

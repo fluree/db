@@ -24,7 +24,8 @@ pub(crate) enum Erased {
     /// incremental build.
     Leafwise,
     /// A value lives in a store leaf by leaf erasure does not rewrite: a
-    /// numeric, vector, geometry or full-text arena, or a triple term.
+    /// numeric, vector, geometry or full-text arena, a triple term, or the
+    /// pooled tree.
     NeedsRebuild,
 }
 
@@ -216,6 +217,11 @@ impl Fluree {
 /// Whether `event` lives only in leaves, their history and the string
 /// dictionary, which leaf by leaf erasure rewrites.
 fn leafwise(root: &IndexRoot, event: &RunRecordV2) -> bool {
+    // The pooled tree holds many graphs, and an erasure's history drop is
+    // per graph.
+    if root.pool.as_ref().is_some_and(|p| p.contains(event.g_id)) {
+        return false;
+    }
     let o_type = OType::from_u16(event.o_type);
     let full_text = o_type == OType::FULLTEXT
         || root

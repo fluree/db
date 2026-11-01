@@ -108,6 +108,9 @@ pub struct ColumnBatch {
     pub o_i: ColumnData<u32>,
     /// Transaction time — always stored on disk but only decoded when requested.
     pub t: ColumnData<u32>,
+    /// Graph of each row — a column only in pooled-tree leaflets; dedicated
+    /// trees leave it `AbsentDefault`.
+    pub g_id: ColumnData<fluree_db_core::GraphId>,
 }
 
 impl ColumnBatch {
@@ -121,6 +124,7 @@ impl ColumnBatch {
             o_type: ColumnData::AbsentDefault,
             o_i: ColumnData::AbsentDefault,
             t: ColumnData::AbsentDefault,
+            g_id: ColumnData::AbsentDefault,
         }
     }
 
@@ -138,6 +142,7 @@ impl ColumnBatch {
             + self.o_type.byte_size()
             + self.o_i.byte_size()
             + self.t.byte_size()
+            + self.g_id.byte_size()
     }
 
     /// Project a (super)batch down to `requested`, mirroring what a fresh narrow
@@ -166,6 +171,7 @@ impl ColumnBatch {
             o_type: keep!(ColumnId::OType, o_type),
             o_i: keep!(ColumnId::OI, o_i),
             t: keep!(ColumnId::T, t),
+            g_id: keep!(ColumnId::GId, g_id),
         }
     }
 
@@ -190,6 +196,7 @@ impl ColumnBatch {
             o_type: pick!(ColumnId::OType, o_type),
             o_i: pick!(ColumnId::OI, o_i),
             t: pick!(ColumnId::T, t),
+            g_id: pick!(ColumnId::GId, g_id),
         }
     }
 }
@@ -205,12 +212,14 @@ pub struct ColumnSet(pub u16);
 impl ColumnSet {
     pub const EMPTY: Self = Self(0);
 
-    /// All core columns (s_id, p_id, o_type, o_key).
+    /// All core columns (s_id, p_id, o_type, o_key), plus the graph, which is
+    /// identity in the pooled tree and absent (free) everywhere else.
     pub const CORE: Self = Self(
         (1 << ColumnId::SId as u16)
             | (1 << ColumnId::PId as u16)
             | (1 << ColumnId::OType as u16)
-            | (1 << ColumnId::OKey as u16),
+            | (1 << ColumnId::OKey as u16)
+            | (1 << ColumnId::GId as u16),
     );
 
     /// All columns including optional ones.
@@ -220,7 +229,8 @@ impl ColumnSet {
             | (1 << ColumnId::OType as u16)
             | (1 << ColumnId::OKey as u16)
             | (1 << ColumnId::OI as u16)
-            | (1 << ColumnId::T as u16),
+            | (1 << ColumnId::T as u16)
+            | (1 << ColumnId::GId as u16),
     );
 
     #[inline]
@@ -310,6 +320,8 @@ pub struct BinaryFilter {
     pub o_type: Option<u16>,
     pub o_key: Option<u64>,
     pub o_i: Option<u32>,
+    /// Graph to keep, for a scan of the pooled tree on behalf of one graph.
+    pub g_id: Option<fluree_db_core::GraphId>,
 }
 
 impl BinaryFilter {
@@ -320,6 +332,13 @@ impl BinaryFilter {
             && self.o_type.is_none()
             && self.o_key.is_none()
             && self.o_i.is_none()
+            && self.g_id.is_none()
+    }
+
+    /// Whether a row's graph passes this filter.
+    #[inline]
+    pub fn matches_graph(&self, g_id: fluree_db_core::GraphId) -> bool {
+        self.g_id.is_none_or(|g| g == g_id)
     }
 
     /// Check whether a single row passes this filter.
@@ -398,28 +417,36 @@ impl BinaryFilter {
         // Sort-column sequence per order (`o_type` precedes `o_key`; `t` is not
         // part of the V3 ordered key and is never consulted).
         let fields: &[SortField] = match order {
-            RunSortOrder::Spot => &[
+            RunSortOrder::Gspo => &[
+                SortField::G,
                 SortField::S,
                 SortField::P,
                 SortField::OType,
                 SortField::OKey,
                 SortField::OI,
             ],
-            RunSortOrder::Psot => &[
+            RunSortOrder::Spot | RunSortOrder::SpotG => &[
+                SortField::S,
+                SortField::P,
+                SortField::OType,
+                SortField::OKey,
+                SortField::OI,
+            ],
+            RunSortOrder::Psot | RunSortOrder::PsotG => &[
                 SortField::P,
                 SortField::S,
                 SortField::OType,
                 SortField::OKey,
                 SortField::OI,
             ],
-            RunSortOrder::Post => &[
+            RunSortOrder::Post | RunSortOrder::PostG => &[
                 SortField::P,
                 SortField::OType,
                 SortField::OKey,
                 SortField::OI,
                 SortField::S,
             ],
-            RunSortOrder::Opst => &[
+            RunSortOrder::Opst | RunSortOrder::OpstG => &[
                 SortField::OType,
                 SortField::OKey,
                 SortField::OI,
@@ -462,6 +489,7 @@ impl BinaryFilter {
             SortField::OType => self.o_type.map(u64::from),
             SortField::OKey => self.o_key,
             SortField::OI => self.o_i.map(u64::from),
+            SortField::G => self.g_id.map(u64::from),
         }
     }
 }
@@ -474,6 +502,7 @@ enum SortField {
     OType,
     OKey,
     OI,
+    G,
 }
 
 #[inline]
@@ -484,6 +513,7 @@ fn field_value(rec: &RunRecordV2, f: SortField) -> u64 {
         SortField::OType => u64::from(rec.o_type),
         SortField::OKey => rec.o_key,
         SortField::OI => u64::from(rec.o_i),
+        SortField::G => u64::from(rec.g_id),
     }
 }
 
@@ -517,6 +547,16 @@ mod tests {
     use super::*;
     use crate::format::run_record_v2::write_ordered_key_v2;
     use fluree_db_core::subject_id::SubjectId;
+
+    /// A pooled batch's graph column is cache weight like any other column.
+    #[test]
+    fn byte_size_counts_the_graph_column() {
+        let batch = ColumnBatch {
+            g_id: ColumnData::Block(vec![7u32; 25_000].into()),
+            ..ColumnBatch::empty()
+        };
+        assert_eq!(batch.byte_size(), 100_000);
+    }
 
     #[test]
     fn column_data_const() {

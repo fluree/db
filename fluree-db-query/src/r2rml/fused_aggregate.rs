@@ -5680,6 +5680,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         }
     }
 
@@ -6876,6 +6877,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6908,6 +6910,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6948,6 +6951,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_none());
     }
@@ -7347,6 +7351,7 @@ mod tests {
                 union_default_graph: None,
                 cypher_vocab: None,
                 unmatched_optional: Default::default(),
+                rdf_list_view: false,
             };
             assert!(detect_fused_r2rml_aggregate(&q).is_some());
         }

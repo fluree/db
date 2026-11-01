@@ -606,7 +606,7 @@ async fn indexed_named_graph_annotation_stays_writable() {
 async fn live_reifies_flakes(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> usize {
     let ledger = fluree.ledger(ledger_id).await.expect("reload");
     let mut live = 0;
-    for g_id in 0..6u16 {
+    for g_id in 0..6u32 {
         let flakes = fluree_db_core::range_with_overlay(
             &ledger.snapshot,
             g_id,

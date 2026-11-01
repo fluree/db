@@ -177,7 +177,7 @@ fn split_group_for_branch_op(
 pub(crate) async fn validate_staged_config(
     view: &StagedLedger,
     ns: &NamespaceRegistry,
-    graph_delta: &FxHashMap<u16, String>,
+    graph_delta: &FxHashMap<GraphId, String>,
     scope: GuardScope,
 ) -> Result<RetentionSignals, GuardError> {
     let authoring = scope == GuardScope::Authoring;
@@ -752,7 +752,7 @@ fn validate_reasoning_modes(view: &StagedLedger, modes_p: &Sid) -> Result<(), Gu
 /// Names terms and graphs for messages.
 struct Names<'a> {
     ns: &'a NamespaceRegistry,
-    graph_delta: &'a FxHashMap<u16, String>,
+    graph_delta: &'a FxHashMap<GraphId, String>,
     view: &'a StagedLedger,
     config_graph: String,
 }
@@ -761,7 +761,7 @@ impl<'a> Names<'a> {
     fn new(
         view: &'a StagedLedger,
         ns: &'a NamespaceRegistry,
-        graph_delta: &'a FxHashMap<u16, String>,
+        graph_delta: &'a FxHashMap<GraphId, String>,
     ) -> Self {
         Self {
             ns,

@@ -34,7 +34,7 @@ use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_first_parent_commits_by_id;
 use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, StorageBackend};
-use fluree_db_ledger::{DecodedIndexRoot, LedgerState, TypeErasedStore};
+use fluree_db_ledger::{DecodedIndexRoot, InstalledIndex, LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
@@ -703,17 +703,10 @@ impl LedgerHandle {
 
     /// Get state metrics for update planning
     ///
-    /// Returns (t, index_t, index_head_id) needed for UpdatePlan::plan()
-    pub async fn state_metrics(&self) -> (i64, i64, Option<ContentId>) {
+    /// Returns the `t` and installed index needed for UpdatePlan::plan()
+    pub async fn state_metrics(&self) -> (i64, InstalledIndex) {
         let state = self.inner.state.read().await;
-        (
-            state.t(),
-            state.index_t(),
-            state
-                .ns_record
-                .as_ref()
-                .and_then(|r| r.index_head_id.clone()),
-        )
+        (state.t(), state.installed_index())
     }
 
     /// The bits of the instance the cached state belongs to; see
@@ -729,11 +722,16 @@ impl LedgerHandle {
         other_activation(state.ns_record.as_ref(), record)
     }
 
-    /// Check if cached state is fresh vs remote watermark
+    /// Check if cached state is fresh vs remote watermark: stale when the
+    /// remote index replaces the installed one (see
+    /// [`InstalledIndex::is_replaced_by`]).
     pub async fn check_freshness(&self, remote: &RemoteWatermark) -> FreshnessCheck {
-        let local_index_t = self.index_t().await;
-
-        if remote.index_t > local_index_t {
+        let (_, local) = self.state_metrics().await;
+        let stale = match &remote.index_head_id {
+            Some(id) => local.is_replaced_by(remote.index_t, id),
+            None => remote.index_t > local.t,
+        };
+        if stale {
             FreshnessCheck::Stale
         } else {
             FreshnessCheck::Current
@@ -759,7 +757,7 @@ impl LedgerHandle {
         index_id: &ContentId,
         cs: Arc<dyn ContentStore>,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let span = tracing::debug_span!(
             "index_install",
@@ -776,7 +774,7 @@ impl LedgerHandle {
         index_id: &ContentId,
         cs: Arc<dyn ContentStore>,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let bytes = cs
             .get(index_id)
@@ -841,9 +839,13 @@ impl LedgerHandle {
             // apply_loaded_db: validates, trims novelty, retires the
             // dictionary entries the indexed commits introduced.
             let phase = Instant::now();
-            state
+            let installed = state
                 .apply_loaded_db(db, Some(index_id))
                 .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
+            if !installed {
+                // Already installed, or the root the installed one replaced.
+                return Ok(false);
+            }
             let apply_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
 
@@ -900,13 +902,11 @@ impl LedgerHandle {
                 install_us = install_started.elapsed().as_micros() as u64,
                 "index install"
             );
-            Ok::<(), ApiError>(())
+            Ok::<bool, ApiError>(true)
         };
         install
             .instrument(tracing::debug_span!("index_install_lock"))
-            .await?;
-
-        Ok(())
+            .await
     }
 }
 
@@ -923,7 +923,8 @@ pub struct RemoteWatermark {
     pub commit_t: i64,
     /// Remote index_t value (used for freshness comparison)
     pub index_t: i64,
-    /// Remote index head CID (for potential future optimization)
+    /// Remote index head CID: at an equal `index_t`, a different one is a
+    /// replacement root (compaction, reindex)
     pub index_head_id: Option<ContentId>,
     /// When this watermark was last updated
     pub updated_at: Instant,
@@ -940,9 +941,9 @@ pub trait FreshnessSource: Send + Sync {
 /// Result of checking if cached state is fresh
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreshnessCheck {
-    /// Local index_t >= remote index_t
+    /// Local index_t >= remote index_t, and the same root at an equal t
     Current,
-    /// Remote index_t > local index_t, needs reload
+    /// Remote index_t > local index_t, or another root at the same t; needs reload
     Stale,
 }
 
@@ -977,6 +978,14 @@ enum LoadState {
         generation: u64,
         handle: LedgerHandle,
         waiters: Vec<oneshot::Sender<std::result::Result<(), Arc<ApiError>>>>,
+    },
+    /// The ledger's binary store failed to load. Until `retry_at`, a request
+    /// gets this error without loading again, so a lasting failure costs one
+    /// load per [`LedgerManagerConfig::store_load_retry`], not one per
+    /// request. The next request after that loads again.
+    Failed {
+        error: Arc<ApiError>,
+        retry_at: Instant,
     },
 }
 
@@ -1121,6 +1130,10 @@ pub struct LedgerManagerConfig {
     ///
     /// By default this is injected by `Fluree` from its global cache budget.
     pub leaflet_cache: Option<Arc<LeafletCache>>,
+    /// How long a ledger whose binary store failed to load answers with that
+    /// failure before a request loads it again (default: 5 s). Zero loads
+    /// again on the next request.
+    pub store_load_retry: Duration,
 }
 
 impl std::fmt::Debug for LedgerManagerConfig {
@@ -1130,6 +1143,7 @@ impl std::fmt::Debug for LedgerManagerConfig {
             .field("sweep_interval", &self.sweep_interval)
             .field("cache_dir", &self.cache_dir)
             .field("has_leaflet_cache", &self.leaflet_cache.is_some())
+            .field("store_load_retry", &self.store_load_retry)
             .finish()
     }
 }
@@ -1141,6 +1155,7 @@ impl Default for LedgerManagerConfig {
             sweep_interval: Duration::from_secs(60),
             cache_dir: default_cache_dir(),
             leaflet_cache: None,
+            store_load_retry: Duration::from_secs(5),
         }
     }
 }
@@ -1653,7 +1668,7 @@ impl LedgerManager {
         let entries = self.entries.read().await;
         match entries.get(&canonical_alias)? {
             LoadState::Ready(handle) | LoadState::Reloading { handle, .. } => Some(handle.clone()),
-            LoadState::Loading { .. } => None,
+            LoadState::Loading { .. } | LoadState::Failed { .. } => None,
         }
     }
 
@@ -1685,6 +1700,12 @@ impl LedgerManager {
             {
                 // Handle is valid even during reload
                 return Ok(handle.clone());
+            } else if let Some(LoadState::Failed { error, retry_at }) =
+                entries.get(&canonical_alias)
+            {
+                if Instant::now() < *retry_at {
+                    return Err(ApiError::http(error.status_code(), error.to_string()));
+                }
             }
         }
 
@@ -1707,7 +1728,11 @@ impl LedgerManager {
                     waiters.push(tx);
                     (Some(rx), 0)
                 }
-                None => {
+                Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
+                    return Err(ApiError::http(error.status_code(), error.to_string()));
+                }
+                // A failure whose window has passed loads again.
+                Some(LoadState::Failed { .. }) | None => {
                     // We're first - mark as loading (with a fresh generation),
                     // release lock, do I/O.
                     let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
@@ -1781,11 +1806,16 @@ impl LedgerManager {
             "ledger.load.state.done"
         );
 
+        // Whether the load failed on the binary store, which is remembered for
+        // `store_load_retry` (a ledger-state failure, such as not found, is not).
+        let mut store_failed = false;
         let publish = match load_result {
             Ok((mut state, root)) => {
-                // Attempt to load binary index store (v2 only).
-                // Non-fatal: if loading fails, log and continue without binary index.
-                let binary_store = match load_and_attach_binary_store(
+                // Attach the binary index store. A ledger with an index can be
+                // neither read nor checked without it, so a failure fails the
+                // load: a handle without its store is never cached, and a
+                // later request loads again.
+                match load_and_attach_binary_store(
                     &self.backend,
                     self.nameservice_mode.reader(),
                     &mut state,
@@ -1795,16 +1825,22 @@ impl LedgerManager {
                 )
                 .await
                 {
-                    Ok(store) => store,
+                    Ok(binary_store) => Ok((state, binary_store)),
                     Err(e) => {
                         tracing::warn!(
                             ledger_id = %ledger_id,
                             error = %e,
-                            "Failed to load binary store, continuing without"
+                            "Failed to load binary store; the load fails"
                         );
-                        None
+                        store_failed = true;
+                        Err(e)
                     }
-                };
+                }
+            }
+            Err(e) => Err(e),
+        };
+        let publish = match publish {
+            Ok((state, binary_store)) => {
                 tracing::debug!(alias = %canonical_alias, "ledger.load.binary_store.done");
                 #[cfg(feature = "shacl")]
                 let loaded_config = warn_if_shapes_unenforced(&state).await;
@@ -1900,6 +1936,18 @@ impl LedgerManager {
                         for tx in waiters {
                             let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
                         }
+                    }
+                    // Remember a store failure, so requests in the window get
+                    // it without each loading again.
+                    let retry = self.config.store_load_retry;
+                    if store_failed && !retry.is_zero() && !shutting_down {
+                        entries.insert(
+                            canonical_alias.clone(),
+                            LoadState::Failed {
+                                error: error_for_waiters,
+                                retry_at: Instant::now() + retry,
+                            },
+                        );
                     }
                 }
 
@@ -2004,7 +2052,8 @@ impl LedgerManager {
                     waiters.push(tx);
                     ReloadAction::WaitForInitialLoad(rx)
                 }
-                None => ReloadAction::NotLoaded,
+                // Nothing is cached to reload; the next request loads.
+                Some(LoadState::Failed { .. }) | None => ReloadAction::NotLoaded,
             }
         };
         // Manager lock released
@@ -2067,80 +2116,84 @@ impl LedgerManager {
                 )
                 .await
                 .map_err(ApiError::from);
-                let result = match loaded {
-                    Ok((mut new_state, root)) => {
-                        // Attempt to load binary index store (v2 only) — still off-lock.
-                        // Artifacts shared with the store being replaced are
-                        // carried over; the slot is read on its own (no
-                        // `state` lock held), which keeps the lock order.
-                        let prev_store = handle.inner.binary_store.read().await.clone();
-                        let new_binary_store = match load_and_attach_binary_store(
-                            &self.backend,
-                            self.nameservice_mode.reader(),
-                            &mut new_state,
-                            self.config.leaflet_cache.clone(),
-                            prev_store.as_deref(),
-                            root,
-                        )
-                        .await
-                        {
-                            Ok(store) => store,
-                            Err(e) => {
-                                tracing::warn!(
-                                    ledger_id = %ledger_id,
-                                    error = %e,
-                                    "Failed to load binary store during reload, continuing without"
-                                );
-                                None
-                            }
-                        };
+                let result = 'load: {
+                    match loaded {
+                        Ok((mut new_state, root)) => {
+                            // Attempt to load binary index store (v2 only) — still off-lock.
+                            // Artifacts shared with the store being replaced are
+                            // carried over; the slot is read on its own (no
+                            // `state` lock held), which keeps the lock order.
+                            let prev_store = handle.inner.binary_store.read().await.clone();
+                            let new_binary_store = match load_and_attach_binary_store(
+                                &self.backend,
+                                self.nameservice_mode.reader(),
+                                &mut new_state,
+                                self.config.leaflet_cache.clone(),
+                                prev_store.as_deref(),
+                                root,
+                            )
+                            .await
+                            {
+                                Ok(store) => store,
+                                Err(e) => {
+                                    // Keep serving the state and store the handle
+                                    // has rather than swap in one without a store.
+                                    tracing::warn!(
+                                        ledger_id = %ledger_id,
+                                        error = %e,
+                                        "Failed to load binary store during reload; keeping the previous state"
+                                    );
+                                    break 'load Err(e);
+                                }
+                            };
 
-                        // Brief coherent swap. Lock order: state -> binary_store;
-                        // acquire both before mutating so there is no `.await`
-                        // between the two assignments (no incoherent
-                        // state/binary_store window on cancellation, and readers
-                        // blocked on `state` never observe a half-applied swap).
-                        let mut write_guard = handle.lock_for_write().await;
-                        // Compare total `t()` (novelty included), not `index_t()`:
-                        // this is deliberately novelty-protective. If the reloaded
-                        // state carries a newer persisted index but an older total
-                        // `t` than the in-memory state, we skip the swap and keep
-                        // the fresher novelty — transiently forgoing the newer
-                        // index, which the next reload picks up. Never clobber a
-                        // newer in-memory commit to adopt a newer index. A state
-                        // of another activation is replaced whatever its t: its
-                        // commits can no longer be published.
-                        let replaced = new_state.ns_record.as_ref().is_some_and(|record| {
-                            other_activation(write_guard.state().ns_record.as_ref(), record)
-                        });
-                        if replaced || new_state.t() >= write_guard.state().t() {
-                            let mut bs_guard = handle.inner.binary_store.write().await;
-                            write_guard.replace(new_state);
-                            *bs_guard = new_binary_store;
-                            // Out-of-band swap: any resolved-config entry may
-                            // have been cached against a state this swap just
-                            // replaced — including a detached-commit
-                            // placeholder whose marker (0) a reloaded state
-                            // can legitimately share. See `config_cache_clear`.
-                            // Taking the config lock while holding `state` is
-                            // safe: no path acquires `state` while holding the
-                            // config lock.
-                            handle.config_cache_clear().await;
-                        } else {
-                            // A concurrent commit advanced the in-memory state
-                            // past the reloaded storage HEAD (a txn took the
-                            // still-valid handle via get_or_load's Reloading
-                            // fast path while we loaded). Keep the fresher
-                            // in-memory state rather than clobber the commit.
-                            tracing::debug!(
-                                ledger_id = %ledger_id,
-                                "reload: in-memory state newer than reloaded storage; skipping swap"
-                            );
+                            // Brief coherent swap. Lock order: state -> binary_store;
+                            // acquire both before mutating so there is no `.await`
+                            // between the two assignments (no incoherent
+                            // state/binary_store window on cancellation, and readers
+                            // blocked on `state` never observe a half-applied swap).
+                            let mut write_guard = handle.lock_for_write().await;
+                            // Compare total `t()` (novelty included), not `index_t()`:
+                            // this is deliberately novelty-protective. If the reloaded
+                            // state carries a newer persisted index but an older total
+                            // `t` than the in-memory state, we skip the swap and keep
+                            // the fresher novelty — transiently forgoing the newer
+                            // index, which the next reload picks up. Never clobber a
+                            // newer in-memory commit to adopt a newer index. A state
+                            // of another activation is replaced whatever its t: its
+                            // commits can no longer be published.
+                            let replaced = new_state.ns_record.as_ref().is_some_and(|record| {
+                                other_activation(write_guard.state().ns_record.as_ref(), record)
+                            });
+                            if replaced || new_state.t() >= write_guard.state().t() {
+                                let mut bs_guard = handle.inner.binary_store.write().await;
+                                write_guard.replace(new_state);
+                                *bs_guard = new_binary_store;
+                                // Out-of-band swap: any resolved-config entry may
+                                // have been cached against a state this swap just
+                                // replaced — including a detached-commit
+                                // placeholder whose marker (0) a reloaded state
+                                // can legitimately share. See `config_cache_clear`.
+                                // Taking the config lock while holding `state` is
+                                // safe: no path acquires `state` while holding the
+                                // config lock.
+                                handle.config_cache_clear().await;
+                            } else {
+                                // A concurrent commit advanced the in-memory state
+                                // past the reloaded storage HEAD (a txn took the
+                                // still-valid handle via get_or_load's Reloading
+                                // fast path while we loaded). Keep the fresher
+                                // in-memory state rather than clobber the commit.
+                                tracing::debug!(
+                                    ledger_id = %ledger_id,
+                                    "reload: in-memory state newer than reloaded storage; skipping swap"
+                                );
+                            }
+                            Ok(())
+                            // state (and binary_store) guards dropped here, before `entries`.
                         }
-                        Ok(())
-                        // state (and binary_store) guards dropped here, before `entries`.
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 };
 
                 // Publish under a brief `entries` lock — no `.await` between the
@@ -2224,6 +2277,10 @@ impl LedgerManager {
                     return false;
                 }
             }
+            // A remembered store failure past its window holds nothing.
+            if let LoadState::Failed { retry_at, .. } = load_state {
+                return Instant::now() < *retry_at;
+            }
             // Keep Loading/Reloading entries - they're transient
             true
         });
@@ -2301,7 +2358,8 @@ pub enum UpdatePlan {
     Noop,
 
     /// Index advanced but commit_t unchanged
-    /// (ns.commit_t == local.t() BUT ns.index_t > local.index_t)
+    /// (ns.commit_t == local.t() BUT ns.index_t > local.index_t, or another
+    /// root at the same index_t)
     /// Action: reload index root, trim novelty to only commits > new index_t
     IndexOnly {
         /// New index head CID to load
@@ -2340,41 +2398,19 @@ impl UpdatePlan {
     ///
     /// # Arguments
     /// * `local_t` - Local ledger's current t (max of index + novelty)
-    /// * `local_index_t` - Local ledger's indexed t (db.t)
-    /// * `local_index_id` - Local ledger's current index CID (if any)
+    /// * `local_index` - Local ledger's installed index
     /// * `ns` - Fresh nameservice record
-    pub fn plan(
-        local_t: i64,
-        local_index_t: i64,
-        local_index_id: Option<&ContentId>,
-        ns: &NsRecord,
-    ) -> Self {
-        // An index the record names that the cached state has not installed.
-        // Valid whenever the record's index is newer than the local one: the
-        // index covers a prefix of commits, so it applies equally to a local
-        // state at, ahead of, or behind the record's commit head.
-        let index_advance = match (&ns.index_head_id, local_index_id) {
-            (Some(ns_idx), Some(local_idx))
-                if ns_idx != local_idx && ns.index_t > local_index_t =>
-            {
-                Some((ns_idx.clone(), ns.index_t))
-            }
-            (Some(ns_idx), None) if ns.index_t > local_index_t => {
+    pub fn plan(local_t: i64, local_index: &InstalledIndex, ns: &NsRecord) -> Self {
+        // An index the record names that replaces the installed one (see
+        // `InstalledIndex::is_replaced_by`). The index covers a prefix of
+        // commits, so it applies equally to a local state at, ahead of, or
+        // behind the record's commit head.
+        let index_advance = match &ns.index_head_id {
+            Some(ns_idx) if local_index.is_replaced_by(ns.index_t, ns_idx) => {
                 Some((ns_idx.clone(), ns.index_t))
             }
             _ => None,
         };
-        // The same `t` indexed anew (a reindex, or a purge rewriting the
-        // index without an erased value): a reload reads the record as it is
-        // then, so a stale one cannot bring an old root back.
-        let index_replaced = matches!(
-            (&ns.index_head_id, local_index_id),
-            (Some(ns_idx), Some(local_idx))
-                if ns_idx != local_idx && ns.index_t == local_index_t
-        );
-        if index_replaced && ns.commit_t >= local_t {
-            return UpdatePlan::Reload;
-        }
 
         if ns.commit_t == local_t {
             match index_advance {
@@ -2555,15 +2591,15 @@ impl LedgerManager {
         }
 
         // Get local state metrics for planning
-        let (local_t, local_index_t, local_index_id) = handle.state_metrics().await;
+        let (local_t, local_index) = handle.state_metrics().await;
 
         // Plan the update action
-        let plan = UpdatePlan::plan(local_t, local_index_t, local_index_id.as_ref(), &ns_record);
+        let plan = UpdatePlan::plan(local_t, &local_index, &ns_record);
 
         tracing::debug!(
             alias = %input.ledger_id,
             local_t = local_t,
-            local_index_t = local_index_t,
+            local_index_t = local_index.t,
             ns_commit_t = ns_record.commit_t,
             ns_index_t = ns_record.index_t,
             ?plan,
@@ -2597,10 +2633,14 @@ impl LedgerManager {
                     "notify: applying index update (incremental)"
                 );
                 let cs = cs_for_record().await?;
-                handle
+                let installed = handle
                     .apply_index_v2(&index_head_id, cs, self.config.leaflet_cache.clone())
                     .await?;
-                Ok(NotifyResult::IndexUpdated)
+                Ok(if installed {
+                    NotifyResult::IndexUpdated
+                } else {
+                    NotifyResult::Current
+                })
             }
 
             UpdatePlan::CommitCatchUp {
@@ -2767,7 +2807,7 @@ impl LedgerManager {
                 _ => return None,
             }
         };
-        let (t, _, _) = handle.state_metrics().await;
+        let (t, _) = handle.state_metrics().await;
         Some(t)
     }
 }
@@ -2978,6 +3018,14 @@ mod tests {
         ContentId::new(ContentKind::Commit, label.as_bytes())
     }
 
+    fn installed(t: i64, id: Option<&ContentId>) -> InstalledIndex {
+        InstalledIndex {
+            t,
+            id: id.cloned(),
+            replaced: None,
+        }
+    }
+
     fn make_index_cid(label: &str) -> ContentId {
         use fluree_db_core::ContentKind;
         ContentId::new(ContentKind::IndexRoot, label.as_bytes())
@@ -3014,7 +3062,7 @@ mod tests {
         // Local t == ns.commit_t, index unchanged -> Noop
         let idx_cid = make_index_cid("index:8");
         let ns = make_ns_record(10, 8, Some(make_cid("commit:10")), Some(idx_cid.clone()));
-        let plan = UpdatePlan::plan(10, 8, Some(&idx_cid), &ns);
+        let plan = UpdatePlan::plan(10, &installed(8, Some(&idx_cid)), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -3022,7 +3070,7 @@ mod tests {
     fn test_update_plan_noop_when_commit_t_matches_no_index() {
         // Local t == ns.commit_t, no index on either side -> Noop
         let ns = make_ns_record(5, 0, Some(make_cid("commit:5")), None);
-        let plan = UpdatePlan::plan(5, 0, None, &ns);
+        let plan = UpdatePlan::plan(5, &installed(0, None), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -3033,7 +3081,7 @@ mod tests {
         let idx_cid = make_index_cid("index:5");
         let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(idx_cid.clone()));
         // Local: index_t=5, but t()=10 due to novelty
-        let plan = UpdatePlan::plan(10, 5, Some(&idx_cid), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&idx_cid)), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -3048,29 +3096,55 @@ mod tests {
         );
         let local_idx = make_index_cid("index:5");
         // Local: t()=10, index_t=5
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
     }
 
     #[test]
-    fn test_update_plan_reload_when_index_replaced_at_same_t() {
-        // Same t, another root (a purge rewrote the index) -> Reload
-        let ns = make_ns_record(
-            10,
-            8,
-            Some(make_cid("commit:10")),
-            Some(make_index_cid("index:8-rewritten")),
-        );
-        let local_idx = make_index_cid("index:8");
+    fn another_root_at_the_same_index_t_is_installed() {
+        // A compaction or reindex replaced the root at the cached index's t.
+        let local_idx = make_index_cid("index:5");
+        let ns_idx = make_index_cid("index:5-compacted");
+        let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(ns_idx.clone()));
         assert_eq!(
-            UpdatePlan::plan(10, 8, Some(&local_idx), &ns),
-            UpdatePlan::Reload
+            UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns),
+            UpdatePlan::IndexOnly {
+                index_head_id: ns_idx.clone(),
+                index_t: 5
+            }
         );
-        // A record older on commits than the cached state is not acted on.
+        // Commits behind as well: caught up, and the root installed after.
+        let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(ns_idx.clone()));
+        assert!(matches!(
+            UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns),
+            UpdatePlan::CommitCatchUp {
+                gap: 1,
+                index_update: Some((ref id, 5)),
+                ..
+            } if *id == ns_idx
+        ));
+        // The installed root is current.
+        let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(local_idx.clone()));
         assert_eq!(
-            UpdatePlan::plan(11, 8, Some(&local_idx), &ns),
+            UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns),
             UpdatePlan::Noop
         );
+        // Nor is the root the installed one replaced, which a record read
+        // before the replacement still names.
+        let compacted = InstalledIndex {
+            t: 5,
+            id: Some(ns_idx.clone()),
+            replaced: Some(local_idx.clone()),
+        };
+        assert_eq!(UpdatePlan::plan(10, &compacted, &ns), UpdatePlan::Noop);
+        let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(local_idx));
+        assert!(matches!(
+            UpdatePlan::plan(10, &compacted, &ns),
+            UpdatePlan::CommitCatchUp {
+                index_update: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3083,7 +3157,7 @@ mod tests {
             Some(make_index_cid("index:10")),
         );
         // Local: t()=10, no index
-        let plan = UpdatePlan::plan(10, 0, None, &ns);
+        let plan = UpdatePlan::plan(10, &installed(0, None), &ns);
         assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
     }
 
@@ -3092,7 +3166,7 @@ mod tests {
         // ns.commit_t == local.t() + 1 -> CommitCatchUp with gap=1
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert!(matches!(
             plan,
             UpdatePlan::CommitCatchUp {
@@ -3111,7 +3185,7 @@ mod tests {
         let local_idx = make_index_cid("index:2");
         let ns_idx = make_index_cid("index:61");
         let ns = make_ns_record(66, 61, Some(make_cid("commit:66")), Some(ns_idx.clone()));
-        let plan = UpdatePlan::plan(67, 2, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(67, &installed(2, Some(&local_idx)), &ns);
         assert_eq!(
             plan,
             UpdatePlan::IndexOnly {
@@ -3123,7 +3197,7 @@ mod tests {
         // Same lag with no index advance stays a no-op.
         let ns = make_ns_record(66, 2, Some(make_cid("commit:66")), Some(local_idx.clone()));
         assert_eq!(
-            UpdatePlan::plan(67, 2, Some(&local_idx), &ns),
+            UpdatePlan::plan(67, &installed(2, Some(&local_idx)), &ns),
             UpdatePlan::Noop
         );
     }
@@ -3138,7 +3212,7 @@ mod tests {
             Some(make_cid("commit:20")),
             Some(make_index_cid("index:15")),
         );
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert_eq!(plan, UpdatePlan::Reload);
     }
 
@@ -3147,7 +3221,7 @@ mod tests {
         // ns.commit_t a few ahead -> CommitCatchUp (gap <= MAX_INCREMENTAL_COMMITS)
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(13, 5, Some(make_cid("commit:13")), Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert!(matches!(
             plan,
             UpdatePlan::CommitCatchUp {
@@ -3169,7 +3243,7 @@ mod tests {
             Some(make_cid("commit:11")),
             Some(make_index_cid("index:10")),
         );
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         match plan {
             UpdatePlan::CommitCatchUp {
                 gap: 1,
@@ -3189,7 +3263,7 @@ mod tests {
         // next install. Stale record, nothing to do — never a reload.
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(5, 5, Some(make_cid("commit:5")), Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -3198,7 +3272,7 @@ mod tests {
         // ns.commit_t == local.t() + 1 but no commit_head_id -> Reload (safety)
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(11, 5, None, Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert_eq!(plan, UpdatePlan::Reload);
     }
 

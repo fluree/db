@@ -54,6 +54,16 @@ pub struct DeltaMapRequest {
     pub model: Option<String>,
     /// `default-allow` for governed requests that match no policy.
     pub default_allow: Option<bool>,
+    /// Materialization: the column that marks a row as deleted, as for
+    /// `/iceberg/map`. Omit to merge rows into their subjects; a change feed's
+    /// deletes retract either way.
+    pub delete_column: Option<String>,
+    /// Values of `delete_column` that mark a row as deleted; a `null` element
+    /// matches a NULL value. Required when `delete_column` is set.
+    #[serde(default)]
+    pub delete_values: Vec<Option<String>>,
+    /// Materialization: the column that orders one key's rows within a version.
+    pub order_by: Option<String>,
 }
 
 /// A Unity Catalog connection, as every Delta endpoint spells it.
@@ -218,6 +228,19 @@ fn build_delta_config_allowing(
     }
     .into_auth()
     .map_err(ServerError::Api)?;
+    let delete = req
+        .delete_column
+        .map(|column| {
+            let convention = fluree_db_api::DeleteConvention {
+                column,
+                deleted_values: req.delete_values,
+            };
+            convention
+                .validate()
+                .map_err(|e| ServerError::bad_request(format!("invalid delete convention: {e}")))
+                .map(|()| convention)
+        })
+        .transpose()?;
     Ok(fluree_db_api::DeltaCreateConfig {
         unity,
         name: req.name,
@@ -234,6 +257,8 @@ fn build_delta_config_allowing(
         mapping_media_type: req.r2rml_type,
         model: req.model,
         default_allow: req.default_allow,
+        delete,
+        order_by: req.order_by,
     })
 }
 
@@ -560,6 +585,37 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn materialize_options_are_stored_with_the_source() {
+        let config = build_delta_config_allowing(
+            request(serde_json::json!({
+                "root": "s3://lake/Tables",
+                "delete_column": "op",
+                "delete_values": ["D", null],
+                "order_by": "updated_at",
+            })),
+            "",
+        )
+        .unwrap();
+        let stored = stored(&config);
+        assert_eq!(stored["delete"]["column"], "op");
+        assert_eq!(
+            stored["delete"]["deleted_values"],
+            serde_json::json!(["D", null])
+        );
+        assert_eq!(stored["order_by"], "updated_at");
+
+        let bare = build_delta_config_allowing(
+            request(serde_json::json!({"root": "s3://lake/Tables", "delete_column": "op"})),
+            "",
+        );
+        assert!(
+            bare.err()
+                .is_some_and(|e| e.to_string().contains("delete convention")),
+            "a delete column with no values is refused"
+        );
     }
 
     #[test]

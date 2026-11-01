@@ -203,15 +203,10 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     // PR-BASE: relative-IRI/BASE resolution in query output (2)
-    // list-2..4: the SPARQL parser now desugars `( ... )` patterns to
-    // rdf:first/rest/nil triples, but Fluree's Turtle ingest emits
-    // OBJECT-position collections as Fluree list_index items —
-    // `parse_collection_as_list`, fluree-graph-turtle/src/parser.rs — so
-    // the first/rest triples the query needs are never stored. Eval-side
-    // ingest/model gap (D-13), not parser. list-1 came OFF this register
-    // with the #1694 empty-collection fix: `()` now ingests as the
-    // `rdf:nil` triple it denotes (`:x :list0 rdf:nil`), and `:x ?p ()`
-    // needs no spine — the pattern lowers to the rdf:nil constant.
+    // list-2..4: SPARQL reads a list's members as values of the property that
+    // holds it, as JSON-LD does, not as `rdf:first`/`rdf:rest` cells
+    // (docs/query/sparql.md#lists), so a `( … )` pattern matches nothing.
+    // By design; list-1 passes because `()` is the `rdf:nil` it denotes.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",

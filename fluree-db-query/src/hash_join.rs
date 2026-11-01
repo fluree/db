@@ -533,7 +533,7 @@ impl<'a> HashJoinPlanner<'a> {
 /// A join key that is comparable across build/probe sides regardless of whether a
 /// ref was delivered as `EncodedSid` or materialised `Sid`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum JoinKey {
+pub(crate) enum JoinKey {
     /// A resolved subject id (ledger-local; valid because the operator is
     /// single-store / native).
     Ref(u64),
@@ -587,6 +587,19 @@ fn join_key(
         other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(
             other, dicts, gv,
         ))),
+    }
+}
+
+/// `binding`'s inner-join key (see `join_key`), or `None` for an unbound or
+/// poisoned binding, which an inner join on it never matches.
+pub(crate) fn inner_join_key(
+    binding: &Binding,
+    dicts: Option<TermDicts<'_>>,
+    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Option<JoinKey> {
+    match join_key(binding, dicts, gv) {
+        JoinKeyClass::Keyed(key) => Some(key),
+        JoinKeyClass::Wildcard | JoinKeyClass::Dead => None,
     }
 }
 

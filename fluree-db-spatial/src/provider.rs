@@ -724,15 +724,22 @@ mod tests {
 
     /// Build a minimal snapshot with a single polygon for testing.
     fn build_test_snapshot(wkt: &str, subject_id: u64, t: i64) -> SpatialIndexSnapshot {
+        build_snapshot_of(&[(wkt, subject_id, t, true)])
+    }
+
+    /// A snapshot built from `(wkt, subject_id, t, is_assert)` events.
+    fn build_snapshot_of(events: &[(&str, u64, i64, bool)]) -> SpatialIndexSnapshot {
         use std::cell::RefCell;
         use std::sync::Arc;
 
         let config = SpatialCreateConfig::new("test:vg", "test:ledger", "test:geom");
         let mut builder = SpatialIndexBuilder::new(config);
 
-        builder
-            .add_geometry(subject_id, wkt, t, true)
-            .expect("add geometry");
+        for &(wkt, subject_id, t, is_assert) in events {
+            builder
+                .add_geometry(subject_id, wkt, t, is_assert)
+                .expect("add geometry");
+        }
 
         let result = builder.build().expect("build");
 
@@ -784,6 +791,34 @@ mod tests {
             .collect();
 
         (entries, arena)
+    }
+
+    /// The cell index keys a cell by subject, not by geometry, so a polygon
+    /// edited within the cells it covers retracts and asserts those cells
+    /// at one `t`. The edit holds there (`fluree_db_core::same_t`): the
+    /// subject is still found, at the edit's `t` and before it.
+    #[tokio::test]
+    async fn test_polygon_edited_within_its_cells_is_found() {
+        let before = "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))";
+        let after = "POLYGON((0 0, 10 0, 10 10, 0 10.0001, 0 0))";
+        let snapshot = build_snapshot_of(&[
+            (before, 100, 1, true),
+            (before, 100, 2, false),
+            (after, 100, 2, true),
+        ]);
+        let provider = EmbeddedSpatialProvider::new(snapshot);
+        let query_geom = parse_wkt("POLYGON((-5 -5, 15 -5, 15 15, -5 15, -5 -5))").unwrap();
+        for t in [2, 1] {
+            let results = provider.query_within(&query_geom, t, None).await.unwrap();
+            let subjects: Vec<u64> = results.iter().map(|r| r.subject_id).collect();
+            assert_eq!(subjects, vec![100], "within at t={t}");
+            let results = provider
+                .query_intersects(&query_geom, t, None)
+                .await
+                .unwrap();
+            let subjects: Vec<u64> = results.iter().map(|r| r.subject_id).collect();
+            assert_eq!(subjects, vec![100], "intersects at t={t}");
+        }
     }
 
     #[tokio::test]

@@ -75,7 +75,7 @@ pub fn encode_leaflet(
 
     // Validate segmentation invariants.
     let first = &records[0];
-    match order {
+    match order.base() {
         RunSortOrder::Post | RunSortOrder::Psot => {
             debug_assert!(
                 records.iter().all(|r| r.p_id == first.p_id),
@@ -88,7 +88,7 @@ pub fn encode_leaflet(
                 "OPST leaflet must be type-homogeneous (got mixed o_type)"
             );
         }
-        RunSortOrder::Spot => {}
+        _ => {}
     }
 
     let row_count = records.len() as u32;
@@ -100,7 +100,7 @@ pub fn encode_leaflet(
     write_ordered_key_v2(order, records.last().unwrap(), &mut last_key);
 
     // Determine constants and flags.
-    let p_const = match order {
+    let p_const = match order.base() {
         RunSortOrder::Post | RunSortOrder::Psot => Some(first.p_id),
         _ => None,
     };
@@ -109,7 +109,7 @@ pub fn encode_leaflet(
     // For POST/PSOT: set when the predicate has a single datatype (common case).
     // For SPOT: never set — SPOT leaflets are almost always mixed-type and
     // the check would be wasted work.
-    let o_type_const = match order {
+    let o_type_const = match order.base() {
         RunSortOrder::Opst => Some(first.o_type),
         RunSortOrder::Post | RunSortOrder::Psot => {
             let first_o_type = first.o_type;
@@ -119,7 +119,7 @@ pub fn encode_leaflet(
                 None
             }
         }
-        RunSortOrder::Spot => None,
+        _ => None,
     };
 
     // Check if any row has a list index.
@@ -149,7 +149,7 @@ pub fn encode_leaflet(
     // ColumnBlockRef offsets), but putting hot columns first may improve
     // prefetch locality for sequential reads.
 
-    match order {
+    match order.base() {
         RunSortOrder::Post => {
             // p_const: p_id omitted. Hot path: o_key for aggregates.
             // o_type column only if mixed types.
@@ -261,8 +261,8 @@ pub fn encode_leaflet(
                 zstd_level,
             )?;
         }
-        RunSortOrder::Opst => {
-            // o_type_const always set (type-homogeneous by segmentation).
+        _ => {
+            // OPST: o_type_const always set (type-homogeneous by segmentation).
             // p_id and s_id are columns.
             append_column_u64(
                 &mut payload,
@@ -293,6 +293,31 @@ pub fn encode_leaflet(
                 &t_vals,
                 zstd_level,
             )?;
+        }
+    }
+
+    // Pooled trees carry each row's graph, two bytes wide unless this
+    // leaflet holds a graph id past u16.
+    if order.is_pooled() {
+        let narrow: Option<Vec<u16>> = records.iter().map(|r| u16::try_from(r.g_id).ok()).collect();
+        match narrow {
+            Some(g_ids) => append_column_u16(
+                &mut payload,
+                &mut column_refs,
+                ColumnId::GId,
+                &g_ids,
+                zstd_level,
+            )?,
+            None => {
+                let g_ids: Vec<u32> = records.iter().map(|r| r.g_id).collect();
+                append_column_u32(
+                    &mut payload,
+                    &mut column_refs,
+                    ColumnId::GId,
+                    &g_ids,
+                    zstd_level,
+                )?;
+            }
         }
     }
 
@@ -334,7 +359,17 @@ fn compute_lead_group_count(records: &[RunRecordV2], order: RunSortOrder) -> u32
         return 0;
     }
 
-    match order {
+    if order == RunSortOrder::Gspo {
+        // Count distinct (g_id, s_id).
+        let mut count = 1u32;
+        for i in 1..records.len() {
+            if records[i].g_id != records[i - 1].g_id || records[i].s_id != records[i - 1].s_id {
+                count += 1;
+            }
+        }
+        return count;
+    }
+    match order.base() {
         RunSortOrder::Post | RunSortOrder::Opst => {
             // Count distinct (o_type, o_key).
             let mut count = 1u32;
@@ -347,8 +382,8 @@ fn compute_lead_group_count(records: &[RunRecordV2], order: RunSortOrder) -> u32
             }
             count
         }
-        RunSortOrder::Psot | RunSortOrder::Spot => {
-            // Count distinct s_id.
+        _ => {
+            // PSOT / SPOT: count distinct s_id.
             let mut count = 1u32;
             for i in 1..records.len() {
                 if records[i].s_id != records[i - 1].s_id {

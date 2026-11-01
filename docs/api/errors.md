@@ -520,6 +520,7 @@ of them indicate a fault in the request. The `@type` identifies the cause:
 | `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
 | `err:db/CommitContention` | Every commit attempt the server made lost its race with other writers to the same ledger. Nothing was committed; the same request can succeed once the other writers ease off. |
 | `err:db/ReplicaNotCurrent` | A cluster replica could not confirm it holds the current [removal journal](../transactions/history-retention.md#clusters) of a ledger with history retention, so it did not serve that ledger's history. Clears once the replica reaches a leader. |
+| `err:db/IndexNotLoaded` | The server has not loaded the ledger's index: it failed to load, or the one the server holds is older than the ledger's. The write was refused before it read or committed anything; the same request can succeed once the index loads. |
 | `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
 
 **Example:**
@@ -540,10 +541,12 @@ Retry-After: 5
 **How to Fix:**
 - Wait at least `Retry-After` seconds, then retry the same request
 - Idempotent retries are safe: replay the request with the same
-  `Idempotency-Key` — a novelty refusal does not consume the key
+  `Idempotency-Key` — a novelty or index-not-loaded refusal does not
+  consume the key
 - Keep your own exponential backoff as the outer bound for repeated 503s
 - If a ledger 503s persistently, check indexer health and
-  `--reindex-max-bytes` sizing
+  `--reindex-max-bytes` sizing; for `err:db/IndexNotLoaded`, check the
+  server log for why the ledger's index failed to load
 
 #### 504 Gateway Timeout
 

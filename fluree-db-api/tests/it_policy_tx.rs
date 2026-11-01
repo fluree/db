@@ -998,3 +998,281 @@ async fn onclass_modify_denies_exclusive_property_on_non_instance() {
         "Lead-scoped allow must not permit writing onto a Person subject"
     );
 }
+
+/// A modify-policy refusal, not a failure for some other reason.
+fn assert_policy_refusal(refused: &fluree_db_api::TrackedErrorResponse) {
+    assert_eq!(refused.status, 403, "{}", refused.error);
+    assert!(
+        refused
+            .error
+            .contains("Policy enforcement prevents modification"),
+        "{}",
+        refused.error
+    );
+}
+
+/// A schema write is judged by modify policy like any other. View policy
+/// targets widen through the property and class hierarchy, so an identity
+/// that may write nothing could otherwise add `ex:ssn rdfs:subPropertyOf
+/// ex:name`, or `ex:Secret rdfs:subClassOf ex:Public`, and widen what a
+/// policy allowing `ex:name` or `ex:Public` lets others read. Root writing
+/// either edge does widen it; an identity allowed to write the edge may.
+#[tokio::test]
+async fn schema_writes_follow_modify_policy() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:bob", "@type": "ex:Secret", "ex:name": "Bob", "ex:ssn": "123-45-6789"},
+            {"@id": "ex:carol", "@type": "ex:Public", "ex:name": "Carol"}
+        ]
+    });
+    let seeded = |name: &'static str| {
+        let (fluree, seed) = (&fluree, seed.clone());
+        async move {
+            let ledger0 =
+                genesis_ledger(fluree, &format!("policy/schema-writes-{name}:main")).await;
+            fluree.insert(ledger0, &seed).await.unwrap().ledger
+        }
+    };
+    let ledger = seeded("subproperty").await;
+    let cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let context = |ledger: fluree_db_api::LedgerState, policy: serde_json::Value| async move {
+        let opts = GovernanceOptions {
+            policy: Some(policy),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        policy_builder::build_policy_context_from_opts(
+            &ledger.snapshot,
+            ledger.novelty.as_ref(),
+            Some(ledger.novelty.as_ref()),
+            ledger.t(),
+            &opts,
+            &[0],
+        )
+        .await
+        .expect("build policy context")
+    };
+    let reader = json!([
+        {
+            "@id": "ex:viewName",
+            "f:onProperty": [{"@id": "http://example.org/ns/name"}],
+            "f:action": "f:view",
+            "f:allow": true
+        },
+        {
+            "@id": "ex:viewPublic",
+            "f:onClass": [{"@id": "http://example.org/ns/Public"}],
+            "f:action": "f:view",
+            "f:allow": true
+        }
+    ]);
+    let ssns = |ledger: fluree_db_api::LedgerState| {
+        let fluree = &fluree;
+        let reader = reader.clone();
+        async move {
+            let policy = context(ledger.clone(), reader).await;
+            let query = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": "?ssn",
+                "where": {"@id": "ex:bob", "ex:ssn": "?ssn"}
+            });
+            support::query_jsonld_with_policy(fluree, &ledger, &query, &policy)
+                .await
+                .expect("query")
+                .to_jsonld(&ledger.snapshot)
+                .expect("format")
+        }
+    };
+    assert_eq!(
+        ssns(ledger.clone()).await,
+        json!([]),
+        "hidden to begin with"
+    );
+
+    let edges = [
+        (
+            "subproperty",
+            json!({"@id": "ex:ssn", "rdfs:subPropertyOf": {"@id": "ex:name"}}),
+        ),
+        (
+            "subclass",
+            json!({"@id": "ex:Secret", "rdfs:subClassOf": {"@id": "ex:Public"}}),
+        ),
+    ];
+    let txn = |edge: &serde_json::Value| {
+        json!({
+            "@context": {
+                "ex": "http://example.org/ns/",
+                "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+            },
+            "insert": edge
+        })
+    };
+    let view_all = json!([{"@id": "ex:viewAll", "f:action": "f:view", "f:allow": true}]);
+    for (name, edge) in &edges {
+        let ledger = match *name {
+            "subproperty" => ledger.clone(),
+            other => seeded(other).await,
+        };
+        let writer = context(ledger.clone(), view_all.clone()).await;
+        let txn = txn(edge);
+        let input =
+            TrackedTransactionInput::new(TxnType::Update, &txn, TxnOpts::default(), &writer);
+        let refused = fluree
+            .transact_tracked_with_policy(ledger.clone(), input, CommitOpts::default(), &cfg)
+            .await
+            .expect_err(&format!(
+                "{edge}: an identity that may modify nothing wrote it"
+            ));
+        assert_policy_refusal(&refused);
+
+        let widened = fluree.update(ledger.clone(), &txn).await.unwrap().ledger;
+        assert_eq!(
+            ssns(widened).await,
+            json!(["123-45-6789"]),
+            "{edge}: written by root, it widens the reader's view"
+        );
+    }
+
+    let may_write_subproperties = json!([{
+        "@id": "ex:writeSubproperties",
+        "f:onProperty": [{"@id": "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"}],
+        "f:action": "f:modify",
+        "f:allow": true
+    }]);
+    let ledger = seeded("allowed").await;
+    let writer = context(ledger.clone(), may_write_subproperties).await;
+    let txn = txn(&edges[0].1);
+    let input = TrackedTransactionInput::new(TxnType::Update, &txn, TxnOpts::default(), &writer);
+    fluree
+        .transact_tracked_with_policy(ledger, input, CommitOpts::default(), &cfg)
+        .await
+        .expect("an identity allowed to write the edge may");
+}
+
+/// The ontology maintainer grant `docs/security/policy-in-transactions.md`
+/// suggests: modify on the four schema properties, and on `rdf:type` whose
+/// value is a class or property type. Its holder declares classes and
+/// properties, new or existing, and writes their hierarchy, domain and range,
+/// but cannot give a subject any other type or write any other property.
+#[tokio::test]
+async fn ontology_maintainer_grant_covers_schema_triples_only() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = json!({
+        "ex": "http://example.org/ns/",
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+        "owl": "http://www.w3.org/2002/07/owl#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+    let ledger0 = genesis_ledger(&fluree, "policy/ontology-maintainer:main").await;
+    let seed = json!({
+        "@context": context,
+        "@graph": [
+            {"@id": "ex:Super", "@type": "rdfs:Class"},
+            {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"}
+        ]
+    });
+    let mut ledger = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+    let maintainer = json!([
+        {"@id": "ex:viewAll", "f:action": {"@id": "f:view"}, "f:allow": true},
+        {
+            "@id": "ex:ontologyEdges",
+            "f:action": {"@id": "f:modify"},
+            "f:allow": true,
+            "f:onProperty": [
+                {"@id": "http://www.w3.org/2000/01/rdf-schema#subClassOf"},
+                {"@id": "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"},
+                {"@id": "http://www.w3.org/2000/01/rdf-schema#domain"},
+                {"@id": "http://www.w3.org/2000/01/rdf-schema#range"}
+            ]
+        },
+        {
+            "@id": "ex:ontologyTerms",
+            "f:action": {"@id": "f:modify"},
+            "f:onProperty": [{"@id": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"}],
+            "f:query": {
+                "@type": "https://ns.flur.ee/db#sparql",
+                "@value": "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX owl: <http://www.w3.org/2002/07/owl#> ASK { FILTER($value IN (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty)) }"
+            }
+        }
+    ]);
+    let cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let transact = |ledger: fluree_db_api::LedgerState, txn: serde_json::Value| {
+        let (fluree, maintainer, cfg) = (&fluree, maintainer.clone(), &cfg);
+        async move {
+            let opts = GovernanceOptions {
+                policy: Some(maintainer),
+                default_allow: Some(false),
+                ..Default::default()
+            };
+            let policy = policy_builder::build_policy_context_from_opts(
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                Some(ledger.novelty.as_ref()),
+                ledger.t(),
+                &opts,
+                &[0],
+            )
+            .await
+            .expect("build policy context");
+            let input =
+                TrackedTransactionInput::new(TxnType::Update, &txn, TxnOpts::default(), &policy);
+            fluree
+                .transact_tracked_with_policy(ledger, input, CommitOpts::default(), cfg)
+                .await
+                .map(|(result, _)| result.ledger)
+        }
+    };
+    let insert = |data: serde_json::Value| json!({"@context": context, "insert": data});
+
+    for allowed in [
+        insert(json!({
+            "@id": "ex:Lead",
+            "@type": "rdfs:Class",
+            "rdfs:subClassOf": {"@id": "ex:Super"}
+        })),
+        insert(json!({"@id": "ex:Org", "@type": "owl:Class"})),
+        insert(json!({"@id": "ex:Super", "@type": "owl:Class"})),
+        insert(json!({
+            "@id": "ex:email",
+            "@type": "rdf:Property",
+            "rdfs:domain": {"@id": "ex:Super"},
+            "rdfs:range": {"@id": "xsd:string"}
+        })),
+        insert(json!([
+            {"@id": "ex:worksFor", "@type": "owl:ObjectProperty"},
+            {"@id": "ex:age", "@type": "owl:DatatypeProperty"},
+            {"@id": "ex:nickname", "rdfs:subPropertyOf": {"@id": "ex:name"}}
+        ])),
+        json!({
+            "@context": context,
+            "delete": {"@id": "ex:Lead", "rdfs:subClassOf": {"@id": "ex:Super"}}
+        }),
+    ] {
+        ledger = transact(ledger, allowed.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{allowed}: {}", e.error));
+    }
+
+    for refused in [
+        insert(json!({"@id": "ex:bob", "@type": "ex:Super"})),
+        insert(json!({"@id": "ex:bob", "@type": "rdfs:Class", "ex:name": "Robert"})),
+        insert(json!({"@id": "ex:Lead", "rdfs:label": "Lead"})),
+    ] {
+        let err = transact(ledger.clone(), refused.clone())
+            .await
+            .expect_err(&refused.to_string());
+        assert_policy_refusal(&err);
+    }
+}

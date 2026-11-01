@@ -27,9 +27,10 @@
 //!
 //! Each record is exactly [`SPOOL_RECORD_WIRE_SIZE`] (36) bytes, little-endian,
 //! serialized via [`RunRecord::write_spool_le`] / [`RunRecord::read_spool_le`].
-//! Unlike the 34-byte run wire format, spool records include `g_id: u16`
+//! Unlike the 34-byte run wire format, spool records include `g_id: fluree_db_core::GraphId`
 //! because spool files are pre-graph-partition.
 
+use crate::run_index::build::graph_scope::GraphScope;
 use fluree_db_binary_index::format::run_record::{RunRecord, SPOOL_RECORD_WIRE_SIZE};
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_core::o_type_registry::OTypeRegistry;
@@ -982,7 +983,7 @@ pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     subject_remap: S,
     string_remap: R,
     lang_remap: Vec<u16>,
-    target_g_id: u16,
+    scope: GraphScope,
     term_ctx: Option<Arc<TermRemapCtx>>,
     current: Option<RunRecordV2>,
 }
@@ -994,7 +995,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
         subject_remap: S,
         string_remap: R,
         lang_remap: Vec<u16>,
-        target_g_id: u16,
+        scope: GraphScope,
         term_ctx: Option<Arc<TermRemapCtx>>,
     ) -> io::Result<Self> {
         let mut reader = Self {
@@ -1002,7 +1003,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
             subject_remap,
             string_remap,
             lang_remap,
-            target_g_id,
+            scope,
             term_ctx,
             current: None,
         };
@@ -1013,7 +1014,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
     fn advance_to_next(&mut self) -> io::Result<()> {
         self.current = None;
         while let Some(mut record) = self.reader.next_record()? {
-            if record.g_id != self.target_g_id {
+            if !self.scope.accepts(record.g_id) {
                 continue;
             }
             let lang_remap = if self.lang_remap.is_empty() {
@@ -1386,7 +1387,7 @@ fn remap_records_to_runs<I, S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
     subject_remap: &S,
     string_remap: &R,
     lang_remap: Option<&[u16]>,
-    target_g_id: Option<u16>,
+    target_g_id: Option<fluree_db_core::GraphId>,
     registry: &OTypeRegistry,
     writer: &mut super::run_writer::MultiOrderRunWriter,
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
@@ -1510,7 +1511,7 @@ pub fn remap_commit_to_runs<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
     subject_remap: &S,
     string_remap: &R,
     lang_remap: &[u16],
-    target_g_id: u16,
+    target_g_id: fluree_db_core::GraphId,
     registry: &OTypeRegistry,
     writer: &mut super::run_writer::MultiOrderRunWriter,
     stats_hook: Option<&mut crate::stats::IdStatsHook>,
@@ -1537,7 +1538,7 @@ pub fn remap_sorted_commit_v2_to_runs<S: SubjectRemap + ?Sized, R: StringRemap +
     subject_remap: &S,
     string_remap: &R,
     lang_remap: &[u16],
-    target_g_id: u16,
+    scope: &GraphScope,
     term_ctx: Option<&TermRemapCtx>,
     writer: &mut super::run_writer::MultiOrderRunWriter,
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
@@ -1556,7 +1557,7 @@ pub fn remap_sorted_commit_v2_to_runs<S: SubjectRemap + ?Sized, R: StringRemap +
     let mut progress_batch = 0u64;
     for result in reader {
         let mut record = result?;
-        if record.g_id != target_g_id {
+        if !scope.accepts(record.g_id) {
             continue;
         }
         remap_v2_record(
@@ -1627,7 +1628,7 @@ pub(crate) fn remap_commit_to_runs_with_op<S: SubjectRemap, R: StringRemap>(
     subject_remap: &S,
     string_remap: &R,
     lang_remap: &[u16],
-    target_g_id: u16,
+    scope: &crate::run_index::build::graph_scope::GraphScope,
     registry: &OTypeRegistry,
     writer: &mut super::run_writer::MultiOrderRunWriterWithOp,
 ) -> io::Result<u64> {
@@ -1641,7 +1642,7 @@ pub(crate) fn remap_commit_to_runs_with_op<S: SubjectRemap, R: StringRemap>(
     let mut count = 0u64;
     for result in reader {
         let v1_record = result?;
-        if v1_record.g_id != target_g_id {
+        if !scope.accepts(v1_record.g_id) {
             continue;
         }
         let op = v1_record.op;
@@ -1680,8 +1681,8 @@ pub struct SortedCommitInfo {
     pub string_count: u64,
     /// Path to the types-map sidecar (`.types`), if rdf:type extraction was enabled.
     ///
-    /// Contains `(g_id: u16, s_sorted_local: u64, class_sorted_local: u64)` tuples
-    /// (18 bytes each) for every `rdf:type` assertion. Used after Phase B vocab merge
+    /// Contains `(g_id: u32, s_sorted_local: u64, class_sorted_local: u64)` tuples
+    /// (`TYPES_RECORD_BYTES` each) for every `rdf:type` assertion. Used after Phase B vocab merge
     /// to build the global subject→class bitset table.
     pub types_map_path: Option<PathBuf>,
     /// Duplicate statements collapsed by the within-chunk dedup (step 4b).
@@ -1691,6 +1692,12 @@ pub struct SortedCommitInfo {
     /// chunk's reified base edges in ordinal order, sorted-local ids. `None`
     /// when the chunk reified nothing.
     pub term_table: Option<(PathBuf, u64)>,
+    /// Post-dedup asserts and retracts per graph, ascending by `g_id` — what a
+    /// build sizes each graph by to place it in the pool or its own tree.
+    pub graph_events: Vec<(
+        fluree_db_core::GraphId,
+        crate::run_index::build::graph_scope::GraphEvents,
+    )>,
 }
 
 /// Sort, remap, and write a sorted commit file from buffered parse output.
@@ -1903,6 +1910,11 @@ pub fn sort_remap_and_write_sorted_commit(
         None
     };
 
+    // Records are sorted graph-first, so each graph is one run.
+    let graph_events = crate::run_index::build::graph_scope::graph_event_counts(
+        records.iter().map(|r| (r.g_id, r.op)),
+    );
+
     Ok(SortedCommitInfo {
         path: spool_info.path,
         record_count: spool_info.record_count,
@@ -1913,6 +1925,7 @@ pub fn sort_remap_and_write_sorted_commit(
         types_map_path,
         duplicates_removed,
         term_table,
+        graph_events,
     })
 }
 
@@ -2772,8 +2785,8 @@ mod tests {
             info.record_count,
             &subject_remap,
             &string_remap,
-            &[],  // no lang remap
-            0,    // target g_id (default graph)
+            &[], // no lang remap
+            &GraphScope::One(0),
             None, // no term table
             &mut writer,
             Some(&mut stats_hook),

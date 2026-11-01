@@ -11,6 +11,7 @@ use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryGraphView, BinaryIndexStore, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
     flake_matches_range_eq, overlay_eq_bounds, range_provider::RangeQuery, Flake, FlakeValue,
@@ -765,12 +766,22 @@ fn binary_range_eq_v3(
     }
 
     // Get branch manifest.
-    let branch = match store.branch_for_order(g_id, order) {
-        Some(b) => Arc::clone(b),
-        None => {
-            // No branch for this order — return overlay-only results if any.
-            return overlay_only_flakes(store, g_id, index, match_val, opts, overlay);
+    let Some(tree) = store.graph_tree(g_id, order) else {
+        // No branch for this order — return overlay-only results if any.
+        return overlay_only_flakes(store, g_id, index, match_val, opts, overlay);
+    };
+    let branch = tree.branch;
+    // A pooled graph reads the pooled tree filtered to it; its rows arrive in
+    // the pooled order's base, which is the index the overlay ops sort by.
+    let (order, index) = match tree.g_filter {
+        Some(g) => {
+            filter.g_id = Some(g);
+            (
+                tree.order,
+                crate::binary_scan::sort_order_to_index_type(tree.order),
+            )
         }
+        None => (order, index),
     };
 
     // Resolve the optional projection-predicate allow-list once.
@@ -801,7 +812,8 @@ fn binary_range_eq_v3(
         object_slice_filters(order, filter, &object_slices)
             .into_iter()
             .map(|filter| {
-                let use_range = filter.s_id.is_some()
+                let use_range = filter.g_id.is_some()
+                    || filter.s_id.is_some()
                     || filter.p_id.is_some()
                     || filter.o_type.is_some()
                     || filter.o_key.is_some();
@@ -1144,32 +1156,31 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     };
 
     // Get branch manifest.
-    let branch = match store.branch_for_order(g_id, RunSortOrder::Psot) {
-        Some(b) => Arc::clone(b),
-        None => {
-            // No PSOT branch — try overlay only.
-            return batched_refs_overlay_only(
-                store,
-                dict_novelty,
-                g_id,
-                predicate,
-                subjects,
-                opts,
-                overlay,
-            );
-        }
+    let Some(tree) = store.graph_tree(g_id, RunSortOrder::Psot) else {
+        // No PSOT branch — try overlay only.
+        return batched_refs_overlay_only(
+            store,
+            dict_novelty,
+            g_id,
+            predicate,
+            subjects,
+            opts,
+            overlay,
+        );
     };
+    let order = tree.order;
 
     let filter = BinaryFilter {
         p_id: Some(p_id),
+        g_id: tree.g_filter,
         ..Default::default()
     };
 
     let projection = ColumnProjection::all();
     let mut cursor = BinaryCursor::new(
         Arc::clone(store),
-        RunSortOrder::Psot,
-        branch,
+        order,
+        tree.branch,
         &min_key,
         &max_key,
         filter,
@@ -1199,7 +1210,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     );
 
     if !ops.is_empty() {
-        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
+        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
         cursor.set_overlay_ops(ops.into());
     }
@@ -1282,15 +1293,13 @@ fn apply_raw_overlay_deltas_to_batched_refs(
             None => {
                 subj_entry.insert(class_sid, (flake.t, flake.op));
             }
-            Some(&(t0, op0)) => {
-                // Newest op wins; at equal `t` the retraction does. Taking
-                // `>` alone let whichever flake the walk happened to yield
-                // first win the tie — and on this lane, which decides
-                // class-based policy grants, the direction it failed was
-                // open: a same-`t` assert+retract of a class left the class
-                // granted. Same rule as `resolve_current_flakes` and
-                // `resolve_overlay_ops`.
-                if flake.t > t0 || (flake.t == t0 && !flake.op && op0) {
+            Some(&cur) => {
+                // Newest op wins; at equal `t` the assertion
+                // (`fluree_db_core::same_t`). Decided by rule, not by which
+                // flake the walk yields first, so this lane answers as
+                // `resolve_current_flakes`, `resolve_overlay_ops` and every
+                // index build do.
+                if supersedes((flake.t, flake.op), cur) {
                     subj_entry.insert(class_sid, (flake.t, flake.op));
                 }
             }
@@ -1481,21 +1490,21 @@ fn binary_range_bounded_v3(
         );
     }
 
-    let branch = match store.branch_for_order(g_id, order) {
-        Some(b) => Arc::clone(b),
-        None => {
-            // No SPOT branch — return overlay-only results (already translated above).
-            return overlay_only_flakes_bounded(
-                store,
-                g_id,
-                index,
-                start_bound,
-                end_bound,
-                opts,
-                overlay,
-            );
-        }
+    let Some(tree) = store.graph_tree(g_id, order) else {
+        // No SPOT branch — return overlay-only results (already translated above).
+        return overlay_only_flakes_bounded(
+            store,
+            g_id,
+            index,
+            start_bound,
+            end_bound,
+            opts,
+            overlay,
+        );
     };
+    let branch = tree.branch;
+    // A pooled graph reads GSPO filtered to the graph (SPOT order within it).
+    let order = tree.order;
 
     // Compute s_id bounds for leaf selection (narrows the leaf range).
     let min_s_id = *s_id_set.iter().min().unwrap();
@@ -1520,7 +1529,10 @@ fn binary_range_bounded_v3(
         g_id,
     };
 
-    let filter = BinaryFilter::default();
+    let filter = BinaryFilter {
+        g_id: tree.g_filter,
+        ..Default::default()
+    };
     let projection = ColumnProjection::all();
     let mut cursor = BinaryCursor::new(
         Arc::clone(store),
@@ -1722,7 +1734,7 @@ fn overlay_only_flakes_bounded(
 /// exists for `(g_id, order)`.
 ///
 /// That second trigger is broader than "genesis / pre-first-index":
-/// `branch_for_order` is keyed per graph AND order, and the bulk-import path
+/// `dedicated_branch` is keyed per graph AND order, and the bulk-import path
 /// emits SPOT unconditionally while skipping PSOT/POST/OPST when the order
 /// produced no run files (`index_build.rs`'s empty-run-dir early return),
 /// so a graph with zero rows at the indexed `t` lands here for three of the
@@ -1905,12 +1917,12 @@ mod tests {
         );
     }
 
-    /// The equal-`t` tie on the policy lane, and the map-shape contract.
+    /// The equal-`t` tie, and the map-shape contract.
     ///
-    /// `t > t0` alone let whichever flake the walk yielded first win a tie,
-    /// and the direction it failed was open: a same-`t` assert+retract left
-    /// the class granted. And a subject whose overlay flakes are all
-    /// retractions must be ABSENT from the map, not present with an empty
+    /// A same-`t` assert+retract of a class resolves by rule, not by which
+    /// flake the walk yields first: the assert holds, as on every other
+    /// lane and in every index build. And a subject whose overlay flakes are
+    /// all retractions must be ABSENT from the map, not present with an empty
     /// vector — `lookup_subject_classes` documents that, and its per-subject
     /// fallback enforces it.
     #[test]
@@ -1939,9 +1951,10 @@ mod tests {
             }
             let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
             apply_raw_overlay_deltas_to_batched_refs(&mut out, &raw, &rdf_type, 10);
-            assert!(
-                !out.contains_key(&s("carol")),
-                "same-t assert+retract must revoke, and leave no empty entry (flip={flip})"
+            assert_eq!(
+                out.get(&s("carol")),
+                Some(&vec![s("Admin")]),
+                "same-t assert+retract holds the class (flip={flip})"
             );
         }
 

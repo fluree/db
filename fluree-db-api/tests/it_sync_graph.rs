@@ -188,38 +188,39 @@ async fn empty_payload_requires_allow_empty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sync-graph/empty:main";
     seed(&fluree, ledger_id).await;
-    fluree
-        .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
-        .await
-        .expect("sync");
 
-    let empty = json!({ "@graph": [] });
+    for empty in [json!({ "@graph": [] }), json!([])] {
+        fluree
+            .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
+            .await
+            .expect("sync");
 
-    let err = fluree
-        .sync_named_graph(ledger_id, ONT_IRI, &empty, SyncGraphOpts::default())
-        .await
-        .expect_err("empty payload without allowEmpty must be rejected");
-    assert!(
-        err.to_string().contains("allowEmpty"),
-        "error should name the opt-in: {err}"
-    );
+        let err = fluree
+            .sync_named_graph(ledger_id, ONT_IRI, &empty, SyncGraphOpts::default())
+            .await
+            .expect_err("empty payload without allowEmpty must be rejected");
+        assert!(
+            err.to_string().contains("allowEmpty"),
+            "{empty}: error should name the opt-in: {err}"
+        );
 
-    let report = fluree
-        .sync_named_graph(
-            ledger_id,
-            ONT_IRI,
-            &empty,
-            SyncGraphOpts {
-                allow_empty: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("empty sync with allowEmpty");
-    assert_eq!(report.asserted, 0);
-    assert_eq!(report.retracted, 3, "clears the whole graph");
-    assert!(report.committed);
-    assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 0);
+        let report = fluree
+            .sync_named_graph(
+                ledger_id,
+                ONT_IRI,
+                &empty,
+                SyncGraphOpts {
+                    allow_empty: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("empty sync with allowEmpty");
+        assert_eq!(report.asserted, 0, "{empty}");
+        assert_eq!(report.retracted, 3, "{empty}: clears the whole graph");
+        assert!(report.committed, "{empty}");
+        assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 0);
+    }
 }
 
 #[tokio::test]

@@ -80,6 +80,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         if let Some(grouping) = &level.grouping {
             construct_template.unbind_outside_group_row(grouping, self.vars);
         }
+        construct_template.mark_list_entries(&patterns, self.vars);
 
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
@@ -100,6 +101,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         })
     }
 
@@ -286,6 +288,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 }
                 // Filters, Binds, Values, PropertyPaths, Subqueries, IndexSearch, Service, and R2rml don't contribute template triples
                 Pattern::Filter(_)
+                | Pattern::ListView(_)
                 | Pattern::Bind { .. }
                 | Pattern::Unwind { .. }
                 | Pattern::Values { .. }

@@ -23,6 +23,7 @@ pub(crate) const GROUP_POINTERS: &[&str] = &[
     config_iris::RETENTION_DEFAULTS,
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
+    config_iris::INDEXING_DEFAULTS,
 ];
 
 /// Edges from a config node to another config node. The node an edge points
@@ -38,6 +39,7 @@ pub(crate) const CONFIG_EDGES: &[&str] = &[
     config_iris::RETENTION_DEFAULTS,
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
+    config_iris::INDEXING_DEFAULTS,
     config_iris::GRAPH_OVERRIDES,
     config_iris::OVERRIDE_CONTROL,
     config_iris::SHAPES_SOURCE,
@@ -64,6 +66,7 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::RETENTION_DEFAULTS,
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
+    config_iris::INDEXING_DEFAULTS,
     config_iris::DEFAULT_ALLOW,
     config_iris::POLICY_SOURCE,
     config_iris::SHACL_ENABLED,
@@ -83,6 +86,7 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::SERVE_BLOCKS,
     config_iris::PUBLIC_VISIBILITY,
     config_iris::UNION_DEFAULT_GRAPH,
+    config_iris::GRAPH_PLACEMENT,
     config_iris::UNIQUE_ENABLED,
     config_iris::DEFAULT_LANGUAGE,
     config_iris::TARGET_GRAPH,
@@ -232,6 +236,7 @@ mod tests {
             retention,
             serving,
             query,
+            indexing,
             graph_overrides: _,
         } = config;
         vec![
@@ -244,6 +249,7 @@ mod tests {
             (config_iris::RETENTION_DEFAULTS, retention.is_some()),
             (config_iris::SERVING_DEFAULTS, serving.is_some()),
             (config_iris::QUERY_DEFAULTS, query.is_some()),
+            (config_iris::INDEXING_DEFAULTS, indexing.is_some()),
         ]
     }
 
@@ -285,6 +291,8 @@ mod tests {
         config_iris::OVERRIDE_ALL,
         config_iris::IDENTITY_RESTRICTED,
         config_iris::ENFORCE_UNIQUE,
+        config_iris::PLACEMENT_AUTO,
+        config_iris::PLACEMENT_DEDICATED,
     ];
 
     /// Every term `fluree_vocab::config_iris` defines is a config field the
@@ -346,7 +354,8 @@ mod tests {
                 f:reasoningDefaults <urn:c:reasoning> ; f:datalogDefaults <urn:c:datalog> ;
                 f:transactDefaults <urn:c:transact> ; f:fullTextDefaults <urn:c:ft> ;
                 f:servingDefaults <urn:c:serving> ; f:queryDefaults <urn:c:query> ;
-                f:retentionDefaults <urn:c:ret> ; f:graphOverrides <urn:c:g1> .
+                f:retentionDefaults <urn:c:ret> ; f:indexingDefaults <urn:c:indexing> ;
+                f:graphOverrides <urn:c:g1> .
               <urn:c:policy> f:defaultAllow false ; f:policySource <urn:c:ref> ;
                 f:policyClass ex:Reader ; f:overrideControl <urn:c:oc> .
               <urn:c:oc> f:controlMode f:IdentityRestricted ; f:allowedIdentities <did:key:z6Mk> .
@@ -371,6 +380,7 @@ mod tests {
               <urn:c:retp> f:target ex:counter ; f:ttl 60 ; f:noHistory false .
               <urn:c:serving> f:serveQuery true ; f:serveBlocks true ; f:publicVisibility true .
               <urn:c:query> f:unionDefaultGraph true .
+              <urn:c:indexing> f:graphPlacement f:PlacementAuto .
               <urn:c:g1> a f:GraphConfig ; f:targetGraph ex:g1 ; f:shaclDefaults <urn:c:shacl2> .
               <urn:c:shacl2> f:shaclEnabled false .
             }";

@@ -793,7 +793,13 @@ async fn incremental_term_packs_are_compacted() {
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/triple-term-links:term-pack-compaction";
-    let (local, handle) = support::start_background_indexer_for(&fluree, IndexerConfig::small());
+    // Every cycle's root is read back below, so no version ceiling collects
+    // the oldest.
+    let config = IndexerConfig {
+        gc_hard_max_old_indexes: None,
+        ..IndexerConfig::small()
+    };
+    let (local, handle) = support::start_background_indexer_for(&fluree, config);
 
     local
         .run_until(async {

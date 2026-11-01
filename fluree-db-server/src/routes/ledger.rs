@@ -13,7 +13,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::wire::{
-    ReindexRequest, ReindexResponse, SweepPlanResponse, SweepRequest, SweepResponse,
+    IndexRequest, IndexResponse, ReindexRequest, ReindexResponse, SweepPlanResponse, SweepRequest,
+    SweepResponse,
 };
 use fluree_db_api::{
     ApiError, BranchDropReport, DropMode, DropNamedGraphReport, DropReport, DropStatus,
@@ -705,6 +706,68 @@ async fn sweep_request_span(
 
 /// Full reindex from commit history.
 ///
+/// POST /fluree/index
+///
+/// Indexes a ledger's pending commits, then folds the pooled tree's delta
+/// runs into their bases: index maintenance a scheduler can call where no
+/// long-running indexer does it. In peer mode, forwards to the transaction
+/// server.
+pub async fn index(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    index_local(state, request).await.into_response()
+}
+
+async fn index_local(state: Arc<AppState>, request: Request) -> Result<Json<IndexResponse>> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IndexRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "ledger:index",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+    async move {
+        let span = tracing::Span::current();
+        let opts = fluree_db_api::MaintainIndexOptions {
+            timeout_ms: req.timeout_ms,
+            compact: req.compact.unwrap_or(true),
+        };
+        let result = match state.fluree.maintain_index(&req.ledger, opts).await {
+            Ok(r) => r,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:IndexFailed");
+                tracing::error!(error = %server_error, "ledger index maintenance failed");
+                return Err(server_error);
+            }
+        };
+        tracing::info!(
+            status = "success",
+            index_t = result.index_t,
+            built = result.built,
+            compacted = result.compacted,
+            "ledger index maintenance complete"
+        );
+        Ok(Json(IndexResponse::from(result)))
+    }
+    .instrument(span)
+    .await
+}
+
 /// POST /fluree/reindex
 ///
 /// Rebuilds the binary index for a ledger from scratch using the server's

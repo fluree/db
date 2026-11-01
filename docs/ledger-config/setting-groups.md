@@ -17,6 +17,7 @@ When no config graph is present (or a setting group is absent), the system defau
 | Transact constraints | Disabled — no uniqueness enforcement |
 | Retention | No property lifetimes — values expire only by their own or their transaction's TTL |
 | Query defaults | The default graph holds only its own triples (no union default graph) |
+| Indexing defaults | Named graphs placed automatically |
 | Override control | `f:OverrideAll` — any request can override any setting |
 
 An unconfigured ledger applies no validation and no reasoning. Policy is the one group where "unconfigured" is not the same as "open", because policy enforcement is switched on by the ledger's configuration *or* by the request:
@@ -24,7 +25,7 @@ An unconfigured ledger applies no validation and no reasoning. Policy is the one
 - A request that carries **no policy inputs** — no identity, no `policy-class`, no inline `policy` — is governed by the ledger's [policy defaults](#policy-defaults) when the ledger configures any; `f:defaultAllow false`, for example, denies it. On a ledger with no policy configuration it reads everything. This is the case that makes a fresh ledger feel fully open.
 - A request that carries **any** of those inputs is enforced. If the identity has no policies granting it anything and nothing sets `f:defaultAllow true`, it reads no data — authenticating *reduces* what a caller sees on an unpoliced ledger. Setting `f:defaultAllow true` on the ledger is what opens an unpoliced ledger to identity-carrying requests.
 
-Schema flakes (`rdf:type` with a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`) bypass policy, so even a fully denied identity can read the ontology.
+Schema flakes (`rdf:type` with a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`) bypass view policy, so even a fully denied identity can read the ontology. Writing them is checked by modify policy like any other triple.
 
 To find out whether a given request was enforced, ask for policy tracking — see [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
@@ -450,6 +451,64 @@ Entries merge by `f:target`, and each field merges on its own: an absent field i
 **No override control.** Retention is durable state policy. No query or transaction option overrides it, and `f:overrideControl` on the group is refused. A per-value or per-transaction lifetime is an input for that value, not an override of the property's policy.
 
 **Validation.** A config write is refused if it would leave the retention config ambiguous or malformed: an entry without exactly one IRI `f:target`, two entries for the same target in one group, a field with the wrong type or a negative duration, a field that belongs on an entry written on the group, a target in Fluree's own vocabulary, or two graph overrides setting retention for the same graph. Config that reaches a ledger some other way (bulk import, say) and is invalid is not treated as "no retention": the worker stops expiring values for the ledger and reports the problem in its status.
+
+---
+
+## Indexing defaults
+
+**Group predicate**: `f:indexingDefaults`
+
+Controls how the indexer lays out named graphs. It changes storage layout and
+performance, never query results.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:graphPlacement` | IRI | `f:PlacementAuto` | `f:PlacementAuto` lets the indexer decide. `f:PlacementDedicated` gives a graph its own index trees whatever its size |
+
+Under `f:PlacementAuto`, small named graphs share one set of index trees,
+which keeps the index compact and makes queries across many graphs fast. A
+graph that grows past 4,096 live rows, or past 16,384 history entries, moves
+to trees of its own at the next index build. The `FLUREE_POOL_MAX_GRAPH_ROWS`
+and `FLUREE_POOL_MAX_GRAPH_HISTORY` environment variables change those
+bounds (see [Configuration](../operations/configuration.md)).
+
+Writes to shared graphs keep one of those trees current at every build; the
+others take the build's changes as a small delta and fold it in periodically,
+which keeps a build's writes small. A server folds an idle ledger's delta on
+its periodic indexer tick, and `POST /index` or `fluree index` does it on
+demand (see [Background Indexing](../indexing-and-search/background-indexing.md#index-maintenance-without-a-long-running-indexer)).
+
+On `f:LedgerConfig`, `f:graphPlacement` is the default for every user named
+graph; an `f:GraphConfig` override sets it for one graph. The default graph
+and the system graphs always have trees of their own, and overrides naming
+them are ignored. Override control does not apply: requests never choose the
+index layout.
+
+### When a change takes effect
+
+The next index build applies a placement change. A graph newly set to
+`f:PlacementDedicated` moves to trees of its own then, with its full history.
+A graph set back to `f:PlacementAuto` can share trees again, but moves only
+at the next full reindex. Until a build applies a change, queries read each
+graph wherever the current index holds it.
+
+### Example
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:graphOverrides [
+      a f:GraphConfig ;
+      f:targetGraph <urn:example:catalog> ;
+      f:indexingDefaults [ f:graphPlacement f:PlacementDedicated ]
+    ] .
+}
+```
+
+Every other named graph is placed automatically; `urn:example:catalog`, a
+graph mostly queried on its own, keeps its own trees.
 
 ---
 

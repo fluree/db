@@ -85,7 +85,7 @@ pub mod graphql;
 pub mod import;
 pub mod import_source;
 #[cfg(not(target_arch = "wasm32"))]
-mod indexer_fulltext_provider;
+mod indexer_config_provider;
 mod indexer_warm_cache;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
@@ -156,6 +156,8 @@ pub use admin::{
     GraphSourceDropReport,
     // Index maintenance
     IndexStatusResult,
+    MaintainIndexOptions,
+    MaintainIndexResult,
     OrphanInstance,
     OrphanSweepReport,
     ReindexOptions,
@@ -707,6 +709,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().all_records().await
+    }
+
+    async fn branch_records(
+        &self,
+        ledger_name: &str,
+    ) -> std::result::Result<
+        Vec<fluree_db_nameservice::NsRecord>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().branch_records(ledger_name).await
     }
 
     async fn heads(
@@ -1583,6 +1595,15 @@ fn build_indexer_config(config: &ConnectionConfig) -> wasm_compat::IndexerConfig
         .and_then(|i| i.gc_min_time_mins)
     {
         indexer_config.gc_min_time_mins = min_time.min(u32::MAX as u64) as u32;
+    }
+
+    if let Some(ceiling) = config
+        .defaults
+        .as_ref()
+        .and_then(|d| d.indexing.as_ref())
+        .and_then(|i| i.gc_hard_max_old_indexes)
+    {
+        indexer_config.gc_hard_max_old_indexes = Some(ceiling.min(u32::MAX as u64) as u32);
     }
 
     indexer_config
@@ -2582,7 +2603,7 @@ impl FlureeBuilder {
     /// config is discarded) and is not honored by [`build_with`],
     /// [`Fluree::from_backend`], or [`Fluree::with_indexing_mode`], which
     /// construct without an in-process worker. Provider hooks set on the
-    /// supplied config (`fulltext_config_provider`, `warm_cache_source`)
+    /// supplied config (`ledger_config_provider`, `warm_cache_source`)
     /// are replaced by
     /// the API layer's own wiring at build time.
     ///
@@ -2672,13 +2693,15 @@ impl FlureeBuilder {
     /// default; order relative to [`Self::with_indexing_thresholds`] does not
     /// matter, since each preserves the other's half of the config.
     ///
-    /// `max_old_indexes` and `min_time_mins` are ANDed, so under a fast publish
-    /// rate the age guard always wins and the count target bounds nothing.
-    /// `hard_max_old_indexes` is an opt-in ceiling past which the guard is
-    /// overridden. It bounds retained versions, not bytes, and overriding the
-    /// guard can release artifacts a query still reading an older version
-    /// needs; see `CleanGarbageConfig::hard_max_old_indexes` in
-    /// `fluree_db_indexer::gc` for the trade-off.
+    /// `min_time_mins` is the age guard: a superseded version is kept that long
+    /// so a query that started on it can finish. `hard_max_old_indexes` is a
+    /// ceiling (default 10) past which versions go whatever their age, and
+    /// `max_old_indexes` an optional floor (default 0) kept whatever its age.
+    /// The ceiling bounds retained versions, not bytes, and can release
+    /// artifacts a query still reading an older version needs; see
+    /// `CleanGarbageConfig::hard_max_old_indexes` in `fluree_db_indexer::gc`
+    /// for the trade-off. To remove it, set
+    /// `IndexerConfig::gc_hard_max_old_indexes` to `None`.
     pub fn with_gc_settings(
         mut self,
         max_old_indexes: Option<u32>,
@@ -3473,21 +3496,19 @@ impl FlureeBuilder {
     ) -> tx::IndexingMode {
         let backend = &with_artifact_cache(backend.clone(), self.ledger_cache_config.as_ref());
         if let Some(ref idx_config) = self.indexing_config {
-            // Attach an api-side full-text config provider so each index
-            // build refreshes `fulltext_configured_properties` from the
-            // live ledger. Without this, background / CLI incremental
+            // Attach an api-side ledger config provider so each index build
+            // refreshes its full-text properties and graph placement from
+            // the live ledger. Without this, background / CLI incremental
             // runs would silently drop configured plain-string values
             // committed after the connection started. 64MB cache matches
             // the default `LeafletCache` budget in `load_per_graph_arenas`.
             let ns_for_provider: Arc<dyn fluree_db_nameservice::NameServiceLookup> =
                 Arc::clone(&nameservice) as _;
-            let provider = Arc::new(
-                crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
-                    backend: backend.clone(),
-                    nameservice: ns_for_provider,
-                    leaflet_cache: Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(64)),
-                },
-            ) as Arc<dyn fluree_db_indexer::FulltextConfigProvider>;
+            let provider = Arc::new(crate::indexer_config_provider::ApiLedgerConfigProvider {
+                backend: backend.clone(),
+                nameservice: ns_for_provider,
+                leaflet_cache: Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(64)),
+            }) as Arc<dyn fluree_db_indexer::LedgerConfigProvider>;
             // Warm-on-write (co-located only): let the background build seed the
             // query server's shared read cache with the leaflets it just wrote.
             // Resolved late from the LedgerManager cell, so the worker warms the
@@ -3499,7 +3520,7 @@ impl FlureeBuilder {
             let indexer_config = idx_config
                 .indexer_config
                 .clone()
-                .with_fulltext_config_provider(provider)
+                .with_ledger_config_provider(provider)
                 .with_warm_cache_source(warm_cache_source);
             // BackgroundIndexerWorker takes an
             // `Arc<dyn IndexingNameService>` — the combined lookup
@@ -4321,7 +4342,7 @@ impl Fluree {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn build_index(&self, ledger_id: &str) -> Result<fluree_db_indexer::IndexResult> {
         let config = fluree_db_indexer::IndexerConfig::default()
-            .with_fulltext_config_provider(self.fulltext_config_provider());
+            .with_ledger_config_provider(self.ledger_config_provider());
         warn_if_staging_plaintext(&self.backend, &config);
         let content_store = self.branched_content_store(ledger_id).await?;
         Ok(fluree_db_indexer::build_index_for_ledger(
@@ -4333,12 +4354,12 @@ impl Fluree {
         .await?)
     }
 
-    /// Build a [`fluree_db_indexer::FulltextConfigProvider`] backed by this
+    /// Build a [`fluree_db_indexer::LedgerConfigProvider`] backed by this
     /// connection's storage + nameservice. Attach it to the indexer's
-    /// `IndexerConfig` (via `with_fulltext_config_provider`) so every index
-    /// build — including CLI-driven incremental runs — refreshes the
-    /// configured full-text property set from the live ledger's
-    /// `f:fullTextDefaults`.
+    /// `IndexerConfig` (via `with_ledger_config_provider`) so every index
+    /// build — including CLI-driven incremental runs — refreshes its
+    /// configured full-text properties and named-graph placement from the
+    /// live ledger's config graph.
     ///
     /// The background indexer constructed at `FlureeBuilder::build()` time
     /// already attaches one of these automatically, as does
@@ -4346,14 +4367,12 @@ impl Fluree {
     /// `fluree_db_indexer::build_index_for_ledger` directly should attach
     /// their own by calling this method.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn fulltext_config_provider(&self) -> Arc<dyn fluree_db_indexer::FulltextConfigProvider> {
-        Arc::new(
-            crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
-                backend: self.backend.clone(),
-                nameservice: self.nameservice_mode.as_arc_reader(),
-                leaflet_cache: Arc::clone(&self.leaflet_cache),
-            },
-        )
+    pub fn ledger_config_provider(&self) -> Arc<dyn fluree_db_indexer::LedgerConfigProvider> {
+        Arc::new(crate::indexer_config_provider::ApiLedgerConfigProvider {
+            backend: self.backend.clone(),
+            nameservice: self.nameservice_mode.as_arc_reader(),
+            leaflet_cache: Arc::clone(&self.leaflet_cache),
+        })
     }
 
     /// Per-instance cache for cross-ledger governance artifacts.
@@ -6228,9 +6247,10 @@ mod tests {
             defaults.gc_min_time_mins
         );
         assert_eq!(
-            cfg3.indexer_config.gc_hard_max_old_indexes, None,
-            "the ceiling is opt-in"
+            cfg3.indexer_config.gc_hard_max_old_indexes,
+            defaults.gc_hard_max_old_indexes
         );
+        assert_eq!(defaults.gc_hard_max_old_indexes, Some(10));
         assert!(!b3.indexer_config_user_set);
     }
 
@@ -6273,7 +6293,7 @@ mod tests {
             .with_writer(buf.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = fluree_test_support::scoped_default(subscriber);
         (buf, guard)
     }
 
@@ -6351,6 +6371,7 @@ mod tests {
                     indexing_enabled: None,
                     track_class_stats: None,
                     gc_min_time_mins: None,
+                    gc_hard_max_old_indexes: None,
                 }),
             }),
             ..Default::default()
@@ -6359,6 +6380,45 @@ mod tests {
         let idx = derive_index_config(&config);
         assert_eq!(idx.reindex_min_bytes, 250_000);
         assert_eq!(idx.reindex_max_bytes, 2_500_000);
+    }
+
+    /// The three retention settings reach the indexer from a JSON-LD
+    /// connection config, and an absent ceiling keeps the indexer's default.
+    #[cfg(feature = "native")]
+    #[test]
+    fn connection_config_gc_retention_reaches_the_indexer() {
+        use serde_json::{json, Value as JsonValue};
+
+        let parse = |indexing: JsonValue| {
+            ConnectionConfig::from_json_ld(&json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    {"@id": "memory", "@type": "Storage"},
+                    {
+                        "@id": "connection",
+                        "@type": "Connection",
+                        "indexStorage": {"@id": "memory"},
+                        "defaults": {"indexing": indexing}
+                    }
+                ]
+            }))
+            .expect("parse")
+        };
+
+        let set = build_indexer_config(&parse(json!({
+            "maxOldIndexes": 3,
+            "gcMinTimeMins": 60,
+            "gcHardMaxOldIndexes": 40
+        })));
+        assert_eq!(set.gc_max_old_indexes, 3);
+        assert_eq!(set.gc_min_time_mins, 60);
+        assert_eq!(set.gc_hard_max_old_indexes, Some(40));
+
+        let unset = build_indexer_config(&parse(json!({"gcMinTimeMins": 60})));
+        assert_eq!(unset.gc_hard_max_old_indexes, Some(10));
     }
 
     #[test]

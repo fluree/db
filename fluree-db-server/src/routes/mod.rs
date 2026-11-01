@@ -135,6 +135,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Permanent erasure: the removal on every branch holding the
         // occurrences, then proofs in the background.
         .route("/erase/*ledger", post(ledger::erase_occurrences_tail))
+        // Indexes pending commits and compacts the pooled delta, for
+        // deployments without a long-running indexer.
+        .route("/index", post(ledger::index))
         // Reclaims index artifacts no index chain references. Deletes storage
         // and holds the ledger against indexing, so it is admin-gated and
         // runs where the indexer does.

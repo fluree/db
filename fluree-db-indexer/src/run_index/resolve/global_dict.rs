@@ -391,7 +391,7 @@ impl PredicateDict {
     pub fn graph_dict_id(&self, iri: &str) -> Option<u32> {
         self.inner.find(iri).or_else(|| {
             fluree_db_core::graph_registry::names_config_graph(iri)
-                .then_some(u32::from(fluree_db_core::graph_registry::CONFIG_GRAPH_ID) - 1)
+                .then_some(fluree_db_core::graph_registry::CONFIG_GRAPH_ID - 1)
         })
     }
 

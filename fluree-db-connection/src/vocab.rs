@@ -149,3 +149,4 @@ pub const FIELD_MAX_OLD_INDEXES: &str = "https://ns.flur.ee/system#maxOldIndexes
 pub const FIELD_INDEXING_ENABLED: &str = "https://ns.flur.ee/system#indexingEnabled";
 pub const FIELD_TRACK_CLASS_STATS: &str = "https://ns.flur.ee/system#trackClassStats";
 pub const FIELD_GC_MIN_TIME_MINS: &str = "https://ns.flur.ee/system#gcMinTimeMins";
+pub const FIELD_GC_HARD_MAX_OLD_INDEXES: &str = "https://ns.flur.ee/system#gcHardMaxOldIndexes";

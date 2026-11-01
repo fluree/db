@@ -256,6 +256,13 @@ impl OverlayProvider for DerivedFactsOverlay {
         self
     }
 
+    /// None: a derived fact carries no list position.
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        Some(Default::default())
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
     }

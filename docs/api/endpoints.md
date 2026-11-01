@@ -3603,6 +3603,8 @@ POST {api_base_url}/delta/map
 | `oauth2_token_url`, `oauth2_scope` | string | Default to the workspace's own token endpoint and `all-apis` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+| `delete_column`, `delete_values` | string, array | Materialization: the column and values that mark a row as deleted, as on `/iceberg/map`. With either this or `order_by`, a key's latest change replaces its subject whole; a change feed's deletes retract in either mode. See [Delta → Materialization](../graph-sources/delta.md#materialization). |
+| `order_by` | string | Materialization: an integer, date or timestamp column that orders one key's rows within a table version, and the rows the table still holds for a key a delete touched |
 
 **Response:**
 
@@ -3751,7 +3753,7 @@ POST {api_base_url}/sql/map
 
 ### POST {api_base_url}/iceberg/materialize
 
-Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
+Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). The source may be an Iceberg or a Delta graph source; a Delta source is read through its change data feed (see [Delta → Materialization](../graph-sources/delta.md#materialization)). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
 
 **Request Body:**
 
@@ -3789,7 +3791,7 @@ The source is read with the same credentials a query of it would use, on full an
 
 ### POST {api_base_url}/iceberg/track
 
-Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. Admin-protected; `iceberg` feature only.
+Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. The source may be an Iceberg or a Delta graph source. Admin-protected; `iceberg` feature only.
 
 **Request Body:**
 
@@ -3823,6 +3825,70 @@ List the tracking worker's jobs and cumulative stats.
 }
 ```
 ## Admin Endpoints
+
+### POST /index
+
+Bring a ledger's index up to date: index its pending commits, then fold the delta that writes to small shared named graphs leave into the index (see [Indexing defaults](../ledger-config/setting-groups.md#indexing-defaults)). Meant for deployments with no long-running indexer, such as a function run on a schedule; a long-running server does the same for an idle ledger on its indexer's periodic tick. With nothing to do it costs a nameservice lookup and one index root read. Admin-protected — requires the admin Bearer token when admin auth is enabled.
+
+The request returns when both steps are done. Where the server indexes in the background, the build runs there and the request waits for it. In peer mode, the request is forwarded to the transaction server.
+
+**URL:**
+```
+POST /index
+```
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb:main"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger` | string | Ledger alias (`name` or `name:branch`). Required. |
+| `compact` | bool | Fold the shared graphs' delta in once the index is current. Default `true`. |
+| `timeout-ms` | integer | Wait at most this long for the build. Unset waits until it finishes. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/index \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main"}'
+```
+
+**Response:**
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "index_t": 42,
+  "root_id": "fluree:cid:bafy…",
+  "built": true,
+  "compacted": true
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger_id` | Ledger alias the call ran against |
+| `index_t` | Transaction time the index covers after the call |
+| `root_id` | ContentId of the current index root; absent if the ledger has none |
+| `built` | The call indexed pending commits |
+| `compacted` | The call folded the delta into the index. A compaction keeps the index `t` and the data the same; only the layout changes. It is skipped while an index build is queued or running, and a later call sees the delta. |
+
+**Status Codes:**
+- `200 OK` — the index is current (including when there was nothing to do)
+- `400 Bad Request` — missing/invalid `ledger`
+- `401/403` — admin auth required
+- `404 Not Found` — ledger does not exist
+- `504 Gateway Timeout` — the build did not finish within `timeout-ms`
+- `500 Internal Server Error` — indexing failed
+
+From the CLI, `fluree index <ledger>` does the same; through the Rust API, `Fluree::maintain_index`.
 
 ### POST /reindex
 
@@ -4101,7 +4167,7 @@ The raw RDF for the requested format. The reference server today buffers the ful
 
 ## Admin Authentication
 
-Administrative endpoints (`/create`, `/drop`, `/reindex`, branch operations, and Iceberg mapping when enabled) can be protected with Bearer token authentication.
+Administrative endpoints (`/create`, `/drop`, `/index`, `/reindex`, `/sweep`, branch operations, and Iceberg mapping when enabled) can be protected with Bearer token authentication.
 
 ### Configuration
 

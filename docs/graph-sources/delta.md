@@ -442,13 +442,75 @@ read the old values, new versions do not resurrect them.
 source at two different states in one query is rejected, as for
 [Iceberg sources](iceberg.md#time-travel).
 
+## Materialization
+
+A Delta source materializes into a native ledger as an Iceberg source does,
+through the same endpoints: one pass with `POST /iceberg/materialize`, or kept
+in sync with `POST /iceberg/track`. See
+[Iceberg → Materialization](iceberg.md#materialization-into-a-native-ledger)
+for the endpoints, templated targets and the shared state ledger.
+
+The first pass reads each table's latest version whole. Every later pass reads
+what changed since the version the last one applied, from the table's
+**change data feed**, so a table must have `delta.enableChangeDataFeed = true`
+for its updates and deletes to reach the target. The feed is off by default.
+Without it, every pass after a change reads the table whole, so on a large
+table each such pass can reach `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` or the
+target's novelty ceiling, and logs the `warn` described below. Inserted rows
+and an update's new values assert their triples; deleted rows and an update's
+old values retract theirs. How a key's changes combine depends on the source's
+options:
+
+- **Additive** (the default): each triple takes its latest change in the
+  window. An update replaces the values it changes and keeps the rest, a
+  deleted row's triples are removed, and a row inserted and deleted between
+  two passes never lands. A triple the deleted row shares with another row or
+  source, such as a common class, is removed too: a statement does not record
+  which rows asserted it. A mapping with blank-node objects is refused in this
+  mode before anything loads: a delete names the triples it removes, and a
+  blank node's label names a new node in every transaction. Map them to IRIs,
+  or use latest-by-key.
+- **Latest-by-key** (`delete_column` and `delete_values`, or `order_by`, set on
+  [`/delta/map`](../api/endpoints.md#post-api_base_urldeltamap)): a key's
+  latest change replaces its subject whole. Changes are ordered by version;
+  `order_by` orders a key's rows within one version. A delete, or an update
+  that moves a row to another subject, graph or target ledger, removes a row
+  but not necessarily its key, so the pass reads such a key back from the
+  table as of the version it ends on. The key's latest remaining row, by
+  `order_by`, replaces the subject, and a key with no row left is removed. A
+  table that keeps several revisions per key can therefore prune superseded
+  revisions without losing the key.
+
+A pass applies at most `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` changed rows (by
+default derived from the novelty ceiling; see
+[Configuration](../operations/configuration.md)). It stops at a commit boundary,
+records the last version it applied, and the next pass continues from there. A
+read pinned to a version, and a first whole read, are not bounded.
+
+When the change feed cannot serve a window, the pass reads the latest version
+whole instead and logs why at `warn`: the feed was off for part of the window,
+the schema changed inside it, or log retention has removed its start. A whole
+read upserts what the table holds but cannot see what it no longer holds, so
+rows deleted inside that window stay in the target. Most such windows are
+caught before any rows are read. A version inside one that fails only when it
+is read, such as one whose change file has been removed, fails that pass; the
+server remembers it until restart, and the next pass reads the table whole.
+
+From Rust, `FlureeR2rmlProvider::current_snapshot_id` returns a table's latest
+version, and `scan_for_materialize_stream` reads the changes after a version,
+or the version it is given whole. A scan whose `change_feed` is set yields
+change rows, which carry `_change_type` and `_commit_version` and can retract,
+and one whose `stopped_at` is set ends at that version. `rows_at_version`
+reads a version's rows narrowed by key filters, as latest-by-key reads a key
+back.
+
 ## Limitations
 
 - **Storage**: S3 (and S3-compatible endpoints), ADLS Gen2, OneLake and the
   local filesystem. Azure sovereign clouds are not addressable.
 - **`ORDER BY … LIMIT`** is not pushed down; see [Performance](#performance).
-- **Materialization and tracking** (`fluree materialize`, `fluree track`) are
-  not available for Delta sources.
+- **`fluree materialize`**, the bulk twin builder, reads Iceberg sources only.
+  Materialization into a native ledger is [available](#materialization).
 - **Nested types** cannot be mapped.
 - **Catalogs**: Unity Catalog is the catalog that is browsed and generated
   from. Tables addressed by path have no catalog to list; a mapping over them

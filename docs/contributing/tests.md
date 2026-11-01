@@ -93,20 +93,29 @@ binary. No new `[[test]]` entry is needed unless you are creating a new group.
   reason; the rest of the graph-sync suite stays in `grp_ledger`. (Under
   `cargo nextest`, every test already runs in its own process, so this only
   matters for bare `cargo test`.)
-- Tests whose **assertions are about instrumentation** — presence/absence of
-  tracing events captured via a thread-local `span_capture` subscriber (e.g.
-  `it_cyclic_bgp_probe`, `it_minmax_fast_path_fired`,
-  `it_upsert_skip_fires`). Tracing's
-  callsite-interest cache is process-global and the capture is thread-local,
-  so these assertions are only reliable when the test is alone in its
-  process. (Same caveat as above: bites bare `cargo test` only.)
+
+Tests whose **assertions are about instrumentation**, the presence or absence
+of tracing events or fast-path stamps, no longer need their own binary. They
+must install their capture through `fluree_test_support::scoped_default` or
+`with_scoped_default` (which `span_capture::init_test_tracing` does), never
+with `tracing::subscriber::set_default` or `with_default` directly. Tracing's
+callsite-interest cache is process-global and the capture is thread-local: a
+bare `set_default` capture misses an event whose callsite a sibling test hit
+first with no subscriber, so it intermittently sees nothing and an absence
+assertion passes vacuously. The helper keeps two dispatchers registered that
+rule this out (see its module docs). `harness_coverage`'s
+`scoped_subscribers_use_the_floor` fails on a direct install anywhere in the
+workspace. A thread-local capture still sees only its own thread, so assert
+on events emitted there, not on a rayon pool. Some instrumentation tests
+(`it_cyclic_bgp_probe`, `it_minmax_fast_path_fired`, `it_upsert_skip_fires`
+and others) predate this and still have their own binary.
 
 `fluree-db-server` uses the same pattern and the same standalone rules, with
 harnesses named for its domains (`grp_http`, `grp_query`, `grp_proxy`,
 `grp_policy`, `grp_search`, `grp_raft`, `grp_bolt`). It has no shared
-`support/` module, so its case files are self-contained; `telemetry_test` and
-`multi_query_tracing_integration` are kept standalone under the
-instrumentation-assertion rule above.
+`support/` module, so its case files are self-contained; `telemetry_test`,
+`multi_query_tracing_integration` and `graph_source_query_logging` are
+standalone instrumentation tests that predate the shared capture helper.
 
 Because `autotests = false` means an unwired file silently never compiles and
 never runs — with `cargo test` still reporting success — both crates carry a
@@ -118,10 +127,11 @@ itself instead of being assumed to be a target. Only those two line-anchored
 forms are followed; a file included any other way is reported as an orphan
 rather than missed, and the fix is to wire it in with `#[path]`.
 
-The other two standalone rules — env mutation and instrumentation assertions —
-are **not** mechanically enforced. Detecting them means scanning Rust source for
-call shapes, which costs more in false positives and blind spots than review
-does. They are conventions; honour them when adding a test.
+The env-mutation rule is **not** mechanically enforced. Detecting it means
+scanning Rust source for call shapes, which costs more in false positives and
+blind spots than review does; it is a convention, so honour it when adding a
+test. The instrumentation rule is narrower, four exact call paths, so it is
+checked (`scoped_subscribers_use_the_floor`, above).
 
 The check lives in the `fluree-test-support` crate, so adopting it in a third
 crate is a dev-dependency plus a `tests/harness_coverage.rs` calling

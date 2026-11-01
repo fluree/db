@@ -49,6 +49,7 @@ pub mod disk_cache;
 pub mod edge;
 pub mod error;
 pub mod fd_limit;
+pub mod fir6_frame;
 pub mod flake;
 pub mod geo;
 pub mod graph_db_ref;
@@ -74,7 +75,9 @@ pub mod process;
 pub mod query_bounds;
 pub mod range;
 pub mod range_provider;
+pub mod rdf_list;
 pub mod runtime_small_dicts;
+pub mod same_t;
 pub mod schema_hierarchy;
 pub mod serde;
 pub mod sid;
@@ -93,6 +96,7 @@ pub mod triple_term;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+pub mod vector;
 pub mod verified_identity;
 // moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
 // unit tests. See module docs.

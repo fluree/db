@@ -378,7 +378,7 @@ impl Fluree {
         let name = fluree_db_core::LedgerId::parse(ledger_id)?;
         let ledgers: Vec<String> = self
             .nameservice()
-            .list_branches(name.name())
+            .branch_records(name.name())
             .await?
             .into_iter()
             .filter(|r| !r.retracted)
@@ -1208,7 +1208,7 @@ impl Fluree {
         let name = LedgerId::parse(branch)?;
         let mut records: Vec<_> = self
             .nameservice()
-            .list_branches(name.name())
+            .branch_records(name.name())
             .await?
             .into_iter()
             .filter(|r| !r.retracted)

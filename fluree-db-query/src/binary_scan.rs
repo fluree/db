@@ -19,6 +19,7 @@ use fluree_db_binary_index::{
     LeafletCache, OverlayOp,
 };
 use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::ObjKey;
 use fluree_db_core::DatatypeConstraint;
@@ -83,11 +84,11 @@ pub fn index_type_to_sort_order(index: IndexType) -> RunSortOrder {
 /// overlay cursor in a given order to select the matching novelty overlay index
 /// for `OverlayProvider::for_each_overlay_flake`.
 pub fn sort_order_to_index_type(order: RunSortOrder) -> IndexType {
-    match order {
-        RunSortOrder::Spot => IndexType::Spot,
+    match order.base() {
         RunSortOrder::Psot => IndexType::Psot,
         RunSortOrder::Post => IndexType::Post,
         RunSortOrder::Opst => IndexType::Opst,
+        _ => IndexType::Spot,
     }
 }
 
@@ -172,6 +173,36 @@ fn inline_ops_need_t(ops: &[InlineOperator]) -> bool {
 // BinaryScanOperator
 // ============================================================================
 
+/// The graphs a quad scan reads (see [`BinaryScanOperator::into_quad`]), with
+/// the IRI each binds the graph variable to.
+pub(crate) struct QuadGraphs {
+    iris: rustc_hash::FxHashMap<GraphId, Arc<str>>,
+}
+
+impl QuadGraphs {
+    pub(crate) fn new(iris: impl IntoIterator<Item = (GraphId, Arc<str>)>) -> Self {
+        Self {
+            iris: iris.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn iri(&self, g_id: GraphId) -> Option<&Arc<str>> {
+        self.iris.get(&g_id)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.iris.len()
+    }
+
+    pub(crate) fn contains(&self, g_id: GraphId) -> bool {
+        self.iris.contains_key(&g_id)
+    }
+}
+
+struct QuadScan {
+    graphs: Arc<QuadGraphs>,
+}
+
 /// Encoded form of the inner-subject and inner-object bounds on a term
 /// variable (see `ObjectBounds::term_subject` / `term_object`).
 #[derive(Debug, Clone, Copy)]
@@ -184,7 +215,17 @@ struct TermKeyFilter {
 /// `ColumnBatch` rows into `Binding::Sid` / `Binding::Lit` values.
 pub struct BinaryScanOperator {
     pattern: TriplePattern,
+    /// The index this open scans; reset from `planned_index` on every open,
+    /// then adjusted for the graph being read (see `open`).
     index: IndexType,
+    /// The planner's index choice.
+    planned_index: IndexType,
+    /// Read the pooled tree across all its graphs, for
+    /// [`Self::drain_probe_graphs`] (see [`Self::into_pool_probe`]).
+    pool_probe: bool,
+    /// Read the pooled tree across the graphs of a [`QuadGraphs`] and bind
+    /// each row's graph (see [`Self::into_quad`]).
+    quad: Option<QuadScan>,
     schema: Arc<[VarId]>,
     s_var_pos: Option<usize>,
     p_var_pos: Option<usize>,
@@ -214,6 +255,11 @@ pub struct BinaryScanOperator {
     /// `f:reifies*` skip in `flakes_to_bindings`) become no-ops so
     /// debug/inspection callers can see Fluree-system facts directly.
     include_system_facts: bool,
+    /// Skip rows that are members of a compactly stored RDF list — rows with
+    /// a list position. In SPARQL's view of lists (see
+    /// [`crate::list_view`]) a member is not a value of its predicate; the
+    /// list's owner edge and cells come from [`crate::list_view`] instead.
+    hide_list_members: bool,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -705,6 +751,56 @@ impl BinaryScanOperator {
         )
     }
 
+    /// A probe over the pooled tree: `open` reads the pattern's pooled order
+    /// across every pooled graph, and [`Self::drain_probe_graphs`] reports the
+    /// graphs whose persisted rows match the pattern's bound terms. Overlay and
+    /// decoded-value filters are not applied, so the set may over-include.
+    pub(crate) fn into_pool_probe(mut self) -> Self {
+        self.pool_probe = true;
+        self
+    }
+
+    /// After `open` on a [`Self::into_pool_probe`] scan: the graphs of the
+    /// persisted rows the cursors yield, or `None` when the scan did not take
+    /// the cursor path (the caller then cannot rule any graph out).
+    pub(crate) fn drain_probe_graphs(&mut self) -> Result<Option<rustc_hash::FxHashSet<GraphId>>> {
+        let Some(first) = self.cursor.take() else {
+            return Ok(None);
+        };
+        let mut graphs = rustc_hash::FxHashSet::default();
+        for mut cursor in std::iter::once(first).chain(self.pending_cursors.drain(..)) {
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("pool probe: {e}")))?
+            {
+                for i in 0..batch.row_count {
+                    graphs.insert(batch.g_id.get_or(i, 0));
+                }
+            }
+        }
+        Ok(Some(graphs))
+    }
+
+    /// A quad scan: `open` reads the pattern's pooled order across the
+    /// graphs of `graphs` at once, and every row binds `graph_var` to its
+    /// graph's IRI, appended to the schema. The overlay is not merged — the
+    /// caller hands only graphs without novelty — and each row's values decode
+    /// through its own graph.
+    pub(crate) fn into_quad(mut self, graph_var: VarId, graphs: Arc<QuadGraphs>) -> Self {
+        debug_assert!(self.inline_ops.is_empty() && !self.schema.contains(&graph_var));
+        let mut schema = self.schema.to_vec();
+        schema.push(graph_var);
+        self.schema = schema.into();
+        self.quad = Some(QuadScan { graphs });
+        self
+    }
+
+    /// Whether this scan reads the pooled tree across graphs (a probe or a
+    /// quad scan) rather than one graph's rows.
+    fn spans_pool(&self) -> bool {
+        self.pool_probe || self.quad.is_some()
+    }
+
     fn with_mode(
         pattern: TriplePattern,
         object_bounds: Option<ObjectBounds>,
@@ -753,6 +849,9 @@ impl BinaryScanOperator {
         Self {
             pattern,
             index,
+            planned_index: index,
+            pool_probe: false,
+            quad: None,
             schema,
             s_var_pos,
             p_var_pos,
@@ -767,6 +866,7 @@ impl BinaryScanOperator {
             hidden_p_ids: Vec::new(),
             p_is_var,
             include_system_facts: false,
+            hide_list_members: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -784,6 +884,12 @@ impl BinaryScanOperator {
             unresolved_bound_subject_iri: None,
             mode,
         }
+    }
+
+    /// Skip list members (see [`Self::hide_list_members`]).
+    pub fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -851,6 +957,9 @@ impl BinaryScanOperator {
                 && !self.include_system_facts
                 && fluree_db_core::is_scan_hidden_predicate(&flake.p)
             {
+                continue;
+            }
+            if self.hide_list_members && flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
                 continue;
             }
 
@@ -1182,6 +1291,7 @@ impl BinaryScanOperator {
             o_type: None,
             o_key: None,
             o_i: None,
+            g_id: None,
         })
     }
 
@@ -1379,10 +1489,10 @@ impl BinaryScanOperator {
         let mut bindings = Vec::with_capacity(ncols.max(base_len));
         let store_arc: Arc<BinaryIndexStore> = Arc::clone(self.store());
         let dict_novelty_arc = ctx.and_then(|c| c.dict_novelty.clone());
-        let view = {
+        let make_view = |g_id: GraphId| {
             let mut v = BinaryGraphView::with_novelty(
                 Arc::clone(&store_arc),
-                self.g_id,
+                g_id,
                 dict_novelty_arc.clone(),
             )
             .with_namespace_codes_fallback(ctx.and_then(|c| c.namespace_codes_fallback.clone()));
@@ -1391,12 +1501,16 @@ impl BinaryScanOperator {
             }
             v
         };
+        let scan_view = make_view(self.g_id);
+        // A quad scan's rows decode through their own graphs.
+        let mut quad_views: HashMap<GraphId, BinaryGraphView> = HashMap::new();
         // DictOverlay is no longer needed here for decoding — BinaryGraphView
         // handles watermark routing internally. DictOverlay is still used for
         // overlay translation (translate_overlay_flakes) in BinaryScanOperator::open.
 
         // Late materialization is safe only when the BinaryIndexStore is authoritative
-        // for decoding (no novelty overlay with ephemeral IDs).
+        // for decoding (no novelty overlay with ephemeral IDs) — for the graphs this
+        // scan reads: its own, or a quad scan's, which hold no novelty.
         //
         // An indexed cached ledger retains a nonzero overlay epoch even after
         // all novelty is drained. Test for live overlay rows, not past writes.
@@ -1404,13 +1518,22 @@ impl BinaryScanOperator {
         // bindings eagerly — infrastructure queries (config, policy) need concrete
         // `Binding::Sid`/`Lit`, not `EncodedSid`/`EncodedLit`.
         let late_materialize = ctx.is_some_and(|c| {
-            !crate::fast_path_common::overlay_has_novelty(c) && !c.eager_materialization
+            (self.quad.is_some() || !crate::fast_path_common::graph_has_novelty(c, self.g_id))
+                && !c.eager_materialization
         })
             // If a repeated variable forces two components into the same output slot,
             // late-materialization must produce comparable binding representations.
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // Decided per batch: a leaflet holding no list rows loads its
+        // position column as the constant "none".
+        let hide_members = self.hide_list_members
+            && !matches!(
+                batch.o_i,
+                fluree_db_binary_index::ColumnData::Const(u32::MAX)
+                    | fluree_db_binary_index::ColumnData::AbsentDefault
+            );
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
@@ -1424,8 +1547,26 @@ impl BinaryScanOperator {
             };
             let t_enc = t_opt.unwrap_or(0);
 
+            let quad_graph = match &self.quad {
+                Some(quad) => {
+                    let g_id = batch.g_id.get_or(row, 0);
+                    match quad.graphs.iri(g_id) {
+                        Some(iri) => Some((g_id, Arc::clone(iri))),
+                        None => continue,
+                    }
+                }
+                None => None,
+            };
+            let view = match quad_graph {
+                Some((g_id, _)) => &*quad_views.entry(g_id).or_insert_with(|| make_view(g_id)),
+                None => &scan_view,
+            };
+
             // Skip internal db: predicates on wildcard scans.
             if self.is_internal_predicate(p_id) {
+                continue;
+            }
+            if hide_members && o_i != u32::MAX {
                 continue;
             }
 
@@ -1438,12 +1579,12 @@ impl BinaryScanOperator {
                 continue;
             }
 
-            if !self.within_row_var_equality_ok(&view, s_id, p_id, o_type, o_key)? {
+            if !self.within_row_var_equality_ok(view, s_id, p_id, o_type, o_key)? {
                 continue;
             }
 
             // Enforce datatype constraints before decoding into bindings.
-            if !self.matches_datatype_constraint(&view, o_type, o_key, p_id) {
+            if !self.matches_datatype_constraint(view, o_type, o_key, p_id) {
                 continue;
             }
 
@@ -1605,9 +1746,21 @@ impl BinaryScanOperator {
                         }
                     }
                 };
+                // An arena handle names a value in one graph's arenas, which a
+                // quad scan's consumers cannot tell apart: decode it here.
+                let binding =
+                    if quad_graph.is_some() && crate::object_binding::is_arena_encoded(&binding) {
+                        crate::group_aggregate::materialize_encoded(&binding, Some(view))
+                    } else {
+                        binding
+                    };
                 if !Self::set_binding_at(&mut bindings, pos, binding) {
                     continue;
                 }
+            }
+
+            if let Some((_, iri)) = quad_graph {
+                bindings.push(Binding::iri(iri));
             }
 
             // Apply inline operators.
@@ -1871,7 +2024,6 @@ impl BinaryScanOperator {
 
         let to_t = ctx.to_t;
         let from_t = ctx.from_t;
-        let cmp = self.index.comparator();
 
         // Collect overlay flakes for this graph+index, applying the bound-term
         // equality match INSIDE the walk.
@@ -1886,7 +2038,7 @@ impl BinaryScanOperator {
         // allocation for the (overwhelmingly common) non-matching flakes.
         //
         // Equivalent to the previous filter-after-resolve order:
-        // `resolve_overlay_retractions` decides each distinct fact
+        // `resolve_current_flakes` decides each distinct fact
         // `(s, p, o, dt, m)` independently, and an (s, p, o) equality filter
         // either keeps or drops a fact's entries as a whole — so it can never
         // separate an assertion from the retraction that cancels it.
@@ -1942,8 +2094,7 @@ impl BinaryScanOperator {
             },
         );
 
-        flakes.sort_by(cmp);
-        flakes = resolve_overlay_retractions(flakes);
+        flakes = resolve_current_flakes(flakes, self.index);
 
         // Apply object bounds (post-filter) when present.
         if let Some(bounds) = self.object_bounds.as_ref() {
@@ -1956,57 +2107,6 @@ impl BinaryScanOperator {
         self.state = OperatorState::Open;
         Ok(())
     }
-}
-
-/// Resolve assert/retract pairs in overlay flakes.
-///
-/// For each distinct fact `(s, p, o, dt, m)`, the latest entry (highest `t`)
-/// determines the current state: if it's an assertion, the fact is kept;
-/// if it's a retraction, the fact is excluded from query results.
-///
-/// Novelty enforces RDF set semantics at write time (`apply_commit`), so
-/// duplicate assertions for the same fact cannot exist. This function only
-/// needs to resolve assert/retract lifecycles, not deduplicate.
-fn resolve_overlay_retractions(flakes: Vec<Flake>) -> Vec<Flake> {
-    use std::collections::HashSet;
-
-    // Full fact identity includes metadata (lang tags, list indices).
-    // Two flakes with same (s, p, o, dt) but different `m` are distinct facts.
-    #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-    struct FactKeyRef<'a> {
-        s: &'a Sid,
-        p: &'a Sid,
-        o: &'a FlakeValue,
-        dt: &'a Sid,
-        m: &'a Option<FlakeMeta>,
-    }
-
-    let mut seen: HashSet<FactKeyRef<'_>> = HashSet::new();
-    let mut keep = vec![false; flakes.len()];
-
-    // Walk in reverse (highest t first). First occurrence per fact key is
-    // the latest state. Keep it only if it's an assertion.
-    for (idx, f) in flakes.iter().enumerate().rev() {
-        let key = FactKeyRef {
-            s: &f.s,
-            p: &f.p,
-            o: &f.o,
-            dt: &f.dt,
-            m: &f.m,
-        };
-        if !seen.insert(key) {
-            continue;
-        }
-        if f.op {
-            keep[idx] = true;
-        }
-    }
-
-    flakes
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(f, k)| k.then_some(f))
-        .collect()
 }
 
 fn build_match_val_for_snapshot(
@@ -2111,6 +2211,12 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // The same operator reopens per graph (GRAPH ?g, per-row probes), and
+        // a pooled graph remaps the index below.
+        self.index = self.planned_index;
+        // Over a dataset spanning ledgers the list view is not applied, and a
+        // member is a value of its predicate.
+        self.hide_list_members &= !ctx.is_multi_ledger();
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
         // hiding it would defeat the point of inspecting a history
@@ -2245,7 +2351,12 @@ impl Operator for BinaryScanOperator {
                 // Scan-time datatype narrowing only — never semantic elision.
                 false,
             );
-            let mut inferred_dt_sid = if dt_sid.is_none() && lang.is_none() {
+            // A pool probe or quad scan reads every pooled graph, so it
+            // narrows only by encodings that mean the same in each: no
+            // datatype inferred from this graph's stats, and no arena handle,
+            // which is local to a (graph, predicate).
+            let graph_local_ok = !self.spans_pool();
+            let mut inferred_dt_sid = if dt_sid.is_none() && lang.is_none() && graph_local_ok {
                 filter.p_id.and_then(|p_id| {
                     infer_exact_datatype_sid_from_stats(
                         stats_view.as_deref(),
@@ -2263,14 +2374,15 @@ impl Operator for BinaryScanOperator {
             // encoding and arena contents instead of interpreting UNKNOWN as a
             // datatype. Limit this additional proof to current, indexed reads;
             // novelty and historical reads retain the general numeric matcher.
-            if dt_sid.is_none()
+            if graph_local_ok
+                && dt_sid.is_none()
                 && inferred_dt_sid.is_none()
                 && lang.is_none()
                 && matches!(bound_o, FlakeValue::Decimal(_))
                 && !self.pattern.s_bound()
                 && !self.mode.is_history()
                 && ctx.to_t >= store_ref.max_t()
-                && !crate::fast_path_common::overlay_has_novelty(ctx)
+                && !crate::fast_path_common::graph_has_novelty(ctx, self.g_id)
                 && !decimal_seeks_disabled()
             {
                 if let Some(p_id) = filter.p_id {
@@ -2297,6 +2409,7 @@ impl Operator for BinaryScanOperator {
             let numeric_slices = if untyped_number {
                 let observed = filter
                     .p_id
+                    .filter(|_| graph_local_ok)
                     .and_then(|p_id| observed_datatypes(stats_view.as_deref(), self.g_id, p_id));
                 untyped_numeric_slices(
                     store_ref,
@@ -2304,7 +2417,7 @@ impl Operator for BinaryScanOperator {
                     filter.p_id,
                     observed,
                     bound_o,
-                    !self.mode.is_history() && ctx.to_t >= store_ref.max_t(),
+                    graph_local_ok && !self.mode.is_history() && ctx.to_t >= store_ref.max_t(),
                 )
             } else {
                 None
@@ -2379,6 +2492,7 @@ impl Operator for BinaryScanOperator {
                         // rows; novelty still goes through the decoded fallback.
                         if let FlakeValue::Decimal(value) = bound_o {
                             if *dt_sid == Sid::new(namespaces::XSD, xsd_names::DECIMAL)
+                                && graph_local_ok
                                 && !self.mode.is_history()
                                 // The arena reflects the index at max_t. It keeps
                                 // retracted values today, but an absent handle only
@@ -2489,7 +2603,7 @@ impl Operator for BinaryScanOperator {
             self.index = IndexType::Psot;
         }
 
-        let order = index_type_to_sort_order(self.index);
+        let mut order = index_type_to_sort_order(self.index);
         // Decode only columns needed for correctness:
         // - `o_i` is part of the V3 identity model (list semantics)
         // - `t` is only required for history mode
@@ -2506,15 +2620,51 @@ impl Operator for BinaryScanOperator {
         // Get branch manifest (clone into Arc for cursor ownership).
         let store_arc = Arc::clone(self.store.as_ref().expect("store set above"));
         let store_ref = store_arc.as_ref();
-        let Some(branch_ref) = store_ref.branch_for_order(self.g_id, order) else {
+        let tree = if self.spans_pool() {
+            let pooled = order.pooled();
+            store_ref
+                .pool_branch(pooled)
+                .map(|branch| fluree_db_binary_index::GraphTree {
+                    branch: Arc::clone(branch),
+                    order: pooled,
+                    g_filter: None,
+                })
+        } else if order == RunSortOrder::Post
+            && store_ref.is_pooled(self.g_id)
+            && filter.o_key.is_some()
+            && object_slices.is_empty()
+            && self.object_bounds.is_none()
+        {
+            // One exact object value: the graph's own GSPO rows, filtered to
+            // (p, o), cost at most the graph's size, where the pooled POST range
+            // for (p, o) spans every pooled graph. With p and o fixed both come
+            // back ordered by subject.
+            store_ref.pool_branch(RunSortOrder::Gspo).map(|branch| {
+                fluree_db_binary_index::GraphTree {
+                    branch: Arc::clone(branch),
+                    order: RunSortOrder::Gspo,
+                    g_filter: Some(self.g_id),
+                }
+            })
+        } else {
+            store_ref.graph_tree(self.g_id, order)
+        };
+        let Some(tree) = tree else {
             // The index root may omit graphs (or specific sort orders) that have
             // zero indexed rows. Queries over such graphs should return empty
             // results (or overlay-only results when novelty is present), not
             // fail with an internal error.
             return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
         };
-        let branch: Arc<fluree_db_binary_index::format::branch::BranchManifest> =
-            Arc::clone(branch_ref);
+        // A pooled graph reads the pooled tree filtered to the graph. With the
+        // graph fixed, the pooled order's rows arrive in its base order, so
+        // that base is the index the overlay ops are sorted and cached by.
+        if let Some(g_id) = tree.g_filter {
+            filter.g_id = Some(g_id);
+            self.index = sort_order_to_index_type(tree.order);
+        }
+        order = tree.order;
+        let branch = tree.branch;
 
         // If this scan has range bounds on the object variable and we're scanning in POST order,
         // narrow the cursor's leaf range by object-key range. Two cases are safe:
@@ -2530,7 +2680,7 @@ impl Operator for BinaryScanOperator {
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
         let mut term_o_key_range: Option<(u64, u64)> = None;
-        if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
+        if order.base() == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
             if self.term_only && filter.o_type.is_none() {
                 filter.o_type = Some(OType::TRIPLE_TERM.as_u16());
             }
@@ -2719,8 +2869,11 @@ impl Operator for BinaryScanOperator {
             }
         }
 
+        // A pooled graph's rows are contiguous in the pooled GSPO, so the
+        // graph alone narrows the leaves a scan of it routes.
         let use_range = |filter: &BinaryFilter| {
-            filter.s_id.is_some()
+            filter.g_id.is_some()
+                || filter.s_id.is_some()
                 || filter.p_id.is_some()
                 || filter.o_type.is_some()
                 || filter.o_key.is_some()
@@ -2753,7 +2906,7 @@ impl Operator for BinaryScanOperator {
                 t: 0,
                 o_i: 0,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(0),
-                g_id: self.g_id,
+                g_id: if self.spans_pool() { 0 } else { self.g_id },
             };
             let max_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(u64::MAX)),
@@ -2762,7 +2915,11 @@ impl Operator for BinaryScanOperator {
                 t: u32::MAX,
                 o_i: u32::MAX,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(u16::MAX),
-                g_id: self.g_id,
+                g_id: if self.spans_pool() {
+                    GraphId::MAX
+                } else {
+                    self.g_id
+                },
             };
             let cursor = BinaryCursor::new(
                 Arc::clone(&store_arc),
@@ -2797,7 +2954,7 @@ impl Operator for BinaryScanOperator {
         // `overlay_has_novelty`, which also trusts a zero epoch: this block is
         // the scan's only overlay merge, so a wrong answer here drops rows
         // instead of declining a fast path.
-        if ctx.overlay.is_some_and(|o| !o.is_effectively_empty()) {
+        if self.quad.is_none() && ctx.overlay.is_some_and(|o| !o.is_effectively_empty()) {
             let epoch = ctx.overlay().epoch();
             // A bound subject (or, failing that, a bound predicate) turns the
             // translation from a whole-novelty walk into a seek. Without it the
@@ -2926,8 +3083,7 @@ impl Operator for BinaryScanOperator {
                 };
                 resolve_overlay_ops(&mut ops);
                 if !untranslated.is_empty() {
-                    untranslated.sort_by(self.index.comparator());
-                    untranslated = resolve_overlay_retractions(untranslated);
+                    untranslated = resolve_current_flakes(untranslated, self.index);
                 }
                 let entry = Arc::new(TranslatedOverlayOps {
                     ops: ops.into(),
@@ -3025,8 +3181,7 @@ impl Operator for BinaryScanOperator {
                     sort_overlay_ops(&mut ops, order);
                     resolve_overlay_ops(&mut ops);
                     if !untranslated.is_empty() {
-                        untranslated.sort_by(self.index.comparator());
-                        untranslated = resolve_overlay_retractions(untranslated);
+                        untranslated = resolve_current_flakes(untranslated, self.index);
                     }
                     Arc::new(TranslatedOverlayOps {
                         ops: ops.into(),
@@ -3126,7 +3281,7 @@ impl Operator for BinaryScanOperator {
             &self.inline_ops,
             &self.pattern,
             store_ref,
-            !crate::fast_path_common::overlay_has_novelty(ctx),
+            self.quad.is_some() || !crate::fast_path_common::graph_has_novelty(ctx, self.g_id),
         );
         self.encoded_pre_filters = encoded;
         self.inline_ops = pruned;
@@ -3136,6 +3291,12 @@ impl Operator for BinaryScanOperator {
             order = ?order,
             g_id = self.g_id,
             pattern = ?self.pattern,
+            leaves = self
+                .cursor
+                .iter()
+                .chain(&self.pending_cursors)
+                .map(BinaryCursor::leaf_count)
+                .sum::<usize>(),
             "BinaryScanOperator::open"
         );
 
@@ -3247,7 +3408,8 @@ impl Operator for BinaryScanOperator {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
-        if !self.count_only_eligible() {
+        // Counting rows undecoded would count the list members it hides.
+        if !self.count_only_eligible() || self.hide_list_members {
             stamp_scan_count_drain(false);
             return Ok(None);
         }
@@ -3829,6 +3991,7 @@ pub(crate) fn translate_one_flake_v3_pub(
                 o_i,
                 t: flake.t,
                 op: flake.op,
+                g_id,
             });
         }
         // No matching base row. For a retraction this means the assertion
@@ -3876,6 +4039,7 @@ pub(crate) fn translate_one_flake_v3_pub(
         o_i,
         t: flake.t,
         op: flake.op,
+        g_id,
     })
 }
 
@@ -4255,7 +4419,7 @@ fn predicate_is_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
 fn prove_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Option<bool> {
     use fluree_db_binary_index::format::run_record::RunSortOrder;
     if !store.numbig_is_decimal_only(g_id, p_id)
-        || store.branch_for_order(g_id, RunSortOrder::Post).is_none()
+        || store.dedicated_branch(g_id, RunSortOrder::Post).is_none()
     {
         return Some(false);
     }
@@ -4621,9 +4785,12 @@ pub(crate) fn object_slice_filters(
     slices: &[ObjectSlice],
 ) -> Vec<BinaryFilter> {
     let ordered = match order {
-        RunSortOrder::Opst => true,
-        RunSortOrder::Post => filter.p_id.is_some(),
-        RunSortOrder::Spot | RunSortOrder::Psot => filter.s_id.is_some() && filter.p_id.is_some(),
+        RunSortOrder::Opst | RunSortOrder::OpstG => true,
+        RunSortOrder::Post | RunSortOrder::PostG => filter.p_id.is_some(),
+        RunSortOrder::Gspo => {
+            filter.g_id.is_some() && filter.s_id.is_some() && filter.p_id.is_some()
+        }
+        _ => filter.s_id.is_some() && filter.p_id.is_some(),
     };
     if slices.is_empty() || !ordered {
         return vec![filter];
@@ -5227,6 +5394,7 @@ mod bounded_overlay_walk_tests {
                     o_i: u32::MAX,
                     t: (rng(&mut st) % 9) as i64,
                     op: rng(&mut st).is_multiple_of(2),
+                    g_id: 0,
                 });
             }
 
@@ -5271,6 +5439,7 @@ mod bounded_overlay_walk_tests {
                     o_i: u32::MAX,
                     t: (rng(&mut st) % 9) as i64,
                     op: rng(&mut st).is_multiple_of(2),
+                    g_id: 0,
                 });
             }
 
@@ -5311,6 +5480,7 @@ mod bounded_overlay_walk_tests {
             o_i: u32::MAX,
             t: 5,
             op: true,
+            g_id: 0,
         };
         let b = OverlayOp {
             t: 8,

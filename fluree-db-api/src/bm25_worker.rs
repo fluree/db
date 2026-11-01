@@ -849,7 +849,7 @@ mod tests {
         let collect = Collect::default();
         let sink = Arc::clone(&collect.0);
         let subscriber = tracing_subscriber::registry().with(collect);
-        tracing::subscriber::with_default(subscriber, f);
+        fluree_test_support::with_scoped_default(subscriber, f);
         let out = sink.lock().unwrap().clone();
         out
     }
@@ -859,14 +859,9 @@ mod tests {
     /// operator greps for when an index stops syncing, so emitting it on an
     /// ordinary republish points the investigation at the wrong event.
     ///
-    /// Enforced under `cargo nextest` (CI), which runs each test in its own
-    /// process. Under a bare parallel `cargo test` this can pass vacuously:
-    /// `with_default` is thread-local while tracing's callsite-interest cache
-    /// is process-global, so a sibling test hitting these callsites with no
-    /// subscriber installed can leave them cached as uninteresting and the
-    /// events never reach the collector. Verified by mutation
-    /// (`prune_reverse_edges` -> `unregister_graph_source`): red under nextest
-    /// and under `--test-threads=1`, green under bare parallel `cargo test`.
+    /// The collector is installed with `with_scoped_default`, so a sibling
+    /// test hitting these callsites first can't leave them cached as
+    /// uninteresting, and an absent unregistration means one wasn't logged.
     #[test]
     fn re_registering_does_not_log_an_unregistration() {
         let messages = captured_debug_messages(|| {

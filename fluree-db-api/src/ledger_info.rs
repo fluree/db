@@ -183,6 +183,37 @@ pub struct NamedGraph {
     pub flakes: Option<i64>,
     /// Byte size (native) / `0` (virtual).
     pub size: u64,
+    /// Where the current index holds the graph's rows. Omitted while the
+    /// index holds none of them yet, and for virtual datasets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<IndexedPlacement>,
+}
+
+/// Where an index holds a named graph's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexedPlacement {
+    /// In the pooled tree, with other small named graphs.
+    Pooled,
+    /// In trees of its own.
+    Dedicated,
+}
+
+fn indexed_placement(store: Option<&BinaryIndexStore>, g_id: GraphId) -> Option<IndexedPlacement> {
+    use fluree_db_binary_index::RunSortOrder;
+    let store = store?;
+    if store.is_pooled(g_id) {
+        return Some(IndexedPlacement::Pooled);
+    }
+    [
+        RunSortOrder::Spot,
+        RunSortOrder::Psot,
+        RunSortOrder::Post,
+        RunSortOrder::Opst,
+    ]
+    .into_iter()
+    .any(|order| store.dedicated_branch(g_id, order).is_some())
+    .then_some(IndexedPlacement::Dedicated)
 }
 
 /// Graph-scoped statistics block (`stats`).
@@ -632,7 +663,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     // server route stamps `ledger_id`/`t` on as trailing keys.
 
     // 1. Ledger block (ledger-wide metadata).
-    let ledger_block = build_ledger_block(ledger, &stats);
+    let ledger_block = build_ledger_block(ledger, &stats, binary_store.as_deref());
 
     // 2 + 3. Graph name + graph-scoped stats section.
     let stats_block = build_graph_scoped_stats(
@@ -809,7 +840,11 @@ fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String
 // ============================================================================
 
 /// Build the `ledger` block with ledger-wide metadata.
-fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
+fn build_ledger_block(
+    ledger: &LedgerState,
+    stats: &IndexStats,
+    store: Option<&BinaryIndexStore>,
+) -> Ledger {
     let graph_sizes = stats.graphs.as_deref().unwrap_or_default();
     let graph_totals = |g_id: GraphId| -> (u64, u64) {
         graph_sizes
@@ -837,6 +872,7 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
         g_id: 0,
         flakes: Some(default_flakes as i64),
         size: default_size,
+        placement: indexed_placement(store, 0),
     });
     // Then every registered graph (txn-meta at g_id=1, config at g_id=2,
     // user-defined at g_id>=3). `iter_entries` is dense and ordered by
@@ -848,6 +884,7 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
             g_id,
             flakes: Some(flakes as i64),
             size,
+            placement: indexed_placement(store, g_id),
         });
     }
 
@@ -1577,6 +1614,7 @@ pub fn build_virtual_ledger_info(
                 g_id: 0,
                 flakes: total_rows,
                 size: 0,
+                placement: None,
             }],
             needs_link_reindex: false,
         },
@@ -2879,7 +2917,7 @@ mod tests {
         let mut ledger = LedgerState::new(snapshot, novelty);
         ledger.ns_record = Some(NsRecord::new("info-watermarks:main"));
 
-        let block = build_ledger_block(&ledger, &IndexStats::default());
+        let block = build_ledger_block(&ledger, &IndexStats::default(), None);
         assert_eq!(block.t, Some(2));
         assert_eq!(block.commit_t, Some(2));
         assert_eq!(block.index_t, Some(1));

@@ -5,7 +5,7 @@
 //!
 //! `g_id` is NOT stored in the run wire format (34 bytes) because each graph
 //! gets its own set of run files and indexes. The spool wire format (36 bytes)
-//! still includes `g_id` as `u16` because spool files are pre-partition.
+//! still includes `g_id` (`u32`) because spool files are pre-partition.
 
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -20,8 +20,8 @@ pub const RECORD_WIRE_SIZE: usize = 34;
 
 /// Wire format size of a single record in **spool files**, in bytes.
 ///
-/// Includes `g_id` as `u16` (spool records are pre-graph-partition).
-pub const SPOOL_RECORD_WIRE_SIZE: usize = 36;
+/// Includes `g_id` as `u32` (spool records are pre-graph-partition).
+pub const SPOOL_RECORD_WIRE_SIZE: usize = 38;
 
 /// Sentinel value for "not a list member" in the `u32` `i` field.
 pub const LIST_INDEX_NONE: u32 = u32::MAX;
@@ -78,7 +78,7 @@ pub struct RunRecord {
     /// List index (u32::MAX = none).
     pub i: u32,
     /// Graph ID (0 = default graph). In-memory only; not in run wire format.
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Datatype dict index (for sort-key tie-breaking).
     pub dt: u16,
     /// Language tag id (per-run assignment, 0 = none).
@@ -95,7 +95,7 @@ impl RunRecord {
     /// Create a new RunRecord with all fields.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         s_id: SubjectId,
         p_id: u32,
         o_kind: ObjKind,
@@ -153,37 +153,35 @@ impl RunRecord {
         }
     }
 
-    /// Serialize to [`SPOOL_RECORD_WIRE_SIZE`] (36) bytes, little-endian.
+    /// Serialize to [`SPOOL_RECORD_WIRE_SIZE`] (38) bytes, little-endian.
     ///
-    /// Includes `g_id` as `u16` — spool records are pre-graph-partition.
+    /// Includes `g_id` — spool records are pre-graph-partition.
     pub fn write_spool_le(&self, buf: &mut [u8; SPOOL_RECORD_WIRE_SIZE]) {
-        buf[0..2].copy_from_slice(&self.g_id.to_le_bytes());
-        buf[2..10].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
-        buf[10..18].copy_from_slice(&self.o_key.to_le_bytes());
-        buf[18..22].copy_from_slice(&self.p_id.to_le_bytes());
-        buf[22..26].copy_from_slice(&self.t.to_le_bytes());
-        buf[26..30].copy_from_slice(&self.i.to_le_bytes());
-        buf[30..32].copy_from_slice(&self.dt.to_le_bytes());
-        buf[32..34].copy_from_slice(&self.lang_id.to_le_bytes());
-        buf[34] = self.o_kind;
-        buf[35] = self.op;
+        buf[0..4].copy_from_slice(&self.g_id.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
+        buf[12..20].copy_from_slice(&self.o_key.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.p_id.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.t.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.i.to_le_bytes());
+        buf[32..34].copy_from_slice(&self.dt.to_le_bytes());
+        buf[34..36].copy_from_slice(&self.lang_id.to_le_bytes());
+        buf[36] = self.o_kind;
+        buf[37] = self.op;
     }
 
-    /// Deserialize from [`SPOOL_RECORD_WIRE_SIZE`] (36) bytes, little-endian.
-    ///
-    /// Includes `g_id` as `u16`.
+    /// Deserialize from [`SPOOL_RECORD_WIRE_SIZE`] (38) bytes, little-endian.
     pub fn read_spool_le(buf: &[u8; SPOOL_RECORD_WIRE_SIZE]) -> Self {
         Self {
-            g_id: u16::from_le_bytes(buf[0..2].try_into().unwrap()),
-            s_id: SubjectId::from_u64(u64::from_le_bytes(buf[2..10].try_into().unwrap())),
-            o_key: u64::from_le_bytes(buf[10..18].try_into().unwrap()),
-            p_id: u32::from_le_bytes(buf[18..22].try_into().unwrap()),
-            t: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
-            i: u32::from_le_bytes(buf[26..30].try_into().unwrap()),
-            dt: u16::from_le_bytes(buf[30..32].try_into().unwrap()),
-            lang_id: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
-            o_kind: buf[34],
-            op: buf[35],
+            g_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            s_id: SubjectId::from_u64(u64::from_le_bytes(buf[4..12].try_into().unwrap())),
+            o_key: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+            p_id: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            t: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            i: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+            dt: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
+            lang_id: u16::from_le_bytes(buf[34..36].try_into().unwrap()),
+            o_kind: buf[36],
+            op: buf[37],
         }
     }
 
@@ -287,6 +285,25 @@ pub fn cmp_g_spot(a: &RunRecord, b: &RunRecord) -> Ordering {
     a.g_id.cmp(&b.g_id).then_with(|| cmp_spot(a, b))
 }
 
+/// Pooled orders compare the base order's identity columns, then `g_id`,
+/// then `t`/`op` (so a fact's history stays adjacent within its graph).
+macro_rules! pooled_v1_cmp {
+    ($name:ident, $($field:ident),+) => {
+        #[inline]
+        fn $name(a: &RunRecord, b: &RunRecord) -> Ordering {
+            Ordering::Equal
+                $(.then(a.$field.cmp(&b.$field)))+
+                .then(a.g_id.cmp(&b.g_id))
+                .then(a.t.cmp(&b.t))
+                .then(a.op.cmp(&b.op))
+        }
+    };
+}
+pooled_v1_cmp!(cmp_spot_g, s_id, p_id, o_kind, o_key, dt);
+pooled_v1_cmp!(cmp_psot_g, p_id, s_id, o_kind, o_key, dt);
+pooled_v1_cmp!(cmp_post_g, p_id, o_kind, o_key, dt, s_id);
+pooled_v1_cmp!(cmp_opst_g, o_kind, o_key, dt, p_id, s_id);
+
 /// Return the comparator function for a given sort order.
 pub fn cmp_for_order(order: RunSortOrder) -> fn(&RunRecord, &RunRecord) -> Ordering {
     match order {
@@ -294,10 +311,21 @@ pub fn cmp_for_order(order: RunSortOrder) -> fn(&RunRecord, &RunRecord) -> Order
         RunSortOrder::Psot => cmp_psot,
         RunSortOrder::Post => cmp_post,
         RunSortOrder::Opst => cmp_opst,
+        RunSortOrder::Gspo => cmp_g_spot,
+        RunSortOrder::SpotG => cmp_spot_g,
+        RunSortOrder::PsotG => cmp_psot_g,
+        RunSortOrder::PostG => cmp_post_g,
+        RunSortOrder::OpstG => cmp_opst_g,
     }
 }
 
 /// Sort order identifier for run files.
+///
+/// `Spot`..`Opst` are the orders of a dedicated tree, which holds one graph
+/// and keeps the graph implicit. The pooled orders belong to the shared tree
+/// for small named graphs: each carries `g_id` per row, `SpotG`..`OpstG`
+/// compare it after the base order's columns (so cross-graph prefixes stay
+/// contiguous) and `Gspo` leads with it (one graph's rows are contiguous).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RunSortOrder {
@@ -305,6 +333,11 @@ pub enum RunSortOrder {
     Psot = 1,
     Post = 2,
     Opst = 3,
+    Gspo = 4,
+    SpotG = 5,
+    PsotG = 6,
+    PostG = 7,
+    OpstG = 8,
 }
 
 impl PartialOrd for RunSortOrder {
@@ -327,6 +360,11 @@ impl RunSortOrder {
             1 => Some(Self::Psot),
             2 => Some(Self::Post),
             3 => Some(Self::Opst),
+            4 => Some(Self::Gspo),
+            5 => Some(Self::SpotG),
+            6 => Some(Self::PsotG),
+            7 => Some(Self::PostG),
+            8 => Some(Self::OpstG),
             _ => None,
         }
     }
@@ -353,6 +391,11 @@ impl RunSortOrder {
             Self::Psot => "psot",
             Self::Post => "post",
             Self::Opst => "opst",
+            Self::Gspo => "gspo",
+            Self::SpotG => "spot_g",
+            Self::PsotG => "psot_g",
+            Self::PostG => "post_g",
+            Self::OpstG => "opst_g",
         }
     }
 
@@ -363,6 +406,11 @@ impl RunSortOrder {
             "psot" => Some(Self::Psot),
             "post" => Some(Self::Post),
             "opst" => Some(Self::Opst),
+            "gspo" => Some(Self::Gspo),
+            "spot_g" => Some(Self::SpotG),
+            "psot_g" => Some(Self::PsotG),
+            "post_g" => Some(Self::PostG),
+            "opst_g" => Some(Self::OpstG),
             _ => None,
         }
     }
@@ -376,6 +424,53 @@ impl RunSortOrder {
     /// from sorted commit files via streaming k-way merge.
     pub fn secondary_orders() -> &'static [RunSortOrder] {
         &[Self::Psot, Self::Post, Self::Opst]
+    }
+
+    /// Orders of the pooled tree.
+    pub fn pool_build_orders() -> &'static [RunSortOrder] {
+        &[
+            Self::Gspo,
+            Self::SpotG,
+            Self::PsotG,
+            Self::PostG,
+            Self::OpstG,
+        ]
+    }
+
+    /// Pooled orders built from run files. `Gspo` comes from the
+    /// `(g_id, SPOT)`-sorted commit files, as `Spot` does for a single graph.
+    pub fn pool_secondary_orders() -> &'static [RunSortOrder] {
+        &[Self::SpotG, Self::PsotG, Self::PostG, Self::OpstG]
+    }
+
+    /// Whether this order belongs to the pooled tree (rows carry `g_id`).
+    #[inline]
+    pub fn is_pooled(self) -> bool {
+        (self as u8) >= Self::Gspo as u8
+    }
+
+    /// The dedicated order whose columns and segmentation this order uses.
+    /// `Gspo` lays out its columns as SPOT does.
+    #[inline]
+    pub fn base(self) -> RunSortOrder {
+        match self {
+            Self::Spot | Self::Gspo | Self::SpotG => Self::Spot,
+            Self::Psot | Self::PsotG => Self::Psot,
+            Self::Post | Self::PostG => Self::Post,
+            Self::Opst | Self::OpstG => Self::Opst,
+        }
+    }
+
+    /// The pooled counterpart of a dedicated order (trailing `g_id`).
+    #[inline]
+    pub fn pooled(self) -> RunSortOrder {
+        match self {
+            Self::Spot | Self::SpotG => Self::SpotG,
+            Self::Psot | Self::PsotG => Self::PsotG,
+            Self::Post | Self::PostG => Self::PostG,
+            Self::Opst | Self::OpstG => Self::OpstG,
+            Self::Gspo => Self::Gspo,
+        }
     }
 }
 
@@ -708,8 +803,32 @@ mod tests {
         assert_eq!(RunSortOrder::from_u8(1), Some(RunSortOrder::Psot));
         assert_eq!(RunSortOrder::from_u8(2), Some(RunSortOrder::Post));
         assert_eq!(RunSortOrder::from_u8(3), Some(RunSortOrder::Opst));
-        assert_eq!(RunSortOrder::from_u8(4), None);
+        assert_eq!(RunSortOrder::from_u8(4), Some(RunSortOrder::Gspo));
+        assert_eq!(RunSortOrder::from_u8(8), Some(RunSortOrder::OpstG));
+        assert_eq!(RunSortOrder::from_u8(9), None);
         assert_eq!(RunSortOrder::from_u8(255), None);
+        for &o in RunSortOrder::all_build_orders()
+            .iter()
+            .chain(RunSortOrder::pool_build_orders())
+        {
+            assert_eq!(RunSortOrder::from_wire_id(o.to_wire_id()), Some(o));
+            assert_eq!(RunSortOrder::from_dir_name(o.dir_name()), Some(o));
+        }
+    }
+
+    #[test]
+    fn pooled_orders_map_to_their_base() {
+        for &o in RunSortOrder::all_build_orders() {
+            assert!(!o.is_pooled());
+            assert_eq!(o.base(), o);
+            assert!(o.pooled().is_pooled());
+            assert_eq!(o.pooled().base(), o);
+        }
+        for &o in RunSortOrder::pool_build_orders() {
+            assert!(o.is_pooled());
+            assert_eq!(o.pooled(), o);
+        }
+        assert_eq!(RunSortOrder::Gspo.base(), RunSortOrder::Spot);
     }
 
     #[test]

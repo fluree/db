@@ -52,7 +52,7 @@ enum EncodedBindingCacheKey {
     },
 }
 
-type EncodedBoolPredicateKey = (usize, u16, u64, EncodedBindingCacheKey);
+type EncodedBoolPredicateKey = (usize, fluree_db_core::GraphId, u64, EncodedBindingCacheKey);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CacheableBoolPredicate {

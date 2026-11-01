@@ -5,7 +5,7 @@
 //! general merges with conflict resolution strategies.
 
 use crate::commit_data::{
-    collect_from_commits, CollectedCommitData, ConfigGraphs, Fold, OwnChanges,
+    collect_from_commits, CollectedCommitData, ConfigGraphs, Fold, NetChange, OwnChanges,
 };
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
@@ -686,7 +686,10 @@ impl crate::Fluree {
         }
 
         let CollectedCommitData {
-            flakes: source_flakes,
+            net: NetChange {
+                flakes: source_flakes,
+                ..
+            },
             namespace_delta,
             graph_iris,
         } = source_data;

@@ -97,9 +97,10 @@ pub(crate) fn parse_sparql_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_sparql::ParamMap>,
+    rdf_list_view: bool,
 ) -> Result<(VarRegistry, Query)> {
     let ast = parse_and_validate_sparql(sparql, params)?;
-    lower_sparql_ast(ast, snapshot, default_context, sparql)
+    lower_sparql_ast(ast, snapshot, default_context, sparql, rdf_list_view)
 }
 
 /// Inject default prefixes from the ledger's stored `@context`, but only when
@@ -132,17 +133,23 @@ pub(crate) fn inject_default_prefixes(
 /// resolve a `FROM` clause) reuse it here instead of re-parsing the string —
 /// see #1473. Behaviour matches [`parse_sparql_to_ir`], which is now a thin
 /// parse-then-lower wrapper over this.
+///
+/// `rdf_list_view` reads lists as their RDF cells, for the Graph Store `GET`
+/// ([`crate::QueryExecutionOptions::with_rdf_list_view`]); SPARQL itself
+/// reads a list's members as values.
 pub(crate) fn lower_sparql_ast(
     mut ast: fluree_db_sparql::SparqlAst,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     sparql: &str,
+    rdf_list_view: bool,
 ) -> Result<(VarRegistry, Query)> {
     inject_default_prefixes(&mut ast, default_context);
 
     let mut vars = VarRegistry::new();
-    let parsed =
+    let mut parsed =
         fluree_db_sparql::lower_sparql_with_source(&ast, snapshot, &mut vars, Some(sparql))?;
+    parsed.rdf_list_view = rdf_list_view;
     Ok((vars, parsed))
 }
 
@@ -170,7 +177,7 @@ pub(crate) fn parse_cypher_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
-    overlay: Option<(&dyn OverlayProvider, u16)>,
+    overlay: Option<(&dyn OverlayProvider, fluree_db_core::GraphId)>,
     policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     let ast = substituted_cypher_ast(cypher, params)?;
@@ -267,7 +274,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
     ast: &fluree_db_cypher::CypherAst,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
-    overlay: Option<(&dyn OverlayProvider, u16)>,
+    overlay: Option<(&dyn OverlayProvider, fluree_db_core::GraphId)>,
     policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
@@ -324,7 +331,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
 ///    can't supply the overlay stay conservative.
 fn reified_edges_possible(
     snapshot: &LedgerSnapshot,
-    overlay: Option<(&dyn OverlayProvider, u16)>,
+    overlay: Option<(&dyn OverlayProvider, fluree_db_core::GraphId)>,
 ) -> bool {
     let Some(reifies_sid) = snapshot.encode_iri(fluree_vocab::rdf::REIFIES) else {
         return false;
@@ -354,11 +361,11 @@ fn index_has_reified_edges(snapshot: &LedgerSnapshot, reifies_sid: &fluree_db_co
 
 fn overlay_has_reified_edges(
     overlay: &dyn OverlayProvider,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     reifies_sid: &fluree_db_core::Sid,
 ) -> bool {
     use std::sync::OnceLock;
-    type ReifiesCache = parking_lot::Mutex<lru::LruCache<(u64, u16), bool>>;
+    type ReifiesCache = parking_lot::Mutex<lru::LruCache<(u64, fluree_db_core::GraphId), bool>>;
     static CACHE: OnceLock<ReifiesCache> = OnceLock::new();
 
     if overlay.is_effectively_empty() {
@@ -863,7 +870,7 @@ mod tests {
         assert_eq!(sparql_parse_count(), 1, "exactly one parse so far");
 
         let snapshot = LedgerSnapshot::genesis("test:main");
-        let _ = lower_sparql_ast(ast, &snapshot, None, sparql).expect("lower");
+        let _ = lower_sparql_ast(ast, &snapshot, None, sparql, false).expect("lower");
 
         assert_eq!(
             sparql_parse_count(),
@@ -878,7 +885,7 @@ mod tests {
     fn parse_sparql_to_ir_parses_once() {
         reset_sparql_parse_count();
         let snapshot = LedgerSnapshot::genesis("test:main");
-        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None, None)
+        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None, None, false)
             .expect("lower");
         assert_eq!(sparql_parse_count(), 1);
     }

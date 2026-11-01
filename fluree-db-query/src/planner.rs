@@ -122,6 +122,51 @@ pub(crate) fn classify_pattern(
     }
 }
 
+/// A [`ListViewPattern`](crate::list_view::ListViewPattern)'s rows: its
+/// stored triples, plus the cells the view adds, which no statistic counts —
+/// a compact list stores no `rdf:first`, so stats alone would rank
+/// `?c rdf:first ?x` empty and seed a walk from every cell. Without a bound
+/// subject the cells are every list's, read in full: two per member.
+fn estimate_list_view_row_count(
+    lv: &crate::list_view::ListViewPattern,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> f64 {
+    let t = &lv.triple;
+    let stored = estimate_triple_row_count(t, bound_vars, stats);
+    let bound = |r: Option<VarId>| r.is_none_or(|v| bound_vars.contains(&v));
+    let reads_cells = match &t.p {
+        Ref::Var(_) => true,
+        Ref::Sid(p) => {
+            fluree_db_core::namespaces::is_rdf_first(p)
+                || fluree_db_core::namespaces::is_rdf_rest(p)
+        }
+        Ref::Iri(iri) => {
+            [fluree_vocab::rdf::FIRST, fluree_vocab::rdf::REST].contains(&iri.as_ref())
+        }
+    };
+    if !reads_cells {
+        return stored;
+    }
+    if bound(t.s.as_var()) {
+        return stored + HIGHLY_SELECTIVE;
+    }
+    let members = match (lv.view.predicates(), stats) {
+        (Some(predicates), Some(stats)) => predicates
+            .iter()
+            .map(|p| stats.get_property(p).map(|d| d.count as f64))
+            .sum::<Option<f64>>()
+            .unwrap_or(DEFAULT_PROPERTY_SCAN_SELECTIVITY),
+        _ => DEFAULT_PROPERTY_SCAN_SELECTIVITY,
+    };
+    let cells = 2.0 * members;
+    if bound(t.o.as_var()) {
+        stored + (cells / MODERATELY_SELECTIVE).max(HIGHLY_SELECTIVE)
+    } else {
+        stored + cells
+    }
+}
+
 /// Look up property statistics by predicate term (SID or IRI).
 fn property_stats<'a>(stats: &'a StatsView, pred: &Ref) -> Option<&'a PropertyStatData> {
     if let Some(sid) = pred.as_sid() {
@@ -1078,6 +1123,10 @@ pub fn estimate_pattern(
     match pattern {
         Pattern::Triple(tp) => PatternEstimate::Source {
             row_count: estimate_triple_row_count(tp, bound_vars, stats),
+        },
+
+        Pattern::ListView(lv) => PatternEstimate::Source {
+            row_count: estimate_list_view_row_count(lv, bound_vars, stats),
         },
 
         Pattern::Values { rows, .. } => PatternEstimate::Source {

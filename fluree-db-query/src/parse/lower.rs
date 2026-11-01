@@ -167,6 +167,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         union_default_graph: ast.options.union_default_graph,
         cypher_vocab: None,
         unmatched_optional: Default::default(),
+        rdf_list_view: false,
     })
 }
 

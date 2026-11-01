@@ -161,13 +161,12 @@ impl GeoSearchOperator {
 
         let mut results: Vec<(u64, u64, f64)> = Vec::new(); // (s_id, o_key, distance)
 
-        // Get branch manifest for POST order.
-        let branch_ref = store
-            .branch_for_order(g_id, RunSortOrder::Post)
-            .ok_or_else(|| {
-                QueryError::Internal(format!("GeoSearch: no POST branch for g_id={g_id}"))
-            })?;
-        let branch: Arc<BranchManifest> = Arc::clone(branch_ref);
+        // POST order (pooled graphs: the pooled POST filtered to the graph).
+        let tree = store.graph_tree(g_id, RunSortOrder::Post).ok_or_else(|| {
+            QueryError::Internal(format!("GeoSearch: no POST branch for g_id={g_id}"))
+        })?;
+        let branch: Arc<BranchManifest> = tree.branch;
+        let order = tree.order;
 
         let geo_otype = OType::GEO_POINT.as_u16();
 
@@ -202,12 +201,13 @@ impl GeoSearchOperator {
                 o_type: Some(geo_otype),
                 o_key: None, // Range filtering done by cursor bounds
                 o_i: None,
+                g_id: tree.g_filter,
             };
 
             // Create cursor for POST order
             let mut cursor = BinaryCursor::new(
                 store.clone(),
-                RunSortOrder::Post,
+                order,
                 branch.clone(),
                 &min_key,
                 &max_key,

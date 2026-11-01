@@ -21,7 +21,7 @@
 //!
 //! The execution engine is split into focused submodules:
 //!
-//! - `reasoning_prep`: Schema hierarchy, reasoning modes, derived facts
+//! - `reasoning_prep`: Reasoning modes, derived facts
 //! - `rewrite_glue`: Pattern rewriting for RDFS/OWL expansion
 //! - `pushdown`: Filter bounds extraction for index-level filtering
 //! - `where_plan`: WHERE clause operator building
@@ -119,6 +119,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         let executable = ExecutableQuery::simple(query);
         let results = execute(db, &vars, &executable, ContextConfig::default())
@@ -151,6 +152,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(
@@ -183,6 +185,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(

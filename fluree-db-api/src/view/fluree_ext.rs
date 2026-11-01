@@ -1343,9 +1343,9 @@ fn resolve_local_rules_source_g_id(
         ));
     }
     let g_id = match src.graph_selector.as_deref() {
-        Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0),
         Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-        None => Some(0u16),
+        None => Some(0),
     };
     match g_id {
         Some(id) => Ok(Some(id)),

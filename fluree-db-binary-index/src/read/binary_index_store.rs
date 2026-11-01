@@ -32,7 +32,7 @@ use crate::dict::pack_reader::ForwardPackReader;
 use crate::dict::term_dict::TermDictReader;
 use crate::dict::DictTreeReader;
 use crate::format::branch::{read_branch_from_bytes, BranchManifest};
-use crate::format::index_root::{IndexRoot, OTypeTableEntry};
+use crate::format::index_root::{BranchTree, IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
 
@@ -245,6 +245,40 @@ where
 // Per-graph V3 index data
 // ============================================================================
 
+/// What a single-graph scan reads: see [`BinaryIndexStore::graph_tree`].
+#[derive(Clone)]
+pub struct GraphTree {
+    pub branch: Arc<BranchManifest>,
+    /// The order of `branch` — pooled when `g_filter` is set.
+    pub order: RunSortOrder,
+    /// Keep only this graph's rows (pooled tree).
+    pub g_filter: Option<GraphId>,
+}
+
+/// The pooled tree shared by small named graphs.
+struct PoolIndex {
+    /// Membership by graph id.
+    member: Vec<bool>,
+    /// Pooled graph ids, sorted.
+    graphs: Vec<GraphId>,
+    /// Pooled graphs without a `graph_indexes` entry (one holding only
+    /// arenas), so the graph count needs no walk.
+    unindexed: usize,
+    orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
+    /// Branch cid behind each order; what a reload matches on to reuse it.
+    order_cids: HashMap<RunSortOrder, ContentId>,
+    /// Each secondary order's delta events since its base, every run merged
+    /// and sorted by the order's key, with the run cids they came from.
+    deltas: HashMap<RunSortOrder, (Vec<ContentId>, Arc<[crate::read::types::OverlayOp]>)>,
+}
+
+impl PoolIndex {
+    #[inline]
+    fn contains(&self, g_id: GraphId) -> bool {
+        self.member.get(g_id as usize).copied().unwrap_or(false)
+    }
+}
+
 struct GraphIndex {
     orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
     /// Branch cid behind each named-graph order (default-graph orders are
@@ -257,6 +291,19 @@ struct GraphIndex {
     /// on each property. `@fulltext`-datatype and configured-English content
     /// both resolve to the dict-assigned id for `"en"` and share a bucket.
     fulltext: HashMap<(u32, u16), Arc<crate::arena::fulltext::FulltextArena>>,
+}
+
+impl GraphIndex {
+    fn empty() -> Self {
+        Self {
+            orders: HashMap::new(),
+            order_cids: HashMap::new(),
+            numbig: HashMap::new(),
+            vectors: HashMap::new(),
+            spatial: HashMap::new(),
+            fulltext: HashMap::new(),
+        }
+    }
 }
 
 // ============================================================================
@@ -379,6 +426,7 @@ pub struct BinaryIndexStore {
     store_id: u64,
     dicts: DictionarySet,
     graph_indexes: HashMap<GraphId, GraphIndex>,
+    pool: Option<PoolIndex>,
     /// o_type table: full list (for iteration / serialization).
     o_type_table: Vec<OTypeTableEntry>,
     /// O(1) lookup: o_type value → index into o_type_table.
@@ -434,6 +482,22 @@ pub struct BinaryIndexStore {
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
+    /// The predicates with list rows, built on first use. See
+    /// [`Self::list_predicate_ids`].
+    list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
+    /// Per SPOT leaf, the subjects with list rows, sorted. See
+    /// [`Self::subject_holds_lists`].
+    leaf_list_subjects: RwLock<HashMap<ContentId, Arc<[u64]>>>,
+    /// Per graph, its list census. See [`Self::list_census`].
+    list_census: RwLock<HashMap<GraphId, Arc<HashMap<u32, ListCensus>>>>,
+}
+
+/// One predicate's compactly stored lists in a graph's index: the subjects
+/// holding members under it (one list each) and the members.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCensus {
+    pub lists: u64,
+    pub members: u64,
 }
 
 /// Lowercase the root's language tags, preserving position.
@@ -484,6 +548,7 @@ impl BinaryIndexStore {
                 dt_sids: Vec::new(),
             },
             graph_indexes: HashMap::new(),
+            pool: None,
             o_type_table: Vec::new(),
             o_type_index: HashMap::new(),
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
@@ -505,6 +570,9 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         }
     }
 
@@ -576,60 +644,148 @@ impl BinaryIndexStore {
             let branch = BranchManifest {
                 leaves: dgo.leaves.clone(),
             };
-            let gi = graph_indexes.entry(0).or_insert_with(|| GraphIndex {
-                orders: HashMap::new(),
-                order_cids: HashMap::new(),
-                numbig: HashMap::new(),
-                vectors: HashMap::new(),
-                spatial: HashMap::new(),
-                fulltext: HashMap::new(),
-            });
+            let gi = graph_indexes.entry(0).or_insert_with(GraphIndex::empty);
             gi.orders.insert(dgo.order, Arc::new(branch));
         }
 
-        // Named graphs: FBR3 branch manifests from CAS, or from the previous
-        // store when the cid is unchanged.
-        for ng in &root.named_graphs {
-            for (order, branch_cid) in &ng.orders {
-                let carried = prev
-                    .and_then(|p| p.graph_indexes.get(&ng.g_id))
-                    .filter(|gi| gi.order_cids.get(order) == Some(branch_cid))
-                    .and_then(|gi| gi.orders.get(order))
-                    .cloned();
-                let branch = match carried {
-                    Some(branch) => branch,
-                    None => {
-                        let branch_bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
-                        Arc::new(read_branch_from_bytes(&branch_bytes)?)
-                    }
-                };
-                let gi = graph_indexes.entry(ng.g_id).or_insert_with(|| GraphIndex {
-                    orders: HashMap::new(),
-                    order_cids: HashMap::new(),
-                    numbig: HashMap::new(),
-                    vectors: HashMap::new(),
-                    spatial: HashMap::new(),
-                    fulltext: HashMap::new(),
-                });
-                gi.orders.insert(*order, branch);
-                gi.order_cids.insert(*order, branch_cid.clone());
+        // Branch manifests — each named graph's own and the pooled tree's —
+        // from CAS, or from the previous store when the cid is unchanged.
+        let mut pool_orders: HashMap<RunSortOrder, Arc<BranchManifest>> = HashMap::new();
+        let mut pool_order_cids: HashMap<RunSortOrder, ContentId> = HashMap::new();
+        for (tree, order, branch_cid) in root.branches() {
+            let carried = match tree {
+                BranchTree::Graph(g_id) => prev
+                    .and_then(|p| p.graph_indexes.get(&g_id))
+                    .filter(|gi| gi.order_cids.get(&order) == Some(branch_cid))
+                    .and_then(|gi| gi.orders.get(&order)),
+                BranchTree::Pool => prev
+                    .and_then(|p| p.pool.as_ref())
+                    .filter(|pi| pi.order_cids.get(&order) == Some(branch_cid))
+                    .and_then(|pi| pi.orders.get(&order)),
+            }
+            .cloned();
+            let branch = match carried {
+                Some(branch) => branch,
+                None => {
+                    let branch_bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
+                    Arc::new(read_branch_from_bytes(&branch_bytes)?)
+                }
+            };
+            match tree {
+                BranchTree::Graph(g_id) => {
+                    let gi = graph_indexes.entry(g_id).or_insert_with(GraphIndex::empty);
+                    gi.orders.insert(order, branch);
+                    gi.order_cids.insert(order, branch_cid.clone());
+                }
+                BranchTree::Pool => {
+                    pool_orders.insert(order, branch);
+                    pool_order_cids.insert(order, branch_cid.clone());
+                }
             }
         }
 
+        let mut pool_deltas = HashMap::new();
+        let deltas_started = std::time::Instant::now();
+        // Orders whose runs need fetching: (order, run cids, runs already
+        // decoded, their events).
+        let mut pending: Vec<(
+            RunSortOrder,
+            Vec<ContentId>,
+            usize,
+            Vec<crate::read::types::OverlayOp>,
+        )> = Vec::new();
+        for (order, runs) in root.pool.iter().flat_map(|p| &p.deltas) {
+            if runs.is_empty() {
+                continue;
+            }
+            let cids: Vec<ContentId> = runs.iter().map(|r| r.cid.clone()).collect();
+            // A build appends runs, so the previous store's merged events
+            // usually cover a prefix of them.
+            let carried = prev
+                .and_then(|p| p.pool.as_ref())
+                .and_then(|pi| pi.deltas.get(order))
+                .filter(|(prev_cids, _)| cids.starts_with(prev_cids));
+            match carried {
+                Some((prev_cids, events)) if prev_cids.len() == cids.len() => {
+                    pool_deltas.insert(*order, (cids, Arc::clone(events)));
+                }
+                Some((prev_cids, events)) => {
+                    pending.push((*order, cids, prev_cids.len(), events.to_vec()));
+                }
+                None => pending.push((*order, cids, 0, Vec::new())),
+            }
+        }
+        // Every order's missing runs at once.
+        let fetches: Vec<(usize, ContentId)> = pending
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (_, cids, done, _))| cids[*done..].iter().map(move |c| (i, c.clone())))
+            .collect();
+        let runs_fetched = fetches.len();
+        let fetched: Vec<(usize, Vec<crate::read::types::OverlayOp>)> = {
+            use futures::stream::{StreamExt, TryStreamExt};
+            let cs = &cs;
+            futures::stream::iter(fetches)
+                .map(|(i, cid)| async move {
+                    let bytes = cs.get(&cid).await.map_err(storage_io_error)?;
+                    Ok::<_, io::Error>((i, crate::format::pool_delta::decode_delta_run(&bytes)?.1))
+                })
+                .buffered(crate::format::pool_delta::RUN_FETCH_WIDTH)
+                .try_collect()
+                .await?
+        };
+        for (i, events) in fetched {
+            pending[i].3.extend(events);
+        }
+        for (order, cids, _, mut events) in pending {
+            crate::read::types::sort_overlay_ops_stable(&mut events, order);
+            pool_deltas.insert(order, (cids, Arc::from(events)));
+        }
+        if !pool_deltas.is_empty() {
+            tracing::debug!(
+                orders = pool_deltas.len(),
+                runs = pool_deltas
+                    .values()
+                    .map(|(cids, _)| cids.len())
+                    .sum::<usize>(),
+                runs_fetched,
+                events = pool_deltas.values().map(|(_, e)| e.len()).sum::<usize>(),
+                elapsed_ms = deltas_started.elapsed().as_millis() as u64,
+                "pool deltas loaded"
+            );
+        }
+
+        let mut pool = root.pool.as_ref().map(|routing| {
+            let graphs: Vec<GraphId> = routing.graph_ids().collect();
+            let mut member = vec![false; graphs.last().map_or(0, |&g| g as usize + 1)];
+            for &g in &graphs {
+                member[g as usize] = true;
+            }
+            PoolIndex {
+                member,
+                graphs,
+                unindexed: 0,
+                orders: pool_orders,
+                order_cids: pool_order_cids,
+                deltas: pool_deltas,
+            }
+        });
+
         // Inject per-graph arenas into graph indexes.
         for (g_id, arenas) in per_graph_arenas.drain() {
-            let gi = graph_indexes.entry(g_id).or_insert_with(|| GraphIndex {
-                orders: HashMap::new(),
-                order_cids: HashMap::new(),
-                numbig: HashMap::new(),
-                vectors: HashMap::new(),
-                spatial: HashMap::new(),
-                fulltext: HashMap::new(),
-            });
+            let gi = graph_indexes.entry(g_id).or_insert_with(GraphIndex::empty);
             gi.numbig = arenas.numbig;
             gi.vectors = arenas.vectors;
             gi.spatial = arenas.spatial;
             gi.fulltext = arenas.fulltext;
+        }
+
+        if let Some(pool) = pool.as_mut() {
+            pool.unindexed = pool
+                .graphs
+                .iter()
+                .filter(|g| !graph_indexes.contains_key(g))
+                .count();
         }
 
         let leaf_count: usize = graph_indexes
@@ -658,6 +814,7 @@ impl BinaryIndexStore {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts,
             graph_indexes,
+            pool,
             o_type_table,
             o_type_index,
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
@@ -679,6 +836,9 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         })
     }
 
@@ -724,8 +884,74 @@ impl BinaryIndexStore {
         self.decimal_encoding
     }
 
-    /// Get the branch manifest for a graph + sort order.
-    pub fn branch_for_order(
+    /// Whether `g_id` lives in the pooled tree. A pooled graph has no tree of
+    /// its own: [`Self::dedicated_branch`] returns `None` for it, and readers
+    /// scan [`Self::pool_branch`] filtered to the graph instead.
+    #[inline]
+    pub fn is_pooled(&self, g_id: GraphId) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.contains(g_id))
+    }
+
+    /// Graphs held by the pooled tree, sorted.
+    pub fn pooled_graph_ids(&self) -> &[GraphId] {
+        self.pool.as_ref().map_or(&[], |p| p.graphs.as_slice())
+    }
+
+    /// The pooled tree's branch for a pooled order.
+    pub fn pool_branch(&self, order: RunSortOrder) -> Option<&Arc<BranchManifest>> {
+        self.pool.as_ref().and_then(|p| p.orders.get(&order))
+    }
+
+    /// The events a pooled secondary order holds beyond its branch, sorted by
+    /// its key, which every cursor over that branch merges in (see
+    /// [`crate::format::pool_delta`]).
+    pub fn pool_delta(&self, order: RunSortOrder) -> Option<&Arc<[crate::read::types::OverlayOp]>> {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.deltas.get(&order))
+            .map(|(_, events)| events)
+    }
+
+    /// The tree a scan of one graph in `order` reads: the graph's own branch,
+    /// or — for a pooled graph — the pooled tree in the corresponding pooled
+    /// order, with the graph to filter rows on.
+    ///
+    /// A pooled scan reads GSPO for SPOT and PSOT (one graph's rows are
+    /// contiguous there, and with the graph fixed they come back in SPOT
+    /// order, which for a fixed predicate is PSOT's), and POST/OPST with the
+    /// graph last (value lookups are selective across graphs). In every case
+    /// the rows of the one graph arrive in `order`'s sequence.
+    pub fn graph_tree(&self, g_id: GraphId, order: RunSortOrder) -> Option<GraphTree> {
+        if self.is_pooled(g_id) {
+            let pooled = Self::pooled_order_for(order);
+            return self.pool_branch(pooled).map(|branch| GraphTree {
+                branch: Arc::clone(branch),
+                order: pooled,
+                g_filter: Some(g_id),
+            });
+        }
+        self.dedicated_branch(g_id, order).map(|branch| GraphTree {
+            branch: Arc::clone(branch),
+            order,
+            g_filter: None,
+        })
+    }
+
+    /// The pooled order a single-graph scan in `order` reads (see
+    /// [`Self::graph_tree`]).
+    #[inline]
+    pub fn pooled_order_for(order: RunSortOrder) -> RunSortOrder {
+        match order.base() {
+            RunSortOrder::Spot | RunSortOrder::Psot => RunSortOrder::Gspo,
+            base => base.pooled(),
+        }
+    }
+
+    /// The branch manifest of a graph's own tree for `order` (the default
+    /// graph's included). `None` for a pooled graph: a reader that can scan
+    /// one reads [`Self::graph_tree`] instead, and paths that read a
+    /// graph's leaf metadata whole (the fast paths) decline it.
+    pub fn dedicated_branch(
         &self,
         g_id: GraphId,
         order: RunSortOrder,
@@ -784,7 +1010,7 @@ impl BinaryIndexStore {
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
-        let Some(branch) = self.branch_for_order(g_id, order) else {
+        let Some(branch) = self.dedicated_branch(g_id, order) else {
             return;
         };
 
@@ -1094,7 +1320,21 @@ impl BinaryIndexStore {
         if self.residency_mode() {
             return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
         }
-        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay)
+        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay, self.remote_leaf_fetch)
+    }
+
+    /// [`Self::open_leaf_handle`] for reading a few leaflets' columns: a
+    /// remote leaf is range-read whatever [`RemoteLeafFetch`] the store uses,
+    /// so a walk that reads one leaflet in many leaves fetches no whole leaf.
+    pub fn open_leaf_handle_ranged(
+        &self,
+        leaf_cid: &ContentId,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self.open_resident_leaf_handle(leaf_cid, None, false);
+        }
+        self.open_leaf_handle_native(leaf_cid, None, false, RemoteLeafFetch::Ranged)
     }
 
     /// Residency-mode leaf open: whole leaf (and sidecar when replaying)
@@ -1127,6 +1367,7 @@ impl BinaryIndexStore {
         leaf_cid: &ContentId,
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
+        remote_fetch: RemoteLeafFetch,
     ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
         use super::leaf_access::{fetch_header_and_directory, RangeReadLeafHandle};
         let cs = self
@@ -1152,7 +1393,7 @@ impl BinaryIndexStore {
 
         // The whole-leaf policy, and a store whose range reads fetch the whole
         // object anyway, fetch a leaf whole on its first open.
-        if self.remote_leaf_fetch == RemoteLeafFetch::Whole || !cs.supports_ranged_reads() {
+        if remote_fetch == RemoteLeafFetch::Whole || !cs.supports_ranged_reads() {
             tracing::debug!(leaf = %leaf_cid, need_replay, source = "remote_whole", "binary leaf open");
             let bytes = self.fetch_whole_leaf(leaf_cid, leaf_id)?;
             return self.leaf_handle_from_bytes(bytes, leaf_id, sidecar_cid, need_replay);
@@ -1527,16 +1768,22 @@ impl BinaryIndexStore {
                 Ok(FlakeValue::Ref(Sid::new(0, &bnode_iri)))
             }
             DecodeKind::IriRef => {
-                let iri = self.resolve_subject_iri(o_key).map_err(|e| {
-                    tracing::debug!(
-                        g_id,
-                        o_key,
-                        error = %e,
-                        "binary index failed to resolve IRI ref subject"
-                    );
-                    e
-                })?;
-                Ok(FlakeValue::Ref(self.encode_iri(&iri)))
+                // Decoded as a subject is: re-encoding the IRI through the
+                // namespace table would give an OVERFLOW subject the EMPTY
+                // code, a Sid no stored fact has.
+                let sid = self
+                    .resolve_subject_parts(o_key)
+                    .and_then(|(ns_code, suffix)| self.subject_sid_of_parts(ns_code, suffix))
+                    .map_err(|e| {
+                        tracing::debug!(
+                            g_id,
+                            o_key,
+                            error = %e,
+                            "binary index failed to resolve IRI ref subject"
+                        );
+                        e
+                    })?;
+                Ok(FlakeValue::Ref(sid))
             }
             DecodeKind::StringDict => {
                 let s = self.resolve_string_value(o_key as u32).map_err(|e| {
@@ -1639,6 +1886,16 @@ impl BinaryIndexStore {
         arena.lookup_vector(handle)
     }
 
+    /// The length of `(g_id, p_id)`'s vectors, from the arena manifest (no
+    /// shard is loaded). `None` when the predicate has no vectors in `g_id`.
+    pub fn vector_dims(&self, g_id: GraphId, p_id: u32) -> Option<u16> {
+        self.graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+            .map(crate::arena::vector::LazyVectorArena::dims)
+            .filter(|&dims| dims != 0)
+    }
+
     /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
     ///
     /// See [`crate::arena::vector::LazyVectorArena::snapshot`] — scan loops
@@ -1716,9 +1973,8 @@ impl BinaryIndexStore {
         use crate::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
         use fluree_db_core::o_type::OType;
 
-        let branch = match self.branch_for_order(g_id, RunSortOrder::Spot) {
-            Some(b) => Arc::clone(b),
-            None => return Ok(None),
+        let Some(tree) = self.graph_tree(g_id, RunSortOrder::Spot) else {
+            return Ok(None);
         };
         let arena = self
             .graph_indexes
@@ -1730,13 +1986,27 @@ impl BinaryIndexStore {
             p_id: Some(p_id),
             o_type: Some(OType::VECTOR.as_u16()),
             o_i: Some(o_i),
+            g_id: tree.g_filter,
             ..Default::default()
         };
-        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
-        let mut cursor = BinaryCursor::scan_all(
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, tree.order);
+        // The fact's (graph, subject, predicate) run; the graph bounds only
+        // the pooled tree's keys.
+        let bound = |low: bool| crate::format::run_record_v2::RunRecordV2 {
+            s_id: fluree_db_core::subject_id::SubjectId(s_id),
+            o_key: if low { 0 } else { u64::MAX },
+            p_id,
+            t: if low { 0 } else { u32::MAX },
+            o_i: if low { 0 } else { u32::MAX },
+            o_type: if low { 0 } else { u16::MAX },
+            g_id,
+        };
+        let mut cursor = BinaryCursor::new(
             Arc::clone(self),
-            RunSortOrder::Spot,
-            branch,
+            tree.order,
+            tree.branch,
+            &bound(true),
+            &bound(false),
             filter,
             projection,
         );
@@ -2328,15 +2598,21 @@ impl BinaryIndexStore {
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
     }
 
-    /// The `Sid` of a persisted subject stored as `(ns_code, suffix)`: what
+    /// The `Sid` of a persisted subject stored as `(ns_code, suffix)`.
+    ///
+    /// An OVERFLOW subject's parts are its `Sid`: a lookup by its IRI tries
+    /// EMPTY first, and could name another subject holding the same IRI there
+    /// (#2138) instead of the one stored here. Any other subject takes what
     /// [`Self::find_subject_sid`] gives for its IRI, else [`Self::encode_iri`].
     ///
     /// When the canonical split of the IRI is exactly the parts the subject is
     /// stored under, they are the answer: the reverse dictionary holds that
-    /// key, so the lookup `find_subject_sid` would make returns them. A
-    /// full-IRI namespace, or a split the current rules do not produce, takes
-    /// the lookup.
+    /// key, so the lookup `find_subject_sid` would make returns them. An EMPTY
+    /// subject, or a split the current rules do not produce, takes the lookup.
     pub fn subject_sid_of_parts(&self, ns_code: u16, suffix: String) -> io::Result<Sid> {
+        if ns_code == namespaces::OVERFLOW {
+            return Ok(Sid::new(ns_code, suffix));
+        }
         if namespaces::is_full_iri(ns_code) {
             return Ok(self
                 .find_subject_sid(&suffix)?
@@ -2568,6 +2844,237 @@ impl BinaryIndexStore {
                 lang,
             },
         )))
+    }
+
+    /// The predicates with list rows (`o_i`, an RDF-list position) in any
+    /// graph, read once per store from the leaflet directories of each
+    /// graph's POST tree and of the pooled GSPO, which every build merges, so
+    /// it holds the pooled graphs' rows without the secondary orders' delta
+    /// runs. The index is immutable, so the set holds for the store's
+    /// lifetime. Only directories are read, except that a list-bearing
+    /// leaflet spanning several predicates has its predicate and position
+    /// columns range-read; no whole leaf is fetched. Concurrent first callers
+    /// may each walk the branches.
+    pub fn list_predicate_ids(&self) -> io::Result<Arc<std::collections::HashSet<u32>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(ids) = self.list_predicate_ids.get() {
+            return Ok(Arc::clone(ids));
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut columns = ColumnSet::EMPTY;
+        columns.insert(ColumnId::PId);
+        columns.insert(ColumnId::OI);
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        let trees = self
+            .graph_ids()
+            .into_iter()
+            .filter_map(|g_id| self.dedicated_branch(g_id, RunSortOrder::Post))
+            .map(|branch| (branch, RunSortOrder::Post))
+            .chain(
+                self.pool_branch(RunSortOrder::Gspo)
+                    .map(|branch| (branch, RunSortOrder::Gspo)),
+            );
+        for (branch, order) in trees {
+            for leaf in &branch.leaves {
+                let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                let mut handle = None;
+                for (idx, entry) in dir.entries.iter().enumerate() {
+                    if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
+                        continue;
+                    }
+                    if let Some(p_id) = entry.p_const {
+                        ids.insert(p_id);
+                        continue;
+                    }
+                    let handle = match &mut handle {
+                        Some(handle) => handle,
+                        None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                    };
+                    let batch = handle.load_columns(idx, &projection, order)?;
+                    for row in 0..batch.row_count {
+                        if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                            ids.insert(batch.p_id.get_or(row, 0));
+                        }
+                    }
+                }
+            }
+        }
+        let ids = Arc::new(ids);
+        let _ = self.list_predicate_ids.set(Arc::clone(&ids));
+        Ok(ids)
+    }
+
+    /// Graph `g_id`'s compactly stored lists, per predicate holding them, as
+    /// of the index: read once per graph for the store's life from the PSOT
+    /// leaflets of [`Self::list_predicate_ids`] flagged as holding list rows.
+    /// PSOT sorts a predicate's rows by subject, so each run of a subject's
+    /// members is one list. A pooled graph has no PSOT of its own and reads
+    /// as having none; the fast paths that use a census decline pooled graphs.
+    pub fn list_census(&self, g_id: GraphId) -> io::Result<Arc<HashMap<u32, ListCensus>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(census) = self.list_census.read().get(&g_id) {
+            return Ok(Arc::clone(census));
+        }
+        let mut census: HashMap<u32, ListCensus> = HashMap::new();
+        if let Some(branch) = self.dedicated_branch(g_id, RunSortOrder::Psot) {
+            let mut columns = ColumnSet::EMPTY;
+            for column in [ColumnId::SId, ColumnId::PId, ColumnId::OI] {
+                columns.insert(column);
+            }
+            let projection = ColumnProjection {
+                output: columns,
+                internal: ColumnSet::EMPTY,
+            };
+            for &p_id in self.list_predicate_ids()?.iter() {
+                let mut found = ListCensus::default();
+                let mut last_owner = None;
+                let leaves = branch
+                    .leaves
+                    .iter()
+                    .filter(|leaf| leaf.first_key.p_id <= p_id && p_id <= leaf.last_key.p_id);
+                for leaf in leaves {
+                    let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                    let mut handle = None;
+                    for (idx, entry) in dir.entries.iter().enumerate() {
+                        if entry.row_count == 0
+                            || entry.flags & HAS_O_I == 0
+                            || entry.p_const.is_some_and(|p| p != p_id)
+                        {
+                            continue;
+                        }
+                        let handle = match &mut handle {
+                            Some(handle) => handle,
+                            None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                        };
+                        let batch = handle.load_columns(idx, &projection, RunSortOrder::Psot)?;
+                        for row in 0..batch.row_count {
+                            if batch.p_id.get_or(row, p_id) != p_id
+                                || batch.o_i.get_or(row, LIST_INDEX_NONE) == LIST_INDEX_NONE
+                            {
+                                continue;
+                            }
+                            found.members += 1;
+                            let owner = batch.s_id.get(row);
+                            if last_owner != Some(owner) {
+                                found.lists += 1;
+                                last_owner = Some(owner);
+                            }
+                        }
+                    }
+                }
+                if found.members > 0 {
+                    census.insert(p_id, found);
+                }
+            }
+        }
+        let census = Arc::new(census);
+        self.list_census.write().insert(g_id, Arc::clone(&census));
+        Ok(census)
+    }
+
+    /// Whether subject `s_id` has list rows in graph `g_id`'s index. Reads
+    /// the directories of the SPOT leaves (GSPO for a pooled graph) holding
+    /// its rows and, once per leaf for the store's life, the subject and
+    /// position columns of a leaflet flagged as holding list rows. A pooled
+    /// leaf's subjects span its graphs, so for a pooled graph a `true` can
+    /// come from another graph's list; a `false` is exact.
+    pub fn subject_holds_lists(&self, g_id: GraphId, s_id: u64) -> io::Result<bool> {
+        use crate::format::run_record_v2::{cmp_v2_g_spot, RunRecordV2};
+
+        let (branch, leaves, order) = if self.is_pooled(g_id) {
+            let Some(branch) = self.pool_branch(RunSortOrder::Gspo) else {
+                return Ok(false);
+            };
+            let key = |low: bool| RunRecordV2 {
+                s_id: fluree_db_core::subject_id::SubjectId(s_id),
+                o_key: if low { 0 } else { u64::MAX },
+                p_id: if low { 0 } else { u32::MAX },
+                t: if low { 0 } else { u32::MAX },
+                o_i: if low { 0 } else { u32::MAX },
+                o_type: if low { 0 } else { u16::MAX },
+                g_id,
+            };
+            let leaves = branch.find_leaves_in_range(&key(true), &key(false), cmp_v2_g_spot);
+            (branch, leaves, RunSortOrder::Gspo)
+        } else {
+            let Some(branch) = self.dedicated_branch(g_id, RunSortOrder::Spot) else {
+                return Ok(false);
+            };
+            (
+                branch,
+                branch.find_leaves_for_subject(s_id),
+                RunSortOrder::Spot,
+            )
+        };
+        for leaf in &branch.leaves[leaves] {
+            if self
+                .leaf_list_subjects(leaf, order)?
+                .binary_search(&s_id)
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The subjects with list rows in leaf `leaf` of an `order` tree, sorted.
+    fn leaf_list_subjects(
+        &self,
+        leaf: &crate::format::branch::LeafEntry,
+        order: RunSortOrder,
+    ) -> io::Result<Arc<[u64]>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(subjects) = self.leaf_list_subjects.read().get(&leaf.leaf_cid) {
+            return Ok(Arc::clone(subjects));
+        }
+        let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+        let mut columns = ColumnSet::EMPTY;
+        columns.insert(ColumnId::SId);
+        columns.insert(ColumnId::OI);
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        let mut subjects = Vec::new();
+        let mut handle = None;
+        for (idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
+                continue;
+            }
+            let handle = match &mut handle {
+                Some(handle) => handle,
+                None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+            };
+            let batch = handle.load_columns(idx, &projection, order)?;
+            for row in 0..batch.row_count {
+                if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                    subjects.push(batch.s_id.get(row));
+                }
+            }
+        }
+        subjects.sort_unstable();
+        subjects.dedup();
+        let subjects: Arc<[u64]> = subjects.into();
+        self.leaf_list_subjects
+            .write()
+            .insert(leaf.leaf_cid.clone(), Arc::clone(&subjects));
+        Ok(subjects)
     }
 
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
@@ -2836,9 +3343,20 @@ impl BinaryIndexStore {
             })
     }
 
+    /// Number of graphs in the index: `graph_ids().len()` without the walk.
+    pub fn graph_count(&self) -> usize {
+        self.graph_indexes.len() + self.pool.as_ref().map_or(0, |p| p.unindexed)
+    }
+
     /// Returns all graph IDs present in the index.
     pub fn graph_ids(&self) -> Vec<GraphId> {
-        self.graph_indexes.keys().copied().collect()
+        let mut ids: Vec<GraphId> = self.graph_indexes.keys().copied().collect();
+        ids.extend(
+            self.pooled_graph_ids()
+                .iter()
+                .filter(|g| !self.graph_indexes.contains_key(g)),
+        );
+        ids
     }
 
     /// Lookup graph IRI → `GraphId`. Returns `None` if the IRI is not known.
@@ -4936,6 +5454,140 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
+    /// List predicates come from POST leaflet directories alone: no whole
+    /// leaf is fetched, even under the `Whole` policy.
+    #[test]
+    fn list_predicates_are_read_without_fetching_a_whole_leaf() {
+        let member = |s: u64, p: u32, o: u64, i: u32| RunRecordV2 {
+            o_i: i,
+            ..make_rec(s, p, OType::XSD_INTEGER.as_u16(), o, 1)
+        };
+        // One leaf holding a plain predicate and a list predicate, one
+        // leaflet each, and one holding a list predicate alone.
+        let spanning = [
+            make_rec(1, 5, OType::XSD_INTEGER.as_u16(), 10, 1),
+            make_rec(2, 5, OType::XSD_INTEGER.as_u16(), 20, 1),
+            member(3, 6, 30, 0),
+            member(3, 6, 40, 1),
+        ];
+        let single = [member(4, 7, 50, 0), member(4, 7, 60, 1)];
+        let store = CountingContentStore::new();
+        let mut leaves = Vec::new();
+        for records in [&spanning[..], &single[..]] {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            for rec in records {
+                writer.push_record(*rec).unwrap();
+            }
+            let info = writer.finish().unwrap().remove(0);
+            let leaf_cid = run_sync_on_runtime({
+                let store = store.clone();
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("store leaf bytes");
+            leaves.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid,
+                sidecar_cid: None,
+            });
+        }
+        let mut binary_store = empty_store(Arc::new(store.clone()));
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        binary_store.graph_indexes.insert(
+            0,
+            GraphIndex {
+                orders: HashMap::from([(
+                    RunSortOrder::Post,
+                    Arc::new(crate::format::branch::BranchManifest { leaves }),
+                )]),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            },
+        );
+
+        let ids = binary_store.list_predicate_ids().expect("list predicates");
+        assert_eq!(*ids, std::collections::HashSet::from([6, 7]));
+        assert_eq!(store.get_calls(), 0, "no whole-leaf GET");
+    }
+
+    /// A subject's list rows are found exactly: a neighbor sharing the
+    /// list-bearing leaflet holds none, and no whole leaf is fetched.
+    #[test]
+    fn a_subjects_list_rows_are_found_exactly() {
+        let member = |s: u64, o: u64, i: u32| RunRecordV2 {
+            o_i: i,
+            ..make_rec(s, 7, OType::XSD_INTEGER.as_u16(), o, 1)
+        };
+        // Subjects 1 and 3 hold plain rows; subject 2 owns a list. One leaflet.
+        let records = [
+            make_rec(1, 5, OType::XSD_INTEGER.as_u16(), 10, 1),
+            member(2, 30, 0),
+            member(2, 40, 1),
+            make_rec(3, 5, OType::XSD_INTEGER.as_u16(), 20, 1),
+        ];
+        let store = CountingContentStore::new();
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 1000, 1);
+        writer.set_skip_history(true);
+        for rec in records {
+            writer.push_record(rec).unwrap();
+        }
+        let info = writer.finish().unwrap().remove(0);
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let bytes = info.leaf_bytes.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let mut binary_store = empty_store(Arc::new(store.clone()));
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        let leaf = crate::format::branch::LeafEntry {
+            first_key: info.first_key,
+            last_key: info.last_key,
+            row_count: info.total_rows,
+            leaf_cid,
+            sidecar_cid: None,
+        };
+        binary_store.graph_indexes.insert(
+            0,
+            GraphIndex {
+                orders: HashMap::from([(
+                    RunSortOrder::Spot,
+                    Arc::new(crate::format::branch::BranchManifest { leaves: vec![leaf] }),
+                )]),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            },
+        );
+
+        let holds = |s_id| binary_store.subject_holds_lists(0, s_id).unwrap();
+        assert_eq!(
+            (holds(1), holds(2), holds(3), holds(9)),
+            (false, true, false, false)
+        );
+        assert_eq!(store.get_calls(), 0, "no whole-leaf GET");
+    }
+
     #[test]
     fn whole_policy_coalesces_concurrent_cold_opens() {
         let store = CountingContentStore::with_get_delay(Duration::from_millis(200));
@@ -5496,11 +6148,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A subject stored under its IRI's canonical split resolves to its
-    /// stored parts without the reverse lookup; every other subject takes
-    /// it, and each resolves to what that lookup gives.
+    /// A subject stored under its IRI's canonical split, or under OVERFLOW,
+    /// resolves to its stored parts without the reverse lookup; every other
+    /// subject takes it, and each resolves to what that lookup gives.
     #[test]
-    fn subject_sids_skip_the_reverse_lookup_only_for_canonical_splits() {
+    fn subject_sids_skip_the_reverse_lookup_only_for_canonical_splits_and_overflow() {
         use crate::dict::reverse_leaf::{subject_reverse_key, ReverseEntry};
 
         const EX: u16 = 100;
@@ -5567,12 +6219,74 @@ pub(crate) mod tests {
                 "{suffix}"
             );
             let lookups = tree.cache_hits() - lookups;
-            if ns_code == EX {
-                assert_eq!(expected, Sid::new(EX, "alice"));
-                assert_eq!(lookups, 0, "a canonical subject needs no reverse lookup");
+            if ns_code == EX || ns_code == namespaces::OVERFLOW {
+                assert_eq!(expected, Sid::new(ns_code, suffix));
+                assert_eq!(lookups, 0, "{suffix} needs no reverse lookup");
             } else {
                 assert!(lookups > 0, "{suffix} takes the reverse lookup");
             }
+        }
+    }
+
+    /// An OVERFLOW subject decodes to its stored `Sid`, in subject and object
+    /// position, even when another subject holds the same IRI where a lookup
+    /// by IRI finds it first: under EMPTY, as #2138 left, or under a coded
+    /// prefix. A retraction carrying the twin's `Sid` would name the twin and
+    /// leave the stored fact in place.
+    #[test]
+    fn overflow_subject_decodes_to_its_own_sid_beside_a_twin() {
+        use crate::dict::reverse_leaf::subject_reverse_key;
+
+        const IRI: &str = "http://vendors.example/v/1";
+        const VENDORS: u16 = 100;
+        const VENDORS_PREFIX: &str = "http://vendors.example/v/";
+        for (twin_ns, twin_suffix) in [(namespaces::EMPTY, IRI), (VENDORS, "1")] {
+            let mut store = empty_store(Arc::new(MemoryContentStore::new()));
+            store.set_ns_split_mode(NsSplitMode::MostGranular);
+            if twin_ns == VENDORS {
+                store.dicts.namespace_codes =
+                    Arc::new(HashMap::from([(VENDORS, VENDORS_PREFIX.to_string())]));
+                store.dicts.namespace_reverse =
+                    Arc::new(HashMap::from([(VENDORS_PREFIX.to_string(), VENDORS)]));
+            }
+            let mut reverse = Vec::new();
+            for (ns_code, suffix) in [(twin_ns, twin_suffix), (namespaces::OVERFLOW, IRI)] {
+                store.dicts.subject_forward_packs.insert(
+                    ns_code,
+                    ForwardPackReader::from_memory(vec![Arc::from(
+                        make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
+                    )])
+                    .unwrap(),
+                );
+                reverse.push(ReverseEntry {
+                    key: subject_reverse_key(ns_code, suffix.as_bytes()),
+                    id: SubjectId::new(ns_code, 1).as_u64(),
+                });
+            }
+            reverse.sort_by(|a, b| a.key.cmp(&b.key));
+            store.dicts.subject_reverse_tree = Some(Arc::new(build_reverse_reader(reverse)));
+            let store = Arc::new(store);
+            assert_eq!(
+                store.find_subject_sid(IRI).unwrap(),
+                Some(Sid::new(twin_ns, twin_suffix)),
+                "a lookup by IRI finds the twin"
+            );
+
+            let s_id = SubjectId::new(namespaces::OVERFLOW, 1).as_u64();
+            let stored = Sid::new(namespaces::OVERFLOW, IRI);
+            let view = BinaryGraphView::new(Arc::clone(&store), 0);
+            assert_eq!(
+                view.resolve_subject_sid(s_id).unwrap(),
+                stored,
+                "twin under {twin_ns}"
+            );
+            assert_eq!(
+                store
+                    .decode_value_v3(OType::IRI_REF.as_u16(), s_id, 0, 0)
+                    .unwrap(),
+                FlakeValue::Ref(stored),
+                "twin under {twin_ns}"
+            );
         }
     }
 

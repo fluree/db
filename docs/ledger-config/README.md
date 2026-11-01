@@ -42,6 +42,7 @@ Configuration is organized into independent **setting groups**, each governing a
 | [`f:transactDefaults`](setting-groups.md#transact-defaults) | Transaction constraints | `f:uniqueEnabled`, `f:constraintsSource` |
 | [`f:fullTextDefaults`](setting-groups.md#full-text-defaults) | Full-text indexing | `f:property`, `f:defaultLanguage` |
 | [`f:retentionDefaults`](setting-groups.md#retention-defaults) | Value lifetimes (TTL) and history retention | `f:property` entries with `f:target`, `f:ttl`, `f:noHistory` |
+| [`f:indexingDefaults`](setting-groups.md#indexing-defaults) | Named-graph index layout | `f:graphPlacement` |
 | [`f:queryDefaults`](setting-groups.md#fquerydefaults--query-defaults) | Query defaults (ledger-scoped) | `f:unionDefaultGraph` |
 | [`f:servingDefaults`](setting-groups.md#fservingdefaults--serving-posture) | Serving posture (ledger-scoped) | `f:serveQuery`, `f:serveBlocks`, `f:publicVisibility` |
 

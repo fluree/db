@@ -5,7 +5,9 @@
 //! Tracks replaced CIDs for garbage collection.
 
 use fluree_db_binary_index::format::branch::LeafEntry;
-use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, IndexRoot, NamedGraphRouting};
+use fluree_db_binary_index::format::index_root::{
+    DefaultGraphOrder, IndexRoot, NamedGraphRouting, PoolMember, PoolRouting,
+};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
 use fluree_db_binary_index::{DictRefs, GraphArenaRefs};
@@ -51,6 +53,87 @@ impl IncrementalRootBuilder {
         self.root.index_t = t;
     }
 
+    /// Take `g_id` out of the pooled tree's graphs: it now has a dedicated
+    /// tree, and this build's pool update purges its rows and history.
+    pub fn remove_from_pool(&mut self, g_id: fluree_db_core::GraphId) {
+        if let Some(pool) = self.root.pool.as_mut() {
+            pool.members.retain(|m| m.g_id != g_id);
+        }
+    }
+
+    /// Replace the pooled tree's branch for one pooled order, creating the
+    /// pool if the root has none.
+    ///
+    /// **GC note**: Records the old branch CID as replaced, like
+    /// [`Self::set_named_graph_branch`].
+    pub fn set_pool_branch(&mut self, order: RunSortOrder, branch_cid: ContentId) {
+        let pool = self.root.pool.get_or_insert_with(|| PoolRouting {
+            members: Vec::new(),
+            orders: Vec::new(),
+            deltas: Vec::new(),
+        });
+        if let Some(entry) = pool.orders.iter_mut().find(|(o, _)| *o == order) {
+            self.replaced_cids.push(entry.1.clone());
+            entry.1 = branch_cid;
+        } else {
+            pool.orders.push((order, branch_cid));
+        }
+    }
+
+    /// Append a delta run to a pooled secondary order.
+    pub fn append_pool_delta_run(
+        &mut self,
+        order: RunSortOrder,
+        run: fluree_db_binary_index::PoolDeltaRun,
+    ) {
+        let Some(pool) = self.root.pool.as_mut() else {
+            return;
+        };
+        match pool.deltas.iter_mut().find(|(o, _)| *o == order) {
+            Some((_, runs)) => runs.push(run),
+            None => pool.deltas.push((order, vec![run])),
+        }
+    }
+
+    /// Drop a pooled secondary order's delta runs: this build folds them into
+    /// its base.
+    ///
+    /// **GC note**: Records the runs as replaced.
+    pub fn clear_pool_delta(&mut self, order: RunSortOrder) {
+        if let Some(pool) = self.root.pool.as_mut() {
+            if let Some(at) = pool.deltas.iter().position(|(o, _)| *o == order) {
+                let (_, runs) = pool.deltas.remove(at);
+                self.replaced_cids.extend(runs.into_iter().map(|r| r.cid));
+            }
+        }
+    }
+
+    /// Admit `joined` to the pool and apply this build's per-graph changes
+    /// in rows and history to its members' sizes.
+    pub fn update_pool_members(
+        &mut self,
+        joined: &[fluree_db_core::GraphId],
+        deltas: &crate::run_index::build::incremental_leaf::GraphDeltas,
+    ) {
+        let Some(pool) = self.root.pool.as_mut() else {
+            return;
+        };
+        for &g_id in joined {
+            if let Err(at) = pool.members.binary_search_by_key(&g_id, |m| m.g_id) {
+                pool.members.insert(at, PoolMember::new(g_id));
+            }
+        }
+        let apply =
+            |size: u32, delta: i64| (i64::from(size) + delta).clamp(0, i64::from(u32::MAX)) as u32;
+        for (&g_id, delta) in deltas {
+            if let Ok(at) = pool.members.binary_search_by_key(&g_id, |m| m.g_id) {
+                let m = &mut pool.members[at];
+                m.rows = apply(m.rows, delta.rows);
+                m.history = apply(m.history, delta.history);
+            }
+        }
+    }
+
     /// Replace the default graph's leaf entries for one sort order.
     ///
     /// If an existing entry for `order` exists, it is replaced; otherwise appended.
@@ -79,7 +162,7 @@ impl IncrementalRootBuilder {
     /// also pass leaf-level replaced CIDs via `add_replaced_cids()`.
     pub fn set_named_graph_branch(
         &mut self,
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         order: RunSortOrder,
         branch_cid: ContentId,
     ) {
@@ -338,6 +421,7 @@ mod tests {
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            pool: None,
         }
     }
 

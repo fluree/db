@@ -67,7 +67,7 @@ impl Fluree {
         let mut erased = BTreeSet::new();
         let mut rebuild = BTreeSet::new();
         let mut jobs = Vec::new();
-        for record in self.nameservice().list_branches(name.name()).await? {
+        for record in self.nameservice().branch_records(name.name()).await? {
             if record.retracted {
                 continue;
             }

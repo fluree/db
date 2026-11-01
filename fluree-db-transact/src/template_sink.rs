@@ -27,6 +27,7 @@ use crate::parse::txn_meta::check_user_predicate;
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue};
+use fluree_graph_ir::syntax::reserved_blank_label;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -122,6 +123,10 @@ pub struct TemplateSink<'a> {
     /// Data statements accepted so far (not `<#txn-meta>` entries, not
     /// reifier links).
     statements: usize,
+    /// Lists begun so far, and the one each subject and predicate is adding
+    /// items to, for [`TripleTemplate::list_id`].
+    lists: u32,
+    open_lists: HashMap<(TermId, TermId), u32>,
     /// First error; surfaced by [`Self::into_parts`] so a bad document fails
     /// the whole transaction rather than committing part of it.
     error: Option<TransactError>,
@@ -141,6 +146,8 @@ impl<'a> TemplateSink<'a> {
             statement_hashes: None,
             blank_nodes: false,
             statements: 0,
+            lists: 0,
+            open_lists: HashMap::new(),
             error: None,
         }
     }
@@ -262,7 +269,14 @@ impl<'a> TemplateSink<'a> {
         }
     }
 
-    fn push_statement(&mut self, s: TermId, p: TermId, o: TermId, list_index: Option<i32>) {
+    fn push_statement(
+        &mut self,
+        s: TermId,
+        p: TermId,
+        o: TermId,
+        list_index: Option<i32>,
+        list_id: Option<u32>,
+    ) {
         if matches!(self.scope, Scope::TxnMeta) {
             if list_index.is_some() {
                 self.fail("lists are not allowed in the txn-meta graph");
@@ -347,6 +361,7 @@ impl<'a> TemplateSink<'a> {
         if let Some(i) = list_index {
             template = template.with_list_index(i);
         }
+        template.list_id = list_id;
         self.statements += 1;
         self.emit(template);
     }
@@ -560,10 +575,8 @@ impl GraphSink for TemplateSink<'_> {
                 id
             }
             None => {
-                // The leading '-' keeps minted labels out of the
-                // user-writable BLANK_NODE_LABEL space (see FlakeSink).
                 self.anon += 1;
-                let label = format!("-b{}", self.anon);
+                let label = reserved_blank_label("b", self.anon);
                 let hash = if self.identity() {
                     hash_parts(b"B", &[label.as_bytes()])
                 } else {
@@ -636,7 +649,7 @@ impl GraphSink for TemplateSink<'_> {
     }
 
     fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {
-        self.push_statement(subject, predicate, object, None);
+        self.push_statement(subject, predicate, object, None, None);
         Ok(())
     }
 
@@ -647,7 +660,16 @@ impl GraphSink for TemplateSink<'_> {
         object: TermId,
         index: i32,
     ) -> SinkResult {
-        self.push_statement(subject, predicate, object, Some(index));
+        let list = match self.open_lists.get(&(subject, predicate)) {
+            Some(&list) if index != 0 => list,
+            _ => {
+                let list = self.lists;
+                self.lists += 1;
+                self.open_lists.insert((subject, predicate), list);
+                list
+            }
+        };
+        self.push_statement(subject, predicate, object, Some(index), Some(list));
         Ok(())
     }
 
@@ -673,7 +695,7 @@ impl GraphSink for TemplateSink<'_> {
         };
         let outer = std::mem::replace(&mut self.scope, Scope::Default);
         self.set_scope(Scope::Named(iri));
-        self.push_statement(subject, predicate, object, None);
+        self.push_statement(subject, predicate, object, None, None);
         self.scope = outer;
         Ok(())
     }

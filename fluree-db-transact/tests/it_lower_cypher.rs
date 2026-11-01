@@ -121,7 +121,7 @@ fn create_two_parallel_relationships_mints_distinct_annotation_subjects() {
         .iter()
         .filter_map(|t| match (&t.predicate, &t.subject) {
             (TemplateTerm::Sid(_), TemplateTerm::BlankNode(label))
-                if label.starts_with("_:cy_ann_") =>
+                if label.starts_with("_:-cye") =>
             {
                 Some(label.clone())
             }

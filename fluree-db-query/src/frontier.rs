@@ -56,7 +56,8 @@ pub(crate) fn overlay_dirty_ids(
     store: &Arc<BinaryIndexStore>,
 ) -> Option<Arc<DirtyIds>> {
     use std::sync::OnceLock;
-    type Cache = parking_lot::Mutex<lru::LruCache<(u64, u16, u64), Arc<DirtyIds>>>;
+    type Cache =
+        parking_lot::Mutex<lru::LruCache<(u64, fluree_db_core::GraphId, u64), Arc<DirtyIds>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
 
     if overlay.is_effectively_empty() {

@@ -312,6 +312,37 @@ impl TriggerIndexOptions {
     }
 }
 
+/// Options for [`Fluree::maintain_index`](crate::Fluree::maintain_index).
+#[derive(Debug, Clone)]
+pub struct MaintainIndexOptions {
+    /// Wait at most this long for a build the background indexer runs.
+    pub timeout_ms: Option<u64>,
+    /// Once the index is current, fold the pooled tree's delta runs into
+    /// their bases.
+    pub compact: bool,
+}
+
+impl Default for MaintainIndexOptions {
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            compact: true,
+        }
+    }
+}
+
+/// Result of [`Fluree::maintain_index`](crate::Fluree::maintain_index).
+#[derive(Debug, Clone)]
+pub struct MaintainIndexResult {
+    pub ledger_id: String,
+    pub index_t: i64,
+    pub root_id: Option<fluree_db_core::ContentId>,
+    /// This call indexed pending commits.
+    pub built: bool,
+    /// This call folded the pooled tree's delta runs into their bases.
+    pub compacted: bool,
+}
+
 /// Options for reindex operation
 #[derive(Debug, Clone, Default)]
 pub struct ReindexOptions {
@@ -1950,7 +1981,7 @@ impl crate::Fluree {
         warnings: &mut Vec<String>,
     ) -> Vec<ContentId> {
         let backend = self.backend();
-        let records = match self.nameservice().all_records().await {
+        let records = match self.nameservice().branch_records(ledger_id.name()).await {
             Ok(records) => records,
             Err(e) => {
                 warnings.push(format!(
@@ -2675,13 +2706,151 @@ impl crate::Fluree {
     }
 }
 
+impl crate::Fluree {
+    /// Index a ledger's pending commits, then fold the pooled tree's delta
+    /// runs into their bases. For deployments with no long-running indexer
+    /// to tidy an idle ledger, such as a function run on a schedule. With
+    /// nothing to do it costs a nameservice lookup and one root read.
+    pub async fn maintain_index(
+        &self,
+        ledger_id: &str,
+        opts: MaintainIndexOptions,
+    ) -> Result<MaintainIndexResult> {
+        let id = LedgerId::parse(ledger_id)?;
+        let record = self
+            .nameservice()
+            .lookup(&id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {id}")))?;
+        let built = record.commit_t > record.index_t;
+        if built {
+            match &self.indexing_mode {
+                IndexingMode::Background(_) => {
+                    self.trigger_index(
+                        id.as_str(),
+                        TriggerIndexOptions {
+                            timeout_ms: opts.timeout_ms,
+                        },
+                    )
+                    .await?;
+                }
+                IndexingMode::Disabled => {
+                    let result = self.build_index(id.as_str()).await?;
+                    self.publisher()?
+                        .publish_index_allow_equal_fenced(
+                            &id,
+                            result.basis,
+                            result.index_t,
+                            &result.root_id,
+                        )
+                        .await?;
+                }
+            }
+        }
+        let compacted =
+            opts.compact && self.compact_pool_deltas(&id).await? == PoolCompaction::Compacted;
+        let record = self
+            .nameservice()
+            .lookup(&id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {id}")))?;
+        Ok(MaintainIndexResult {
+            ledger_id: id.to_string(),
+            index_t: record.index_t,
+            root_id: record.index_head_id,
+            built,
+            compacted,
+        })
+    }
+
+    /// Fold the pooled delta into its base at the current index `t`, with
+    /// the background indexer's builds held off. Deferred while a build is
+    /// queued or running, or another maintenance operation holds the ledger:
+    /// that build, or a later call, sees the delta.
+    pub(crate) async fn compact_pool_deltas(&self, id: &LedgerId) -> Result<PoolCompaction> {
+        let _hold = match &self.indexing_mode {
+            IndexingMode::Background(handle) => {
+                let Some(guard) = handle.acquire_maintenance(id) else {
+                    debug!(ledger_id = %id, "pool compaction deferred: ledger held for maintenance");
+                    return Ok(PoolCompaction::Deferred);
+                };
+                let busy = handle
+                    .status(id)
+                    .await
+                    .is_some_and(|s| s.phase != fluree_db_indexer::IndexPhase::Idle);
+                if busy {
+                    debug!(ledger_id = %id, "pool compaction deferred: a build is queued or running");
+                    return Ok(PoolCompaction::Deferred);
+                }
+                Some(guard)
+            }
+            IndexingMode::Disabled => None,
+        };
+        let Some(record) = self.nameservice().lookup(id).await? else {
+            return Ok(PoolCompaction::NoDelta);
+        };
+        if record.index_head_id.is_none() || record.commit_t > record.index_t {
+            return Ok(PoolCompaction::Deferred);
+        }
+        let content_store = self.branched_content_store(id.as_str()).await?;
+        let config = fluree_db_indexer::IndexerConfig::default()
+            .with_ledger_config_provider(self.ledger_config_provider());
+        let Some(result) = fluree_db_indexer::compact_pool_deltas_for_record(
+            content_store.clone(),
+            &record,
+            config,
+        )
+        .await?
+        else {
+            return Ok(PoolCompaction::NoDelta);
+        };
+        content_store
+            .sync()
+            .await
+            .map_err(|e| ApiError::internal(format!("flush index artifacts: {e}")))?;
+        self.publisher()?
+            .publish_index_allow_equal_fenced(
+                id,
+                record.write_basis(),
+                result.index_t,
+                &result.root_id,
+            )
+            .await?;
+        // Same `t`, new root: the cached state adopts it, keeping its novelty.
+        // One left on the old root would read runs the next sweep deletes.
+        if let Some(ref lm) = self.ledger_manager {
+            let notify = crate::ledger_manager::NsNotify {
+                ledger_id: id.clone(),
+                record: None,
+            };
+            if let Err(e) = lm.notify(notify).await {
+                warn!(ledger_id = %id, error = %e, "compacted root not adopted; dropping the cached ledger");
+                lm.disconnect(id).await;
+            }
+        }
+        info!(ledger_id = %id, index_t = result.index_t, root_id = %result.root_id, "pooled delta compacted and published");
+        Ok(PoolCompaction::Compacted)
+    }
+}
+
+/// What [`Fluree::compact_pool_deltas`](crate::Fluree::compact_pool_deltas) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolCompaction {
+    Compacted,
+    /// The current index holds no delta.
+    NoDelta,
+    /// A build, or another maintenance operation, comes first.
+    Deferred,
+}
+
 // =============================================================================
 // Reindex (requires AdminPublisher for allow-equal publish)
 // =============================================================================
 
 impl crate::Fluree {
     /// `config` for a full rebuild of `ledger_id` from its commits: with the
-    /// full-text properties its ledger config names, read from `state`, and
+    /// full-text properties and graph placement its ledger config names, read
+    /// from `state`, and
     /// the history retention suppresses, which a rebuild would otherwise
     /// bring back.
     pub(crate) async fn rebuild_config(
@@ -2705,8 +2874,12 @@ impl crate::Fluree {
             let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
             match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
                 Ok(Some(cfg)) => {
-                    config.fulltext_configured_properties =
-                        crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
+                    let fluree_db_indexer::LedgerIndexingConfig {
+                        fulltext_properties,
+                        graph_placement,
+                    } = crate::config_resolver::indexing_config_for_indexer(&cfg);
+                    config.fulltext_configured_properties = fulltext_properties;
+                    config.graph_placement = graph_placement;
                 }
                 Ok(None) => {
                     // No LedgerConfig — nothing to seed.
@@ -2714,7 +2887,7 @@ impl crate::Fluree {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
+                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped and graphs placed automatically"
                     );
                 }
             }
@@ -2788,6 +2961,7 @@ impl crate::Fluree {
         let indexer_config = opts.indexer_config.clone().unwrap_or_default();
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
+        let gc_hard_max_old_indexes = indexer_config.gc_hard_max_old_indexes;
 
         let ledger_state = match self.ledger(&ledger_id).await {
             Ok(state) => Some(state),
@@ -2900,6 +3074,7 @@ impl crate::Fluree {
                 let gc_config = CleanGarbageConfig {
                     max_old_indexes: Some(gc_max_old_indexes),
                     min_time_garbage_mins: Some(gc_min_time_mins),
+                    hard_max_old_indexes: gc_hard_max_old_indexes,
                     ..Default::default()
                 };
                 let pass = async {
@@ -2910,11 +3085,10 @@ impl crate::Fluree {
                         Some(handle) => Some(handle.hold_gc(&gc_ledger_id.ledger_name()).await),
                         None => None,
                     };
-                    let Some(plan) =
-                        plan_garbage(gc_store.as_ref(), &gc_root_id, &gc_config).await?
-                    else {
+                    let plan = plan_garbage(gc_store.as_ref(), &gc_root_id, &gc_config).await?;
+                    if plan.is_empty() {
                         return Ok(());
-                    };
+                    }
                     let _window = match (&gc_handle, &gc_guard) {
                         (Some(handle), Some(guard)) => {
                             match handle.open_release_window(guard).await {
@@ -2925,10 +3099,10 @@ impl crate::Fluree {
                         }
                         _ => None,
                     };
-                    // A reindex is rare enough for a full listing; the
-                    // worker's own passes avoid one. A failed listing
-                    // defers every shared blob.
-                    let siblings = match gc_nameservice.all_records().await {
+                    // Listed inside the release window, so only this
+                    // ledger's branches. A failed listing defers every
+                    // shared blob.
+                    let siblings = match gc_nameservice.branch_records(gc_ledger_id.name()).await {
                         Ok(records) => {
                             let mut ids: Vec<LedgerId> = siblings_of(&records, &gc_ledger_id)
                                 .into_iter()
@@ -3172,9 +3346,10 @@ impl crate::Fluree {
     /// Hold every branch of `ledger_name` excluded from indexing and collect
     /// their index heads.
     ///
-    /// Enumerates through `all_records` rather than `list_branches` so that
-    /// **retracted** branches participate. A soft drop is reversible until the
-    /// name is purged, so a soft-dropped branch's index must survive a sweep.
+    /// Enumerates every record under the name, so that **retracted** branches
+    /// participate, through `all_records`, which the nested-ledger check needs
+    /// too. A soft drop is reversible until the name is purged, so a
+    /// soft-dropped branch's index must survive a sweep.
     /// Its own artifacts are safe either way — an unlisted branch contributes
     /// no prefix to scan — but dict blobs are shared across a ledger's
     /// branches, so omitting one would reclaim dicts it still reads.

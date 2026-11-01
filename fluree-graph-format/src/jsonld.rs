@@ -2,11 +2,12 @@
 //!
 //! Formats a `Graph` as JSON-LD: `{"@context": ..., "@graph": [...]}`
 
+use crate::collections::{blank_nodes_in_several_graphs, Collections};
 use crate::policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 use fluree_graph_ir::datatype::iri as dt_iri;
 use fluree_graph_ir::{BlankId, Dataset, Datatype, Graph, LiteralValue, Term};
 use serde_json::{json, Map, Value as JsonValue};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Type alias for IRI compaction functions used in JSON-LD formatting.
@@ -274,7 +275,7 @@ pub fn format_jsonld(
     config: &JsonLdFormatConfig,
 ) -> Result<JsonValue, LiteralAsNode> {
     let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
-    let nodes = graph_nodes(graph, config, &mut bnode_renamer)?;
+    let nodes = graph_nodes(graph, config, &HashSet::new(), &mut bnode_renamer)?;
     Ok(document(config, nodes))
 }
 
@@ -288,7 +289,8 @@ pub fn format_jsonld_dataset(
     config: &JsonLdFormatConfig,
 ) -> Result<JsonValue, LiteralAsNode> {
     let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
-    let mut nodes = graph_nodes(&dataset.default, config, &mut bnode_renamer)?;
+    let shared = blank_nodes_in_several_graphs(dataset);
+    let mut nodes = graph_nodes(&dataset.default, config, &shared, &mut bnode_renamer)?;
     for (name, graph) in &dataset.named {
         let mut node = Map::new();
         node.insert(
@@ -297,7 +299,7 @@ pub fn format_jsonld_dataset(
         );
         node.insert(
             "@graph".to_string(),
-            JsonValue::Array(graph_nodes(graph, config, &mut bnode_renamer)?),
+            JsonValue::Array(graph_nodes(graph, config, &shared, &mut bnode_renamer)?),
         );
         nodes.push(JsonValue::Object(node));
     }
@@ -313,20 +315,26 @@ fn document(config: &JsonLdFormatConfig, nodes: Vec<JsonValue>) -> JsonValue {
     JsonValue::Object(output)
 }
 
-/// One graph's node objects, in subject order.
-fn graph_nodes(
-    graph: &Graph,
+/// One graph's node objects, in subject order. A collection is written as
+/// `{"@list": [...]}` where its head is named, and its cells are not nodes.
+fn graph_nodes<'g>(
+    graph: &'g Graph,
     config: &JsonLdFormatConfig,
+    shared: &HashSet<&'g Term>,
     bnode_renamer: &mut BlankNodeRenamer,
 ) -> Result<Vec<JsonValue>, LiteralAsNode> {
     // Reifiers by the triple they reify, rendered as `@annotation`.
     let reifiers = graph.reifiers_by_triple();
+    let collections = Collections::of(graph, &reifiers, shared);
 
     // Group triples by subject, then by predicate
     // This allows us to detect and handle list predicates
     let mut subjects: BTreeMap<String, SubjectData> = BTreeMap::new();
 
     for triple in graph.iter() {
+        if collections.cells.contains(&triple.s) {
+            continue;
+        }
         let subj_key = term_to_subject_key(&triple.s, config, bnode_renamer)?;
 
         let subj_data = subjects
@@ -340,7 +348,7 @@ fn graph_nodes(
     let mut nodes: BTreeMap<String, Map<String, JsonValue>> = BTreeMap::new();
 
     for (subj_key, subj_data) in subjects {
-        let node = subj_data.into_jsonld_node(config, bnode_renamer, &reifiers)?;
+        let node = subj_data.into_jsonld_node(config, bnode_renamer, &reifiers, &collections)?;
         nodes.insert(subj_key, node);
     }
 
@@ -446,6 +454,7 @@ impl SubjectData {
         config: &JsonLdFormatConfig,
         bnode_renamer: &mut BlankNodeRenamer,
         reifiers: &HashMap<&fluree_graph_ir::Triple, Vec<&Term>>,
+        collections: &Collections<'_>,
     ) -> Result<Map<String, JsonValue>, LiteralAsNode> {
         let mut node = Map::new();
         node.insert("@id".to_string(), JsonValue::String(self.id.clone()));
@@ -455,17 +464,20 @@ impl SubjectData {
             let is_list = triples.iter().any(|(idx, _)| idx.is_some());
 
             // Handle rdf:type specially. `@type` holds only IRIs and blank
-            // nodes and cannot carry an annotation, so an annotated type, or
-            // one that is a literal or a triple term, is written as an
-            // `rdf:type` property.
+            // nodes and cannot carry an annotation, so an annotated type, a
+            // list, or one that is a literal or a triple term, is written as
+            // an `rdf:type` property.
             if pred_iri == dt_iri::RDF_TYPE && config.type_handling.use_at_type() {
                 for (_, triple) in &triples {
                     let reified = reifiers.get(triple);
-                    if reified.is_none() && matches!(triple.o, Term::Iri(_) | Term::BlankNode(_)) {
+                    if reified.is_none()
+                        && matches!(triple.o, Term::Iri(_) | Term::BlankNode(_))
+                        && !collections.heads.contains_key(&triple.o)
+                    {
                         add_type_value(&mut node, &triple.o, config, bnode_renamer);
                         continue;
                     }
-                    let mut obj = term_to_object(&triple.o, config, bnode_renamer);
+                    let mut obj = collections.object(&triple.o, config, bnode_renamer);
                     if let Some(rs) = reified {
                         obj = annotate(obj, rs, bnode_renamer, config)?;
                     }
@@ -492,7 +504,7 @@ impl SubjectData {
                 // indistinguishable once rendered despite being distinct RDF
                 // terms.
                 for (_, triple) in triples {
-                    let mut obj_val = term_to_object(&triple.o, config, bnode_renamer);
+                    let mut obj_val = collections.object(&triple.o, config, bnode_renamer);
                     if let Some(rs) = reifiers.get(&triple) {
                         obj_val = annotate(obj_val, rs, bnode_renamer, config)?;
                     }
@@ -502,6 +514,27 @@ impl SubjectData {
         }
 
         Ok(node)
+    }
+}
+
+impl Collections<'_> {
+    /// `term` as an object value, a collection head as `{"@list": [...]}`.
+    fn object(
+        &self,
+        term: &Term,
+        config: &JsonLdFormatConfig,
+        bnode_renamer: &mut BlankNodeRenamer,
+    ) -> JsonValue {
+        match self.heads.get(term) {
+            Some(items) => {
+                let items: Vec<JsonValue> = items
+                    .iter()
+                    .map(|item| self.object(item, config, bnode_renamer))
+                    .collect();
+                json!({ "@list": items })
+            }
+            None => term_to_object(term, config, bnode_renamer),
+        }
     }
 }
 
@@ -957,6 +990,64 @@ mod tests {
 
         let knows = &result["@graph"][0]["http://xmlns.com/foaf/0.1/knows"];
         assert_eq!(knows["@id"], "_:person1");
+    }
+
+    /// A chain of unnamed `rdf:first`/`rdf:rest` cells is written as `@list`,
+    /// lists of lists included, and its cells are not nodes.
+    #[test]
+    fn rdf_collections_are_written_as_lists() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let cell = |l: &str| Term::blank(l);
+        let first = || Term::iri(rdf::FIRST);
+        let rest = || Term::iri(rdf::REST);
+        let mut graph = Graph::new();
+        graph.add_triple(ex("s"), ex("items"), cell("c0"));
+        graph.add_triple(cell("c0"), first(), Term::integer(1));
+        graph.add_triple(cell("c0"), rest(), cell("c1"));
+        graph.add_triple(cell("c1"), first(), cell("inner"));
+        graph.add_triple(cell("c1"), rest(), Term::iri(rdf::NIL));
+        graph.add_triple(cell("inner"), first(), ex("a"));
+        graph.add_triple(cell("inner"), rest(), Term::iri(rdf::NIL));
+        graph.sort();
+
+        let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+        assert_eq!(
+            result["@graph"],
+            json!([{
+                "@id": "http://example.org/s",
+                "http://example.org/items": {"@list": [
+                    1,
+                    {"@list": [{"@id": "http://example.org/a"}]}
+                ]}
+            }])
+        );
+    }
+
+    /// A collection named only from its own cells, or from a cycle of
+    /// collections, has nowhere to be written inline: it keeps its triples.
+    #[test]
+    fn unanchored_collections_keep_their_triples() {
+        let cell = |l: &str| Term::blank(l);
+        let (first, rest, nil) = (
+            || Term::iri(rdf::FIRST),
+            || Term::iri(rdf::REST),
+            || Term::iri(rdf::NIL),
+        );
+        let mut graph = Graph::new();
+        graph.add_triple(cell("a"), first(), cell("a"));
+        graph.add_triple(cell("a"), rest(), nil());
+        graph.add_triple(cell("b"), first(), cell("c"));
+        graph.add_triple(cell("b"), rest(), nil());
+        graph.add_triple(cell("c"), first(), cell("b"));
+        graph.add_triple(cell("c"), rest(), nil());
+        graph.sort();
+
+        let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+        assert_eq!(
+            result["@graph"].as_array().map(Vec::len),
+            Some(3),
+            "{result}"
+        );
     }
 
     #[test]

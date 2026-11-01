@@ -363,7 +363,13 @@ mod tests {
             .collect()
     }
 
-    fn make_entry(g_id: u16, p_id: u32, string_id: u32, t: i64, is_assert: bool) -> FulltextEntry {
+    fn make_entry(
+        g_id: fluree_db_core::GraphId,
+        p_id: u32,
+        string_id: u32,
+        t: i64,
+        is_assert: bool,
+    ) -> FulltextEntry {
         FulltextEntry {
             g_id,
             p_id,

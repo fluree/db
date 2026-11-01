@@ -283,7 +283,7 @@ impl crate::Fluree {
                     commits.push(commit);
                 }
                 let CollectedCommitData {
-                    flakes: inverted,
+                    net: undo,
                     namespace_delta,
                     graph_iris,
                 } = collect_from_commits(commits, Fold::Undo);
@@ -291,7 +291,7 @@ impl crate::Fluree {
                 let staged = self
                     .stage_revert(
                         branch_state,
-                        inverted,
+                        undo,
                         &all_conflict_keys,
                         &opts.conflict_strategy,
                         &namespace_delta,

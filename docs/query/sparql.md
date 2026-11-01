@@ -111,7 +111,7 @@ PREFIX ex: <http://example.org/ns/>
 DESCRIBE ex:alice
 ```
 
-Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`).
+Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`), plus the outgoing triples of each blank node it points to, and of every cell of a list it points to that is [stored as its triples](#writing-lists). It writes each [list](#lists) the resource holds as a list.
 
 ## Basic Graph Patterns
 
@@ -274,6 +274,24 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 #### Not Yet Supported
 
 A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
+
+### Lists
+
+A list (Turtle `( … )`, JSON-LD `{"@list": [...]}`) is stored in order under the subject and property that hold it. SPARQL reads its members as values of that property, as a JSON-LD query does:
+
+```sparql
+# data: ex:s ex:items (ex:a ex:b ex:a) .
+
+SELECT ?x WHERE { ex:s ex:items ?x }                  # ex:a, ex:b, ex:a
+SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
+```
+
+- A member that occurs twice in a list is a value twice.
+- A solution carries no position. A JSON-LD crawl, [export](../cli/export.md) and the Graph Store `GET` return each list in order.
+- A CONSTRUCT template triple that repeats a triple pattern of its WHERE (including one inside an OPTIONAL) writes the list entries it reads as the list, in order: `( … )` in Turtle, `{"@list": [...]}` in JSON-LD. DESCRIBE does too. A value stands for every entry holding it, so over the data above, `CONSTRUCT { ex:s ex:items ?x } WHERE { ex:s ex:items ?x FILTER(?x != ex:b) }` writes `ex:s ex:items ( ex:a ex:a )`, and a `LIMIT` keeping one `ex:a` writes both. A value the owner also holds outside the list is written beside it as well, so the output reads back as the data it came from.
+- A template that writes the values under another subject or property, or into a named graph, writes them as values. So does a default graph in which more than one graph holds a list on that subject and property.
+- A list's `rdf:first`/`rdf:rest` cells are not triples SPARQL can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it.
+- A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
 
 ## Query Modifiers
 
@@ -1336,6 +1354,23 @@ INSERT DATA {
   _:newPerson ex:age 25 .
 }
 ```
+
+### Writing lists
+
+A `( … )` in a template writes a list, stored as a JSON-LD `@list` is. An update reads a list's members as values, as a [query](#lists) does, so a write naming a member reaches it:
+
+```sparql
+# data: ex:s ex:items (1 2 1 3) .
+
+DELETE DATA { ex:s ex:items 1 }                        # ex:s ex:items (2 3)
+INSERT { ex:t ex:copy ?x } WHERE { ex:s ex:items ?x }  # ex:t ex:copy 2, 3
+```
+
+- Deleting a value deletes every entry of a list that holds it, and the value where it is also stored beside the list, however the delete is written.
+- To replace a list, or change one entry of it, upsert the list from JSON-LD or Turtle.
+- `ADD` and `COPY` copy a graph's lists into the destination and leave the source's as they were. `MOVE` moves them.
+- A list whose cells something else names, or that carries other triples, is stored as its triples, and so is a second list on one subject and property, including one `ADD` brings into a graph that holds a list there.
+- Under a policy, a change to the cells of a list stored as its triples is judged as a change to its owner's property.
 
 ### Typed Literals
 

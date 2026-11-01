@@ -119,6 +119,46 @@ struct Known {
     pinned: VecDeque<Resolved>,
 }
 
+/// Versions of a table's change feed that could not be read: one of
+/// `first..=last` failed. Kernel names the version only when the feed is off
+/// at it; otherwise the span runs from the newest version read before the
+/// failure to the end of the range.
+struct FeedRefusal {
+    table_root: String,
+    first: u64,
+    last: u64,
+    reason: String,
+}
+
+/// Feed refusals kept for the process, most recent first.
+const FEED_REFUSALS_KEPT: usize = 256;
+
+/// Kernel opens a change range after checking only its two ends, so a version
+/// inside it can fail after rows have been read. Remembering the failure is
+/// what lets the next pass refuse the range before reading any, and the
+/// memory outlives the table handle: a cache entry that expired between two
+/// passes would otherwise fail every pass the same way.
+fn feed_refusals() -> &'static Mutex<VecDeque<FeedRefusal>> {
+    static REFUSALS: std::sync::OnceLock<Mutex<VecDeque<FeedRefusal>>> = std::sync::OnceLock::new();
+    REFUSALS.get_or_init(Mutex::default)
+}
+
+/// The column Kernel names a change feed row's change in: `insert`, `delete`,
+/// `update_preimage` or `update_postimage`.
+pub const CHANGE_TYPE_COLUMN: &str = "_change_type";
+
+/// The column Kernel names the version that made a change feed row in.
+pub const COMMIT_VERSION_COLUMN: &str = "_commit_version";
+
+/// A change feed being read: its rows, and where it stopped.
+pub struct DeltaChanges {
+    pub stream: DeltaBatchStream,
+    /// Once the stream has ended at a commit boundary because its row budget
+    /// ran out, the last version whose changes it carries. Unset while rows are
+    /// still arriving, and when the stream reaches the version it was asked for.
+    pub stopped_at: Arc<std::sync::OnceLock<u64>>,
+}
+
 /// A resolved version and its file listing, shared by every reader of it.
 #[derive(Clone)]
 struct Resolved {
@@ -558,6 +598,187 @@ impl DeltaSnapshot {
         })))
     }
 
+    /// The changes of every version after `after` through this one, from the
+    /// table's change data feed, in commit order. Each row carries the
+    /// projected columns, resolved against this version's schema (every column
+    /// when `projection` is empty), then [`CHANGE_TYPE_COLUMN`] and
+    /// [`COMMIT_VERSION_COLUMN`].
+    ///
+    /// With a `row_budget`, the stream ends at the first commit boundary at or
+    /// past that many rows and records the last version it read in
+    /// [`DeltaChanges::stopped_at`]. A commit is never split, so every read
+    /// gets through at least one.
+    ///
+    /// [`DeltaError::ChangeFeedUnavailable`] when the feed cannot serve the
+    /// range, whether Kernel says so on opening it or at a version inside it.
+    /// A failure inside it is remembered for the process, so a later request
+    /// whose range covers the versions that failed is refused before any rows
+    /// are read.
+    pub async fn changes_since(
+        &self,
+        after: u64,
+        projection: &[String],
+        row_budget: Option<u64>,
+    ) -> Result<DeltaChanges> {
+        let through = self.version();
+        if after >= through {
+            return Err(DeltaError::Internal(format!(
+                "no changes after version {after} through version {through}"
+            )));
+        }
+        if let Some(reason) = self.feed_refusal(after) {
+            return Err(self.feed_unavailable(after, reason));
+        }
+        let (schema, bridge) = self.plan_changes(projection)?;
+        let this = self.clone();
+        let scan = blocking(move || {
+            let opened = delta_kernel::table_changes::TableChanges::try_new(
+                this.snapshot.table_root().clone(),
+                this.table.engine.as_ref(),
+                after + 1,
+                Some(through),
+            )
+            .and_then(|changes| changes.into_scan_builder().with_schema(schema).build());
+            opened.map_err(|e| match crate::error::change_range_refusal(&e) {
+                Some(reason) => this.feed_unavailable(after, reason),
+                None => this.table.kernel(e),
+            })
+        })
+        .await?;
+
+        let stopped_at = Arc::new(std::sync::OnceLock::new());
+        let stopped = stopped_at.clone();
+        let budget = row_budget.unwrap_or(0);
+        let this = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ColumnBatch>>(4);
+        let _delta_runtime = self.table.executor.enter();
+        tokio::task::spawn_blocking(move || {
+            let engine: Arc<dyn delta_kernel::Engine> = this.table.engine.clone();
+            let changes = match scan.execute(engine) {
+                Ok(changes) => changes,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(this.feed_failure(after, None, e)));
+                    return;
+                }
+            };
+            let mut rows = 0u64;
+            // The newest version sent so far: every row of it, since rows
+            // arrive in commit order.
+            let mut sent_through: Option<u64> = None;
+            for data in changes {
+                let batch = match data.and_then(EngineDataArrowExt::try_into_record_batch) {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(this.feed_failure(after, sent_through, e)));
+                        return;
+                    }
+                };
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let (first, last) = match commit_version_range(&batch) {
+                    Ok(range) => range,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                };
+                if let Some(done) = sent_through {
+                    // A row older than one already sent would land after a
+                    // stop that claimed its version complete.
+                    if first < done {
+                        let _ = tx.blocking_send(Err(DeltaError::Internal(format!(
+                            "change feed of '{}' returned version {first} after {done}",
+                            this.table.name
+                        ))));
+                        return;
+                    }
+                    if first > done && budget > 0 && rows >= budget {
+                        let _ = stopped.set(done);
+                        return;
+                    }
+                }
+                sent_through = Some(last);
+                rows += batch.num_rows() as u64;
+                if tx.blocking_send(bridge.convert(&batch)).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(DeltaChanges {
+            stream: Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            })),
+            stopped_at,
+        })
+    }
+
+    /// A remembered failure inside `(after, this version]`, if any.
+    fn feed_refusal(&self, after: u64) -> Option<String> {
+        let root = self.snapshot.table_root().as_str();
+        let through = self.version();
+        lock(feed_refusals())
+            .iter()
+            .find(|r| r.table_root == root && after < r.first && r.last <= through)
+            .map(|r| r.reason.clone())
+    }
+
+    /// The error for `error`, met reading the changes after `after`, `read`
+    /// being the newest version any rows were sent from. A refusal is
+    /// remembered.
+    fn feed_failure(
+        &self,
+        after: u64,
+        read: Option<u64>,
+        error: delta_kernel::Error,
+    ) -> DeltaError {
+        let Some(reason) = crate::error::change_feed_refusal(&error) else {
+            return self.table.kernel(error);
+        };
+        // A failure while reading a version's rows leaves it incomplete, so
+        // the span starts at the newest version read, not after it.
+        let (first, last) = match crate::error::feed_off_at(&error) {
+            Some(version) => (version, version),
+            None => (read.unwrap_or(after + 1), self.version()),
+        };
+        let mut refusals = lock(feed_refusals());
+        refusals.push_front(FeedRefusal {
+            table_root: self.snapshot.table_root().to_string(),
+            first,
+            last,
+            reason: reason.clone(),
+        });
+        refusals.truncate(FEED_REFUSALS_KEPT);
+        self.feed_unavailable(after, reason)
+    }
+
+    fn feed_unavailable(&self, after: u64, reason: String) -> DeltaError {
+        DeltaError::ChangeFeedUnavailable {
+            table: self.table.name.to_string(),
+            after,
+            reason,
+        }
+    }
+
+    /// [`Self::plan`] for a change feed: the projection, then the two columns
+    /// Kernel adds to every change row.
+    fn plan_changes(&self, projection: &[String]) -> Result<(Arc<StructType>, BatchBridge)> {
+        use delta_kernel::schema::DataType;
+        let (schema, bridge) = self.plan(projection)?;
+        let mut ids: Vec<i32> = bridge.schema().field_ids().collect();
+        let next = ids.iter().copied().max().unwrap_or(0);
+        ids.extend([next.saturating_add(1), next.saturating_add(2)]);
+        let fields = schema.fields().cloned().chain([
+            StructField::not_null(CHANGE_TYPE_COLUMN, DataType::STRING),
+            StructField::not_null(COMMIT_VERSION_COLUMN, DataType::LONG),
+        ]);
+        let schema = Arc::new(StructType::try_new(fields).map_err(|e| self.table.kernel(e))?);
+        let arrow = ArrowSchema::try_from_kernel(schema.as_ref())
+            .map_err(|e| DeltaError::UnsupportedType(e.to_string()))?;
+        let bridge = BatchBridge::new(Arc::new(arrow), &ids)?;
+        Ok((schema, bridge))
+    }
+
     /// Stat the first data file this version reads, as its URL and size: the
     /// proof the store lets a scan's reads through, which reading the log alone
     /// is not (a table's files can sit outside the prefix its credentials
@@ -847,6 +1068,34 @@ impl DeltaSnapshot {
         let bridge = BatchBridge::new(Arc::new(arrow), &ids)?;
         Ok((schema, bridge))
     }
+}
+
+/// The oldest and newest [`COMMIT_VERSION_COLUMN`] values in a change batch.
+fn commit_version_range(
+    batch: &delta_kernel::arrow::record_batch::RecordBatch,
+) -> Result<(u64, u64)> {
+    use delta_kernel::arrow::array::{Array as _, Int64Array};
+    let versions = batch
+        .column_by_name(COMMIT_VERSION_COLUMN)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| {
+            DeltaError::SchemaMismatch(format!("change batch without {COMMIT_VERSION_COLUMN}"))
+        })?;
+    let as_version = |v: i64| {
+        u64::try_from(v)
+            .map_err(|_| DeltaError::SchemaMismatch(format!("negative commit version {v}")))
+    };
+    let mut values = versions.iter().flatten();
+    let first = values.next().ok_or_else(|| {
+        DeltaError::SchemaMismatch(format!("change batch with a null {COMMIT_VERSION_COLUMN}"))
+    })?;
+    let (low, high) = values.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    if versions.null_count() > 0 {
+        return Err(DeltaError::SchemaMismatch(format!(
+            "change batch with a null {COMMIT_VERSION_COLUMN}"
+        )));
+    }
+    Ok((as_version(low)?, as_version(high)?))
 }
 
 /// `wanted` by exact name, else ignoring ASCII case.

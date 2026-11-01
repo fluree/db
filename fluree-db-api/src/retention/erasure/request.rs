@@ -139,7 +139,7 @@ impl Fluree {
         // removed from, one made after inherits the removal.
         let _admission = runtime.admission.lock().await;
         let mut branches: Vec<String> = ns
-            .list_branches(ledger_id.name())
+            .branch_records(ledger_id.name())
             .await?
             .into_iter()
             .filter(|r| !r.retracted && r.ledger_id != ledger_id)
@@ -204,7 +204,7 @@ impl Fluree {
                 ))
             })?;
             let appeared: Vec<String> = ns
-                .list_branches(ledger_id.name())
+                .branch_records(ledger_id.name())
                 .await?
                 .into_iter()
                 .filter(|r| !r.retracted)

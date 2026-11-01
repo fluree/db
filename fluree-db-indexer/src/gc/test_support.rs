@@ -90,6 +90,7 @@ pub(crate) fn fir6_with_named_graph_for(
         decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
         o_type_table: IndexRoot::build_o_type_table(&[], &[]),
         ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+        pool: None,
     };
     root.encode()
 }

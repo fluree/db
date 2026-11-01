@@ -11,9 +11,10 @@
 //! A WHERE scoped to one named graph takes the lane too, and its rows are
 //! decoded and retracted in that graph.
 //!
-//! Its own `[[test]]` binary, like `it_upsert_skip_fires`: tracing's
-//! callsite-interest cache is process-global, so a sibling test in a bundled
-//! binary can leave the stamp's callsite disabled.
+//! Its own `[[test]]` binary, like `it_upsert_skip_fires`, which predates the
+//! shared capture helper; with the capture going through
+//! `fluree_test_support::scoped_default`, a sibling can no longer leave the
+//! stamp's callsite disabled.
 
 mod support;
 

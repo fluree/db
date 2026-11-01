@@ -36,6 +36,7 @@ fn hist(p_id: u32, s_id: u64, v: i64, t: u32, op: u8) -> HistEntryV2 {
         o_i: LIST_INDEX_NONE,
         t,
         op,
+        g_id: 0,
     }
 }
 

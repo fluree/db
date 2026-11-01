@@ -16,6 +16,39 @@ pub struct UploadedIndexes {
     pub default_graph_orders: Vec<(RunSortOrder, Vec<LeafEntry>)>,
     /// Named graphs (g_id!=0): branch CIDs per sort order per graph.
     pub named_graphs: Vec<NamedGraphRouting>,
+    /// The pooled tree's branch CID per pooled order (empty when no build
+    /// produced the pool). The caller knows which graphs it holds.
+    pub pool_orders: Vec<(RunSortOrder, ContentId)>,
+    /// Rows and history of each pooled graph the build wrote any of.
+    pub pool_members: Vec<fluree_db_binary_index::PoolMember>,
+}
+
+impl UploadedIndexes {
+    /// The pool's routing: `graphs` (the build's placement, which may include
+    /// graphs with nothing written) sized from what the build wrote.
+    pub fn pool_routing(
+        &self,
+        graphs: &[fluree_db_core::GraphId],
+    ) -> Option<fluree_db_binary_index::PoolRouting> {
+        use fluree_db_binary_index::PoolMember;
+        (!self.pool_orders.is_empty()).then(|| {
+            let mut members: Vec<PoolMember> = graphs
+                .iter()
+                .map(|&g| {
+                    self.pool_members
+                        .binary_search_by_key(&g, |m| m.g_id)
+                        .map_or(PoolMember::new(g), |i| self.pool_members[i])
+                })
+                .collect();
+            members.sort_unstable_by_key(|m| m.g_id);
+            members.dedup_by_key(|m| m.g_id);
+            fluree_db_binary_index::PoolRouting {
+                members,
+                orders: self.pool_orders.clone(),
+                deltas: Vec::new(),
+            }
+        })
+    }
 }
 
 /// Result of uploading persisted dict flat files to CAS.

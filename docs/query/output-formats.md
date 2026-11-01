@@ -222,7 +222,7 @@ ex:alice ex:label "Alice" .
 ex:bob ex:label "Bob" .
 ```
 
-N-Triples writes one triple per line with full IRIs. Both use the canonical N-Triples escapes for strings, and escape characters an IRI may not contain as `\uXXXX`, which reads back as the same IRI. Blank nodes keep their stored labels (`_:fdb-…`), so the output can be written back to the same nodes.
+N-Triples writes one triple per line with full IRIs. Both use the canonical N-Triples escapes for strings, and escape characters an IRI may not contain as `\uXXXX`, which reads back as the same IRI. Blank nodes keep their stored labels (`_:fdb-…`), so the output can be written back to the same nodes. A label the grammar doesn't allow, which only data written by earlier versions holds, is written as `_:x` followed by its hex and writes back as a new node.
 
 **Named graphs.** A CONSTRUCT template with `GRAPH` blocks produces a dataset (see [CONSTRUCT](construct.md#named-graphs-in-the-template)). TriG writes the default graph as top-level Turtle and each named graph as a `GRAPH <name> { ... }` block; N-Quads adds the graph name as a fourth term; JSON-LD adds a `{"@id": <name>, "@graph": [...]}` node per named graph. Turtle, N-Triples and RDF/XML cannot express named graphs and refuse such a result (over HTTP, a `406`). Without named graphs, TriG and N-Quads output are plain Turtle and N-Triples.
 

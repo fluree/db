@@ -65,8 +65,8 @@ pub use projection::{
     Projection, Root,
 };
 pub use query::{
-    ConstructTemplate, PostValues, Query, QueryOutput, Restriction, TemplateReification,
-    UngroupedProjection,
+    ConstructTemplate, ListEntryVars, PostValues, Query, QueryOutput, Restriction,
+    TemplateReification, UngroupedProjection,
 };
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use term_components::{

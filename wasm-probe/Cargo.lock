@@ -86,6 +86,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "archery"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -532,6 +541,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -724,6 +734,7 @@ dependencies = [
 name = "fluree-db-binary-index"
 version = "5.0.0-alpha.1"
 dependencies = [
+ "arc-swap",
  "bigdecimal 0.4.10",
  "chrono",
  "ciborium",
@@ -831,6 +842,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-nameservice",
  "hex",
+ "hkdf",
  "rand_core 0.6.4",
  "sha2",
  "thiserror 1.0.69",
@@ -1041,6 +1053,7 @@ dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
  "fluree-db-query",
+ "fluree-graph-ir",
  "fluree-graph-json-ld",
  "fluree-vocab",
  "num-bigint",
@@ -1127,6 +1140,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smallvec",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1490,6 +1504,24 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "i_float"

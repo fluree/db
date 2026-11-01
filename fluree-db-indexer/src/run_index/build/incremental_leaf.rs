@@ -39,6 +39,28 @@ use super::novelty_merge::{merge_novelty, MergeInput, MergeOutput};
 // Configuration and output types
 // ============================================================================
 
+/// What a pooled-tree leaf update does besides merging novelty.
+#[derive(Clone, Copy, Default)]
+pub struct PoolMerge<'a> {
+    /// Graphs leaving the pool, sorted: their rows and history are dropped
+    /// from every leaflet the update touches. Novelty carries an
+    /// [`OP_PURGE`](super::novelty_merge::OP_PURGE) marker per identity they
+    /// hold, so every leaflet holding them is touched.
+    pub purge: &'a [fluree_db_core::GraphId],
+    /// Report each graph's change in rows and history entries.
+    pub tally: bool,
+}
+
+/// One graph's change in rows and history entries across an update.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraphDelta {
+    pub rows: i64,
+    pub history: i64,
+}
+
+/// Per-graph deltas, keyed by graph.
+pub type GraphDeltas = std::collections::BTreeMap<fluree_db_core::GraphId, GraphDelta>;
+
 /// Configuration for a single leaf update.
 pub struct LeafUpdateInput<'a> {
     /// Raw FLI3 leaf bytes.
@@ -56,7 +78,7 @@ pub struct LeafUpdateInput<'a> {
     /// Sort order.
     pub order: RunSortOrder,
     /// Graph id (for routing context; not encoded in leaf V3).
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Zstd compression level for re-encoded leaflets.
     pub zstd_level: i32,
     /// Target rows per leaflet (for splitting oversized merged results).
@@ -71,6 +93,8 @@ pub struct LeafUpdateInput<'a> {
         Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
     /// Rebuild the history even without novelty: it holds erased events.
     pub rewrite_history: bool,
+    /// Pooled tree only: graphs to purge and whether to tally graphs.
+    pub pool: PoolMerge<'a>,
 }
 
 /// A new leaf blob produced by the update.
@@ -111,6 +135,9 @@ pub struct LeafUpdateOutput {
     /// Novelty ops whose identity matched an existing base row, aggregated
     /// across this leaf's merged leaflets (see [`MergeOutput::matched`]).
     pub matched: Vec<RunRecordV2>,
+    /// Each graph's change in rows and history (empty unless
+    /// [`PoolMerge::tally`]).
+    pub graph_deltas: GraphDeltas,
 }
 
 /// One key range's portion of the winner and superseded streams, sliced
@@ -206,6 +233,7 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
         header.leaflet_count as usize + input.novelty.len() / input.leaflet_target_rows,
     );
     let mut matched: Vec<RunRecordV2> = Vec::new();
+    let mut graph_deltas = GraphDeltas::new();
 
     for (i, slices) in leaflet_slices.iter().enumerate() {
         let entry = &dir.entries[i];
@@ -229,6 +257,7 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
                 (slices.novelty, slices.novelty_ops),
                 (slices.superseded, slices.superseded_ops),
                 &mut matched,
+                &mut graph_deltas,
             )?;
             processed.append(&mut merged);
         }
@@ -237,6 +266,7 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
     // Assemble processed leaflets into leaf blob(s).
     let mut output = assemble_output_leaves(processed, input)?;
     output.matched = matched;
+    output.graph_deltas = graph_deltas;
     Ok(output)
 }
 
@@ -376,6 +406,7 @@ fn passthrough_entire_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdate
             replaced_leaf_cid: None,
         }],
         matched: Vec::new(),
+        graph_deltas: GraphDeltas::new(),
     })
 }
 
@@ -435,6 +466,7 @@ fn passthrough_leaflet(
 ///
 /// May produce multiple `ProcessedLeafletV3` if the merged result exceeds
 /// `leaflet_target_rows` or requires segmentation splits.
+#[allow(clippy::too_many_arguments)]
 fn merge_and_encode_leaflet(
     input: &LeafUpdateInput<'_>,
     entry: &LeafletDirEntryV3,
@@ -443,6 +475,7 @@ fn merge_and_encode_leaflet(
     (novelty, novelty_ops): (&[RunRecordV2], &[u8]),
     (superseded, superseded_ops): (&[RunRecordV2], &[u8]),
     matched: &mut Vec<RunRecordV2>,
+    graph_deltas: &mut GraphDeltas,
 ) -> io::Result<Vec<ProcessedLeafletV3>> {
     // 1. Load existing leaflet columns. A leaflet emptied by a prior
     //    retract-all (`empty_encoded_leaflet_with_keys`) carries no column
@@ -477,6 +510,7 @@ fn merge_and_encode_leaflet(
         superseded,
         superseded_ops,
         order,
+        purge: input.pool.purge,
     };
     let MergeOutput {
         records: merged,
@@ -484,6 +518,29 @@ fn merge_and_encode_leaflet(
         matched: leaflet_matched,
     } = merge_novelty(&merge_input);
     matched.extend(leaflet_matched);
+    if input.pool.tally {
+        for row in 0..batch.row_count {
+            graph_deltas
+                .entry(batch.g_id.get_or(row, 0))
+                .or_default()
+                .rows -= 1;
+        }
+        for rec in &merged {
+            graph_deltas.entry(rec.g_id).or_default().rows += 1;
+        }
+        for h in &existing_history {
+            graph_deltas.entry(h.g_id).or_default().history -= 1;
+        }
+        for h in &history {
+            graph_deltas.entry(h.g_id).or_default().history += 1;
+        }
+    }
+
+    // A leaflet left with neither rows nor history (only a purge empties
+    // one: a retraction always leaves history) has nothing to keep.
+    if merged.is_empty() && history.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // 4. Handle empty-after-retract: valid in V3 (history preserved in sidecar).
     //    Preserve the original leaflet's key range and constants so branch
@@ -554,7 +611,7 @@ fn widen_leaflet_keys_over_history(
             t: entry.t,
             o_i: entry.o_i,
             o_type: entry.o_type,
-            g_id: 0,
+            g_id: entry.g_id,
         };
         write_ordered_key_v2(order, &rec, &mut key);
         if key < encoded.first_key {
@@ -603,7 +660,7 @@ fn split_by_segmentation_and_size(
 
 /// Find the end of the homogeneous segment starting at `start`.
 fn find_segment_end(records: &[RunRecordV2], start: usize, order: RunSortOrder) -> usize {
-    match order {
+    match order.base() {
         RunSortOrder::Post | RunSortOrder::Psot => {
             let p_id = records[start].p_id;
             records[start..]
@@ -618,8 +675,8 @@ fn find_segment_end(records: &[RunRecordV2], start: usize, order: RunSortOrder) 
                 .position(|r| r.o_type != o_type)
                 .map_or(records.len(), |pos| start + pos)
         }
-        RunSortOrder::Spot => {
-            // No segmentation — entire slice is one segment.
+        _ => {
+            // SPOT / GSPO: no segmentation — entire slice is one segment.
             records.len()
         }
     }
@@ -659,7 +716,7 @@ fn partition_history_to_chunks(
             t: 0,
             o_i: entry.o_i,
             o_type: entry.o_type,
-            g_id: 0,
+            g_id: entry.g_id,
         };
 
         // Find the chunk this entry belongs to via binary search on boundaries.
@@ -687,6 +744,7 @@ fn assemble_output_leaves(
         return Ok(LeafUpdateOutput {
             leaves: vec![],
             matched: Vec::new(),
+            graph_deltas: GraphDeltas::new(),
         });
     }
 
@@ -747,6 +805,7 @@ fn assemble_output_leaves(
     Ok(LeafUpdateOutput {
         leaves: output,
         matched: Vec::new(),
+        graph_deltas: GraphDeltas::new(),
     })
 }
 
@@ -764,7 +823,7 @@ fn build_leaf_from_group(
 
     // Build sidecar from history entries, leaving out what retention drops
     // (carried-forward history included).
-    let mut sidecar_builder = HistSidecarBuilder::new();
+    let mut sidecar_builder = HistSidecarBuilder::for_order(order);
     for (_, history, _) in &group {
         sidecar_builder.start_leaflet();
         for entry in history {
@@ -1034,6 +1093,7 @@ mod tests {
         let (leaf_bytes, sidecar) = build_test_leaf(&records, RunSortOrder::Spot);
 
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &[],
             novelty_ops: &[],
@@ -1064,6 +1124,7 @@ mod tests {
 
         // Small targets force the merged 400 rows to split into multiple leaves.
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1134,6 +1195,7 @@ mod tests {
         let novelty = vec![rec2(301, 1, 0, 5)];
         let ops = vec![1u8];
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1174,6 +1236,7 @@ mod tests {
         let ops = vec![1u8];
 
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1206,6 +1269,7 @@ mod tests {
         let ops = vec![0u8];
 
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1235,6 +1299,7 @@ mod tests {
         let ops = vec![0u8];
 
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1273,6 +1338,7 @@ mod tests {
         let ops = vec![0u8, 0];
 
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1320,6 +1386,7 @@ mod tests {
         let retracts = vec![rec2(100, 1, 10, 5), rec2(200, 1, 20, 5)];
         let ops = vec![0u8, 0];
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &retracts,
             novelty_ops: &ops,
@@ -1344,6 +1411,7 @@ mod tests {
         let novelty = vec![rec2(150, 1, 15, 9)];
         let ops = vec![1u8];
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: empty_leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1434,6 +1502,7 @@ mod tests {
         let retracts = vec![rec2(30, 1, 30, 5), rec2(40, 1, 40, 5)];
         let ops = vec![0u8, 0];
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &retracts,
             novelty_ops: &ops,
@@ -1456,6 +1525,7 @@ mod tests {
         let novelty = vec![rec2(35, 1, 35, 9)];
         let ops = vec![1u8];
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &gen1.leaves[0].info.leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1505,6 +1575,7 @@ mod tests {
                 o_i: OI_NONE,
                 t,
                 op,
+                g_id: 0,
             });
         }
         let leaves = writer.finish().unwrap();
@@ -1526,6 +1597,7 @@ mod tests {
         let novelty = vec![rec2(100, 2, 20, 9)];
         let ops = vec![1u8];
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf.leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1574,6 +1646,7 @@ mod tests {
                 o_i: OI_NONE,
                 t,
                 op,
+                g_id: 0,
             });
         }
         let leaves = writer.finish().unwrap();
@@ -1588,6 +1661,7 @@ mod tests {
         let novelty = vec![rec2(100, 2, 11, 9)];
         let ops = vec![1u8];
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf.leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
@@ -1641,6 +1715,7 @@ mod tests {
         let ops = vec![0u8, 1, 1, 1, 1, 0];
 
         let input = LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,

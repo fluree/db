@@ -86,9 +86,9 @@ ReindexOptions::default()
 
 // Custom configuration
 let config = IndexerConfig::default()
-    .with_gc_max_old_indexes(10)       // Keep more old index versions
-    .with_gc_min_time_mins(60)         // Retain for at least 60 minutes
-    .with_gc_hard_max_old_indexes(Some(40)) // Collect past 40 versions even inside the age guard
+    .with_gc_max_old_indexes(10)       // Always keep 10 old index versions
+    .with_gc_min_time_mins(60)         // Keep a superseded version for 60 minutes
+    .with_gc_hard_max_old_indexes(Some(40)) // Past 40 old versions, collect even inside the age guard
     .with_run_budget_bytes(1 << 30)    // 1 GB memory budget for sort buffers
     .with_data_dir("/data/fluree");    // Directory for index artifacts
 
@@ -104,9 +104,9 @@ Key `IndexerConfig` fields:
 | `leaf_max_bytes` | 375,000 | Maximum bytes per leaf node (triggers split) |
 | `branch_target_children` | 100 | Target children per branch node |
 | `branch_max_children` | 200 | Maximum children per branch node |
-| `gc_max_old_indexes` | 5 | Old index versions to retain before GC |
-| `gc_min_time_mins` | 15 | Minimum age (minutes) before an index can be GC'd |
-| `gc_hard_max_old_indexes` | unset | Version ceiling past which the age guard is overridden. Bounds versions, not bytes, and can release artifacts a still-running query needs — see [Index Retention](background-indexing.md#index-retention) |
+| `gc_max_old_indexes` | 0 | Old index versions always kept, whatever their age |
+| `gc_min_time_mins` | 15 | Minutes a superseded index version is kept, so a query that started on it can finish |
+| `gc_hard_max_old_indexes` | `Some(10)` | Version ceiling past which the age guard is overridden; `None` removes it. Bounds versions, not bytes, and can release artifacts a still-running query needs — see [Index Retention](background-indexing.md#index-retention) |
 | `run_budget_bytes` | 256 MB | Memory budget for sort buffers (split across all sort orders) |
 | `data_dir` | System temp dir | Base directory for index artifacts |
 | `incremental_enabled` | true | Background indexing: attempt incremental updates before full rebuild |
@@ -172,7 +172,7 @@ The reindex operation:
    - **Phase F**: Uploads dictionaries and index artifacts to CAS, creates `IndexRoot` (FIR6)
 4. **Validates** that no new commits arrived during the build (conflict detection)
 5. **Publishes** the new index root via `publish_index_allow_equal`
-6. **Spawns** async garbage collection to clean up old index versions
+6. **Spawns** async garbage collection to clean up old index versions, under the same [retention settings](background-indexing.md#index-retention) as background indexing
 
 The published root links the index version it supersedes and carries a garbage manifest naming what that version replaced, so the new root participates in the GC chain like any incremental build. Roots published by Fluree **4.1.4 or earlier** did neither: they severed the chain, leaving every earlier root permanently unreachable for garbage collection. A ledger reindexed on one of those versions still holds those artifacts, and only a [storage sweep](background-indexing.md#reclaiming-orphaned-artifacts) reclaims them.
 

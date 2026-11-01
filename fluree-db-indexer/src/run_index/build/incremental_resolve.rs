@@ -25,6 +25,7 @@ use fluree_db_binary_index::format::run_record::{cmp_for_order, RunRecord, RunSo
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_core::content_id::ContentId;
 use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::same_t::op_order;
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -193,9 +194,9 @@ pub struct IncrementalNovelty {
     /// Total retractions.
     pub delta_retracts: u64,
     /// Base vector arena counts per (g_id, p_id) for handle offsetting.
-    pub base_vector_counts: HashMap<(u16, u32), u32>,
+    pub base_vector_counts: HashMap<(fluree_db_core::GraphId, u32), u32>,
     /// Base numbig arena counts per (g_id, p_id).
-    pub base_numbig_counts: HashMap<(u16, u32), usize>,
+    pub base_numbig_counts: HashMap<(fluree_db_core::GraphId, u32), usize>,
     /// String text bytes for fulltext assertion entries.
     pub fulltext_string_bytes: HashMap<u32, Vec<u8>>,
     /// Triple terms first interned by this window as `(p_id, seq, key bytes)`,
@@ -308,7 +309,7 @@ pub async fn resolve_incremental_commits_v6(
     let (base_numbig_counts, base_vector_counts, vector_manifests, t_seed_arenas_ms) = {
         let t0 = Instant::now();
 
-        let mut base_numbig_counts: HashMap<(u16, u32), usize> = HashMap::new();
+        let mut base_numbig_counts: HashMap<(fluree_db_core::GraphId, u32), usize> = HashMap::new();
         for ga in &root.graph_arenas {
             if ga.numbig.is_empty() {
                 continue;
@@ -331,9 +332,9 @@ pub async fn resolve_incremental_commits_v6(
             }
         }
 
-        let mut base_vector_counts: HashMap<(u16, u32), u32> = HashMap::new();
+        let mut base_vector_counts: HashMap<(fluree_db_core::GraphId, u32), u32> = HashMap::new();
         let mut vector_manifests: Vec<(
-            u16,
+            fluree_db_core::GraphId,
             u32,
             fluree_db_binary_index::arena::vector::VectorManifest,
         )> = Vec::new();
@@ -676,7 +677,8 @@ pub async fn resolve_incremental_commits_v6(
     let prior_attachments = if attachments.is_empty() {
         HashMap::new()
     } else {
-        let mut keys: Vec<(u16, u64)> = attachments.iter().map(|a| (a.g_id, a.ann)).collect();
+        let mut keys: Vec<(fluree_db_core::GraphId, u64)> =
+            attachments.iter().map(|a| (a.g_id, a.ann)).collect();
         keys.sort_unstable();
         keys.dedup();
         base_attachment_states(
@@ -745,7 +747,7 @@ pub async fn resolve_incremental_commits_v6(
                 ))
             })?;
         }
-        let prior = |g_id: u16, ann: u64| {
+        let prior = |g_id: fluree_db_core::GraphId, ann: u64| {
             prior_attachments
                 .get(&(g_id, ann))
                 .copied()
@@ -984,9 +986,9 @@ type ResolvedIdentity = (u16, u32);
 /// - A re-assert of a currently-asserted fact is a no-op: the earlier assert
 ///   (and its `t`) survives, matching `NoveltyFactState`'s skip rule.
 /// - Every other op becomes the identity's winner: a retract after an assert,
-///   an assert after a retract, and a repeat retract at higher `t`.
-/// - An assert at the same `t` as a winning retract loses (same-`t` ties
-///   resolve retract-wins), matching `resolve_overlay_ops`.
+///   an assert after a retract (at a later `t` or the same one: a same-`t`
+///   pair holds the assert, [`fluree_db_core::same_t`]), and a repeat retract
+///   at higher `t`.
 ///
 /// Fact identity is the resolved V2 identity `(o_type, o_i)` within the
 /// sort-prefix group — the identity `merge_novelty`, replay, and the query
@@ -1007,8 +1009,10 @@ type ResolvedIdentity = (u16, u32);
 /// lifecycle steps the winner stream collapses away; `merge_novelty` turns
 /// the ones that were real state transitions into history-sidecar entries so
 /// index-served time travel can see states a fact held only within this
-/// window. No-op re-asserts and same-`t` losers are discarded outright: they
-/// transition nothing anywhere.
+/// window. A same-`t` pair's retraction is superseded like any other
+/// replaced winner, so the merge walks the same events a full rebuild does
+/// and writes the same row and sidecar. No-op re-asserts are discarded
+/// outright: they transition nothing anywhere.
 pub(crate) fn dedup_fact_lifecycles(
     mut records: Vec<RunRecord>,
     o_types: &OTypeRegistry,
@@ -1051,10 +1055,10 @@ pub(crate) fn dedup_fact_lifecycles(
 /// in `keyed` in comparator order (`dt`, `t`, `op`) and appending superseded
 /// events to `superseded`.
 ///
-/// The group is keyed by resolved V2 identity and sorted by
-/// `(identity, t, op)` first: the incoming `(g_id, SPOT)` order interleaves
-/// `dt` before `t`, so events of one identity spread across `dt` variants
-/// would otherwise arrive out of chronological order.
+/// The group is keyed by resolved V2 identity and sorted by identity, then
+/// [`op_order`]: the incoming `(g_id, SPOT)` order interleaves `dt` before
+/// `t`, so events of one identity spread across `dt` variants would
+/// otherwise arrive out of chronological order.
 fn dedup_group(
     group: &[RunRecord],
     o_types: &OTypeRegistry,
@@ -1074,12 +1078,13 @@ fn dedup_group(
     }));
     keyed.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
-            .then(a.1.t.cmp(&b.1.t))
-            .then(a.1.op.cmp(&b.1.op))
+            .then(op_order(a.1.t, a.1.op == 1).cmp(&op_order(b.1.t, b.1.op == 1)))
     });
 
     // Compact each identity run to its winner, in place. Replaced winners
-    // are the identity's intermediate lifecycle steps → superseded.
+    // are the identity's intermediate lifecycle steps → superseded. Walked in
+    // `op_order`, every event replaces the current winner (a same-`t` assert
+    // included) except a re-assert of an asserted fact.
     let mut w = 0;
     for r in 1..keyed.len() {
         if keyed[r].0 != keyed[w].0 {
@@ -1091,8 +1096,7 @@ fn dedup_group(
         let rec = keyed[r].1;
         let winner = &mut keyed[w].1;
         let noop_reassert = rec.op == 1 && winner.op == 1;
-        let same_t_retract_wins = rec.op == 1 && winner.op == 0 && rec.t == winner.t;
-        if !noop_reassert && !same_t_retract_wins {
+        if !noop_reassert {
             superseded.push(*winner);
             *winner = rec;
         }
@@ -1190,11 +1194,11 @@ async fn seed_vector_fact_handles(
     // Walk every graph that has vector arenas; for each, scan SPOT for
     // VECTOR_ID rows and decode (s_ns_code, s_name, p_id, o_i, value) →
     // handle into the shared fact map.
-    let graphs_with_vectors: Vec<u16> = shared.vectors.keys().copied().collect();
+    let graphs_with_vectors: Vec<fluree_db_core::GraphId> =
+        shared.vectors.keys().copied().collect();
     for g_id in graphs_with_vectors {
-        let branch = match store.branch_for_order(g_id, RunSortOrder::Spot) {
-            Some(b) => Arc::clone(b),
-            None => continue,
+        let Some(tree) = store.graph_tree(g_id, RunSortOrder::Spot) else {
+            continue;
         };
         let arena_map = match shared.vectors.get(&g_id) {
             Some(m) => m,
@@ -1202,16 +1206,41 @@ async fn seed_vector_fact_handles(
         };
         let filter = BinaryFilter {
             o_type: Some(OType::VECTOR.as_u16()),
+            g_id: tree.g_filter,
             ..Default::default()
         };
-        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
-        let mut cursor = BinaryCursor::scan_all(
-            Arc::clone(&store),
-            RunSortOrder::Spot,
-            branch,
-            filter,
-            projection,
-        );
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, tree.order);
+        let mut cursor = match tree.g_filter {
+            // The graph's run of the pooled GSPO.
+            Some(g) => {
+                let bound =
+                    |low: bool| fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                        s_id: fluree_db_core::subject_id::SubjectId(if low { 0 } else { u64::MAX }),
+                        o_key: if low { 0 } else { u64::MAX },
+                        p_id: if low { 0 } else { u32::MAX },
+                        t: if low { 0 } else { u32::MAX },
+                        o_i: if low { 0 } else { u32::MAX },
+                        o_type: if low { 0 } else { u16::MAX },
+                        g_id: g,
+                    };
+                BinaryCursor::new(
+                    Arc::clone(&store),
+                    tree.order,
+                    tree.branch,
+                    &bound(true),
+                    &bound(false),
+                    filter,
+                    projection,
+                )
+            }
+            None => BinaryCursor::scan_all(
+                Arc::clone(&store),
+                tree.order,
+                tree.branch,
+                filter,
+                projection,
+            ),
+        };
         let fact_map = shared.vector_fact_handles.entry(g_id).or_default();
         while let Some(batch) = cursor.next_batch()? {
             for i in 0..batch.row_count {
@@ -1275,9 +1304,9 @@ async fn base_attachment_states(
     root: &IndexRoot,
     predicates: &crate::run_index::resolve::global_dict::PredicateDict,
     slots: [Option<u32>; 3],
-    keys: &[(u16, u64)],
+    keys: &[(fluree_db_core::GraphId, u64)],
     strings: &mut WindowStrings<'_>,
-) -> io::Result<HashMap<(u16, u64), [Option<SlotValue>; 3]>> {
+) -> io::Result<HashMap<(fluree_db_core::GraphId, u64), [Option<SlotValue>; 3]>> {
     use crate::run_index::resolve::link_synth::ObjectId;
     use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
     use fluree_db_core::o_type::OType;
@@ -2024,13 +2053,20 @@ mod tests {
         assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
     }
 
-    /// Same-`t` ties resolve retract-wins, matching `resolve_overlay_ops` and
-    /// `NoveltyFactState`. Sorted input puts the retract first (op 0 < 1).
+    /// A same-`t` pair holds the assert ([`fluree_db_core::same_t`]), as
+    /// `resolve_overlay_ops`, `NoveltyFactState` and the full rebuild resolve
+    /// it, whatever the input's order. The losing retract is superseded, so
+    /// the merge walks both events, as a rebuild does.
     #[test]
-    fn same_t_retract_beats_assert() {
-        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)];
-        let out = dedup(records);
-        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+    fn same_t_assert_beats_retract() {
+        for records in [
+            vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)],
+            vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 5, OP_RETRACT)],
+        ] {
+            let (out, superseded) = dedup_with_superseded(records);
+            assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+            assert_eq!(keys(&superseded), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+        }
     }
 
     /// Distinct language tags on `rdf:langString` values are distinct fact

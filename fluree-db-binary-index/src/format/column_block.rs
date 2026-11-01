@@ -18,11 +18,14 @@ pub enum ColumnId {
     OKey = 3,
     OI = 4,
     T = 5,
+    /// Graph of each row; present only in pooled-tree leaflets. Its block
+    /// width follows the largest id it holds (2 or 4 bytes).
+    GId = 6,
 }
 
 impl ColumnId {
     /// Number of columns; `from_u16` accepts exactly `0..COUNT`.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 
     pub const fn from_u16(v: u16) -> Option<Self> {
         match v {
@@ -32,6 +35,7 @@ impl ColumnId {
             3 => Some(Self::OKey),
             4 => Some(Self::OI),
             5 => Some(Self::T),
+            6 => Some(Self::GId),
             _ => None,
         }
     }

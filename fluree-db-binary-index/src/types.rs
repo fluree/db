@@ -108,7 +108,7 @@ pub struct OverlayOp {
 /// `cmp_for_order`, `cmp_row_vs_overlay`, and `cmp_row_vs_record` so
 /// that the merge cursors see a consistent sequence.
 pub fn sort_overlay_ops(ops: &mut [OverlayOp], order: RunSortOrder) {
-    ops.sort_unstable_by(|a, b| match order {
+    ops.sort_unstable_by(|a, b| match order.base() {
         RunSortOrder::Spot => a
             .s_id
             .cmp(&b.s_id)
@@ -130,7 +130,7 @@ pub fn sort_overlay_ops(ops: &mut [OverlayOp], order: RunSortOrder) {
             .then(a.o_key.cmp(&b.o_key))
             .then(a.dt.cmp(&b.dt))
             .then(a.s_id.cmp(&b.s_id)),
-        RunSortOrder::Opst => a
+        _ => a
             .o_kind
             .cmp(&b.o_kind)
             .then(a.o_key.cmp(&b.o_key))

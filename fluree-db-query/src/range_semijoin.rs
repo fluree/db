@@ -635,6 +635,7 @@ impl RangeSemiJoinOperator {
             || ctx.is_history_range()
             || !ctx.overlay_free_single_graph()
             || ctx.to_t < store.max_t()
+            || store.is_pooled(ctx.binary_g_id)
         {
             return Ok(WalkOutcome::Declined);
         }

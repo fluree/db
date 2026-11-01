@@ -561,7 +561,7 @@ impl crate::Fluree {
                         .await?;
                         Ok::<_, ApiError>((
                             want_keys.then_some(keys),
-                            Some(data.flakes),
+                            Some(data.net.flakes),
                             Some((data.namespace_delta, data.graph_iris)),
                         ))
                     } else {

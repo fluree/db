@@ -49,31 +49,32 @@ fn ctx() -> JsonValue {
     })
 }
 
-async fn count_items(fluree: &fluree_db_api::Fluree, ledger: &fluree_db_api::LedgerState) -> usize {
-    // SPARQL `SELECT (COUNT(*) AS ?c)` counts binding rows — each distinct
-    // flake matching the pattern contributes one row, so list entries at
-    // distinct positions with distinct values each get counted.
-    let sparql = "\
-        PREFIX ex: <http://example.org/> \
-        SELECT (COUNT(*) AS ?c) WHERE { ex:alice ex:items ?o }";
-    let result = support::query_sparql(fluree, ledger, sparql)
+/// Rows `query` matches: a JSON-LD query, which sees each stored list entry
+/// as a value (SPARQL sees a list's owner edge and cells instead).
+async fn count_rows(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    query: &JsonValue,
+) -> usize {
+    let result = support::query_jsonld(fluree, ledger, query)
         .await
-        .expect("sparql count");
+        .expect("count query");
     let jsonld = result
         .to_jsonld_async(ledger.as_graph_db_ref(0))
         .await
         .expect("to_jsonld_async");
-    let arr = jsonld.as_array().expect("array result");
-    if arr.is_empty() {
-        return 0;
-    }
-    // SPARQL always returns array-of-arrays (one inner array per binding row).
-    arr[0]
-        .as_array()
-        .and_then(|row| row.first())
-        .and_then(serde_json::Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(0)
+    jsonld.as_array().expect("array result").len()
+}
+
+async fn count_items(fluree: &fluree_db_api::Fluree, ledger: &fluree_db_api::LedgerState) -> usize {
+    // One row per stored entry: list entries at distinct positions with
+    // distinct values each get counted.
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?o"],
+        "where": {"@id": "ex:alice", "ex:items": "?o"}
+    });
+    count_rows(fluree, ledger, &query).await
 }
 
 /// Three distinct `@list` entries, wildcard DELETE WHERE.
@@ -201,24 +202,15 @@ async fn filtered_delete_retracts_tagged_subjects_with_lists_in_novelty() {
     let count_all = |ledger: fluree_db_api::LedgerState, tag: &'static str| {
         let fluree = &fluree;
         async move {
-            let sparql = format!(
-                "PREFIX ex: <http://example.org/> \
-                 SELECT (COUNT(*) AS ?c) WHERE {{ \
-                   ?s ex:sourceDocument ex:doc-{tag} . ?s ?p ?o }}"
-            );
-            let result = support::query_sparql(fluree, &ledger, &sparql)
-                .await
-                .expect("sparql count");
-            let jsonld = result
-                .to_jsonld_async(ledger.as_graph_db_ref(0))
-                .await
-                .expect("to_jsonld_async");
-            let arr = jsonld.as_array().expect("array result");
-            arr.first()
-                .and_then(JsonValue::as_array)
-                .and_then(|row| row.first())
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(0)
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": ["?s", "?p", "?o"],
+                "where": [
+                    {"@id": "?s", "ex:sourceDocument": {"@id": format!("ex:doc-{tag}")}},
+                    {"@id": "?s", "?p": "?o"}
+                ]
+            });
+            count_rows(fluree, &ledger, &query).await as u64
         }
     };
 
@@ -328,24 +320,15 @@ async fn filtered_delete_with_lists_on_indexed_base_plus_novelty() {
     let count_all = |ledger: fluree_db_api::LedgerState, tag: &'static str| {
         let fluree = &fluree;
         async move {
-            let sparql = format!(
-                "PREFIX ex: <http://example.org/> \
-                 SELECT (COUNT(*) AS ?c) WHERE {{ \
-                   ?s ex:sourceDocument ex:doc-{tag} . ?s ?p ?o }}"
-            );
-            let result = support::query_sparql(fluree, &ledger, &sparql)
-                .await
-                .expect("sparql count");
-            let jsonld = result
-                .to_jsonld_async(ledger.as_graph_db_ref(0))
-                .await
-                .expect("to_jsonld_async");
-            let arr = jsonld.as_array().expect("array result");
-            arr.first()
-                .and_then(JsonValue::as_array)
-                .and_then(|row| row.first())
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(0)
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": ["?s", "?p", "?o"],
+                "where": [
+                    {"@id": "?s", "ex:sourceDocument": {"@id": format!("ex:doc-{tag}")}},
+                    {"@id": "?s", "?p": "?o"}
+                ]
+            });
+            count_rows(fluree, &ledger, &query).await as u64
         }
     };
 
