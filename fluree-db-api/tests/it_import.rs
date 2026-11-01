@@ -1149,16 +1149,17 @@ ex:alice ex:items ( 'a' 'b' 'c' ) .
     // And it is not merely reported: a filtered DELETE of one entry has to
     // land, which needs hydration to have run.
     let ctx = json!({"ex": "http://example.org/"});
+    // The projection writes the list as an `@list` object.
     let items = |v: &serde_json::Value| -> Vec<String> {
         v.as_array()
             .and_then(|a| a.first())
             .and_then(|node| node.get("ex:items"))
-            .map(|v| match v {
-                serde_json::Value::Array(a) => a
-                    .iter()
+            .and_then(|v| v.get("@list"))
+            .and_then(|list| list.as_array())
+            .map(|a| {
+                a.iter()
                     .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect(),
-                other => other.as_str().map(str::to_string).into_iter().collect(),
+                    .collect()
             })
             .unwrap_or_default()
     };

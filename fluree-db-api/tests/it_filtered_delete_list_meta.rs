@@ -69,8 +69,9 @@ async fn list_values(
     list_items(fluree, ledger, subject, "ex:items").await
 }
 
-/// Items of `subject`'s `pred` list; language-tagged entries render as
-/// `value@lang` so two tags on the same lexical form stay distinguishable.
+/// Members of `subject`'s `pred` lists, in order (the projection writes each
+/// list as an `@list` object); language-tagged entries render as `value@lang`
+/// so two tags on the same lexical form stay distinguishable.
 async fn list_items(
     fluree: &fluree_db_api::Fluree,
     ledger: &fluree_db_api::LedgerState,
@@ -99,12 +100,18 @@ async fn list_items(
             _ => None,
         }
     };
+    let members = |v: &serde_json::Value| -> Vec<String> {
+        match v.get("@list") {
+            Some(serde_json::Value::Array(list)) => list.iter().filter_map(render).collect(),
+            _ => render(v).into_iter().collect(),
+        }
+    };
     rows.as_array()
         .and_then(|a| a.first())
         .and_then(|node| node.get(pred))
         .map(|v| match v {
-            serde_json::Value::Array(items) => items.iter().filter_map(render).collect(),
-            other => render(other).into_iter().collect(),
+            serde_json::Value::Array(items) => items.iter().flat_map(members).collect(),
+            other => members(other),
         })
         .unwrap_or_default()
 }
