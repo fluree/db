@@ -757,7 +757,8 @@ impl ErasureIndex {
         read.insert(self.write_map(&erased).await?);
         self.install(erased);
         // Past a bound, one object holding everything replaces the objects
-        // listed: what they hold is in the index, which loaded them all.
+        // read: what they hold is in the index. One listed but not read,
+        // another instance's since the last listing, is not.
         let objects = self.storage.list_prefix(&self.address("map/")).await?;
         if objects.len() >= COMPACT_AT {
             let all: Vec<ErasedCommit> = self
@@ -768,7 +769,10 @@ impl ErasureIndex {
                 .collect();
             let union = self.write_map(&all).await?;
             read.insert(union.clone());
-            let stale: Vec<String> = objects.into_iter().filter(|o| *o != union).collect();
+            let stale: Vec<String> = objects
+                .into_iter()
+                .filter(|o| *o != union && read.contains(o))
+                .collect();
             for (address, e) in self.storage.delete_many(&stale).await {
                 tracing::warn!(%address, error = %e, "erasure: compacted map object not deleted");
             }
@@ -1315,5 +1319,33 @@ mod tests {
         merge(&mut held, erased(&["a"], &["f2"]));
         assert_eq!(held["c"].steps.len(), 2);
         assert_eq!(held["c"].replaced_at, ["f1", "f2"]);
+    }
+
+    /// A compaction deletes only the map objects it has read: one another
+    /// instance on the storage wrote since this one last listed them holds
+    /// what this one's union does not.
+    #[tokio::test]
+    async fn a_compaction_keeps_the_map_objects_it_has_not_read() {
+        let storage: Arc<dyn Storage> = Arc::new(fluree_db_core::MemoryStorage::new());
+        let index = || ErasureIndex::new(storage.clone(), Arc::new(Verifier::default()));
+        let (a, b) = (index(), index());
+        let original = erased(0);
+        let cid: ContentId = original.commit.parse().unwrap();
+        let at = |folder: &str| {
+            format!(
+                "fluree:memory://{folder}/main/commit/{}.fcv2",
+                cid.address_digest()
+            )
+        };
+        a.publish(vec![original]).await.unwrap();
+        b.record_replaced_at(&[at("other")]).await.unwrap();
+        for n in 0..COMPACT_AT {
+            a.record_replaced_at(&[at(&format!("copy{n}"))])
+                .await
+                .unwrap();
+        }
+        assert!(a.fresh(), "a compacted without listing the maps again");
+        let held = index().erased(&cid).await.unwrap().unwrap();
+        assert!(held.replaced_at.contains(&at("other")), "{held:?}");
     }
 }
