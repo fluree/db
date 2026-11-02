@@ -3461,7 +3461,10 @@ async fn live_differential(backend: &LiveBackend) {
     let mut cfg = fluree_db_sql::SqlGsConfig::new(url.clone());
     cfg.dialect = backend.dialect;
     let cfg = cfg.hydrate(None).await.expect("hydrate");
-    let auth = cfg.auth.create_provider_arc().expect("auth");
+    let auth = cfg
+        .auth
+        .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+        .expect("auth");
     let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
     for stmt in backend.seed {
         client
@@ -4209,8 +4212,8 @@ mod source_lookups_fail {
         async fn all_records(&self) -> Result<Vec<NsRecord>> {
             self.0.all_records().await
         }
-        async fn list_branches(&self, name: &str) -> Result<Vec<NsRecord>> {
-            self.0.list_branches(name).await
+        async fn branch_records(&self, name: &str) -> Result<Vec<NsRecord>> {
+            self.0.branch_records(name).await
         }
         async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
             self.0.heads(id).await

@@ -65,12 +65,7 @@ Wherever a query or an update names a graph of the ledger it reads or writes, on
 - A `GRAPH ?g` template writes the graph its binding names in this table, which is the graph the `WHERE` read: `DELETE { GRAPH ?g { ?s ?p ?o } } USING NAMED <mydb:main> WHERE { GRAPH ?g { ?s ?p ?o } }` deletes from the default graph.
 - The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`, and the address with a reserved keyword is the same graph in every position. `CLEAR`, `DROP`, `ADD`, `COPY` and `MOVE` refuse both reserved graphs, by either name. A branch made from an indexed ledger keeps its source's reserved IRIs (`urn:fluree:mydb:main#config` on `mydb:feature`), and `mydb:feature#config` names the graph at that place in reads and writes alike.
 
-A graph registered under the ledger's address by an earlier version (for instance by a TriG block `GRAPH <mydb:main> { … }`) keeps its data and is reached as `<mydb:main#mydb:main>`: the address, `#`, and the IRI it is registered under. One registered under the address with a keyword is reached the same way, as `<mydb:main#mydb:main#config>`. `GRAPH ?g` lists it under that name, in queries and updates alike, so a `?g` binding reads it back. The graph-management verbs (`CLEAR`, `DROP`, `ADD`, `COPY`, `MOVE`) read `mydb:main#<g>` as the graph `<g>` too, so `DROP GRAPH <mydb:main#mydb:main#config>` acts on such a graph. The address alone keeps naming the graph registered under it, never the default graph, so they also reach that graph by the address itself; to move its data into the default graph:
-
-```sparql
-ADD GRAPH <mydb:main> TO DEFAULT ;
-DROP GRAPH <mydb:main>
-```
+An earlier version could register a graph under the ledger's address; how to reach and move one is in [Behavior changes](../reference/compatibility.md#a-ledgers-own-address-names-its-default-graph-in-every-graph-position).
 
 #### Named graphs with no default graph (changed in 4.1.4)
 

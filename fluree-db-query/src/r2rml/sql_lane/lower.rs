@@ -112,6 +112,7 @@ enum ExprKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RdfClass {
     Iri,
+    /// An `xsd:string`; on a column, one the database holds as text.
     Str,
     LangStr(String),
     Numeric,
@@ -119,6 +120,54 @@ pub(crate) enum RdfClass {
     Date,
     DateTime,
     Other,
+    /// A string the engine renders from a column the database holds as another
+    /// type (an un-annotated or language-tagged `rr:column` over a `bigint`, a
+    /// `double`, a `date`), or whose type the probe did not report. The term is
+    /// the materializer's lexical form: it orders as that string (`"10"` before
+    /// `"9"`) where the database orders the column by value, and it compares
+    /// with a string literal where the database would cast the literal. So no
+    /// comparison or ordering of it is pushed, and equality only where
+    /// [`RdfClass::database_eq_is_exact`] holds.
+    Rendered {
+        /// The column's probed type, when the probe reported one.
+        ty: Option<FieldType>,
+        /// The literal's language tag, for a language-tagged map: two rendered
+        /// columns are one class only in one language.
+        lang: Option<String>,
+        /// Whether the database's `=` on the column is the rendered strings'
+        /// equality (see [`rendered_eq_is_exact`]).
+        eq_exact: bool,
+    },
+}
+
+impl RdfClass {
+    /// Whether the database's `=` over a column of this class partitions its
+    /// values as the engine's equality of their terms does — what a `GROUP BY`,
+    /// a `DISTINCT`, a `COUNT(DISTINCT)` or a join on the column relies on.
+    /// Only a rendered string can fail it.
+    pub(crate) fn database_eq_is_exact(&self) -> bool {
+        match self {
+            RdfClass::Rendered { eq_exact, .. } => *eq_exact,
+            _ => true,
+        }
+    }
+}
+
+/// Whether the database's `=` on a column of physical type `ty` is equality of
+/// the strings the materializer renders from it. The rendering is one-to-one
+/// for integers, decimals (one scale per column), booleans, dates and bytes,
+/// and for a timestamp the source declares at most microsecond precision
+/// (`fractional_digits`), since a value decodes to the microsecond: a
+/// `timestamp(9)` keeps instants apart that render alike. A float renders
+/// `-0.0` and `0.0` apart where the database groups them, and an unprobed
+/// column cannot be vouched for.
+pub(crate) fn rendered_eq_is_exact(ty: Option<FieldType>, fractional_digits: Option<u8>) -> bool {
+    use FieldType as F;
+    match ty {
+        Some(F::Int32 | F::Int64 | F::Decimal { .. } | F::Boolean | F::Date | F::Bytes) => true,
+        Some(F::Timestamp | F::TimestampTz) => fractional_digits.is_some_and(|d| d <= 6),
+        _ => false,
+    }
 }
 
 /// The columns a variable's value is a function of — what a join, a seed or
@@ -726,9 +775,11 @@ impl<'a> Lowerer<'a> {
                     .col()
                     .is_some_and(|c| !matches!(self.field_type(c), None | Some(FieldType::String)))
             }))
-            && !projected
-                .iter()
-                .any(|v| matches!(self.vars[v].term, TermSource::Union { .. }));
+            && !projected.iter().any(|v| {
+                matches!(self.vars[v].term, TermSource::Union { .. })
+                    || matches!(&self.vars[v].key,
+                        Some(KeyShape::Column { class, .. }) if !class.database_eq_is_exact())
+            });
         let mut accesses: Vec<AccessInfo> = self
             .accesses
             .iter()
@@ -803,14 +854,7 @@ impl<'a> Lowerer<'a> {
         let mut order_columns = HashMap::new();
         for (v, src) in &self.vars {
             if let (Some(KeyShape::Column { col, class }), false) = (&src.key, src.nullable) {
-                let orderable = match class {
-                    RdfClass::Numeric | RdfClass::Date | RdfClass::DateTime | RdfClass::Bool => {
-                        true
-                    }
-                    RdfClass::Str => self.caps.string_order_is_codepoint,
-                    _ => false,
-                };
-                if orderable
+                if orders_as(class, self.field_type(col), self.caps)
                     && self
                         .required_columns
                         .contains(&(col.alias.clone(), col.column.clone()))
@@ -1818,9 +1862,10 @@ impl<'a> Lowerer<'a> {
     fn literal_exact(&self, col: &ColRef, class: &RdfClass) -> bool {
         use FieldType as F;
         let Some(ty) = self.field_type(col) else {
-            return *class != RdfClass::DateTime;
+            return !matches!(class, RdfClass::DateTime | RdfClass::Rendered { .. });
         };
         match class {
+            RdfClass::Rendered { .. } => false,
             RdfClass::Numeric => matches!(
                 ty,
                 F::Int32 | F::Int64 | F::Float32 | F::Float64 | F::Decimal { .. }
@@ -1833,6 +1878,36 @@ impl<'a> Lowerer<'a> {
             }
             RdfClass::Iri | RdfClass::Other => true,
         }
+    }
+
+    /// The class of `col` read as `declared`, given what the database holds: a
+    /// plain or language-tagged string over anything but a text column is
+    /// [`RdfClass::Rendered`].
+    fn column_class(&self, col: &ColRef, declared: RdfClass) -> RdfClass {
+        let ty = self.field_type(col);
+        let lang = match declared {
+            _ if ty == Some(FieldType::String) => return declared,
+            RdfClass::Str => None,
+            RdfClass::LangStr(lang) => Some(lang),
+            declared => return declared,
+        };
+        RdfClass::Rendered {
+            ty,
+            lang,
+            eq_exact: rendered_eq_is_exact(ty, self.fractional_digits(col)),
+        }
+    }
+
+    /// The fractional-second digits the probe reported for `col`, if any. A
+    /// derived table's columns report none.
+    fn fractional_digits(&self, col: &ColRef) -> Option<u8> {
+        let derived = self.derived_types.get(&col.alias);
+        if derived.is_some_and(|cols| cols.contains_key(&col.column)) {
+            return None;
+        }
+        self.schemas
+            .get(&self.rel_source(&col.alias))?
+            .fractional_digits(&col.column)
     }
 
     /// Whether outer values can be sent as a key set on this shape.
@@ -2147,9 +2222,15 @@ impl<'a> Lowerer<'a> {
                 // number — a silently wrong answer rather than an error. Require
                 // both sides to carry the class natively, the rule
                 // `literal_exact` already applies to a literal comparison.
-                // `Str` is exempt: a string join on text columns is exact.
-                if *cl != RdfClass::Str && !(self.literal_exact(l, cl) && self.literal_exact(r, cr))
-                {
+                // `Str` is exempt: a string join on text columns is exact. So is a
+                // rendered string over one column type whose rendering the
+                // database's `=` matches; `-0.0 = 0.0` and `10 = 10.00` are not.
+                let exact = match cl {
+                    RdfClass::Str => true,
+                    RdfClass::Rendered { .. } => cl.database_eq_is_exact(),
+                    _ => self.literal_exact(l, cl) && self.literal_exact(r, cr),
+                };
+                if !exact {
                     return decline("repeated variable joins columns that do not carry the class");
                 }
                 self.push_edge(l.clone(), r.clone());
@@ -2201,8 +2282,11 @@ impl<'a> Lowerer<'a> {
                 language,
                 term_type,
             } => {
-                let class = class_of(datatype.as_deref(), language.as_deref(), *term_type);
                 let col = ColRef::new(alias, column);
+                let class = self.column_class(
+                    &col,
+                    class_of(datatype.as_deref(), language.as_deref(), *term_type),
+                );
                 if !nullable {
                     self.require(alias, column);
                 }
@@ -3622,6 +3706,30 @@ fn parse_triple(tp: &TriplePattern, snapshot: &LedgerSnapshot) -> Lowering<Tp> {
     Ok(Tp { s, p, o })
 }
 
+/// Whether the database orders a column of physical type `ty` as the engine
+/// orders terms of `class`: the type must hold the class natively (an
+/// `xsd:integer` over a text column sorts "9" above "100" in the database and
+/// below it in the engine), and a string orders by code point only where the
+/// dialect does. A rendered string never orders as its column.
+pub(crate) fn orders_as(
+    class: &RdfClass,
+    ty: Option<FieldType>,
+    caps: &PushdownCapabilities,
+) -> bool {
+    use FieldType as F;
+    match class {
+        RdfClass::Numeric => matches!(
+            ty,
+            Some(F::Int32 | F::Int64 | F::Float32 | F::Float64 | F::Decimal { .. })
+        ),
+        RdfClass::Date => ty == Some(F::Date),
+        RdfClass::DateTime => matches!(ty, Some(F::Timestamp | F::TimestampTz)),
+        RdfClass::Bool => ty == Some(F::Boolean),
+        RdfClass::Str => caps.string_order_is_codepoint,
+        _ => false,
+    }
+}
+
 /// The RDF class of an object map's values.
 pub(crate) fn class_of(
     datatype: Option<&str>,
@@ -3975,4 +4083,81 @@ fn triple_is_admissible(tp: &TriplePattern) -> bool {
         );
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(codepoint: bool) -> PushdownCapabilities {
+        PushdownCapabilities {
+            left_join: true,
+            keyset_max_rows: 1000,
+            statement_max_bytes: 1 << 20,
+            string_eq_is_binary: true,
+            string_distinct_is_binary: true,
+            string_order_is_codepoint: codepoint,
+            union_null_is_typed: true,
+            timestamp_is_text: false,
+        }
+    }
+
+    /// The database orders a column as the engine orders its terms only when
+    /// the physical type holds the term's class; a rendered string never.
+    #[test]
+    fn orders_as_needs_the_physical_type_to_hold_the_class() {
+        use FieldType as F;
+        let c = caps(true);
+        assert!(orders_as(&RdfClass::Numeric, Some(F::Int64), &c));
+        assert!(orders_as(
+            &RdfClass::Numeric,
+            Some(F::Decimal {
+                precision: 38,
+                scale: 2
+            }),
+            &c
+        ));
+        assert!(!orders_as(&RdfClass::Numeric, Some(F::String), &c));
+        assert!(!orders_as(&RdfClass::Numeric, None, &c));
+        assert!(orders_as(&RdfClass::Date, Some(F::Date), &c));
+        assert!(!orders_as(&RdfClass::Date, Some(F::String), &c));
+        assert!(orders_as(&RdfClass::DateTime, Some(F::TimestampTz), &c));
+        assert!(!orders_as(&RdfClass::DateTime, Some(F::String), &c));
+        assert!(orders_as(&RdfClass::Bool, Some(F::Boolean), &c));
+        assert!(!orders_as(&RdfClass::Bool, Some(F::Int32), &c));
+        assert!(orders_as(&RdfClass::Str, Some(F::String), &c));
+        assert!(!orders_as(&RdfClass::Str, Some(F::String), &caps(false)));
+        let rendered = RdfClass::Rendered {
+            ty: Some(F::Int64),
+            lang: None,
+            eq_exact: true,
+        };
+        assert!(!orders_as(&rendered, Some(F::Int64), &c));
+    }
+
+    /// Equality on a rendered column is the strings' equality where the
+    /// rendering is one-to-one and the decode lossless.
+    #[test]
+    fn rendered_equality_is_exact_by_type_and_precision() {
+        use FieldType as F;
+        for ty in [F::Int32, F::Int64, F::Boolean, F::Date, F::Bytes] {
+            assert!(rendered_eq_is_exact(Some(ty), None), "{ty:?}");
+        }
+        assert!(rendered_eq_is_exact(
+            Some(F::Decimal {
+                precision: 38,
+                scale: 9
+            }),
+            None
+        ));
+        for ty in [F::Timestamp, F::TimestampTz] {
+            assert!(rendered_eq_is_exact(Some(ty), Some(3)), "{ty:?}");
+            assert!(rendered_eq_is_exact(Some(ty), Some(6)), "{ty:?}");
+            assert!(!rendered_eq_is_exact(Some(ty), Some(9)), "{ty:?}");
+            assert!(!rendered_eq_is_exact(Some(ty), None), "{ty:?}");
+        }
+        for ty in [Some(F::Float32), Some(F::Float64), Some(F::String), None] {
+            assert!(!rendered_eq_is_exact(ty, None), "{ty:?}");
+        }
+    }
 }

@@ -250,7 +250,7 @@ impl LedgerState {
         let (mut snapshot, mut dict_novelty) = match &record.index_head_id {
             Some(index_cid) => {
                 let root_bytes = store.get(index_cid).await?;
-                let loaded = LedgerSnapshot::from_root_bytes(&root_bytes)?;
+                let loaded = LedgerSnapshot::from_root(index_cid, &root_bytes)?;
                 let dn = DictNovelty::with_watermarks(
                     loaded.subject_watermarks.clone(),
                     loaded.string_watermark,
@@ -603,7 +603,7 @@ impl LedgerState {
     /// - `Core` errors from loading the index
     pub async fn apply_index(&mut self, index_id: &ContentId, cs: &dyn ContentStore) -> Result<()> {
         let root_bytes = cs.get(index_id).await?;
-        let new_snapshot = LedgerSnapshot::from_root_bytes(&root_bytes)?;
+        let new_snapshot = LedgerSnapshot::from_root(index_id, &root_bytes)?;
 
         // Verify ledger ID matches
         if new_snapshot.ledger_id != self.snapshot.ledger_id {

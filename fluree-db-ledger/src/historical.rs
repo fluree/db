@@ -132,7 +132,7 @@ impl HistoricalLedgerView {
         let (mut snapshot, index_t) = match record.index_head_id.as_ref() {
             Some(index_cid) => {
                 let root_bytes = store.get(index_cid).await?;
-                let loaded = LedgerSnapshot::from_root_bytes(&root_bytes)?;
+                let loaded = LedgerSnapshot::from_root(index_cid, &root_bytes)?;
                 if target_t < loaded.base_t {
                     tracing::debug!(
                         target_t,
