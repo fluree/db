@@ -144,6 +144,7 @@ fluree graph drop <IRI> [OPTIONS]
 - The graph IRI keeps its `g_id`; a subsequent insert into the same IRI lands in the same logical graph rather than a new slot.
 - Drops are per-branch — sibling branches that share the same graph IRI are not touched.
 - Idempotent: re-running the drop on an already-empty graph reports `committed: false`, `retracted: 0` and produces no new commit.
+- **One commit, sized by the graph.** Every retraction lands in that commit, so a graph holding more facts than `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default 10,000,000; `0` disables) is refused before it is read. A drop that fits that limit but not the ledger's novelty limit (`--reindex-max-bytes`) is refused at commit. Drop a larger graph in batches, e.g. `DELETE { GRAPH <g> { ?s ?p ?o } } WHERE { GRAPH <g> { VALUES ?s { … } ?s ?p ?o } }`.
 
 The following are rejected with a clear error (no commit is produced):
 

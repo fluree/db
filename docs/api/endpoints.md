@@ -2465,11 +2465,12 @@ POST /drop-graph
 - **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
 - **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
 - **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
+- **Bounded.** The drop is one commit holding every retraction. A graph with more facts than `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default 10,000,000; `0` disables) is refused (400) before it is read. A drop larger than the novelty limit (`--reindex-max-bytes`) is refused at commit (413); one that fits only once earlier writes are indexed gets 503.
 
 **Status codes:**
 
 - `200 OK` - Drop succeeded (commit produced or no-op)
-- `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
+- `400 Bad Request` - Malformed IRI, empty IRI, system-graph IRI, or a graph past `FLUREE_MAX_GRAPH_SCAN_FLAKES`
 - `401`/`403` - Admin token required and absent/invalid
 - `404 Not Found` - Ledger or graph IRI not found
 - `500 Internal Server Error` - Server error
