@@ -3879,23 +3879,12 @@ impl BinaryGraphView {
     /// arena. `None` for a handle the arena does not hold, such as a novelty
     /// handle.
     pub fn arena_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<ArenaVector>> {
-        let Some(arena) = self
-            .store
-            .graph_indexes
-            .get(&self.g_id)
-            .and_then(|gi| gi.vectors.get(&p_id))
-        else {
-            return Ok(None);
-        };
-        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
-            return Ok(None);
-        };
         let mut cursor = self.vector_cursor.lock();
         if !matches!(&cursor.identity, Some((p, _)) if *p == p_id) {
             cursor.identity = Some((p_id, self.store.built_vector_identity(self.g_id, p_id)));
         }
         // With the identity table built, the key is its hash and canonical
-        // handle: no shard is read or held.
+        // handle: no shard is read or held, and the arena isn't looked up.
         if let Some((hash, canonical)) = cursor
             .identity
             .as_ref()
@@ -3914,6 +3903,17 @@ impl BinaryGraphView {
                 },
             }));
         }
+        let Some(arena) = self
+            .store
+            .graph_indexes
+            .get(&self.g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
         let held = cursor
             .shard
             .as_ref()
