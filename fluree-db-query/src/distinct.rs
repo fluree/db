@@ -6,6 +6,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::group_aggregate::{binding_to_group_key_normalized, is_vector_binding, GroupKeyOwned};
 use crate::object_binding::{equality_norm, normalize_for_key_cow, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
@@ -34,6 +35,12 @@ pub struct DistinctOperator {
     /// binding (a vector's every component), so growing the table reuses it
     /// rather than hashing each row again.
     seen: HashTable<(u64, RowSignature)>,
+    /// Seen rows that hold a vector, keyed by value
+    /// ([`binding_to_group_key_normalized`]): a stored vector keys as a slice
+    /// of its arena, so neither probing nor keeping a row decodes it. Kept
+    /// apart from `seen` (a vector equals no other term), so a row without
+    /// one pays only the check that it has none.
+    seen_keyed: HashTable<(u64, Vec<GroupKeyOwned>)>,
     /// Output schema (same as child)
     schema: Arc<[VarId]>,
     /// Operator state
@@ -55,6 +62,7 @@ impl DistinctOperator {
         Self {
             child,
             seen: HashTable::new(),
+            seen_keyed: HashTable::new(),
             schema,
             state: OperatorState::Created,
             norm: None,
@@ -68,7 +76,7 @@ impl DistinctOperator {
 
     /// Get the number of unique rows seen so far
     pub fn unique_count(&self) -> usize {
-        self.seen.len()
+        self.seen.len() + self.seen_keyed.len()
     }
 
     /// Extract row signature from batch at given row index.
@@ -136,6 +144,7 @@ impl Operator for DistinctOperator {
 
         self.child.open(ctx).await?;
         self.seen.clear();
+        self.seen_keyed.clear();
         if self.norm.is_none() {
             self.norm = equality_norm(ctx);
         }
@@ -199,9 +208,33 @@ impl Operator for DistinctOperator {
             // Reused across rows: a duplicate row costs a hash and a probe, no
             // allocation; only rows that survive are copied into an owned key.
             let mut scratch: Vec<Cow<'_, Binding>> = Vec::with_capacity(num_cols);
+            let mut keyed: Vec<GroupKeyOwned> = Vec::with_capacity(num_cols);
 
             let (dicts, gv) = EqualityNorm::parts(&self.norm);
             for row_idx in 0..batch.len() {
+                if self.norm.is_some()
+                    && (0..num_cols).any(|col| is_vector_binding(batch.get_by_col(row_idx, col)))
+                {
+                    keyed.clear();
+                    keyed.extend((0..num_cols).map(|col| {
+                        binding_to_group_key_normalized(batch.get_by_col(row_idx, col), dicts, gv)
+                    }));
+                    let mut h = FxHasher::default();
+                    keyed.hash(&mut h);
+                    let hash = h.finish();
+                    let entry = self.seen_keyed.entry(
+                        hash,
+                        |(h, key)| *h == hash && *key == keyed,
+                        |(h, _)| *h,
+                    );
+                    if let Entry::Vacant(v) = entry {
+                        v.insert((hash, std::mem::take(&mut keyed)));
+                        for (col_idx, col) in columns.iter_mut().enumerate() {
+                            col.push(batch.get_by_col(row_idx, col_idx).clone());
+                        }
+                    }
+                    continue;
+                }
                 if self.norm.is_some() {
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
@@ -275,6 +308,7 @@ impl Operator for DistinctOperator {
     fn close(&mut self) {
         self.child.close();
         self.seen.clear(); // Release memory
+        self.seen_keyed.clear();
         self.state = OperatorState::Closed;
     }
 

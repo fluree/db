@@ -416,9 +416,10 @@ pub struct BinaryIndexStore {
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
-    /// Per `(graph, predicate)` vector arena, whether it holds no value
-    /// twice. See [`Self::vector_handles_name_values`].
-    vector_handle_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
+    /// Per `(graph, predicate)` vector arena, its identity table, built on
+    /// first use. The store owns it, so it lives and dies with the store's
+    /// immutable arenas. See [`Self::vector_identity`].
+    vector_identities: RwLock<HashMap<(GraphId, u32), Arc<VectorIdentity>>>,
     /// The predicates with list rows, built on first use. See
     /// [`Self::list_predicate_ids`].
     list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
@@ -505,7 +506,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
-            vector_handle_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -694,7 +695,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
-            vector_handle_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -2577,52 +2578,50 @@ impl BinaryIndexStore {
 
     /// Whether `(g_id, p_id)`'s vector arena holds no value twice, so within
     /// the predicate a vector's handle names its value. True without an
-    /// arena. The arena is immutable for the store's lifetime, so the answer
-    /// is computed once, on first use, by hashing every vector in it (shards
-    /// read without entering the shared cache) and comparing the vectors of
-    /// any hash that repeats. Concurrent first callers may each compute it.
+    /// arena. Builds the arena's [identity table](Self::vector_identity) if
+    /// it isn't built yet. This certifies the persisted arena only: a caller
+    /// that also reads novelty must not rely on it unless it merges novelty
+    /// by value.
     pub fn vector_handles_name_values(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+        Ok(self
+            .vector_identity(g_id, p_id)?
+            .is_none_or(|identity| identity.duplicate_free))
+    }
+
+    /// `(g_id, p_id)`'s vector identity table, built on first use: one pass
+    /// that hashes every vector in the arena (shards read without entering
+    /// the shared cache), then compares the vectors of any hash that repeats.
+    /// `None` without an arena. The arena is immutable for the store's
+    /// lifetime, so the table is too; concurrent first callers may each build
+    /// it, and one wins.
+    pub fn vector_identity(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> io::Result<Option<Arc<VectorIdentity>>> {
         let Some(arena) = self
             .graph_indexes
             .get(&g_id)
             .and_then(|gi| gi.vectors.get(&p_id))
         else {
-            return Ok(true);
+            return Ok(None);
         };
-        if let Some(&proven) = self.vector_handle_proofs.read().get(&(g_id, p_id)) {
-            return Ok(proven);
+        if let Some(built) = self.built_vector_identity(g_id, p_id) {
+            return Ok(Some(built));
         }
-        let mut hashes: Vec<(u64, u32)> = Vec::with_capacity(arena.len() as usize);
-        arena.scan_all(|handle, components| {
-            hashes.push((
-                fluree_db_core::value::vector_f32_bits_hash(components),
-                handle,
-            ));
-            std::ops::ControlFlow::Continue(())
-        })?;
-        hashes.sort_unstable();
-        let mut distinct = true;
-        for pair in hashes.windows(2) {
-            if pair[0].0 == pair[1].0 {
-                let a = arena.lookup_vector(pair[0].1)?;
-                let b = arena.lookup_vector(pair[1].1)?;
-                if let (Some(a), Some(b)) = (a, b) {
-                    let same = a.as_f32().len() == b.as_f32().len()
-                        && a.as_f32()
-                            .iter()
-                            .zip(b.as_f32())
-                            .all(|(x, y)| x.to_bits() == y.to_bits());
-                    if same {
-                        distinct = false;
-                        break;
-                    }
-                }
-            }
-        }
-        self.vector_handle_proofs
-            .write()
-            .insert((g_id, p_id), distinct);
-        Ok(distinct)
+        let identity = Arc::new(VectorIdentity::build(arena)?);
+        Ok(Some(Arc::clone(
+            self.vector_identities
+                .write()
+                .entry((g_id, p_id))
+                .or_insert(identity),
+        )))
+    }
+
+    /// `(g_id, p_id)`'s vector identity table if something has built it;
+    /// never builds it.
+    pub fn built_vector_identity(&self, g_id: GraphId, p_id: u32) -> Option<Arc<VectorIdentity>> {
+        self.vector_identities.read().get(&(g_id, p_id)).cloned()
     }
 
     /// Whether any NumBig arena of `g_id` holds one value under several
@@ -3336,6 +3335,96 @@ impl NsLookup for BinaryIndexStore {
 // BinaryGraphView — graph-scoped wrapper
 // ============================================================================
 
+/// One vector arena's identity table: per handle, the hash of its value
+/// ([`fluree_db_core::value::vector_value_hash_f32`], the same function a
+/// decoded vector's key hashes with) and its canonical handle, the lowest
+/// handle holding an equal vector. 12 bytes per handle; it holds no shards.
+pub struct VectorIdentity {
+    hashes: Box<[u64]>,
+    canonical: Box<[u32]>,
+    duplicate_free: bool,
+}
+
+impl VectorIdentity {
+    fn build(arena: &crate::arena::vector::LazyVectorArena) -> io::Result<Self> {
+        let len = arena.len() as usize;
+        let mut hashes = vec![0u64; len];
+        let mut canonical: Vec<u32> = (0..len as u32).collect();
+        let mut by_hash: Vec<(u64, u32)> = Vec::with_capacity(len);
+        arena.scan_all(|handle, components| {
+            let hash = fluree_db_core::value::vector_value_hash_f32(components);
+            if let Some(slot) = hashes.get_mut(handle as usize) {
+                *slot = hash;
+                by_hash.push((hash, handle));
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+        by_hash.sort_unstable();
+        let mut duplicate_free = true;
+        for run in by_hash.chunk_by(|a, b| a.0 == b.0) {
+            if run.len() < 2 {
+                continue;
+            }
+            // Handles ascend within a run, so the first equal vector met is
+            // the canonical one.
+            let mut seen: Vec<(u32, crate::arena::vector::VectorSlice)> = Vec::new();
+            for &(_, handle) in run {
+                let Some(slice) = arena.lookup_vector(handle)? else {
+                    continue;
+                };
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                match seen
+                    .iter()
+                    .find(|(_, s)| bits(s.as_f32()) == bits(slice.as_f32()))
+                {
+                    Some(&(canon, _)) => {
+                        canonical[handle as usize] = canon;
+                        duplicate_free = false;
+                    }
+                    None => seen.push((handle, slice)),
+                }
+            }
+        }
+        Ok(Self {
+            hashes: hashes.into_boxed_slice(),
+            canonical: canonical.into_boxed_slice(),
+            duplicate_free,
+        })
+    }
+
+    /// The value hash and canonical handle of `handle`; `None` out of range.
+    pub fn of(&self, handle: u32) -> Option<(u64, u32)> {
+        Some((
+            *self.hashes.get(handle as usize)?,
+            *self.canonical.get(handle as usize)?,
+        ))
+    }
+
+    /// Whether no value is held twice: every handle is its own canonical one.
+    pub fn duplicate_free(&self) -> bool {
+        self.duplicate_free
+    }
+
+    /// The table's heap bytes.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.hashes) + std::mem::size_of_val(&*self.canonical)
+    }
+}
+
+/// A stored vector as a key: a zero-copy slice of its arena shard, the
+/// arena's identity (store, graph, predicate) and handle, its value hash, and
+/// its canonical handle when the arena's identity table is built.
+#[derive(Clone, Debug)]
+pub struct ArenaVector {
+    pub slice: crate::arena::vector::VectorSlice,
+    pub hash: u64,
+    pub store_id: u64,
+    pub g_id: GraphId,
+    pub p_id: u32,
+    pub handle: u32,
+    pub canonical: Option<u32>,
+}
+
 /// Graph-scoped view for V6 store. Binds a specific `g_id` for value decoding.
 ///
 /// When `dict_novelty` is present, all decode methods automatically perform
@@ -3360,137 +3449,31 @@ pub struct BinaryGraphView {
     /// the life of the store and novelty window the view holds.
     subject_sids: SubjectMemo<Sid>,
     subject_iris: SubjectMemo<Arc<str>>,
-    /// Vectors already decoded through this view, one shared value per
-    /// distinct vector: the arena gives every stored fact its own handle, so
-    /// equal vectors under many handles decode to one allocation.
-    vectors: VectorMemo,
+    /// The vector shard this view's keys read last, and that predicate's
+    /// identity table if it was built. See [`Self::arena_vector`].
+    vector_cursor: VectorCursor,
 }
 
-/// Per-view memo of decoded vectors keyed by value, bounded by clearing
-/// rather than evicting. A probe hashes and compares the arena's `f32`
-/// components in place, so a handle whose value was seen allocates nothing.
-/// When values rarely repeat, probing stops (`bypass`).
-struct VectorMemo(std::sync::Mutex<VectorMemoInner>);
+/// Where a view's vector keys read: the shard read last, by
+/// `(p_id, shard index)` (a scan reads handles mostly in runs, so a key
+/// usually skips the shared cache's probe), and the identity table of the
+/// predicate read last. One shard only, so the view never holds more of an
+/// arena than the cache's eviction allows; a key's own slice keeps its shard
+/// for as long as the key lives.
+#[derive(Default)]
+struct VectorCursor(std::sync::Mutex<VectorCursorInner>);
 
 #[derive(Default)]
-struct VectorMemoInner {
-    /// Decoded values by the hash of their components ([`VectorMemo::hash`]).
-    by_hash: rustc_hash::FxHashMap<u64, Vec<Arc<[f64]>>>,
-    /// Components held, the bound the memo clears at.
-    components: usize,
-    /// Probes that found their value, and that didn't, since the last
-    /// [`VectorMemo::WINDOW`] misses.
-    window_hits: u32,
-    window_misses: u32,
-    /// Set once a window's probes mostly missed (values that rarely repeat,
-    /// such as one embedding per subject): the view then decodes each vector
-    /// without probing.
-    bypass: bool,
-    /// The arena shard read last, by `(p_id, shard index)`: a scan reads
-    /// handles mostly in order, so a lookup usually skips the shared shard
-    /// cache's probe. One shard only, so the memo never holds more of an
-    /// arena than that cache's eviction allows.
-    last_shard: Option<(u32, usize, Arc<crate::arena::vector::VectorShard>)>,
+struct VectorCursorInner {
+    shard: Option<(u32, usize, Arc<crate::arena::vector::VectorShard>)>,
+    identity: Option<(u32, Option<Arc<VectorIdentity>>)>,
 }
 
-impl VectorMemo {
-    const MAX_COMPONENTS: usize = 1 << 22;
-    /// Misses per hit-rate check.
-    const WINDOW: u32 = 1024;
-
-    fn new() -> Self {
-        Self(std::sync::Mutex::new(VectorMemoInner::default()))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, VectorMemoInner> {
+impl VectorCursor {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VectorCursorInner> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn hash(components: &[f32]) -> u64 {
-        fluree_db_core::value::vector_f32_bits_hash(components)
-    }
-
-    /// The shared value of `handle` in `p_id`'s `arena`, allocating it on the
-    /// first sight of that value. `None` for a handle the arena does not hold.
-    fn get(
-        &self,
-        p_id: u32,
-        arena: &crate::arena::vector::LazyVectorArena,
-        handle: u32,
-    ) -> io::Result<Option<Arc<[f64]>>> {
-        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
-            return Ok(None);
-        };
-        let mut memo = self.lock();
-        let last = memo
-            .last_shard
-            .as_ref()
-            .filter(|(p, i, _)| *p == p_id && *i == shard_idx)
-            .map(|(_, _, shard)| Arc::clone(shard));
-        let shard = match last {
-            Some(shard) => shard,
-            None => {
-                // The load can read from disk; don't hold the memo meanwhile.
-                drop(memo);
-                let shard = arena.shard(shard_idx)?;
-                memo = self.lock();
-                memo.last_shard = Some((p_id, shard_idx, Arc::clone(&shard)));
-                shard
-            }
-        };
-        Ok(shard
-            .get_f32(offset)
-            .map(|components| Self::get_or_insert(&mut memo, components)))
-    }
-
-    /// The shared value equal to `components` (widened exactly to `f64`),
-    /// allocating it on the first sight of that value.
-    fn get_or_insert(memo: &mut VectorMemoInner, components: &[f32]) -> Arc<[f64]> {
-        let widen = || -> Arc<[f64]> { components.iter().map(|&x| f64::from(x)).collect() };
-        if memo.bypass {
-            return widen();
-        }
-        let same = |v: &[f64]| {
-            v.len() == components.len()
-                && v.iter()
-                    .zip(components)
-                    .all(|(a, b)| a.to_bits() == f64::from(*b).to_bits())
-        };
-        let hash = Self::hash(components);
-        if let Some(found) = memo
-            .by_hash
-            .get(&hash)
-            .and_then(|bucket| bucket.iter().find(|v| same(v)))
-        {
-            let found = Arc::clone(found);
-            memo.window_hits += 1;
-            return found;
-        }
-        memo.window_misses += 1;
-        if memo.window_misses >= Self::WINDOW {
-            // Mostly new values: the probe is all cost, so stop probing.
-            if memo.window_hits < memo.window_misses / 4 {
-                memo.bypass = true;
-                memo.by_hash = rustc_hash::FxHashMap::default();
-                memo.components = 0;
-                return widen();
-            }
-            memo.window_hits = 0;
-            memo.window_misses = 0;
-        }
-        if memo.components >= Self::MAX_COMPONENTS {
-            memo.by_hash.clear();
-            memo.components = 0;
-        }
-        let value = widen();
-        memo.components += components.len();
-        memo.by_hash
-            .entry(hash)
-            .or_default()
-            .push(Arc::clone(&value));
-        value
     }
 }
 
@@ -3534,7 +3517,7 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
-            vectors: VectorMemo::new(),
+            vector_cursor: VectorCursor::default(),
         }
     }
 
@@ -3557,7 +3540,7 @@ impl BinaryGraphView {
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
-            vectors: VectorMemo::new(),
+            vector_cursor: VectorCursor::default(),
         }
     }
 
@@ -3681,11 +3664,6 @@ impl BinaryGraphView {
                 }
             }
         }
-        if o_kind == ObjKind::VECTOR_ID.as_u8() {
-            if let Some(value) = self.shared_vector(p_id, o_key as u32)? {
-                return Ok(FlakeValue::Vector(value));
-            }
-        }
         // Charge a dict touch for dict-backed ObjKinds when novelty didn't satisfy.
         if o_kind == ObjKind::REF_ID.as_u8()
             || o_kind == ObjKind::LEX_ID.as_u8()
@@ -3794,12 +3772,13 @@ impl BinaryGraphView {
         &self.store
     }
 
-    /// The vector at `handle` in `p_id`'s arena of this view's graph, shared
-    /// with every handle decoded through this view that holds an equal
-    /// vector: one allocation per distinct value, none for a handle that
-    /// repeats one. `None` for a handle the arena does not hold (such as a
-    /// novelty handle), which the store's decode reports.
-    pub fn shared_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<Arc<[f64]>>> {
+    /// `handle` of `p_id`'s vector arena in this view's graph, as a key:
+    /// a zero-copy slice of its shard, its value hash, and its canonical
+    /// handle when the arena's identity table is built (this never builds
+    /// it: a small query would pay for the whole arena). Without the table
+    /// the hash is computed from the slice in place, with the same function.
+    /// `None` for a handle the arena does not hold, such as a novelty handle.
+    pub fn arena_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<ArenaVector>> {
         let Some(arena) = self
             .store
             .graph_indexes
@@ -3808,7 +3787,54 @@ impl BinaryGraphView {
         else {
             return Ok(None);
         };
-        self.vectors.get(p_id, arena, handle)
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
+        let mut cursor = self.vector_cursor.lock();
+        let held = cursor
+            .shard
+            .as_ref()
+            .filter(|(p, i, _)| *p == p_id && *i == shard_idx)
+            .map(|(_, _, shard)| Arc::clone(shard));
+        let shard = match held {
+            Some(shard) => shard,
+            None => {
+                // The load can read from disk; don't hold the cursor meanwhile.
+                drop(cursor);
+                let shard = arena.shard(shard_idx)?;
+                cursor = self.vector_cursor.lock();
+                cursor.shard = Some((p_id, shard_idx, Arc::clone(&shard)));
+                shard
+            }
+        };
+        let identity = match &cursor.identity {
+            Some((p, identity)) if *p == p_id => identity.clone(),
+            _ => {
+                let identity = self.store.built_vector_identity(self.g_id, p_id);
+                cursor.identity = Some((p_id, identity.clone()));
+                identity
+            }
+        };
+        drop(cursor);
+        let Some(slice) = crate::arena::vector::VectorSlice::new(shard, offset) else {
+            return Ok(None);
+        };
+        let (hash, canonical) = match identity.as_ref().and_then(|t| t.of(handle)) {
+            Some((hash, canonical)) => (hash, Some(canonical)),
+            None => (
+                fluree_db_core::value::vector_value_hash_f32(slice.as_f32()),
+                None,
+            ),
+        };
+        Ok(Some(ArenaVector {
+            slice,
+            hash,
+            store_id: self.store.store_id(),
+            g_id: self.g_id,
+            p_id,
+            handle,
+            canonical,
+        }))
     }
 
     pub fn clone_store(&self) -> Arc<BinaryIndexStore> {
@@ -4458,64 +4484,36 @@ pub(crate) mod tests {
         make_lazy_arena(manifest, sources)
     }
 
-    /// The memo reads through one shard at a time: once a lookup moves on,
-    /// it holds only the shard it moved to, and the shared cache alone holds
-    /// the rest.
+    /// The identity table hashes each vector with the function a decoded
+    /// vector's key uses, gives equal vectors one canonical handle, and is
+    /// duplicate-free exactly when no vector repeats.
     #[test]
-    fn vector_memo_holds_only_the_shard_it_read_last() {
-        let dir = std::env::temp_dir().join("fluree_vector_memo_last_shard");
+    fn vector_identity_hashes_by_value_and_canonicalizes_repeats() {
+        use fluree_db_core::value::{vector_value_hash, vector_value_hash_f32};
+        let dir = std::env::temp_dir().join("fluree_vector_identity_table");
         std::fs::create_dir_all(&dir).unwrap();
-        let shards: Vec<Vec<Vec<f32>>> = (0..3)
-            .map(|s| (0..2).map(|i| vec![s as f32, i as f32]).collect())
-            .collect();
+        // Handles 0..4 over two shards; handle 3 repeats handle 1.
+        let shards = vec![
+            vec![vec![0.5f32, 0.25], vec![1.0, 0.0]],
+            vec![vec![0.0, 1.0], vec![1.0, 0.0]],
+        ];
         let arena = vector_arena_of(&dir, 2, 2, &shards);
-        let memo = VectorMemo::new();
-        assert_eq!(&*memo.get(7, &arena, 0).unwrap().unwrap(), &[0.0, 0.0]);
-        assert_eq!(&*memo.get(7, &arena, 3).unwrap().unwrap(), &[1.0, 1.0]);
-        assert_eq!(&*memo.get(7, &arena, 4).unwrap().unwrap(), &[2.0, 0.0]);
-        assert!(
-            matches!(memo.lock().last_shard, Some((7, 2, _))),
-            "the memo holds the shard it read last, and only that one"
-        );
+        let table = VectorIdentity::build(&arena).unwrap();
+        assert!(!table.duplicate_free());
+        assert_eq!(table.of(3).unwrap().1, 1, "a repeat's canonical handle");
+        assert_eq!(table.of(1).unwrap().1, 1);
+        assert_eq!(table.of(2).unwrap().1, 2);
+        assert_eq!(table.of(1).unwrap().0, table.of(3).unwrap().0);
+        // The same vector arriving decoded (novelty, VALUES) hashes the same.
+        assert_eq!(table.of(1).unwrap().0, vector_value_hash(&[1.0, 0.0]));
+        assert_eq!(table.of(0).unwrap().0, vector_value_hash_f32(&[0.5, 0.25]));
+        assert_eq!(table.heap_bytes(), 4 * 12);
+
+        let distinct = vector_arena_of(&dir, 2, 2, &shards[..1]);
+        assert!(VectorIdentity::build(&distinct).unwrap().duplicate_free());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Repeated values share one allocation; once a window of lookups finds
-    /// mostly new values, the memo stops probing and decodes each one.
-    #[test]
-    fn vector_memo_shares_repeats_and_stops_probing_new_values() {
-        let dir = std::env::temp_dir().join("fluree_vector_memo_bypass");
-        std::fs::create_dir_all(&dir).unwrap();
-        let window = VectorMemo::WINDOW as usize;
-        // Shard 0: 64 values, each four times. Shard 1: a window and more of
-        // values seen once.
-        let repeats: Vec<Vec<f32>> = (0..256).map(|i| vec![(i % 64) as f32]).collect();
-        let fresh: Vec<Vec<f32>> = (0..window + 8).map(|i| vec![1000.0 + i as f32]).collect();
-        let capacity = (window + 8) as u32;
-        let mut first = repeats.clone();
-        first.resize(capacity as usize, vec![-1.0]);
-        let arena = vector_arena_of(&dir, capacity, 1, &[first, fresh]);
-        let memo = VectorMemo::new();
-
-        let a = memo.get(7, &arena, 0).unwrap().unwrap();
-        let b = memo.get(7, &arena, 64).unwrap().unwrap();
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "a repeated value shares its allocation"
-        );
-
-        for i in 0..window + 8 {
-            memo.get(7, &arena, capacity + i as u32).unwrap().unwrap();
-        }
-        let c = memo.get(7, &arena, 1).unwrap().unwrap();
-        let d = memo.get(7, &arena, 65).unwrap().unwrap();
-        assert_eq!(c, d);
-        assert!(
-            !Arc::ptr_eq(&c, &d),
-            "after a window of new values the memo decodes without probing"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
     use fluree_db_core::o_type::OType;

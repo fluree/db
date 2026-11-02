@@ -555,7 +555,7 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
 
     // A vector predicate that holds no value twice keeps the per-predicate
     // lanes: there a handle names its value.
-    let held_once: [(&str, &str, &[&str]); 3] = [
+    let held_once: [(&str, &str, &[&str]); 5] = [
         (
             "COUNT(DISTINCT)",
             "SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE { ?s ex:j1 ?v }",
@@ -572,6 +572,20 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
             "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:j1 ?v . ?s ex:k1 ?k } GROUP BY ?v \
              ORDER BY DESC(?n) LIMIT 5",
             &["n=1,v=[0.125,0.875]", "n=1,v=[0.75,0.25]"],
+        ),
+        // The whole-graph shapes Cypher lowers `count(DISTINCT n.j1)` and
+        // `n.j1, count(*)` to.
+        (
+            "whole-graph scalar aggregates",
+            "SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE { \
+             { SELECT DISTINCT ?s WHERE { ?s ?p ?o } } OPTIONAL { ?s ex:j1 ?v } }",
+            &["n=2"],
+        ),
+        (
+            "whole-graph scalar aggregates",
+            "SELECT ?v (COUNT(*) AS ?n) WHERE { \
+             { SELECT DISTINCT ?s WHERE { ?s ?p ?o } } OPTIONAL { ?s ex:j1 ?v } } GROUP BY ?v",
+            &["n=1,v=[0.125,0.875]", "n=1,v=[0.75,0.25]", "n=5,v="],
         ),
     ];
     for (site, query, rows) in held_once {
@@ -651,4 +665,121 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
         "{:?}",
         cyclic_bails(&store, before)
     );
+}
+
+/// The no-repeat proof covers the persisted arena only. With novelty adding
+/// a copy of a stored vector to a predicate whose arena holds none twice,
+/// each per-predicate lane declines, and the vector counts once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_novelty_copy_of_a_stored_vector_counts_once() {
+    let ledger_id = "vector-identity/novelty-duplicate:main";
+    let (_dirs, fluree) = ledger(Condition::Indexed, ledger_id).await;
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .insert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+@prefix f: <https://ns.flur.ee/db#> .
+ex:h ex:j1 "[0.75, 0.25]"^^f:embeddingVector ; ex:k1 "s" .
+"#,
+        )
+        .commit()
+        .await
+        .expect("insert novelty");
+    let db = fluree.graph(ledger_id).load().await.expect("load");
+    let _switch = FAST_PATH_SWITCH.read().await;
+    let (store, _guard) = init_test_tracing();
+    // (lane that must not serve it, query, rows)
+    let cases: [(&str, &str, &[&str]); 5] = [
+        (
+            "COUNT(DISTINCT)",
+            "SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE { ?s ex:j1 ?v }",
+            &["n=2"],
+        ),
+        (
+            "group_by_object_count_topk",
+            "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:j1 ?v } GROUP BY ?v \
+             ORDER BY DESC(?n) LIMIT 5",
+            &["n=1,v=[0.125,0.875]", "n=2,v=[0.75,0.25]"],
+        ),
+        (
+            "group_by_object_star_topk",
+            "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:j1 ?v . ?s ex:k1 ?k } GROUP BY ?v \
+             ORDER BY DESC(?n) LIMIT 5",
+            &["n=1,v=[0.125,0.875]", "n=2,v=[0.75,0.25]"],
+        ),
+        (
+            "whole-graph scalar aggregates",
+            "SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE { \
+             { SELECT DISTINCT ?s WHERE { ?s ?p ?o } } OPTIONAL { ?s ex:j1 ?v } }",
+            &["n=2"],
+        ),
+        (
+            "partitioned GROUP BY",
+            "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:j1 ?v } GROUP BY ?v",
+            &["n=1,v=[0.125,0.875]", "n=2,v=[0.75,0.25]"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (site, query, rows) in cases {
+        let before = store.find_events("fast-path outcome").len();
+        let got = sparql(&db, query).await;
+        if got != rows {
+            failures.push(format!("{query}: {got:?}, want {rows:?}"));
+        }
+        if site != "partitioned GROUP BY" && served(&store, before, site) {
+            failures.push(format!("{site} served novelty over the arena: {query}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A join on a vector across two predicates pairs equal values, not equal
+/// handles. Each subject holds its own vector under `ex:v`; every tenth also
+/// holds a copy under `ex:u`, where it gets a different handle (the tenth
+/// subject's copy is `ex:u`'s second vector). Pairing by handle joins
+/// `ex:s10`'s copy with `ex:s1`'s vector.
+#[tokio::test]
+async fn a_join_on_a_vector_pairs_values_not_handles() {
+    let ledger_id = "vector-identity/join-pairs:main";
+    let mut ttl = String::from(
+        "@prefix ex: <http://example.org/> .\n@prefix f: <https://ns.flur.ee/db#> .\n",
+    );
+    for i in 0..300 {
+        let v = format!("[{}.25, {}]", i, i % 7);
+        ttl.push_str(&format!("ex:s{i} ex:v \"{v}\"^^f:embeddingVector .\n"));
+        if i % 10 == 0 {
+            ttl.push_str(&format!("ex:s{i} ex:u \"{v}\"^^f:embeddingVector .\n"));
+        }
+    }
+    let db_dir = TempDir::new().expect("db tmpdir");
+    let data_dir = TempDir::new().expect("data tmpdir");
+    std::fs::File::create(data_dir.path().join("00-data.ttl"))
+        .expect("create ttl")
+        .write_all(ttl.as_bytes())
+        .expect("write ttl");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create(ledger_id)
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let db = fluree.graph(ledger_id).load().await.expect("load");
+    let rows = sparql(&db, "SELECT ?a ?b WHERE { ?a ex:v ?v . ?b ex:u ?v }").await;
+    let want: Vec<String> = {
+        let mut w: Vec<String> = (0..300)
+            .step_by(10)
+            .map(|i| format!("a=s{i},b=s{i}"))
+            .collect();
+        w.sort();
+        w
+    };
+    assert_eq!(rows, want);
 }

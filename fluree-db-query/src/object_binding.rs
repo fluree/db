@@ -771,6 +771,19 @@ pub(crate) fn same_term(
             if let Some(same) = gv.and_then(|gv| encoded_against_decoded_subject(a, b, gv)) {
                 return Ok(same);
             }
+            // Vectors compare by value through their keys: a stored one reads
+            // its arena slice in place rather than decoding.
+            if crate::group_aggregate::is_vector_binding(a)
+                || crate::group_aggregate::is_vector_binding(b)
+            {
+                use crate::group_aggregate::VectorKey;
+                return Ok(
+                    match (VectorKey::of_binding(a, gv), VectorKey::of_binding(b, gv)) {
+                        (Some(x), Some(y)) => x == y,
+                        _ => false,
+                    },
+                );
+            }
             let (dicts, gv) = EqualityNorm::parts(norm);
             normalize_for_key_cow(a, dicts, gv) == normalize_for_key_cow(b, dicts, gv)
         }

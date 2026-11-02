@@ -585,6 +585,7 @@ pub struct LazyVectorArena {
 /// Holds an `Arc<VectorShard>` to keep the shard alive while the caller
 /// reads the slice. Dropping the `VectorSlice` releases the Arc reference
 /// (the shard stays in cache if still referenced there).
+#[derive(Clone)]
 pub struct VectorSlice {
     shard: Arc<VectorShard>,
     offset: u32,
@@ -600,6 +601,17 @@ impl std::fmt::Debug for VectorSlice {
 }
 
 impl VectorSlice {
+    /// The vector at `offset` of `shard`; `None` past the shard's count.
+    pub fn new(shard: Arc<VectorShard>, offset: u32) -> Option<Self> {
+        shard.get_f32(offset)?;
+        Some(Self { shard, offset })
+    }
+
+    /// Whether `self` and `other` are one vector of one loaded shard.
+    pub fn same_slot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shard, &other.shard) && self.offset == other.offset
+    }
+
     /// Borrow the f32 slice for this vector.
     #[inline]
     pub fn as_f32(&self) -> &[f32] {

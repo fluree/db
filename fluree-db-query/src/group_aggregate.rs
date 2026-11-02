@@ -441,35 +441,126 @@ pub(crate) enum GroupKeyOwned {
     Absent,
 }
 
-/// A vector's components as a hash key: equal iff `FlakeValue`'s vector
-/// equality holds (same length, bitwise-equal components). Carries its hash,
-/// computed once, so a table that rehashes as it grows doesn't read the
-/// components again, and unequal keys rarely compare them.
+/// A vector as a hash key, by value: two keys are equal iff the vectors are
+/// (bitwise-equal components, as `FlakeValue`'s vector equality has it), in
+/// whichever form each arrives. A stored vector keys as a zero-copy slice of
+/// its arena shard, so keying never decodes or copies it; a decoded one
+/// (novelty, `VALUES`, `BIND`) keys by its components. Both hash with the one
+/// canonical function ([`fluree_db_core::value::vector_value_hash`]), carried
+/// in the key so a table that grows doesn't read the components again.
 #[derive(Debug, Clone)]
 pub(crate) struct VectorKey {
     hash: u64,
-    value: Arc<[f64]>,
+    repr: VectorRepr,
+}
+
+#[derive(Debug, Clone)]
+enum VectorRepr {
+    Arena(fluree_db_binary_index::ArenaVector),
+    Decoded(Arc<[f64]>),
 }
 
 impl VectorKey {
-    fn new(value: &Arc<[f64]>) -> Self {
+    pub(crate) fn decoded(value: &Arc<[f64]>) -> Self {
         Self {
-            hash: fluree_db_core::value::vector_bits_hash(value),
-            value: Arc::clone(value),
+            hash: fluree_db_core::value::vector_value_hash(value),
+            repr: VectorRepr::Decoded(Arc::clone(value)),
         }
+    }
+
+    /// The key of an encoded vector, read from its arena without decoding.
+    /// `None` for any other binding, or a handle the arena doesn't hold
+    /// (which the caller decodes instead).
+    pub(crate) fn of_encoded(binding: &Binding, gv: &BinaryGraphView) -> Option<Self> {
+        let Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            ..
+        } = binding
+        else {
+            return None;
+        };
+        if *o_kind != fluree_db_core::ObjKind::VECTOR_ID.as_u8() {
+            return None;
+        }
+        let arena = gv.arena_vector(*p_id, *o_key as u32).ok()??;
+        Some(Self {
+            hash: arena.hash,
+            repr: VectorRepr::Arena(arena),
+        })
+    }
+
+    /// The key of any vector binding: encoded through its arena (decoding it
+    /// only if the arena doesn't hold the handle), decoded by its
+    /// components. `None` for a binding that isn't a vector.
+    pub(crate) fn of_binding(binding: &Binding, gv: Option<&BinaryGraphView>) -> Option<Self> {
+        match binding {
+            Binding::Lit {
+                val: FlakeValue::Vector(v),
+                ..
+            } => Some(Self::decoded(v)),
+            Binding::EncodedLit { o_kind, .. }
+                if *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8() =>
+            {
+                let gv = gv?;
+                Self::of_encoded(binding, gv).or_else(|| {
+                    match materialize_encoded(binding, Some(gv)) {
+                        Binding::Lit {
+                            val: FlakeValue::Vector(v),
+                            ..
+                        } => Some(Self::decoded(&v)),
+                        _ => None,
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether `binding` is a vector, encoded or decoded.
+pub(crate) fn is_vector_binding(binding: &Binding) -> bool {
+    match binding {
+        Binding::Lit { val, .. } => matches!(val, FlakeValue::Vector(_)),
+        Binding::EncodedLit { o_kind, .. } => *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8(),
+        _ => false,
     }
 }
 
 impl PartialEq for VectorKey {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.value, &other.value)
-            || self.hash == other.hash
-                && self.value.len() == other.value.len()
-                && self
-                    .value
-                    .iter()
-                    .zip(other.value.iter())
-                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        if self.hash != other.hash {
+            return false;
+        }
+        match (&self.repr, &other.repr) {
+            (VectorRepr::Arena(a), VectorRepr::Arena(b)) => {
+                let same_arena = a.store_id == b.store_id && a.g_id == b.g_id && a.p_id == b.p_id;
+                if same_arena {
+                    if a.handle == b.handle {
+                        return true;
+                    }
+                    if let (Some(x), Some(y)) = (a.canonical, b.canonical) {
+                        return x == y;
+                    }
+                }
+                a.slice.same_slot(&b.slice) || {
+                    let (x, y) = (a.slice.as_f32(), b.slice.as_f32());
+                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+                }
+            }
+            (VectorRepr::Arena(a), VectorRepr::Decoded(d))
+            | (VectorRepr::Decoded(d), VectorRepr::Arena(a)) => {
+                fluree_db_core::value::vector_eq_f32_f64(a.slice.as_f32(), d)
+            }
+            (VectorRepr::Decoded(x), VectorRepr::Decoded(y)) => {
+                Arc::ptr_eq(x, y)
+                    || x.len() == y.len()
+                        && x.iter()
+                            .zip(y.iter())
+                            .all(|(p, q)| p.to_bits() == q.to_bits())
+            }
+        }
     }
 }
 
@@ -479,6 +570,19 @@ impl Hash for VectorKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.hash.hash(state);
     }
+}
+
+/// The datatype constraint a decoded vector of `dt_id` carries, as
+/// [`materialize_encoded`] gives it, so an encoded vector's key matches a
+/// decoded one's.
+fn vector_dtc(gv: &BinaryGraphView, dt_id: u16) -> DatatypeConstraint {
+    DatatypeConstraint::Explicit(
+        gv.store()
+            .dt_sids()
+            .get(dt_id as usize)
+            .cloned()
+            .unwrap_or_else(|| Sid::new(0, "")),
+    )
 }
 
 /// Hashable key for materialized literals.
@@ -537,6 +641,12 @@ pub(crate) fn binding_to_group_key_normalized(
     }
     if crate::object_binding::is_arena_encoded(binding) {
         if let Some(gv) = gv {
+            // A stored vector keys by a slice of its arena, undecoded.
+            if let (Some(key), Binding::EncodedLit { dt_id, .. }) =
+                (VectorKey::of_encoded(binding, gv), binding)
+            {
+                return GroupKeyOwned::MaterializedVector(key, vector_dtc(gv, *dt_id));
+            }
             let materialized = materialize_encoded(binding, Some(gv));
             if !matches!(materialized, Binding::EncodedLit { .. }) {
                 return binding_to_group_key_owned(&materialized);
@@ -581,7 +691,7 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             val: FlakeValue::Vector(v),
             dtc,
             ..
-        } => GroupKeyOwned::MaterializedVector(VectorKey::new(v), dtc.clone()),
+        } => GroupKeyOwned::MaterializedVector(VectorKey::decoded(v), dtc.clone()),
         Binding::Lit { val, dtc, .. } => {
             GroupKeyOwned::MaterializedLit(flake_value_to_key(val, dtc))
         }
@@ -1505,6 +1615,100 @@ fn extract_numeric_with_gv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored vector's key: `handle` of a one-shard arena holding
+    /// `vectors`, under `(store_id, p_id)`, without an identity table.
+    fn arena_key(store_id: u64, p_id: u32, vectors: &[&[f32]], handle: u32) -> VectorKey {
+        use fluree_db_binary_index::arena::vector::{VectorShard, VectorSlice};
+        let dims = vectors[0].len();
+        let shard = Arc::new(VectorShard {
+            dims: dims as u16,
+            count: vectors.len() as u32,
+            values: vectors.iter().flat_map(|v| v.iter().copied()).collect(),
+        });
+        let slice = VectorSlice::new(shard, handle).unwrap();
+        let hash = fluree_db_core::value::vector_value_hash_f32(slice.as_f32());
+        VectorKey {
+            hash,
+            repr: VectorRepr::Arena(fluree_db_binary_index::ArenaVector {
+                slice,
+                hash,
+                store_id,
+                g_id: 0,
+                p_id,
+                handle,
+                canonical: None,
+            }),
+        }
+    }
+
+    fn hash_of(key: &VectorKey) -> u64 {
+        use std::hash::BuildHasher;
+        FxBuildHasher.hash_one(key)
+    }
+
+    /// One vector, keyed as an arena slice, as decoded novelty and as a
+    /// `VALUES` literal, is one key; another vector at the same offset of
+    /// another arena is not.
+    #[test]
+    fn vector_keys_agree_across_forms() {
+        let stored = arena_key(1, 7, &[&[0.25, -1.5], &[0.5, 0.5]], 1);
+        let novelty = VectorKey::decoded(&Arc::from(vec![0.5, 0.5]));
+        let values = VectorKey::of_binding(
+            &Binding::lit(
+                FlakeValue::Vector(Arc::from(vec![0.5f64, 0.5])),
+                Sid::new(0, "v"),
+            ),
+            None,
+        )
+        .unwrap();
+        for other in [&novelty, &values] {
+            assert_eq!(&stored, other);
+            assert_eq!(hash_of(&stored), hash_of(other));
+        }
+        assert_eq!(novelty, values);
+
+        let elsewhere = arena_key(1, 8, &[&[9.0, 9.0], &[0.75, 0.5]], 1);
+        assert_ne!(stored, elsewhere);
+        // The same value at another offset of another arena is equal.
+        let moved = arena_key(2, 8, &[&[0.5, 0.5]], 0);
+        assert_eq!(stored, moved);
+        assert_eq!(hash_of(&stored), hash_of(&moved));
+    }
+
+    /// Equality is bitwise on the components, as `FlakeValue`'s is: `-0.0`
+    /// and `0.0` differ; a query literal whose component doesn't narrow to
+    /// `f32` equals no stored vector; a NaN equals itself, so a table keyed
+    /// by it stays consistent.
+    #[test]
+    fn vector_key_equality_is_bitwise_and_hash_consistent() {
+        let zero = arena_key(1, 7, &[&[0.0, 1.0]], 0);
+        let neg_zero = VectorKey::decoded(&Arc::from(vec![-0.0, 1.0]));
+        assert_ne!(zero, neg_zero);
+        assert_eq!(zero, VectorKey::decoded(&Arc::from(vec![0.0, 1.0])));
+
+        let stored = arena_key(1, 7, &[&[0.1f32]], 0);
+        let literal = VectorKey::decoded(&Arc::from(vec![0.1f64]));
+        let widened = VectorKey::decoded(&Arc::from(vec![f64::from(0.1f32)]));
+        assert_ne!(stored, literal, "0.1 as f64 is not the stored f32 0.1");
+        assert_eq!(stored, widened);
+        assert_eq!(hash_of(&stored), hash_of(&widened));
+        assert!(
+            FlakeValue::Vector(Arc::from(vec![0.1f64]))
+                != FlakeValue::Vector(Arc::from(vec![f64::from(0.1f32)])),
+            "the decoded values agree"
+        );
+
+        let nan = VectorKey::decoded(&Arc::from(vec![f64::NAN]));
+        let nan_again = VectorKey::decoded(&Arc::from(vec![f64::NAN]));
+        assert_eq!(nan, nan_again);
+        assert_eq!(hash_of(&nan), hash_of(&nan_again));
+        let stored_nan = arena_key(1, 7, &[&[f32::NAN]], 0);
+        assert_eq!(stored_nan == nan, hash_of(&stored_nan) == hash_of(&nan));
+        let mut set = FxHashSet::default();
+        set.insert(nan.clone());
+        assert!(set.contains(&nan_again));
+    }
     use crate::ir::InputSemantics;
     use fluree_db_core::LedgerSnapshot;
     use std::collections::HashMap;
