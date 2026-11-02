@@ -248,6 +248,7 @@ The request conflicts with current server state.
 - Concurrent modification conflict (`err:db/CommitConflict`) that the server did not retry. When the server retried and every attempt lost, the answer is a 503 `err:db/CommitContention` instead.
 - Ledger already exists (`err:db/LedgerExists`)
 - Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
+- A merge, rebase or revert whose result would leave a config setting group's fields outside the config graph or a single-valued setting with two values, or that would carry one branch's config or `#txn-meta` writes into another (`err:db/CommitConflict`; see [Behavior changes](../reference/compatibility.md#behavior-changes))
 - The ledger advanced while a reindex ran (`err:system/ReindexConflict`)
 - Syncing a graph source that has been dropped (`err:db/GraphSourceRetracted`)
 - An Iceberg table that carries merge-on-read delete files (`err:iceberg/MergeOnReadDeletes`)
@@ -372,6 +373,14 @@ Datatype IDs are never released, so retrying the same write cannot succeed,
 and the response carries no `Retry-After`. Fix: type the new values with
 datatypes the ledger already holds.
 
+**`Invalid vector`** (`err:db/InvalidTransaction`): a `@vector` value has no
+elements or more than 65,535, or its length differs from the one its property
+already holds in that graph. The message names the property and the graph. A
+property's length is not reset when its vectors are retracted, so retrying the
+same write cannot succeed, and the response carries no `Retry-After`. Fix: put
+vectors of another length on another property or in another graph. See
+[Length](../indexing-and-search/vector-search.md#length).
+
 #### 429 Too Many Requests
 
 Rate limit exceeded.
@@ -417,6 +426,9 @@ An unexpected error occurred on the server.
   whether a `GRAPH <iri>` names a graph source (`err:system/NameServiceError`).
   The query fails rather than read a possible graph source as an empty graph;
   the request itself was fine, so retry it.
+- Reading the ledger's config failed (`err:storage/ReadFailure`). Writes,
+  branch operations, push and queries fail rather than run without the checks
+  the config sets; retry once storage recovers.
 
 **Example:**
 ```json

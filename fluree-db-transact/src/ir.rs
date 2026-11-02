@@ -203,13 +203,6 @@ pub struct Txn {
     /// leave this empty.
     pub namespace_delta: std::collections::HashMap<u16, String>,
 
-    /// The transaction reads and writes lists as RDF does, as a SPARQL UPDATE
-    /// does: a list is its owner's edge to a head cell and a chain of
-    /// `rdf:first`/`rdf:rest` cells, not values of its property
-    /// (`fluree_db_query::list_view`). JSON-LD and Cypher writes keep
-    /// Fluree's view, where the members are the values.
-    pub rdf_list_view: bool,
-
     /// SPARQL graph-management directive (CLEAR/DROP/COPY/MOVE/ADD).
     ///
     /// When `Some`, this transaction retracts and/or re-homes whole graphs by
@@ -319,7 +312,6 @@ impl Txn {
             txn_meta: Vec::new(),
             write_graphs: BTreeSet::new(),
             namespace_delta: std::collections::HashMap::new(),
-            rdf_list_view: false,
             graph_mgmt: None,
             sync_graph: None,
         }
