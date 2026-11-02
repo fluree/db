@@ -2382,7 +2382,25 @@ Existing endpoint, extended with graph source fallback. Request body is unchange
 
 Creates an Iceberg graph source with an R2RML mapping that defines how table rows become RDF triples. This is a write operation and should be admin-protected (same middleware as `/create` and `/drop`).
 
-**Request body fields:**
+The CLI sends the connection **structured**: `catalog` and `io` objects exactly as the stored config spells them (see [Iceberg connection](../api/endpoints.md#iceberg-connection)), built by the same conversion its local `map` uses, so a remote and a local map store the same record. A server must also keep accepting the legacy flat fields below from other clients, through one converter, and must refuse a body that mixes the two forms. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
+
+```json
+{
+  "name": "warehouse-orders",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://polaris.example.com/api/catalog",
+    "catalog_type": "polaris",
+    "warehouse": "my-warehouse",
+    "auth": { "type": "bearer", "token": { "env_var": "POLARIS_TOKEN" } }
+  },
+  "io": { "vended_credentials": true, "s3_path_style": false }
+}
+```
+
+**Legacy flat request body fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -2397,10 +2415,12 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | `r2rml` | string | No | Inline R2RML mapping content (Turtle). Without it the source is a plain Iceberg source with no mapping |
 | `r2rml_type` | string | No | Mapping media type; default `"text/turtle"` (JSON-LD mappings are not supported yet) |
 | `branch` | string | No | Branch name (default: `"main"`) |
-| `auth_bearer` | string | No | Bearer token for REST catalog auth |
+| `auth_bearer` / `auth_bearer_env` | string | No | Bearer token for REST catalog auth, or the name of a listed server environment variable holding it |
 | `oauth2_token_url` | string | No | OAuth2 token endpoint |
-| `oauth2_client_id` | string | No | OAuth2 client ID |
-| `oauth2_client_secret` | string | No | OAuth2 client secret |
+| `oauth2_client_id` | string | No | OAuth2 client ID (default: empty) |
+| `oauth2_client_secret` / `oauth2_client_secret_env` | string | No | OAuth2 client secret, or a listed variable holding it |
+| `oauth2_scope`, `oauth2_audience` | string | No | OAuth2 scope and audience |
+| `auth_google_metadata`, `auth_google_scopes` | boolean, string | No | The GCE/GKE metadata server's identity, and its scopes |
 | `warehouse` | string | No | Warehouse identifier (REST mode) |
 | `no_vended_credentials` | boolean | No | Disable vended credentials (default: `false`) |
 | `s3_region` | string | No | S3 region override |
@@ -2417,7 +2437,9 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 - S3 Tables mode requires `table_bucket_arn` (a well-formed S3 Tables bucket ARN, any AWS partition) and `table` unless specified in R2RML mapping's `rr:tableName`; a `region` that contradicts the ARN's region is refused
 - `region` and `s3_region` must be AWS region codes (e.g. `us-east-1`) in Glue and S3 Tables modes
 - Glue and S3 Tables modes read with the server's ambient AWS credentials; vended credentials are turned off for them
-- OAuth2 fields must all be provided together (url + id + secret)
+- OAuth2 needs `oauth2_token_url` and the client secret; any OAuth2 field without both is refused (400), not ignored
+- One way to authenticate: a bearer beside OAuth2 or a Google identity is refused (400), as is a literal beside its `_env` variable
+- An unknown field, inside the structured objects too, is refused (400, `err:api/InvalidGraphSourceConfig`), as is a variable not listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`
 
 **Example — REST catalog with R2RML:**
 

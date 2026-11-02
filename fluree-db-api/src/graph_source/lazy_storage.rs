@@ -10,9 +10,10 @@
 //! Parquet reads racing to force), and it reuses the query session's existing
 //! storage-build path (the slice-1 credential machinery), never a duplicate.
 //!
-//! A force-time build failure surfaces as an [`IcebergError`] carrying the same
-//! "Failed to load table from catalog" cause the eager path produces — no
-//! panic/unwrap inside the trait methods (a fallible `get_or_try_init`).
+//! A force-time build failure surfaces as the build's own [`IcebergError`],
+//! unconverted, so the read that forced it reports the type, status and wire
+//! code the eager path reports — no panic/unwrap inside the trait methods (a
+//! fallible `get_or_try_init`).
 
 use std::fmt;
 use std::future::Future;
@@ -26,8 +27,8 @@ use fluree_db_iceberg::io::{IcebergStorageBackend, SendIcebergStorage};
 use tokio::sync::OnceCell;
 
 /// A boxed, `Send + Sync` async builder that performs the deferred loadTable GET
-/// and returns the concrete storage — or an [`IcebergError`] mapped from the build
-/// failure (so the trait methods surface the eager path's error shape).
+/// and returns the concrete storage — or the build's own [`IcebergError`] (so the
+/// trait methods surface the eager path's error shape).
 pub(crate) type StorageBuilder<'a, S> = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = IcebergResult<Arc<S>>> + Send + 'a>> + Send + Sync + 'a,
 >;
