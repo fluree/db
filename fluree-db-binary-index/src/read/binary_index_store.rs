@@ -3459,7 +3459,7 @@ pub struct BinaryGraphView {
 /// usually skips the shared cache's probe), and the identity table of the
 /// predicate read last. One shard only, so the view never holds more of an
 /// arena than the cache's eviction allows; a key's own slice keeps its shard
-/// for as long as the key lives.
+/// for as long as the key lives, and keys share one copy of each shard.
 #[derive(Default)]
 struct VectorCursor(std::sync::Mutex<VectorCursorInner>);
 
@@ -3467,6 +3467,12 @@ struct VectorCursor(std::sync::Mutex<VectorCursorInner>);
 struct VectorCursorInner {
     shard: Option<(u32, usize, Arc<crate::arena::vector::VectorShard>)>,
     identity: Option<(u32, Option<Arc<VectorIdentity>>)>,
+    /// Every shard this view has handed to a key, weakly: while some key
+    /// still holds a shard, a later key reuses that copy rather than load
+    /// another once the shared cache has evicted it, so keys never hold more
+    /// than one copy of the arena. Holds nothing alive itself.
+    handed_out:
+        rustc_hash::FxHashMap<(u32, usize), std::sync::Weak<crate::arena::vector::VectorShard>>,
 }
 
 impl VectorCursor {
@@ -3796,6 +3802,12 @@ impl BinaryGraphView {
             .as_ref()
             .filter(|(p, i, _)| *p == p_id && *i == shard_idx)
             .map(|(_, _, shard)| Arc::clone(shard));
+        let held = held.or_else(|| {
+            cursor
+                .handed_out
+                .get(&(p_id, shard_idx))
+                .and_then(std::sync::Weak::upgrade)
+        });
         let shard = match held {
             Some(shard) => shard,
             None => {
@@ -3803,10 +3815,15 @@ impl BinaryGraphView {
                 drop(cursor);
                 let shard = arena.shard(shard_idx)?;
                 cursor = self.vector_cursor.lock();
-                cursor.shard = Some((p_id, shard_idx, Arc::clone(&shard)));
+                cursor
+                    .handed_out
+                    .insert((p_id, shard_idx), Arc::downgrade(&shard));
                 shard
             }
         };
+        if !matches!(&cursor.shard, Some((p, i, _)) if *p == p_id && *i == shard_idx) {
+            cursor.shard = Some((p_id, shard_idx, Arc::clone(&shard)));
+        }
         if !matches!(&cursor.identity, Some((p, _)) if *p == p_id) {
             cursor.identity = Some((p_id, self.store.built_vector_identity(self.g_id, p_id)));
         }
