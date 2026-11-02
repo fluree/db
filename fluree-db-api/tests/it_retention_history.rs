@@ -219,51 +219,36 @@ async fn a_no_history_property_is_read_from_what_the_index_keeps() {
 async fn disabling_no_history_reopens_only_what_it_kept() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = ledger(&fluree, "it/nohist-disable").await;
-    upsert(
-        &fluree,
-        &id,
-        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 1}),
-    )
-    .await;
+    let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
+    let t1 = upsert(&fluree, &id, doc(1)).await;
     set_no_history(&fluree, &id, "ex:count", true).await;
-    upsert(
-        &fluree,
-        &id,
-        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 2}),
-    )
-    .await;
+    let t3 = upsert(&fluree, &id, doc(2)).await;
     fluree.run_retention(&id).await.expect("pass");
     let off = set_no_history(&fluree, &id, "ex:count", false).await;
-    let t5 = upsert(
-        &fluree,
-        &id,
-        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 3}),
-    )
-    .await;
-    upsert(
-        &fluree,
-        &id,
-        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 4}),
-    )
-    .await;
+    let t5 = upsert(&fluree, &id, doc(3)).await;
+    upsert(&fluree, &id, doc(4)).await;
     fluree.run_retention(&id).await.expect("pass");
     let status = fluree.retention_status(&id).await.unwrap();
     let rule = &status.registration.as_ref().unwrap().journal.history_rules[0];
     assert_eq!(rule.until_t, Some(off), "{status:?}");
     reindex(&fluree, &id).await;
-    // History written after the rule ended stays in the index.
+    let at = |t: i64| json!(format!("{id}@t:{t}"));
+    // A value superseded while the rule was in force leaves the index.
     assert_eq!(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t5}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-        .unwrap(),
-        vec![json!(3)]
+        read(&fluree, &id, at(t1), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        Vec::<JsonValue>::new()
     );
+    // One superseded after it ended keeps its whole span, its assertion
+    // under the rule included; history written after it ended stays too.
+    for (t, value) in [(t3, 2), (off, 2), (t5, 3)] {
+        assert_eq!(
+            read(&fluree, &id, at(t), "ex:c", "ex:count").await.unwrap(),
+            vec![json!(value)],
+            "t={t}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -622,6 +607,84 @@ async fn incremental_builds_leave_suppressed_history_out() {
             .unwrap(),
         vec![json!(5)]
     );
+}
+
+/// Wait for the background indexer to reach the head.
+async fn caught_up(fluree: &Fluree, ledger_id: &str) {
+    for _ in 0..300 {
+        let record = fluree
+            .nameservice()
+            .lookup(ledger_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if record.index_t >= record.commit_t {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the background indexer did not catch up");
+}
+
+/// Wait for the worker to record the ledger's one rule as in force, or ended.
+async fn rule_in_force(fluree: &Fluree, ledger_id: &str, in_force: bool) {
+    for _ in 0..300 {
+        let rules = history_rules(fluree, ledger_id).await;
+        if rules.len() == 1 && rules[0].until_t.is_none() == in_force {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the worker did not record the rule");
+}
+
+/// Incremental builds keep a span that straddles a rule's end whole, as a
+/// rebuild does (`disabling_no_history_reopens_only_what_it_kept`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_builds_keep_a_span_that_outlives_the_rule() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_millis(200))
+            .build()
+            .unwrap(),
+    );
+    fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            ..Default::default()
+        }),
+    );
+    let id = ledger(&fluree, "it/nohist-incremental-span").await;
+    let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
+    let t1 = upsert(&fluree, &id, doc(1)).await;
+    caught_up(&fluree, &id).await;
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    rule_in_force(&fluree, &id, true).await;
+    let t3 = upsert(&fluree, &id, doc(2)).await;
+    caught_up(&fluree, &id).await;
+    set_no_history(&fluree, &id, "ex:count", false).await;
+    rule_in_force(&fluree, &id, false).await;
+    let t5 = upsert(&fluree, &id, doc(3)).await;
+    caught_up(&fluree, &id).await;
+
+    let at = |t: i64| json!(format!("{id}@t:{t}"));
+    assert_eq!(
+        read(&fluree, &id, at(t1), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        Vec::<JsonValue>::new()
+    );
+    for (t, value) in [(t3, 2), (t5, 3)] {
+        assert_eq!(
+            read(&fluree, &id, at(t), "ex:c", "ex:count").await.unwrap(),
+            vec![json!(value)],
+            "t={t}"
+        );
+    }
 }
 
 /// A full-text index built before a removal could still match the removed

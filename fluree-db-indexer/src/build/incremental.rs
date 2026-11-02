@@ -6092,7 +6092,6 @@ fn build_folded_tree(
     config: &IndexerConfig,
     history_drop: Option<Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
 ) -> Result<BranchUpdateResult> {
-    use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
     use fluree_db_binary_index::format::leaf::LeafWriter;
 
     let cmp = cmp_v2_for_order(order);
@@ -6106,18 +6105,7 @@ fn build_folded_tree(
     );
     writer.set_history_drop(history_drop);
     for fact in by_key {
-        for &(rec, op) in &fact.transitions {
-            writer.push_history_entry(HistEntryV2 {
-                s_id: rec.s_id,
-                p_id: rec.p_id,
-                o_type: rec.o_type,
-                o_key: rec.o_key,
-                o_i: rec.o_i,
-                t: rec.t,
-                op,
-                g_id: rec.g_id,
-            });
-        }
+        writer.push_transitions(&fact.transitions);
         if let Some(row) = fact.row {
             writer
                 .push_record(row)

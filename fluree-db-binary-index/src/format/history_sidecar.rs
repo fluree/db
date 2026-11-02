@@ -380,6 +380,53 @@ mod tests {
         }
     }
 
+    /// `(o_key, t, op)` of what `drop` keeps of `entries`.
+    fn kept(drop: &HistoryDrop, mut entries: Vec<HistEntryV2>) -> Vec<(u64, u32, u8)> {
+        drop.retain(&mut entries);
+        let mut out: Vec<_> = entries.iter().map(|e| (e.o_key, e.t, e.op)).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn a_range_leaves_out_a_span_only_when_both_ends_fall_in_it() {
+        let span = |o_key, from, until| {
+            vec![
+                make_entry(1, 7, 3, o_key, from, 1),
+                make_entry(1, 7, 3, o_key, until, 0),
+            ]
+        };
+        let mut until_4 = HistoryDrop::default();
+        until_4.insert(7, 0, Some(4));
+        // Inside: gone. Straddling the end: kept whole. After it: kept.
+        let entries = [span(10, 1, 3), span(20, 3, 5), span(30, 5, 6)].concat();
+        assert_eq!(
+            kept(&until_4, entries),
+            vec![(20, 3, 1), (20, 5, 0), (30, 5, 1), (30, 6, 0)]
+        );
+        // One fact's spans, one after another.
+        let chain = [span(10, 1, 2), span(10, 3, 5)].concat();
+        assert_eq!(kept(&until_4, chain), vec![(10, 3, 1), (10, 5, 0)]);
+        // Straddling the start: kept whole.
+        let mut from_2 = HistoryDrop::default();
+        from_2.insert(7, 2, None);
+        assert_eq!(kept(&from_2, span(10, 1, 3)), vec![(10, 1, 1), (10, 3, 0)]);
+        // Another predicate is untouched.
+        let other = vec![make_entry(1, 8, 3, 10, 1, 1), make_entry(1, 8, 3, 10, 3, 0)];
+        assert_eq!(kept(&until_4, other), vec![(10, 1, 1), (10, 3, 0)]);
+    }
+
+    #[test]
+    fn a_straddling_span_does_not_keep_an_erased_event() {
+        let entries = vec![make_entry(1, 7, 3, 10, 3, 1), make_entry(1, 7, 3, 10, 5, 0)];
+        let mut drop = HistoryDrop::default();
+        drop.insert(7, 0, Some(4));
+        for e in &entries {
+            drop.insert_event(e);
+        }
+        assert!(kept(&drop, entries).is_empty());
+    }
+
     #[test]
     fn hist_entry_roundtrip() {
         let entry = HistEntryV2 {
@@ -525,11 +572,10 @@ mod tests {
 /// `t`, for retention that keeps no history (`f:noHistory`) for a predicate,
 /// and as single events, for permanent erasure.
 ///
-/// A range covers whole transitions of the predicate's facts, so what is
-/// left still replays consistently from the head back to any point after the
-/// range. An erasure removes an assertion with the retraction that ended it,
-/// a whole span of one fact, which replays consistently too. Reads of points
-/// inside a range are refused before they reach the index.
+/// Both leave out whole spans of one fact, an assertion with the retraction
+/// that ended it, so what is left replays consistently at every point. A
+/// range leaves a span out only when both its ends fall in one (see
+/// [`HistoryDrop::retain`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HistoryDrop {
     by_p_id: std::collections::HashMap<u32, Vec<(i64, i64)>>,
@@ -569,13 +615,63 @@ impl HistoryDrop {
         self.by_p_id.is_empty() && self.events.is_empty()
     }
 
-    /// Whether `entry` is left out.
+    /// Whether `entry` falls in one of its predicate's ranges.
     #[inline]
-    pub fn drops(&self, entry: &HistEntryV2) -> bool {
+    fn in_range(&self, entry: &HistEntryV2) -> bool {
         self.by_p_id.get(&entry.p_id).is_some_and(|ranges| {
             ranges
                 .iter()
                 .any(|(from, until)| *from <= i64::from(entry.t) && i64::from(entry.t) < *until)
-        }) || (!self.events.is_empty() && self.events.contains(&event_key(entry)))
+        })
+    }
+
+    #[inline]
+    fn erases(&self, entry: &HistEntryV2) -> bool {
+        !self.events.is_empty() && self.events.contains(&event_key(entry))
+    }
+
+    /// Leave out of `entries`, which hold every transition of the facts they
+    /// name, what is dropped. A span whose assertion or retraction falls
+    /// outside the ranges is kept whole: one asserted while a rule was in
+    /// force and retracted after it ended still reads as present between the
+    /// two, and never before its assertion.
+    pub fn retain(&self, entries: &mut Vec<HistEntryV2>) {
+        let mut ranged: Vec<bool> = entries.iter().map(|e| self.in_range(e)).collect();
+        let any_ranged = ranged.contains(&true);
+        if !any_ranged && self.events.is_empty() {
+            return;
+        }
+        if any_ranged {
+            type Fact = (u64, u32, u16, u64, u32, fluree_db_core::GraphId);
+            let mut facts: std::collections::HashMap<Fact, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, e) in entries.iter().enumerate() {
+                if self.by_p_id.contains_key(&e.p_id) {
+                    let fact = (e.s_id.as_u64(), e.p_id, e.o_type, e.o_key, e.o_i, e.g_id);
+                    facts.entry(fact).or_default().push(i);
+                }
+            }
+            for mut transitions in facts.into_values() {
+                transitions.sort_unstable_by_key(|&i| {
+                    fluree_db_core::same_t::op_order(entries[i].t, entries[i].op == 1)
+                });
+                for span in transitions.windows(2) {
+                    let (assert, retract) = (span[0], span[1]);
+                    if entries[assert].op == 1
+                        && entries[retract].op == 0
+                        && ranged[assert] != ranged[retract]
+                    {
+                        ranged[assert] = false;
+                        ranged[retract] = false;
+                    }
+                }
+            }
+        }
+        let mut i = 0;
+        entries.retain(|e| {
+            let keep = !ranged[i] && !self.erases(e);
+            i += 1;
+            keep
+        });
     }
 }

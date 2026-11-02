@@ -47,7 +47,7 @@ The same `f:noHistory` entry can carry an `f:ttl` too: values expire, and once i
 ### Coverage
 
 - **Enabling covers existing history.** The values the predicate had before the config commit leave the index too.
-- **Disabling covers only the past.** `f:noHistory false`, or removing the entry, ends the rule at that config commit. History written from then on is kept. History from the covered period stays out of the index.
+- **Disabling covers only the past.** `f:noHistory false`, or removing the entry, ends the rule at that config commit. History written from then on is kept. History from the covered period stays out of the index, except a value that was still current when the rule ended: it keeps its whole span, so a read between its assertion and its later retraction still sees it.
 - **Graphs.** A ledger-wide entry governs the predicate in every data graph. A graph override with `f:noHistory false` keeps that graph's history.
 
 A rule takes effect when the retention worker next runs, within `--retention-interval-secs` (15 seconds by default) of the config commit. Until then, index builds keep the history. Status shows the rule once it is recorded.

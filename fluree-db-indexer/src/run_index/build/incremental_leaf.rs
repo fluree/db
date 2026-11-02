@@ -811,7 +811,7 @@ fn assemble_output_leaves(
 
 /// Build a single leaf blob from a group of (EncodedLeaflet, history, was_re_encoded) triples.
 fn build_leaf_from_group(
-    group: Vec<(
+    mut group: Vec<(
         fluree_db_binary_index::format::leaflet::EncodedLeaflet,
         Vec<HistEntryV2>,
         bool,
@@ -824,12 +824,12 @@ fn build_leaf_from_group(
     // Build sidecar from history entries, leaving out what retention drops
     // (carried-forward history included).
     let mut sidecar_builder = HistSidecarBuilder::for_order(order);
-    for (_, history, _) in &group {
+    for (_, history, _) in &mut group {
+        if let Some(drop) = history_drop {
+            drop.retain(history);
+        }
         sidecar_builder.start_leaflet();
-        for entry in history {
-            if history_drop.is_some_and(|d| d.drops(entry)) {
-                continue;
-            }
+        for entry in history.iter() {
             sidecar_builder.push_entry(*entry);
         }
     }

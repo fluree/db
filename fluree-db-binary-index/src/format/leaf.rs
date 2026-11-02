@@ -355,18 +355,7 @@ impl LeafWriter {
     /// order and is left holding the sidecar transitions.
     pub fn push_lifecycle(&mut self, events: &mut Vec<(RunRecordV2, u8)>) -> io::Result<bool> {
         let row = resolve_transitions(events, false);
-        for &(rec, op) in events.iter() {
-            self.push_history_entry(HistEntryV2 {
-                s_id: rec.s_id,
-                p_id: rec.p_id,
-                o_type: rec.o_type,
-                o_key: rec.o_key,
-                o_i: rec.o_i,
-                t: rec.t,
-                op,
-                g_id: rec.g_id,
-            });
-        }
+        self.push_transitions(events);
         match row {
             Some(row) => self.push_record(row).map(|()| true),
             None => Ok(false),
@@ -382,12 +371,43 @@ impl LeafWriter {
     /// entry into the leaflet that actually holds its row. Retract-winner facts
     /// (no materialized row) push history only; those entries are committed to the
     /// current leaflet by the next `push_record` (or by `finish`).
+    ///
+    /// Retention's drop applies per fact, through [`Self::push_transitions`].
     pub fn push_history_entry(&mut self, entry: HistEntryV2) {
-        if self.skip_history || self.history_drop.as_ref().is_some_and(|d| d.drops(&entry)) {
+        if self.skip_history {
             return;
         }
         self.tally(entry.g_id, 0, 1);
         self.pending_history.push(entry);
+    }
+
+    /// Push one fact identity's sidecar transitions (`op`: 1 = assert,
+    /// 0 = retract), leaving out what retention drops.
+    pub fn push_transitions(&mut self, transitions: &[(RunRecordV2, u8)]) {
+        let entry = |&(rec, op): &(RunRecordV2, u8)| HistEntryV2 {
+            s_id: rec.s_id,
+            p_id: rec.p_id,
+            o_type: rec.o_type,
+            o_key: rec.o_key,
+            o_i: rec.o_i,
+            t: rec.t,
+            op,
+            g_id: rec.g_id,
+        };
+        match &self.history_drop {
+            Some(drop) => {
+                let mut entries: Vec<HistEntryV2> = transitions.iter().map(entry).collect();
+                drop.retain(&mut entries);
+                for e in entries {
+                    self.push_history_entry(e);
+                }
+            }
+            None => {
+                for t in transitions {
+                    self.push_history_entry(entry(t));
+                }
+            }
+        }
     }
 
     /// Commit `entry` into the current leaflet's sidecar segment, starting the
