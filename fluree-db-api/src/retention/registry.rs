@@ -77,10 +77,6 @@ pub struct Registration {
     /// The removal journal: what the branch's history no longer serves.
     #[serde(default, skip_serializing_if = "super::journal::Journal::is_empty")]
     pub journal: super::journal::Journal,
-    /// The journal generation whose history rules the index has been rebuilt
-    /// for (the backfill that drops existing history from the index).
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub history_backfilled: u64,
     /// The CID of the ledger's genesis commit, which every copy of it
     /// (restored, cloned, branched) shares; keys the journal checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]

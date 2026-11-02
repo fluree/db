@@ -56,7 +56,7 @@ A rule takes effect when the retention worker next runs, within `--retention-int
 
 ### The index
 
-The background indexer leaves the covered history out of the index, in incremental builds as well as full rebuilds. Enabling a rule also starts a background rebuild, so history indexed before the rule is dropped too. While that rebuild runs, reads that need the history are already refused. `historyBackfilled` in [status](#status) reaches the journal's `generation` when it finishes.
+The background indexer leaves the covered history out of the index, in incremental builds as well as full rebuilds. History indexed before the rule was recorded stays in the index until a build rewrites the leaf that holds it. A [reindex](../indexing-and-search/reindex.md) drops all of it at once.
 
 ## Targeted removal
 
@@ -167,8 +167,7 @@ Such a replica refuses the ledger's history until it catches up.
           "subject": "v1:4f0c..."
         }
       ]
-    },
-    "historyBackfilled": 4
+    }
   },
   "maintenanceRunning": true
 }

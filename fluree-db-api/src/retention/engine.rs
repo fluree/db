@@ -812,10 +812,6 @@ impl Fluree {
                 );
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(current) = &current {
-            self.backfill_history_if_needed(ledger_id, current);
-        }
         Ok(report)
     }
 

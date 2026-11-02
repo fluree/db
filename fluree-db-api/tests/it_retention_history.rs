@@ -500,21 +500,19 @@ async fn no_history_compacts_the_index_history() {
 
     set_no_history(&fluree, &id, "ex:count", true).await;
     fluree.run_retention(&id).await.expect("pass");
-    let mut backfilled = false;
-    for _ in 0..200 {
-        let status = fluree.retention_status(&id).await.unwrap();
-        let r = status.registration.unwrap();
-        if r.history_backfilled >= r.journal.generation && r.journal.generation > 0 {
-            backfilled = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(backfilled, "the backfill rebuild did not finish");
+    assert_eq!(
+        indexed_history_entries(&fluree, &id).await,
+        before,
+        "recording the rule does not rebuild the index"
+    );
+    fluree
+        .reindex(&id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
     assert_eq!(
         indexed_history_entries(&fluree, &id).await,
         0,
-        "the backfill left no history for the counter"
+        "a rebuild leaves no history for the counter"
     );
 
     // Later changes leave no history in the next build either.
@@ -564,18 +562,17 @@ async fn incremental_builds_leave_suppressed_history_out() {
     )
     .await;
     set_no_history(&fluree, &id, "ex:count", true).await;
-    // The worker records the rule and rebuilds once.
     let mut ready = false;
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Some(r) = fluree.retention_status(&id).await.unwrap().registration {
-            if r.journal.generation > 0 && r.history_backfilled >= r.journal.generation {
+            if !r.journal.history_rules.is_empty() {
                 ready = true;
                 break;
             }
         }
     }
-    assert!(ready, "the rule and its backfill");
+    assert!(ready, "the worker records the rule");
     // Incremental builds over later changes add no history for the counter.
     for n in 2..=5 {
         upsert(

@@ -48,8 +48,6 @@ pub(crate) struct RetentionRuntime {
     pub(crate) suppressions: super::suppression::SuppressionCache,
     /// Each branch's instance, head and journal, as this instance knows them.
     pub(crate) watch: Arc<super::watch::BranchWatch>,
-    /// Branches whose history backfill (a rebuild) is running.
-    backfills: parking_lot::Mutex<HashSet<String>>,
     /// Set on a cluster node.
     pub(crate) replicas: std::sync::OnceLock<Arc<dyn super::replicas::ReplicaSync>>,
     /// Registration chunks read.
@@ -241,72 +239,6 @@ impl RetentionWriter for BorrowedWriter<'_> {
 }
 
 impl Fluree {
-    #[cfg(not(target_arch = "wasm32"))]
-    /// Rebuild `ledger_id`'s index once its journal has history rules the
-    /// index was not yet rebuilt for: incremental builds drop suppressed
-    /// history only from the leaves they touch, so existing history goes in
-    /// one rebuild. Runs in the background; a failure is retried on a later
-    /// pass.
-    pub(crate) fn backfill_history_if_needed(
-        &self,
-        ledger_id: &str,
-        registration: &registry::Registration,
-    ) {
-        // Closed rules count too: one enabled and disabled between passes
-        // still covers history the index holds.
-        let journal = &registration.journal;
-        if journal.history_rules.is_empty() || registration.history_backfilled >= journal.generation
-        {
-            return;
-        }
-        if !self
-            .retention
-            .backfills
-            .lock()
-            .insert(ledger_id.to_string())
-        {
-            return;
-        }
-        let fluree = self.clone();
-        let ledger_id = ledger_id.to_string();
-        let generation = journal.generation;
-        tokio::spawn(async move {
-            let outcome = fluree
-                .reindex(&ledger_id, crate::ReindexOptions::default())
-                .await;
-            match outcome {
-                Ok(_) => {
-                    if let Ok(ns) = fluree.publisher() {
-                        let _ = registry::update(
-                            ns,
-                            fluree.registry_objects(),
-                            &ledger_id,
-                            |current| {
-                                let current = current?;
-                                (current.history_backfilled < generation).then(|| {
-                                    registry::Registration {
-                                        history_backfilled: generation,
-                                        ..current.clone()
-                                    }
-                                })
-                            },
-                        )
-                        .await;
-                    }
-                    tracing::info!(
-                        ledger_id,
-                        generation,
-                        "retention: history backfill rebuilt the index"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(ledger_id, error = %e, "retention: history backfill failed; will retry");
-                }
-            }
-            fluree.retention.backfills.lock().remove(&ledger_id);
-        });
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     /// Housekeeping that runs the retention worker, committing through
     /// `writer` (this instance directly when `None`). Install it on the

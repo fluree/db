@@ -3056,7 +3056,7 @@ GET /retention/{ledger-id}
 
 `active` is `false` (and `registration` absent) for a ledger that never wrote a lifetime or configured one. `maintenanceRunning` and `overdue` describe the node that answers: in a cluster, ask the leader.
 
-A ledger with [history retention](../transactions/history-retention.md#status) also reports `registration.journal` (its `f:noHistory` rules and removals, never the removed values) and `registration.historyBackfilled`.
+A ledger with [history retention](../transactions/history-retention.md#status) also reports `registration.journal`: its `f:noHistory` rules and removals, never the removed values.
 
 **Status Codes:**
 - `200 OK` - Ledger found
