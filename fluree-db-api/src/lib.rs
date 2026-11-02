@@ -193,7 +193,9 @@ pub use import::{
     EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
     ImportSummary, RemoteSource,
 };
-pub use ledger_info::{redact_graph_source_config, LedgerInfoBuilder};
+pub use ledger_info::{
+    redact_graph_source_config, redact_graph_source_record_config, LedgerInfoBuilder,
+};
 pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
@@ -246,17 +248,28 @@ pub use view::{
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
 };
 
+#[cfg(feature = "sql")]
+pub use graph_source::sql_auth_from_json;
+#[cfg(feature = "delta")]
+pub use graph_source::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
+/// The one codec every surface turns its graph-source input into the
+/// persisted config with; see [`graph_source::surface`].
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
-    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
-    sample_column_values, sample_iceberg_rows, verify_storage_access, BrowseDepth, CatalogBrowse,
-    CatalogMode, CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic,
-    FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse,
-    IcebergConnectionConfig, IcebergCreateConfig, IcebergCreateResult, MaterializeResult,
-    PartitionFieldInfo, PersistedMaterializeJob, R2rmlCreateConfig, R2rmlCreateResult,
-    R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    StorageAccessReport, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride,
-    TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    default_google_quota_project, default_storage_auth, iceberg_connection_from_json,
+    iceberg_create_from_json, secret_field, AuthProfile, CatalogAuthFields, GraphSourceInputError,
+    IcebergConnectionFields, InputErrorKind, SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
+};
+#[cfg(feature = "iceberg")]
+pub use graph_source::{
+    guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
+    CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider,
+    GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
+    IcebergCreateConfig, IcebergCreateResult, MaterializeResult, PartitionFieldInfo,
+    PersistedMaterializeJob, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput,
+    ResolvedStorage, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
+    StorageAccessReport, StorageDecision, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
+    TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 #[cfg(feature = "delta")]
@@ -283,10 +296,30 @@ pub use graph_source::{
 #[cfg(feature = "sql")]
 pub use graph_source::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 
+/// A REST catalog's (or SQL endpoint's) auth, in its stored shape.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::auth::AuthConfig as IcebergAuthConfig;
+/// A Workload Identity Federation credential configuration, inline or held by
+/// a [`IcebergConfigValue`].
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::auth::ExternalAccountConfig;
 /// A graph-source secret: a literal, a secret reference, or the name of an
 /// environment variable of the reading process.
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::ConfigValue as IcebergConfigValue;
+/// Which host-derived identities graph sources may use, and the AWS subject
+/// that signs Workload Identity Federation exchanges — injected per instance
+/// via [`Fluree::with_host_identity_policy`] /
+/// [`Fluree::with_aws_subject_credentials`].
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::{
+    AwsCredentials, AwsSubjectCredentials, HostIdentityKind, HostIdentityPolicy,
+    AMBIENT_BUCKETS_ENV, HOST_IDENTITIES_ENV,
+};
+/// A Google identity's credential source, and which identity reads a graph
+/// source's storage.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::{GoogleCredentials, StorageAuth};
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
 /// graph-source auth. The host constructs a [`SecretResolver`] with the tenant
 /// captured and injects it via [`Fluree::with_secret_resolver`]; db stays
@@ -1574,10 +1607,26 @@ pub struct FlureeBuilder {
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
     /// Read-only remote mounts applied at build time (alias-prefixed).
     remote_mounts: Vec<RemoteMountSpec>,
-    /// Optional secret resolver forwarded to the built `Fluree` for
-    /// `ConfigValue::SecretRef` hydration. See [`FlureeBuilder::with_secret_resolver`].
+    /// The identity context forwarded to the built `Fluree`: the secret
+    /// resolver for `ConfigValue::SecretRef` hydration, the host-identity
+    /// policy, and the AWS subject for Workload Identity Federation. See
+    /// [`FlureeBuilder::with_secret_resolver`],
+    /// [`FlureeBuilder::with_host_identity_policy`] and
+    /// [`FlureeBuilder::with_aws_subject_credentials`].
     #[cfg(feature = "iceberg")]
-    secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    identity: fluree_db_iceberg::IdentityContext,
+}
+
+/// The identity context an instance starts with: no secret resolver, and the
+/// operator's host-identity policy from the environment
+/// ([`HostIdentityPolicy::from_env`](fluree_db_iceberg::HostIdentityPolicy::from_env)),
+/// which allows every host identity when its variables are unset.
+#[cfg(feature = "iceberg")]
+fn default_identity_context() -> fluree_db_iceberg::IdentityContext {
+    fluree_db_iceberg::IdentityContext {
+        policy: fluree_db_iceberg::HostIdentityPolicy::from_env(),
+        ..fluree_db_iceberg::IdentityContext::default()
+    }
 }
 
 /// Configuration for background indexing in `FlureeBuilder`.
@@ -1816,7 +1865,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         }
     }
 
@@ -1841,7 +1890,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         }
     }
 
@@ -1922,7 +1971,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         }
     }
 
@@ -2155,7 +2204,7 @@ impl FlureeBuilder {
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         })
     }
 
@@ -2587,7 +2636,37 @@ impl FlureeBuilder {
         mut self,
         resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
     ) -> Self {
-        self.secret_resolver = Some(resolver);
+        self.identity.secret_resolver = Some(resolver);
+        self
+    }
+
+    /// Set which host-derived identities graph sources built by this instance
+    /// may use (the ambient AWS chain, the GCE metadata server, the host's
+    /// gcloud ADC, host-signed Workload Identity Federation). Defaults to
+    /// [`HostIdentityPolicy::from_env`](fluree_db_iceberg::HostIdentityPolicy::from_env),
+    /// the operator's `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES` and
+    /// `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS`, which allows all of them when
+    /// neither is set.
+    /// Forwarded to the finalized `Fluree`; see [`Fluree::with_host_identity_policy`].
+    #[cfg(feature = "iceberg")]
+    pub fn with_host_identity_policy(
+        mut self,
+        policy: fluree_db_iceberg::HostIdentityPolicy,
+    ) -> Self {
+        self.identity.policy = policy;
+        self
+    }
+
+    /// Set the AWS credentials that sign Workload Identity Federation subject
+    /// tokens for Google graph-source identities, instead of the host's own
+    /// aws-config chain. Forwarded to the finalized `Fluree`; see
+    /// [`Fluree::with_aws_subject_credentials`].
+    #[cfg(feature = "iceberg")]
+    pub fn with_aws_subject_credentials(
+        mut self,
+        subject: Arc<dyn fluree_db_iceberg::AwsSubjectCredentials>,
+    ) -> Self {
+        self.identity.aws_subject = Some(subject);
         self
     }
 
@@ -2685,7 +2764,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         )
     }
 
@@ -2750,7 +2829,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         )
     }
 
@@ -2876,7 +2955,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         )
     }
 
@@ -2944,7 +3023,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
@@ -3003,7 +3082,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
@@ -3085,7 +3164,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
@@ -3268,12 +3347,11 @@ impl FlureeBuilder {
         parts: RuntimeParts,
         remote_connections: remote_service::RemoteConnectionRegistry,
         remote_mounts: Vec<RemoteMountSpec>,
-        // The single assembly point forwards the builder's secret resolver so
-        // every `build*` path carries it uniformly. Gated: the trait lives in the
+        // The single assembly point forwards the builder's identity context
+        // (secret resolver, host-identity policy, AWS subject) so every
+        // `build*` path carries it uniformly. Gated: the types live in the
         // optional `fluree-db-iceberg` dep.
-        #[cfg(feature = "iceberg")] secret_resolver: Option<
-            Arc<dyn fluree_db_iceberg::SecretResolver>,
-        >,
+        #[cfg(feature = "iceberg")] identity: fluree_db_iceberg::IdentityContext,
     ) -> Fluree {
         let RuntimeParts {
             backend,
@@ -3328,7 +3406,7 @@ impl FlureeBuilder {
             ledger_manager,
             remote_service: build_remote_service(remote_connections),
             #[cfg(feature = "iceberg")]
-            secret_resolver,
+            identity,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             #[cfg(feature = "native")]
             root: RootHold::default(),
@@ -3445,7 +3523,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
@@ -3528,7 +3606,7 @@ impl FlureeBuilder {
                 self.remote_connections,
                 self.remote_mounts,
                 #[cfg(feature = "iceberg")]
-                self.secret_resolver,
+                self.identity,
             )
             .holding(root_lock))
         }
@@ -3596,7 +3674,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
@@ -3677,13 +3755,14 @@ pub struct Fluree {
     /// the executor is passed to `ContextConfig` and made available to
     /// `ServiceOperator` during query execution.
     remote_service: Option<Arc<dyn fluree_db_query::remote_service::RemoteServiceExecutor>>,
-    /// Injected resolver for `ConfigValue::SecretRef` secret references in
-    /// Iceberg graph-source auth. `None` in OSS/CLI (secret references then fail
-    /// closed); a host (e.g. solo) injects a tenant-scoped resolver via
-    /// [`Fluree::with_secret_resolver`]. db never sees tenant identity — the
-    /// resolver authorizes itself.
+    /// What graph-source auth providers are built with: the injected resolver
+    /// for `ConfigValue::SecretRef` references (`None` in OSS/CLI, where they
+    /// fail closed; a multi-tenant host injects a tenant-scoped one via
+    /// [`Fluree::with_secret_resolver`] — db never sees tenant identity, the
+    /// resolver authorizes itself), the host-identity policy, and the AWS
+    /// subject that signs Workload Identity Federation exchanges.
     #[cfg(feature = "iceberg")]
-    secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    identity: fluree_db_iceberg::IdentityContext,
     /// The key-rotation sweep running in this process, if any.
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
     /// What this instance holds of its file storage root.
@@ -3739,7 +3818,7 @@ impl Fluree {
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             #[cfg(feature = "native")]
             root: RootHold::default(),
@@ -3767,7 +3846,7 @@ impl Fluree {
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             #[cfg(feature = "native")]
             root: RootHold::default(),
@@ -3819,7 +3898,37 @@ impl Fluree {
         resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
     ) -> Fluree {
         let mut cloned = self.clone();
-        cloned.secret_resolver = Some(resolver);
+        cloned.identity.secret_resolver = Some(resolver);
+        cloned
+    }
+
+    /// Return a clone of this `Fluree` whose graph sources may use only the
+    /// host-derived identities `policy` allows (see
+    /// [`HostIdentityPolicy`](fluree_db_iceberg::HostIdentityPolicy)). Cheap,
+    /// and leaves the original untouched, like [`Fluree::with_secret_resolver`].
+    #[cfg(feature = "iceberg")]
+    pub fn with_host_identity_policy(
+        &self,
+        policy: fluree_db_iceberg::HostIdentityPolicy,
+    ) -> Fluree {
+        let mut cloned = self.clone();
+        cloned.identity.policy = policy;
+        cloned
+    }
+
+    /// Return a clone of this `Fluree` whose Google Workload Identity
+    /// Federation exchanges are signed with `subject` instead of the host's
+    /// own AWS credential chain — e.g. an AssumeRole session per tenant, so a
+    /// customer's WIF provider can condition on the tenant. An embedder's
+    /// subject is not a host identity, so the host-identity policy does not
+    /// gate it. Cheap, and leaves the original untouched.
+    #[cfg(feature = "iceberg")]
+    pub fn with_aws_subject_credentials(
+        &self,
+        subject: Arc<dyn fluree_db_iceberg::AwsSubjectCredentials>,
+    ) -> Fluree {
+        let mut cloned = self.clone();
+        cloned.identity.aws_subject = Some(subject);
         cloned
     }
 
@@ -3827,7 +3936,20 @@ impl Fluree {
     /// path; `None` means `ConfigValue::SecretRef` references fail closed.
     #[cfg(feature = "iceberg")]
     pub(crate) fn secret_resolver(&self) -> Option<&Arc<dyn fluree_db_iceberg::SecretResolver>> {
-        self.secret_resolver.as_ref()
+        self.identity.secret_resolver.as_ref()
+    }
+
+    /// Whether this instance can resolve a graph source's `secret_ref` values
+    /// (see [`Fluree::with_secret_resolver`]); a surface refuses them otherwise.
+    #[cfg(feature = "iceberg")]
+    pub fn has_secret_resolver(&self) -> bool {
+        self.identity.secret_resolver.is_some()
+    }
+
+    /// Everything a graph-source auth provider is built with on this instance.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn identity_context(&self) -> &fluree_db_iceberg::IdentityContext {
+        &self.identity
     }
 
     /// Get the remote SERVICE executor, if configured.
