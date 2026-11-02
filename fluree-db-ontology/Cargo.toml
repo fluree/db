@@ -14,6 +14,10 @@ fluree-graph-format = { path = "../fluree-graph-format" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# `ontology from`: CSV headers and rows, workbook sheets, SQL DDL
+csv = "1.4"
+fluree-doc-xlsx.workspace = true
+sqlparser = "0.63"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
