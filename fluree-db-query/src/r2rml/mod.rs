@@ -34,7 +34,7 @@ pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
     BatchSchema, ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, PushdownCapabilities,
     R2rmlProvider, R2rmlTableProvider, RelPlan, RelSource, ScanCmpOp, ScanFilter, ScanTopK,
-    ScanValue, SourceTime, TableWatermark,
+    ScanValue, SourceTime, TableWatermark, TermOrder,
 };
 pub use rewrite::{
     convert_triple_to_r2rml, r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml,

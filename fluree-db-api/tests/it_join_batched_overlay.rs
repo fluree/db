@@ -374,6 +374,18 @@ async fn probe_helpers_merge_novelty() {
             Engage::SpotStarWalk,
         ),
         (
+            // ex:missing is no predicate of the ledger's, so the star probe
+            // reads nothing for it while it merges the other predicates'
+            // novelty: the star matches nothing, rather than refusing.
+            "property-join-spot-walk-unknown-predicate",
+            r#"PREFIX ex: <http://example.org/ns/>
+              SELECT ?s ?v ?m
+              WHERE { ?s ex:city "Quito" . ?s ex:age ?v . ?s ex:missing ?m }
+              ORDER BY ?s ?v ?m"#,
+            0,
+            Engage::SpotStarWalk,
+        ),
+        (
             // ex:nick exists only in novelty, so the whole-star SPOT plan
             // declines and the remaining base predicates take the chunked
             // batched probes instead (the novelty-only predicate full-scans).
