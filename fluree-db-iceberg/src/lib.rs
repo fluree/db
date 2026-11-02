@@ -12,7 +12,9 @@
 //!
 //! The crate is organized into several modules:
 //!
-//! - [`auth`] - Authentication providers (bearer tokens, OAuth2 client credentials)
+//! - [`auth`] - Authentication providers (bearer tokens, OAuth2 client credentials,
+//!   Google identities)
+//! - [`host_identity`] - The operator's policy for host-derived identities
 //! - [`catalog`] - REST catalog client for table discovery and metadata location
 //! - [`credential`] - Vended credentials handling and caching
 //! - [`metadata`] - Iceberg table metadata parsing and snapshot selection
@@ -57,12 +59,14 @@ pub mod config;
 pub mod config_value;
 pub mod credential;
 pub mod error;
+pub mod host_identity;
 pub mod io;
 pub mod local_guard;
 pub mod manifest;
 pub mod metadata;
 pub mod mor_guard;
 pub mod net;
+pub(crate) mod renew;
 pub mod scan;
 pub mod stats;
 
@@ -73,6 +77,7 @@ pub mod stats;
 /// the reverse), so the falsy-spelling set is duplicated here ONCE, and the crate's
 /// kill switches call this instead of each hand-rolling the same match. Call sites
 /// cache the result in a per-switch `OnceLock` — set switches at process startup.
+#[cfg(feature = "aws")]
 pub(crate) fn env_switch_enabled(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => !matches!(
@@ -84,11 +89,18 @@ pub(crate) fn env_switch_enabled(name: &str) -> bool {
 }
 
 // Re-export commonly used types
+#[cfg(feature = "aws")]
+pub use auth::{AwsCredentials, AwsSubjectCredentials};
+pub use auth::{GoogleCredentials, IdentityContext};
 pub use config::{
-    CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, TableConfig,
+    CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, StorageAuth,
+    TableConfig,
 };
 pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
-pub use error::{IcebergError, Result};
+pub use error::{GoogleTokenStage, IcebergError, Result};
+pub use host_identity::{
+    HostIdentityKind, HostIdentityPolicy, AMBIENT_BUCKETS_ENV, HOST_IDENTITIES_ENV,
+};
 pub use local_guard::{
     ensure_local_location_allowed, is_local_location, local_roots, resolve_local_path,
     LOCAL_ROOTS_ENV,
@@ -118,6 +130,9 @@ pub use catalog::SendDirectCatalogClient;
 #[cfg(feature = "aws")]
 pub use fluree_db_core::disk_cache::DiskArtifactCache;
 #[cfg(feature = "aws")]
-pub use io::{S3IcebergStorage, SendIcebergStorage, SendParquetReader};
+pub use io::{
+    GcsIcebergStorage, IcebergStorageBackend, S3IcebergStorage, SendIcebergStorage,
+    SendParquetReader, StorageScope,
+};
 #[cfg(feature = "aws")]
 pub use scan::SendScanPlanner;

@@ -58,14 +58,16 @@ pub use path::{
     PathDirection, PathModifier, PathNodeFilter, PathStep, PropertyPathPattern, ShortestPathMode,
     ShortestPathPattern,
 };
-pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
+pub use pattern::{
+    GraphName, OrderRole, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
+};
 pub use projection::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec,
     Projection, Root,
 };
 pub use query::{
-    ConstructTemplate, PostValues, Query, QueryOutput, Restriction, TemplateReification,
-    UngroupedProjection,
+    ConstructTemplate, ListEntryVars, PostValues, Query, QueryOutput, Restriction,
+    TemplateReification, UngroupedProjection,
 };
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use triple::{Ref, Term, TriplePattern};

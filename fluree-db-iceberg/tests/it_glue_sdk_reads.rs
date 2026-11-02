@@ -49,6 +49,8 @@ async fn read_rows(catalog: Box<dyn SendCatalogClient>, table_id: TableIdentifie
         "the AWS SDK path reads S3 with ambient creds (no vending)"
     );
 
+    // An SDK smoke test of the S3 client itself, not a graph-source read.
+    #[allow(deprecated)]
     let storage = S3IcebergStorage::from_default_chain(region().as_deref(), None, false)
         .await
         .expect("storage");

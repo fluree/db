@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fluree_db_iceberg::metadata::TableMetadata;
-use fluree_db_iceberg::DataFile;
+use fluree_db_iceberg::{DataFile, StorageScope};
 use serde::{Deserialize, Serialize};
 
 use super::cache::CachedScanFiles;
@@ -210,7 +210,7 @@ fn pointer_is_usable(
 ///
 /// **v2** = the payload change that added the verified [`Envelope::key`] field.
 /// The filename RE-KEY that landed alongside it (a spec-defined [`stable_key_hash`]
-/// replacing `std`'s `DefaultHasher`, plus a [`CACHE_SCOPE`] segment) is ORTHOGONAL
+/// replacing `std`'s `DefaultHasher`, plus a scope segment) is ORTHOGONAL
 /// to this version and deliberately did NOT bump it: it changes file NAMES, not the
 /// stored layout, so a re-keyed process simply never opens a pre-existing file. Old
 /// entries are harmless ORPHANS, evicted oldest-first by the [`MAX_CACHE_BYTES`]
@@ -268,34 +268,27 @@ fn stable_key_hash(key: &str) -> u64 {
     xxhash_rust::xxh64::xxh64(key.as_bytes(), 0)
 }
 
-/// Cache-scope discriminant embedded in every entry filename (see
-/// [`DiskCatalogCache::path`]). CONSTANT today: every graph source in a process
-/// currently reads S3 under the SAME identity, so a single shared scope is
-/// correct by construction and a shared key is safe.
-///
-/// **Load-bearing design rule for mechanism B (per-graph-source
-/// `sts:AssumeRole`).** When per-graph-source role assumption lands, this
-/// constant MUST be replaced by a per-entry scope value that is a STABLE
-/// FINGERPRINT of the graph source's catalog-auth scope — the same identity
-/// `rest_clients` is keyed on. It MUST NEVER be the vended credential itself:
-/// vended credentials rotate on every `loadTable`, so keying on the credential
-/// would yield a 0% hit rate under the default configuration. Keeping the scope a
-/// constant embedded in the existing filename slot makes that future change a
-/// localized edit (thread a `scope: &str` into [`DiskCatalogCache::path`]) rather
-/// than a format migration.
-///
-/// **Per-layer verdict** (decide this deliberately when B lands — do not inherit it
-/// by accident):
-/// - `scanfiles` / `countstats` — **storage-gated**: their column bounds and
-///   per-file record counts come from manifests, i.e. S3 objects behind the storage
-///   gate. These are the layers a per-source identity must discriminate.
-/// - `metadata` — **catalog-gated**: a successful `loadTable` discloses the schema
-///   by protocol (and now hands it to us inline), so it crosses no storage gate.
-/// - `pointer` — **catalog-gated AND already per-graph-source**: its key is an
-///   `lt_key` (`graph_source_id` + namespace + table), so two graph sources can never
-///   share an entry, and the value is a non-secret `s3://` path the catalog itself
-///   returned. It needs no scope.
-const CACHE_SCOPE: &str = "shared";
+// Cache scope: every entry filename carries a scope segment, and every
+// storage-read layer's key is qualified by the source's [`StorageScope`] (the
+// identity the cached object was read under; see `graph_source::storage`).
+// The shared scope (the host's ambient AWS chain, no endpoint override, the
+// default identity context) keeps the literal segment `shared` and the bare
+// key, so entries written before scopes existed are still found.
+//
+// It is never the vended credential itself: vended credentials rotate on every
+// `loadTable`, so keying on them would give a 0% hit rate. A vended read is
+// scoped by the catalog (URI, warehouse, the stored auth's fingerprint) instead.
+//
+// Per-layer verdict:
+// - `scanfiles` / `countstats` — storage-gated (manifests are objects behind the
+//   storage identity): scoped.
+// - `metadata` — catalog-gated for a catalog that returns it inline, but read
+//   from storage on every other path (Direct, Glue, S3 Tables, a REST catalog
+//   that omits it): scoped.
+// - `pointer` — catalog-gated and already per graph source: its key is the
+//   source's `lt_key` and config fingerprint. It holds only a location the
+//   catalog returned, every read of which goes through the scoped layers. Kept
+//   under the shared scope.
 
 /// Content-addressed on-disk catalog cache. A pure optimization: any I/O, parse,
 /// or version failure degrades to a miss (the caller reads from S3), never an
@@ -324,28 +317,34 @@ impl DiskCatalogCache {
         }
     }
 
-    /// File path for `key`'s `suffix` entry, under [`CACHE_SCOPE`].
+    /// File path for `key`'s `suffix` entry, under `scope`.
     ///
     /// `key` spans TWO DISJOINT key spaces, separated only by `suffix`: an `s3://…`
     /// `metadata_location` (the `metadata` / `scanfiles` / `countstats` layers) or an
     /// `lt_key` (the `pointer` layer). Hash it — STABLY, see [`stable_key_hash`] — to
     /// a filesystem-safe, fixed-length stem; [`Envelope::key`] stores the full key so
     /// a stem collision (within or across those spaces) is a clean miss rather than a
-    /// wrong-payload read. The middle `scope` segment is a discriminant for future
-    /// per-graph-source identity (see [`CACHE_SCOPE`]); it is a constant today, so
-    /// this shape already leaves room to make the scope a per-call argument without
-    /// changing the filename layout. Shape: `{hash:016x}.{scope}.{suffix}.json`.
-    fn path(&self, key: &str, suffix: &str) -> PathBuf {
-        let hash = stable_key_hash(key);
-        self.dir
-            .join(format!("{hash:016x}.{CACHE_SCOPE}.{suffix}.json"))
+    /// wrong-payload read. `key` is qualified by `scope` (the bare key in the
+    /// shared scope), and the middle segment names the scope, so one identity's
+    /// entry is never another's. Shape: `{hash:016x}.{scope}.{suffix}.json`.
+    fn path(&self, scope: &StorageScope, key: &str, suffix: &str) -> PathBuf {
+        let hash = stable_key_hash(&scope.qualify(key));
+        self.dir.join(format!(
+            "{hash:016x}.{}.{suffix}.json",
+            scope.file_segment()
+        ))
     }
 
     /// Read + version-check an entry. A deserialize failure (corrupt, truncated by
     /// a crash mid-write, or an old value layout) OR a version mismatch is a miss;
     /// a stale-version file is deleted so it stops occupying the cap.
-    fn read<T: for<'de> Deserialize<'de>>(&self, key: &str, suffix: &str) -> Option<T> {
-        let path = self.path(key, suffix);
+    fn read<T: for<'de> Deserialize<'de>>(
+        &self,
+        scope: &StorageScope,
+        key: &str,
+        suffix: &str,
+    ) -> Option<T> {
+        let path = self.path(scope, key, suffix);
         let bytes = std::fs::read(&path).ok()?;
         let env: Envelope<T> = match serde_json::from_slice(&bytes) {
             Ok(e) => e,
@@ -362,7 +361,7 @@ impl DiskCatalogCache {
         // colliding entry deserializes but carries a DIFFERENT key. Verify it and
         // treat a mismatch as a miss (do NOT delete — the entry is valid for its
         // own key, which a future read under that key will want).
-        if env.key != key {
+        if env.key != scope.qualify(key) {
             return None;
         }
         Some(env.payload)
@@ -371,11 +370,11 @@ impl DiskCatalogCache {
     /// Write an entry via temp-file + atomic rename, so a crash mid-write can't
     /// leave a torn file a later read would trust (a torn temp is just orphaned).
     /// Best-effort: any failure just means a future miss.
-    fn write<T: Serialize>(&self, key: &str, suffix: &str, value: &T) {
-        let path = self.path(key, suffix);
+    fn write<T: Serialize>(&self, scope: &StorageScope, key: &str, suffix: &str, value: &T) {
+        let path = self.path(scope, key, suffix);
         let env = Envelope {
             format_version: CACHE_FORMAT_VERSION,
-            key: key.to_string(),
+            key: scope.qualify(key).into_owned(),
             payload: value,
         };
         let Ok(bytes) = serde_json::to_vec(&env) else {
@@ -387,26 +386,39 @@ impl DiskCatalogCache {
         }
     }
 
-    pub(crate) fn get_metadata(&self, metadata_location: &str) -> Option<Arc<TableMetadata>> {
+    pub(crate) fn get_metadata(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+    ) -> Option<Arc<TableMetadata>> {
         if !self.enabled {
             return None;
         }
-        self.read::<TableMetadata>(metadata_location, "metadata")
+        self.read::<TableMetadata>(scope, metadata_location, "metadata")
             .map(Arc::new)
     }
 
-    pub(crate) fn put_metadata(&self, metadata_location: &str, metadata: &TableMetadata) {
+    pub(crate) fn put_metadata(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+        metadata: &TableMetadata,
+    ) {
         if !self.enabled {
             return;
         }
-        self.write(metadata_location, "metadata", metadata);
+        self.write(scope, metadata_location, "metadata", metadata);
     }
 
-    pub(crate) fn get_scan_files(&self, metadata_location: &str) -> Option<Arc<CachedScanFiles>> {
+    pub(crate) fn get_scan_files(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+    ) -> Option<Arc<CachedScanFiles>> {
         if !self.enabled {
             return None;
         }
-        let p: PersistedScanFiles = self.read(metadata_location, "scanfiles")?;
+        let p: PersistedScanFiles = self.read(scope, metadata_location, "scanfiles")?;
         Some(Arc::new(CachedScanFiles {
             data_files: Arc::new(p.data_files),
             estimated_row_count: p.estimated_row_count,
@@ -416,7 +428,12 @@ impl DiskCatalogCache {
         }))
     }
 
-    pub(crate) fn put_scan_files(&self, metadata_location: &str, sf: &CachedScanFiles) {
+    pub(crate) fn put_scan_files(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+        sf: &CachedScanFiles,
+    ) {
         if !self.enabled {
             return;
         }
@@ -427,19 +444,24 @@ impl DiskCatalogCache {
             files_pruned: sf.files_pruned,
             has_delete_manifests: sf.has_delete_manifests,
         };
-        self.write(metadata_location, "scanfiles", &p);
+        self.write(scope, metadata_location, "scanfiles", &p);
     }
 
-    pub(crate) fn get_count_stats(&self, metadata_location: &str) -> Option<(Vec<DataFile>, bool)> {
+    pub(crate) fn get_count_stats(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+    ) -> Option<(Vec<DataFile>, bool)> {
         if !self.enabled {
             return None;
         }
-        let p: PersistedCountStats = self.read(metadata_location, "countstats")?;
+        let p: PersistedCountStats = self.read(scope, metadata_location, "countstats")?;
         Some((p.data_files, p.has_delete_manifests))
     }
 
     pub(crate) fn put_count_stats(
         &self,
+        scope: &StorageScope,
         metadata_location: &str,
         data_files: &[DataFile],
         has_delete_manifests: bool,
@@ -451,7 +473,7 @@ impl DiskCatalogCache {
             data_files: data_files.to_vec(),
             has_delete_manifests,
         };
-        self.write(metadata_location, "countstats", &p);
+        self.write(scope, metadata_location, "countstats", &p);
     }
 
     /// Resolve the persisted `metadata_location` for `lt_key` WITHOUT a REST GET,
@@ -471,7 +493,7 @@ impl DiskCatalogCache {
         if !self.enabled || !loadtable_ptr_cache_enabled() || ttl_secs == 0 {
             return None;
         }
-        let p: PersistedMetadataPointer = self.read(lt_key, "pointer")?;
+        let p: PersistedMetadataPointer = self.read(&StorageScope::shared(), lt_key, "pointer")?;
         let ttl_ms = ttl_secs.saturating_mul(1000);
         if pointer_is_usable(&p, now_ms(), ttl_ms, min_snapshot_ms) {
             Some(p.metadata_location)
@@ -479,7 +501,7 @@ impl DiskCatalogCache {
             // A TTL-expired entry is dead weight; drop it. (A rider miss keeps the
             // entry — it is still valid for a latest-snapshot read.)
             if now_ms().saturating_sub(p.cached_at_ms) > ttl_ms {
-                let _ = std::fs::remove_file(self.path(lt_key, "pointer"));
+                let _ = std::fs::remove_file(self.path(&StorageScope::shared(), lt_key, "pointer"));
             }
             None
         }
@@ -502,13 +524,18 @@ impl DiskCatalogCache {
             snapshot_ms,
             cached_at_ms: now_ms(),
         };
-        self.write(lt_key, "pointer", &p);
+        self.write(&StorageScope::shared(), lt_key, "pointer", &p);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared scope: what every entry was keyed under before scopes.
+    fn sh() -> StorageScope {
+        StorageScope::shared()
+    }
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let d =
@@ -550,12 +577,15 @@ mod tests {
         let dir = tmp_dir("corrupt");
         let cache = DiskCatalogCache::for_dir(&dir);
         let loc = "s3://b/m.json";
-        cache.put_count_stats(loc, &[data_file("s3://b/f.parquet", 1)], false);
-        assert!(cache.get_count_stats(loc).is_some(), "valid entry hits");
+        cache.put_count_stats(&sh(), loc, &[data_file("s3://b/f.parquet", 1)], false);
+        assert!(
+            cache.get_count_stats(&sh(), loc).is_some(),
+            "valid entry hits"
+        );
         // Simulate a torn/garbage file (e.g. a crash mid-write on a non-atomic FS).
         std::fs::write(only_entry(&dir), b"{ not valid json").unwrap();
         assert!(
-            cache.get_count_stats(loc).is_none(),
+            cache.get_count_stats(&sh(), loc).is_none(),
             "a corrupt entry is a miss, never a surfaced error"
         );
     }
@@ -565,7 +595,7 @@ mod tests {
         let dir = tmp_dir("version");
         let cache = DiskCatalogCache::for_dir(&dir);
         let loc = "s3://b/m.json";
-        cache.put_count_stats(loc, &[data_file("s3://b/f.parquet", 1)], false);
+        cache.put_count_stats(&sh(), loc, &[data_file("s3://b/f.parquet", 1)], false);
         // Rewrite the envelope with a bumped version, payload untouched — models a
         // future release whose value schema changed.
         let path = only_entry(&dir);
@@ -574,7 +604,7 @@ mod tests {
         v["format_version"] = serde_json::json!(CACHE_FORMAT_VERSION + 1);
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         assert!(
-            cache.get_count_stats(loc).is_none(),
+            cache.get_count_stats(&sh(), loc).is_none(),
             "a version-mismatched entry is dropped and refetched, never misread"
         );
     }
@@ -583,7 +613,10 @@ mod tests {
     fn scan_files_round_trip_by_metadata_location() {
         let cache = DiskCatalogCache::for_dir(&tmp_dir("scanfiles"));
         let loc = "s3://bucket/warehouse/t/metadata/00042-abc.metadata.json";
-        assert!(cache.get_scan_files(loc).is_none(), "empty is a miss");
+        assert!(
+            cache.get_scan_files(&sh(), loc).is_none(),
+            "empty is a miss"
+        );
         let sf = CachedScanFiles {
             data_files: Arc::new(vec![
                 data_file("s3://b/f1.parquet", 23),
@@ -594,8 +627,8 @@ mod tests {
             files_pruned: 5,
             has_delete_manifests: false,
         };
-        cache.put_scan_files(loc, &sf);
-        let got = cache.get_scan_files(loc).expect("hit after put");
+        cache.put_scan_files(&sh(), loc, &sf);
+        let got = cache.get_scan_files(&sh(), loc).expect("hit after put");
         assert_eq!(got.data_files.len(), 2);
         assert_eq!(got.estimated_row_count, 30);
         assert_eq!(got.files_selected, 2);
@@ -604,7 +637,10 @@ mod tests {
         assert!(!got.has_delete_manifests, "delete flag round-trips");
         // A different (content-addressed) location is a clean miss.
         assert!(cache
-            .get_scan_files("s3://bucket/warehouse/t/metadata/00043-def.metadata.json")
+            .get_scan_files(
+                &sh(),
+                "s3://bucket/warehouse/t/metadata/00043-def.metadata.json"
+            )
             .is_none());
     }
 
@@ -612,9 +648,9 @@ mod tests {
     fn count_stats_round_trip() {
         let cache = DiskCatalogCache::for_dir(&tmp_dir("countstats"));
         let loc = "s3://bucket/t/metadata/00001-x.metadata.json";
-        assert!(cache.get_count_stats(loc).is_none());
-        cache.put_count_stats(loc, &[data_file("s3://b/a.parquet", 100)], true);
-        let (files, has_deletes) = cache.get_count_stats(loc).expect("hit");
+        assert!(cache.get_count_stats(&sh(), loc).is_none());
+        cache.put_count_stats(&sh(), loc, &[data_file("s3://b/a.parquet", 100)], true);
+        let (files, has_deletes) = cache.get_count_stats(&sh(), loc).expect("hit");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].record_count, 100);
         assert!(has_deletes);
@@ -630,14 +666,18 @@ mod tests {
         let cache = DiskCatalogCache::for_dir(&tmp_dir("collision"));
         let a = "s3://bucket/TABLE_A/metadata/00001-a.metadata.json";
         let b = "s3://bucket/TABLE_B/metadata/00002-b.metadata.json";
-        cache.put_count_stats(a, &[data_file("s3://b/a.parquet", 100)], true);
-        std::fs::copy(cache.path(a, "countstats"), cache.path(b, "countstats")).unwrap();
+        cache.put_count_stats(&sh(), a, &[data_file("s3://b/a.parquet", 100)], true);
+        std::fs::copy(
+            cache.path(&sh(), a, "countstats"),
+            cache.path(&sh(), b, "countstats"),
+        )
+        .unwrap();
         assert!(
-            cache.get_count_stats(b).is_none(),
+            cache.get_count_stats(&sh(), b).is_none(),
             "a collided entry whose stored key mismatches is a clean miss, not a misread"
         );
         assert!(
-            cache.get_count_stats(a).is_some(),
+            cache.get_count_stats(&sh(), a).is_some(),
             "A's own entry still hits"
         );
     }
@@ -741,8 +781,13 @@ mod tests {
         let file = tmp_dir("asfile");
         std::fs::write(&file, b"x").ok();
         let cache = DiskCatalogCache::for_dir(&file.join("child"));
-        cache.put_count_stats("s3://b/m.json", &[data_file("s3://b/f.parquet", 1)], false);
-        assert!(cache.get_count_stats("s3://b/m.json").is_none());
+        cache.put_count_stats(
+            &sh(),
+            "s3://b/m.json",
+            &[data_file("s3://b/f.parquet", 1)],
+            false,
+        );
+        assert!(cache.get_count_stats(&sh(), "s3://b/m.json").is_none());
     }
 
     /// GOLDEN: pins the stable key hash so cross-toolchain stability is enforced,
@@ -769,10 +814,10 @@ mod tests {
     #[test]
     fn path_includes_scope_segment() {
         let cache = DiskCatalogCache::for_dir(&tmp_dir("scope"));
-        let p = cache.path("s3://b/m.json", "metadata");
+        let p = cache.path(&sh(), "s3://b/m.json", "metadata");
         let name = p.file_name().and_then(|n| n.to_str()).unwrap();
         assert!(
-            name.ends_with(&format!(".{CACHE_SCOPE}.metadata.json")),
+            name.ends_with(".shared.metadata.json"),
             "filename must carry the scope discriminant + suffix: {name}"
         );
         let stem = name.split('.').next().unwrap();
@@ -792,7 +837,7 @@ mod tests {
         let dir = tmp_dir("v1drop");
         let cache = DiskCatalogCache::for_dir(&dir);
         let loc = "s3://b/m.json";
-        cache.put_count_stats(loc, &[data_file("s3://b/f.parquet", 1)], false);
+        cache.put_count_stats(&sh(), loc, &[data_file("s3://b/f.parquet", 1)], false);
         let path = only_entry(&dir);
         // Downgrade the envelope version in place, payload untouched.
         let mut v: serde_json::Value =
@@ -800,7 +845,7 @@ mod tests {
         v["format_version"] = serde_json::json!(1u32);
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         assert!(
-            cache.get_count_stats(loc).is_none(),
+            cache.get_count_stats(&sh(), loc).is_none(),
             "a v1-versioned entry is a miss under CACHE_FORMAT_VERSION = 3"
         );
         assert!(
@@ -826,7 +871,7 @@ mod tests {
             files_pruned: 0,
             has_delete_manifests: true,
         };
-        cache.put_scan_files(loc, &sf);
+        cache.put_scan_files(&sh(), loc, &sf);
         // Downgrade the on-disk envelope to the pre-guard version, payload intact.
         let path = only_entry(&dir);
         let mut v: serde_json::Value =
@@ -834,8 +879,85 @@ mod tests {
         v["format_version"] = serde_json::json!(2u32);
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         assert!(
-            cache.get_scan_files(loc).is_none(),
+            cache.get_scan_files(&sh(), loc).is_none(),
             "a pre-guard v2 scanfiles entry must be a miss (recomputed through the guard)"
         );
+    }
+
+    /// An entry written before storage scopes existed — at the filename and
+    /// with the envelope key that code wrote — is still a hit under the shared
+    /// scope, so an upgrade leaves the default configuration's cache warm.
+    #[test]
+    fn an_entry_written_before_scopes_is_still_found_under_the_shared_scope() {
+        let dir = tmp_dir("prescope");
+        let cache = DiskCatalogCache::for_dir(&dir);
+        let loc = "s3://lake/wh/t/metadata/00001-abc.metadata.json";
+        // Exactly what the pre-scope writer produced:
+        // `{xxh64(key):016x}.shared.countstats.json`, envelope key = the bare key.
+        let legacy_name = format!(
+            "{:016x}.shared.countstats.json",
+            xxhash_rust::xxh64::xxh64(loc.as_bytes(), 0)
+        );
+        let legacy = serde_json::json!({
+            "format_version": CACHE_FORMAT_VERSION,
+            "key": loc,
+            "payload": { "data_files": [], "has_delete_manifests": false },
+        });
+        std::fs::write(dir.join(&legacy_name), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            cache.get_count_stats(&sh(), loc).is_some(),
+            "the legacy entry is a hit"
+        );
+        assert_eq!(
+            cache
+                .path(&sh(), loc, "countstats")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            legacy_name
+        );
+    }
+
+    /// Two storage identities naming one location never share an entry, in any
+    /// storage-read layer.
+    #[test]
+    fn two_identities_never_share_a_catalog_cache_entry() {
+        let dir = tmp_dir("crossidentity");
+        let cache = DiskCatalogCache::for_dir(&dir);
+        let loc = "gs://lake/wh/t/metadata/00001-abc.metadata.json";
+        let alice = StorageScope::of(&[("kind", "google"), ("principal", "alice@p.iam")]);
+        let bob = StorageScope::of(&[("kind", "google"), ("principal", "bob@p.iam")]);
+
+        cache.put_count_stats(&alice, loc, &[data_file("gs://lake/f.parquet", 7)], false);
+        let sf = CachedScanFiles {
+            data_files: Arc::new(vec![data_file("gs://lake/f.parquet", 7)]),
+            estimated_row_count: 7,
+            files_selected: 1,
+            files_pruned: 0,
+            has_delete_manifests: false,
+        };
+        cache.put_scan_files(&alice, loc, &sf);
+
+        assert!(cache.get_count_stats(&alice, loc).is_some());
+        assert!(cache.get_scan_files(&alice, loc).is_some());
+        for other in [&bob, &sh()] {
+            assert!(cache.get_count_stats(other, loc).is_none(), "{other:?}");
+            assert!(cache.get_scan_files(other, loc).is_none(), "{other:?}");
+            assert!(cache.get_metadata(other, loc).is_none(), "{other:?}");
+        }
+        assert_ne!(
+            cache.path(&alice, loc, "scanfiles"),
+            cache.path(&bob, loc, "scanfiles")
+        );
+
+        // A file copied under the other identity's name is still a miss: the
+        // envelope carries the scope-qualified key.
+        std::fs::copy(
+            cache.path(&alice, loc, "countstats"),
+            cache.path(&bob, loc, "countstats"),
+        )
+        .unwrap();
+        assert!(cache.get_count_stats(&bob, loc).is_none());
     }
 }

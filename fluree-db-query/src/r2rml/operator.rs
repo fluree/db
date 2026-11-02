@@ -37,6 +37,7 @@ use crate::eval::PreparedBoolExpression;
 use crate::filter::filter_batch;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
+use crate::operator::flush::{pull_window, FlushSchedule};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::policy::R2rmlPolicyGate;
 use crate::r2rml::ColumnBatchStream;
@@ -226,6 +227,15 @@ fn limit_pushdown_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_LIMIT_PUSHDOWN"))
 }
 
+/// Whether a correlated scan joins a window of child rows per table pass
+/// rather than one child batch. Read once from `FLUREE_R2RML_CHILD_WINDOW`
+/// (family falsy spellings, [`super::env_switch_enabled`]); off restores one
+/// pass per child batch.
+fn child_window_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_CHILD_WINDOW"))
+}
+
 /// Whether a single-column DESC `ORDER BY … LIMIT` may push a scan-side top-k
 /// directive into the R2RML scan (PR-5), so it reads only the files that can hold
 /// the top-k. Read once from `FLUREE_R2RML_TOPK_PUSHDOWN` (family falsy
@@ -386,6 +396,15 @@ pub struct R2rmlScanOperator {
     /// In-flight streaming scan for the current buffered child batch, advanced
     /// one window per `next_batch` so the whole table is never materialized.
     progress: Option<ScanProgress>,
+    /// How many child rows the next table pass joins. Each pass streams the
+    /// whole produced side, so a correlated scan under a large child (the rows
+    /// of a full class scan, say) made one pass per child batch: a table's
+    /// worth of work per thousand child rows. Capped at one materialize window,
+    /// the resident footprint a pass already accepts; under a LIMIT the first
+    /// window is budget-sized and later ones grow (see [`FlushSchedule`]).
+    child_window: FlushSchedule,
+    /// Child rows a window pulled past its size, read first by the next one.
+    child_pending: Option<(Batch, usize)>,
     /// Inner-table scans cached across child batches, keyed by
     /// `(table_name, projection)`. A correlated join re-invokes `build_progress`
     /// once per child batch; without this the (dimension-sized) inner table is
@@ -511,6 +530,8 @@ impl R2rmlScanOperator {
             mapping: None,
             pending: VecDeque::new(),
             progress: None,
+            child_window: FlushSchedule::fixed(materialize_window_rows()),
+            child_pending: None,
             scan_cache: HashMap::new(),
             parent_lookup_cache: HashMap::new(),
             parent_memo: parent_memo_enabled(),
@@ -2876,6 +2897,7 @@ impl Operator for R2rmlScanOperator {
         // received one, its output flows 1:1 to the LIMIT.
         if limit_pushdown_enabled() {
             self.row_budget = Some(budget);
+            self.child_window = FlushSchedule::budgeted(budget, materialize_window_rows());
         }
     }
 
@@ -3014,8 +3036,16 @@ impl Operator for R2rmlScanOperator {
                 continue;
             }
 
-            // 3. No scan in flight: pull the next child batch and start one.
-            match self.child.next_batch(ctx).await? {
+            // 3. No scan in flight: pull the next child window and start one.
+            let child_rows = if child_window_enabled() {
+                let window = self.child_window.size();
+                let exact = window < materialize_window_rows();
+                self.child_window.advance();
+                pull_window(&mut self.child, &mut self.child_pending, window, exact, ctx).await?
+            } else {
+                self.child.next_batch(ctx).await?
+            };
+            match child_rows {
                 Some(child_batch) => {
                     if let Some(progress) = self.build_progress(ctx, child_batch).await? {
                         self.progress = Some(progress);
@@ -3052,6 +3082,7 @@ impl Operator for R2rmlScanOperator {
         self.policy_gate = None;
         self.pending.clear();
         self.progress = None;
+        self.child_pending = None;
         self.scan_cache.clear();
         self.parent_lookup_cache.clear();
         self.state = OperatorState::Closed;
@@ -4552,6 +4583,101 @@ mod tests {
                 "no solution may bind ?o while leaving ?p unbound: {row:?}"
             );
         }
+    }
+
+    /// A correlated scan joins a window of child rows per pass over its table.
+    /// It used to pass once per child batch, so a child of many batches (the
+    /// rows of a full class scan under a crawl's ORDER BY, say) cost a table's
+    /// worth of work per batch. The pushed filter keeps every pass off the scan
+    /// cache, which would otherwise replay the table unseen by the counter.
+    #[tokio::test]
+    async fn a_correlated_scan_passes_its_table_once_per_child_window() {
+        use crate::ir::adapters::ScanPushdown;
+        use crate::r2rml::{R2rmlTableProvider, ScanCmpOp, ScanValue};
+        use crate::seed::BatchReplayOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct CountingStores {
+            scans: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for CountingStores {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                self.scans.fetch_add(1, Ordering::SeqCst);
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "STORE_KEY".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                let batch =
+                    ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1), Some(2), Some(3)])])
+                        .unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/storeKey"),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let provider = CountingStores::default();
+        let mut ctx = ExecutionContext::new(&snapshot, &vars);
+        ctx.r2rml_table_provider = Some(&provider);
+
+        // Three child batches of one bound subject each.
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batches = (1..=3)
+            .map(|k| {
+                Batch::new(
+                    Arc::clone(&schema),
+                    vec![vec![Binding::iri(format!("http://ex/store/{k}"))]],
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut child = BatchReplayOperator::new(Arc::clone(&schema), batches);
+        child.open(&ctx).await.unwrap();
+
+        let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+        pattern.predicate_filter = Some("http://ex/storeKey".to_string());
+        pattern.scan_filters.push(ScanPushdown {
+            var: VarId(1),
+            op: ScanCmpOp::GtEq,
+            value: ScanValue::Int(0),
+        });
+        let mut op = R2rmlScanOperator::new(Box::new(child), pattern);
+        op.mapping = Some(Arc::new(CompiledR2rmlMapping::new(vec![tm])));
+        op.state = OperatorState::Open;
+
+        let mut rows = 0;
+        while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+            rows += batch.len();
+        }
+        assert_eq!(rows, 3, "each child subject joins its own row");
+        assert_eq!(
+            provider.scans.load(Ordering::SeqCst),
+            1,
+            "one table pass for the whole child window"
+        );
     }
 
     // PR-4: the cross-child-batch parent-lookup memoization, CI-enforced. Drives
