@@ -4475,7 +4475,24 @@ pub(crate) mod tests {
         dims: u16,
         shards: &[Vec<Vec<f32>>],
     ) -> crate::arena::vector::LazyVectorArena {
-        use crate::arena::vector::tests::{make_lazy_arena, write_test_shard};
+        vector_arena_cached(
+            dir,
+            capacity,
+            dims,
+            shards,
+            Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024)),
+        )
+    }
+
+    /// [`vector_arena_of`] reading through `cache`.
+    fn vector_arena_cached(
+        dir: &std::path::Path,
+        capacity: u32,
+        dims: u16,
+        shards: &[Vec<Vec<f32>>],
+        cache: Arc<LeafletCache>,
+    ) -> crate::arena::vector::LazyVectorArena {
+        use crate::arena::vector::tests::write_test_shard;
         use crate::arena::vector::{ShardInfo, VectorManifest};
         let mut sources = Vec::new();
         let mut infos = Vec::new();
@@ -4497,7 +4514,112 @@ pub(crate) mod tests {
             total_count: shards.iter().map(|v| v.len() as u32).sum(),
             shards: infos,
         };
-        make_lazy_arena(manifest, sources)
+        crate::arena::vector::LazyVectorArena::new(manifest, sources, cache, None)
+    }
+
+    /// A view of graph 0 of a store holding `arena` as predicate `p_id`'s
+    /// vector arena.
+    fn view_with_vector_arena(
+        p_id: u32,
+        arena: crate::arena::vector::LazyVectorArena,
+    ) -> BinaryGraphView {
+        let mut store = BinaryIndexStore::empty(std::env::temp_dir());
+        store
+            .graph_indexes
+            .entry(0)
+            .or_insert_with(|| GraphIndex {
+                orders: HashMap::new(),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            })
+            .vectors
+            .insert(p_id, arena);
+        BinaryGraphView::new(Arc::new(store), 0)
+    }
+
+    /// Two keys over one shard share one loaded copy of it, even after the
+    /// shared cache has evicted it between them: the view reuses the copy an
+    /// earlier key still holds rather than load a second.
+    #[test]
+    fn vector_keys_over_an_evicted_shard_share_one_copy() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_shared_shard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards: Vec<Vec<Vec<f32>>> = (0..2)
+            .map(|s| (0..2).map(|i| vec![s as f32, i as f32]).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        let first = view.arena_vector(7, 0).unwrap().unwrap();
+        // Move the view's cursor to the other shard, then evict everything.
+        let _other = view.arena_vector(7, 2).unwrap().unwrap();
+        cache.invalidate_all();
+        let again = view.arena_vector(7, 1).unwrap().unwrap();
+        assert_eq!(again.slice.as_f32(), &[0.0, 1.0]);
+        assert!(
+            first.slice.same_shard(&again.slice),
+            "a second key over shard 0 loaded another copy of it"
+        );
+        drop((first, again));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key's hash doesn't depend on whether the identity table is built,
+    /// and the table's canonical handles agree with comparing the vectors,
+    /// for every pair of handles of an arena with repeats.
+    #[test]
+    fn vector_keys_agree_with_and_without_the_identity_table() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_table_on_off");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Eight handles over three shards; values repeat within and across
+        // shards, and include `-0.0` beside `0.0`.
+        let values: [[f32; 2]; 8] = [
+            [1.0, 0.0],
+            [0.5, 0.5],
+            [1.0, 0.0],
+            [-0.0, 1.0],
+            [0.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [1.0, 0.0],
+        ];
+        let shards: Vec<Vec<Vec<f32>>> = values
+            .chunks(3)
+            .map(|c| c.iter().map(|v| v.to_vec()).collect())
+            .collect();
+        let arena = vector_arena_of(&dir, 3, 2, &shards);
+        let view = view_with_vector_arena(7, arena);
+        let off: Vec<ArenaVector> = (0..8)
+            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .collect();
+        assert!(off.iter().all(|k| k.canonical.is_none()));
+
+        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+        assert!(!table.duplicate_free());
+        // A fresh view, as a later query has, sees the built table.
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let on: Vec<ArenaVector> = (0..8)
+            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for i in 0..8 {
+            assert_eq!(off[i].hash, on[i].hash, "handle {i}'s hash");
+            for j in 0..8 {
+                let same = bits(&values[i]) == bits(&values[j]);
+                assert_eq!(
+                    on[i].canonical == on[j].canonical,
+                    same,
+                    "handles {i} and {j}"
+                );
+                if same {
+                    assert_eq!(off[i].hash, off[j].hash);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The identity table hashes each vector with the function a decoded

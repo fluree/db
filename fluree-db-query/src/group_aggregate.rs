@@ -1642,6 +1642,39 @@ mod tests {
         }
     }
 
+    /// [`arena_key`] carrying `canonical`, as a key does once its arena's
+    /// identity table is built.
+    fn with_canonical(mut key: VectorKey, canonical: u32) -> VectorKey {
+        if let VectorRepr::Arena(a) = &mut key.repr {
+            a.canonical = Some(canonical);
+        }
+        key
+    }
+
+    /// Keys of one arena compare the same with and without canonical
+    /// handles, and with one side carrying one: a DISTINCT that started
+    /// before the identity table was built agrees with one after.
+    #[test]
+    fn vector_keys_agree_with_and_without_canonical_handles() {
+        let vectors: &[&[f32]] = &[&[1.0, 0.0], &[0.5, 0.5], &[1.0, 0.0]];
+        let canonical = [0u32, 1, 0];
+        for i in 0..3u32 {
+            for j in 0..3u32 {
+                let off = (arena_key(1, 7, vectors, i), arena_key(1, 7, vectors, j));
+                let on = (
+                    with_canonical(arena_key(1, 7, vectors, i), canonical[i as usize]),
+                    with_canonical(arena_key(1, 7, vectors, j), canonical[j as usize]),
+                );
+                let mixed = (on.0.clone(), off.1.clone());
+                let same = vectors[i as usize] == vectors[j as usize];
+                assert_eq!(off.0 == off.1, same, "{i} {j} without");
+                assert_eq!(on.0 == on.1, same, "{i} {j} with");
+                assert_eq!(mixed.0 == mixed.1, same, "{i} {j} mixed");
+                assert_eq!(hash_of(&off.0), hash_of(&on.0));
+            }
+        }
+    }
+
     fn hash_of(key: &VectorKey) -> u64 {
         use std::hash::BuildHasher;
         FxBuildHasher.hash_one(key)

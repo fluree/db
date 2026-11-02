@@ -607,6 +607,11 @@ impl VectorSlice {
         Some(Self { shard, offset })
     }
 
+    /// Whether `self` and `other` read one loaded copy of a shard.
+    pub fn same_shard(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shard, &other.shard)
+    }
+
     /// Whether `self` and `other` are one vector of one loaded shard.
     pub fn same_slot(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shard, &other.shard) && self.offset == other.offset
