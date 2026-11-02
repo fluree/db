@@ -459,6 +459,7 @@ impl crate::Fluree {
                 table_id,
                 StatsTier::Stats,
                 self.identity_context(),
+                None,
             );
             match preview.await {
                 Ok(preview) => {
