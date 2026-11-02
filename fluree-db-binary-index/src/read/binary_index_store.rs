@@ -3807,19 +3807,18 @@ impl BinaryGraphView {
                 shard
             }
         };
-        let identity = match &cursor.identity {
-            Some((p, identity)) if *p == p_id => identity.clone(),
-            _ => {
-                let identity = self.store.built_vector_identity(self.g_id, p_id);
-                cursor.identity = Some((p_id, identity.clone()));
-                identity
-            }
-        };
+        if !matches!(&cursor.identity, Some((p, _)) if *p == p_id) {
+            cursor.identity = Some((p_id, self.store.built_vector_identity(self.g_id, p_id)));
+        }
+        let known = cursor
+            .identity
+            .as_ref()
+            .and_then(|(_, identity)| identity.as_ref()?.of(handle));
         drop(cursor);
         let Some(slice) = crate::arena::vector::VectorSlice::new(shard, offset) else {
             return Ok(None);
         };
-        let (hash, canonical) = match identity.as_ref().and_then(|t| t.of(handle)) {
+        let (hash, canonical) = match known {
             Some((hash, canonical)) => (hash, Some(canonical)),
             None => (
                 fluree_db_core::value::vector_value_hash_f32(slice.as_f32()),
