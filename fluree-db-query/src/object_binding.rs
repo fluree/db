@@ -777,12 +777,12 @@ pub(crate) fn same_term(
                 || crate::group_aggregate::is_vector_binding(b)
             {
                 use crate::group_aggregate::VectorKey;
-                return Ok(
-                    match (VectorKey::of_binding(a, gv), VectorKey::of_binding(b, gv)) {
-                        (Some(x), Some(y)) => x == y,
-                        _ => false,
-                    },
-                );
+                return match (VectorKey::of_binding(a, gv), VectorKey::of_binding(b, gv)) {
+                    (Some(x), Some(y)) => x
+                        .same_value(&y)
+                        .map_err(|err| crate::error::QueryError::from_io("vector comparison", err)),
+                    _ => Ok(false),
+                };
             }
             let (dicts, gv) = EqualityNorm::parts(norm);
             normalize_for_key_cow(a, dicts, gv) == normalize_for_key_cow(b, dicts, gv)

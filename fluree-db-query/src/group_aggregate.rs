@@ -443,11 +443,13 @@ pub(crate) enum GroupKeyOwned {
 
 /// A vector as a hash key, by value: two keys are equal iff the vectors are
 /// (bitwise-equal components, as `FlakeValue`'s vector equality has it), in
-/// whichever form each arrives. A stored vector keys as a zero-copy slice of
-/// its arena shard, so keying never decodes or copies it; a decoded one
-/// (novelty, `VALUES`, `BIND`) keys by its components. Both hash with the one
-/// canonical function ([`fluree_db_core::value::vector_value_hash`]), carried
-/// in the key so a table that grows doesn't read the components again.
+/// whichever form each arrives. A stored vector keys by its arena's identity
+/// table when that is built (hash and canonical handle, no shard held), and
+/// otherwise as a zero-copy slice of its arena shard, so keying never decodes
+/// or copies it; a decoded one (novelty, `VALUES`, `BIND`) keys by its
+/// components. All hash with the one canonical function
+/// ([`fluree_db_core::value::vector_value_hash`]), carried in the key so a
+/// table that grows doesn't read the components again.
 #[derive(Debug, Clone)]
 pub(crate) struct VectorKey {
     hash: u64,
@@ -528,39 +530,40 @@ pub(crate) fn is_vector_binding(binding: &Binding) -> bool {
     }
 }
 
-impl PartialEq for VectorKey {
-    fn eq(&self, other: &Self) -> bool {
+impl VectorKey {
+    /// Whether the two keys hold equal vectors. Keys of one arena whose
+    /// identity table is built compare by canonical handle and read nothing;
+    /// otherwise, on a hash match, components are compared, read from the
+    /// arena for a key that holds none.
+    pub(crate) fn same_value(&self, other: &Self) -> std::io::Result<bool> {
         if self.hash != other.hash {
-            return false;
+            return Ok(false);
         }
         match (&self.repr, &other.repr) {
-            (VectorRepr::Arena(a), VectorRepr::Arena(b)) => {
-                let same_arena = a.store_id == b.store_id && a.g_id == b.g_id && a.p_id == b.p_id;
-                if same_arena {
-                    if a.handle == b.handle {
-                        return true;
-                    }
-                    if let (Some(x), Some(y)) = (a.canonical, b.canonical) {
-                        return x == y;
-                    }
-                }
-                a.slice.same_slot(&b.slice) || {
-                    let (x, y) = (a.slice.as_f32(), b.slice.as_f32());
-                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
-                }
-            }
+            (VectorRepr::Arena(a), VectorRepr::Arena(b)) => a.same_value(b),
             (VectorRepr::Arena(a), VectorRepr::Decoded(d))
             | (VectorRepr::Decoded(d), VectorRepr::Arena(a)) => {
-                fluree_db_core::value::vector_eq_f32_f64(a.slice.as_f32(), d)
+                a.same_value_as_decoded(self.hash, d)
             }
-            (VectorRepr::Decoded(x), VectorRepr::Decoded(y)) => {
-                Arc::ptr_eq(x, y)
-                    || x.len() == y.len()
-                        && x.iter()
-                            .zip(y.iter())
-                            .all(|(p, q)| p.to_bits() == q.to_bits())
-            }
+            (VectorRepr::Decoded(x), VectorRepr::Decoded(y)) => Ok(Arc::ptr_eq(x, y)
+                || x.len() == y.len()
+                    && x.iter()
+                        .zip(y.iter())
+                        .all(|(p, q)| p.to_bits() == q.to_bits())),
         }
+    }
+}
+
+/// A failed arena read reads as unequal: like a key whose arena read fails
+/// (which keys by handle, see [`VectorKey::of_binding`]), it can only fail to
+/// merge equal vectors, never merge distinct ones. Only a comparison that
+/// needs components a key doesn't hold reads, on a hash match.
+impl PartialEq for VectorKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_value(other).unwrap_or_else(|err| {
+            tracing::warn!(%err, "vector key comparison could not read its arena");
+            false
+        })
     }
 }
 
@@ -1631,47 +1634,13 @@ mod tests {
         VectorKey {
             hash,
             repr: VectorRepr::Arena(fluree_db_binary_index::ArenaVector {
-                slice,
                 hash,
                 store_id,
                 g_id: 0,
                 p_id,
                 handle,
-                canonical: None,
+                form: fluree_db_binary_index::ArenaVectorForm::Slice(slice),
             }),
-        }
-    }
-
-    /// [`arena_key`] carrying `canonical`, as a key does once its arena's
-    /// identity table is built.
-    fn with_canonical(mut key: VectorKey, canonical: u32) -> VectorKey {
-        if let VectorRepr::Arena(a) = &mut key.repr {
-            a.canonical = Some(canonical);
-        }
-        key
-    }
-
-    /// Keys of one arena compare the same with and without canonical
-    /// handles, and with one side carrying one: a DISTINCT that started
-    /// before the identity table was built agrees with one after.
-    #[test]
-    fn vector_keys_agree_with_and_without_canonical_handles() {
-        let vectors: &[&[f32]] = &[&[1.0, 0.0], &[0.5, 0.5], &[1.0, 0.0]];
-        let canonical = [0u32, 1, 0];
-        for i in 0..3u32 {
-            for j in 0..3u32 {
-                let off = (arena_key(1, 7, vectors, i), arena_key(1, 7, vectors, j));
-                let on = (
-                    with_canonical(arena_key(1, 7, vectors, i), canonical[i as usize]),
-                    with_canonical(arena_key(1, 7, vectors, j), canonical[j as usize]),
-                );
-                let mixed = (on.0.clone(), off.1.clone());
-                let same = vectors[i as usize] == vectors[j as usize];
-                assert_eq!(off.0 == off.1, same, "{i} {j} without");
-                assert_eq!(on.0 == on.1, same, "{i} {j} with");
-                assert_eq!(mixed.0 == mixed.1, same, "{i} {j} mixed");
-                assert_eq!(hash_of(&off.0), hash_of(&on.0));
-            }
         }
     }
 

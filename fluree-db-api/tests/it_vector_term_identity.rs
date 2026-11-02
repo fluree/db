@@ -426,6 +426,33 @@ async fn vectors_compare_by_value_on_an_indexed_ledger() {
     answers_in_both_lanes(Condition::Indexed, "vector-identity/indexed:main").await;
 }
 
+/// Once the whole-predicate fast paths have built each arena's identity
+/// table, stored vectors key by canonical handle rather than by a slice of
+/// their shard. Every query must still answer by value, in both lanes.
+#[tokio::test]
+async fn vectors_compare_by_value_with_the_identity_tables_built() {
+    let ledger_id = "vector-identity/tables-built:main";
+    let (_dirs, fluree) = ledger(Condition::Indexed, ledger_id).await;
+    let db = fluree.graph(ledger_id).load().await.expect("load");
+    let mut failures = Vec::new();
+    {
+        let _switch = FAST_PATH_SWITCH.read().await;
+        // The per-predicate COUNT(DISTINCT) builds the predicate's table.
+        for (p, n) in [("v1", 1), ("v2", 1), ("w", 2), ("j1", 2), ("j2", 2)] {
+            let body = format!("SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE {{ ?s ex:{p} ?v }}");
+            assert_eq!(sparql(&db, &body).await, [format!("n={n}")], "ex:{p}");
+        }
+        run_all(&db, Condition::Indexed, true, &mut failures).await;
+    }
+    {
+        let _switch = FAST_PATH_SWITCH.write().await;
+        set_fast_paths_disabled(true);
+        let _restore = FastPathsGuard;
+        run_all(&db, Condition::Indexed, false, &mut failures).await;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[tokio::test]
 async fn vectors_compare_by_value_in_novelty() {
     answers_in_both_lanes(Condition::Novelty, "vector-identity/novelty:main").await;

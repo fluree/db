@@ -3411,18 +3411,111 @@ impl VectorIdentity {
     }
 }
 
-/// A stored vector as a key: a zero-copy slice of its arena shard, the
-/// arena's identity (store, graph, predicate) and handle, its value hash, and
-/// its canonical handle when the arena's identity table is built.
+/// A stored vector as a key: the arena's identity (store, graph, predicate)
+/// and handle, its value hash, and how its value is reached ([`ArenaVectorForm`]).
 #[derive(Clone, Debug)]
 pub struct ArenaVector {
-    pub slice: crate::arena::vector::VectorSlice,
     pub hash: u64,
     pub store_id: u64,
     pub g_id: GraphId,
     pub p_id: u32,
     pub handle: u32,
-    pub canonical: Option<u32>,
+    pub form: ArenaVectorForm,
+}
+
+/// How an [`ArenaVector`] reaches its value.
+#[derive(Clone)]
+pub enum ArenaVectorForm {
+    /// Read without the arena's identity table: a zero-copy slice of its
+    /// shard, hashed in place.
+    Slice(crate::arena::vector::VectorSlice),
+    /// Resolved by the arena's identity table, which gave the hash and the
+    /// canonical handle, the lowest handle holding an equal vector. It holds
+    /// no shard. Two keys of one arena compare by canonical handle; only a
+    /// comparison with another arena's key or a decoded vector, on a hash
+    /// match, reads the components ([`ArenaVector::components`]).
+    Canonical {
+        canonical: u32,
+        store: Arc<BinaryIndexStore>,
+    },
+}
+
+impl std::fmt::Debug for ArenaVectorForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slice(slice) => f.debug_tuple("Slice").field(slice).finish(),
+            Self::Canonical { canonical, .. } => f
+                .debug_struct("Canonical")
+                .field("canonical", canonical)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl ArenaVector {
+    /// Its canonical handle, when the identity table resolved it.
+    pub fn canonical(&self) -> Option<u32> {
+        match &self.form {
+            ArenaVectorForm::Slice(_) => None,
+            ArenaVectorForm::Canonical { canonical, .. } => Some(*canonical),
+        }
+    }
+
+    /// Whether `self` and `other` are keys of one arena.
+    pub fn same_arena(&self, other: &Self) -> bool {
+        self.store_id == other.store_id && self.g_id == other.g_id && self.p_id == other.p_id
+    }
+
+    /// Its components: the slice it holds, or its arena's, read through the
+    /// shared cache. `None` if the arena no longer holds the handle, which a
+    /// store's immutable arenas never do.
+    pub fn components(&self) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
+        match &self.form {
+            ArenaVectorForm::Slice(slice) => Ok(Some(slice.clone())),
+            ArenaVectorForm::Canonical { store, .. } => {
+                store.vector_slice(self.g_id, self.p_id, self.handle)
+            }
+        }
+    }
+
+    /// Whether `self` and `other` hold equal vectors (bitwise-equal
+    /// components). Keys of one arena that the identity table resolved
+    /// compare by canonical handle and read nothing; any other pair compares
+    /// components on a hash match, reading them for a key that holds none.
+    pub fn same_value(&self, other: &Self) -> io::Result<bool> {
+        if self.hash != other.hash {
+            return Ok(false);
+        }
+        if self.same_arena(other) {
+            if self.handle == other.handle {
+                return Ok(true);
+            }
+            if let (Some(x), Some(y)) = (self.canonical(), other.canonical()) {
+                return Ok(x == y);
+            }
+        }
+        if let (ArenaVectorForm::Slice(x), ArenaVectorForm::Slice(y)) = (&self.form, &other.form) {
+            if x.same_slot(y) {
+                return Ok(true);
+            }
+        }
+        let (Some(x), Some(y)) = (self.components()?, other.components()?) else {
+            return Ok(false);
+        };
+        let (x, y) = (x.as_f32(), y.as_f32());
+        Ok(x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()))
+    }
+
+    /// Whether `self` holds the decoded vector `wide`
+    /// ([`fluree_db_core::value::vector_eq_f32_f64`]), on a hash match.
+    pub fn same_value_as_decoded(&self, wide_hash: u64, wide: &[f64]) -> io::Result<bool> {
+        if self.hash != wide_hash {
+            return Ok(false);
+        }
+        Ok(self
+            .components()?
+            .is_some_and(|slice| fluree_db_core::value::vector_eq_f32_f64(slice.as_f32(), wide)))
+    }
 }
 
 /// Graph-scoped view for V6 store. Binds a specific `g_id` for value decoding.
@@ -3778,12 +3871,13 @@ impl BinaryGraphView {
         &self.store
     }
 
-    /// `handle` of `p_id`'s vector arena in this view's graph, as a key:
-    /// a zero-copy slice of its shard, its value hash, and its canonical
-    /// handle when the arena's identity table is built (this never builds
-    /// it: a small query would pay for the whole arena). Without the table
-    /// the hash is computed from the slice in place, with the same function.
-    /// `None` for a handle the arena does not hold, such as a novelty handle.
+    /// `handle` of `p_id`'s vector arena in this view's graph, as a key.
+    /// When the arena's identity table is built, the key is the table's hash
+    /// and canonical handle, and no shard is read. Otherwise it is a
+    /// zero-copy slice of its shard, hashed in place with the same function.
+    /// This never builds the table: a small query would pay for the whole
+    /// arena. `None` for a handle the arena does not hold, such as a novelty
+    /// handle.
     pub fn arena_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<ArenaVector>> {
         let Some(arena) = self
             .store
@@ -3797,6 +3891,29 @@ impl BinaryGraphView {
             return Ok(None);
         };
         let mut cursor = self.vector_cursor.lock();
+        if !matches!(&cursor.identity, Some((p, _)) if *p == p_id) {
+            cursor.identity = Some((p_id, self.store.built_vector_identity(self.g_id, p_id)));
+        }
+        // With the identity table built, the key is its hash and canonical
+        // handle: no shard is read or held.
+        if let Some((hash, canonical)) = cursor
+            .identity
+            .as_ref()
+            .and_then(|(_, identity)| identity.as_ref()?.of(handle))
+        {
+            drop(cursor);
+            return Ok(Some(ArenaVector {
+                hash,
+                store_id: self.store.store_id(),
+                g_id: self.g_id,
+                p_id,
+                handle,
+                form: ArenaVectorForm::Canonical {
+                    canonical,
+                    store: Arc::clone(&self.store),
+                },
+            }));
+        }
         let held = cursor
             .shard
             .as_ref()
@@ -3824,32 +3941,17 @@ impl BinaryGraphView {
         if !matches!(&cursor.shard, Some((p, i, _)) if *p == p_id && *i == shard_idx) {
             cursor.shard = Some((p_id, shard_idx, Arc::clone(&shard)));
         }
-        if !matches!(&cursor.identity, Some((p, _)) if *p == p_id) {
-            cursor.identity = Some((p_id, self.store.built_vector_identity(self.g_id, p_id)));
-        }
-        let known = cursor
-            .identity
-            .as_ref()
-            .and_then(|(_, identity)| identity.as_ref()?.of(handle));
         drop(cursor);
         let Some(slice) = crate::arena::vector::VectorSlice::new(shard, offset) else {
             return Ok(None);
         };
-        let (hash, canonical) = match known {
-            Some((hash, canonical)) => (hash, Some(canonical)),
-            None => (
-                fluree_db_core::value::vector_value_hash_f32(slice.as_f32()),
-                None,
-            ),
-        };
         Ok(Some(ArenaVector {
-            slice,
-            hash,
+            hash: fluree_db_core::value::vector_value_hash_f32(slice.as_f32()),
             store_id: self.store.store_id(),
             g_id: self.g_id,
             p_id,
             handle,
-            canonical,
+            form: ArenaVectorForm::Slice(slice),
         }))
     }
 
@@ -4523,21 +4625,34 @@ pub(crate) mod tests {
         p_id: u32,
         arena: crate::arena::vector::LazyVectorArena,
     ) -> BinaryGraphView {
+        view_with_vector_arenas(vec![(p_id, arena)])
+    }
+
+    /// A view of graph 0 of a store holding each `(p_id, arena)` as that
+    /// predicate's vector arena.
+    fn view_with_vector_arenas(
+        arenas: Vec<(u32, crate::arena::vector::LazyVectorArena)>,
+    ) -> BinaryGraphView {
         let mut store = BinaryIndexStore::empty(std::env::temp_dir());
-        store
-            .graph_indexes
-            .entry(0)
-            .or_insert_with(|| GraphIndex {
-                orders: HashMap::new(),
-                order_cids: HashMap::new(),
-                numbig: HashMap::new(),
-                vectors: HashMap::new(),
-                spatial: HashMap::new(),
-                fulltext: HashMap::new(),
-            })
-            .vectors
-            .insert(p_id, arena);
+        let gi = store.graph_indexes.entry(0).or_insert_with(|| GraphIndex {
+            orders: HashMap::new(),
+            order_cids: HashMap::new(),
+            numbig: HashMap::new(),
+            vectors: HashMap::new(),
+            spatial: HashMap::new(),
+            fulltext: HashMap::new(),
+        });
+        for (p_id, arena) in arenas {
+            gi.vectors.insert(p_id, arena);
+        }
         BinaryGraphView::new(Arc::new(store), 0)
+    }
+
+    fn slice_of(key: &ArenaVector) -> &crate::arena::vector::VectorSlice {
+        match &key.form {
+            ArenaVectorForm::Slice(slice) => slice,
+            ArenaVectorForm::Canonical { .. } => panic!("expected a slice key: {key:?}"),
+        }
     }
 
     /// Two keys over one shard share one loaded copy of it, even after the
@@ -4558,9 +4673,9 @@ pub(crate) mod tests {
         let _other = view.arena_vector(7, 2).unwrap().unwrap();
         cache.invalidate_all();
         let again = view.arena_vector(7, 1).unwrap().unwrap();
-        assert_eq!(again.slice.as_f32(), &[0.0, 1.0]);
+        assert_eq!(slice_of(&again).as_f32(), &[0.0, 1.0]);
         assert!(
-            first.slice.same_shard(&again.slice),
+            slice_of(&first).same_shard(slice_of(&again)),
             "a second key over shard 0 loaded another copy of it"
         );
         drop((first, again));
@@ -4568,8 +4683,9 @@ pub(crate) mod tests {
     }
 
     /// A key's hash doesn't depend on whether the identity table is built,
-    /// and the table's canonical handles agree with comparing the vectors,
-    /// for every pair of handles of an arena with repeats.
+    /// and keys compare by value with the table, without it, and with one
+    /// key from each side (a query that keyed some rows before another built
+    /// the table), for every pair of handles of an arena with repeats.
     #[test]
     fn vector_keys_agree_with_and_without_the_identity_table() {
         let dir = std::env::temp_dir().join("fluree_vector_keys_table_on_off");
@@ -4595,7 +4711,7 @@ pub(crate) mod tests {
         let off: Vec<ArenaVector> = (0..8)
             .map(|h| view.arena_vector(7, h).unwrap().unwrap())
             .collect();
-        assert!(off.iter().all(|k| k.canonical.is_none()));
+        assert!(off.iter().all(|k| k.canonical().is_none()));
 
         let table = view.store().vector_identity(0, 7).unwrap().unwrap();
         assert!(!table.duplicate_free());
@@ -4610,15 +4726,114 @@ pub(crate) mod tests {
             for j in 0..8 {
                 let same = bits(&values[i]) == bits(&values[j]);
                 assert_eq!(
-                    on[i].canonical == on[j].canonical,
+                    on[i].canonical() == on[j].canonical(),
                     same,
                     "handles {i} and {j}"
                 );
+                assert_eq!(on[i].same_value(&on[j]).unwrap(), same, "{i} {j} with");
+                assert_eq!(off[i].same_value(&off[j]).unwrap(), same, "{i} {j} without");
+                assert_eq!(on[i].same_value(&off[j]).unwrap(), same, "{i} {j} mixed");
+                assert_eq!(off[i].same_value(&on[j]).unwrap(), same, "{i} {j} mixed");
                 if same {
                     assert_eq!(off[i].hash, off[j].hash);
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the identity table built, keying a vector reads no shard: every
+    /// handle keys, and keys of the arena compare by value, with the shard
+    /// files gone and the cache empty. Only a comparison that needs
+    /// components (here against a decoded vector) reads the arena, and its
+    /// failure surfaces rather than reading as an answer.
+    #[test]
+    fn vector_keys_read_no_shard_once_the_identity_table_is_built() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_no_shard_read");
+        std::fs::create_dir_all(&dir).unwrap();
+        let values: [[f32; 2]; 5] = [[1.0, 0.0], [0.5, 0.5], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        let shards: Vec<Vec<Vec<f32>>> = values
+            .chunks(2)
+            .map(|c| c.iter().map(|v| v.to_vec()).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+
+        cache.invalidate_all();
+        for i in 0..shards.len() {
+            std::fs::remove_file(dir.join(format!("s{i}.vas"))).unwrap();
+        }
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let keys: Vec<ArenaVector> = (0..5)
+            .map(|h| {
+                view.arena_vector(7, h)
+                    .unwrap_or_else(|e| panic!("handle {h} read its shard: {e}"))
+                    .unwrap()
+            })
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (h, key) in keys.iter().enumerate() {
+            assert_eq!(
+                Some((key.hash, key.canonical().unwrap())),
+                table.of(h as u32)
+            );
+            for (g, other) in keys.iter().enumerate() {
+                assert_eq!(
+                    key.same_value(other).unwrap(),
+                    bits(&values[h]) == bits(&values[g]),
+                    "handles {h} and {g}"
+                );
+            }
+        }
+        let decoded = [1.0f64, 0.0];
+        let decoded_hash = fluree_db_core::value::vector_value_hash(&decoded);
+        assert!(
+            keys[0]
+                .same_value_as_decoded(decoded_hash, &decoded)
+                .is_err(),
+            "a comparison that needs the components reads them"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keys of two arenas whose tables are both built compare components on
+    /// a hash match: an equal vector in each arena is one value wherever it
+    /// sits, since canonical handles only name values within one arena.
+    #[test]
+    fn vector_keys_of_two_tabled_arenas_compare_components() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_two_arenas");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let a = vec![vec![vec![1.0f32, 0.0], vec![0.5, 0.5]]];
+        let b = vec![vec![vec![0.5f32, 0.5], vec![1.0, 0.0], vec![0.25, 0.25]]];
+        let view = view_with_vector_arenas(vec![
+            (7, vector_arena_of(&dir.join("a"), 2, 2, &a)),
+            (8, vector_arena_of(&dir.join("b"), 3, 2, &b)),
+        ]);
+        view.store().vector_identity(0, 7).unwrap().unwrap();
+        view.store().vector_identity(0, 8).unwrap().unwrap();
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let ka: Vec<ArenaVector> = (0..2)
+            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .collect();
+        let kb: Vec<ArenaVector> = (0..3)
+            .map(|h| view.arena_vector(8, h).unwrap().unwrap())
+            .collect();
+        assert!(ka.iter().chain(&kb).all(|k| k.canonical().is_some()));
+        for (i, x) in ka.iter().enumerate() {
+            for (j, y) in kb.iter().enumerate() {
+                let same = a[0][i] == b[0][j];
+                assert_eq!(x.same_value(y).unwrap(), same, "7/{i} against 8/{j}");
+                assert_eq!(y.same_value(x).unwrap(), same, "8/{j} against 7/{i}");
+                if same {
+                    assert_eq!(x.hash, y.hash);
+                }
+            }
+        }
+        // `[1.0, 0.0]` is canonical handle 0 of one arena and 1 of the other.
+        assert_eq!((ka[0].canonical(), kb[1].canonical()), (Some(0), Some(1)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
