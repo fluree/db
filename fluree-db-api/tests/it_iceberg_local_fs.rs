@@ -1935,6 +1935,18 @@ async fn a_direct_registration_reports_whether_its_tables_resolve() {
 
 /// A REST catalog that serves the committed `people` fixture's current
 /// metadata inline at `silver.people` and refuses `silver.refused` (403).
+/// The `metadata-location` a mock REST catalog answers with for the fixture
+/// metadata file `current`. A catalog may not place a table on this host's
+/// disk (only a Direct source reads the local filesystem), so the mock names
+/// an object-store location and serves the metadata inline, which is all
+/// registration's table check reads.
+fn catalog_metadata_location(current: &std::path::Path) -> String {
+    format!(
+        "s3://fixture-bucket/silver/people/metadata/{}",
+        current.file_name().unwrap().to_string_lossy()
+    )
+}
+
 async fn people_catalog() -> wiremock::MockServer {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1959,7 +1971,7 @@ async fn people_catalog() -> wiremock::MockServer {
     Mock::given(method("GET"))
         .and(path("/v1/namespaces/silver/tables/people"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "metadata-location": format!("file://{}", current.display()),
+            "metadata-location": catalog_metadata_location(&current),
             "metadata": metadata,
         })))
         .mount(&server)
@@ -2385,7 +2397,7 @@ async fn a_registration_builds_one_catalog_client_for_all_its_tables() {
         Mock::given(method("GET"))
             .and(path_regex(r"^/v1/namespaces/silver/tables/people_[0-9]+$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "metadata-location": format!("file://{}", current.display()),
+                "metadata-location": catalog_metadata_location(&current),
                 "metadata": metadata,
             })))
             .mount(&catalog)

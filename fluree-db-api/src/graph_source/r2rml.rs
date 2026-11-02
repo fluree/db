@@ -6852,7 +6852,10 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_delay(Duration::from_millis(600))
                     .set_body_json(json!({
-                        "metadata-location": format!("file://{}", current.display()),
+                        "metadata-location": format!(
+                            "s3://fixture-bucket/silver/people/metadata/{}",
+                            current.file_name().unwrap().to_string_lossy()
+                        ),
                         "metadata": metadata,
                     })),
             )

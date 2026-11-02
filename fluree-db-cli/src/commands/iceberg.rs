@@ -960,6 +960,8 @@ mod tests {
                 "gs",
                 "--catalog-uri",
                 "https://c",
+                "--r2rml",
+                "m.ttl",
             ];
             argv.extend_from_slice(extra);
             crate::cli::Cli::try_parse_from(argv)
