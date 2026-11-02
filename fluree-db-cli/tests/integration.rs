@@ -1293,6 +1293,63 @@ fn create_from_file() {
         .stdout(predicate::str::contains("flakes"));
 }
 
+/// `graph import` adds a new named graph to a ledger built by transactions:
+/// the ledger's unindexed commits are indexed first, the graph reads back,
+/// and it joins with the default graph through the subject they share.
+#[test]
+fn graph_import_fills_a_new_graph_of_an_existing_ledger() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "peopledb");
+    let source = tmp.path().join("extra.ttl");
+    std::fs::write(
+        &source,
+        "@prefix ex: <http://example.org/> .\nex:widget ex:maker ex:alice ; ex:name \"Widget\" .\n",
+    )
+    .unwrap();
+    let graph = "http://example.org/graph/extra";
+
+    fluree_cmd(&tmp)
+        .args(["graph", "import", graph, "--from", source.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("before the import"))
+        .stdout(predicate::str::contains(format!(
+            "into graph <{graph}> of 'peopledb:main'"
+        )));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            &format!(
+                "SELECT ?name WHERE {{ GRAPH <{graph}> {{ ?w <http://example.org/name> ?name }} }}"
+            ),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Widget"))
+        .stdout(predicate::str::contains("Alice").not());
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            &format!(
+                "SELECT ?who WHERE {{ GRAPH <{graph}> {{ ?w <http://example.org/maker> ?m }} \
+                 ?m <http://example.org/name> ?who }}"
+            ),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // The graph must be new.
+    fluree_cmd(&tmp)
+        .args(["graph", "import", graph, "--from", source.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already has the graph"));
+}
+
 #[test]
 fn create_from_nt_file() {
     let tmp = TempDir::new().unwrap();

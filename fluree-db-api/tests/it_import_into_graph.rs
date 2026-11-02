@@ -373,8 +373,15 @@ async fn later_writes_index_incrementally_over_the_spliced_root() {
     let dir = tempfile::tempdir().unwrap();
     indexed_ledger(dir.path()).await;
     let fluree = fluree_at(dir.path());
-    let result = import_into_graph(&fluree, &[("a.ttl", SOURCE_A)], GRAPH)
+    // On a spawned task, as a server's import job runs it: the import's
+    // future must be `Send` for every lifetime it borrows.
+    let spawned = fluree.clone();
+    let result =
+        tokio::spawn(
+            async move { import_into_graph(&spawned, &[("a.ttl", SOURCE_A)], GRAPH).await },
+        )
         .await
+        .unwrap()
         .expect("graph import");
 
     let ledger = fluree.ledger(LEDGER).await.unwrap();
@@ -446,13 +453,21 @@ async fn an_import_needs_a_new_graph_and_default_graph_data() {
         "names a graph of its own",
     )
     .await;
-    assert_refused(&fluree, &[("b.ttl", SOURCE_B)], "urn:default", "default").await;
+    assert_refused(
+        &fluree,
+        &[("b.ttl", SOURCE_B)],
+        "urn:default",
+        "names the default graph of",
+    )
+    .await;
 }
 
+/// Without a background indexer, the import indexes the commits after the
+/// ledger's index itself before it splices the graph in.
 #[tokio::test]
-async fn an_unindexed_ledger_is_refused_without_an_indexer() {
+async fn an_unindexed_ledger_is_indexed_before_the_import() {
     let dir = tempfile::tempdir().unwrap();
-    indexed_ledger(dir.path()).await;
+    let base_t = indexed_ledger(dir.path()).await;
     let fluree = fluree_at(dir.path());
     let ledger = fluree.ledger(LEDGER).await.unwrap();
     fluree
@@ -462,7 +477,25 @@ async fn an_unindexed_ledger_is_refused_without_an_indexer() {
         )
         .await
         .unwrap();
-    assert_refused(&fluree, &[("a.ttl", SOURCE_A)], GRAPH, "index it").await;
+
+    let result = import_into_graph(&fluree, &[("a.ttl", SOURCE_A)], GRAPH)
+        .await
+        .expect("graph import");
+    assert_eq!(result.graph.as_ref().map(|g| g.base_t), Some(base_t + 1));
+    assert_eq!(result.index_t, result.t);
+
+    let fresh = fluree_at(dir.path());
+    let ledger = fresh.ledger(LEDGER).await.unwrap();
+    assert_eq!(ledger.index_t(), result.t);
+    let read = statements(&fresh).await;
+    assert!(
+        read.contains(&"default: ex:dave ex:name Dave".to_string()),
+        "{read:?}"
+    );
+    assert!(
+        read.contains(&"g: ex:widget1 ex:name Widget".to_string()),
+        "{read:?}"
+    );
 }
 
 const CLAIMS: &str = "@prefix ex: <http://example.org/> .

@@ -429,6 +429,62 @@ fn txn_meta_records(
 // Orchestration
 // ============================================================================
 
+/// The named graph an import into `ledger_id` would fill: `graph_iri` as
+/// the import names it. Refuses the default graph and the ledger's own
+/// graphs; whether the ledger exists and already has the graph is left to
+/// the import, which checks both against the head it starts from.
+pub fn graph_import_target(ledger_id: &str, graph_iri: &str) -> Result<String, ImportError> {
+    let alias = LedgerId::parse(ledger_id)
+        .map_err(|e| ImportError::Api(e.into()))?
+        .to_string();
+    let names_default = || {
+        ImportError::Refused(format!(
+            "<{graph_iri}> names the default graph of {alias}; an import into an \
+             existing ledger fills a new named graph"
+        ))
+    };
+    match fluree_db_transact::import::target_graph_iri(graph_iri, &alias) {
+        Ok(Some(graph)) => Ok(graph),
+        Ok(None) | Err(fluree_db_transact::TransactError::DefaultGraphNameAsGraph) => {
+            Err(names_default())
+        }
+        Err(e) => Err(ImportError::Invalid(e)),
+    }
+}
+
+/// Index `ledger_id` through its head in this task, for a connection with
+/// no background indexer to ask: incremental over the commits after its
+/// index where it can be, a rebuild otherwise.
+async fn index_to_head(fluree: &Fluree, ledger_id: &str) -> Result<(), ImportError> {
+    let mut config = fluree_db_indexer::IndexerConfig::default()
+        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+    // An annotated ledger seals its annotation arena in the build, as the
+    // background indexer's would; others skip the provider, as
+    // `Fluree::reindex` does.
+    if let Some(provider) = fluree.attachment_events_provider() {
+        let handle = fluree.ledger_cached(ledger_id).await?;
+        let view = handle.snapshot().await;
+        if view.snapshot.has_annotations || view.novelty.attachments.has_annotations() {
+            config.attachment_events = provider.attachment_events(handle.id()).await;
+        }
+    }
+    let content_store = fluree.branched_content_store(ledger_id).await?;
+    let indexed = fluree_db_indexer::build_index_for_ledger(
+        content_store,
+        fluree.nameservice(),
+        ledger_id,
+        config,
+    )
+    .await
+    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+    fluree
+        .publisher()?
+        .publish_index_allow_equal(ledger_id, indexed.index_t, &indexed.root_id)
+        .await
+        .map_err(|e| ImportError::Api(e.into()))?;
+    Ok(())
+}
+
 /// Import `source` into the new named graph `graph_iri` of `ledger_id`.
 pub(crate) async fn import_into_graph<S>(
     fluree: &Fluree,
@@ -442,26 +498,19 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     if !config.build_index || !config.publish {
-        return Err(ImportError::Api(ApiError::invalid_query(
+        return Err(ImportError::Refused(String::from(
             "an import into a graph of an existing ledger builds and publishes its index; \
              build_index(false) and publish(false) apply only to a new ledger",
         )));
     }
     if config.virtual_source.is_some() {
-        return Err(ImportError::Api(ApiError::invalid_query(
+        return Err(ImportError::Refused(String::from(
             "an R2RML source can be materialized only into a new ledger",
         )));
     }
     let ledger = LedgerId::parse(ledger_id).map_err(|e| ImportError::Api(e.into()))?;
     let alias = ledger.to_string();
-    let graph_iri = fluree_db_transact::import::target_graph_iri(graph_iri, &alias)
-        .map_err(ImportError::Invalid)?
-        .ok_or_else(|| {
-            ImportError::Api(ApiError::invalid_query(format!(
-                "<{graph_iri}> names the default graph of {alias}; an import into an \
-                 existing ledger fills a new named graph"
-            )))
-        })?;
+    let graph_iri = graph_import_target(&alias, graph_iri)?;
 
     // Index the ledger up to its head first, so the root the import splices
     // into covers every commit before it.
@@ -480,12 +529,13 @@ where
                     .await?;
             }
             IndexingMode::Disabled => {
-                return Err(ImportError::Api(ApiError::invalid_query(format!(
-                    "{alias} has commits after its index (t={}..{}); index it before \
-                     importing into one of its graphs",
-                    record.index_t + 1,
-                    record.commit_t
-                ))));
+                tracing::info!(
+                    ledger_id = %alias,
+                    index_t = record.index_t,
+                    commit_t = record.commit_t,
+                    "indexing the ledger to its head before the graph import"
+                );
+                index_to_head(fluree, &alias).await?;
             }
         }
     }
@@ -514,9 +564,9 @@ where
     let (Some(head_commit), Some(base_root_id)) =
         (record.commit_head_id.clone(), record.index_head_id.clone())
     else {
-        return Err(ImportError::Api(ApiError::invalid_query(format!(
+        return Err(ImportError::Refused(format!(
             "{alias} has no indexed commits; import into a new ledger with `create` instead"
-        ))));
+        )));
     };
     if record.index_t != record.commit_t {
         return Err(ImportError::Api(ApiError::BranchConflict(format!(
@@ -652,10 +702,10 @@ async fn load_seed(
         .map_err(|e| ImportError::Storage(format!("index root dictionaries: {e}")))?;
 
     if base_dicts.graphs.get(&graph_iri).is_some() {
-        return Err(ImportError::Api(ApiError::invalid_query(format!(
+        return Err(ImportError::Refused(format!(
             "{} already has the graph <{graph_iri}>; an import fills a new graph only",
             record.ledger_id
-        ))));
+        )));
     }
     let g_id = u16::try_from(base_dicts.graphs.len() + 1)
         .map_err(|_| ImportError::Transact("the ledger has no graph id left".into()))?;

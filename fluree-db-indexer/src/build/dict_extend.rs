@@ -364,11 +364,15 @@ async fn extend_reverse_tree(
     }
 
     let touched = leaves_receiving(&branch, terms, key_of)?;
-    let mut fetched = futures::stream::iter(touched.iter().map(|&i| {
-        let cid = &existing.leaves[i];
-        async move { content_store.get(cid).await }
-    }))
-    .buffered(LEAF_PREFETCH);
+    // Owned ids: a stream of futures borrowing through a closure argument
+    // is not `Send` for every lifetime, which a spawned import needs.
+    let to_fetch: Vec<ContentId> = touched
+        .iter()
+        .map(|&i| existing.leaves[i].clone())
+        .collect();
+    let mut fetched = futures::stream::iter(to_fetch)
+        .map(|cid| async move { content_store.get(&cid).await })
+        .buffered(LEAF_PREFETCH);
 
     let mut cursor = EntryCursor::open(terms, key_of)?;
     let mut cutter = LeafCutter::new(target_leaf_bytes);

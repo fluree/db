@@ -720,6 +720,10 @@ pub enum ImportError {
     /// The data holds a value the ledger refuses, refused as a transaction
     /// of it is: an `Invalid vector`, or more datatypes than a ledger holds.
     Invalid(fluree_db_transact::TransactError),
+    /// The import cannot run as asked — into a graph the ledger already
+    /// has, from a source that names graphs of its own, over a ledger whose
+    /// index trails its head — and wrote nothing. The message says why.
+    Refused(String),
     /// Storage I/O error.
     Storage(String),
     /// TTL parse / commit error.
@@ -755,10 +759,11 @@ pub enum ImportError {
 /// A TriG or N-Quads source names graphs of its own, so it cannot be imported
 /// into one graph of an existing ledger.
 fn refuse_quads_into_graph() -> ImportError {
-    ImportError::Api(ApiError::invalid_query(
+    ImportError::Refused(
         "a TriG or N-Quads source names graphs of its own; an import into one graph \
-         of an existing ledger takes Turtle, N-Triples or JSON-LD",
-    ))
+         of an existing ledger takes Turtle, N-Triples or JSON-LD"
+            .to_string(),
+    )
 }
 
 /// Wrap an index-build I/O failure, upgrading descriptor exhaustion
@@ -782,6 +787,7 @@ impl std::fmt::Display for ImportError {
         match self {
             Self::Api(e) => write!(f, "api: {e}"),
             Self::Invalid(e) => write!(f, "{e}"),
+            Self::Refused(msg) => write!(f, "{msg}"),
             Self::Storage(msg) => write!(f, "storage: {msg}"),
             Self::Transact(msg) => write!(f, "transact: {msg}"),
             Self::RunGeneration(msg) => write!(f, "run generation: {msg}"),

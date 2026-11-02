@@ -44,16 +44,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Create {
             ledger,
             from,
-            edge_properties,
-            base_iri,
+            import,
             memory,
             no_user,
-            chunk_size_mb,
-            memory_budget_mb,
-            parallelism,
-            skolem_namespace,
-            leaflet_rows,
-            leaflets_per_leaf,
             remote,
         } => {
             if from.is_some() && memory.is_some() {
@@ -61,7 +54,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     "--from and --memory are mutually exclusive".into(),
                 ));
             }
-            let edge_policy: fluree_db_api::csv_import::EdgePolicy = edge_properties.into();
+            // Create-specific flags take precedence; fall back to global flags.
+            let import_opts = import.opts(cli.memory_budget_mb, cli.parallelism);
 
             // `--remote` doesn't write any local state, so it must work even
             // when the user has no project-local `.fluree/` directory — fall
@@ -101,8 +95,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                             &remote_name,
                             path,
                             &fluree_dir,
-                            edge_policy,
-                            base_iri.as_deref(),
+                            &import_opts,
                         )
                         .await
                     }
@@ -125,25 +118,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 .await;
             }
 
-            // Create-specific flags take precedence; fall back to global flags.
-            let import_opts = commands::create::ImportOpts {
-                memory_budget_mb: if memory_budget_mb > 0 {
-                    memory_budget_mb
-                } else {
-                    cli.memory_budget_mb
-                },
-                parallelism: if parallelism > 0 {
-                    parallelism
-                } else {
-                    cli.parallelism
-                },
-                chunk_size_mb,
-                skolem_namespace,
-                leaflet_rows,
-                leaflets_per_leaf,
-                edge_policy,
-                base_iri,
-            };
             commands::create::run(
                 &ledger,
                 from.as_deref(),
@@ -202,7 +176,13 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Graph { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::graph::run(action, &fluree_dir, direct).await
+            let globals = commands::graph::GlobalFlags {
+                verbose: cli.verbose,
+                quiet: cli.quiet,
+                memory_budget_mb: cli.memory_budget_mb,
+                parallelism: cli.parallelism,
+            };
+            commands::graph::run(action, &fluree_dir, direct, globals).await
         }
 
         Commands::Bm25 { action } => {

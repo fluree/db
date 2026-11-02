@@ -70,6 +70,10 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 - Named graphs are created by writing to them (TriG, SPARQL `GRAPH`, or a
   JSON-LD node's `"@graph"`). `ledger.graphs()` lists them, and
   `ledger.drop_graph(iri)` retracts one's contents in a single commit.
+  `ledger.import_graph(iri, path)` bulk-loads Turtle, N-Triples or JSON-LD
+  files into a graph the ledger does not have yet, as `conn.create(name,
+  source=path)` loads a new ledger; the graph shares the ledger's IRIs, so it
+  joins with the rest of it.
 
 A property value in a JSON-LD dict may be any value a query returns, and
 reads back as it went in: a `fluree.IRI` or `BlankNode` is a reference to that

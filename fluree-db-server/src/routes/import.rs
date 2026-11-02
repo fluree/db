@@ -145,6 +145,11 @@ struct MintRequest {
     /// `fluree create --base-iri`.
     #[serde(default)]
     base_iri: Option<String>,
+    /// Import a `"source"` upload into this new named graph of the
+    /// existing ledger `ledger`, as `fluree graph import` does, instead of
+    /// creating `ledger`.
+    #[serde(default)]
+    graph: Option<String>,
 }
 
 /// Pipeline-native single-file extensions (importable as staged, and the only
@@ -242,9 +247,17 @@ fn source_import_options(req: &MintRequest) -> Result<SourceImportOptions> {
             )))
         }
     };
+    let graph = match req.graph.as_deref() {
+        Some(graph) => Some(
+            fluree_db_api::graph_import_target(&req.ledger, graph)
+                .map_err(|e| ServerError::bad_request(e.to_string()))?,
+        ),
+        None => None,
+    };
     Ok(SourceImportOptions {
         edge_policy,
         base_iri: req.base_iri.clone(),
+        graph,
     })
 }
 
@@ -349,6 +362,11 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
     // whose extension the staged file keeps (format sniffing), and are
     // refused up front on deployments that can't run the pipeline.
     let (source, staged_ext, source_options) = match req.source_kind.as_deref() {
+        None | Some("flpack") if req.graph.is_some() => {
+            return Err(ServerError::bad_request(
+                "\"graph\" applies to a source upload; a .flpack restores a whole ledger",
+            ))
+        }
         None | Some("flpack") => (
             ImportSourceKind::Flpack,
             "flpack".to_string(),
@@ -361,10 +379,25 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
                     "source uploads must include \"filename\" so the format can be detected",
                 )
             })?;
+            let options = source_import_options(&req)?;
+            // Into a graph, the ledger must be there to receive it: say so
+            // before the upload rather than after.
+            if options.graph.is_some()
+                && !state
+                    .fluree
+                    .ledger_exists(&req.ledger)
+                    .await
+                    .map_err(ServerError::Api)?
+            {
+                return Err(ServerError::not_found(format!(
+                    "ledger '{}' not found; an import into a graph needs an existing ledger",
+                    req.ledger
+                )));
+            }
             (
                 ImportSourceKind::Source,
                 source_staged_extension(filename)?,
-                source_import_options(&req)?,
+                options,
             )
         }
         Some(other) => {
@@ -852,6 +885,34 @@ async fn run_source_import(
     } else {
         (staged_path.to_path_buf(), None)
     };
+
+    if let Some(graph) = &options.graph {
+        let result = state
+            .fluree
+            .import_into_graph(ledger_id, graph)
+            .import(&import_path)
+            .execute()
+            .await
+            .map_err(|e| e.to_string())?;
+        // Unlike a new ledger, no reindex follows an annotated graph: it
+        // would rebuild the whole ledger. `has_annotations` tells the
+        // caller its annotation arena waits for one.
+        return Ok(serde_json::json!({
+            "kind": "graph-import",
+            "ledger_id": result.ledger_id,
+            "graph": result.graph.as_ref().map(|g| serde_json::json!({
+                "iri": g.iri,
+                "g_id": g.g_id,
+                "base_t": g.base_t,
+            })),
+            "t": result.t,
+            "flake_count": result.flake_count,
+            "commit_head_id": result.commit_head_id.to_string(),
+            "root_id": result.root_id.as_ref().map(std::string::ToString::to_string),
+            "index_t": result.index_t,
+            "has_annotations": result.has_annotations,
+        }));
+    }
 
     let result = state
         .fluree

@@ -23,6 +23,15 @@ pub struct ImportOpts {
     pub base_iri: Option<String>,
 }
 
+/// Where a bulk import's data goes.
+#[derive(Clone, Copy)]
+pub(crate) enum ImportTarget<'a> {
+    /// A new ledger, created by the import (`fluree create --from`).
+    NewLedger,
+    /// A new named graph of an existing ledger (`fluree graph import`).
+    Graph(&'a str),
+}
+
 /// `fluree create <ledger> --remote <name>` — create an empty ledger on the
 /// remote server. Only the empty-create case is supported; bulk imports
 /// (`--from`, `--memory`) require local data ingestion and are dispatched
@@ -293,8 +302,7 @@ pub async fn run_remote_source_import(
     remote_name: &str,
     path: &Path,
     dirs: &FlureeDir,
-    edge_policy: fluree_db_api::csv_import::EdgePolicy,
-    base_iri: Option<&str>,
+    import_opts: &ImportOpts,
 ) -> CliResult<()> {
     use colored::Colorize;
 
@@ -306,14 +314,6 @@ pub async fn run_remote_source_import(
             path.display()
         )));
     }
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| CliError::Input(format!("unusable file name: {}", path.display())))?;
-    let meta = std::fs::metadata(path)
-        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
-    let size = meta.len();
-
     let client = context::build_remote_client(remote_name, dirs).await?;
     let ledger_id = context::to_ledger_id(ledger)?;
 
@@ -326,41 +326,15 @@ pub async fn run_remote_source_import(
         )));
     }
 
-    eprintln!(
-        "Uploading '{}' to remote '{}' for server-side bulk import ({}, {})...",
-        ledger.cyan(),
+    let result = upload_source_import(
+        &client,
+        &ledger_id,
         remote_name,
-        filename,
-        format_human_bytes(size),
-    );
-
-    // Same mint → upload → complete → poll handshake as the negotiated
-    // `.flpack` path; the mint body declares the source kind + filename so the
-    // server stages with the right extension and runs the pipeline on
-    // complete.
-    let mint = client
-        .mint_source_import_upload(&ledger_id, Some(size), filename, edge_policy, base_iri)
-        .await
-        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
-    let import_id = mint["import_id"]
-        .as_str()
-        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
-        .to_string();
-
-    let completed_parts = if mint.get("multipart").is_some() {
-        upload_multipart(&client, &mint, path, size).await?
-    } else {
-        upload_single(&client, &mint, path).await?
-    };
-
-    client
-        .complete_import_upload(&import_id, &completed_parts)
-        .await
-        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
-
-    eprintln!("Upload complete; importing on '{remote_name}'...");
-
-    let result = poll_remote_import(&client, &import_id).await?;
+        path,
+        import_opts,
+        ImportTarget::NewLedger,
+    )
+    .await?;
     context::persist_refreshed_tokens(&client, remote_name, dirs).await;
 
     let resolved = result["ledger_id"].as_str().unwrap_or(&ledger_id);
@@ -375,6 +349,74 @@ pub async fn run_remote_source_import(
         flakes,
     );
     Ok(())
+}
+
+/// Upload the single source file `path` for a bulk import on the server
+/// behind `client`, into `target` of `ledger_id`, and wait for it: the mint →
+/// upload → complete → poll handshake of the negotiated `.flpack` path, with
+/// a mint body that declares the source kind and filename so the server
+/// stages with the right extension and runs the pipeline on complete.
+/// Returns the job's result.
+pub(crate) async fn upload_source_import(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger_id: &str,
+    server_label: &str,
+    path: &Path,
+    import_opts: &ImportOpts,
+    target: ImportTarget<'_>,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| CliError::Input(format!("unusable file name: {}", path.display())))?;
+    let size = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?
+        .len();
+    let graph = match target {
+        ImportTarget::NewLedger => None,
+        ImportTarget::Graph(iri) => Some(iri),
+    };
+
+    eprintln!(
+        "Uploading '{}' to '{}' for server-side bulk import ({}, {})...",
+        ledger_id.cyan(),
+        server_label,
+        filename,
+        format_human_bytes(size),
+    );
+    let mint = client
+        .mint_source_import_upload(
+            ledger_id,
+            Some(size),
+            filename,
+            import_opts.edge_policy,
+            import_opts.base_iri.as_deref(),
+            graph,
+        )
+        .await
+        .map_err(|e| {
+            CliError::Remote(format!("failed to start upload to '{server_label}': {e}"))
+        })?;
+    let import_id = mint["import_id"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
+        .to_string();
+
+    let completed_parts = if mint.get("multipart").is_some() {
+        upload_multipart(client, &mint, path, size).await?
+    } else {
+        upload_single(client, &mint, path).await?
+    };
+
+    client
+        .complete_import_upload(&import_id, &completed_parts)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
+
+    eprintln!("Upload complete; importing on '{server_label}'...");
+    poll_remote_import(client, &import_id).await
 }
 
 /// Print the shared success summary for a remote import (both paths).
@@ -423,13 +465,33 @@ pub async fn run(
         // pipeline. Checked before the directory / bulk branches, which only
         // understand RDF/JSON-LD.
         Some(path) if is_csv_input(path) => {
-            run_csv_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
+            run_csv_import(
+                &fluree,
+                ledger,
+                ImportTarget::NewLedger,
+                path,
+                dirs,
+                verbose,
+                quiet,
+                import_opts,
+            )
+            .await?;
         }
         // Cypher scripts (.cypher/.cyp/.cql of CREATE / MATCH…CREATE
         // statements) are converted to newline-delimited JSON-LD and loaded
         // through the same chunked bulk-import pipeline.
         Some(path) if is_cypher_input(path) => {
-            run_cypher_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
+            run_cypher_import(
+                &fluree,
+                ledger,
+                ImportTarget::NewLedger,
+                path,
+                dirs,
+                verbose,
+                quiet,
+                import_opts,
+            )
+            .await?;
         }
         Some(path) if path.is_dir() => {
             // Validate directory format (catches mixed formats & empty dirs).
@@ -437,6 +499,7 @@ pub async fn run(
             run_bulk_import(
                 &fluree,
                 ledger,
+                ImportTarget::NewLedger,
                 path,
                 dirs.data_dir(),
                 verbose,
@@ -452,6 +515,7 @@ pub async fn run(
             run_bulk_import(
                 &fluree,
                 ledger,
+                ImportTarget::NewLedger,
                 path,
                 dirs.data_dir(),
                 verbose,
@@ -474,6 +538,7 @@ pub async fn run(
                     run_bulk_import(
                         &fluree,
                         ledger,
+                        ImportTarget::NewLedger,
                         path,
                         dirs.data_dir(),
                         verbose,
@@ -513,14 +578,108 @@ pub async fn run(
     Ok(())
 }
 
+/// `fluree graph import` run in-process: bulk-import `path` into the new
+/// graph `graph_iri` of the existing ledger `ledger`. The import indexes the
+/// ledger to its head first when its index trails it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_graph_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    graph_iri: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    let ledger_id = context::to_ledger_id(ledger)?;
+    let graph_iri = fluree_db_api::graph_import_target(&ledger_id, graph_iri)?;
+    let record = fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("ledger '{ledger}' not found")))?;
+    if record.index_t < record.commit_t && !quiet {
+        eprintln!(
+            "  {} indexing {} (t={}..{}) before the import...",
+            "index:".cyan().bold(),
+            ledger_id,
+            record.index_t + 1,
+            record.commit_t
+        );
+    }
+
+    let target = ImportTarget::Graph(&graph_iri);
+    if is_csv_input(path) {
+        run_csv_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs,
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else if is_cypher_input(path) {
+        run_cypher_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs,
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else if path.is_dir() {
+        fluree_db_api::scan_directory_format(path)?;
+        run_bulk_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs.data_dir(),
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else if is_import_path(path)? {
+        run_bulk_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs.data_dir(),
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else {
+        Err(CliError::Usage(format!(
+            "{} is not a format `graph import` reads: use Turtle, N-Triples, JSON-LD, \
+             JSONL/NDJSON (optionally .gz/.zst), CSV or Cypher",
+            path.display()
+        )))
+    }
+}
+
 /// Run the bulk import pipeline for a Turtle file or directory.
 ///
 /// Prints effective import settings (memory budget, parallelism, chunk size,
 /// run budget) to stderr so the user can cancel if the values look excessive.
 /// Shows a live progress bar unless `quiet` is set.
+#[allow(clippy::too_many_arguments)]
 async fn run_bulk_import(
     fluree: &fluree_db_api::Fluree,
     ledger: &str,
+    target: ImportTarget<'_>,
     path: &Path,
     fluree_dir: &Path,
     verbose: bool,
@@ -537,7 +696,10 @@ async fn run_bulk_import(
 
     let ledger_owned = ledger.to_string();
 
-    let mut builder = fluree.create(ledger).import(path);
+    let mut builder = match target {
+        ImportTarget::NewLedger => fluree.create(ledger).import(path),
+        ImportTarget::Graph(iri) => fluree.import_into_graph(ledger, iri).import(path),
+    };
     if import_opts.parallelism > 0 {
         builder = builder.parallelism(import_opts.parallelism);
     }
@@ -851,15 +1013,32 @@ async fn run_bulk_import(
     };
     let elapsed = start.elapsed();
 
-    config::write_active_ledger(fluree_dir, ledger)?;
-
     let secs = elapsed.as_secs_f64();
     let total_m = result.flake_count as f64 / 1_000_000.0;
     let mflakes_per_sec = total_m / secs;
-    println!(
-        "\n\nAbout ledger '{}':\nImported {:.1}M flakes in {:.2}s ({:.2} M flakes/s) across {} commits (t={})",
-        ledger, total_m, secs, mflakes_per_sec, result.t, result.t
-    );
+    match target {
+        ImportTarget::NewLedger => {
+            config::write_active_ledger(fluree_dir, ledger)?;
+            println!(
+                "\n\nAbout ledger '{}':\nImported {:.1}M flakes in {:.2}s ({:.2} M flakes/s) across {} commits (t={})",
+                ledger, total_m, secs, mflakes_per_sec, result.t, result.t
+            );
+        }
+        ImportTarget::Graph(iri) => {
+            let base_t = result.graph.as_ref().map_or(0, |graph| graph.base_t);
+            println!(
+                "\n\nImported {:.1}M flakes into graph <{}> of '{}' in {:.2}s ({:.2} M flakes/s) across {} commits (t={}..{})",
+                total_m,
+                iri,
+                ledger,
+                secs,
+                mflakes_per_sec,
+                result.t - base_t,
+                base_t + 1,
+                result.t
+            );
+        }
+    }
     if result.duplicates_removed > 0 {
         println!(
             "Collapsed {} duplicate statement(s); the index holds {} distinct flakes",
@@ -912,7 +1091,18 @@ async fn run_bulk_import(
     // second step. Non-annotation imports skip this entirely (the
     // sticky bit gate on `Fluree::reindex` and the early-return in
     // the indexer's arena builder both make it cheap to be wrong).
-    if result.has_annotations {
+    if result.has_annotations && matches!(target, ImportTarget::Graph(_)) {
+        // Resealing here would rebuild the whole ledger's index, not just
+        // the graph's, so it is left for the user to schedule.
+        if !quiet {
+            eprintln!(
+                "{} The graph holds statement annotations, so the ledger's annotation arena \
+                 was set aside; quoted-triple queries read by scan until `fluree reindex {ledger}` \
+                 seals it again.",
+                "info:".cyan().bold()
+            );
+        }
+    } else if result.has_annotations {
         if !quiet {
             eprintln!(
                 "{} Sealing annotation arena (one-shot reindex pass) — ledger contains `f:reifies*` flakes…",
@@ -1115,9 +1305,11 @@ fn has_cypher_extension(path: &Path) -> bool {
 /// **chunked, parallel bulk-import pipeline** (the same path as `--from data/`
 /// of Turtle/JSON-LD). Streaming the `.jsonl` keeps memory flat and gives a
 /// progress bar + chunk-per-commit, instead of one giant in-memory transaction.
+#[allow(clippy::too_many_arguments)]
 async fn run_csv_import(
     fluree: &fluree_db_api::Fluree,
     ledger: &str,
+    target: ImportTarget<'_>,
     path: &Path,
     dirs: &FlureeDir,
     verbose: bool,
@@ -1156,6 +1348,7 @@ async fn run_csv_import(
     run_bulk_import(
         fluree,
         ledger,
+        target,
         tmp.path(),
         dirs.data_dir(),
         verbose,
@@ -1171,9 +1364,11 @@ async fn run_csv_import(
 /// instead of replaying statements one at a time over the transactional write
 /// path. Three sequential passes over the input (each statement parsed once):
 /// learn match-key property sets, emit nodes, emit edges.
+#[allow(clippy::too_many_arguments)]
 async fn run_cypher_import(
     fluree: &fluree_db_api::Fluree,
     ledger: &str,
+    target: ImportTarget<'_>,
     path: &Path,
     dirs: &FlureeDir,
     verbose: bool,
@@ -1222,6 +1417,7 @@ async fn run_cypher_import(
     run_bulk_import(
         fluree,
         ledger,
+        target,
         tmp.path(),
         dirs.data_dir(),
         verbose,

@@ -182,6 +182,8 @@ pub use format::{
 };
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
+#[cfg(not(target_arch = "wasm32"))]
+pub use graph_import::graph_import_target;
 pub use graph_query_builder::{GraphQueryBuilder, GraphSnapshotQueryBuilder};
 pub use graph_snapshot::GraphSnapshot;
 pub use graph_source::{
