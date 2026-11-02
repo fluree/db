@@ -19,9 +19,9 @@
 //! current state, derives the actual write, and commits it as one transaction.
 
 use fluree_db_cypher::ast::{
-    BinOp, CypherAst, DeleteClause, Direction, Expr, FuncCall, Literal, MatchClause, MergeClause,
-    NodePattern, Pattern, PatternPart, ProjectionItem, Query, ReadClause, ReturnClause, SetClause,
-    SetItem, Statement, Update, Variable, WithClause, WriteClause,
+    CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
+    Pattern, PatternPart, ProjectionItem, Query, ReadClause, ReturnClause, SetClause, SetItem,
+    Statement, Update, Variable, WriteClause,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_transact::ir::Txn;
@@ -323,31 +323,6 @@ pub(crate) fn bound_by_mandatory_match(u: &Update, name: &str) -> bool {
     })
 }
 
-/// Find the (subject-side, object-side) endpoint variables of relationship
-/// variable `rel_var` in the MATCH, honoring direction. Returns `None` if the
-/// endpoints aren't both named.
-pub(crate) fn rel_endpoint_vars(u: &Update, rel_var: &str) -> Option<(Variable, Variable)> {
-    for clause in &u.read_clauses {
-        let (ReadClause::Match(m) | ReadClause::OptionalMatch(m)) = clause else {
-            continue;
-        };
-        for part in &m.pattern.parts {
-            let mut prev = &part.head;
-            for (rel, next) in &part.tail {
-                if rel.var.as_ref().is_some_and(|v| v.name == rel_var) {
-                    let (s, o) = match rel.direction {
-                        Direction::Incoming => (next, prev),
-                        _ => (prev, next),
-                    };
-                    return Some((s.var.clone()?, o.var.clone()?));
-                }
-                prev = next;
-            }
-        }
-    }
-    None
-}
-
 /// Build a probe that returns at most one row when a node matching the MERGE
 /// identity pattern exists: `MATCH (<node>) RETURN <var> LIMIT 1`. Built from
 /// the AST (the node is cloned verbatim) so labels/properties — including
@@ -482,81 +457,6 @@ pub(crate) fn build_delete_target_probe_ast(
                 order_by: Vec::new(),
                 skip: None,
                 limit: None,
-                span,
-            },
-            union_tail: None,
-            span,
-        }),
-        span,
-    }
-}
-
-/// Build a probe that returns at most one row when the matched relationship
-/// `rel_var` has a **parallel sibling** — another reified edge sharing the same
-/// `(a)-[:T]->(b)` base triple. Appends
-/// `WITH <a>, <b>, count(<rel_var>) AS __cyrel_c WHERE __cyrel_c > 1
-///  RETURN <a> LIMIT 1` to the original read clauses. Named relationships bind
-/// one row per annotation SID, so a `count > 1` per `(a, b)` group means the
-/// base edge backs multiple relationship identities — retracting it would
-/// disturb the siblings, so `DELETE r` must reject.
-pub(crate) fn build_parallel_probe_ast(
-    read_clauses: &[ReadClause],
-    a: &Variable,
-    b: &Variable,
-    rel_var: &str,
-) -> CypherAst {
-    let span = a.span;
-    let proj = |v: &Variable| ProjectionItem {
-        expr: Expr::Var(v.clone()),
-        alias: None,
-        span,
-    };
-    let count_alias = Variable {
-        name: "__cyrel_c".to_string(),
-        span,
-    };
-    let count_item = ProjectionItem {
-        // DISTINCT: count relationship *identities*, not solution rows. Extra
-        // multiplicity in the original MATCH (another matched variable) can
-        // repeat one identity across rows, which would falsely trip the guard.
-        expr: Expr::Call(FuncCall {
-            name: "count".to_string(),
-            args: vec![Expr::Var(Variable {
-                name: rel_var.to_string(),
-                span,
-            })],
-            distinct: true,
-            span,
-        }),
-        alias: Some(count_alias.clone()),
-        span,
-    };
-    let having = Expr::BinOp(
-        BinOp::Gt,
-        Box::new(Expr::Var(count_alias)),
-        Box::new(Expr::Lit(Literal::Integer(1, span))),
-        span,
-    );
-    let mut clauses: Vec<ReadClause> = read_clauses.to_vec();
-    clauses.push(ReadClause::With(WithClause {
-        items: vec![proj(a), proj(b), count_item],
-        distinct: false,
-        where_clause: Some(having),
-        order_by: Vec::new(),
-        skip: None,
-        limit: None,
-        span,
-    }));
-
-    CypherAst {
-        statement: Statement::Query(Query {
-            clauses,
-            return_clause: ReturnClause {
-                items: vec![proj(a)],
-                distinct: false,
-                order_by: Vec::new(),
-                skip: None,
-                limit: Some(Expr::Lit(Literal::Integer(1, span))),
                 span,
             },
             union_tail: None,

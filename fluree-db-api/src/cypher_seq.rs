@@ -36,12 +36,14 @@
 use std::sync::Arc;
 
 use fluree_db_cypher::ast::{
-    CypherAst, Expr, Literal, MatchClause, MergeClause, Pattern, PatternPart, ProjectionItem,
-    Query, ReadClause, ReturnClause, SetClause, Statement, Update, Variable, WriteClause,
+    CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
+    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, RemoveClause, RemoveItem,
+    ReturnClause, SetClause, SetItem, Statement, Update, Variable, WriteClause,
 };
 use fluree_db_cypher::span::SourceSpan;
 use fluree_db_ledger::IndexConfig;
 use fluree_db_ledger::LedgerState;
+use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use fluree_db_query::parse::{UnresolvedPattern, UnresolvedValue};
 use fluree_db_query::{Binding, Materializer};
 use fluree_db_transact::lower_cypher_update::{cypher_blank_label, CypherBlank};
@@ -61,6 +63,10 @@ const MAX_SEQUENTIAL_ROWS: usize = 100_000;
 /// engine-side reordering. `#`-prefixed so it can never collide with a user
 /// variable (Cypher identifiers cannot start with `#`).
 const ROW_IDX_VAR: &str = "#__cy_seq_row";
+
+/// Prefix of the variables the driver names a relationship's endpoints with
+/// (see [`rel_delete_edges`]); `#` keeps them clear of user variables.
+const REL_END_VAR: &str = "#__cy_seq_rel_";
 
 /// Synthetic column used when a read prefix produces rows but binds no user
 /// variables (for example `MATCH (:Person)`). Without a column, that N-row
@@ -85,7 +91,9 @@ pub struct SequentialCypherWrite {
 /// - a node MERGE under a plain leading read (`MATCH … MERGE (n {…})`),
 ///   with or without `ON MATCH SET` / trailing SETs — the driver's per-row
 ///   partition creates once per distinct absent key and binds every row,
-///   which is exactly Cypher's semantics for that shape.
+///   which is exactly Cypher's semantics for that shape;
+/// - write clauses without a MERGE that can see or undo one another's
+///   writes ([`interacting_writes`]).
 pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
     let Statement::Update(u) = &ast.statement else {
         return None;
@@ -95,7 +103,10 @@ pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
         .iter()
         .any(|w| matches!(w, WriteClause::Merge(_)));
     if !has_merge {
-        return None;
+        return interacting_writes(u).map(|update| SequentialCypherWrite {
+            update,
+            span: ast.span,
+        });
     }
 
     let merge_set_shape = matches!(
@@ -133,6 +144,505 @@ pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
     None
 }
 
+/// `u` prepared for the driver when its write clauses can see or undo one
+/// another's writes.
+///
+/// The single-`Txn` lowering evaluates every clause against the state before
+/// the statement and stages them as one operation, so a later clause neither
+/// sees an earlier one's write nor replaces it: `SET n.p = 1 SET n.p = 2`
+/// asserts both values, `REMOVE n.p SET n.p = <stored value>` removes it. A
+/// clause whose lowering reads stored values (an `OPTIONAL` lookup) also adds
+/// rows that a `CREATE` in the same statement fires on, once per row. The
+/// driver stages each clause against the state the clauses before it leave,
+/// and the stager folds each fact to its last write (as for SPARQL's
+/// `;`-separated operations), so these statements route there. A SET clause
+/// writing one key twice is split at the repeat, since its items apply in
+/// order.
+///
+/// Statements whose clauses can't meet keep the single `Txn`, as do shapes
+/// the driver doesn't stage ([`validate_members`]: a `CALL` before the
+/// writes, an `OPTIONAL MATCH` before a `CREATE`, a node's bare `DELETE`,
+/// `FOREACH`), which the single `Txn`'s lowering refuses in turn.
+fn interacting_writes(u: &Update) -> Option<Update> {
+    // One clause meets itself only as a SET writing one key twice, and two
+    // CREATEs never meet.
+    if let [only] = u.write_clauses.as_slice() {
+        if !matches!(only, WriteClause::Set(s) if set_repeats_a_key(s)) {
+            return None;
+        }
+    }
+    if u.write_clauses
+        .iter()
+        .all(|c| matches!(c, WriteClause::Create(_)))
+    {
+        return None;
+    }
+    let writes: Vec<ClauseWrites<'_>> = u.write_clauses.iter().map(ClauseWrites::of).collect();
+    let meet = writes
+        .iter()
+        .enumerate()
+        .any(|(i, a)| writes[i + 1..].iter().any(|b| a.meets(b)))
+        || u.write_clauses
+            .iter()
+            .any(|c| matches!(c, WriteClause::Set(s) if set_repeats_a_key(s)));
+    if !meet {
+        return None;
+    }
+    if validate_members(u).is_err() {
+        return None;
+    }
+    Some(Update {
+        write_clauses: split_repeated_set_keys(&u.write_clauses),
+        ..u.clone()
+    })
+}
+
+/// The edges a `DELETE` clause's relationship targets retract, as `MATCH`
+/// clauses its seeded sub-statement re-matches: the lowering retracts the edge
+/// a relationship variable was matched on, in the state the clauses before it
+/// leave, and staging refuses an edge that carries another relationship (one
+/// an earlier clause created included), as for a `DELETE r` of its own.
+///
+/// Each re-match is `(s)-[r:T]->(o)`. Its endpoints are the variables that
+/// hold `r`'s endpoints at the end of the read clauses ([`RelBinding::ends`],
+/// carried through any `WITH` under names of the driver's own), so with `r`
+/// and both endpoints seeded it is a point lookup of the edge, and the names
+/// the statement's `MATCH` gave the endpoints play no part. When the pattern
+/// read the edge in either direction, the re-match takes endpoint variables
+/// of its own, which the seeded `r` and its `f:reifies*` bundle pin to the
+/// edge `r` is on: slower over many rows, but it never reaches another edge.
+fn rel_delete_edges(
+    rels: &[RelBinding],
+    delete: &DeleteClause,
+    span: SourceSpan,
+) -> Vec<ReadClause> {
+    delete
+        .targets
+        .iter()
+        .filter_map(|target| {
+            let rel = rels.iter().find(|r| r.name == target.name)?;
+            Some((target, rel))
+        })
+        .map(|(target, rel)| {
+            let (s, o) = rel.ends.clone().unwrap_or_else(|| {
+                (
+                    format!("{REL_END_VAR}s_{}", target.name),
+                    format!("{REL_END_VAR}o_{}", target.name),
+                )
+            });
+            let node = |name: String| NodePattern {
+                var: Some(Variable { name, span }),
+                labels: Vec::new(),
+                props: None,
+                span,
+            };
+            ReadClause::Match(MatchClause {
+                pattern: Pattern {
+                    parts: vec![PatternPart {
+                        path_var: None,
+                        path_search: None,
+                        head: node(s),
+                        tail: vec![(
+                            RelPattern {
+                                var: Some(target.clone()),
+                                direction: Direction::Outgoing,
+                                types: rel.pattern.types.clone(),
+                                length: rel.pattern.length.clone(),
+                                props: None,
+                                span,
+                            },
+                            node(o),
+                        )],
+                        span,
+                    }],
+                    span,
+                },
+                where_clause: None,
+                span,
+            })
+        })
+        .collect()
+}
+
+/// The endpoint variables of the relationships a `DELETE` in `u` targets that
+/// only the read prefix names ([`name_anonymous_ends`]): the read prefix
+/// returns them as row-table columns, so the DELETE's re-match is seeded with
+/// them.
+fn hidden_delete_ends(u: &Update, rels: &[RelBinding]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in &u.write_clauses {
+        let WriteClause::Delete(d) = w else {
+            continue;
+        };
+        for t in &d.targets {
+            let Some((s, o)) = rels
+                .iter()
+                .find(|r| r.name == t.name)
+                .and_then(|r| r.ends.as_ref())
+            else {
+                continue;
+            };
+            for end in [s, o] {
+                if end.starts_with(REL_END_VAR) && !out.contains(end) {
+                    out.push(end.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `clauses` with every unnamed node beside a named relationship given a
+/// name of the driver's own, so a relationship's DELETE can be seeded with its
+/// endpoints (see [`rel_delete_edges`]). Naming a node changes nothing the
+/// pattern matches.
+fn name_anonymous_ends(clauses: &[ReadClause]) -> Vec<ReadClause> {
+    let mut clauses = clauses.to_vec();
+    for (ci, c) in clauses.iter_mut().enumerate() {
+        let (ReadClause::Match(m) | ReadClause::OptionalMatch(m)) = c else {
+            continue;
+        };
+        for (pi, part) in m.pattern.parts.iter_mut().enumerate() {
+            let named_rel: Vec<bool> = part.tail.iter().map(|(rel, _)| rel.var.is_some()).collect();
+            let span = part.head.span;
+            let name = |node: &mut NodePattern, ni: usize| {
+                if node.var.is_none() {
+                    node.var = Some(Variable {
+                        name: format!("{REL_END_VAR}n{ci}_{pi}_{ni}"),
+                        span,
+                    });
+                }
+            };
+            if named_rel.first() == Some(&true) {
+                name(&mut part.head, 0);
+            }
+            for (i, (_, node)) in part.tail.iter_mut().enumerate() {
+                if named_rel[i] || named_rel.get(i + 1) == Some(&true) {
+                    name(node, i + 1);
+                }
+            }
+        }
+    }
+    clauses
+}
+
+/// Whether a SET's items write one property key twice.
+fn set_repeats_a_key(s: &SetClause) -> bool {
+    let mut seen = ClauseWrites::default();
+    for item in &s.items {
+        let mut writes = ClauseWrites::default();
+        writes.add_set_items(std::slice::from_ref(item));
+        if seen.shares_keys(&writes) {
+            return true;
+        }
+        seen.add_set_items(std::slice::from_ref(item));
+    }
+    false
+}
+
+/// A relationship variable in scope after the read clauses.
+struct RelBinding {
+    name: String,
+    /// The pattern that bound it.
+    pattern: RelPattern,
+    /// The variables holding its endpoints, subject first: `None` when one is
+    /// unnamed, when the pattern reads the edge in either direction, or (unless
+    /// the scope carries them, see [`relationship_scope`]) once a `WITH` drops
+    /// or rebinds one.
+    ends: Option<(String, String)>,
+}
+
+/// The relationship variables in scope after the read clauses. A `WITH`
+/// carries a relationship (and its endpoints) under the names it projects them
+/// as and drops what it doesn't project, so a name the `MATCH` gave a
+/// relationship can name a node afterwards, and the reverse.
+///
+/// With `carry_ends`, the clauses come back prepared for the read prefix: an
+/// unnamed endpoint beside a named relationship gets a name of its own
+/// ([`name_anonymous_ends`]), and a `WITH` that keeps a relationship but drops
+/// or rebinds an endpoint also projects that endpoint under a name of the
+/// driver's own. Neither changes what the clauses match or bind for the
+/// statement (an endpoint is a function of its relationship, so carrying it
+/// changes no grouping or `DISTINCT`), and every relationship keeps the
+/// variables holding its endpoints, which seed its DELETE's re-match.
+fn relationship_scope(
+    clauses: &[ReadClause],
+    carry_ends: bool,
+) -> (Vec<ReadClause>, Vec<RelBinding>) {
+    // A name that is bound anew holds no relationship or endpoint it held.
+    fn forget(vars: &mut Vec<RelBinding>, name: &str) {
+        vars.retain(|r| r.name != name);
+        for r in vars.iter_mut() {
+            if r.ends.as_ref().is_some_and(|(s, o)| s == name || o == name) {
+                r.ends = None;
+            }
+        }
+    }
+    let mut clauses = if carry_ends {
+        name_anonymous_ends(clauses)
+    } else {
+        clauses.to_vec()
+    };
+    let mut vars: Vec<RelBinding> = Vec::new();
+    for (ci, c) in clauses.iter_mut().enumerate() {
+        match c {
+            ReadClause::Match(m) | ReadClause::OptionalMatch(m) => {
+                for part in &m.pattern.parts {
+                    let mut prev = &part.head;
+                    for (rel, next) in &part.tail {
+                        if let Some(v) = &rel.var {
+                            let ends = match rel.direction {
+                                Direction::Outgoing => Some((prev, next)),
+                                Direction::Incoming => Some((next, prev)),
+                                Direction::Either => None,
+                            }
+                            .and_then(|(s, o)| Some((s.var.clone()?.name, o.var.clone()?.name)));
+                            vars.retain(|r| r.name != v.name);
+                            vars.push(RelBinding {
+                                name: v.name.clone(),
+                                pattern: rel.clone(),
+                                ends,
+                            });
+                        }
+                        prev = next;
+                    }
+                }
+            }
+            ReadClause::With(w) => {
+                let (next, carried) = with_scope(w, std::mem::take(&mut vars), carry_ends, ci);
+                vars = next;
+                w.items.extend(carried);
+            }
+            ReadClause::Unwind(u) => forget(&mut vars, &u.alias.name),
+            ReadClause::InlineRows { vars: cols, .. } => {
+                for v in cols {
+                    forget(&mut vars, &v.name);
+                }
+            }
+            ReadClause::CallSubquery(_) => {}
+        }
+    }
+    (clauses, vars)
+}
+
+/// The relationship variables in scope after `w` (clause `ci`), and, with
+/// `carry_ends`, the items `w` must also project to keep each surviving
+/// relationship's endpoints (see [`relationship_scope`]).
+fn with_scope(
+    w: &fluree_db_cypher::ast::WithClause,
+    vars: Vec<RelBinding>,
+    carry_ends: bool,
+    ci: usize,
+) -> (Vec<RelBinding>, Vec<ProjectionItem>) {
+    // Where each name this WITH projects a variable under comes from. `WITH *`
+    // carries every user variable as it is.
+    let star = w
+        .items
+        .iter()
+        .any(|i| i.alias.is_none() && matches!(&i.expr, Expr::Var(v) if v.name == "*"));
+    let renames: Vec<(&str, &str)> = w
+        .items
+        .iter()
+        .filter_map(|i| match (&i.alias, &i.expr) {
+            (None, Expr::Var(v)) if v.name == "*" => None,
+            (alias, Expr::Var(v)) => {
+                Some((v.name.as_str(), alias.as_ref().unwrap_or(v).name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let assigned = |name: &str| {
+        w.items
+            .iter()
+            .any(|i| i.alias.as_ref().is_some_and(|a| a.name == name))
+    };
+    let new_name = |old: &str| -> Option<String> {
+        if let Some((_, new)) = renames.iter().find(|(from, _)| *from == old) {
+            return Some((*new).to_string());
+        }
+        (star && !old.starts_with('#') && !assigned(old)).then(|| old.to_string())
+    };
+    let mut carried: Vec<ProjectionItem> = Vec::new();
+    let mut carry = |old: &str| -> String {
+        if let Some(i) = carried
+            .iter()
+            .find(|i| matches!(&i.expr, Expr::Var(v) if v.name == old))
+        {
+            return i
+                .alias
+                .as_ref()
+                .expect("carried items are aliased")
+                .name
+                .clone();
+        }
+        let alias = Variable {
+            name: format!("{REL_END_VAR}w{ci}_{}", carried.len()),
+            span: w.span,
+        };
+        carried.push(ProjectionItem {
+            expr: Expr::Var(Variable {
+                name: old.to_string(),
+                span: w.span,
+            }),
+            alias: Some(alias.clone()),
+            span: w.span,
+        });
+        alias.name
+    };
+    let next = vars
+        .into_iter()
+        .filter_map(|r| {
+            let name = new_name(&r.name)?;
+            let ends = r.ends.and_then(|(s, o)| {
+                let mut keep =
+                    |end: String| new_name(&end).or_else(|| carry_ends.then(|| carry(&end)));
+                Some((keep(s)?, keep(o)?))
+            });
+            Some(RelBinding {
+                name,
+                pattern: r.pattern,
+                ends,
+            })
+        })
+        .collect();
+    (next, carried)
+}
+
+/// `clauses` with each SET that writes one property key twice split into
+/// consecutive SETs at every repeat.
+fn split_repeated_set_keys(clauses: &[WriteClause]) -> Vec<WriteClause> {
+    let mut out = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let WriteClause::Set(s) = clause else {
+            out.push(clause.clone());
+            continue;
+        };
+        let mut run: Vec<SetItem> = Vec::new();
+        let mut run_writes = ClauseWrites::default();
+        for item in &s.items {
+            let mut item_writes = ClauseWrites::default();
+            item_writes.add_set_items(std::slice::from_ref(item));
+            if !run.is_empty() && run_writes.shares_keys(&item_writes) {
+                out.push(WriteClause::Set(SetClause {
+                    items: std::mem::take(&mut run),
+                    span: s.span,
+                }));
+                run_writes = ClauseWrites::default();
+            }
+            run.push(item.clone());
+            run_writes.add_set_items(std::slice::from_ref(item));
+        }
+        out.push(WriteClause::Set(SetClause {
+            items: run,
+            span: s.span,
+        }));
+    }
+    out
+}
+
+/// What one write clause writes, and whether its lowering reads stored values
+/// (an `OPTIONAL` lookup, which adds rows to the statement's solutions).
+#[derive(Default)]
+struct ClauseWrites<'a> {
+    keys: Vec<&'a str>,
+    /// `SET n = {…}`: every property key of `n`.
+    all_keys: bool,
+    labels: Vec<&'a str>,
+    reads: bool,
+    creates: bool,
+    /// A `DELETE`: a node's `DETACH DELETE` takes every fact of the node, and
+    /// a relationship's takes its edge and every property of the
+    /// relationship, so it meets every other clause.
+    deletes: bool,
+}
+
+impl<'a> ClauseWrites<'a> {
+    fn of(clause: &'a WriteClause) -> Self {
+        let mut w = Self::default();
+        match clause {
+            WriteClause::Create(c) => {
+                w.creates = true;
+                for part in &c.pattern.parts {
+                    for node in std::iter::once(&part.head).chain(part.tail.iter().map(|(_, n)| n))
+                    {
+                        w.labels.extend(node.labels.iter().map(|l| l.name.as_str()));
+                        if let Some(props) = &node.props {
+                            w.keys.extend(props.entries.iter().map(|(k, _)| k.as_str()));
+                        }
+                    }
+                }
+            }
+            WriteClause::Set(s) => w.add_set_items(&s.items),
+            WriteClause::Remove(r) => {
+                for item in &r.items {
+                    match item {
+                        RemoveItem::Property { property, .. } => {
+                            w.keys.push(property);
+                            w.reads = true;
+                        }
+                        RemoveItem::Labels { labels, .. } => {
+                            w.labels.extend(labels.iter().map(String::as_str));
+                        }
+                    }
+                }
+            }
+            WriteClause::Delete(_) => {
+                w.deletes = true;
+                w.reads = true;
+            }
+            WriteClause::Merge(_) | WriteClause::Foreach(_) => {}
+        }
+        w
+    }
+
+    fn add_set_items(&mut self, items: &'a [SetItem]) {
+        for item in items {
+            match item {
+                SetItem::Property { property, .. } => {
+                    self.keys.push(property);
+                    self.reads = true;
+                }
+                SetItem::MapMerge { map, .. } => {
+                    self.keys
+                        .extend(map.entries.iter().map(|(k, _)| k.as_str()));
+                    self.reads = true;
+                }
+                SetItem::MapReplace { map, .. } => {
+                    self.keys
+                        .extend(map.entries.iter().map(|(k, _)| k.as_str()));
+                    self.all_keys = true;
+                    self.reads = true;
+                }
+                SetItem::Labels { labels, .. } => {
+                    self.labels.extend(labels.iter().map(String::as_str));
+                }
+            }
+        }
+    }
+
+    /// Whether this and `other` write one property key, on any variables.
+    fn shares_keys(&self, other: &Self) -> bool {
+        (self.all_keys && (other.all_keys || !other.keys.is_empty()))
+            || (other.all_keys && !self.keys.is_empty())
+            || self.keys.iter().any(|k| other.keys.contains(k))
+    }
+
+    /// Whether this clause and `other` can see or undo each other's writes,
+    /// on any variables (two can bind one node). A CREATE writes only the
+    /// entities it creates, so two never meet.
+    fn meets(&self, other: &Self) -> bool {
+        if self.creates && other.creates {
+            return false;
+        }
+        self.deletes
+            || other.deletes
+            || (self.creates && other.reads)
+            || (other.creates && self.reads)
+            || self.shares_keys(other)
+            || self.labels.iter().any(|l| other.labels.contains(l))
+    }
+}
+
 /// Classify Cypher source for transports: whether the (param-substituted)
 /// statement routes to the sequential driver, and whether it carries a
 /// trailing `RETURN`. Parse/substitution errors report `(false, false)` —
@@ -151,15 +661,39 @@ pub fn classify_sequential_source(
 }
 
 /// Outcome of staging a sequential write: the merged one-commit stage result,
-/// the answered trailing `RETURN` (when the statement has one), and the final
-/// virtual state (base + every clause) the RETURN evaluated against — call
-/// sites format the result against it (or against the equivalent committed
-/// state).
+/// and the trailing `RETURN` answered, when the statement has one.
 pub(crate) struct SequentialOutcome {
     pub stage_result: StageResult,
-    pub return_result: Option<QueryResult>,
+    pub returned: Option<AnsweredReturn>,
+}
+
+/// A trailing `RETURN`'s result, with the state it was read from: the final
+/// virtual state (base + every clause). Call sites format the result against
+/// it, or against the equivalent committed state.
+///
+/// The final state is only reachable here. The driver builds the state after
+/// the last write clause only for a statement with a `RETURN`
+/// ([`StateAfter`]), so no caller can read a state it didn't build.
+pub(crate) struct AnsweredReturn {
+    pub result: QueryResult,
     pub final_state: LedgerState,
 }
+
+/// Whether anything reads the virtual state after a clause is staged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateAfter {
+    /// A later clause, a MERGE probe or the trailing `RETURN` reads it.
+    Read,
+    /// Nothing does: the last write clause of a statement with no `RETURN`.
+    /// Its stage folds the clause's facts into the merged result, which is
+    /// all the commit reads, and builds no state after it.
+    Unread,
+}
+
+/// Routing stamp site for the state after a statement's last write clause:
+/// `proceed` when it was left unbuilt, a fallback when it was built (a
+/// `RETURN` or a MERGE reads it, or the last clause staged nothing).
+pub const UNREAD_FINAL_STATE_SITE: &str = "cypher_unread_final_state";
 
 /// Input for staging a sequential Cypher write through the transaction
 /// builder ([`crate::RefTransactBuilder::cypher_sequential`]): the detected
@@ -195,6 +729,133 @@ impl RowTable {
 
     fn is_seeded(&self) -> bool {
         !self.cols.is_empty()
+    }
+
+    /// The rows that bind every column in `vars`, when some row doesn't;
+    /// `None` when every row does.
+    fn bound_on(&self, vars: &[&str]) -> Option<Self> {
+        let cols: Vec<usize> = vars.iter().filter_map(|v| self.col_idx(v)).collect();
+        let binds = |row: &Vec<Binding>| cols.iter().all(|&c| !row[c].is_unbound_or_poisoned());
+        if self.rows.iter().all(binds) {
+            return None;
+        }
+        Some(Self {
+            cols: self.cols.clone(),
+            rows: self.rows.iter().filter(|r| binds(r)).cloned().collect(),
+        })
+    }
+}
+
+/// The variables a SET, REMOVE or DELETE clause writes to.
+fn clause_targets(clause: &WriteClause) -> Vec<&str> {
+    match clause {
+        WriteClause::Set(s) => s.items.iter().map(set_item_target).collect(),
+        WriteClause::Remove(r) => r.items.iter().map(remove_item_target).collect(),
+        WriteClause::Delete(d) => d.targets.iter().map(|t| t.name.as_str()).collect(),
+        WriteClause::Create(_) | WriteClause::Merge(_) | WriteClause::Foreach(_) => Vec::new(),
+    }
+}
+
+/// A SET, REMOVE or DELETE clause as the parts it stages in, each with the
+/// rows that seed it (`None`: every row in `table`), leaving out a part no
+/// row binds.
+///
+/// When every row binds every target, the clause stages whole. Otherwise each
+/// target's writes stage on their own, seeded with the rows that bind that
+/// target, in the clause's order. Items on different targets are independent
+/// (a SET that writes one key twice was split at the repeat, and the rest
+/// write distinct keys or labels), so staging them apart writes what staging
+/// them together would. A DELETE's relationship targets go last: a node's
+/// DETACH DELETE beside them takes every relationship on the node, which a
+/// relationship's DELETE staged first would refuse if the edge carries
+/// another.
+fn parts_by_bound_target(
+    clause: &WriteClause,
+    table: &RowTable,
+    rel_vars: &[RelBinding],
+) -> Vec<(WriteClause, Option<RowTable>)> {
+    if table.rows.is_empty() {
+        return Vec::new();
+    }
+    let targets = clause_targets(clause);
+    let Some(bound) = table.bound_on(&targets) else {
+        return vec![(clause.clone(), None)];
+    };
+    let mut distinct: Vec<&str> = Vec::new();
+    for t in targets {
+        if !distinct.contains(&t) {
+            distinct.push(t);
+        }
+    }
+    if distinct.len() == 1 {
+        return if bound.rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![(clause.clone(), Some(bound))]
+        };
+    }
+    if matches!(clause, WriteClause::Delete(_)) {
+        let is_rel = |t: &&str| rel_vars.iter().any(|r| r.name == *t);
+        distinct.sort_by_key(|t| is_rel(t));
+    }
+    distinct
+        .into_iter()
+        .filter_map(|target| {
+            let rows = table.bound_on(&[target]);
+            if rows.as_ref().is_some_and(|r| r.rows.is_empty()) {
+                return None;
+            }
+            Some((clause_on(clause, target), rows))
+        })
+        .collect()
+}
+
+/// The part of a SET, REMOVE or DELETE clause that writes to `target`.
+fn clause_on(clause: &WriteClause, target: &str) -> WriteClause {
+    match clause {
+        WriteClause::Set(s) => WriteClause::Set(SetClause {
+            items: s
+                .items
+                .iter()
+                .filter(|item| set_item_target(item) == target)
+                .cloned()
+                .collect(),
+            span: s.span,
+        }),
+        WriteClause::Remove(r) => WriteClause::Remove(RemoveClause {
+            items: r
+                .items
+                .iter()
+                .filter(|item| remove_item_target(item) == target)
+                .cloned()
+                .collect(),
+            span: r.span,
+        }),
+        WriteClause::Delete(d) => WriteClause::Delete(DeleteClause {
+            targets: d
+                .targets
+                .iter()
+                .filter(|t| t.name == target)
+                .cloned()
+                .collect(),
+            ..d.clone()
+        }),
+        WriteClause::Create(_) | WriteClause::Merge(_) | WriteClause::Foreach(_) => clause.clone(),
+    }
+}
+
+fn set_item_target(item: &SetItem) -> &str {
+    match item {
+        SetItem::Property { target, .. }
+        | SetItem::MapMerge { target, .. }
+        | SetItem::MapReplace { target, .. }
+        | SetItem::Labels { target, .. } => &target.name,
+    }
+}
+
+fn remove_item_target(item: &RemoveItem) -> &str {
+    match item {
+        RemoveItem::Property { target, .. } | RemoveItem::Labels { target, .. } => &target.name,
     }
 }
 
@@ -250,11 +911,13 @@ impl Fluree {
         };
 
         // ---- 1. Read prefix → initial row table --------------------------
+        let (read_clauses, rel_vars) = relationship_scope(&update.read_clauses, true);
         let mut table = if update.read_clauses.is_empty() {
             RowTable::unit()
         } else {
             let mut cols = visible_vars(&update.read_clauses)?;
-            let ast = read_prefix_query(update, &cols, span);
+            cols.extend(hidden_delete_ends(update, &rel_vars));
+            let ast = read_prefix_query(&read_clauses, &cols, span);
             let view = self
                 .seq_probe_view(stager.state(), governance, default_context.as_ref())
                 .await?;
@@ -275,8 +938,19 @@ impl Fluree {
         };
 
         // ---- 2. Per-clause staging loop ----------------------------------
+        let last_clause = update.write_clauses.len().saturating_sub(1);
         for (ci, clause) in update.write_clauses.iter().enumerate() {
             let clause_skolem = format!("{skolem_base}-s{ci}");
+            // The state after the last write clause is read only by a
+            // trailing RETURN, or by the clause itself when it's a MERGE.
+            let after = if ci == last_clause
+                && update.return_clause.is_none()
+                && !matches!(clause, WriteClause::Merge(_))
+            {
+                StateAfter::Unread
+            } else {
+                StateAfter::Read
+            };
             // Hoist computed value expressions (`{name: p.team}`,
             // `SET n.x = p.age + 1`) into engine-evaluated row columns —
             // the write lowering takes literals and bound variables only.
@@ -304,6 +978,7 @@ impl Fluree {
                         policy,
                         tracker,
                         span,
+                        after,
                     )
                     .await?;
                 }
@@ -323,27 +998,61 @@ impl Fluree {
                     )
                     .await?;
                 }
-                WriteClause::Set(_) | WriteClause::Remove(_) => {
-                    if !table.rows.is_empty() {
+                WriteClause::Set(_) | WriteClause::Remove(_) | WriteClause::Delete(_) => {
+                    // A row that leaves one of the clause's targets unbound
+                    // (an OPTIONAL MATCH that found nothing) skips the
+                    // clause's writes to that target and keeps the rest. The
+                    // seeded `VALUES` would leave the target free for the
+                    // clause's own lookup of stored values to bind, so each
+                    // part is seeded only with the rows that bind its target.
+                    let parts = parts_by_bound_target(clause, &table, &rel_vars);
+                    let last_part = parts.len().saturating_sub(1);
+                    for (pi, (part, rows)) in parts.into_iter().enumerate() {
+                        let edges = match &part {
+                            WriteClause::Delete(d) => rel_delete_edges(&rel_vars, d, span),
+                            _ => Vec::new(),
+                        };
+                        let skolem = if last_part == 0 {
+                            clause_skolem.clone()
+                        } else {
+                            format!("{clause_skolem}-t{pi}")
+                        };
                         self.seq_stage_seeded(
                             &mut stager,
-                            &table,
-                            vec![clause.clone()],
-                            Some(clause_skolem),
+                            rows.as_ref().unwrap_or(&table),
+                            edges,
+                            vec![part],
+                            Some(skolem),
                             ledger_id,
                             index_config,
                             policy,
                             tracker,
                             span,
+                            if pi == last_part {
+                                after
+                            } else {
+                                StateAfter::Read
+                            },
                         )
                         .await?;
                     }
                 }
-                WriteClause::Delete(_) | WriteClause::Foreach(_) => {
+                WriteClause::Foreach(_) => {
                     unreachable!("rejected by validate_members");
                 }
             }
         }
+
+        // Stamped from what the stager holds rather than from the decision,
+        // so `proceed` means the state was in fact left unbuilt.
+        stamp_fast_path(
+            UNREAD_FINAL_STATE_SITE,
+            if stager.has_state() {
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+            } else {
+                FastPathOutcome::Proceed
+            },
+        );
 
         // ---- 3. Trailing RETURN off the final row table ------------------
         let return_result = match &update.return_clause {
@@ -403,11 +1112,13 @@ impl Fluree {
             None => None,
         };
 
-        let final_state = stager.state().clone();
+        let returned = return_result.map(|result| AnsweredReturn {
+            result,
+            final_state: stager.state().clone(),
+        });
         Ok(SequentialOutcome {
             stage_result: stager.finish().await?,
-            return_result,
-            final_state,
+            returned,
         })
     }
 
@@ -428,6 +1139,8 @@ impl Fluree {
             sync_graph: _,
             scope: _,
         } = outcome.stage_result;
+        // The rows format against the committed state, not the virtual one.
+        let return_result = outcome.returned.map(|answered| answered.result);
 
         let commit_opts = fluree_db_transact::CommitOpts::default()
             .with_txn_meta(txn_meta)
@@ -448,7 +1161,7 @@ impl Fluree {
             .finalize_owned_commit(receipt, ledger, index_config)
             .await;
 
-        let rows = match outcome.return_result {
+        let rows = match return_result {
             Some(qr) => {
                 let view = GraphDb::from_ledger_state(&result.ledger);
                 Some(
@@ -525,6 +1238,7 @@ impl Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
+        after: StateAfter,
     ) -> Result<()> {
         if table.rows.is_empty() {
             return Ok(());
@@ -563,6 +1277,7 @@ impl Fluree {
         self.seq_stage_seeded(
             stager,
             table,
+            Vec::new(),
             vec![WriteClause::Create(create.clone())],
             Some(clause_skolem.clone()),
             ledger_id,
@@ -570,6 +1285,7 @@ impl Fluree {
             policy,
             tracker,
             span,
+            after,
         )
         .await?;
 
@@ -695,6 +1411,7 @@ impl Fluree {
                 self.seq_stage_seeded(
                     stager,
                     &sub,
+                    Vec::new(),
                     vec![create_ast_clause],
                     Some(clause_skolem.clone()),
                     ledger_id,
@@ -702,6 +1419,7 @@ impl Fluree {
                     policy,
                     tracker,
                     span,
+                    StateAfter::Read,
                 )
                 .await?;
             } else {
@@ -897,6 +1615,7 @@ impl Fluree {
                 .seq_stage_seeded(
                     stager,
                     &table,
+                    Vec::new(),
                     vec![WriteClause::Set(SetClause {
                         items: items.to_vec(),
                         span,
@@ -907,6 +1626,7 @@ impl Fluree {
                     policy,
                     tracker,
                     span,
+                    StateAfter::Read,
                 )
                 .await
                 .map(|_| ());
@@ -935,6 +1655,7 @@ impl Fluree {
             self.seq_stage_seeded(
                 stager,
                 &table,
+                Vec::new(),
                 vec![clause],
                 None,
                 ledger_id,
@@ -942,6 +1663,7 @@ impl Fluree {
                 policy,
                 tracker,
                 span,
+                StateAfter::Read,
             )
             .await?;
         }
@@ -1242,13 +1964,15 @@ impl Fluree {
         Ok(clause)
     }
 
-    /// Lower `write_clauses` as one sub-statement with the table's columns
+    /// Lower `write_clauses` (after `read_clauses`, which re-match what the
+    /// writes need matched) as one sub-statement with the table's columns
     /// declared bound, seed the row block, and stage it on the stager.
     #[allow(clippy::too_many_arguments)]
     async fn seq_stage_seeded(
         &self,
         stager: &mut SequentialStager,
         table: &RowTable,
+        read_clauses: Vec<ReadClause>,
         write_clauses: Vec<WriteClause>,
         skolem: Option<String>,
         ledger_id: &str,
@@ -1256,8 +1980,17 @@ impl Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         span: SourceSpan,
+        after: StateAfter,
     ) -> Result<usize> {
-        let ast = update_ast(write_clauses, span);
+        let ast = CypherAst {
+            statement: Statement::Update(Update {
+                read_clauses,
+                write_clauses,
+                return_clause: None,
+                span,
+            }),
+            span,
+        };
         let mut txn = self
             .lower_cypher_ast_to_txn_seeded(
                 &ast,
@@ -1286,7 +2019,14 @@ impl Fluree {
         }
         txn.opts.skolem_txn_id = skolem;
         stager
-            .stage(self, txn, index_config, policy, tracker, true)
+            .stage(
+                self,
+                txn,
+                index_config,
+                policy,
+                tracker,
+                after == StateAfter::Read,
+            )
             .await
     }
 }
@@ -1365,9 +2105,16 @@ fn set_items_need_hoist(items: &[fluree_db_cypher::ast::SetItem], cols: &[String
 
 /// Reject members the v1 driver defers, with clear errors.
 fn validate_members(u: &Update) -> Result<()> {
+    // A row an OPTIONAL MATCH leaves unbound is not seeded into a SET,
+    // REMOVE or DETACH DELETE (see the staging loop), but could assert part
+    // of a CREATE or MERGE pattern.
+    let creates = u
+        .write_clauses
+        .iter()
+        .any(|w| matches!(w, WriteClause::Create(_) | WriteClause::Merge(_)));
     for c in &u.read_clauses {
         match c {
-            ReadClause::OptionalMatch(_) => {
+            ReadClause::OptionalMatch(_) if creates => {
                 return Err(cypher_err(
                     "OPTIONAL MATCH before a multi-clause write is not supported — a \
                      partially-bound row could assert a partial pattern; bind the variables \
@@ -1382,12 +2129,23 @@ fn validate_members(u: &Update) -> Result<()> {
             _ => {}
         }
     }
+    let (_, rel_vars) = relationship_scope(&u.read_clauses, false);
     for w in &u.write_clauses {
         match w {
+            // A DELETE stages as a seeded `Txn`. A node's DETACH DELETE finds
+            // the node's triples in the state it stages on, and a
+            // relationship's DELETE (DETACH or not) re-matches the edge it
+            // reifies there (see `rel_delete_edges`); one clause may hold both.
+            WriteClause::Delete(d)
+                if d.detach
+                    || d.targets
+                        .iter()
+                        .all(|t| rel_vars.iter().any(|r| r.name == t.name)) => {}
             WriteClause::Delete(_) => {
                 return Err(cypher_err(
-                    "DELETE in a multi-clause write statement is deferred — run the DELETE \
-                     as its own statement",
+                    "a bare node DELETE in a multi-clause write statement is deferred — run \
+                     the DELETE as its own statement (a node's DETACH DELETE and a \
+                     relationship's DELETE are supported)",
                 ));
             }
             WriteClause::Foreach(_) => {
@@ -1529,7 +2287,7 @@ fn visible_vars(clauses: &[ReadClause]) -> Result<Vec<String>> {
 }
 
 /// The read prefix as a read query projecting `cols`.
-fn read_prefix_query(update: &Update, cols: &[String], span: SourceSpan) -> CypherAst {
+fn read_prefix_query(read_clauses: &[ReadClause], cols: &[String], span: SourceSpan) -> CypherAst {
     let items = if cols.is_empty() {
         vec![ProjectionItem {
             expr: Expr::Lit(Literal::Integer(0, span)),
@@ -1544,7 +2302,7 @@ fn read_prefix_query(update: &Update, cols: &[String], span: SourceSpan) -> Cyph
     };
     CypherAst {
         statement: Statement::Query(Query {
-            clauses: update.read_clauses.clone(),
+            clauses: read_clauses.to_vec(),
             return_clause: ReturnClause {
                 items,
                 distinct: false,
