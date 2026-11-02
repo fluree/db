@@ -6829,6 +6829,11 @@ mod tests {
         use std::time::{Duration, Instant};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        // How long the catalog takes to answer. The probe's budget is far
+        // below it, and the margin is wide on purpose: building the catalog
+        // client runs before the budget's timer can fire, and on a loaded
+        // machine that alone has taken over a second.
+        const CATALOG_DELAY: Duration = Duration::from_secs(5);
 
         let metadata_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/iceberg/silver/people/metadata");
@@ -6850,7 +6855,7 @@ mod tests {
             .and(path("/v1/namespaces/silver/tables/people"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(600))
+                    .set_delay(CATALOG_DELAY)
                     .set_body_json(json!({
                         "metadata-location": format!(
                             "s3://fixture-bucket/silver/people/metadata/{}",
@@ -6904,7 +6909,7 @@ mod tests {
             "{probe:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < CATALOG_DELAY / 2,
             "the probe returned at its budget, not at the catalog's answer: {:?}",
             started.elapsed()
         );
