@@ -1027,7 +1027,7 @@ pub fn gs_record_to_jsonld(record: &GraphSourceRecord) -> JsonValue {
     // token (an env-var reference is safe, but a literal secret must never reach
     // a client). `redact_graph_source_config` returns the string unchanged when
     // it holds no secrets, so non-secret configs stay byte-identical.
-    let redacted_config = redact_graph_source_config(&record.config);
+    let redacted_config = redact_graph_source_record_config(&record.source_type, &record.config);
     let mut obj = json!({
         "@context": { "f": "https://ns.flur.ee/db#" },
         "@id": &canonical_id,
@@ -1082,6 +1082,15 @@ const SECRET_CONFIG_KEYS: &[&str] = &[
     "refresh_token",
 ];
 
+/// A Google service-account credential stores its key file under the generic
+/// name `key` (`{"source": "service_account", "key": …}`, in catalog auth and in
+/// `io.storage_auth`), which no name rule could mark secret without masking every
+/// other `key`. So `key` is secret exactly inside an object that says it is a
+/// service account.
+fn holds_service_account_key(map: &serde_json::Map<String, JsonValue>) -> bool {
+    map.get("source").and_then(JsonValue::as_str) == Some("service_account")
+}
+
 fn is_secret_config_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
@@ -1132,8 +1141,9 @@ pub fn redact_json_secrets(value: &mut JsonValue) -> bool {
     let mut redacted = false;
     match value {
         JsonValue::Object(map) => {
+            let service_account = holds_service_account_key(map);
             for (k, v) in map.iter_mut() {
-                if is_secret_config_key(k) {
+                if is_secret_config_key(k) || (service_account && k == "key") {
                     if is_secret_ref_object(v) {
                         // A secret *reference* is not a secret (same policy as
                         // env-var names, which the redactor deliberately keeps):
@@ -1202,7 +1212,53 @@ fn redact_secret_subtree(value: &mut JsonValue) -> bool {
     redacted
 }
 
-/// Redact auth/credential leaves from a stored graph-source config JSON string.
+/// Redact a stored graph-source config for a read-out, by its type: every
+/// secret the persisted type classifies (bearer tokens, OAuth2 and Azure client
+/// secrets, service-account keys, in every auth variant) and every key the
+/// type does not know are masked, and then every value under a secret key
+/// name, as [`redact_graph_source_config`] masks it. Returns `config`
+/// unchanged when nothing is, so secret-free configs stay byte-identical.
+///
+/// FAILS CLOSED: a config that is not JSON, or that its source type's config
+/// cannot read, is replaced wholesale, since nothing in it can be classified.
+/// Source types with no auth (BM25, vector, geo) and builds without the
+/// type's feature fall back to [`redact_graph_source_config`].
+pub fn redact_graph_source_record_config(source_type: &GraphSourceType, config: &str) -> String {
+    #[cfg(feature = "iceberg")]
+    {
+        use crate::graph_source::surface::{redact_stored, Redaction};
+        let Ok(mut value) = serde_json::from_str::<JsonValue>(config) else {
+            return "\"[redacted:unparseable]\"".to_string();
+        };
+        // Nothing to classify, and nothing to leak.
+        if value.as_object().is_some_and(serde_json::Map::is_empty) {
+            return config.to_string();
+        }
+        match redact_stored(source_type, &mut value) {
+            Redaction::Masked(typed) => {
+                // The name rule as well: it masks a value the type holds as
+                // plain text under a secret-sounding key (a SQL session
+                // property named `x_token`), and a secret field a config type
+                // gains outside its auth.
+                let named = redact_json_secrets(&mut value);
+                if !typed && !named {
+                    return config.to_string();
+                }
+                return serde_json::to_string(&value)
+                    .unwrap_or_else(|_| "\"[redacted:unserializable]\"".to_string());
+            }
+            Redaction::Unreadable => return "\"[redacted:unreadable]\"".to_string(),
+            Redaction::Untyped => {}
+        }
+    }
+    #[cfg(not(feature = "iceberg"))]
+    let _ = source_type;
+    redact_graph_source_config(config)
+}
+
+/// Redact auth/credential leaves from a stored graph-source config JSON string,
+/// by key name, for a config whose type is unknown. A graph-source record's
+/// read-out uses [`redact_graph_source_record_config`] instead.
 ///
 /// Returns the original string unchanged when it parses as JSON and contains no
 /// secrets, so non-secret configs (e.g. BM25/Vector) stay byte-for-byte
@@ -1606,7 +1662,7 @@ pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue 
         obj["dependencies"] = json!(record.dependencies);
     }
     if !record.config.is_empty() {
-        let redacted = redact_graph_source_config(&record.config);
+        let redacted = redact_graph_source_record_config(&record.source_type, &record.config);
         if let Ok(parsed) = serde_json::from_str::<JsonValue>(&redacted) {
             let empty_object = parsed.as_object().is_some_and(serde_json::Map::is_empty);
             if !empty_object {
@@ -1802,13 +1858,21 @@ async fn fetch_virtual_table_row_counts(
                     let metadata = metadata.as_ref();
                     let schema =
                         crate::graph_source::table_schema_from_metadata(&api_id, metadata).ok()?;
+                    let grant = crate::graph_source::CatalogGrant::from_load(&load, None);
                     let (row_count, has_deletes) = virtual_table_row_count(
                         fluree.r2rml_cache(),
                         &table,
                         metadata,
                         schema.row_count,
                         deadline,
-                        || crate::graph_source::catalog_read_storage(cfg, &load),
+                        || async {
+                            let plan =
+                                crate::graph_source::catalog_read_plan(fluree, cfg, &load).await?;
+                            let scope = plan.scope().clone();
+                            Ok::<_, fluree_db_query::QueryError>((scope, move || async move {
+                                crate::graph_source::catalog_read_storage(&plan, &grant).await
+                            }))
+                        },
                     )
                     .await;
                     Some((table, row_count, schema.snapshot.id, has_deletes))
@@ -1843,18 +1907,27 @@ async fn fetch_virtual_table_row_counts(
 /// 1. `summary_rows`, the snapshot summary's `total-records` as
 ///    `table_schema_from_metadata` read it. Zero-I/O, and most writers set it.
 /// 2. The manifest-list totals cache, keyed by the snapshot's manifest-list
-///    location.
+///    location under the [`StorageScope`] of the source's storage plan.
 /// 3. One read of that manifest list ([`ManifestListTotals`]), cached for the
 ///    next call. `total-records` is optional in the Iceberg spec, and BigQuery
 ///    writes a summary of only `operation`.
 ///
-/// `open_storage` runs only on a cache miss, so a warm `/info` builds no
-/// storage and reads nothing. A failed read caches nothing and omits the count.
+/// `plan` decides the source's storage identity (and proves a Google one)
+/// before the cache is consulted, as every location-keyed cache is, so a total
+/// read under one identity is never served to another. It runs only when the
+/// summary has no total. A warm plan makes no remote call: a Google identity's
+/// token is cached process-wide. The store it returns is built only on a cache
+/// miss, so a warm `/info` builds no storage and reads nothing. A failed plan
+/// or read caches nothing and omits the count.
 ///
-/// Only the manifest-list read (building its storage and reading the list) is
-/// bounded by `deadline`, and an overrun omits only this table's count. A count
-/// from the summary never waits on anything, and a cache hit is served even
-/// past the deadline: the cache is looked up before the timer starts.
+/// `deadline` bounds the plan and the manifest-list read (building its store
+/// and reading the list), and an overrun omits only this table's count. A
+/// count from the summary never waits on anything, and a warm count is served
+/// even past the deadline: the plan is polled once before the deadline is
+/// consulted, so a plan that is ready at once is used, and the cache is looked
+/// up before the read's timer starts.
+///
+/// [`StorageScope`]: fluree_db_iceberg::StorageScope
 ///
 /// MoR rider (F-AUD-1): neither source subtracts position/equality deletes,
 /// which Fluree recognizes but does not yet apply, so both over-count a
@@ -1865,19 +1938,22 @@ async fn fetch_virtual_table_row_counts(
 ///
 /// [`ManifestListTotals`]: fluree_db_iceberg::ManifestListTotals
 #[cfg(feature = "iceberg")]
-async fn virtual_table_row_count<S, E, F, Fut>(
+async fn virtual_table_row_count<S, E, P, PFut, O, OFut>(
     cache: &crate::graph_source::R2rmlCache,
     table: &str,
     metadata: &fluree_db_iceberg::metadata::TableMetadata,
     summary_rows: Option<i64>,
     deadline: tokio::time::Instant,
-    open_storage: F,
+    plan: P,
 ) -> (Option<i64>, bool)
 where
     S: fluree_db_iceberg::SendIcebergStorage + ?Sized,
     E: std::fmt::Display,
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+    P: FnOnce() -> PFut,
+    PFut:
+        std::future::Future<Output = std::result::Result<(fluree_db_iceberg::StorageScope, O), E>>,
+    O: FnOnce() -> OFut,
+    OFut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
 {
     let summary_mor = metadata_indicates_mor_approximate_count(metadata);
     if summary_rows.is_some() {
@@ -1886,16 +1962,40 @@ where
     let Some(snapshot) = metadata.current_snapshot() else {
         return (None, summary_mor);
     };
+    let mut plan = std::pin::pin!(plan());
+    let planned = match futures::poll!(plan.as_mut()) {
+        std::task::Poll::Ready(planned) => Some(planned),
+        std::task::Poll::Pending => tokio::time::timeout_at(deadline, plan).await.ok(),
+    };
+    let (scope, open_storage) = match planned {
+        Some(Ok(planned)) => planned,
+        Some(Err(e)) => {
+            tracing::debug!(table, error = %e, "virtual ledger-info: no storage plan for the manifest list; count omitted");
+            return (None, summary_mor);
+        }
+        None => {
+            tracing::debug!(
+                table,
+                "virtual ledger-info: storage plan exceeded the count budget; count omitted"
+            );
+            return (None, summary_mor);
+        }
+    };
     if let Some(totals) =
-        crate::graph_source::cached_manifest_list_totals_hit(Some(cache), snapshot)
+        crate::graph_source::cached_manifest_list_totals_hit(Some(cache), &scope, snapshot)
     {
         return (
             totals.row_count,
             summary_mor || totals.has_delete_manifests(),
         );
     }
-    let read =
-        crate::graph_source::read_manifest_list_totals(Some(cache), table, snapshot, open_storage);
+    let read = crate::graph_source::read_manifest_list_totals(
+        Some(cache),
+        &scope,
+        table,
+        snapshot,
+        open_storage,
+    );
     match tokio::time::timeout_at(deadline, read).await {
         Ok(Some(totals)) => (
             totals.row_count,
@@ -3021,19 +3121,76 @@ mod tests {
         )
         .unwrap()
         .row_count;
-        let out = virtual_table_row_count(
+        let out = count_under(
+            cache,
+            &fluree_db_iceberg::StorageScope::shared(),
+            metadata,
+            summary_rows,
+            storage,
+            &opened,
+        )
+        .await;
+        (out, opened.into_inner())
+    }
+
+    /// [`count_with`], with the storage plan reading under `scope`.
+    #[cfg(feature = "iceberg")]
+    async fn count_under(
+        cache: &crate::graph_source::R2rmlCache,
+        scope: &fluree_db_iceberg::StorageScope,
+        metadata: &fluree_db_iceberg::metadata::TableMetadata,
+        summary_rows: Option<i64>,
+        storage: &Arc<CountingStorage>,
+        opened: &std::sync::atomic::AtomicUsize,
+    ) -> (Option<i64>, bool) {
+        virtual_table_row_count(
             cache,
             "ns.t",
             metadata,
             summary_rows,
             far_deadline(),
             || {
-                opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::future::ready(Ok::<_, String>(Arc::clone(storage)))
+                std::future::ready(Ok::<_, String>((scope.clone(), || {
+                    opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(Ok::<_, String>(Arc::clone(storage)))
+                })))
             },
         )
-        .await;
-        (out, opened.into_inner())
+        .await
+    }
+
+    /// A total read under one storage identity is not served to another: the
+    /// cache is keyed by (scope, manifest-list location), as every
+    /// location-keyed cache is.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_cached_under_one_scope_is_not_served_to_another() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let a = fluree_db_iceberg::StorageScope::of(&[("kind", "google"), ("principal", "a")]);
+        let b = fluree_db_iceberg::StorageScope::of(&[("kind", "google"), ("principal", "b")]);
+
+        let (rows, _) = count_under(&cache, &a, &metadata, None, &storage, &opened).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+        let (rows, _) = count_under(&cache, &a, &metadata, None, &storage, &opened).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+        assert_eq!(
+            storage.reads(),
+            1,
+            "the same scope is served from the cache"
+        );
+
+        let (rows, _) = count_under(&cache, &b, &metadata, None, &storage, &opened).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+        assert_eq!(storage.reads(), 2, "another scope reads the list itself");
+        assert_eq!(
+            opened.into_inner(),
+            2,
+            "each scope built its own store once"
+        );
     }
 
     /// A count budget no test reaches.
@@ -3042,11 +3199,63 @@ mod tests {
         tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
     }
 
-    /// Storage that never comes: its open never completes.
+    /// A storage plan that is ready at once, whose store never comes: its open
+    /// never completes.
     #[cfg(feature = "iceberg")]
-    fn never_opens(
-    ) -> impl std::future::Future<Output = std::result::Result<Arc<CountingStorage>, String>> {
+    #[allow(clippy::type_complexity)]
+    fn never_opens() -> std::future::Ready<
+        std::result::Result<
+            (
+                fluree_db_iceberg::StorageScope,
+                fn() -> std::future::Pending<std::result::Result<Arc<CountingStorage>, String>>,
+            ),
+            String,
+        >,
+    > {
+        std::future::ready(Ok((
+            fluree_db_iceberg::StorageScope::shared(),
+            std::future::pending,
+        )))
+    }
+
+    /// A storage plan that never decides (a Google identity proof that hangs).
+    #[cfg(feature = "iceberg")]
+    #[allow(clippy::type_complexity)]
+    fn never_plans() -> std::future::Pending<
+        std::result::Result<
+            (
+                fluree_db_iceberg::StorageScope,
+                fn() -> std::future::Pending<std::result::Result<Arc<CountingStorage>, String>>,
+            ),
+            String,
+        >,
+    > {
         std::future::pending()
+    }
+
+    /// The count budget bounds the storage plan too: a plan that never decides
+    /// costs only this table's count, and returns by the deadline.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_budget_bounds_the_storage_plan() {
+        let metadata = bq_metadata();
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let budget = std::time::Duration::from_millis(50);
+
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + budget;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            virtual_table_row_count(&cache, "ns.t", &metadata, None, deadline, never_plans),
+        )
+        .await
+        .expect("the storage plan is bounded by the deadline");
+        assert_eq!(out, (None, false), "the overrun omits this table's count");
+        let took = started.elapsed();
+        assert!(
+            took >= budget && took < std::time::Duration::from_secs(5),
+            "returned at the deadline, not before it and not long after: {took:?}"
+        );
     }
 
     /// The count budget bounds the manifest-list read and nothing else: a read
@@ -3182,7 +3391,8 @@ mod tests {
         let storage = CountingStorage::with_file(&list, BQ_MANIFEST_LIST);
         let cache = crate::graph_source::R2rmlCache::with_defaults();
         cache.put_manifest_list_totals(
-            list,
+            &fluree_db_iceberg::StorageScope::shared(),
+            &list,
             fluree_db_iceberg::ManifestListTotals {
                 row_count: Some(1000),
                 data_file_count: Some(1),
@@ -3906,7 +4116,7 @@ mod tests {
     #[cfg(feature = "iceberg")]
     #[test]
     fn test_every_auth_config_variant_redacts_on_emit() {
-        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::auth::{AuthConfig, ExternalAccountConfig, GoogleCredentials};
         use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
         use fluree_db_iceberg::{ConfigValue, IcebergGsConfig};
 
@@ -3958,6 +4168,46 @@ mod tests {
                 scopes: None,
                 metadata_url: None,
             },
+            // A service-account key file (stored under the generic name `key`),
+            // as a literal and as an env var with an inline default; and as a
+            // secret reference, which stays visible.
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::literal(format!(
+                        r#"{{"type":"service_account","private_key":"{SENTINEL_A}"}}"#
+                    )),
+                },
+                scopes: None,
+                quota_project: Some("lake-project".to_string()),
+            },
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::Dynamic {
+                        env_var: Some("MY_TOKEN".to_string()),
+                        java_property: None,
+                        default_val: Some(SENTINEL_B.to_string()),
+                    },
+                },
+                scopes: None,
+                quota_project: None,
+            },
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::SecretRef {
+                        secret_ref: VISIBLE_REF.to_string(),
+                    },
+                },
+                scopes: None,
+                quota_project: None,
+            },
+            // A WIF configuration is not secret; the other sources carry none.
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ExternalAccount {
+                    config: ExternalAccountConfig::Inline(serde_json::Map::new()),
+                },
+                scopes: None,
+                quota_project: None,
+            },
         ];
 
         // Exhaustiveness canary — NO wildcard arm. A new AuthConfig variant
@@ -3968,7 +4218,8 @@ mod tests {
                 AuthConfig::None
                 | AuthConfig::Bearer { .. }
                 | AuthConfig::OAuth2ClientCredentials { .. }
-                | AuthConfig::GoogleMetadata { .. } => {}
+                | AuthConfig::GoogleMetadata { .. }
+                | AuthConfig::Google { .. } => {}
             }
         }
 

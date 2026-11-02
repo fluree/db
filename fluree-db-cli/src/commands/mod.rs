@@ -36,6 +36,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod multi_query;
+pub mod ontology;
 pub mod prefix;
 pub mod query;
 pub mod query_stream;
@@ -43,6 +44,8 @@ pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod show;
+#[cfg(feature = "iceberg")]
+pub mod source_auth;
 pub mod sql;
 pub mod sweep;
 pub mod sync;

@@ -544,8 +544,9 @@ Two related bounds, both off by default:
 - A transaction-requested `opts.validationMode: "warn"` is
   honored only where an operator has written an
   `f:shaclDefaults` group whose `f:overrideControl` permits it.
-  A ledger with shapes but no `#config` graph enforces
-  unconditionally and ignores the request.
+  A ledger whose config does not enable SHACL validates nothing
+  against its stored shapes, so there is nothing for the request
+  to relax (see [SHACL](../ledger-config/setting-groups.md)).
 
 ## Cross-ledger datalog rules
 
