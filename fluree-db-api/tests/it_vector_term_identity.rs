@@ -738,14 +738,15 @@ ex:h ex:j1 "[0.75, 0.25]"^^f:embeddingVector ; ex:k1 "s" .
 /// handles. Each subject holds its own vector under `ex:v`; every tenth also
 /// holds a copy under `ex:u`, where it gets a different handle (the tenth
 /// subject's copy is `ex:u`'s second vector). Pairing by handle joins
-/// `ex:s10`'s copy with `ex:s1`'s vector.
+/// `ex:s10`'s copy with `ex:s1`'s vector. At this size the join takes a lane
+/// that a few hundred subjects don't reach.
 #[tokio::test]
 async fn a_join_on_a_vector_pairs_values_not_handles() {
     let ledger_id = "vector-identity/join-pairs:main";
     let mut ttl = String::from(
         "@prefix ex: <http://example.org/> .\n@prefix f: <https://ns.flur.ee/db#> .\n",
     );
-    for i in 0..300 {
+    for i in 0..1000 {
         let v = format!("[{}.25, {}]", i, i % 7);
         ttl.push_str(&format!("ex:s{i} ex:v \"{v}\"^^f:embeddingVector .\n"));
         if i % 10 == 0 {
@@ -774,7 +775,7 @@ async fn a_join_on_a_vector_pairs_values_not_handles() {
     let db = fluree.graph(ledger_id).load().await.expect("load");
     let rows = sparql(&db, "SELECT ?a ?b WHERE { ?a ex:v ?v . ?b ex:u ?v }").await;
     let want: Vec<String> = {
-        let mut w: Vec<String> = (0..300)
+        let mut w: Vec<String> = (0..1000)
             .step_by(10)
             .map(|i| format!("a=s{i},b=s{i}"))
             .collect();
