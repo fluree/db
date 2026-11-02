@@ -527,7 +527,9 @@ A column's value becomes an RDF literal through its object map. With `rr:datatyp
 | date | xsd:string | xsd:date |
 | timestamp, timestamptz | xsd:string | xsd:dateTime |
 | binary, fixed | xsd:string | xsd:hexBinary |
-| string, uuid, time | xsd:string | none (xsd:string) |
+| string | xsd:string | none (xsd:string) |
+
+`uuid`, `time` and nested `struct`/`list`/`map` columns are left out of a generated mapping and reported as skipped columns.
 
 An un-annotated numeric, boolean or temporal column therefore compares, sorts and aggregates as text: `FILTER(?score > 80)` compares `"9"` with `80` and finds no match. Give such a column an `rr:datatype`, as a generated mapping does. An `rr:template` object map produces an IRI (or, with `rr:termType rr:Literal`, an `xsd:string` literal), and a reference object map the parent's subject IRI.
 
@@ -1004,7 +1006,9 @@ ORDER BY ?date
 
 ### Query Planning
 
-Fluree pushes filters to Iceberg:
+Fluree pushes filters to Iceberg. Here `ex:orderDate` maps a `date` column
+with `rr:datatype xsd:date`, as a generated mapping does, so the plain string
+compares as a date:
 
 ```text
 Query: SELECT ?id WHERE { ?order ex:orderDate ?date } FILTER (?date > "2024-01-01")
