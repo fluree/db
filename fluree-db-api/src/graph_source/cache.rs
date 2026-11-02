@@ -22,7 +22,9 @@ use super::catalog_session::CachedLoadTable;
 #[cfg(feature = "iceberg")]
 use fluree_db_iceberg::catalog::SendCatalogClient;
 #[cfg(feature = "iceberg")]
-use fluree_db_iceberg::{io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile};
+use fluree_db_iceberg::{
+    io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile, StorageScope,
+};
 #[cfg(feature = "sql")]
 use fluree_db_sql::TrinoClient;
 #[cfg(feature = "iceberg")]
@@ -77,7 +79,7 @@ fn rest_loadtable_ttl_secs() -> u64 {
 const DEFAULT_REST_CLIENT_TTL_SECS: u64 = 900;
 
 #[cfg(feature = "iceberg")]
-fn rest_client_ttl_secs() -> u64 {
+pub(crate) fn rest_client_ttl_secs() -> u64 {
     std::env::var("FLUREE_ICEBERG_REST_CLIENT_TTL_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -244,35 +246,54 @@ impl R2rmlCache {
         self.compiled_mappings.insert(cache_key, mapping);
     }
 
-    /// Get table metadata from cache.
+    /// Get table metadata from cache, as read under the storage identity
+    /// `scope` (see [`StorageScope`]: an entry is only ever served to the
+    /// identity that read it).
     #[cfg(feature = "iceberg")]
-    pub async fn get_metadata(&self, metadata_location: &str) -> Option<Arc<TableMetadata>> {
-        self.table_metadata.get(metadata_location)
+    pub async fn get_metadata(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+    ) -> Option<Arc<TableMetadata>> {
+        self.table_metadata
+            .get(scope.qualify(metadata_location).as_ref())
     }
 
-    /// Store table metadata in cache.
+    /// Store table metadata in cache, as read under `scope`.
     #[cfg(feature = "iceberg")]
-    pub async fn put_metadata(&self, metadata_location: String, metadata: Arc<TableMetadata>) {
-        self.table_metadata.insert(metadata_location, metadata);
+    pub async fn put_metadata(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+        metadata: Arc<TableMetadata>,
+    ) {
+        self.table_metadata
+            .insert(scope.qualify(metadata_location).into_owned(), metadata);
     }
 
-    /// Get cached scan file selections for a metadata location.
+    /// Get cached scan file selections for a metadata location, as read under
+    /// `scope`.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn get_scan_files(
         &self,
+        scope: &StorageScope,
         metadata_location: &str,
     ) -> Option<Arc<CachedScanFiles>> {
-        self.scan_files.get(metadata_location)
+        self.scan_files
+            .get(scope.qualify(metadata_location).as_ref())
     }
 
-    /// Store manifest-derived scan file selections for a metadata location.
+    /// Store manifest-derived scan file selections for a metadata location, as
+    /// read under `scope`.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn put_scan_files(
         &self,
-        metadata_location: String,
+        scope: &StorageScope,
+        metadata_location: &str,
         scan_files: Arc<CachedScanFiles>,
     ) {
-        self.scan_files.insert(metadata_location, scan_files);
+        self.scan_files
+            .insert(scope.qualify(metadata_location).into_owned(), scan_files);
     }
 
     /// Get the shared Parquet footer cache (clone the `Arc` to share into
@@ -285,23 +306,30 @@ impl R2rmlCache {
     /// Get a recently resolved direct-catalog metadata location.
     ///
     /// Entries auto-expire after `DIRECT_METADATA_LOCATION_TTL` via moka's native TTL.
+    /// Keyed by the storage identity `scope` too: the location is read from
+    /// storage (`version-hint.text`), so another identity must read it itself.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn get_direct_metadata_location(
         &self,
+        scope: &StorageScope,
         table_location: &str,
     ) -> Option<String> {
-        self.direct_metadata_locations.get(table_location)
+        self.direct_metadata_locations
+            .get(scope.qualify(table_location).as_ref())
     }
 
-    /// Store a resolved direct-catalog metadata location.
+    /// Store a resolved direct-catalog metadata location, as read under `scope`.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn put_direct_metadata_location(
         &self,
-        table_location: String,
+        scope: &StorageScope,
+        table_location: &str,
         metadata_location: String,
     ) {
-        self.direct_metadata_locations
-            .insert(table_location, metadata_location);
+        self.direct_metadata_locations.insert(
+            scope.qualify(table_location).into_owned(),
+            metadata_location,
+        );
     }
 
     /// Get a process-wide catalog client for a source config `fingerprint`, or
@@ -337,31 +365,42 @@ impl R2rmlCache {
         self.sql_clients.insert(key, client);
     }
 
-    /// The shared handle for the Delta table at `placement`, opened on first
-    /// use. Keyed on the config as stored, before secrets are resolved, so a
+    /// The shared handle for source `graph_source_id`'s Delta table at
+    /// `placement`, opened on first use. Keyed on the config as stored, so a
     /// rotated secret behind a reference does not re-key the cache; the TTL
     /// bounds how long a handle keeps the old one — and, for a table found
     /// through a catalog, how long one dropped and recreated elsewhere is
     /// still read where it was.
+    ///
+    /// The config's secrets are resolved before the lookup, on every call: a
+    /// caller whose resolver cannot resolve them does not reach a handle
+    /// another caller opened with them.
     #[cfg(feature = "delta")]
     pub(crate) async fn delta_table(
         &self,
+        graph_source_id: &str,
         table_name: &str,
         placement: &fluree_db_delta::Placement,
         config: &fluree_db_delta::DeltaGsConfig,
-        resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
+        identity: &fluree_db_iceberg::IdentityContext,
     ) -> fluree_db_delta::Result<fluree_db_delta::DeltaTable> {
         use fluree_db_delta::{DeltaTable, Placement};
-        let key = delta_table_key(placement, config);
+        let resolver = identity.secret_resolver.as_ref();
+        let io = config.io.hydrate(resolver).await?;
+        let unity = match (placement, &config.unity) {
+            (Placement::Unity(_), Some(unity)) => Some(unity.hydrate(resolver).await?),
+            _ => None,
+        };
+        let key = delta_table_key(graph_source_id, placement, config, identity);
         if let Some(table) = self.delta_tables.get(&key) {
             return Ok(table);
         }
-        let io = config.io.hydrate(resolver).await?;
-        let table = match (placement, &config.unity) {
-            (Placement::Path(location), _) => DeltaTable::open(table_name, location, &io)?,
+        let table = match (placement, &unity) {
+            (Placement::Path(location), _) => {
+                DeltaTable::open(table_name, location, &io, identity)?
+            }
             (Placement::Unity(full_name), Some(unity)) => {
-                let unity = unity.hydrate(resolver).await?;
-                DeltaTable::open_in_unity(table_name, &unity, full_name, &io).await?
+                DeltaTable::open_in_unity(table_name, unity, full_name, &io, identity).await?
             }
             (Placement::Unity(full_name), None) => {
                 return Err(fluree_db_delta::DeltaError::Config(format!(
@@ -501,7 +540,7 @@ mod iceberg_tests {
     use fluree_db_iceberg::credential::VendedCredentials;
 
     fn creds(expires_in_secs: i64) -> VendedCredentials {
-        VendedCredentials {
+        VendedCredentials::S3(fluree_db_iceberg::credential::S3Credentials {
             access_key_id: "AKIA".to_string(),
             secret_access_key: "secret".to_string(),
             session_token: Some("token".to_string()),
@@ -509,7 +548,7 @@ mod iceberg_tests {
             endpoint: None,
             region: Some("us-east-2".to_string()),
             path_style: false,
-        }
+        })
     }
 
     fn entry(loc: &str, creds: Option<VendedCredentials>) -> Arc<CachedLoadTable> {
@@ -568,20 +607,28 @@ mod iceberg_tests {
     }
 }
 
-/// Keyed on the config as stored, never on resolved secrets. Two sources that
-/// name one catalog table with different catalog credentials get a handle
-/// each: the credentials are what reads it.
+/// Keyed on the source and its config as stored, never on resolved secrets.
+/// Two sources never share a handle, even with one config: each is its own
+/// registration, and what one source's references resolve to is not
+/// evidence of what another's do.
 #[cfg(feature = "delta")]
 fn delta_table_key(
+    graph_source_id: &str,
     placement: &fluree_db_delta::Placement,
     config: &fluree_db_delta::DeltaGsConfig,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> String {
     use fluree_db_delta::Placement;
     let io = serde_json::to_string(&config.io).unwrap_or_default();
+    // A handle holds clients built under the identity context (Unity's auth,
+    // and the storage it reads with); another context must not reuse it.
+    let scope = identity.cache_scope();
     match placement {
-        Placement::Path(location) => format!("{location}\u{1f}{io}"),
+        Placement::Path(location) => {
+            format!("{graph_source_id}\u{1f}{location}\u{1f}{io}\u{1f}{scope}")
+        }
         Placement::Unity(full_name) => format!(
-            "{full_name}\u{1f}{}\u{1f}{io}",
+            "{graph_source_id}\u{1f}{full_name}\u{1f}{}\u{1f}{io}\u{1f}{scope}",
             serde_json::to_string(&config.unity).unwrap_or_default(),
         ),
     }
@@ -593,6 +640,7 @@ mod delta_key_tests {
     use fluree_db_delta::{DeltaGsConfig, Placement, UnityConfig};
     use fluree_db_iceberg::auth::AuthConfig;
     use fluree_db_iceberg::ConfigValue;
+    use fluree_db_iceberg::IdentityContext;
 
     fn source(token: ConfigValue) -> DeltaGsConfig {
         DeltaGsConfig {
@@ -614,29 +662,39 @@ mod delta_key_tests {
         let bob = source(ConfigValue::literal("bob"));
 
         assert_eq!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&orders, &alice)
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default())
         );
         assert_ne!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&orders, &bob)
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &bob, &IdentityContext::default())
         );
         assert_ne!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&items, &alice)
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &items, &alice, &IdentityContext::default())
+        );
+        // Two sources with one config are two registrations.
+        assert_ne!(
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:b", &orders, &alice, &IdentityContext::default())
         );
 
         let mut elsewhere = alice.clone();
         elsewhere.unity.as_mut().unwrap().uri = "https://other.example.com".to_string();
         assert_ne!(
-            delta_table_key(&orders, &alice),
-            delta_table_key(&orders, &elsewhere)
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &elsewhere, &IdentityContext::default())
         );
 
         // A path and a catalog name spelt alike are different tables.
         assert_ne!(
-            delta_table_key(&Placement::Path("main.sales.orders".to_string()), &alice),
-            delta_table_key(&orders, &alice)
+            delta_table_key(
+                "gs:a",
+                &Placement::Path("main.sales.orders".to_string()),
+                &alice,
+                &IdentityContext::default()
+            ),
+            delta_table_key("gs:a", &orders, &alice, &IdentityContext::default())
         );
     }
 
@@ -644,9 +702,124 @@ mod delta_key_tests {
     fn a_secret_named_by_variable_keys_on_the_name() {
         let orders = Placement::Unity("main.sales.orders".to_string());
         let key = delta_table_key(
+            "gs:a",
             &orders,
             &source(ConfigValue::from_env("UNITY_TOKEN_KEY_TEST")),
+            &IdentityContext::default(),
         );
         assert!(key.contains("UNITY_TOKEN_KEY_TEST"), "{key}");
+    }
+
+    /// The cache is shared by every clone of a `Fluree`: a handle opened under
+    /// one identity context (AWS subject, host-identity policy) never serves
+    /// another.
+    #[test]
+    fn the_identity_context_is_part_of_the_key() {
+        let orders = Placement::Unity("main.sales.orders".to_string());
+        let config = source(ConfigValue::literal("t"));
+        let closed = IdentityContext {
+            policy: fluree_db_iceberg::HostIdentityPolicy::deny_all(),
+            ..IdentityContext::default()
+        };
+        assert_ne!(
+            delta_table_key("gs:a", &orders, &config, &IdentityContext::default()),
+            delta_table_key("gs:a", &orders, &config, &closed)
+        );
+    }
+
+    /// Resolves every reference to one secret, for `tenant` (or for no one in
+    /// particular), or refuses every one.
+    #[derive(Debug)]
+    struct Tenant {
+        tenant: Option<&'static str>,
+        refuses: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::SecretResolver for Tenant {
+        async fn resolve_secret(
+            &self,
+            secret_ref: &str,
+        ) -> Result<String, fluree_db_iceberg::SecretResolveError> {
+            if self.refuses {
+                return Err(fluree_db_iceberg::SecretResolveError::Denied(
+                    secret_ref.to_string(),
+                ));
+            }
+            Ok("one-secret".to_string())
+        }
+
+        fn scope_id(&self) -> Option<String> {
+            self.tenant.map(str::to_string)
+        }
+    }
+
+    fn resolving(tenant: Option<&'static str>, refuses: bool) -> IdentityContext {
+        IdentityContext {
+            secret_resolver: Some(std::sync::Arc::new(Tenant { tenant, refuses })),
+            ..IdentityContext::default()
+        }
+    }
+
+    /// A source on Azure whose service principal's secret is a reference.
+    fn azure_source() -> (Placement, DeltaGsConfig) {
+        let config = DeltaGsConfig {
+            io: fluree_db_delta::DeltaIoConfig {
+                azure: Some(fluree_db_delta::AzureAuth::ClientSecret {
+                    tenant_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                    client_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    client_secret: ConfigValue::SecretRef {
+                        secret_ref: "azure-secret".to_string(),
+                    },
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let placement =
+            Placement::Path("abfss://lake@account.dfs.core.windows.net/orders".to_string());
+        (placement, config)
+    }
+
+    /// Two resolvers that resolve the same stored reference for two tenants
+    /// key two handles; one tenant's two resolvers share one.
+    #[test]
+    fn a_resolvers_scope_id_is_part_of_the_key() {
+        let (orders, config) = azure_source();
+        let key = |ctx: &IdentityContext| delta_table_key("gs:a", &orders, &config, ctx);
+        let a = key(&resolving(Some("tenant-a"), false));
+        assert_eq!(a, key(&resolving(Some("tenant-a"), false)));
+        assert_ne!(a, key(&resolving(Some("tenant-b"), false)));
+        assert_ne!(a, key(&resolving(None, false)));
+    }
+
+    /// A cached handle is never a way around the resolver: a caller whose
+    /// resolver refuses the source's secret gets that refusal, not the handle
+    /// a caller that could resolve it opened, even under one key.
+    #[tokio::test]
+    async fn a_caller_that_cannot_resolve_the_secrets_is_not_served_the_handle() {
+        let (orders, config) = azure_source();
+        let cache = super::R2rmlCache::new(4, 4);
+        let (allowed, refused) = (resolving(None, false), resolving(None, true));
+        assert_eq!(
+            delta_table_key("gs:a", &orders, &config, &allowed),
+            delta_table_key("gs:a", &orders, &config, &refused),
+            "the two callers share a key, so only the resolver can tell them apart"
+        );
+        cache
+            .delta_table("gs:a", "orders", &orders, &config, &allowed)
+            .await
+            .expect("an Azure store is built without a request");
+        match cache
+            .delta_table("gs:a", "orders", &orders, &config, &refused)
+            .await
+        {
+            Ok(_) => panic!("served a handle opened with a secret this caller cannot resolve"),
+            Err(error) => assert!(error.to_string().contains("denied"), "{error}"),
+        }
+        assert!(cache
+            .delta_table("gs:a", "orders", &orders, &config, &allowed)
+            .await
+            .is_ok());
     }
 }

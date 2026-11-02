@@ -155,6 +155,12 @@ pub const NOT_ACCEPTABLE: &str = "err:api/NotAcceptable";
 /// Unsupported media type (request body format not accepted)
 pub const UNSUPPORTED_MEDIA_TYPE: &str = "err:api/UnsupportedMediaType";
 
+/// A graph source's connection, auth or storage-identity input was refused
+/// before anything was built (HTTP 400): an unknown field, auth given two ways
+/// or only partly, flat and structured fields mixed, or a secret the surface
+/// may not name. The message names the field, never its value.
+pub const INVALID_GRAPH_SOURCE_CONFIG: &str = "err:api/InvalidGraphSourceConfig";
+
 // =============================================================================
 // Parsing Errors (parse)
 // =============================================================================
@@ -202,6 +208,13 @@ pub const STORAGE_WRITE: &str = "err:storage/WriteFailure";
 /// credentials lack access **or** the object was moved/removed.
 pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
 
+/// A graph source's storage identity was asked to read a path whose scheme it
+/// does not serve (HTTP 400): `gs://` on an AWS identity without a GCS interop
+/// endpoint, `s3://` on a Google identity. The identity is decided by the
+/// source's `io.storage_auth`, never by the path, so this is refused rather
+/// than read with whatever client accepts the scheme.
+pub const STORAGE_SCHEME_NOT_SERVED: &str = "err:storage/SchemeNotServed";
+
 /// The catalog authorized the table but vended no storage credentials while the
 /// source is configured to require them (`vended_credentials = true`).
 ///
@@ -215,6 +228,13 @@ pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVend
 /// Distinct from [`STORAGE_ACCESS_DENIED`] (the object store refused a read)
 /// and from the policy-layer [`ACCESS_DENIED`].
 pub const CATALOG_ACCESS_DENIED: &str = "err:catalog/AccessDenied";
+
+/// A Google catalog refused the request because it names no quota project
+/// (`USER_PROJECT_DENIED`, or BigLake's "missing `x-goog-user-project`
+/// header"): BigLake bills every request, whatever the identity, to the
+/// project the request names. The fix is the source's `quota_project`, not a
+/// broader grant.
+pub const CATALOG_QUOTA_PROJECT_REQUIRED: &str = "err:catalog/QuotaProjectRequired";
 
 /// Connection error
 pub const CONNECTION: &str = "err:storage/ConnectionError";
@@ -244,6 +264,25 @@ pub const R2RML_UNSUPPORTED_PATTERN: &str = "err:r2rml/UnsupportedPattern";
 /// does not apply (HTTP 409). The table is correctly configured; its current
 /// state is what is refused.
 pub const MERGE_ON_READ_DELETES: &str = "err:iceberg/MergeOnReadDeletes";
+
+// =============================================================================
+// Graph-source identity Errors (auth)
+// =============================================================================
+
+/// A Google token exchange for a graph source's identity was refused (HTTP 401,
+/// or 403 when Google said `PERMISSION_DENIED`) or got no usable answer (502).
+/// Carries Google's error code, never a response body.
+pub const GOOGLE_TOKEN_EXCHANGE: &str = "err:auth/GoogleTokenExchange";
+
+/// A graph source's Google credential configuration was refused (HTTP 400): a
+/// field outside the accepted subset, or a malformed key. Names the field,
+/// never its value.
+pub const GOOGLE_CREDENTIALS_INVALID: &str = "err:auth/GoogleCredentialsInvalid";
+
+/// A graph source asked for a host-derived identity (ambient AWS, the GCE
+/// metadata server, host ADC, host-signed WIF) that the instance's
+/// host-identity policy does not allow (HTTP 403).
+pub const HOST_IDENTITY_REFUSED: &str = "err:auth/HostIdentityRefused";
 
 // =============================================================================
 // Policy/Auth Errors (policy)

@@ -13,71 +13,23 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::iceberg_ssrf::guard_connection_urls;
+use super::iceberg_ssrf::guard_connection;
 use super::ledger::forward_write_request;
+use fluree_db_api::SecretRules;
 
 /// Request body for `POST /v1/fluree/iceberg/map`
 #[derive(Deserialize)]
 pub struct IcebergMapRequest {
     /// Graph source name
     pub name: String,
-    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
-    #[serde(default = "default_mode")]
-    pub mode: String,
-    /// REST catalog URI
-    pub catalog_uri: Option<String>,
     /// Table identifier (namespace.table)
     pub table: Option<String>,
-    /// S3 table location (direct mode)
-    pub table_location: Option<String>,
-    /// AWS region (glue / s3tables mode)
-    pub region: Option<String>,
-    /// AWS Glue catalog id for cross-account access (glue mode)
-    pub catalog_id: Option<String>,
-    /// AWS S3 Tables table-bucket ARN (s3tables mode)
-    pub table_bucket_arn: Option<String>,
     /// R2RML mapping source
     pub r2rml: Option<String>,
     /// R2RML mapping media type
     pub r2rml_type: Option<String>,
     /// Branch name
     pub branch: Option<String>,
-    /// Bearer token for catalog auth
-    pub auth_bearer: Option<String>,
-    /// Environment variable of this server holding the bearer token; see
-    /// [`secret_value`].
-    pub auth_bearer_env: Option<String>,
-    /// OAuth2 token URL
-    pub oauth2_token_url: Option<String>,
-    /// OAuth2 client ID
-    pub oauth2_client_id: Option<String>,
-    /// OAuth2 client secret
-    pub oauth2_client_secret: Option<String>,
-    /// Environment variable of this server holding the OAuth2 client secret.
-    pub oauth2_client_secret_env: Option<String>,
-    /// OAuth2 scope (e.g. "session:role:<ROLE>" for Snowflake Horizon / Polaris)
-    pub oauth2_scope: Option<String>,
-    /// OAuth2 audience
-    pub oauth2_audience: Option<String>,
-    /// Use Google metadata-server auth (GKE Workload Identity / GCE) for the REST
-    /// catalog, minting + auto-refreshing short-lived tokens — for Google Iceberg
-    /// REST catalogs (BigLake), where a static `auth_bearer` would expire.
-    #[serde(default)]
-    pub auth_google_metadata: bool,
-    /// Optional OAuth scopes for `auth_google_metadata` (defaults to cloud-platform).
-    pub auth_google_scopes: Option<String>,
-    /// Warehouse identifier
-    pub warehouse: Option<String>,
-    /// Disable vended credentials
-    #[serde(default)]
-    pub no_vended_credentials: bool,
-    /// S3 region override
-    pub s3_region: Option<String>,
-    /// S3 endpoint override
-    pub s3_endpoint: Option<String>,
-    /// Use path-style S3 URLs
-    #[serde(default)]
-    pub s3_path_style: bool,
     /// Tombstone/delete convention: source column inspected to classify a row
     /// as a delete during materialization. Omit to disable retraction.
     pub delete_column: Option<String>,
@@ -94,11 +46,18 @@ pub struct IcebergMapRequest {
     /// `default-allow` for governed requests that match no policy (`true`
     /// keeps the source readable under authentication without a model).
     pub default_allow: Option<bool>,
+    /// The connection, as every Iceberg route takes it: see
+    /// [`ConnectionFields`].
+    #[serde(flatten)]
+    pub connection: ConnectionFields,
 }
 
-fn default_mode() -> String {
-    "rest".to_string()
-}
+/// The rest of an Iceberg request: its connection, given either as the
+/// structured `catalog` / `io` objects (exactly the stored config's shape) or
+/// as the legacy flat fields (`mode`, `catalog_uri`, `auth_bearer_env`, …).
+/// [`fluree_db_api::iceberg_connection_from_json`] reads it, and refuses an
+/// unknown field, the two forms mixed, and auth given two ways or half given.
+pub type ConnectionFields = serde_json::Map<String, serde_json::Value>;
 
 /// Response for `POST /v1/fluree/iceberg/map`
 #[derive(Serialize)]
@@ -161,23 +120,15 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
     async move {
         tracing::info!(status = "start", name = %req.name, "iceberg map requested");
 
-        // SSRF guard: reject request-supplied URLs that target internal hosts,
-        // before any outbound HTTP client sees them (unauthenticated by default).
-        guard_connection_urls(
-            req.catalog_uri.as_deref(),
-            req.oauth2_token_url.as_deref(),
-            req.s3_endpoint.as_deref(),
-        )?;
-
         let fluree = &state.fluree;
-        let iceberg_config = build_iceberg_config(&req)?;
+        let iceberg_config = build_iceberg_config(&req, &SecretRules::server(fluree))?;
 
-        let response = if let Some(ref r2rml_content) = req.r2rml {
+        let response = if let Some(r2rml_content) = req.r2rml {
             // R2RML mode — mapping content provided inline
             let config = fluree_db_api::R2rmlCreateConfig {
                 iceberg: iceberg_config,
-                mapping: fluree_db_api::R2rmlMappingInput::Content(r2rml_content.clone()),
-                mapping_media_type: req.r2rml_type.clone(),
+                mapping: fluree_db_api::R2rmlMappingInput::Content(r2rml_content),
+                mapping_media_type: req.r2rml_type,
             };
 
             let result = fluree
@@ -631,143 +582,24 @@ pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Resp
         .into_response()
 }
 
-/// The environment variables a request may name as a secret (comma-separated).
-pub(crate) const SECRET_ENV_ALLOWLIST: &str = "FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS";
-
-pub(crate) fn allowed_secret_env() -> String {
-    std::env::var(SECRET_ENV_ALLOWLIST).unwrap_or_default()
-}
-
-/// One secret, given as a literal or as the name of an environment variable.
-///
-/// The request also chooses where the secret is sent — the catalog or the
-/// token URL — so it may name only a variable the operator has listed.
-/// Anything else would let a caller send this server's environment to a host
-/// of their choosing.
-pub(crate) fn secret_value(
-    field: &str,
-    literal: Option<&str>,
-    env: Option<&str>,
-    allowed: &str,
-) -> Result<Option<fluree_db_api::IcebergConfigValue>> {
-    use fluree_db_api::IcebergConfigValue as ConfigValue;
-    match (literal, env) {
-        (Some(_), Some(_)) => Err(ServerError::bad_request(format!(
-            "give {field} or {field}_env, not both"
-        ))),
-        (Some(value), None) => Ok(Some(ConfigValue::literal(value))),
-        (None, Some(name)) => {
-            if allowed.split(',').any(|listed| listed.trim() == name) {
-                Ok(Some(ConfigValue::from_env(name)))
-            } else {
-                Err(ServerError::bad_request(format!(
-                    "{field}_env names '{name}', which this server does not list in {SECRET_ENV_ALLOWLIST}"
-                )))
-            }
-        }
-        (None, None) => Ok(None),
-    }
-}
-
-/// The REST-only settings a request set, by field name, for the shared parser
-/// to refuse in any other catalog mode (it would otherwise ignore them).
-fn given_rest_only(fields: &[(&'static str, bool)]) -> Vec<&'static str> {
-    fields
-        .iter()
-        .filter_map(|&(name, given)| given.then_some(name))
-        .collect()
-}
-
-fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
-    build_iceberg_config_allowing(req, &allowed_secret_env())
-}
-
-fn build_iceberg_config_allowing(
+/// The map request's create config: its connection through the one codec
+/// (then the SSRF guard on the URLs it names), and its own settings.
+fn build_iceberg_config(
     req: &IcebergMapRequest,
-    allowed_env: &str,
+    rules: &SecretRules,
 ) -> Result<fluree_db_api::IcebergCreateConfig> {
-    // One mode dispatch for every surface (the CLI parses its flags the same way).
-    let rest_only = given_rest_only(&[
-        ("auth_bearer", req.auth_bearer.is_some()),
-        ("auth_bearer_env", req.auth_bearer_env.is_some()),
-        ("oauth2_token_url", req.oauth2_token_url.is_some()),
-        ("oauth2_client_id", req.oauth2_client_id.is_some()),
-        ("oauth2_client_secret", req.oauth2_client_secret.is_some()),
-        (
-            "oauth2_client_secret_env",
-            req.oauth2_client_secret_env.is_some(),
-        ),
-        ("oauth2_scope", req.oauth2_scope.is_some()),
-        ("oauth2_audience", req.oauth2_audience.is_some()),
-        ("auth_google_metadata", req.auth_google_metadata),
-        ("auth_google_scopes", req.auth_google_scopes.is_some()),
-        ("warehouse", req.warehouse.is_some()),
-    ]);
-    let mut config = fluree_db_api::IcebergCreateConfig::from_mode(
+    let mut config = fluree_db_api::iceberg_create_from_json(
         &req.name,
-        fluree_db_api::CatalogModeArgs {
-            mode: &req.mode,
-            catalog_uri: req.catalog_uri.as_deref(),
-            table_location: req.table_location.as_deref(),
-            region: req.region.as_deref(),
-            catalog_id: req.catalog_id.as_deref(),
-            table_bucket_arn: req.table_bucket_arn.as_deref(),
-            rest_only: &rest_only,
-        },
         req.table.as_deref(),
         req.r2rml.is_some(),
+        connection_fields(req.connection.clone()),
+        rules,
     )
-    .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
+    .map_err(input_error)?;
+    guard_connection(&config.connection)?;
 
     if let Some(ref branch) = req.branch {
         config = config.with_branch(branch);
-    }
-    if let Some(token) = secret_value(
-        "auth_bearer",
-        req.auth_bearer.as_deref(),
-        req.auth_bearer_env.as_deref(),
-        allowed_env,
-    )? {
-        config = config.with_auth_bearer_value(token);
-    }
-    // OAuth2 activates on oauth2_token_url + oauth2_client_secret; client_id
-    // defaults to "" so Horizon / PAT callers can omit it (Snowflake Horizon's
-    // `session:role:` token exchange requires an absent/empty client_id).
-    let oauth2_secret = secret_value(
-        "oauth2_client_secret",
-        req.oauth2_client_secret.as_deref(),
-        req.oauth2_client_secret_env.as_deref(),
-        allowed_env,
-    )?;
-    if let (Some(ref url), Some(secret)) = (&req.oauth2_token_url, oauth2_secret) {
-        let id = req.oauth2_client_id.as_deref().unwrap_or("");
-        config = config.with_auth_oauth2_secret_value(url, id, secret);
-        if let Some(ref scope) = req.oauth2_scope {
-            config = config.with_oauth2_scope(scope);
-        }
-        if let Some(ref audience) = req.oauth2_audience {
-            config = config.with_oauth2_audience(audience);
-        }
-    }
-    // Google metadata-server auth (refreshable) — for BigLake / GKE Workload
-    // Identity. Overrides any static bearer configured above.
-    if req.auth_google_metadata {
-        config = config.with_auth_google_metadata(req.auth_google_scopes.clone());
-    }
-    if let Some(ref wh) = req.warehouse {
-        config = config.with_warehouse(wh);
-    }
-    if req.no_vended_credentials {
-        config = config.with_vended_credentials(false);
-    }
-    if let Some(ref region) = req.s3_region {
-        config = config.with_s3_region(region);
-    }
-    if let Some(ref endpoint) = req.s3_endpoint {
-        config = config.with_s3_endpoint(endpoint);
-    }
-    if req.s3_path_style {
-        config = config.with_s3_path_style(true);
     }
     if let Some(ref column) = req.delete_column {
         let convention = fluree_db_api::DeleteConvention {
@@ -792,139 +624,77 @@ fn build_iceberg_config_allowing(
     Ok(config)
 }
 
+/// A refused graph-source input: a typed 400 naming the field.
+pub(crate) fn input_error(e: fluree_db_api::GraphSourceInputError) -> ServerError {
+    ServerError::Api(e.into())
+}
+
 // =============================================================================
 // Read-only catalog browse + metadata preview (metadata-only, no graph source
 // created). POST-with-read-semantics: the connection carries a secret in the
 // body, so these are POSTs, but they mutate nothing.
 // =============================================================================
 
-/// The reusable Iceberg connection fields shared by browse/preview requests
-/// (a subset of [`IcebergMapRequest`], minus `name`/`table`/`r2rml`).
-#[derive(Deserialize)]
-pub struct IcebergConnectionRequest {
-    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
-    #[serde(default = "default_mode")]
-    pub mode: String,
-    /// REST catalog URI
-    pub catalog_uri: Option<String>,
-    /// S3 table location (direct mode)
-    pub table_location: Option<String>,
-    /// AWS region (glue / s3tables mode)
-    pub region: Option<String>,
-    /// AWS Glue catalog id for cross-account access (glue mode)
-    pub catalog_id: Option<String>,
-    /// AWS S3 Tables table-bucket ARN (s3tables mode)
-    pub table_bucket_arn: Option<String>,
-    /// Bearer token for catalog auth
-    pub auth_bearer: Option<String>,
-    /// Environment variable of this server holding the bearer token; see
-    /// [`secret_value`].
-    pub auth_bearer_env: Option<String>,
-    /// OAuth2 token URL
-    pub oauth2_token_url: Option<String>,
-    /// OAuth2 client ID
-    pub oauth2_client_id: Option<String>,
-    /// OAuth2 client secret
-    pub oauth2_client_secret: Option<String>,
-    /// Environment variable of this server holding the OAuth2 client secret.
-    pub oauth2_client_secret_env: Option<String>,
-    /// OAuth2 scope (e.g. "session:role:<ROLE>" for Snowflake Horizon / Polaris)
-    pub oauth2_scope: Option<String>,
-    /// OAuth2 audience
-    pub oauth2_audience: Option<String>,
-    /// Warehouse identifier
-    pub warehouse: Option<String>,
-    /// Disable vended credentials
-    #[serde(default)]
-    pub no_vended_credentials: bool,
-    /// S3 region override
-    pub s3_region: Option<String>,
-    /// S3 endpoint override
-    pub s3_endpoint: Option<String>,
-    /// Use path-style S3 URLs
-    #[serde(default)]
-    pub s3_path_style: bool,
+/// Every field an Iceberg route takes beside the connection: `map`'s, and
+/// those of the read-only routes (browse's `depth`, preview's `namespace` and
+/// `tier`, generate's `tables`, `base_namespace`, `per_table_overrides`,
+/// `options` and `target_model_ledger_id`, validate's `snapshot`). Each route
+/// ignores the ones it does not take itself, rather than refusing them, so a
+/// client can send one payload to browse, preview, verify and map. A route
+/// reads its own fields before this applies; a key no Iceberg route knows is
+/// still refused.
+const ROUTE_FIELDS: &[&str] = &[
+    // iceberg/map
+    "name",
+    "table",
+    "r2rml",
+    "r2rml_type",
+    "branch",
+    "delete_column",
+    "delete_values",
+    "order_by",
+    "model",
+    "default_allow",
+    // catalog/browse
+    "depth",
+    // catalog/preview (`name` above)
+    "namespace",
+    "tier",
+    // r2rml/generate
+    "tables",
+    "base_namespace",
+    "per_table_overrides",
+    "options",
+    "target_model_ledger_id",
+    // r2rml/validate (`r2rml` above)
+    "snapshot",
+];
+
+/// A request's connection fields, without the other routes' own fields
+/// (see [`ROUTE_FIELDS`]).
+fn connection_fields(mut fields: ConnectionFields) -> ConnectionFields {
+    for key in ROUTE_FIELDS {
+        fields.remove(*key);
+    }
+    fields
 }
 
-fn build_iceberg_connection(
-    req: &IcebergConnectionRequest,
+/// A read-only route's connection: through the one codec, then the SSRF
+/// guard on the URLs it names.
+fn build_connection(
+    state: &AppState,
+    fields: ConnectionFields,
 ) -> Result<fluree_db_api::IcebergConnectionConfig> {
-    build_iceberg_connection_allowing(req, &allowed_secret_env())
+    build_connection_with(fields, &SecretRules::server(&state.fluree))
 }
 
-fn build_iceberg_connection_allowing(
-    req: &IcebergConnectionRequest,
-    allowed_env: &str,
+fn build_connection_with(
+    fields: ConnectionFields,
+    rules: &SecretRules,
 ) -> Result<fluree_db_api::IcebergConnectionConfig> {
-    use fluree_db_api::IcebergConnectionConfig;
-
-    let rest_only = given_rest_only(&[
-        ("auth_bearer", req.auth_bearer.is_some()),
-        ("auth_bearer_env", req.auth_bearer_env.is_some()),
-        ("oauth2_token_url", req.oauth2_token_url.is_some()),
-        ("oauth2_client_id", req.oauth2_client_id.is_some()),
-        ("oauth2_client_secret", req.oauth2_client_secret.is_some()),
-        (
-            "oauth2_client_secret_env",
-            req.oauth2_client_secret_env.is_some(),
-        ),
-        ("oauth2_scope", req.oauth2_scope.is_some()),
-        ("oauth2_audience", req.oauth2_audience.is_some()),
-        ("warehouse", req.warehouse.is_some()),
-    ]);
-    let mut conn = IcebergConnectionConfig::from_mode(fluree_db_api::CatalogModeArgs {
-        mode: &req.mode,
-        catalog_uri: req.catalog_uri.as_deref(),
-        table_location: req.table_location.as_deref(),
-        region: req.region.as_deref(),
-        catalog_id: req.catalog_id.as_deref(),
-        table_bucket_arn: req.table_bucket_arn.as_deref(),
-        rest_only: &rest_only,
-    })
-    .map_err(|e| ServerError::bad_request(e.message(str::to_string)))?;
-
-    if let Some(token) = secret_value(
-        "auth_bearer",
-        req.auth_bearer.as_deref(),
-        req.auth_bearer_env.as_deref(),
-        allowed_env,
-    )? {
-        conn = conn.with_auth_bearer_value(token);
-    }
-    // OAuth2 activates on token_url + client_secret; client_id defaults to ""
-    // so Horizon / PAT callers can omit it (mirrors iceberg/map).
-    let oauth2_secret = secret_value(
-        "oauth2_client_secret",
-        req.oauth2_client_secret.as_deref(),
-        req.oauth2_client_secret_env.as_deref(),
-        allowed_env,
-    )?;
-    if let (Some(ref url), Some(secret)) = (&req.oauth2_token_url, oauth2_secret) {
-        let id = req.oauth2_client_id.as_deref().unwrap_or("");
-        conn = conn.with_auth_oauth2_secret_value(url, id, secret);
-        if let Some(ref scope) = req.oauth2_scope {
-            conn = conn.with_oauth2_scope(scope);
-        }
-        if let Some(ref audience) = req.oauth2_audience {
-            conn = conn.with_oauth2_audience(audience);
-        }
-    }
-    if let Some(ref wh) = req.warehouse {
-        conn = conn.with_warehouse(wh);
-    }
-    if req.no_vended_credentials {
-        conn = conn.with_vended_credentials(false);
-    }
-    if let Some(ref region) = req.s3_region {
-        conn = conn.with_s3_region(region);
-    }
-    if let Some(ref endpoint) = req.s3_endpoint {
-        conn = conn.with_s3_endpoint(endpoint);
-    }
-    if req.s3_path_style {
-        conn = conn.with_s3_path_style(true);
-    }
-
+    let conn = fluree_db_api::iceberg_connection_from_json(connection_fields(fields), rules)
+        .map_err(input_error)?;
+    guard_connection(&conn)?;
     Ok(conn)
 }
 
@@ -941,7 +711,7 @@ async fn parse_iceberg_body<T: serde::de::DeserializeOwned>(request: Request) ->
 #[derive(Deserialize)]
 pub struct IcebergBrowseRequest {
     #[serde(flatten)]
-    pub connection: IcebergConnectionRequest,
+    pub connection: ConnectionFields,
     /// Browse depth: "namespaces" or "tables" (default "tables")
     pub depth: Option<String>,
 }
@@ -978,12 +748,7 @@ async fn iceberg_catalog_browse_local(
         None,
     );
     async move {
-        guard_connection_urls(
-            req.connection.catalog_uri.as_deref(),
-            req.connection.oauth2_token_url.as_deref(),
-            req.connection.s3_endpoint.as_deref(),
-        )?;
-        let conn = build_iceberg_connection(&req.connection)?;
+        let conn = build_connection(&state, req.connection)?;
         let depth = match req.depth.as_deref().map(str::to_lowercase).as_deref() {
             Some("namespaces") => BrowseDepth::Namespaces,
             None | Some("tables") => BrowseDepth::Tables,
@@ -1016,7 +781,7 @@ async fn iceberg_catalog_browse_local(
 #[derive(Deserialize)]
 pub struct IcebergPreviewRequest {
     #[serde(flatten)]
-    pub connection: IcebergConnectionRequest,
+    pub connection: ConnectionFields,
     /// Table namespace (e.g. "DW")
     pub namespace: String,
     /// Table name (e.g. "DIM_STORE")
@@ -1057,12 +822,7 @@ async fn iceberg_catalog_preview_local(
         None,
     );
     async move {
-        guard_connection_urls(
-            req.connection.catalog_uri.as_deref(),
-            req.connection.oauth2_token_url.as_deref(),
-            req.connection.s3_endpoint.as_deref(),
-        )?;
-        let conn = build_iceberg_connection(&req.connection)?;
+        let conn = build_connection(&state, req.connection)?;
         let tier = match req.tier.as_deref().map(str::to_lowercase).as_deref() {
             None | Some("schema") => StatsTier::Schema,
             Some("stats") => StatsTier::Stats,
@@ -1096,7 +856,7 @@ async fn iceberg_catalog_preview_local(
 #[derive(Deserialize)]
 pub struct IcebergVerifyRequest {
     #[serde(flatten)]
-    pub connection: IcebergConnectionRequest,
+    pub connection: ConnectionFields,
     /// Table identifier (`"NAMESPACE.NAME"`, byte-for-byte catalog casing).
     pub table: String,
 }
@@ -1135,12 +895,7 @@ async fn iceberg_catalog_verify_local(
         None,
     );
     async move {
-        guard_connection_urls(
-            req.connection.catalog_uri.as_deref(),
-            req.connection.oauth2_token_url.as_deref(),
-            req.connection.s3_endpoint.as_deref(),
-        )?;
-        let conn = build_iceberg_connection(&req.connection)?;
+        let conn = build_connection(&state, req.connection)?;
 
         let report = state
             .fluree
@@ -1197,7 +952,7 @@ pub struct TableOverrideEntry {
 #[derive(Deserialize)]
 pub struct IcebergGenerateRequest {
     #[serde(flatten)]
-    pub connection: IcebergConnectionRequest,
+    pub connection: ConnectionFields,
     /// Tables to map, in output order: `[{ "namespace": .., "name": .. }]`.
     pub tables: Vec<fluree_db_api::TableIdentifier>,
     /// The SINGLE base namespace all IRIs derive from.
@@ -1251,12 +1006,7 @@ async fn iceberg_r2rml_generate_local(
                 "at least one table is required for generate",
             ));
         }
-        guard_connection_urls(
-            req.connection.catalog_uri.as_deref(),
-            req.connection.oauth2_token_url.as_deref(),
-            req.connection.s3_endpoint.as_deref(),
-        )?;
-        let connection = build_iceberg_connection(&req.connection)?;
+        let connection = build_connection(&state, req.connection)?;
         let per_table_overrides = req
             .per_table_overrides
             .into_iter()
@@ -1306,7 +1056,7 @@ async fn iceberg_r2rml_generate_local(
 #[derive(Deserialize)]
 pub struct IcebergValidateRequest {
     #[serde(flatten)]
-    pub connection: IcebergConnectionRequest,
+    pub connection: ConnectionFields,
     /// R2RML mapping to validate, in Turtle format.
     pub r2rml: String,
     /// Optional Iceberg snapshot id to validate against. The metadata preview
@@ -1345,12 +1095,7 @@ async fn iceberg_r2rml_validate_local(
         None,
     );
     async move {
-        guard_connection_urls(
-            req.connection.catalog_uri.as_deref(),
-            req.connection.oauth2_token_url.as_deref(),
-            req.connection.s3_endpoint.as_deref(),
-        )?;
-        let conn = build_iceberg_connection(&req.connection)?;
+        let conn = build_connection(&state, req.connection)?;
 
         let response = state
             .fluree
@@ -1374,36 +1119,10 @@ async fn iceberg_r2rml_validate_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_api::{GraphSourceInputError, InputErrorKind};
 
-    #[test]
-    fn request_deserializes_oauth2_scope_and_reaches_auth_config() {
-        // Omit client_id (Horizon case); provide token_url + secret + scope.
-        let body = serde_json::json!({
-            "name": "gs",
-            "mode": "rest",
-            "catalog_uri": "https://catalog.example.com",
-            "table": "ns.tbl",
-            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
-            "oauth2_client_secret": "pat",
-            "oauth2_scope": "session:role:ICEBERG_READER",
-            "oauth2_audience": "polaris"
-        });
-        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(
-            req.oauth2_scope.as_deref(),
-            Some("session:role:ICEBERG_READER")
-        );
-        assert_eq!(req.oauth2_audience.as_deref(), Some("polaris"));
-
-        let config = build_iceberg_config(&req).unwrap();
-        let gs = config.to_iceberg_gs_config();
-        let v = serde_json::to_value(&gs).unwrap();
-        let auth = &v["catalog"]["auth"];
-
-        assert_eq!(auth["type"], "oauth2_client_credentials");
-        assert_eq!(auth["client_id"], ""); // defaulted to empty
-        assert_eq!(auth["scope"], "session:role:ICEBERG_READER");
-        assert_eq!(auth["audience"], "polaris");
+    fn rules(listed: &str) -> SecretRules {
+        SecretRules::listed(listed, false)
     }
 
     fn map_request(extra: serde_json::Value) -> IcebergMapRequest {
@@ -1417,15 +1136,46 @@ mod tests {
         serde_json::from_value(body).unwrap()
     }
 
+    fn stored(config: fluree_db_api::IcebergCreateConfig) -> serde_json::Value {
+        serde_json::to_value(config.to_iceberg_gs_config()).unwrap()
+    }
+
     fn stored_auth(config: fluree_db_api::IcebergCreateConfig) -> serde_json::Value {
-        serde_json::to_value(config.to_iceberg_gs_config()).unwrap()["catalog"]["auth"].clone()
+        stored(config)["catalog"]["auth"].clone()
+    }
+
+    /// The typed refusal inside a route error.
+    fn input(e: ServerError) -> GraphSourceInputError {
+        match e {
+            ServerError::Api(fluree_db_api::ApiError::GraphSourceInput(e)) => e,
+            other => panic!("not a graph-source input refusal: {other}"),
+        }
+    }
+
+    fn connection(body: serde_json::Value) -> Result<fluree_db_api::IcebergConnectionConfig> {
+        build_connection_with(body.as_object().unwrap().clone(), &rules("CATALOG_TOKEN"))
+    }
+
+    #[test]
+    fn request_deserializes_oauth2_scope_and_reaches_auth_config() {
+        // Omit client_id (Horizon case); provide token_url + secret + scope.
+        let req = map_request(serde_json::json!({
+            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
+            "oauth2_client_secret": "pat",
+            "oauth2_scope": "session:role:ICEBERG_READER",
+            "oauth2_audience": "polaris"
+        }));
+        let auth = stored_auth(build_iceberg_config(&req, &rules("")).unwrap());
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(auth["client_id"], ""); // defaulted to empty
+        assert_eq!(auth["scope"], "session:role:ICEBERG_READER");
+        assert_eq!(auth["audience"], "polaris");
     }
 
     #[test]
     fn a_listed_variable_is_stored_as_its_name() {
         let req = map_request(serde_json::json!({"auth_bearer_env": "CATALOG_TOKEN"}));
-        let auth =
-            stored_auth(build_iceberg_config_allowing(&req, "OTHER, CATALOG_TOKEN").unwrap());
+        let auth = stored_auth(build_iceberg_config(&req, &rules("OTHER, CATALOG_TOKEN")).unwrap());
         assert_eq!(auth["type"], "bearer");
         assert_eq!(auth["token"]["env_var"], "CATALOG_TOKEN");
 
@@ -1434,7 +1184,7 @@ mod tests {
             "oauth2_client_id": "app",
             "oauth2_client_secret_env": "CATALOG_SECRET",
         }));
-        let auth = stored_auth(build_iceberg_config_allowing(&req, "CATALOG_SECRET").unwrap());
+        let auth = stored_auth(build_iceberg_config(&req, &rules("CATALOG_SECRET")).unwrap());
         assert_eq!(auth["type"], "oauth2_client_credentials");
         assert_eq!(auth["client_secret"]["env_var"], "CATALOG_SECRET");
     }
@@ -1442,15 +1192,22 @@ mod tests {
     #[test]
     fn a_variable_the_operator_did_not_list_is_refused() {
         for allowed in ["", "CATALOG_TOKEN_2", "XCATALOG_TOKEN,CATALOG"] {
-            for field in ["auth_bearer_env", "oauth2_client_secret_env"] {
-                let req = map_request(serde_json::json!({
-                    "oauth2_token_url": "https://catalog.example.com/token",
-                    field: "CATALOG_TOKEN",
-                }));
-                let err = build_iceberg_config_allowing(&req, allowed)
+            for (field, extra) in [
+                ("auth_bearer_env", serde_json::json!({})),
+                (
+                    "oauth2_client_secret_env",
+                    serde_json::json!({"oauth2_token_url": "https://catalog.example.com/token"}),
+                ),
+            ] {
+                let mut extra = extra;
+                extra[field] = "CATALOG_TOKEN".into();
+                let err = build_iceberg_config(&map_request(extra), &rules(allowed))
                     .err()
                     .unwrap_or_else(|| panic!("{field} accepted with allowlist {allowed:?}"));
-                assert!(err.to_string().contains(SECRET_ENV_ALLOWLIST), "{err}");
+                assert!(
+                    err.to_string().contains(fluree_db_api::SECRET_ENV_VARS_ENV),
+                    "{err}"
+                );
             }
         }
     }
@@ -1460,36 +1217,194 @@ mod tests {
         let req = map_request(serde_json::json!({
             "auth_bearer": "t", "auth_bearer_env": "CATALOG_TOKEN",
         }));
-        assert!(build_iceberg_config_allowing(&req, "CATALOG_TOKEN").is_err());
+        assert!(build_iceberg_config(&req, &rules("CATALOG_TOKEN")).is_err());
     }
 
     #[test]
     fn browse_and_preview_hold_a_named_variable_to_the_same_list() {
         let req = |allowed: &str| {
-            let req: IcebergConnectionRequest = serde_json::from_value(serde_json::json!({
-                "mode": "rest", "catalog_uri": "https://catalog.example.com",
-                "auth_bearer_env": "CATALOG_TOKEN",
-            }))
-            .unwrap();
-            build_iceberg_connection_allowing(&req, allowed)
+            build_connection_with(
+                serde_json::json!({
+                    "mode": "rest", "catalog_uri": "https://catalog.example.com",
+                    "auth_bearer_env": "CATALOG_TOKEN",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                &rules(allowed),
+            )
         };
         assert!(req("CATALOG_TOKEN").is_ok());
         assert!(req("").is_err());
     }
 
     #[test]
-    fn request_without_secret_does_not_activate_oauth2() {
-        let body = serde_json::json!({
-            "name": "gs",
-            "catalog_uri": "https://catalog.example.com",
-            "table": "ns.tbl",
+    fn a_token_url_without_a_secret_is_refused_not_dropped() {
+        // It used to store `{"type": "none"}` and authenticate nothing.
+        let req = map_request(serde_json::json!({
             "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens"
+        }));
+        let e = input(build_iceberg_config(&req, &rules("")).unwrap_err());
+        assert_eq!(e.field, "oauth2_token_url");
+        assert!(matches!(e.kind, InputErrorKind::Incomplete { .. }), "{e}");
+    }
+
+    #[test]
+    fn google_auth_reaches_every_read_only_route() {
+        // `auth_google_metadata` used to work on `iceberg/map` only: the
+        // read-only routes' request type had no such field and ignored it,
+        // so browse and preview ran with no auth at all.
+        let flat = serde_json::json!({
+            "mode": "rest", "catalog_uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
+            "auth_google_metadata": true,
         });
-        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
-        let config = build_iceberg_config(&req).unwrap();
-        let gs = config.to_iceberg_gs_config();
-        let v = serde_json::to_value(&gs).unwrap();
-        assert_eq!(v["catalog"]["auth"]["type"], "none");
+        let structured = serde_json::json!({"catalog": {"type": "rest",
+            "uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
+            "auth": {"type": "google", "credentials": {"source": "metadata"},
+                "quota_project": "lake"}}});
+        for body in [flat, structured] {
+            let browse: IcebergBrowseRequest = serde_json::from_value(body.clone()).unwrap();
+            let mut preview = body.clone();
+            preview["namespace"] = "ns".into();
+            preview["name"] = "t".into();
+            let preview: IcebergPreviewRequest = serde_json::from_value(preview).unwrap();
+            let mut verify = body.clone();
+            verify["table"] = "ns.t".into();
+            let verify: IcebergVerifyRequest = serde_json::from_value(verify).unwrap();
+            for fields in [browse.connection, preview.connection, verify.connection] {
+                let conn = build_connection_with(fields, &rules("")).unwrap();
+                let fluree_db_api::CatalogMode::Rest(rest) = &conn.catalog_mode else {
+                    panic!("rest");
+                };
+                assert!(
+                    matches!(
+                        rest.auth,
+                        fluree_db_api::IcebergAuthConfig::GoogleMetadata { .. }
+                            | fluree_db_api::IcebergAuthConfig::Google { .. }
+                    ),
+                    "auth dropped: {:?}",
+                    rest.auth
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_on_every_route() {
+        let body = serde_json::json!({
+            "mode": "rest", "catalog_uri": "https://catalog.example.com",
+            "auth_bearer_tokn": "t",
+        });
+        let browse: IcebergBrowseRequest = serde_json::from_value(body.clone()).unwrap();
+        let e = input(build_connection_with(browse.connection, &rules("")).unwrap_err());
+        assert_eq!(
+            (e.field.as_str(), &e.kind),
+            ("auth_bearer_tokn", &InputErrorKind::Unknown)
+        );
+        let mut map = body;
+        map["name"] = "gs".into();
+        map["table"] = "ns.t".into();
+        let req: IcebergMapRequest = serde_json::from_value(map).unwrap();
+        let e = input(build_iceberg_config(&req, &rules("")).unwrap_err());
+        assert_eq!(e.field, "auth_bearer_tokn");
+    }
+
+    #[test]
+    fn every_route_ignores_the_other_routes_fields() {
+        // One payload, carrying every route's own fields, sent to browse,
+        // preview, verify, generate, validate and map.
+        for connection in [
+            serde_json::json!({"mode": "rest", "catalog_uri": "https://catalog.example.com",
+                "auth_bearer": "t"}),
+            serde_json::json!({"catalog": {"type": "rest", "uri": "https://catalog.example.com",
+                "auth": {"type": "bearer", "token": "t"}}}),
+        ] {
+            let mut body = connection.clone();
+            for (key, value) in serde_json::json!({
+                // map
+                "name": "gs", "table": "ns.t", "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
+                "r2rml_type": "text/turtle", "branch": "main", "delete_column": "op",
+                "delete_values": ["d"], "order_by": "ts", "model": "m:main", "default_allow": true,
+                // browse
+                "depth": "tables",
+                // preview
+                "namespace": "ns", "tier": "schema",
+                // generate
+                "tables": [{"namespace": "ns", "name": "t"}],
+                "base_namespace": "https://example.org/", "per_table_overrides": [],
+                "options": {}, "target_model_ledger_id": "m:main",
+                // validate
+                "snapshot": 1,
+            })
+            .as_object()
+            .unwrap()
+            {
+                body[key] = value.clone();
+            }
+            let bare = stored(fluree_db_api::IcebergCreateConfig::from_connection(
+                "gs",
+                build_connection_with(connection.as_object().unwrap().clone(), &rules("")).unwrap(),
+                "ns.t",
+            ));
+            let read_only = |body: &serde_json::Value| {
+                [
+                    serde_json::from_value::<IcebergBrowseRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergPreviewRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergVerifyRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergGenerateRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                    serde_json::from_value::<IcebergValidateRequest>(body.clone())
+                        .unwrap()
+                        .connection,
+                ]
+            };
+            for fields in read_only(&body) {
+                let conn = build_connection_with(fields, &rules("")).unwrap();
+                let read = stored(fluree_db_api::IcebergCreateConfig::from_connection(
+                    "gs", conn, "ns.t",
+                ));
+                assert_eq!(read, bare, "{body}");
+            }
+            let map: IcebergMapRequest = serde_json::from_value(body.clone()).unwrap();
+            let map = build_iceberg_config(&map, &rules("")).unwrap();
+            assert_eq!(stored(map)["catalog"], bare["catalog"], "{body}");
+
+            // A key no Iceberg route knows is still refused, on every route.
+            let mut unknown = body.clone();
+            unknown["tabel"] = "ns.t".into();
+            for fields in read_only(&unknown) {
+                let e = input(build_connection_with(fields, &rules("")).unwrap_err());
+                assert_eq!(e.field, "tabel");
+            }
+            let map: IcebergMapRequest = serde_json::from_value(unknown).unwrap();
+            let e = input(build_iceberg_config(&map, &rules("")).unwrap_err());
+            assert_eq!(e.field, "tabel");
+        }
+    }
+
+    #[test]
+    fn the_map_route_stores_the_same_config_from_either_form() {
+        let flat = map_request(serde_json::json!({
+            "warehouse": "wh", "auth_bearer_env": "CATALOG_TOKEN", "s3_region": "us-east-2",
+        }));
+        let structured: IcebergMapRequest = serde_json::from_value(serde_json::json!({
+            "name": "gs", "table": "ns.tbl",
+            "catalog": {"type": "rest", "uri": "https://catalog.example.com", "warehouse": "wh",
+                "auth": {"type": "bearer", "token": {"env_var": "CATALOG_TOKEN"}}},
+            "io": {"s3_region": "us-east-2"},
+        }))
+        .unwrap();
+        assert_eq!(
+            stored(build_iceberg_config(&flat, &rules("CATALOG_TOKEN")).unwrap()),
+            stored(build_iceberg_config(&structured, &rules("CATALOG_TOKEN")).unwrap())
+        );
     }
 
     #[test]
@@ -1507,80 +1422,46 @@ mod tests {
         });
         let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
         assert_eq!(req.depth.as_deref(), Some("namespaces"));
-        assert_eq!(req.connection.warehouse.as_deref(), Some("wh1"));
 
-        // Build a create config from the same connection so we can inspect the
-        // serialized auth block (the server crate can't name fluree_db_iceberg
-        // types directly).
-        let create = fluree_db_api::IcebergCreateConfig {
-            name: "gs".to_string(),
-            branch: None,
-            connection: build_iceberg_connection(&req.connection).unwrap(),
-            table_identifier: "ns.tbl".to_string(),
-            delete_convention: None,
-            order_by: None,
-            model: None,
-            default_allow: None,
-        };
+        let create = fluree_db_api::IcebergCreateConfig::from_connection(
+            "gs",
+            build_connection_with(req.connection, &rules("")).unwrap(),
+            "ns.tbl",
+        );
         assert!(create.is_rest());
-        let gs = create.to_iceberg_gs_config();
-        let v = serde_json::to_value(&gs).unwrap();
+        let v = stored(create);
         assert_eq!(v["catalog"]["warehouse"], "wh1");
         assert_eq!(v["catalog"]["auth"]["type"], "oauth2_client_credentials");
         assert_eq!(v["catalog"]["auth"]["scope"], "session:role:ICEBERG_READER");
     }
 
     #[test]
-    fn browse_request_direct_mode_builds_direct_connection() {
-        let body = serde_json::json!({
-            "mode": "direct",
-            "table_location": "s3://bucket/warehouse/ns/table"
-        });
-        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
-        assert!(req.depth.is_none());
-        let conn = build_iceberg_connection(&req.connection).unwrap();
-        assert!(conn.is_direct());
-    }
-
-    #[test]
-    fn browse_request_glue_mode_builds_glue_connection() {
-        // The connection builder must accept the glue mode + its region/catalog_id
-        // fields (browse/preview/generate/validate parity with iceberg/map).
-        let body = serde_json::json!({
-            "mode": "glue",
-            "region": "us-east-1",
-            "catalog_id": "123456789012"
-        });
-        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
-        let conn = build_iceberg_connection(&req.connection).unwrap();
-        assert!(conn.is_glue());
-    }
-
-    #[test]
-    fn browse_request_s3tables_mode_builds_s3tables_connection() {
-        let body = serde_json::json!({
-            "mode": "s3tables",
-            "region": "us-east-1",
+    fn every_catalog_mode_builds_its_connection() {
+        let direct = connection(serde_json::json!({
+            "mode": "direct", "table_location": "s3://bucket/warehouse/ns/table"
+        }))
+        .unwrap();
+        assert!(direct.is_direct());
+        let glue = connection(serde_json::json!({
+            "mode": "glue", "region": "us-east-1", "catalog_id": "123456789012"
+        }))
+        .unwrap();
+        assert!(glue.is_glue());
+        let s3tables = connection(serde_json::json!({
+            "mode": "s3tables", "region": "us-east-1",
             "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
-        });
-        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
-        let conn = build_iceberg_connection(&req.connection).unwrap();
-        assert!(conn.is_s3tables());
-    }
-
-    #[test]
-    fn build_iceberg_connection_s3tables_requires_arn() {
-        // s3tables mode without an ARN is a 400, mirroring build_iceberg_config.
-        let body = serde_json::json!({ "mode": "s3tables" });
-        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
-        assert!(build_iceberg_connection(&req.connection).is_err());
+        }))
+        .unwrap();
+        assert!(s3tables.is_s3tables());
+        // s3tables mode without an ARN is a 400, mirroring the map route.
+        assert!(connection(serde_json::json!({ "mode": "s3tables" })).is_err());
     }
 
     #[test]
     fn rest_only_fields_are_refused_by_other_modes() {
         // Catalog auth or a warehouse sent with another mode would be ignored;
         // refuse each one, on both request shapes.
-        let connection_fields = [
+        let fields = [
             "auth_bearer",
             "auth_bearer_env",
             "oauth2_token_url",
@@ -1589,36 +1470,35 @@ mod tests {
             "oauth2_client_secret_env",
             "oauth2_scope",
             "oauth2_audience",
+            "auth_google_metadata",
+            "auth_google_scopes",
             "warehouse",
         ];
-        let map_only = ["auth_google_metadata", "auth_google_scopes"];
         let given = |field: &str| match field {
             "auth_google_metadata" => serde_json::json!(true),
             _ => serde_json::json!("x"),
         };
 
-        for field in connection_fields.iter().chain(&map_only) {
+        for field in fields {
             let mut body = serde_json::json!({
                 "name": "orders",
                 "mode": "glue",
                 "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
             });
-            body[*field] = given(field);
+            body[field] = given(field);
             let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
-            let err = build_iceberg_config(&req).unwrap_err().to_string();
+            let err = build_iceberg_config(&req, &rules("x"))
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains(&format!("{field} applies to rest mode only")),
                 "{field}: {err}"
             );
-        }
-        for field in connection_fields {
+
             let mut body =
                 serde_json::json!({ "mode": "direct", "table_location": "s3://b/w/ns/t" });
             body[field] = given(field);
-            let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
-            let err = build_iceberg_connection(&req.connection)
-                .unwrap_err()
-                .to_string();
+            let err = connection(body).unwrap_err().to_string();
             assert!(
                 err.contains(&format!("{field} applies to rest mode only")),
                 "{field}: {err}"
@@ -1637,18 +1517,29 @@ mod tests {
             "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> ."
         });
         let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
-        let config = build_iceberg_config(&req).unwrap();
+        let config = build_iceberg_config(&req, &rules("")).unwrap();
         assert!(config.connection.is_glue());
         config.validate().unwrap();
 
         // Without a mapping it needs one, and says so in the wire spelling.
         let body = serde_json::json!({ "name": "orders", "mode": "glue" });
         let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
-        let err = build_iceberg_config(&req).unwrap_err().to_string();
+        let err = build_iceberg_config(&req, &rules(""))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("table is required for glue mode (or provide r2rml"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_structured_connection_is_held_to_the_ssrf_guard() {
+        let e = connection(serde_json::json!({
+            "catalog": {"type": "rest", "uri": "http://169.254.169.254/latest"}
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("SSRF guard"), "{e}");
     }
 
     #[test]
@@ -1697,14 +1588,12 @@ mod tests {
         assert_eq!(req.target_model_ledger_id.as_deref(), Some("model:main"));
 
         // The flattened connection builds a REST connection carrying the scope.
-        let conn = build_iceberg_connection(&req.connection).unwrap();
+        let conn = build_connection_with(req.connection, &rules("")).unwrap();
         assert!(conn.is_rest());
     }
 
     #[test]
     fn verify_request_flattens_connection_and_table() {
-        // The flattened connection fields must deserialize alongside `table`, and
-        // build a REST connection carrying the OAuth2 scope.
         let body = serde_json::json!({
             "mode": "rest",
             "catalog_uri": "https://catalog.example.com",
@@ -1716,23 +1605,8 @@ mod tests {
         });
         let req: IcebergVerifyRequest = serde_json::from_value(body).unwrap();
         assert_eq!(req.table, "DW.DIM_STORE");
-        assert_eq!(req.connection.warehouse.as_deref(), Some("wh1"));
-
-        let conn = build_iceberg_connection(&req.connection).unwrap();
+        let conn = build_connection_with(req.connection, &rules("")).unwrap();
         assert!(conn.is_rest());
-    }
-
-    #[test]
-    fn verify_request_direct_mode_builds_direct_connection() {
-        let body = serde_json::json!({
-            "mode": "direct",
-            "table_location": "s3://bucket/warehouse/ns/table",
-            "table": "ns.table"
-        });
-        let req: IcebergVerifyRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(req.table, "ns.table");
-        let conn = build_iceberg_connection(&req.connection).unwrap();
-        assert!(conn.is_direct());
     }
 
     #[test]

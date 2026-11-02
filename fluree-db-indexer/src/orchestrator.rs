@@ -531,8 +531,9 @@ struct GcLockInner {
     /// Worker builds in flight per name.
     building: HashMap<LedgerName, usize>,
     /// Per name, every branch this process has built or taken for
-    /// maintenance: siblings a cached listing may be too old to show. See
-    /// [`SIBLING_LISTING_MAX_AGE`]. Bounded by the branches a ledger has had.
+    /// maintenance: siblings a listing may not show yet, since DynamoDB lists
+    /// through an eventually consistent index. Bounded by the branches a
+    /// ledger has had.
     built: HashMap<LedgerName, HashSet<LedgerId>>,
 }
 
@@ -753,87 +754,31 @@ fn ledger_name_of(ledger_id: &LedgerId) -> LedgerName {
     ledger_id.ledger_name()
 }
 
-/// How old the branch listing the collector's sibling check reads may be.
-///
-/// The listing only has to *discover* siblings; each one's head is re-read
-/// when the pass releases. `all_records()` is O(ledgers) on every backend —
-/// a directory walk, a LIST plus a GET per record, a DynamoDB query per
-/// ledger — so it is not taken per pass.
-///
-/// A fork the listing is too old to show holds either a copy of its source's
-/// head root, or roots this process built or reindexed. The second kind is
-/// tracked ([`GcLockInner::built`]) and joins the siblings. The first
-/// references only what the source's head did under five minutes ago, and
-/// the source still has that root: a version leaves a chain only once the
-/// age guard has passed, and every root left in the chain is protected
-/// (`gc::collector::retained_refs`), on this branch or a sibling's. That
-/// needs the guard to outlast the listing, so a short guard, or the version
-/// ceiling that overrides it, takes the listing fresh for every pass.
-const SIBLING_LISTING_MAX_AGE: Duration = Duration::from_secs(300);
-
-/// The nameservice's records, listed at most every
-/// [`SIBLING_LISTING_MAX_AGE`] on demand and replaced outright by the
-/// catch-up tick, which lists anyway.
-#[derive(Default)]
-struct BranchDirectory {
-    inner: Mutex<Option<(Instant, Arc<Vec<NsRecord>>)>>,
-}
-
-impl BranchDirectory {
-    async fn records(
-        &self,
-        nameservice: &dyn IndexingNameService,
-        max_age: Duration,
-    ) -> fluree_db_nameservice::Result<Arc<Vec<NsRecord>>> {
-        let mut inner = self.inner.lock().await;
-        if let Some((listed_at, records)) = inner.as_ref() {
-            if listed_at.elapsed() <= max_age {
-                return Ok(Arc::clone(records));
-            }
-        }
-        let records = Arc::new(nameservice.all_records().await?);
-        *inner = Some((Instant::now(), Arc::clone(&records)));
-        Ok(records)
-    }
-
-    async fn replace(&self, records: Arc<Vec<NsRecord>>) {
-        *self.inner.lock().await = Some((Instant::now(), records));
-    }
-}
-
 /// Everything one collector pass needs beyond the ledger it runs on.
 #[derive(Clone)]
 struct GcPassContext {
     backend: StorageBackend,
     nameservice: Arc<dyn IndexingNameService>,
-    directory: Arc<BranchDirectory>,
     config: IndexerConfig,
     maintenance: MaintenanceHolds,
     tick: watch::Sender<u64>,
 }
 
 impl GcPassContext {
-    /// The branches that may be siblings of `ledger_id`: the listing's, plus
-    /// the ones this process has built. `None` when the listing cannot be
-    /// taken, which defers every shared blob rather than guess.
+    /// The branches that may be siblings of `ledger_id`: its ledger's
+    /// branches, listed now, plus the ones this process has built. `None`
+    /// when they cannot be listed, which defers every shared blob rather than
+    /// guess.
+    ///
+    /// Taken inside the release window, which holds the ledger's builds, so
+    /// it lists one ledger's branches rather than every record in the
+    /// nameservice.
     async fn sibling_candidates(
         &self,
         gc: &GcGuard,
         ledger_id: &LedgerId,
     ) -> Option<Vec<LedgerId>> {
-        let guard_secs = u64::from(self.config.gc_min_time_mins) * 60;
-        let max_age = if self.config.gc_hard_max_old_indexes.is_some()
-            || guard_secs < 2 * SIBLING_LISTING_MAX_AGE.as_secs()
-        {
-            Duration::ZERO
-        } else {
-            SIBLING_LISTING_MAX_AGE
-        };
-        match self
-            .directory
-            .records(self.nameservice.as_ref(), max_age)
-            .await
-        {
+        match self.nameservice.branch_records(ledger_id.name()).await {
             Ok(records) => {
                 let mut ids: Vec<LedgerId> = crate::gc::siblings_of(&records, ledger_id)
                     .into_iter()
@@ -1573,9 +1518,6 @@ pub struct BackgroundIndexerWorker {
     /// Shared with the handle. One collector pass per ledger name at a
     /// time; see [`GcLockState`].
     gc_locks: GcLocks,
-    /// Branch listing the collector's sibling check reads; see
-    /// [`BranchDirectory`].
-    branch_directory: Arc<BranchDirectory>,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
@@ -1609,7 +1551,6 @@ impl BackgroundIndexerWorker {
         GcPassContext {
             backend: self.backend.clone(),
             nameservice: Arc::clone(&self.nameservice),
-            directory: Arc::clone(&self.branch_directory),
             config: self.config.clone(),
             maintenance: Arc::clone(&self.maintenance),
             tick: self.subscriber_trigger.tick.clone(),
@@ -1659,7 +1600,6 @@ impl BackgroundIndexerWorker {
             gc_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GC)),
             maintenance,
             gc_locks,
-            branch_directory: Arc::default(),
         };
 
         (worker, handle)
@@ -1685,6 +1625,21 @@ impl BackgroundIndexerWorker {
     /// 3. Resolves waiters based on min_t predicate
     /// 4. Handles cancellation and backoff
     pub async fn run(mut self) {
+        // A floor above the ceiling is usually a floor raised before the
+        // ceiling had a default. It still keeps what it asked for, but the age
+        // guard no longer holds anything past it, and nothing else says so.
+        // Equal is left quiet: that is how a fixed retention count is set.
+        if let Some(ceiling) = self.config.gc_hard_max_old_indexes {
+            if self.config.gc_max_old_indexes > ceiling {
+                warn!(
+                    gc_max_old_indexes = self.config.gc_max_old_indexes,
+                    gc_hard_max_old_indexes = ceiling,
+                    "GC floor is above the version ceiling, so the floor is the ceiling: \
+                     old versions past it are collected whatever their age"
+                );
+            }
+        }
+
         // Catch up on ledgers that are already behind, whether or not an event
         // bus was wired.
         //
@@ -2731,11 +2686,7 @@ async fn run_catchup_sweeps(
     // the ledger's next publish, which for a load-once dataset never comes.
     ticker.tick().await;
     match nameservice.all_records().await {
-        Ok(records) => {
-            let records = Arc::new(records);
-            gc.ctx.directory.replace(Arc::clone(&records)).await;
-            gc.collect_idle(&records).await;
-        }
+        Ok(records) => gc.collect_idle(&records).await,
         Err(e) => warn!(error = %e, "start-up collector pass: all_records() failed"),
     }
 
@@ -2744,13 +2695,12 @@ async fn run_catchup_sweeps(
         ticker.tick().await;
 
         let records = match nameservice.all_records().await {
-            Ok(records) => Arc::new(records),
+            Ok(records) => records,
             Err(e) => {
                 warn!(error = %e, "catch-up re-sweep: all_records() failed");
                 continue;
             }
         };
-        gc.ctx.directory.replace(Arc::clone(&records)).await;
 
         handle.clear_superseded_halts(&records).await;
         for (ledger_id, commit_t) in stalled_ledgers(&records, &last_seen) {
@@ -3745,7 +3695,6 @@ mod tests {
             ctx: GcPassContext {
                 backend: StorageBackend::Managed(Arc::new(storage.clone())),
                 nameservice: ns,
-                directory: Arc::default(),
                 config: IndexerConfig {
                     gc_max_old_indexes: 1,
                     gc_min_time_mins: 0,
@@ -3780,11 +3729,140 @@ mod tests {
         assert!(store.has(&cid3).await.unwrap());
     }
 
-    /// A fork newer than the cached listing is still a sibling once this
-    /// process has built it: its head is looked up when the pass releases,
-    /// and a dictionary blob it references is deferred.
+    /// The in-memory nameservice, counting how a pass lists branches and
+    /// leaving some out of every listing, as an eventually consistent index
+    /// does for a branch created a moment ago. Lookups still find them.
+    #[derive(Debug)]
+    struct ListingNs {
+        inner: Arc<MemoryNameService>,
+        unlisted: Vec<LedgerId>,
+        all_records_calls: std::sync::atomic::AtomicUsize,
+        branch_records_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ListingNs {
+        fn new(inner: Arc<MemoryNameService>, unlisted: &[&str]) -> Self {
+            Self {
+                inner,
+                unlisted: unlisted.iter().map(|s| id(s)).collect(),
+                all_records_calls: Default::default(),
+                branch_records_calls: Default::default(),
+            }
+        }
+
+        fn listed(&self, records: Vec<NsRecord>) -> Vec<NsRecord> {
+            records
+                .into_iter()
+                .filter(|r| !self.unlisted.contains(&r.ledger_id))
+                .collect()
+        }
+
+        /// `(all_records, branch_records)` calls so far.
+        fn calls(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (
+                self.all_records_calls.load(SeqCst),
+                self.branch_records_calls.load(SeqCst),
+            )
+        }
+    }
+
+    mod listing_ns_impls {
+        use super::ListingNs;
+        use async_trait::async_trait;
+        use fluree_db_core::ContentId;
+        use fluree_db_nameservice::{
+            BranchLifecycle, ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord,
+            IndexPublisher, NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
+            RefLookup, RefValue, Result, StatusLookup, StatusValue,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+
+        #[async_trait]
+        impl NameServiceLookup for ListingNs {
+            async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+                self.inner.lookup(ledger_id).await
+            }
+            async fn all_records(&self) -> Result<Vec<NsRecord>> {
+                self.all_records_calls.fetch_add(1, SeqCst);
+                Ok(self.listed(self.inner.all_records().await?))
+            }
+            async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+                self.branch_records_calls.fetch_add(1, SeqCst);
+                Ok(self.listed(self.inner.branch_records(ledger_name).await?))
+            }
+        }
+
+        #[async_trait]
+        impl GraphSourceLookup for ListingNs {
+            async fn lookup_graph_source(&self, id: &str) -> Result<Option<GraphSourceRecord>> {
+                self.inner.lookup_graph_source(id).await
+            }
+            async fn lookup_any(&self, id: &str) -> Result<NsLookupResult> {
+                self.inner.lookup_any(id).await
+            }
+            async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+                self.inner.all_graph_source_records().await
+            }
+        }
+
+        #[async_trait]
+        impl RefLookup for ListingNs {
+            async fn get_ref(&self, id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+                self.inner.get_ref(id, kind).await
+            }
+        }
+
+        #[async_trait]
+        impl StatusLookup for ListingNs {
+            async fn get_status(&self, id: &str) -> Result<Option<StatusValue>> {
+                self.inner.get_status(id).await
+            }
+        }
+
+        #[async_trait]
+        impl ConfigLookup for ListingNs {
+            async fn get_config(&self, id: &str) -> Result<Option<ConfigValue>> {
+                self.inner.get_config(id).await
+            }
+        }
+
+        #[async_trait]
+        impl IndexPublisher for ListingNs {
+            async fn publish_index(&self, id: &str, t: i64, index_id: &ContentId) -> Result<()> {
+                self.inner.publish_index(id, t, index_id).await
+            }
+        }
+
+        #[async_trait]
+        impl BranchLifecycle for ListingNs {
+            async fn create_branch(
+                &self,
+                ledger_name: &str,
+                new_branch: &str,
+                source_branch: &str,
+                at_commit: Option<(ContentId, i64)>,
+            ) -> Result<()> {
+                self.inner
+                    .create_branch(ledger_name, new_branch, source_branch, at_commit)
+                    .await
+            }
+            async fn drop_branch(&self, id: &str) -> Result<Option<u32>> {
+                self.inner.drop_branch(id).await
+            }
+            async fn reset_head(&self, id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
+                self.inner.reset_head(id, snapshot).await
+            }
+        }
+    }
+
+    /// A branch no listing shows yet is still a sibling once this process
+    /// has built it: its head is looked up when the pass releases, and a
+    /// dictionary blob it references is deferred. DynamoDB lists through an
+    /// eventually consistent index, so a fork created a moment ago can be
+    /// missing from a listing taken inside the window.
     #[tokio::test]
-    async fn a_fork_the_listing_predates_is_a_sibling_once_built_here() {
+    async fn a_branch_no_listing_shows_yet_is_a_sibling_once_built_here() {
         use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
         use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
         use fluree_db_core::{ContentStore, DictKind, StorageWrite};
@@ -3840,10 +3918,10 @@ mod tests {
         ns.create_ledger(DEV).unwrap();
         ns.publish_index(DEV, 4, &dev1).await.unwrap();
 
+        let ns = Arc::new(ListingNs::new(ns, &[DEV]));
         let ctx = GcPassContext {
             backend: StorageBackend::Managed(Arc::new(storage.clone())),
-            nameservice: ns,
-            directory: Arc::default(),
+            nameservice: ns.clone(),
             config: IndexerConfig {
                 gc_max_old_indexes: 1,
                 ..IndexerConfig::default()
@@ -3851,11 +3929,6 @@ mod tests {
             maintenance: Arc::default(),
             tick: watch::channel(0u64).0,
         };
-        // Listed before the fork existed.
-        let mut main_record = NsRecord::new("db:main");
-        main_record.index_head_id = Some(cid3.clone());
-        ctx.directory.replace(Arc::new(vec![main_record])).await;
-
         let locks: GcLocks = Arc::default();
         drop(try_begin_build(&locks, &id(DEV)).expect("no window open"));
 
@@ -3871,6 +3944,129 @@ mod tests {
         assert!(
             store.has(&shared).await.unwrap(),
             "db:dev's head references the blob; it must survive main's pass"
+        );
+        assert_eq!(ns.calls(), (0, 1), "one listing of db's branches");
+    }
+
+    /// A pass lists its ledger's branches afresh, inside the release window
+    /// where the ledger's builds wait on it, and never the whole nameservice.
+    /// Under the default settings, a ledger publishing faster than the age
+    /// guard keeps ten old versions: the eleventh goes although its garbage is
+    /// fresh, and the listing finds the fork that still reads its blob.
+    #[tokio::test]
+    async fn a_pass_lists_its_ledgers_branches_afresh() {
+        use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
+        use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
+        use fluree_db_core::{ContentStore, DictKind, StorageWrite};
+        use fluree_db_nameservice::IndexPublisher;
+
+        const MAIN: &str = "ceil:main";
+        const DEV: &str = "ceil:dev";
+        const VERSIONS: i64 = 12;
+        let dict_kind = ContentKind::DictBlob {
+            dict: DictKind::Graphs,
+        };
+        let storage = MemoryStorage::new();
+        let (shared, shared_addr) = cid_and_addr_for(MAIN, dict_kind, b"ceil leaf N");
+        let (touched, touched_addr) = cid_and_addr_for(MAIN, dict_kind, b"ceil leaf N+1");
+        storage
+            .write_bytes(&shared_addr, b"ceil leaf N")
+            .await
+            .unwrap();
+        storage
+            .write_bytes(&touched_addr, b"ceil leaf N+1")
+            .await
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut roots: Vec<ContentId> = Vec::new();
+        for t in 1..=VERSIONS {
+            let (root, root_addr) = cid_and_addr_for(
+                MAIN,
+                ContentKind::IndexRoot,
+                format!("ceil-r{t}").as_bytes(),
+            );
+            let (garbage, prev) = match roots.last() {
+                None => (None, None),
+                Some(prev) => {
+                    let (g, g_addr) = cid_and_addr_for(
+                        MAIN,
+                        ContentKind::GarbageRecord,
+                        format!("ceil-g{t}").as_bytes(),
+                    );
+                    // Version 2 replaced the blob version 1 read.
+                    let named = if t == 2 {
+                        format!(r#""{shared}""#)
+                    } else {
+                        String::new()
+                    };
+                    let body = format!(
+                        r#"{{"ledger_id": "{MAIN}", "t": {t}, "garbage": [{named}], "created_at_ms": {now_ms}}}"#
+                    );
+                    storage.write_bytes(&g_addr, body.as_bytes()).await.unwrap();
+                    (
+                        Some(BinaryGarbageRef { id: g }),
+                        Some(BinaryPrevIndexRef {
+                            t: t - 1,
+                            id: prev.clone(),
+                        }),
+                    )
+                }
+            };
+            let reads = if t == 1 { &shared } else { &touched };
+            let bytes = minimal_fir6_for(MAIN, t, prev, garbage, reads.clone());
+            storage.write_bytes(&root_addr, &bytes).await.unwrap();
+            roots.push(root);
+        }
+        let head = roots.last().unwrap().clone();
+        // A fork of version 1.
+        let (dev1, dev1_addr) = cid_and_addr_for(DEV, ContentKind::IndexRoot, b"ceil-d1");
+        let dev_root = minimal_fir6_for(DEV, 1, None, None, shared.clone());
+        storage.write_bytes(&dev1_addr, &dev_root).await.unwrap();
+
+        let ns = Arc::new(MemoryNameService::new());
+        ns.create_ledger(MAIN).unwrap();
+        ns.publish_index(MAIN, VERSIONS, &head).await.unwrap();
+        ns.create_ledger(DEV).unwrap();
+        ns.publish_index(DEV, 1, &dev1).await.unwrap();
+
+        // A ledger the pass has no business listing.
+        ns.create_ledger("other:main").unwrap();
+        let ns = Arc::new(ListingNs::new(ns, &[]));
+        let ctx = GcPassContext {
+            backend: StorageBackend::Managed(Arc::new(storage.clone())),
+            nameservice: ns.clone(),
+            config: IndexerConfig::default(),
+            maintenance: Arc::default(),
+            tick: watch::channel(0u64).0,
+        };
+        let locks: GcLocks = Arc::default();
+        let gc = try_hold_gc(&locks, &name("ceil")).expect("free lock");
+        let result = ctx
+            .run(&id(MAIN), &head, &gc, InFlightBuild::GiveUp)
+            .await
+            .unwrap();
+
+        let store = fluree_db_core::storage::content_store_for(storage.clone(), MAIN);
+        assert_eq!(
+            (result.indexes_cleaned, result.age_guard_overridden),
+            (1, 1),
+            "the eleventh old version goes, inside the age guard"
+        );
+        assert_eq!(result.retained, 11);
+        assert!(!store.has(&roots[0]).await.unwrap());
+        assert_eq!(result.shared_deferred, 1);
+        assert!(
+            store.has(&shared).await.unwrap(),
+            "ceil:dev's head reads the blob"
+        );
+        assert_eq!(
+            ns.calls(),
+            (0, 1),
+            "the pass lists ceil's branches once and never the whole nameservice"
         );
     }
 
