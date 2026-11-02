@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
-use fluree_db_iceberg::auth::AuthConfig;
+use fluree_db_iceberg::auth::{AuthConfig, ConfigValueField, ValueClass};
 use fluree_db_iceberg::config::{DeleteConvention, MappingSource};
 use fluree_db_iceberg::{ConfigValue, SecretResolver};
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,24 @@ pub enum AzureAuth {
         /// with the graph source.
         client_secret: ConfigValue,
     },
+}
+
+impl AzureAuth {
+    /// Every [`ConfigValue`] this credential holds, with paths relative to
+    /// the `azure` object; see [`fluree_db_iceberg::auth::fields`].
+    pub fn config_values(&self) -> Vec<ConfigValueField<'_>> {
+        match self {
+            AzureAuth::ClientSecret {
+                tenant_id: _,
+                client_id: _,
+                client_secret,
+            } => vec![ConfigValueField::new(
+                "client_secret",
+                client_secret,
+                ValueClass::Secret,
+            )],
+        }
+    }
 }
 
 impl DeltaIoConfig {

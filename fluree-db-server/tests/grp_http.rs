@@ -13,6 +13,8 @@ mod graph_store_http;
 #[cfg(feature = "graphql")]
 #[path = "graphql_http_integration.rs"]
 mod graphql_http_integration;
+#[path = "iceberg_connection_http.rs"]
+mod iceberg_connection_http;
 #[path = "iceberg_track_durability.rs"]
 mod iceberg_track_durability;
 #[path = "integration.rs"]

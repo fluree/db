@@ -55,12 +55,19 @@ fluree sql map <NAME> --endpoint <URL> --r2rml <PATH> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--auth-bearer <TOKEN>` | Static bearer token |
+| `--auth-bearer <TOKEN>` | Static bearer token. Stored with the graph source; prefer the option below |
+| `--auth-bearer-env <VAR>` | Environment variable holding the bearer token, read by the process that queries the endpoint; the token is not stored. With `--remote`, the server must list it in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
 | `--oauth2-token-url <URL>` | OAuth2 client-credentials token endpoint |
 | `--oauth2-client-id <ID>` | OAuth2 client ID |
-| `--oauth2-client-secret <SECRET>` | OAuth2 client secret |
+| `--oauth2-client-secret <SECRET>` | OAuth2 client secret. Stored; prefer the option below |
+| `--oauth2-client-secret-env <VAR>` | Environment variable holding the client secret; as `--auth-bearer-env` |
 | `--oauth2-scope <SCOPE>` | OAuth2 scope |
 | `--oauth2-audience <AUD>` | OAuth2 audience |
+| `--auth-google-metadata`, `--auth-google-adc`, `--auth-google-service-account-env <VAR>`, `--auth-google-wif-config <FILE>`, `--auth-google-quota-project <PROJECT>`, `--auth-google-scopes <SCOPES>` | A Google identity, as for [`fluree iceberg map`](iceberg.md#options) |
+
+Give one way to authenticate. A bearer token beside OAuth2, two Google sources, and OAuth2 without both `--oauth2-token-url` and a client secret are refused. With `--remote`, the CLI sends a bearer token or OAuth2 client credentials as the flat fields and a Google identity as the structured `auth`. A server older than the structured `auth` reads the literal flat fields (`--auth-bearer`, `--oauth2-client-secret` and the other OAuth2 options), but not the `_env` forms or a Google identity, which it ignores, registering the source with no auth.
+
+A Google identity's token goes to the SQL endpoint, but a **host** identity's token (the metadata server's, the host's application-default credentials, WIF signed with the host's own AWS identity) is sent only to Google's APIs (`https` on `googleapis.com`) and the hosts the operator lists in `FLUREE_GOOGLE_TOKEN_HOSTS`. Against an ordinary Trino endpoint, then, only a service-account key (`--auth-google-service-account-env`) works unless the operator lists the endpoint's host; `--auth-google-metadata`, `--auth-google-adc` and a WIF configuration signed with the host's AWS identity are refused with `403` (`err:auth/HostIdentityRefused`) before a token is minted.
 
 **General:**
 

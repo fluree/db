@@ -75,6 +75,13 @@ pub enum DeltaError {
 
     #[error("Delta reader internal error: {0}")]
     Internal(String),
+
+    /// A graph-source identity refusal from the catalog's auth provider (a
+    /// Google token exchange refused, invalid Google credentials, a host
+    /// identity the policy refuses), kept typed so the source reports it with
+    /// the same wire code and status as an Iceberg source would.
+    #[error("{0}")]
+    Identity(fluree_db_iceberg::IcebergError),
 }
 
 impl DeltaError {
@@ -209,17 +216,24 @@ fn catalog_refusal(error: &delta_kernel::Error) -> Option<DeltaError> {
     };
     let mut cause = std::error::Error::source(store);
     while let Some(error) = cause {
-        if let Some(DeltaError::Catalog {
-            table,
-            message,
-            denied,
-        }) = error.downcast_ref::<DeltaError>()
-        {
-            return Some(DeltaError::Catalog {
-                table: table.clone(),
-                message: message.clone(),
-                denied: *denied,
-            });
+        match error.downcast_ref::<DeltaError>() {
+            Some(DeltaError::Catalog {
+                table,
+                message,
+                denied,
+            }) => {
+                return Some(DeltaError::Catalog {
+                    table: table.clone(),
+                    message: message.clone(),
+                    denied: *denied,
+                })
+            }
+            // A credential renewal refused for the catalog identity's own
+            // reasons (its Google token exchange, the host-identity policy).
+            Some(DeltaError::Identity(refusal)) => {
+                return Some(DeltaError::Identity(refusal.clone()))
+            }
+            _ => {}
         }
         cause = error.source();
     }
@@ -232,6 +246,29 @@ mod tests {
 
     fn replay_failure(source: delta_kernel::Error) -> DeltaError {
         DeltaError::kernel("t", source)
+    }
+
+    /// A credential renewal refused for the catalog identity's own reasons
+    /// reaches Kernel through the object store; it comes back out typed.
+    #[test]
+    fn an_identity_refusal_survives_the_object_store() {
+        let refusal = DeltaError::Identity(fluree_db_iceberg::IcebergError::HostIdentityRefused {
+            kind: fluree_db_iceberg::HostIdentityKind::GoogleHostSignedWif,
+        });
+        let through_store =
+            delta_kernel::Error::ObjectStore(delta_kernel::object_store::Error::Generic {
+                store: "UnityCatalog",
+                source: Box::new(refusal),
+            });
+        match DeltaError::kernel("t", through_store) {
+            DeltaError::Identity(fluree_db_iceberg::IcebergError::HostIdentityRefused { kind }) => {
+                assert_eq!(
+                    kind,
+                    fluree_db_iceberg::HostIdentityKind::GoogleHostSignedWif
+                );
+            }
+            other => panic!("expected the typed refusal back, got {other:?}"),
+        }
     }
 
     #[test]

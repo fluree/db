@@ -23,9 +23,7 @@
 //! (`ICEBERG_WAREHOUSE`, `ICEBERG_OAUTH2_TOKEN_URL`, `ICEBERG_OAUTH2_SCOPE`,
 //! `ICEBERG_OAUTH2_CLIENT_ID`, `ICEBERG_OAUTH2_CLIENT_SECRET`).
 
-use fluree_db_api::{
-    sample_column_values, sample_iceberg_rows, IcebergConnectionConfig, TableIdentifier,
-};
+use fluree_db_api::{FlureeBuilder, IcebergConnectionConfig, TableIdentifier};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -105,9 +103,12 @@ async fn sample_rows_and_column_live_snowflake() {
     let table = TableIdentifier::new(&namespace, &table_name);
 
     const N: usize = 5;
+    // Sampling runs under an instance's identity context.
+    let fluree = FlureeBuilder::memory().build_memory();
 
     // -- Row sample (all columns) -------------------------------------------
-    let rows = sample_iceberg_rows(conn.clone(), table.clone(), None, N)
+    let rows = fluree
+        .sample_iceberg_rows(conn.clone(), table.clone(), None, N)
         .await
         .expect("sample_iceberg_rows must succeed against live Snowflake");
     eprintln!(
@@ -122,7 +123,8 @@ async fn sample_rows_and_column_live_snowflake() {
     // -- Projected row sample (first two column names) ----------------------
     if let Some(first) = rows.first().and_then(|r| r.as_object()) {
         let cols: Vec<String> = first.keys().take(2).cloned().collect();
-        let projected = sample_iceberg_rows(conn.clone(), table.clone(), Some(cols.clone()), N)
+        let projected = fluree
+            .sample_iceberg_rows(conn.clone(), table.clone(), Some(cols.clone()), N)
             .await
             .expect("projected sample_iceberg_rows must succeed");
         for row in &projected {
@@ -136,7 +138,8 @@ async fn sample_rows_and_column_live_snowflake() {
         // -- Single-column sample: same row count as the all-columns sample
         //    (both read the first row group of the same first data file). --
         let col = cols[0].clone();
-        let values = sample_column_values(conn.clone(), table.clone(), col.clone(), N)
+        let values = fluree
+            .sample_column_values(conn.clone(), table.clone(), col.clone(), N)
             .await
             .expect("sample_column_values must succeed");
         eprintln!("sampled {} value(s) of column {col}", values.len());

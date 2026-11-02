@@ -274,6 +274,15 @@ Pick that maximum depth deliberately and state it wherever the query is document
 
 For genuinely unbounded traversal, materialize the graph source into a native ledger first — see [Materializing a Native Twin](iceberg.md#materializing-a-native-twin). A native ledger evaluates all of these patterns normally.
 
+**JSON-LD subgraph selections.** A JSON-LD subgraph selection over a graph source (`"select": {"?s": ["*"]}`, an explicit property list, or `["@id"]`) is answered by rewriting it into a flat table scan and grouping the rows per subject. Some query keys have no place in that rewrite, so a subgraph selection that carries one is refused with **HTTP 400 `err:r2rml/UnsupportedPattern`** instead of being answered without it:
+
+- **A top-level `values`** — dropping it would return every subject the `where` matches, not the ones `values` names. Put the constraint in the `where` clause instead.
+- **`groupBy` / `having`** — dropping them would return subjects whose groups `having` rejects. Select the grouped variables with a flat `select` instead.
+- **A positive `depth`** on a selection that reads properties (`["*"]` or a property list) — on a native ledger `depth` expands each reference into the referenced node's own properties, but the rewrite renders a reference as its `@id` and expands none, so it would answer as `depth: 0`. Select each referenced subject with its own `"select": {"<iri>": ["*"]}` instead. `["@id"]` and `["@type"]` read no reference, so they take any `depth`.
+- **An `offset` past 10,000 subjects** — each page reads every subject before it again, so paging that deep is refused. Narrow the `where` clause instead.
+
+A flat `select` (`"select": ["?s", "?name"]`) is not a subgraph selection: it takes `values`, `groupBy` and `having` as usual.
+
 ### Patterns Must Be Inside the GRAPH Block
 
 Patterns reach a graph source only inside a `GRAPH <gs_id> { … }` block. Fluree adds that block automatically when you address a graph source directly — but **not** to a query that already contains a `GRAPH` block of its own, since that is taken as explicit scoping. In a query that mixes the two, any triple pattern left at the top level has nothing to route it, and it returns **HTTP 400 `err:db/InvalidQuery`**:
