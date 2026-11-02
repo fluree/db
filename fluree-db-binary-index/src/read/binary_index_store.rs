@@ -420,6 +420,11 @@ pub struct BinaryIndexStore {
     /// first use. The store owns it, so it lives and dies with the store's
     /// immutable arenas. See [`Self::vector_identity`].
     vector_identities: RwLock<HashMap<(GraphId, u32), Arc<VectorIdentity>>>,
+    /// Per graph, the [`ShardPins`] its table-resolved vector keys share,
+    /// held weakly so it drops with the last such key. Shared across views:
+    /// an operator may key each batch through a fresh view, and its keys
+    /// from every batch compare against each other.
+    vector_pins: RwLock<HashMap<GraphId, std::sync::Weak<ShardPins>>>,
     /// The predicates with list rows, built on first use. See
     /// [`Self::list_predicate_ids`].
     list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
@@ -507,6 +512,7 @@ impl BinaryIndexStore {
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
             vector_identities: RwLock::new(HashMap::new()),
+            vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -696,6 +702,7 @@ impl BinaryIndexStore {
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
             vector_identities: RwLock::new(HashMap::new()),
+            vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -2618,6 +2625,18 @@ impl BinaryIndexStore {
         )))
     }
 
+    /// `g_id`'s shared [`ShardPins`]: the live one if any key holds it, or a
+    /// new one.
+    fn shard_pins(store: &Arc<Self>, g_id: GraphId) -> Arc<ShardPins> {
+        let mut pins = store.vector_pins.write();
+        if let Some(live) = pins.get(&g_id).and_then(std::sync::Weak::upgrade) {
+            return live;
+        }
+        let fresh = Arc::new(ShardPins::new(Arc::clone(store), g_id));
+        pins.insert(g_id, Arc::downgrade(&fresh));
+        fresh
+    }
+
     /// `(g_id, p_id)`'s vector identity table if something has built it;
     /// never builds it.
     pub fn built_vector_identity(&self, g_id: GraphId, p_id: u32) -> Option<Arc<VectorIdentity>> {
@@ -3434,20 +3453,21 @@ pub enum ArenaVectorForm {
     /// no shard. Two keys of one arena compare by canonical handle; only a
     /// comparison with another arena's key or a decoded vector, on a hash
     /// match, reads the components ([`ArenaVector::components`]), through the
-    /// [`ShardPins`] its view's keys share.
+    /// [`ShardPins`] its graph's keys share.
     Canonical {
         canonical: u32,
         pins: Arc<ShardPins>,
     },
 }
 
-/// The shards that comparisons of one view's table-resolved vector keys have
+/// The shards that comparisons of a graph's table-resolved vector keys have
 /// read, shared by those keys. A comparison that reads a vector's components
 /// pins its shard here, so later comparisons in that shard reuse it rather
 /// than reload it after the shared cache evicts it (a scan in subject order
-/// reads handles out of order). It lives as long as the keys do: the view
-/// holds it weakly. Only shards a comparison needed are pinned, so a
-/// `DISTINCT` or `GROUP BY` over one tabled predicate pins none.
+/// reads handles out of order). It lives as long as the keys do: the store
+/// and its views hold it weakly. Each shard is pinned at most once, and only
+/// shards a comparison needed, so a `DISTINCT` or `GROUP BY` over one tabled
+/// predicate pins none.
 pub struct ShardPins {
     store: Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -3534,7 +3554,7 @@ impl ArenaVector {
     }
 
     /// Its components: the slice it holds, or its arena's, read through its
-    /// view's [`ShardPins`]. `None` if the arena doesn't hold the handle,
+    /// graph's [`ShardPins`]. `None` if the arena doesn't hold the handle,
     /// which an arena that built a table for it always does.
     pub fn components(&self) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
         match &self.form {
@@ -3631,8 +3651,8 @@ struct VectorCursorInner {
     /// than one copy of the arena. Holds nothing alive itself.
     handed_out:
         rustc_hash::FxHashMap<(u32, usize), std::sync::Weak<crate::arena::vector::VectorShard>>,
-    /// The [`ShardPins`] this view's table-resolved keys share, weakly, so it
-    /// drops with the last of them.
+    /// The store's [`ShardPins`] for this view's graph, weakly, so a key
+    /// skips the store's lock while the pins live.
     pins: std::sync::Weak<ShardPins>,
 }
 
@@ -3959,7 +3979,7 @@ impl BinaryGraphView {
             .and_then(|(_, identity)| identity.as_ref()?.of(handle))
         {
             let pins = cursor.pins.upgrade().unwrap_or_else(|| {
-                let pins = Arc::new(ShardPins::new(Arc::clone(&self.store), self.g_id));
+                let pins = BinaryIndexStore::shard_pins(&self.store, self.g_id);
                 cursor.pins = Arc::downgrade(&pins);
                 pins
             });
@@ -4869,7 +4889,8 @@ pub(crate) mod tests {
     }
 
     /// Comparisons of table-resolved keys pin the shards they read, shared by
-    /// the view's keys: after the shared cache evicts a shard, a later
+    /// the graph's keys across views (an operator may key each batch through
+    /// a fresh view): after the shared cache evicts a shard, a later
     /// comparison in it reuses the copy an earlier one read rather than load
     /// another, so a join whose matches jump between shards loads each once.
     #[test]
@@ -4883,9 +4904,15 @@ pub(crate) mod tests {
         let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
         let view = view_with_vector_arena(7, arena);
         view.store().vector_identity(0, 7).unwrap().unwrap();
-        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let store = view.clone_store();
+        // Each key through its own view, as a batch-at-a-time operator has.
         let keys: Vec<ArenaVector> = (0..4)
-            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .map(|h| {
+                BinaryGraphView::new(Arc::clone(&store), 0)
+                    .arena_vector(7, h)
+                    .unwrap()
+                    .unwrap()
+            })
             .collect();
         let first = keys[0].components().unwrap().unwrap();
         // Read the other shard, then evict everything.
