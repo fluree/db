@@ -291,7 +291,7 @@ impl crate::Fluree {
 
         let mut gs_config = config.to_gs_config(&mapping_address);
         let mut mapping_warnings = Vec::new();
-        let connection_tested = match build_sql_client(&gs_config, self.secret_resolver()).await {
+        let connection_tested = match build_sql_client(&gs_config, self.identity_context()).await {
             Ok(client) => match client.execute_collect("SELECT 1").await {
                 Ok(_) => {
                     if let Some(mapping) = &compiled_for_probe {
@@ -400,9 +400,9 @@ impl crate::Fluree {
             mapping_ref.media_type.as_deref(),
             &mapping_ref.source,
         )?;
-        let client = build_sql_client(&config, self.secret_resolver())
+        let client = build_sql_client(&config, self.identity_context())
             .await
-            .map_err(|e| crate::ApiError::Config(e.to_string()))?;
+            .map_err(sql_api_error)?;
         let (flagged, unverified, mapping_warnings) =
             probe_duplicate_subjects(&client, &compiled, config.allow_duplicate_subjects).await;
         config.duplicate_subject_tables = flagged.clone();
@@ -431,26 +431,30 @@ impl crate::Fluree {
 
     /// `SELECT 1` against the endpoint with the configured credentials.
     pub async fn test_sql_connection(&self, config: &SqlGsConfig) -> crate::Result<()> {
-        let client = build_sql_client(config, self.secret_resolver())
+        let client = build_sql_client(config, self.identity_context())
             .await
-            .map_err(|e| crate::ApiError::Config(e.to_string()))?;
+            .map_err(sql_api_error)?;
         client
             .execute_collect("SELECT 1")
             .await
             .map(|_| ())
-            .map_err(|e| {
-                crate::ApiError::Config(format!("SQL endpoint connection test failed: {e}"))
+            .map_err(|e| match e {
+                SqlError::Identity(_) => sql_api_error(e),
+                other => {
+                    crate::ApiError::Config(format!("SQL endpoint connection test failed: {other}"))
+                }
             })
     }
 }
 
-/// Hydrate secrets, build the auth provider, and construct the client.
+/// Hydrate secrets, build the auth provider under `identity`, and construct the
+/// client.
 async fn build_sql_client(
     config: &SqlGsConfig,
-    resolver: Option<&Arc<dyn fluree_db_sql::SecretResolver>>,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> Result<TrinoClient, SqlError> {
-    let hydrated = config.hydrate(resolver).await?;
-    let auth = hydrated.auth.create_provider_arc()?;
+    let hydrated = config.hydrate(identity.secret_resolver.as_ref()).await?;
+    let auth = hydrated.auth.create_provider_arc(identity)?;
     TrinoClient::new(&hydrated, auth)
 }
 
@@ -476,18 +480,23 @@ impl SqlSource {
             ))
         })?;
         let cache = fluree.r2rml_cache();
-        let key = super::r2rml::catalog_client_cache_key(&record.graph_source_id, &record.config);
+        let key = super::r2rml::catalog_client_cache_key(
+            &record.graph_source_id,
+            &record.config,
+            fluree.identity_context(),
+        );
         let client = match cache.sql_client(&key) {
             Some(c) => c,
             None => {
                 let c = Arc::new(
-                    build_sql_client(&config, fluree.secret_resolver())
+                    build_sql_client(&config, fluree.identity_context())
                         .await
                         .map_err(|e| {
-                            QueryError::Internal(format!(
-                                "SQL graph source '{}': {e}",
-                                record.graph_source_id
-                            ))
+                            let msg = format!("SQL graph source '{}': {e}", record.graph_source_id);
+                            match e {
+                                SqlError::Identity(refusal) => identity_or(refusal, msg),
+                                _ => QueryError::Internal(msg),
+                            }
                         })?,
                 );
                 cache.put_sql_client(key, Arc::clone(&c));
@@ -724,7 +733,27 @@ fn sql_query_error(graph_source_id: &str, table_name: &str, e: SqlError) -> Quer
     let msg = format!("SQL graph source '{graph_source_id}', table '{table_name}': {e}");
     match e {
         SqlError::Config(_) | SqlError::Unsupported(_) => QueryError::InvalidQuery(msg),
+        SqlError::Identity(refusal) => identity_or(refusal, msg),
         _ => QueryError::Internal(msg),
+    }
+}
+
+/// An identity refusal as its typed `QueryError` (the wire codes and statuses
+/// an Iceberg source reports), or `fallback` should it not be one.
+fn identity_or(refusal: fluree_db_iceberg::IcebergError, fallback: String) -> QueryError {
+    super::iceberg_catalog::identity_query_error(refusal).unwrap_or(QueryError::Internal(fallback))
+}
+
+/// A SQL client that could not be built or reached, on the admin paths
+/// (check, connection test): an identity refusal keeps its type and code,
+/// anything else is the caller's configuration.
+fn sql_api_error(e: SqlError) -> crate::ApiError {
+    match e {
+        SqlError::Identity(refusal) => {
+            let message = refusal.to_string();
+            crate::ApiError::Query(identity_or(refusal, message))
+        }
+        other => crate::ApiError::Config(other.to_string()),
     }
 }
 
@@ -781,6 +810,75 @@ pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn google_sql_source() -> SqlGsConfig {
+        let mut config = SqlGsConfig::new("https://trino.invalid");
+        config.auth = fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+            scopes: None,
+            metadata_url: None,
+        };
+        config
+    }
+
+    /// A SQL source's identity refusal is typed where its client is built for
+    /// a query and on the admin connection test, with the codes an Iceberg
+    /// source reports.
+    #[tokio::test]
+    async fn a_refused_sql_identity_is_typed_on_query_and_admin_paths() {
+        let fluree = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(fluree_db_iceberg::HostIdentityPolicy::deny_all());
+        let config = google_sql_source();
+        let record = GraphSourceRecord::new(
+            "sql-identity",
+            "main",
+            GraphSourceType::Sql,
+            config.to_json().unwrap(),
+            vec![],
+        );
+        let query = match SqlSource::open(&fluree, &record).await {
+            Ok(_) => panic!("the policy refuses the metadata server"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&query, QueryError::HostIdentityRefused { kind, .. } if kind == "google-metadata"),
+            "{query:?}"
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 403);
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+
+        let tested = fluree.test_sql_connection(&config).await.unwrap_err();
+        assert_eq!(tested.status_code(), 403, "{tested:?}");
+        assert_eq!(
+            tested.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+    }
+
+    /// A Google token exchange the endpoint's auth could not complete, met on
+    /// a scan, keeps its code and Google's status.
+    #[test]
+    fn a_google_exchange_refusal_on_a_sql_scan_keeps_its_code() {
+        let query = sql_query_error(
+            "sql-identity:main",
+            "orders",
+            SqlError::Identity(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Impersonation,
+                status: Some(403),
+                reason: Some("PERMISSION_DENIED".to_string()),
+            }),
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 403, "{api:?}");
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::GOOGLE_TOKEN_EXCHANGE
+        );
+    }
 
     #[test]
     fn create_config_round_trips_into_gs_config() {

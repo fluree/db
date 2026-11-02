@@ -369,7 +369,10 @@ async fn live_bridge_round_trip() {
         let mut cfg = fluree_db_sql::SqlGsConfig::new(endpoint.clone());
         cfg.dialect = dialect;
         let cfg = cfg.hydrate(None).await.expect("hydrate");
-        let auth = cfg.auth.create_provider_arc().expect("auth");
+        let auth = cfg
+            .auth
+            .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+            .expect("auth");
         let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
         for stmt in [
             "DROP TABLE IF EXISTS bridge_people",

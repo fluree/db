@@ -70,8 +70,8 @@ pub use commit::{
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{
-    graph_id_in, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey, Origin, Retraction, Slot,
-    StoredFact, DELETE_POINT_READ_SITE,
+    graph_id_in, resolve_same_t_pairs, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey,
+    Origin, Retraction, SameTPair, Slot, StoredFact, DELETE_POINT_READ_SITE,
 };
 pub use error::{ReportResult, Result, ShaclViolations, TransactError};
 pub use flake_sink::FlakeSink;

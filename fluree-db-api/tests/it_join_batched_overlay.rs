@@ -504,11 +504,11 @@ async fn batched_object_join_merges_novelty() {
     let receipt = fluree
         .update(
             receipt.ledger,
-            // A constant delete names one entry of a value held at several
-            // list positions; a WHERE-driven delete would name every one.
+            // A delete naming a list position retracts that entry alone;
+            // naming the value would retract every entry holding it.
             &json!({
                 "@context": ctx(),
-                "delete": {"@id": "ex:b5", "ex:authors": {"@id": "ex:bob"}}
+                "delete": {"@id": "ex:b5", "ex:authors": {"@list": [{"@id": "ex:bob"}]}}
             }),
         )
         .await

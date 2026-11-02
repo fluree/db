@@ -7,6 +7,8 @@ mod it_flpack_round_trip;
 mod it_import;
 #[path = "it_import_class_stats.rs"]
 mod it_import_class_stats;
+#[path = "it_import_jsonld_graph_scope.rs"]
+mod it_import_jsonld_graph_scope;
 #[path = "it_import_ndjson.rs"]
 mod it_import_ndjson;
 #[path = "it_import_ns_split_mode.rs"]

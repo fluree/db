@@ -371,6 +371,7 @@ pub fn build_stamp_chunk(
         prefix_map,
         spool_result,
         txn_meta,
+        named_graphs: Vec::new(),
     })
 }
 
@@ -935,6 +936,7 @@ fn spawn_produce_workers(
                             prefix_map,
                             spool_result,
                             txn_meta: Vec::new(),
+                            named_graphs: Vec::new(),
                         };
                         encode_ms += enc.elapsed().as_millis();
                         // Err => the consumer dropped the receiver; stop early.

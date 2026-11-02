@@ -39,6 +39,8 @@ mod it_reindex_class_stats;
 mod it_reindex_pre_build_perf;
 #[path = "it_reindex_schema.rs"]
 mod it_reindex_schema;
+#[path = "it_same_t_one_rule.rs"]
+mod it_same_t_one_rule;
 #[path = "it_stats_sketch_format.rs"]
 mod it_stats_sketch_format;
 #[path = "it_store_load_failure.rs"]
