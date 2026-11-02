@@ -5,11 +5,9 @@
 //! reports it on demand (`configDiagnostics`); this pins the warning logged
 //! once per ledger load, and only for that state.
 //!
-//! Kept as the ONLY test in its own `[[test]]` binary, the same convention as
-//! `it_bm25_sync_scoping` and `it_minmax_fast_path_fired`: tracing's
-//! callsite-interest cache is process-global and the `set_default` capture is
-//! thread-local, so a sibling test in the same process can leave the
-//! callsite's cached interest disabled. See `docs/contributing/tests.md`.
+//! Its own `[[test]]` binary predates the shared capture helper; the capture
+//! goes through `fluree_test_support::scoped_default`, so a sibling test can't
+//! leave the callsite disabled. See `docs/contributing/tests.md`.
 
 mod support;
 

@@ -9,7 +9,8 @@
 //!
 //! - **Turtle**: Default graph triples only
 //! - **TriG**: Default graph + named GRAPH blocks with g_id allocation
-//! - **JSON-LD**: Expanded JSON-LD documents via GraphSink adapter
+//! - **JSON-LD**: Expanded JSON-LD documents via GraphSink adapter, `@graph`
+//!   scoping (graph selectors and JSON-LD named graphs) included
 //!
 //! See the Phase 3 plan for full semantics documentation.
 
@@ -42,6 +43,260 @@ mod inner {
     use rustc_hash::FxHashSet;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The graph a bulk import writes for the graph IRI `iri` (a TriG block's,
+    /// or a JSON-LD graph name's), read through the ledger's graph-position
+    /// table, as every graph position of a ledger reads it: the ledger's own
+    /// address is its default graph (`None`), `L#<g>` the graph `<g>`, and any
+    /// other IRI the graph of that IRI. `registered` is the import's own graph
+    /// table. `urn:default`, a name that is no graph of the ledger, and the
+    /// ledger's system graphs are refused.
+    fn import_graph_position<F>(
+        iri: &str,
+        ledger_id: &str,
+        registered: &F,
+    ) -> Result<Option<String>>
+    where
+        F: Fn(&str) -> Option<u16>,
+    {
+        crate::stage::refuse_default_graph_name(iri)?;
+        let graph = match fluree_db_core::LedgerId::parse(ledger_id) {
+            Ok(id) => match TargetLedger::new(&id, registered).graph_position(iri) {
+                GraphPosition::Default => return Ok(None),
+                GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => iri.into_owned(),
+                GraphPosition::NotAGraph => {
+                    return Err(TransactError::Parse(format!(
+                        "<{iri}> names no graph an import can write: an address of this \
+                         ledger names its default graph, or one of its graphs through '#', \
+                         and carries no time"
+                    )))
+                }
+            },
+            Err(_) => iri.to_string(),
+        };
+        refuse_reserved_graph_iri(&graph, ledger_id)?;
+        Ok(Some(graph))
+    }
+
+    /// Refuse a named graph a bulk import may not write, by its literal IRI:
+    /// the ledger's two system graphs, mirroring the staged-write guard's
+    /// shape. Bulk import bypasses staging, so that guard never sees its
+    /// graphs; `import_trig_commit` says why they must not be written.
+    fn refuse_reserved_graph_iri(iri: &str, ledger_id: &str) -> Result<()> {
+        if iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id) {
+            return Err(TransactError::ReservedGraphTarget {
+                graph_iri: iri.to_string(),
+            });
+        }
+        if iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id) {
+            return Err(TransactError::ConfigGraphImportUnsupported {
+                graph_iri: iri.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The second arm of [`refuse_reserved_graph_iri`], mirroring `stage.rs`:
+    /// refuse by what the IRI actually *routes to*, not only by how it is
+    /// spelled. The shared graph allocator is pre-seeded with the two
+    /// reserved IRIs, so this is belt-and-braces today; it is what keeps the
+    /// guard correct if the seeding ever changes. One integer compare per
+    /// graph.
+    fn refuse_reserved_g_id(iri: &str, g_id: u16) -> Result<()> {
+        if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID {
+            return Err(if g_id == fluree_db_core::graph_registry::CONFIG_GRAPH_ID {
+                TransactError::ConfigGraphImportUnsupported {
+                    graph_iri: iri.to_string(),
+                }
+            } else {
+                TransactError::ReservedGraphTarget {
+                    graph_iri: iri.to_string(),
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Drop a bare `graph` key from the top level of a JSON-LD document that
+    /// is not an envelope, as the transaction parser drops it.
+    ///
+    /// There the key is a transaction's routing key (`RESERVED_TXN_KEYS`):
+    /// a transaction strips it and writes the node where it would without it,
+    /// while the expander would read the same key as a graph selector. (An
+    /// envelope's own keys are not data on either path, and the bare key on
+    /// a node inside the document is a selector on both.) A context that
+    /// defines `graph` as a term makes it an ordinary property, kept.
+    /// `shared` is the context a newline-delimited line is read under, beneath
+    /// its own; a whole document has none.
+    fn strip_top_level_graph_key(
+        doc: &mut serde_json::Value,
+        shared: Option<&fluree_graph_json_ld::ParsedContext>,
+    ) -> Result<()> {
+        let Some(obj) = doc.as_object().filter(|obj| obj.contains_key("graph")) else {
+            return Ok(());
+        };
+        if fluree_graph_json_ld::envelope_graph_key(obj)?.is_some() {
+            return Ok(());
+        }
+        let context = match shared {
+            Some(shared) => line_context(shared, doc)?.into_owned(),
+            None => crate::parse::edge_annotations::top_level_context(doc)?,
+        };
+        if fluree_graph_json_ld::is_graph_key("graph", &context) {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.remove("graph");
+            }
+        }
+        Ok(())
+    }
+
+    /// How a JSON-LD chunk of a bulk import is laid out.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JsonLdChunk {
+        /// One JSON-LD document: a `.jsonld` file, whole.
+        Document,
+        /// Newline-delimited JSON-LD as the ndjson reader hands it over: a
+        /// `{"@context": <shared>, "@graph": [lines]}` wrapper. Each line is a
+        /// document of its own under the shared context, as it would be
+        /// imported or inserted alone: its own `@context` resolves its graph
+        /// names, a top-level bare `graph` key is dropped, and a line that is
+        /// an envelope is unwrapped. (Blank-node labels still unify across
+        /// the lines of a context segment, as the reader documents.)
+        Lines,
+    }
+
+    /// The lines of a newline-delimited chunk: its wrapper's `@graph`.
+    fn ndjson_lines(doc: &serde_json::Value) -> Result<&[serde_json::Value]> {
+        match doc.get("@graph") {
+            Some(serde_json::Value::Array(lines)) => Ok(lines),
+            _ => Err(not_an_ndjson_chunk()),
+        }
+    }
+
+    fn ndjson_lines_mut(doc: &mut serde_json::Value) -> Result<&mut [serde_json::Value]> {
+        match doc.get_mut("@graph") {
+            Some(serde_json::Value::Array(lines)) => Ok(lines),
+            _ => Err(not_an_ndjson_chunk()),
+        }
+    }
+
+    fn not_an_ndjson_chunk() -> TransactError {
+        TransactError::Parse(
+            "a newline-delimited JSON-LD chunk is a {\"@graph\": [lines]} wrapper".to_string(),
+        )
+    }
+
+    /// Whether a newline-delimited `line` reads the same as a node of the
+    /// chunk's envelope as it does as a document of its own: it has no
+    /// `@context` of its own and is not itself an envelope.
+    fn reads_as_a_node(line: &serde_json::Value) -> Result<bool> {
+        Ok(match line.as_object() {
+            Some(obj) => {
+                !obj.contains_key("@context")
+                    && fluree_graph_json_ld::envelope_graph_key(obj)?.is_none()
+            }
+            None => true,
+        })
+    }
+
+    /// The top-level context of a newline-delimited `line`: the shared one,
+    /// beneath the line's own `@context` if it has one.
+    fn line_context<'s>(
+        shared: &'s fluree_graph_json_ld::ParsedContext,
+        line: &serde_json::Value,
+    ) -> Result<std::borrow::Cow<'s, fluree_graph_json_ld::ParsedContext>> {
+        Ok(match line.get("@context") {
+            Some(own) => {
+                std::borrow::Cow::Owned(fluree_graph_json_ld::parse_context_with_base(shared, own)?)
+            }
+            None => std::borrow::Cow::Borrowed(shared),
+        })
+    }
+
+    /// Write one expanded JSON-LD document into `sink`. Its graph names
+    /// resolve against `context`, the document's top-level `@context`,
+    /// computed only for a document that names a graph (the adapter asks once
+    /// per name). A refusal keeps its own error.
+    fn write_jsonld_document<'c>(
+        expanded: &serde_json::Value,
+        sink: &mut ImportSink,
+        context: impl FnOnce() -> Result<std::borrow::Cow<'c, fluree_graph_json_ld::ParsedContext>>,
+        ledger_id: &str,
+    ) -> Result<()> {
+        let mut context = Some(context);
+        let mut graph_context = None;
+        let mut refusal: Option<TransactError> = None;
+        let converted =
+            fluree_graph_json_ld::adapter::to_graph_events_scoped(expanded, sink, |name| {
+                let resolved = (|| {
+                    if let Some(context) = context.take() {
+                        graph_context = Some(context()?);
+                    }
+                    let parsed = graph_context.as_deref().ok_or_else(|| {
+                        TransactError::Parse(
+                            "no @context to resolve a graph name against".to_string(),
+                        )
+                    })?;
+                    import_graph_name(name, parsed, ledger_id)
+                })();
+                resolved.map_err(|e| {
+                    let message = e.to_string();
+                    refusal = Some(e);
+                    fluree_graph_json_ld::adapter::AdapterError::Unsupported(message)
+                })
+            });
+        converted.map_err(|e| {
+            refusal.unwrap_or_else(|| TransactError::Parse(format!("JSON-LD adapter error: {e}")))
+        })
+    }
+
+    /// Where a graph name in a bulk-imported JSON-LD document writes: the
+    /// default graph (`None`), or a named graph by IRI.
+    ///
+    /// A selector resolves as a transaction's data resolves it
+    /// ([`resolve_written_graph`], against the document's top-level
+    /// `@context`), and a named graph's `@id` as a transaction's does
+    /// ([`named_graph`]). The graph then goes through the ledger's
+    /// graph-position table, as a TriG block's does ([`import_graph_position`]):
+    /// the ledger's own address is its default graph, and the system graphs
+    /// are refused, `config` included (a transaction may write the config
+    /// graph, a bulk import may not). A parallel worker has no graph table of
+    /// the import's, so this reads it as empty: a graph is named here by the
+    /// IRI the table would hold it under.
+    ///
+    /// [`resolve_written_graph`]: crate::parse::jsonld::resolve_written_graph
+    /// [`named_graph`]: crate::parse::jsonld::named_graph
+    fn import_graph_name(
+        name: fluree_graph_json_ld::adapter::GraphNameRef<'_>,
+        context: &fluree_graph_json_ld::ParsedContext,
+        ledger_id: &str,
+    ) -> Result<Option<String>> {
+        use crate::ir::GraphName;
+        use fluree_graph_json_ld::adapter::GraphNameRef;
+        let graph = match name {
+            GraphNameRef::Selector(raw) => crate::parse::jsonld::resolve_written_graph(
+                raw,
+                &HashMap::new(),
+                context,
+                true,
+                ledger_id,
+                crate::parse::jsonld::GraphRole::Data,
+                &mut fluree_db_query::VarRegistry::new(),
+            )?,
+            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id, ledger_id)?,
+        };
+        let iri = match &graph {
+            GraphName::Default => return Ok(None),
+            GraphName::Iri(iri) => iri.as_str(),
+            GraphName::Address(address) => address.as_str(),
+            GraphName::Var(_) => {
+                return Err(TransactError::Parse(
+                    "a bulk import has no \"where\" to bind a variable graph".to_string(),
+                ))
+            }
+        };
+        import_graph_position(iri, ledger_id, &|_: &str| None)
+    }
 
     /// Mutable state carried across chunks during an import session.
     pub struct ImportState {
@@ -584,49 +839,13 @@ mod inner {
         // The `<#txn-meta>` sentinel spelling is a different thing and stays
         // supported: `parse_trig_phase1` routes it to `raw_meta`, so legitimate
         // commit metadata never reaches this loop.
-        let txn_meta_iri = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
-        let config_iri = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
-        let this_ledger = fluree_db_core::LedgerId::parse(ledger_id).ok();
-
         for block in &phase1.named_graphs {
-            crate::stage::refuse_default_graph_name(&block.iri)?;
-            // The block's graph, through the table every graph position of a
-            // ledger shares: the ledger's own address is its default graph
-            // (`None`), `L#<g>` the graph `<g>`, and any other IRI the graph
-            // of that IRI.
-            let block_graph: Option<String> = match &this_ledger {
-                Some(id) => {
-                    let lookup = |iri: &str| state.graph_ids.get(iri).copied();
-                    match TargetLedger::new(id, &lookup).graph_position(&block.iri) {
-                        GraphPosition::Default => None,
-                        GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => {
-                            Some(iri.to_string())
-                        }
-                        GraphPosition::NotAGraph => {
-                            return Err(TransactError::Parse(format!(
-                                "TriG block <{}> names no graph an import can write: an \
-                                 address of this ledger names its default graph, or one of \
-                                 its graphs through '#', and carries no time",
-                                block.iri
-                            )))
-                        }
-                    }
-                }
-                None => Some(block.iri.clone()),
-            };
+            let lookup = |iri: &str| state.graph_ids.get(iri).copied();
+            let block_graph = import_graph_position(&block.iri, ledger_id, &lookup)?;
 
             let graph: Option<(u16, Sid)> = match block_graph {
                 None => None,
                 Some(iri) => {
-                    // Refuse by literal IRI, mirroring the staged-write guard's
-                    // shape.
-                    if iri == txn_meta_iri {
-                        return Err(TransactError::ReservedGraphTarget { graph_iri: iri });
-                    }
-                    if iri == config_iri {
-                        return Err(TransactError::ConfigGraphImportUnsupported { graph_iri: iri });
-                    }
-
                     // Allocate or reuse g_id for this graph IRI.
                     //
                     // When spooling (index build) is active, allocate from the
@@ -652,19 +871,7 @@ mod inner {
                         id
                     };
 
-                    // Second arm, mirroring `stage.rs`: refuse by what the IRI
-                    // actually *routes to*, not only by how it is spelled. The
-                    // shared graph allocator is pre-seeded with the two reserved
-                    // IRIs, so this is belt-and-braces today; it is what keeps
-                    // the guard correct if the seeding ever changes. One integer
-                    // compare per graph block.
-                    if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID {
-                        return Err(if g_id == fluree_db_core::graph_registry::CONFIG_GRAPH_ID {
-                            TransactError::ConfigGraphImportUnsupported { graph_iri: iri }
-                        } else {
-                            TransactError::ReservedGraphTarget { graph_iri: iri }
-                        });
-                    }
+                    refuse_reserved_g_id(&iri, g_id)?;
 
                     // Create a graph Sid (using the graph IRI's namespace + local name)
                     Some((g_id, worker_cache.sid_for_iri(&iri)))
@@ -1012,6 +1219,11 @@ mod inner {
         /// completion stamp (watermark + mapping hash + builder version), so a
         /// twin is valid iff a head-walk finds the stamp (DEC-003 §17).
         pub txn_meta: Vec<TxnMetaEntry>,
+        /// Named graphs this chunk wrote (JSON-LD `@graph` scoping), in
+        /// first-use order. The serial finalizer puts each one no earlier
+        /// commit introduced in this commit's `graph_delta`. Empty for every
+        /// other chunk.
+        pub named_graphs: Vec<crate::import_sink::NamedGraphUse>,
     }
 
     /// Parse a TTL chunk into a `StreamingCommitWriter`. Thread-safe.
@@ -1076,6 +1288,7 @@ mod inner {
             prefix_map,
             spool_result,
             txn_meta: Vec::new(),
+            named_graphs: Vec::new(),
         })
     }
 
@@ -1153,6 +1366,7 @@ mod inner {
             prefix_map: HashMap::new(),
             spool_result,
             txn_meta: Vec::new(),
+            named_graphs: Vec::new(),
         })
     }
 
@@ -1212,6 +1426,13 @@ mod inner {
     /// Analogous to [`parse_chunk`] (Turtle) but for JSON-LD input. Uses
     /// `SharedNamespaceAllocator` via `WorkerCache` so that namespace codes are
     /// visible to the spool pipeline during the same parse pass.
+    ///
+    /// `@graph` scoping is written as a transaction writes it: a node's
+    /// statements go to its graph selector's graph, and a JSON-LD named
+    /// graph's content to the graph its `@id` names (see
+    /// [`fluree_graph_json_ld::adapter`]). `ledger_id` names the ledger
+    /// whose system graphs a document may not write. `shape` says whether the
+    /// chunk is one document or newline-delimited lines ([`JsonLdChunk`]).
     #[allow(clippy::too_many_arguments)]
     pub fn parse_jsonld_chunk(
         jsonld: &str,
@@ -1223,6 +1444,8 @@ mod inner {
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
+        ledger_id: &str,
+        shape: JsonLdChunk,
     ) -> Result<ParsedChunk> {
         // Chunk-scoped, matching the behavior before document scoping existed.
         // For the `Files` and remote arms that is also document-scoped, because
@@ -1255,6 +1478,21 @@ mod inner {
 
         let mut doc: serde_json::Value = serde_json::from_str(jsonld)
             .map_err(|e| TransactError::Parse(format!("JSON parse error: {e}")))?;
+        // A newline-delimited chunk's lines are read under the wrapper's
+        // shared context, each as a document of its own.
+        let shared = match shape {
+            JsonLdChunk::Document => {
+                strip_top_level_graph_key(&mut doc, None)?;
+                None
+            }
+            JsonLdChunk::Lines => {
+                let shared = crate::parse::edge_annotations::top_level_context(&doc)?;
+                for line in ndjson_lines_mut(&mut doc)? {
+                    strip_top_level_graph_key(line, Some(&shared))?;
+                }
+                Some(shared)
+            }
+        };
 
         // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
         // `f:reifies*` encoding before expansion, exactly as the transact path
@@ -1291,27 +1529,79 @@ mod inner {
         // declared prefixes.
         register_jsonld_prefixes(&doc, &mut sink);
 
-        let expanded = fluree_graph_json_ld::expand(&doc)
-            .map_err(|e| TransactError::Parse(format!("JSON-LD expand error: {e}")))?;
-        fluree_graph_json_ld::adapter::to_graph_events(&expanded, &mut sink)
-            .map_err(|e| TransactError::Parse(format!("JSON-LD adapter error: {e}")))?;
+        let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
+        match &shared {
+            None => {
+                let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                write_jsonld_document(
+                    &expanded,
+                    &mut sink,
+                    || {
+                        crate::parse::edge_annotations::top_level_context(&doc)
+                            .map(std::borrow::Cow::Owned)
+                    },
+                    ledger_id,
+                )?;
+            }
+            Some(shared) => {
+                // Most lines read the same whether the chunk expands as one
+                // envelope or line by line: those with no `@context` of their
+                // own that are not envelopes. They expand together and are
+                // written in one walk, which resolves each graph name once per
+                // chunk. Any other line expands, and resolves its graph
+                // names, as the document it is.
+                let lines = ndjson_lines(&doc)?;
+                let serde_json::Value::Array(expanded) =
+                    fluree_graph_json_ld::expand(&doc).map_err(expand_error)?
+                else {
+                    return Err(not_an_ndjson_chunk());
+                };
+                if expanded.len() != lines.len() {
+                    return Err(not_an_ndjson_chunk());
+                }
+                let mut plain = Vec::with_capacity(expanded.len());
+                for (line, expanded) in lines.iter().zip(expanded) {
+                    if reads_as_a_node(line)? {
+                        plain.push(expanded);
+                        continue;
+                    }
+                    let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
+                        .map_err(expand_error)?;
+                    write_jsonld_document(
+                        &expanded,
+                        &mut sink,
+                        || line_context(shared, line),
+                        ledger_id,
+                    )?;
+                }
+                write_jsonld_document(
+                    &serde_json::Value::Array(plain),
+                    &mut sink,
+                    || Ok(std::borrow::Cow::Borrowed(shared)),
+                    ledger_id,
+                )?;
+            }
+        }
         drop(_parse_span);
 
-        let (writer, prefix_map, spool_ctx) = sink
-            .into_parts()
+        let output = sink
+            .into_output()
             .map_err(crate::import_sink::encode_failure)?;
-        let op_count = writer.op_count();
+        let op_count = output.writer.op_count();
         let new_codes = worker_cache.into_new_codes();
 
-        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
 
         Ok(ParsedChunk {
-            writer,
+            writer: output.writer,
             op_count,
             new_codes,
-            prefix_map,
+            prefix_map: output.prefix_map,
             spool_result,
             txn_meta: Vec::new(),
+            named_graphs: output.named_graphs,
         })
     }
 
@@ -1350,6 +1640,31 @@ mod inner {
             // Merge turtle prefix short names into session state
             state.prefix_map.extend(parsed.prefix_map);
 
+            // The named graphs this chunk wrote that no earlier commit
+            // introduced: this commit's `graph_delta`, under the g_ids the
+            // spool assigned (the session counter's, without a spool).
+            let mut graph_delta: HashMap<u16, String> = HashMap::new();
+            for graph in parsed.named_graphs {
+                refuse_reserved_graph_iri(&graph.iri, ledger_id)?;
+                if let Some(&existing) = state.graph_ids.get(&graph.iri) {
+                    if graph.g_id.is_some_and(|g_id| g_id != existing) {
+                        return Err(TransactError::Parse(format!(
+                            "graph <{}> was assigned g_id {existing} and then {:?}",
+                            graph.iri, graph.g_id
+                        )));
+                    }
+                    continue;
+                }
+                let g_id = graph.g_id.unwrap_or_else(|| {
+                    let id = state.next_gid;
+                    state.next_gid += 1;
+                    id
+                });
+                refuse_reserved_g_id(&graph.iri, g_id)?;
+                state.graph_ids.insert(graph.iri.clone(), g_id);
+                graph_delta.insert(g_id, graph.iri);
+            }
+
             state.cumulative_flakes += parsed.op_count as u64;
 
             // Persist split mode in genesis commit (first chunk, no previous ref).
@@ -1368,7 +1683,7 @@ mod inner {
                 // completion stamp. The predicate namespace codes were interned through
                 // this chunk's sink, so they are already in `ns_delta` above.
                 txn_meta: parsed.txn_meta,
-                graph_delta: HashMap::new(),
+                graph_delta,
                 ns_split_mode,
             };
 
@@ -1407,5 +1722,6 @@ mod inner {
 
 pub use inner::{
     finalize_parsed_chunk, import_commit_with_prelude, import_trig_commit, parse_chunk,
-    parse_chunk_with_prelude, parse_jsonld_chunk, ImportCommitResult, ImportState, ParsedChunk,
+    parse_chunk_with_prelude, parse_jsonld_chunk, ImportCommitResult, ImportState, JsonLdChunk,
+    ParsedChunk,
 };

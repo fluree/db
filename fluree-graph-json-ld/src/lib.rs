@@ -52,7 +52,8 @@ pub use compact::ContextCompactor;
 pub use context::{Container, ContextEntry, ParsedContext, TypeValue};
 pub use error::{JsonLdError, Result};
 pub use graph_shape::{
-    classify_graph_value, doc_shape, is_envelope_graph, is_graph_key, DocShape, GraphValue,
+    classify_graph_value, doc_shape, envelope_graph_key, is_envelope_graph, is_graph_key,
+    node_graph, DocShape, GraphValue, NodeGraph,
 };
 pub use iri::UnresolvedIriDisposition;
 pub use ndjson_splitter::{FirstLineContextPolicy, NdjsonChunkPayload, NdjsonReader};
@@ -61,6 +62,13 @@ pub use normalize::{Algorithm, Format, NormalizeOptions};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// A key spelled like a JSON-LD keyword (`@` then letters). Keys that
+/// merely start with `@` (`@odata.etag`) are ordinary property names.
+pub fn is_keyword_form(key: &str) -> bool {
+    key.strip_prefix('@')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphabetic()))
+}
 
 /// Parse a JSON-LD context.
 ///

@@ -24,8 +24,8 @@
 //! - A database with transactions
 
 use crate::ns_format::{
-    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
-    NS_VERSION,
+    merge_heads, ns_context, parse_record, BranchPointRef, IndexRef, LedgerRef, NsFileV2,
+    NsIndexFileV2, NS_VERSION,
 };
 use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
@@ -295,10 +295,7 @@ impl FileNameService {
     ) -> Result<Option<T>> {
         use fluree_db_core::StorageRead;
         match self.storage.read_bytes(address).await {
-            Ok(bytes) => {
-                let parsed = serde_json::from_slice(&bytes)?;
-                Ok(Some(parsed))
-            }
+            Ok(bytes) => Ok(Some(parse_record(&bytes, address)?)),
             Err(fluree_db_core::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(NameServiceError::from(e)),
         }
@@ -336,7 +333,7 @@ impl FileNameService {
         // yields a clean not-found and callers fall back to graph-source
         // resolution — instead of failing to deserialize NsFileV2 with a
         // "missing field `f:ledger`" error. This is the single guard shared by
-        // all ledger read paths (`lookup`, `list_branches`, `all_records`).
+        // all ledger read paths (`lookup`, `branch_records`, `all_records`).
         if Self::is_graph_source_from_bytes(&main_bytes) {
             return Ok(None);
         }
@@ -350,7 +347,7 @@ impl FileNameService {
             return Ok(None);
         }
 
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, &main_address)?;
         let Some(ledger_id) =
             crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, &main_address)
         else {
@@ -419,7 +416,7 @@ impl FileNameService {
         if Self::is_graph_source_from_bytes(&main_bytes) {
             return Ok(None);
         }
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, &main_address)?;
         let index_file: Option<NsIndexFileV2> = self
             .read_json_from_address(&Self::index_address(ledger_name, branch))
             .await?;
@@ -439,7 +436,8 @@ impl FileNameService {
             .map_err(|e| NameServiceError::storage(format!("Failed to read {main_path:?}: {e}")))?;
 
         // Parse just enough to check @type
-        let parsed: serde_json::Value = serde_json::from_str(&content)?;
+        let parsed: serde_json::Value =
+            parse_record(content.as_bytes(), &main_path.display().to_string())?;
         Ok(Self::is_graph_source_from_json(&parsed))
     }
 
@@ -551,7 +549,7 @@ impl crate::NameServiceLookup for FileNameService {
         self.load_heads(&ledger_name, &branch).await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         let ledger_dir = self
             .storage
             .path_of(&format!("fluree:file://{NS_VERSION}/{ledger_name}"))?;
@@ -562,8 +560,8 @@ impl crate::NameServiceLookup for FileNameService {
             // (`{ledger_name}/sub/main.json`); the record says which it is.
             // Graph-source records are skipped by `read_record_at` (Ok(None)).
             let relative = format!("{ledger_name}/{}", ns_record_stem(&relative));
-            if let Ok(Some(record)) = self.read_record_at(&relative).await {
-                if record.name == ledger_name && !record.retracted {
+            if let Some(record) = self.read_record_at(&relative).await? {
+                if record.name == ledger_name {
                     records.push(record);
                 }
             }
@@ -1904,10 +1902,10 @@ mod tests {
             ]
         );
 
-        let acme: Vec<_> = ns.list_branches("acme").await.unwrap();
+        let acme: Vec<_> = ns.branch_records("acme").await.unwrap();
         assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
         let mut mydb: Vec<String> = ns
-            .list_branches("mydb")
+            .branch_records("mydb")
             .await
             .unwrap()
             .into_iter()
@@ -2030,7 +2028,7 @@ mod tests {
             assert!(ns.index_path(name, branch).is_err(), "{name}:{branch}");
             assert!(ns.commits_path(name, branch).is_err(), "{name}:{branch}");
         }
-        assert!(ns.list_branches("../beside").await.is_err());
+        assert!(ns.branch_records("../beside").await.is_err());
     }
 
     /// A branch whose name begins with `/` is no ledger address: publishing,
@@ -2279,7 +2277,7 @@ mod tests {
     }
 
     /// The graph-source skip is now a single guard fused into `load_record`, so
-    /// the listing paths (`list_branches` / `all_records`) must keep excluding
+    /// the listing paths (`branch_records` / `all_records`) must keep excluding
     /// graph-source records without their own pre-check. A coexisting real ledger
     /// still resolves (#1369).
     #[tokio::test]
@@ -2297,8 +2295,8 @@ mod tests {
         assert!(ns.lookup("realdb:main").await.unwrap().is_some());
         assert!(matches!(ns.lookup("gs:main").await, Ok(None)));
 
-        // list_branches / all_records exclude the graph-source record.
-        assert!(ns.list_branches("gs").await.unwrap().is_empty());
+        // branch_records / all_records exclude the graph-source record.
+        assert!(ns.branch_records("gs").await.unwrap().is_empty());
         let all = ns.all_records().await.unwrap();
         assert_eq!(all.len(), 1, "all_records should list only the ledger");
         assert_eq!(all[0].ledger_id, "realdb:main");
@@ -2923,7 +2921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_list_branches() {
+    async fn test_file_branch_records() {
         let (_temp, ns) = setup().await;
         ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-3");
@@ -2937,7 +2935,7 @@ mod tests {
         // Also create a different ledger to ensure filtering works
         ns.init("other:main").await.unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
+        let branches = ns.branch_records("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
         let mut names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
         names.sort();
@@ -2945,7 +2943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_list_branches_with_slashes() {
+    async fn test_file_branch_records_with_slashes() {
         let (_temp, ns) = setup().await;
         ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
@@ -2958,7 +2956,7 @@ mod tests {
             .await
             .unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
+        let branches = ns.branch_records("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
         let mut names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
         names.sort();
@@ -2966,27 +2964,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_list_branches_unknown_ledger() {
+    async fn test_file_branch_records_unknown_ledger() {
         let (_temp, ns) = setup().await;
-        let branches = ns.list_branches("nonexistent").await.unwrap();
+        let branches = ns.branch_records("nonexistent").await.unwrap();
         assert!(branches.is_empty());
     }
 
+    /// `branch_records` lists one ledger's branches, retracted ones included,
+    /// and fails on a record it cannot read rather than leave it out: GC reads
+    /// a missing branch as one with nothing to protect. Another ledger's
+    /// records are never read.
     #[tokio::test]
-    async fn test_file_list_branches_excludes_retracted() {
-        let (_temp, ns) = setup().await;
-        ns.init("mydb:main").await.unwrap();
-        let cid = test_cid("commit-1");
-        ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
-
-        ns.create_branch("mydb", "dead", "main", None)
+    async fn test_file_branch_records_lists_one_ledger_strictly() {
+        let (temp, ns) = setup().await;
+        for id in ["mydb:main", "mydb:dev", "mydb/nested:main", "other:main"] {
+            ns.publish_commit(id, 1, &test_cid(id)).await.unwrap();
+        }
+        ns.retract("mydb:dev").await.unwrap();
+        let ns_dir = temp.path().join(NS_VERSION);
+        tokio::fs::write(ns_dir.join("other/main.json"), b"not json")
             .await
             .unwrap();
-        ns.retract("mydb:dead").await.unwrap();
+        assert!(ns.all_records().await.is_err());
 
-        let branches = ns.list_branches("mydb").await.unwrap();
-        assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0].branch, "main");
+        let mut branches: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        branches.sort();
+        assert_eq!(
+            branches,
+            ["dev", "main"],
+            "retracted kept, nested ledger left out"
+        );
+
+        tokio::fs::write(ns_dir.join("mydb/dev.json"), b"not json")
+            .await
+            .unwrap();
+        let err = ns.branch_records("mydb").await.unwrap_err();
+        assert!(
+            err.to_string().contains("mydb/dev.json"),
+            "an unreadable branch fails the listing, naming its record: {err}"
+        );
     }
 
     #[tokio::test]

@@ -34,21 +34,6 @@ pub struct DeltaMapRequest {
     pub r2rml_type: Option<String>,
     /// Branch name
     pub branch: Option<String>,
-    pub s3_region: Option<String>,
-    /// S3 endpoint override (MinIO, LocalStack, …)
-    pub s3_endpoint: Option<String>,
-    #[serde(default)]
-    pub s3_path_style: bool,
-    /// Microsoft Entra service principal for `abfss://` locations. Omit all
-    /// four to use the server's ambient Azure credentials.
-    pub azure_tenant_id: Option<String>,
-    pub azure_client_id: Option<String>,
-    /// Literal client secret (stored with the graph source)
-    pub azure_client_secret: Option<String>,
-    /// Name of a server environment variable holding the client secret
-    pub azure_client_secret_env: Option<String>,
-    #[serde(flatten)]
-    pub unity: UnityConnectionRequest,
     /// Model ledger (`name:branch`) whose default graph supplies the source's
     /// view policies and class/property hierarchy.
     pub model: Option<String>,
@@ -64,65 +49,109 @@ pub struct DeltaMapRequest {
     pub delete_values: Vec<Option<String>>,
     /// Materialization: the column that orders one key's rows within a version.
     pub order_by: Option<String>,
+    /// The catalog and storage options; see [`ConnectionFields`].
+    #[serde(flatten)]
+    pub connection: ConnectionFields,
 }
 
-/// A Unity Catalog connection, as every Delta endpoint spells it.
-#[derive(Deserialize, Default)]
-pub struct UnityConnectionRequest {
-    /// Databricks workspace URL. In a `map` request, tables without a `tables`
-    /// entry are then named in Unity Catalog, which places them and issues
-    /// their credentials.
-    pub unity_uri: Option<String>,
-    /// Complete a table name of fewer than three parts; scope a listing
-    pub unity_catalog: Option<String>,
-    pub unity_schema: Option<String>,
-    /// Catalog auth, as for `iceberg/map`: a bearer token, or the client id and
-    /// secret of a service principal. An `_env` field names a server
-    /// environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`.
-    pub auth_bearer: Option<String>,
-    pub auth_bearer_env: Option<String>,
-    pub oauth2_client_id: Option<String>,
-    pub oauth2_client_secret: Option<String>,
-    pub oauth2_client_secret_env: Option<String>,
-    /// Defaults to the workspace's token endpoint
-    pub oauth2_token_url: Option<String>,
-    /// Defaults to `all-apis`
-    pub oauth2_scope: Option<String>,
+/// The rest of a Delta request: its Unity Catalog connection and storage
+/// options, given either as the structured `unity` / `io` objects (exactly the
+/// stored config's shape) or as the flat fields (`unity_uri`, `unity_catalog`,
+/// `unity_schema`, `auth_bearer[_env]`, `oauth2_*`, `s3_*`, `azure_*`). An
+/// `_env` field names a server environment variable listed in
+/// `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. Read by
+/// [`fluree_db_api::delta_connection_from_json`].
+pub type ConnectionFields = serde_json::Map<String, serde_json::Value>;
+
+/// The connection of a request that names its tables' storage
+/// (`reads_storage`) or only its catalog, through the one codec and then the
+/// SSRF guard on the URLs it names.
+fn connection(
+    fields: ConnectionFields,
+    reads_storage: bool,
+    rules: &fluree_db_api::SecretRules,
+) -> Result<fluree_db_api::DeltaConnection> {
+    let conn = fluree_db_api::delta_connection_from_json(fields, reads_storage, rules)
+        .map_err(super::iceberg::input_error)?;
+    let unity = conn.unity.as_ref();
+    super::iceberg_ssrf::guard_connection_urls(
+        unity.map(|u| u.uri.as_str()),
+        unity.and_then(|u| super::iceberg_ssrf::token_url(&u.auth)),
+        conn.io.s3_endpoint.as_deref(),
+    )?;
+    Ok(conn)
 }
 
-impl UnityConnectionRequest {
-    /// `None` when the request names no catalog.
-    fn into_config(self, allowed_env: &str) -> Result<Option<fluree_db_api::DeltaUnityConfig>> {
-        use super::iceberg::secret_value;
-        fluree_db_api::DeltaUnityFields {
-            bearer: secret_value(
-                "auth_bearer",
-                self.auth_bearer.as_deref(),
-                self.auth_bearer_env.as_deref(),
-                allowed_env,
-            )?,
-            oauth2_client_secret: secret_value(
-                "oauth2_client_secret",
-                self.oauth2_client_secret.as_deref(),
-                self.oauth2_client_secret_env.as_deref(),
-                allowed_env,
-            )?,
-            uri: self.unity_uri,
-            catalog: self.unity_catalog,
-            schema: self.unity_schema,
-            oauth2_client_id: self.oauth2_client_id,
-            oauth2_token_url: self.oauth2_token_url,
-            oauth2_scope: self.oauth2_scope,
+/// Every field a Delta route takes beside its connection: `delta/map`'s
+/// (which `delta/r2rml/validate` takes too), and those of the catalog routes
+/// (browse's `depth`, preview's and verify's `table`, generate's
+/// `base_namespace`, `per_table_overrides` and `options`; its `tables` is
+/// map's name). Each route ignores the ones it does not take itself, rather
+/// than refusing them, so a client can send one payload to browse, preview,
+/// verify, generate and map. A route reads its own fields before this
+/// applies; a key no Delta route knows is still refused.
+const ROUTE_FIELDS: &[&str] = &[
+    // delta/map
+    "name",
+    "root",
+    "tables",
+    "r2rml",
+    "r2rml_type",
+    "branch",
+    "model",
+    "default_allow",
+    "delete_column",
+    "delete_values",
+    "order_by",
+    // catalog/browse
+    "depth",
+    // catalog/preview, catalog/verify
+    "table",
+    // r2rml/generate (`tables` above)
+    "base_namespace",
+    "per_table_overrides",
+    "options",
+];
+
+/// The storage options: what reading a table's data files takes. Browse and
+/// generate read Unity's record of a table only, never its files, so they
+/// ignore these. The routes that read files (map, validate, verify) use
+/// them, and preview and verify refuse an Azure principal (see
+/// [`unity_table_connection`]).
+const STORAGE_FIELDS: &[&str] = &[
+    "io",
+    "s3_region",
+    "s3_endpoint",
+    "s3_path_style",
+    "azure_tenant_id",
+    "azure_client_id",
+    "azure_client_secret",
+    "azure_client_secret_env",
+];
+
+/// A request's connection fields, without the other routes' own fields
+/// (see [`ROUTE_FIELDS`]) and, when the route reads no data files
+/// (`reads_storage` false), without the storage options.
+fn connection_fields(mut fields: ConnectionFields, reads_storage: bool) -> ConnectionFields {
+    for key in ROUTE_FIELDS {
+        fields.remove(*key);
+    }
+    if !reads_storage {
+        for key in STORAGE_FIELDS {
+            fields.remove(*key);
         }
-        .into_config()
-        .map_err(ServerError::Api)
     }
+    fields
+}
 
-    /// For an endpoint that is about the catalog, and so needs one.
-    fn required(self, allowed_env: &str) -> Result<fluree_db_api::DeltaUnityConfig> {
-        self.into_config(allowed_env)?
-            .ok_or_else(|| ServerError::bad_request("`unity_uri` is required"))
-    }
+/// A catalog route's Unity Catalog connection, which it cannot do without.
+fn required_unity(conn: fluree_db_api::DeltaConnection) -> Result<fluree_db_api::DeltaUnityConfig> {
+    conn.unity.ok_or_else(|| {
+        super::iceberg::input_error(fluree_db_api::GraphSourceInputError::incomplete(
+            "unity_uri",
+            &["unity_uri", "unity"],
+        ))
+    })
 }
 
 /// Response for `POST /v1/fluree/delta/map`
@@ -174,16 +203,10 @@ async fn delta_map_local(state: Arc<AppState>, request: Request) -> Result<impl 
     async move {
         tracing::info!(status = "start", name = %req.name, "delta map requested");
 
-        // Each of these reaches an outbound HTTP client.
-        super::iceberg_ssrf::guard_connection_urls(
-            req.unity.unity_uri.as_deref(),
-            req.unity.oauth2_token_url.as_deref(),
-            req.s3_endpoint.as_deref(),
-        )?;
-
+        let rules = fluree_db_api::SecretRules::server(&state.fluree);
         let result = state
             .fluree
-            .create_delta_graph_source(build_delta_config(req)?)
+            .create_delta_graph_source(build_delta_config(req, &rules)?)
             .await
             .map_err(ServerError::Api)?;
 
@@ -211,23 +234,11 @@ async fn delta_map_local(state: Arc<AppState>, request: Request) -> Result<impl 
     .await
 }
 
-fn build_delta_config(req: DeltaMapRequest) -> Result<fluree_db_api::DeltaCreateConfig> {
-    build_delta_config_allowing(req, &super::iceberg::allowed_secret_env())
-}
-
-fn build_delta_config_allowing(
+fn build_delta_config(
     req: DeltaMapRequest,
-    allowed_env: &str,
+    rules: &fluree_db_api::SecretRules,
 ) -> Result<fluree_db_api::DeltaCreateConfig> {
-    let unity = req.unity.into_config(allowed_env)?;
-    let azure = fluree_db_api::DeltaAzureFields {
-        tenant_id: req.azure_tenant_id,
-        client_id: req.azure_client_id,
-        client_secret: req.azure_client_secret,
-        client_secret_env: req.azure_client_secret_env,
-    }
-    .into_auth()
-    .map_err(ServerError::Api)?;
+    let conn = connection(connection_fields(req.connection, true), true, rules)?;
     let delete = req
         .delete_column
         .map(|column| {
@@ -242,17 +253,12 @@ fn build_delta_config_allowing(
         })
         .transpose()?;
     Ok(fluree_db_api::DeltaCreateConfig {
-        unity,
+        unity: conn.unity,
         name: req.name,
         branch: req.branch,
         root: req.root,
         tables: req.tables,
-        io: fluree_db_api::DeltaIoConfig {
-            s3_region: req.s3_region,
-            s3_endpoint: req.s3_endpoint,
-            s3_path_style: req.s3_path_style,
-            azure,
-        },
+        io: conn.io,
         mapping: fluree_db_api::R2rmlMappingInput::Content(req.r2rml),
         mapping_media_type: req.r2rml_type,
         model: req.model,
@@ -288,36 +294,28 @@ fn span_for(operation: &str, state: &AppState, request: &Request) -> Result<trac
     ))
 }
 
-/// Storage options for a table Unity places; its credentials are Unity's.
-#[derive(Deserialize, Default)]
-pub struct UnityStorageRequest {
-    pub s3_region: Option<String>,
-    pub s3_endpoint: Option<String>,
-    #[serde(default)]
-    pub s3_path_style: bool,
-}
-
 /// Request body for `POST /v1/fluree/delta/catalog/browse`
 #[derive(Deserialize)]
 pub struct DeltaBrowseRequest {
-    #[serde(flatten)]
-    pub unity: UnityConnectionRequest,
     /// `schemas` or `tables` (the default): how far a listing of one catalog
     /// reaches. With no `unity_catalog` the catalogs are listed; with a
     /// `unity_schema` too, that schema's tables.
     #[serde(default)]
     pub depth: fluree_db_api::DeltaBrowseDepth,
+    /// The Unity Catalog connection (no storage options).
+    #[serde(flatten)]
+    pub connection: ConnectionFields,
 }
 
 /// Request body for `POST /v1/fluree/delta/catalog/preview` and `…/verify`
 #[derive(Deserialize)]
 pub struct DeltaTableRequest {
-    #[serde(flatten)]
-    pub unity: UnityConnectionRequest,
     /// Completed from `unity_catalog` and `unity_schema` when short
     pub table: String,
+    /// The Unity Catalog connection, and S3 options for the table Unity
+    /// places (its credentials are Unity's, so no Azure principal).
     #[serde(flatten)]
-    pub storage: UnityStorageRequest,
+    pub connection: ConnectionFields,
 }
 
 #[derive(Deserialize)]
@@ -336,8 +334,9 @@ pub struct DeltaTableOverride {
 /// Request body for `POST /v1/fluree/delta/r2rml/generate`
 #[derive(Deserialize)]
 pub struct DeltaGenerateRequest {
+    /// The Unity Catalog connection (no storage options).
     #[serde(flatten)]
-    pub unity: UnityConnectionRequest,
+    pub connection: ConnectionFields,
     /// In output order
     pub tables: Vec<String>,
     /// The base every generated IRI derives from
@@ -348,12 +347,33 @@ pub struct DeltaGenerateRequest {
     pub options: fluree_db_api::GenerateOptions,
 }
 
-fn guard_unity(unity: &UnityConnectionRequest, s3_endpoint: Option<&str>) -> Result<()> {
-    super::iceberg_ssrf::guard_connection_urls(
-        unity.unity_uri.as_deref(),
-        unity.oauth2_token_url.as_deref(),
-        s3_endpoint,
-    )
+/// A Unity-placed table's connection (preview, verify): Unity issues its
+/// credentials, so an Azure principal would read nothing, and is refused
+/// rather than ignored: the caller would believe the table was read as it.
+fn unity_table_connection(
+    fields: ConnectionFields,
+    rules: &fluree_db_api::SecretRules,
+) -> Result<fluree_db_api::DeltaConnection> {
+    let conn = connection(connection_fields(fields, true), true, rules)?;
+    if conn.io.azure.is_some() {
+        return Err(super::iceberg::input_error(
+            fluree_db_api::GraphSourceInputError::invalid(
+                "azure",
+                "Unity Catalog issues a Unity table's storage credentials; an Azure service \
+                 principal applies to delta/map and delta/r2rml/validate",
+            ),
+        ));
+    }
+    Ok(conn)
+}
+
+/// A catalog-only route's connection (browse, generate), which reads no data
+/// files: no storage options.
+fn unity_catalog_connection(
+    fields: ConnectionFields,
+    rules: &fluree_db_api::SecretRules,
+) -> Result<fluree_db_api::DeltaConnection> {
+    connection(connection_fields(fields, false), false, rules)
 }
 
 /// POST /v1/fluree/delta/catalog/browse
@@ -365,8 +385,8 @@ pub async fn delta_catalog_browse(
         let span = span_for("delta:catalog:browse", &state, &request)?;
         let req: DeltaBrowseRequest = parse_body(request).await?;
         async {
-            guard_unity(&req.unity, None)?;
-            let unity = req.unity.required(&super::iceberg::allowed_secret_env())?;
+            let rules = fluree_db_api::SecretRules::server(&state.fluree);
+            let unity = required_unity(unity_catalog_connection(req.connection, &rules)?)?;
             let listing = state
                 .fluree
                 .browse_delta_unity(&unity, req.depth)
@@ -390,8 +410,8 @@ pub async fn delta_catalog_preview(
         let span = span_for("delta:catalog:preview", &state, &request)?;
         let req: DeltaTableRequest = parse_body(request).await?;
         async {
-            guard_unity(&req.unity, None)?;
-            let unity = req.unity.required(&super::iceberg::allowed_secret_env())?;
+            let rules = fluree_db_api::SecretRules::server(&state.fluree);
+            let unity = required_unity(unity_table_connection(req.connection, &rules)?)?;
             let preview = state
                 .fluree
                 .preview_delta_unity_table(&unity, &req.table)
@@ -415,14 +435,10 @@ pub async fn delta_catalog_verify(
         let span = span_for("delta:catalog:verify", &state, &request)?;
         let req: DeltaTableRequest = parse_body(request).await?;
         async {
-            guard_unity(&req.unity, req.storage.s3_endpoint.as_deref())?;
-            let unity = req.unity.required(&super::iceberg::allowed_secret_env())?;
-            let io = fluree_db_api::DeltaIoConfig {
-                s3_region: req.storage.s3_region,
-                s3_endpoint: req.storage.s3_endpoint,
-                s3_path_style: req.storage.s3_path_style,
-                azure: None,
-            };
+            let rules = fluree_db_api::SecretRules::server(&state.fluree);
+            let conn = unity_table_connection(req.connection, &rules)?;
+            let io = conn.io.clone();
+            let unity = required_unity(conn)?;
             let access = state
                 .fluree
                 .verify_delta_unity_table(&unity, &io, &req.table)
@@ -440,7 +456,7 @@ pub async fn delta_catalog_verify(
 
 fn generate_request(
     req: DeltaGenerateRequest,
-    allowed_env: &str,
+    rules: &fluree_db_api::SecretRules,
 ) -> Result<fluree_db_api::GenerateDeltaR2rmlRequest> {
     if req.tables.is_empty() {
         return Err(ServerError::bad_request(
@@ -448,7 +464,7 @@ fn generate_request(
         ));
     }
     Ok(fluree_db_api::GenerateDeltaR2rmlRequest {
-        unity: req.unity.required(allowed_env)?,
+        unity: required_unity(unity_catalog_connection(req.connection, rules)?)?,
         tables: req.tables,
         base_namespace: req.base_namespace,
         per_table_overrides: req
@@ -476,8 +492,8 @@ pub async fn delta_r2rml_generate(
         let span = span_for("delta:r2rml:generate", &state, &request)?;
         let req: DeltaGenerateRequest = parse_body(request).await?;
         async {
-            guard_unity(&req.unity, None)?;
-            let api_req = generate_request(req, &super::iceberg::allowed_secret_env())?;
+            let api_req =
+                generate_request(req, &fluree_db_api::SecretRules::server(&state.fluree))?;
             let response = state
                 .fluree
                 .generate_delta_r2rml(api_req)
@@ -517,10 +533,10 @@ pub async fn delta_r2rml_validate(
         let span = span_for("delta:r2rml:validate", &state, &request)?;
         let req = validate_request(parse_body(request).await?)?;
         async {
-            guard_unity(&req.unity, req.s3_endpoint.as_deref())?;
+            let rules = fluree_db_api::SecretRules::server(&state.fluree);
             let response = state
                 .fluree
-                .validate_delta_r2rml(&build_delta_config(req)?)
+                .validate_delta_r2rml(&build_delta_config(req, &rules)?)
                 .await
                 .map_err(ServerError::Api)?;
             Ok::<_, ServerError>((StatusCode::OK, Json(response)))
@@ -544,6 +560,10 @@ mod tests {
         serde_json::from_value(body).unwrap()
     }
 
+    fn rules(listed: &str) -> fluree_db_api::SecretRules {
+        fluree_db_api::SecretRules::listed(listed, false)
+    }
+
     fn stored(config: &fluree_db_api::DeltaCreateConfig) -> serde_json::Value {
         serde_json::to_value(config.to_gs_config("m.ttl")).unwrap()
     }
@@ -556,7 +576,7 @@ mod tests {
             "oauth2_client_id": "app",
             "oauth2_client_secret_env": "SP_SECRET",
         }));
-        let config = build_delta_config_allowing(req, "SP_SECRET").unwrap();
+        let config = build_delta_config(req, &rules("SP_SECRET")).unwrap();
         config.validate().unwrap();
         let unity = &stored(&config)["unity"];
         assert_eq!(unity["uri"], "https://workspace.example.com");
@@ -570,18 +590,26 @@ mod tests {
 
     #[test]
     fn a_unity_secret_may_name_only_a_listed_variable() {
-        for field in ["auth_bearer_env", "oauth2_client_secret_env"] {
-            let req = request(serde_json::json!({
+        for (field, extra) in [
+            ("auth_bearer_env", serde_json::json!({})),
+            (
+                "oauth2_client_secret_env",
+                serde_json::json!({"oauth2_client_id": "app"}),
+            ),
+        ] {
+            let mut body = serde_json::json!({
                 "unity_uri": "https://workspace.example.com",
-                "oauth2_client_id": "app",
                 field: "AWS_SECRET_ACCESS_KEY",
-            }));
-            let err = build_delta_config_allowing(req, "SP_SECRET")
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let req = request(body);
+            let err = build_delta_config(req, &rules("SP_SECRET"))
                 .err()
                 .unwrap_or_else(|| panic!("{field} accepted"));
             assert!(
-                err.to_string()
-                    .contains(super::super::iceberg::SECRET_ENV_ALLOWLIST),
+                err.to_string().contains(fluree_db_api::SECRET_ENV_VARS_ENV),
                 "{err}"
             );
         }
@@ -589,14 +617,14 @@ mod tests {
 
     #[test]
     fn materialize_options_are_stored_with_the_source() {
-        let config = build_delta_config_allowing(
+        let config = build_delta_config(
             request(serde_json::json!({
                 "root": "s3://lake/Tables",
                 "delete_column": "op",
                 "delete_values": ["D", null],
                 "order_by": "updated_at",
             })),
-            "",
+            &rules(""),
         )
         .unwrap();
         let stored = stored(&config);
@@ -607,9 +635,9 @@ mod tests {
         );
         assert_eq!(stored["order_by"], "updated_at");
 
-        let bare = build_delta_config_allowing(
+        let bare = build_delta_config(
             request(serde_json::json!({"root": "s3://lake/Tables", "delete_column": "op"})),
-            "",
+            &rules(""),
         );
         assert!(
             bare.err()
@@ -620,9 +648,9 @@ mod tests {
 
     #[test]
     fn a_source_by_path_is_built_as_before() {
-        let config = build_delta_config_allowing(
+        let config = build_delta_config(
             request(serde_json::json!({"root": "s3://lake/Tables"})),
-            "",
+            &rules(""),
         )
         .unwrap();
         assert!(config.unity.is_none());
@@ -640,7 +668,7 @@ mod tests {
         body.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        generate_request(serde_json::from_value(body).unwrap(), "UNITY_TOKEN")
+        generate_request(serde_json::from_value(body).unwrap(), &rules("UNITY_TOKEN"))
     }
 
     #[test]
@@ -674,7 +702,11 @@ mod tests {
     fn a_catalog_endpoint_needs_a_catalog_and_a_listed_variable() {
         assert!(generate(serde_json::json!({})).is_ok());
         let stray = generate(serde_json::json!({"unity_uri": null}));
-        assert!(stray.err().unwrap().to_string().contains("workspace URL"));
+        assert!(stray
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unity_catalog needs unity_uri"));
         let none = generate(serde_json::json!({
             "unity_uri": null, "unity_catalog": null, "auth_bearer_env": null,
         }));
@@ -684,7 +716,120 @@ mod tests {
             .err()
             .unwrap()
             .to_string()
-            .contains(super::super::iceberg::SECRET_ENV_ALLOWLIST));
+            .contains(fluree_db_api::SECRET_ENV_VARS_ENV));
+    }
+
+    #[test]
+    fn every_route_ignores_the_other_routes_fields() {
+        // One payload, carrying every route's own fields, sent to browse,
+        // preview, verify, generate, validate and map.
+        let unity = serde_json::json!({"unity_uri": "https://workspace.example.com",
+            "unity_catalog": "main", "auth_bearer_env": "UNITY_TOKEN"});
+        let mut body = unity.clone();
+        for (key, value) in serde_json::json!({
+            // map, validate
+            "name": "sales", "root": "s3://lake/t", "r2rml": "", "r2rml_type": "text/turtle",
+            "branch": "main", "model": "m:main", "default_allow": true,
+            "delete_column": "op", "delete_values": ["d"], "order_by": "ts",
+            // browse
+            "depth": "schemas",
+            // preview, verify
+            "table": "sales.orders",
+            // generate (its `tables` is set below: map's is an object)
+            "base_namespace": "https://example.org/", "per_table_overrides": [], "options": {},
+            // storage
+            "s3_region": "us-east-2", "s3_endpoint": "https://s3.example.com",
+            "s3_path_style": true,
+        })
+        .as_object()
+        .unwrap()
+        {
+            body[key] = value.clone();
+        }
+        let rules = rules("UNITY_TOKEN,SP_SECRET");
+        let json = |v| serde_json::to_value(v).unwrap();
+        let bare = json(
+            fluree_db_api::delta_connection_from_json(
+                unity.as_object().unwrap().clone(),
+                false,
+                &rules,
+            )
+            .unwrap()
+            .unity,
+        );
+        let generate = |body: &serde_json::Value| {
+            let mut generate = body.clone();
+            generate["tables"] = serde_json::json!(["sales.orders"]);
+            generate_request(serde_json::from_value(generate).unwrap(), &rules)
+        };
+
+        let browse: DeltaBrowseRequest = serde_json::from_value(body.clone()).unwrap();
+        let conn = unity_catalog_connection(browse.connection, &rules).unwrap();
+        assert_eq!(json(conn.unity), bare);
+        assert_eq!(json(Some(generate(&body).unwrap().unity)), bare);
+        let table: DeltaTableRequest = serde_json::from_value(body.clone()).unwrap();
+        let conn = unity_table_connection(table.connection, &rules).unwrap();
+        assert_eq!(json(conn.unity), bare);
+        assert_eq!(conn.io.s3_region.as_deref(), Some("us-east-2"));
+        let map = build_delta_config(serde_json::from_value(body.clone()).unwrap(), &rules);
+        assert!(map.is_ok(), "{:?}", map.err());
+        assert!(validate_request(body.clone()).is_ok());
+
+        // A key no Delta route knows is still refused, on every route.
+        let mut unknown = body.clone();
+        unknown["unity_schemaa"] = "s".into();
+        let refused = |e: ServerError| assert!(e.to_string().contains("unity_schemaa"), "{e}");
+        let browse: DeltaBrowseRequest = serde_json::from_value(unknown.clone()).unwrap();
+        refused(unity_catalog_connection(browse.connection, &rules).unwrap_err());
+        let table: DeltaTableRequest = serde_json::from_value(unknown.clone()).unwrap();
+        refused(unity_table_connection(table.connection, &rules).unwrap_err());
+        refused(generate(&unknown).unwrap_err());
+        refused(build_delta_config(serde_json::from_value(unknown).unwrap(), &rules).unwrap_err());
+    }
+
+    #[test]
+    fn an_azure_principal_is_ignored_only_where_no_data_file_is_read() {
+        let unity = serde_json::json!({"unity_uri": "https://workspace.example.com",
+            "unity_catalog": "main", "auth_bearer_env": "UNITY_TOKEN"});
+        let azure = |mut body: serde_json::Value| {
+            for (key, value) in serde_json::json!({"azure_tenant_id": "t",
+                "azure_client_id": "c", "azure_client_secret_env": "SP_SECRET"})
+            .as_object()
+            .unwrap()
+            {
+                body[key] = value.clone();
+            }
+            body
+        };
+        let structured = serde_json::json!({
+            "unity": {"uri": "https://workspace.example.com", "catalog": "main",
+                "auth": {"type": "bearer", "token": {"env_var": "UNITY_TOKEN"}}},
+            "io": {"s3_region": "us-east-2", "azure": {"type": "client_secret",
+                "tenant_id": "t", "client_id": "c", "client_secret": {"env_var": "SP_SECRET"}}},
+        });
+        let rules = rules("UNITY_TOKEN,SP_SECRET");
+        for body in [azure(unity), structured] {
+            // Browse and generate read Unity's record only: ignored.
+            let browse: DeltaBrowseRequest = serde_json::from_value(body.clone()).unwrap();
+            let conn = unity_catalog_connection(browse.connection, &rules);
+            assert!(conn.is_ok(), "{body}: {:?}", conn.err());
+            let mut generate = body.clone();
+            generate["tables"] = serde_json::json!(["sales.orders"]);
+            generate["base_namespace"] = "https://example.org/".into();
+            let generate = generate_request(serde_json::from_value(generate).unwrap(), &rules);
+            assert!(generate.is_ok(), "{body}: {:?}", generate.err());
+            // Preview and verify: Unity issues the table's credentials, so the
+            // principal would not be the identity read with. Refused.
+            let mut table = body.clone();
+            table["table"] = "sales.orders".into();
+            let table: DeltaTableRequest = serde_json::from_value(table).unwrap();
+            let e = unity_table_connection(table.connection, &rules).unwrap_err();
+            assert!(
+                matches!(&e, ServerError::Api(fluree_db_api::ApiError::GraphSourceInput(i))
+                    if i.field == "azure"),
+                "{body}: {e}"
+            );
+        }
     }
 
     #[test]

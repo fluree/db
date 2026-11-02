@@ -20,10 +20,12 @@
 //!
 //! ## Visibility model
 //!
-//! Forward-arena rows are sorted by `(edge, ann, t, op)`. Within a
-//! single `(edge, ann)` group:
+//! Forward-arena rows are sorted by `(edge, ann)` and then
+//! [`op_order`](fluree_db_core::same_t::op_order) — `(t, op)` with a
+//! same-`t` assertion last. Within a single `(edge, ann)` group:
 //!
-//! - The latest row whose `t <= as_of_t` is the visible event.
+//! - The latest row whose `t <= as_of_t` is the visible event (so a
+//!   retraction and an assertion at one `t` leave it live).
 //! - If that event is `op = true`, the annotation is live at that t.
 //! - If `op = false` (or no event ≤ as_of_t exists), the annotation
 //!   is not visible.
@@ -52,6 +54,7 @@ use super::format::{
     AnnotationForwardBranch, AnnotationForwardBranchEntry, AnnotationForwardLeaf,
     AnnotationReverseBranch, AnnotationReverseBranchEntry, AnnotationReverseLeaf,
 };
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
     storage::ContentStore, AnnotationIndexRoot, ContentId, EdgeKey, Result as CoreResult, Sid,
 };
@@ -335,8 +338,8 @@ impl<'a, S: ContentStore + ?Sized> AnnotationArenaReader<'a, S> {
             let mut latest_visible: Option<bool> = None;
             while i < rows.len() && rows[i].edge == group.edge && rows[i].ann == group.ann {
                 if rows[i].t <= as_of_t {
-                    // Sorted `(t, op)` ascending with `false < true`, so the
-                    // last row at or before `as_of_t` is the visible event.
+                    // Sorted by `op_order`, so the last row at or before
+                    // `as_of_t` is the visible event.
                     latest_visible = Some(rows[i].op);
                 }
                 i += 1;
@@ -513,9 +516,8 @@ fn collect_live_anns_from_forward_leaf(
         let mut latest_visible: Option<bool> = None;
         while i < rows.len() && rows[i].edge == *edge && rows[i].ann == group_ann {
             if rows[i].t <= as_of_t {
-                // Sort within the group is `(t, op)` ascending and
-                // `false < true`, so the last row at or before
-                // `as_of_t` is the latest visible event.
+                // Sorted by `op_order` within the group, so the last row
+                // at or before `as_of_t` is the latest visible event.
                 latest_visible = Some(rows[i].op);
             }
             i += 1;
@@ -530,9 +532,8 @@ fn collect_live_anns_from_forward_leaf(
 /// pass. Per-`(edge, ann)` pair, the latest event with `t <= as_of_t`
 /// determines liveness. The arena and novelty event lists are not
 /// required to be sorted or deduplicated — duplicate `(ann, t)`
-/// entries are tolerated; later occurrences with the same `t` win on
-/// the `op` axis (`false < true` so an assert at the same `t` as a
-/// retract wins, matching the on-disk sort tie-break).
+/// entries are tolerated, and an assert at the same `t` as a retract
+/// holds ([`supersedes`]), matching the on-disk sort.
 fn merge_live_annotations(
     arena: &[(Sid, i64, bool)],
     novelty: &[(Sid, i64, bool)],
@@ -547,7 +548,7 @@ fn merge_live_annotations(
         latest
             .entry(ann.clone())
             .and_modify(|cur| {
-                if (t, op) >= (cur.0, cur.1) {
+                if supersedes((t, op), *cur) {
                     *cur = (t, op);
                 }
             })
@@ -580,7 +581,7 @@ fn merge_live_edges(
             latest
                 .entry(edge.clone())
                 .and_modify(|cur| {
-                    if (t, op) >= (cur.0, cur.1) {
+                    if supersedes((t, op), *cur) {
                         *cur = (t, op);
                     }
                 })

@@ -1,0 +1,652 @@
+//! `fluree ontology` and `fluree catalog` — ontology and catalog tools for
+//! document extraction.
+//!
+//! `ontology check` reports what an HTTP reader will and won't read of an
+//! ontology (and catalog), applying its input policy locally;
+//! `ontology from` writes an ontology in the shape the model reads well, from
+//! RDF or from tables (CSV, a workbook, SQL DDL); `catalog from` writes SKOS
+//! records from rows. All read files only: no project, no ledger, nothing
+//! sent anywhere. The logic is in `fluree-db-ontology`; this module reads the
+//! files and prints.
+
+use crate::cli::{
+    CatalogAction, CatalogFromArgs, OntologyAction, OntologyCheckArgs, OntologyFromArgs,
+    OntologyInputFormat, OntologyOutputFormat,
+};
+use crate::error::{CliError, CliResult};
+use colored::Colorize;
+use fluree_db_ontology::catalog::{self, CatalogOptions};
+use fluree_db_ontology::check::thousands;
+use fluree_db_ontology::convert::{self, tabular, EmitOptions};
+use fluree_db_ontology::estimate::{MAX_TEXT_CHARS, TOKENS_PER_WINDOW};
+use fluree_db_ontology::read::Parsed;
+use fluree_db_ontology::read::Quad;
+use fluree_db_ontology::vocab::{WELL_KNOWN_PREFIXES, XT_INSTANCES};
+use fluree_db_ontology::write::{self, OutputFormat};
+use fluree_db_ontology::{check, CheckOptions, Finding, RdfFormat, Report};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::Path;
+use std::sync::Arc;
+
+pub fn run(action: OntologyAction) -> CliResult<()> {
+    match action {
+        OntologyAction::Check(args) => run_check(&args),
+        OntologyAction::From(args) => run_from(&args),
+    }
+}
+
+/// A file's text (`-` is stdin) and its size in bytes.
+fn read_text(path: &Path) -> CliResult<String> {
+    if path == Path::new("-") {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| CliError::Input(format!("failed to read stdin: {e}")))?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))
+}
+
+/// The RDF format to read `path` as: the flag, else its extension, else the
+/// text's first character.
+fn input_format(
+    path: &Path,
+    flag: Option<OntologyInputFormat>,
+    text: &str,
+) -> CliResult<RdfFormat> {
+    if let Some(flag) = flag {
+        return Ok(match flag {
+            OntologyInputFormat::Turtle => RdfFormat::Turtle,
+            OntologyInputFormat::Jsonld => RdfFormat::JsonLd,
+        });
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("trig") => Err(CliError::Input(format!(
+            "{}: TriG isn't read yet; pass the ontology as Turtle or JSON-LD (a saved request as JSON-LD works)",
+            path.display()
+        ))),
+        Some(_) if RdfFormat::from_path(path).is_none() && path != Path::new("-") => {
+            Err(CliError::Input(format!(
+                "{}: not an RDF file this command reads (Turtle .ttl or JSON-LD .jsonld); use --input-format to say which it is",
+                path.display()
+            )))
+        }
+        _ => Ok(RdfFormat::from_path(path).unwrap_or_else(|| RdfFormat::sniff(text))),
+    }
+}
+
+fn parse_file(path: &Path, flag: Option<OntologyInputFormat>) -> CliResult<(Parsed, usize)> {
+    let text = read_text(path)?;
+    let format = input_format(path, flag, &text)?;
+    let parsed = fluree_db_ontology::parse(&text, format, None)
+        .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
+    Ok((parsed, text.len()))
+}
+
+fn run_check(args: &OntologyCheckArgs) -> CliResult<()> {
+    let (mut parsed, bytes) = parse_file(&args.file, args.input_format)?;
+    let mut bytes = bytes;
+    if let Some(catalog) = &args.catalog {
+        let (extra, extra_bytes) = parse_file(catalog, None)?;
+        bytes += extra_bytes;
+        // into the request's catalog graph when the ontology file uses graph
+        // roles; otherwise the flat split finds the records
+        let by_graph = parsed.split().by_graph;
+        parsed.quads.extend(extra.quads.into_iter().map(|mut q| {
+            if by_graph {
+                q.graph = Some(Arc::from(XT_INSTANCES));
+            }
+            q
+        }));
+        parsed.prefixes.extend(extra.prefixes);
+    }
+    let options = CheckOptions {
+        seeds: args.seed.clone(),
+        depth: args.depth,
+        source_bytes: Some(bytes),
+    };
+    let report = check(&parsed, &options).map_err(|e| CliError::Usage(e.to_string()))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_report(&args.file, &report, &Names::new(&parsed));
+    }
+    if report.passes() {
+        Ok(())
+    } else {
+        Err(CliError::ExitCode(1))
+    }
+}
+
+/// Prefixed names for display: the file's prefixes, then the well-known ones.
+struct Names(Vec<(String, String)>);
+
+impl Names {
+    fn new(parsed: &Parsed) -> Self {
+        let mut prefixes: Vec<(String, String)> = parsed
+            .prefixes
+            .iter()
+            .filter(|(p, _)| !p.is_empty())
+            .cloned()
+            .collect();
+        prefixes.extend(
+            WELL_KNOWN_PREFIXES
+                .iter()
+                .map(|(p, ns)| ((*p).to_string(), (*ns).to_string())),
+        );
+        // the longest namespace wins
+        prefixes.sort_by_key(|(_, ns)| std::cmp::Reverse(ns.len()));
+        Names(prefixes)
+    }
+
+    fn show(&self, iri: &str) -> String {
+        self.0
+            .iter()
+            .find_map(|(p, ns)| {
+                iri.strip_prefix(ns.as_str())
+                    .filter(|local| !local.is_empty() && !local.contains(['/', '#']))
+                    .map(|local| format!("{p}:{local}"))
+            })
+            .unwrap_or_else(|| format!("<{iri}>"))
+    }
+
+    /// A report key for display: an IRI in it as a prefixed name. (The JSON
+    /// report keeps keys exactly as an extraction response writes them.)
+    fn key(&self, key: &str) -> String {
+        match key.strip_prefix("rdf:type ") {
+            Some(rest) if rest.contains("://") => format!("rdf:type {}", self.show(rest)),
+            _ if key.contains("://") => self.show(key),
+            _ => key.to_string(),
+        }
+    }
+
+    fn list(&self, iris: &[String], count: usize) -> String {
+        let mut out = iris
+            .iter()
+            .map(|i| self.show(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if count > iris.len() && !iris.is_empty() {
+            out.push_str(&format!(" and {} more", thousands(count - iris.len())));
+        }
+        out
+    }
+}
+
+fn print_report(file: &Path, report: &Report, names: &Names) {
+    let mut head = format!(
+        "{}: {}, {}",
+        file.display(),
+        count(report.classes, "class", "classes"),
+        count(report.properties, "property", "properties")
+    );
+    if report.records > 0 {
+        head.push_str(&format!(
+            ", {}",
+            count(report.records, "catalog record", "catalog records")
+        ));
+    }
+    println!("{}", head.bold());
+    if let Some(slice) = &report.slice {
+        println!(
+            "Sliced from {} classes and {} properties: {} step(s) from {}.",
+            thousands(slice.classes_total),
+            thousands(slice.properties_total),
+            slice.depth,
+            names.list(&slice.seeds, slice.seeds.len())
+        );
+    }
+    let e = &report.estimate;
+    println!(
+        "About {} serialized tokens per window before document text (a window holds {}).",
+        thousands(e.tokens),
+        thousands(e.limit)
+    );
+
+    if !report.will_fail.is_empty() {
+        println!(
+            "\n{}",
+            "Will fail: a request with this would be refused"
+                .red()
+                .bold()
+        );
+        for f in &report.will_fail {
+            print_finding(f, names, "✗".red().to_string());
+        }
+    }
+    print_counts(
+        "Read another way by the reader",
+        &report.adapted,
+        &report.examples.adapted,
+        names,
+    );
+    print_counts(
+        "Not read by the reader",
+        &report.not_shown,
+        &report.examples.not_shown,
+        names,
+    );
+    if !report.advice.is_empty() {
+        println!("\n{}", "Advice".bold());
+        for f in &report.advice {
+            print_finding(f, names, "•".to_string());
+        }
+    }
+    println!();
+    if report.passes() {
+        println!("{}", "Nothing here would make a request fail.".green());
+    } else {
+        let n = report.will_fail.len();
+        println!(
+            "{}",
+            format!(
+                "{n} problem{} would make a request fail.",
+                if n == 1 { "" } else { "s" }
+            )
+            .red()
+        );
+    }
+}
+
+/// `1 class`, `2 classes`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{} {}", thousands(n), if n == 1 { one } else { many })
+}
+
+fn print_counts(
+    title: &str,
+    counts: &BTreeMap<String, usize>,
+    examples: &BTreeMap<String, Vec<String>>,
+    names: &Names,
+) {
+    if counts.is_empty() {
+        return;
+    }
+    println!("\n{}", title.bold());
+    let width = counts
+        .keys()
+        .map(|k| names.key(k).chars().count())
+        .max()
+        .unwrap_or(0);
+    for (key, n) in counts {
+        let ex = examples.get(key).map(Vec::as_slice).unwrap_or_default();
+        // the count is of triples, the examples are the terms they are about
+        let ex = if ex.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  {}",
+                format!("e.g. {}", names.list(ex, ex.len())).dimmed()
+            )
+        };
+        let key = names.key(key);
+        println!("  {key:<width$}  {:>6}{ex}", thousands(*n));
+    }
+}
+
+fn print_finding(f: &Finding, names: &Names, mark: String) {
+    println!("  {mark} {}", f.message);
+    if !f.examples.is_empty() {
+        println!("      {}", names.list(&f.examples, f.count).dimmed());
+    }
+}
+
+/// What `ontology from` reads a file as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Rdf,
+    Csv,
+    Workbook,
+    Sql,
+}
+
+fn source(path: &Path, flag: Option<OntologyInputFormat>) -> Source {
+    if flag.is_some() {
+        return Source::Rdf;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("csv" | "tsv") => Source::Csv,
+        Some("xlsx" | "xlsm") => Source::Workbook,
+        Some("sql" | "ddl") => Source::Sql,
+        _ => Source::Rdf,
+    }
+}
+
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ontology")
+        .to_string()
+}
+
+/// `https://example.com/<file name>/`, for IRIs minted without `--base`.
+fn default_base(path: &Path) -> String {
+    format!("https://example.com/{}/", convert::slug(&file_stem(path)))
+}
+
+/// A prefix for the minted namespace: the file name's letters, else `ex`.
+fn base_prefix(path: &Path) -> String {
+    let letters: String = file_stem(path)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if letters.starts_with(|c: char| c.is_ascii_alphabetic()) && letters.len() <= 12 {
+        letters
+    } else {
+        "ex".to_string()
+    }
+}
+
+fn output_format(format: OntologyOutputFormat) -> OutputFormat {
+    match format {
+        OntologyOutputFormat::Turtle => OutputFormat::Turtle,
+        OntologyOutputFormat::Jsonld => OutputFormat::JsonLd,
+    }
+}
+
+/// Serialize and write to `path`, or to stdout.
+fn emit(
+    quads: &[Quad],
+    prefixes: &BTreeMap<String, String>,
+    format: OutputFormat,
+    path: Option<&Path>,
+) -> CliResult<()> {
+    let text = write::serialize(quads, prefixes, format)
+        .map_err(|e| CliError::Input(format!("failed to write RDF: {e}")))?;
+    match path {
+        Some(path) => std::fs::write(path, &text)
+            .map_err(|e| CliError::Input(format!("failed to write {}: {e}", path.display()))),
+        None => {
+            print!("{text}");
+            Ok(())
+        }
+    }
+}
+
+fn read_bytes(path: &Path) -> CliResult<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))
+}
+
+fn read_sheets(path: &Path) -> CliResult<Vec<tabular::Sheet>> {
+    let failed = |e: tabular::TabularError| CliError::Input(format!("{}: {e}", path.display()));
+    match source(path, None) {
+        Source::Workbook => tabular::read_xlsx(&read_bytes(path)?).map_err(failed),
+        _ => Ok(vec![
+            tabular::read_csv(&read_text(path)?, &file_stem(path)).map_err(failed)?
+        ]),
+    }
+}
+
+fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
+    if !args.seed.is_empty() {
+        return Err(CliError::Usage(
+            "--seed slices an RDF vocabulary; it doesn't apply to tables".into(),
+        ));
+    }
+    let base = args
+        .base
+        .clone()
+        .unwrap_or_else(|| default_base(&args.file));
+    let mut notes = Vec::new();
+    let model = match kind {
+        Source::Sql => {
+            let (model, skipped) = convert::sql::read(&read_text(&args.file)?)
+                .map_err(|e| CliError::Input(format!("{}: {e}", args.file.display())))?;
+            if skipped > 0 {
+                notes.push(format!(
+                    "{skipped} statement(s) no SQL dialect could parse were skipped"
+                ));
+            }
+            model
+        }
+        _ => tabular::model(&read_sheets(&args.file)?, args.enum_max),
+    };
+    let out = convert::emit(&model, &EmitOptions { base: base.clone() });
+    // an empty ontology is never a result: say what was found instead
+    if out.classes == 0 {
+        return Err(CliError::Input(format!(
+            "{}: no tables found to make classes from",
+            args.file.display()
+        )));
+    }
+    notes.extend(out.notes.iter().cloned());
+    let declared = vec![(base_prefix(&args.file), base.clone())];
+    let format = output_format(args.format);
+    match &args.catalog_out {
+        Some(path) => {
+            emit(
+                &out.ontology,
+                &write::used_prefixes(&out.ontology, &declared),
+                format,
+                args.output.as_deref(),
+            )?;
+            emit(
+                &out.catalog,
+                &write::used_prefixes(&out.catalog, &declared),
+                format,
+                Some(path),
+            )?;
+        }
+        None => {
+            let all: Vec<Quad> = out.ontology.iter().chain(&out.catalog).cloned().collect();
+            emit(
+                &all,
+                &write::used_prefixes(&all, &declared),
+                format,
+                args.output.as_deref(),
+            )?;
+        }
+    }
+
+    let mut summary = format!(
+        "{}, {}",
+        count(out.classes, "class", "classes"),
+        count(out.properties, "property", "properties")
+    );
+    if out.enum_classes > 0 {
+        summary.push_str(&format!(
+            "; {} made {}, with {}",
+            count(out.enum_classes, "enumerated column", "enumerated columns"),
+            if out.enum_classes == 1 {
+                "a class"
+            } else {
+                "classes"
+            },
+            count(out.records, "catalog record", "catalog records")
+        ));
+    }
+    if out.keys_left_out > 0 {
+        summary.push_str(&format!(
+            "; {} left out",
+            count(
+                out.keys_left_out,
+                "primary key column",
+                "primary key columns"
+            )
+        ));
+    }
+    eprintln!("{summary}");
+    for note in notes {
+        eprintln!("{note}");
+    }
+    if args.base.is_none() {
+        eprintln!("IRIs minted under {base}; set --base to your own namespace");
+    }
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
+    Ok(())
+}
+
+fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
+    let kind = source(&args.file, args.input_format);
+    if kind != Source::Rdf {
+        return run_from_tables(args, kind);
+    }
+    let (parsed, _) = parse_file(&args.file, args.input_format)?;
+    let out = write::rewrite(&parsed, &args.seed, args.depth)
+        .map_err(|e| CliError::Usage(e.to_string()))?;
+    let prefixes = write::used_prefixes(&out.quads, &parsed.prefixes);
+    emit(
+        &out.quads,
+        &prefixes,
+        output_format(args.format),
+        args.output.as_deref(),
+    )?;
+
+    let mut summary = format!(
+        "{}, {}",
+        count(out.classes, "class", "classes"),
+        count(out.properties, "property", "properties")
+    );
+    if out.records > 0 {
+        summary.push_str(&format!(
+            ", {}",
+            count(out.records, "catalog record", "catalog records")
+        ));
+    }
+    if let Some(slice) = &out.slice {
+        summary.push_str(&format!(
+            " (sliced from {} classes, {} properties)",
+            thousands(slice.classes_total),
+            thousands(slice.properties_total)
+        ));
+    }
+    eprintln!("{summary}");
+    if !out.adapted.is_empty() {
+        let changes: Vec<String> = out
+            .adapted
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", thousands(*v)))
+            .collect();
+        eprintln!("rewritten: {}", changes.join("; "));
+    }
+    eprintln!("run `fluree ontology check` on the result to see what an HTTP reader will read");
+    Ok(())
+}
+
+pub fn run_catalog(action: CatalogAction) -> CliResult<()> {
+    match action {
+        CatalogAction::From(args) => run_catalog_from(&args),
+    }
+}
+
+fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
+    let sheets = read_sheets(&args.file)?;
+    let sheet = match &args.sheet {
+        Some(name) => sheets
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "{} has no sheet {name:?} (its sheets: {})",
+                    args.file.display(),
+                    sheets
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?,
+        None => sheets
+            .first()
+            .ok_or_else(|| CliError::Input(format!("{} has no table", args.file.display())))?,
+    };
+    let base = args
+        .base
+        .clone()
+        .unwrap_or_else(|| default_base(&args.file));
+    // the ontology's prefixes, so its class reads as it does there
+    let mut declared = Vec::new();
+    let class = match &args.ontology {
+        Some(path) => {
+            let (parsed, _) = parse_file(path, None)?;
+            let ontology = parsed.split().ontology;
+            declared.extend(parsed.prefixes.iter().cloned());
+            fluree_db_ontology::slice::resolve_seed(&args.class, &ontology, &parsed.prefixes)
+                .map_err(|e| CliError::Usage(e.to_string().replace("--seed", "--class")))?
+        }
+        None if args.class.contains("://") || args.class.starts_with("urn:") => args.class.clone(),
+        None => format!(
+            "{base}{}",
+            convert::pascal(&convert::class_label(&args.class))
+        ),
+    };
+    let options = CatalogOptions {
+        class: class.clone(),
+        label: args.label.clone(),
+        alt: args.alt.clone(),
+        code: args.code.clone(),
+        definition: args.definition.clone(),
+        describe: args.describe.clone(),
+        id: args.id.clone(),
+        base: base.clone(),
+    };
+    let out = catalog::from_sheet(sheet, &options).map_err(|e| CliError::Usage(e.to_string()))?;
+    declared.push((base_prefix(&args.file), base.clone()));
+    emit(
+        &out.quads,
+        &write::used_prefixes(&out.quads, &declared),
+        output_format(args.format),
+        args.output.as_deref(),
+    )?;
+
+    let mut summary = format!("{} of <{class}>", count(out.records, "record", "records"));
+    if out.merged > 0 {
+        summary.push_str(&format!(
+            "; {} folded into an earlier record with the same id",
+            count(out.merged, "row", "rows")
+        ));
+    }
+    if out.kept_apart > 0 {
+        summary.push_str(&format!(
+            "; {} kept apart from another whose id reads alike in an IRI (suffixed)",
+            count(out.kept_apart, "record", "records")
+        ));
+    }
+    if out.without_label > 0 {
+        summary.push_str(&format!(
+            "; {} without a name left out",
+            count(out.without_label, "row", "rows")
+        ));
+    }
+    eprintln!("{summary}");
+    let e = &out.estimate;
+    eprintln!(
+        "About {} serialized tokens, repeated in every extraction window (a window holds {} with the ontology and the text).",
+        thousands(e.catalog_tokens),
+        thousands(TOKENS_PER_WINDOW)
+    );
+    if e.tokens > TOKENS_PER_WINDOW {
+        eprintln!(
+            "{}",
+            "warning: this catalog alone is more than one window holds; send the records the documents need, or split it by class".yellow()
+        );
+    } else if e.document_chars < MAX_TEXT_CHARS {
+        eprintln!(
+            "{}",
+            format!(
+                "warning: with this catalog a window has room for about {} characters of text",
+                thousands(e.document_chars)
+            )
+            .yellow()
+        );
+    }
+    if args.base.is_none() {
+        eprintln!("IRIs minted under {base}; set --base to your own namespace");
+    }
+    if args.ontology.is_none() && !(args.class.contains("://") || args.class.starts_with("urn:")) {
+        eprintln!("class minted as <{class}>; pass --ontology to use your ontology's class");
+    }
+    Ok(())
+}

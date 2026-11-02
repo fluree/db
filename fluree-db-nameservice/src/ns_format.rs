@@ -6,10 +6,11 @@
 //! so they are defined once here to ensure consistency.
 
 use crate::{
-    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, LedgerHeads, RefValue,
-    StatusPayload, StatusValue,
+    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, LedgerHeads,
+    NameServiceError, RefValue, Result, StatusPayload, StatusValue,
 };
 use fluree_db_core::{ContentId, LedgerId};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// ns@v2 format version path segment.
@@ -240,6 +241,15 @@ pub(crate) struct BranchPointRef {
 
     #[serde(rename = "f:t")]
     pub t: i64,
+}
+
+/// Parse the ns record read from `address`, naming it if it cannot be
+/// parsed. A listing fails on one bad record, and the error is how an
+/// operator finds which.
+pub(crate) fn parse_record<T: DeserializeOwned>(bytes: &[u8], address: &str) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        NameServiceError::storage(format!("Cannot parse nameservice record {address}: {e}"))
+    })
 }
 
 /// Whether `bytes` hold a ledger's main ns record (as opposed to an index or

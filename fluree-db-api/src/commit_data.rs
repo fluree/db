@@ -65,11 +65,26 @@ pub(crate) fn key_of(flake: &Flake) -> ConflictKey {
     ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())
 }
 
+/// A range's net change: one flake per surviving fact, and for an undo the
+/// facts among them whose deciding commit held a same-`t` pair. The
+/// positions index `flakes`, so the two only travel together.
+#[derive(Default)]
+pub(crate) struct NetChange {
+    /// One flake per surviving fact. Unordered.
+    pub(crate) flakes: Vec<Flake>,
+    /// For an undo, the positions in `flakes` of facts whose deciding commit
+    /// held a same-`t` retraction and assertion of them: what undoing that
+    /// commit leaves depends on the fact's presence before it
+    /// (`branch_validation::undo_same_t_pairs`). Empty for a replay, whose
+    /// pairs resolve to the assertion, the state at the range head.
+    pub(crate) same_t_pairs: Vec<usize>,
+}
+
 /// Flakes and metadata accumulated from a sequence of commits.
 #[derive(Default)]
 pub(crate) struct CollectedCommitData {
-    /// The range's net change, one flake per surviving fact. Unordered.
-    pub(crate) flakes: Vec<Flake>,
+    /// The range's net change.
+    pub(crate) net: NetChange,
     /// Union of namespace deltas; earlier commits win on key collisions.
     pub(crate) namespace_delta: HashMap<u16, String>,
     /// Named graphs the range's commits list, by IRI. Unioned by IRI: each
@@ -113,9 +128,12 @@ where
     }
 
     // The accumulator wants the range newest-change-first. For a replay
-    // that is the newest commit, last flake first. For an undo the inverse
-    // of the oldest commit is applied last, so the oldest commit's inverse
-    // comes first and each commit's own flakes keep their order.
+    // that is the newest commit first. For an undo the inverse of the
+    // oldest commit is applied last, so the oldest commit's inverse comes
+    // first. Within one commit order does not matter: the accumulator
+    // resolves a same-`t` retraction and assertion of one fact to the
+    // assertion and, for an undo, reports the pair, which the caller
+    // resolves by the fact's presence before that commit.
     let mut acc = NetChangeAccumulator::default();
     match fold {
         Fold::Replay => {
@@ -146,7 +164,19 @@ where
             }
         }
     }
-    data.flakes = acc.finish();
+    data.net = match fold {
+        Fold::Replay => NetChange {
+            flakes: acc.finish(),
+            same_t_pairs: Vec::new(),
+        },
+        Fold::Undo => {
+            let (flakes, same_t_pairs) = acc.finish_with_pairs();
+            NetChange {
+                flakes,
+                same_t_pairs,
+            }
+        }
+    };
     data
 }
 
@@ -205,7 +235,7 @@ mod tests {
                 label("c", "HTML", Some("en"), 2, false),
             ],
         );
-        let undone = collect_from_commits([legacy_upsert], Fold::Undo).flakes;
+        let undone = collect_from_commits([legacy_upsert], Fold::Undo).net.flakes;
         assert_eq!(undone.len(), 1, "{undone:?}");
         let f = &undone[0];
         assert!(!f.op, "the assertion of \"b\"@en inverts to its retraction");

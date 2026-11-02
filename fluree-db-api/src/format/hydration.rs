@@ -56,7 +56,7 @@ use fluree_db_query::ir::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec, Root,
 };
 use fluree_db_query::QueryPolicyEnforcer;
-use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD};
+use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD, RDF};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -896,6 +896,7 @@ impl<'a> DatasetCtx<'a> {
             novelty,
             dataset: Some(self),
             active_idx: idx,
+            holds_cells: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1156,6 +1157,10 @@ struct HydrationFormatter<'a> {
     /// identifies the view within a hydration's shared cache, so one ledger's
     /// rendering is never served for another's (issue #1259).
     active_idx: usize,
+    /// Whether `db` holds an `rdf:first` triple, so a blank-node value may
+    /// head a list stored as its triples; read when the crawl first meets a
+    /// blank-node value ([`Self::holds_cells`]).
+    holds_cells: std::sync::OnceLock<bool>,
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -1202,6 +1207,7 @@ impl<'a> HydrationFormatter<'a> {
             novelty,
             dataset: None,
             active_idx: 0,
+            holds_cells: std::sync::OnceLock::new(),
         }
     }
 
@@ -2609,7 +2615,7 @@ impl<'a> HydrationFormatter<'a> {
             let FlakeValue::Ref(head) = &flake.o else {
                 continue;
             };
-            if head.namespace_code != BLANK_NODE {
+            if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
                 continue;
             }
             let members = fluree_db_core::rdf_list::chain_members(self.db, head)
@@ -2632,6 +2638,30 @@ impl<'a> HydrationFormatter<'a> {
             out.push((k, members));
         }
         Ok(out)
+    }
+
+    /// Whether `db` holds any `rdf:first` triple, read once per response:
+    /// without one, no blank node heads a list stored as its triples.
+    async fn holds_cells(&self) -> Result<bool> {
+        if let Some(&held) = self.holds_cells.get() {
+            return Ok(held);
+        }
+        let first = self
+            .db
+            .range_with_opts(
+                IndexType::Psot,
+                RangeTest::Eq,
+                RangeMatch {
+                    p: Some(Sid::new(RDF, fluree_vocab::predicates::RDF_FIRST)),
+                    ..Default::default()
+                },
+                RangeOptions::default().with_flake_limit(1),
+            )
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
+        let held = !first.is_empty();
+        let _ = self.holds_cells.set(held);
+        Ok(held)
     }
 
     /// Fetch one `(subject, predicate)` pair via the SPOT index.

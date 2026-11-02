@@ -16,6 +16,7 @@ tracing = { workspace = true }
 rustc-hash = "2"
 
 [dev-dependencies]
+fluree-test-support = { path = "../fluree-test-support" }
 tempfile = "3"
 tracing-subscriber.workspace = true
 

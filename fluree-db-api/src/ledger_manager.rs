@@ -800,6 +800,7 @@ impl LedgerHandle {
             annotation_index: root.annotation_index.clone(),
             had_annotation_arena: root.had_annotation_arena,
             has_list_meta: root.has_list_meta,
+            index_root_id: Some(index_id.clone()),
         };
         tracing::Span::current().record("index_t", meta.t);
         let db = LedgerSnapshot::new_meta(meta)
@@ -1287,7 +1288,7 @@ pub(crate) async fn load_and_attach_binary_store(
         snap.subject_watermarks = root.subject_watermarks;
         snap.string_watermark = root.string_watermark;
         if root.stats.is_some() && snap.stats.is_none() {
-            snap.stats = root.stats.map(Arc::new);
+            snap.set_index_root_stats(root.stats.map(Arc::new), index_cid.clone());
             tracing::debug!("loaded stats from FIR6 root");
         }
         if root.schema.is_some() && snap.schema.is_none() {

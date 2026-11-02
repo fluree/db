@@ -39,10 +39,7 @@ mod it_hydration_predicate_gating;
 mod it_join_batched_overlay;
 #[path = "it_turtle_star_write_paths.rs"]
 mod it_turtle_star_write_paths;
-// it_minmax_fast_path_fired is a STANDALONE `[[test]]` bin (see its header):
-// its assertions are about instrumentation, and tracing's process-global
-// callsite-interest cache + thread-local capture make that fragile next to
-// parallel siblings under bare `cargo test`.
+// it_minmax_fast_path_fired is a standalone `[[test]]` bin; see its header.
 // GraphQL is behind a feature flag (async-graphql is a heavy dependency), so
 // this module only compiles when it is on.
 #[cfg(feature = "graphql")]

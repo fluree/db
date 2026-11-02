@@ -665,6 +665,11 @@ impl crate::Fluree {
         flakes: Vec<Flake>,
         original_commit: &Commit,
     ) -> Result<StagedCommit> {
+        // A commit written before the staging fix can hold a retraction and
+        // an assertion of one fact at one `t`. The pair means the fact holds,
+        // and a commit built here may not hold it, so the replay keeps the
+        // assertion alone.
+        let flakes = fluree_db_transact::resolve_same_t_pairs(&state, flakes);
         // A commit that conformed on the branch can violate a shape the
         // source installed since the fork. Each replay is validated against
         // the state it lands on; the first violation aborts the whole rebase,

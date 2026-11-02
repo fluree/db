@@ -4,7 +4,7 @@
 //! manifest file bounds (lower_bounds, upper_bounds) and partition data.
 //!
 //! Iceberg uses little-endian encoding for numeric types and UTF-8 for strings.
-//! See: https://iceberg.apache.org/spec/#appendix-d-single-value-serialization
+//! See: <https://iceberg.apache.org/spec/#appendix-d-single-value-serialization>
 
 use crate::error::{IcebergError, Result};
 use crate::metadata::SchemaField;

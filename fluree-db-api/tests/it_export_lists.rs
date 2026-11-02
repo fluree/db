@@ -265,23 +265,16 @@ async fn lists_export_in_order_and_reinsert_as_the_same_lists() {
             }
         }
 
-        // N-Triples re-inserts as the spine it spells out.
+        // N-Triples spells a list out as its cells, which re-insert as the
+        // same list.
         let copy = format!("it/export-lists/{lane}-nt:main");
         fluree.create_ledger(&copy).await.expect("create copy");
         insert_text(&fluree, &copy, &nt).await;
-        let ledger = fluree.ledger(&copy).await.expect("load");
-        let rows = support::query_sparql(
-            &fluree,
-            &ledger,
-            "PREFIX ex: <http://example.org/>
-             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-             SELECT ?first WHERE { ex:s ex:items/rdf:first ?first }",
-        )
-        .await
-        .expect("query")
-        .to_jsonld(&ledger.snapshot)
-        .expect("to_jsonld");
-        assert_eq!(support::normalize_rows(&rows), [json!(["c"])], "{lane} nt");
+        assert_eq!(
+            crawl(&fluree, &copy, "ex:s").await["ex:items"],
+            json!(["c", "a", "b", "a"]),
+            "{lane} nt"
+        );
     }
 }
 
@@ -408,8 +401,8 @@ async fn a_list_and_an_annotated_value_share_a_predicate() {
 
 /// Novelty holds each fact's whole lifecycle, and export writes a fact's
 /// latest state: a fact asserted and then deleted since the index was built
-/// is not exported, and neither are the members a SPARQL edit re-stored as
-/// triples. From a ledger with no index, and over one.
+/// is not exported, and a list's members once each. From a ledger with no
+/// index, and over one.
 #[tokio::test]
 async fn facts_deleted_since_the_index_are_not_exported() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -439,16 +432,6 @@ async fn facts_deleted_since_the_index_are_not_exported() {
             .commit()
             .await
             .expect("delete");
-        fluree
-            .graph(&id)
-            .transact()
-            .sparql_update(
-                "PREFIX ex: <http://example.org/>
-                 INSERT { ?h ex:note \"x\" } WHERE { ex:s ex:items ?h }",
-            )
-            .commit()
-            .await
-            .expect("note the list's head");
 
         for format in [
             ExportFormat::NTriples,
@@ -464,7 +447,7 @@ async fn facts_deleted_since_the_index_are_not_exported() {
                 assert_eq!(
                     text.matches(member).count(),
                     1,
-                    "{indexed} {format:?}: {member} once, in the re-stored list: {text}"
+                    "{indexed} {format:?}: {member} once: {text}"
                 );
             }
         }
