@@ -1654,7 +1654,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-Call `without_indexing()` when another process, such as a dedicated indexer, maintains the index for the same storage.
+Call `without_indexing()` when another process, such as a dedicated indexer, maintains the index for the same storage. That needs storage several processes can share: a file storage directory is used by one process at a time ([One process per directory](../operations/storage.md#one-process-per-directory)).
 
 ### Index retention
 

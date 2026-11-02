@@ -18,6 +18,7 @@ After a successful publish, reindex evicts the calling instance's cached ledger.
 2. **Configuration changes** - Changing index parameters (leaf size, branch size)
 3. **Storage backend changes** - If you move a deployment between storage backends or adopt a new index strategy/type.
 4. **Merges indexed by an older build** - A ledger that took a general merge while indexed by a build from before branch operations stamped their flakes on the target's clock can hold index entries carrying the source branch's numbering. Head reads are correct, but `--at` reads served from that index stay wrong until a rebuild.
+5. **Deletes in a new graph, indexed by an older build** - On Fluree 4.2.4 and earlier, an incremental build could bring back a fact that was inserted and then deleted between two builds, in a graph the base index held nothing for (a named graph first written after the last build, or the default graph of a ledger whose indexed data all sat in named graphs). Such a fact reads as live until a full rebuild, which replays the deletion.
 
 ### Before You Reindex
 

@@ -21,7 +21,7 @@
 //!
 //! The execution engine is split into focused submodules:
 //!
-//! - `reasoning_prep`: Schema hierarchy, reasoning modes, derived facts
+//! - `reasoning_prep`: Reasoning modes, derived facts
 //! - `rewrite_glue`: Pattern rewriting for RDFS/OWL expansion
 //! - `pushdown`: Filter bounds extraction for index-level filtering
 //! - `where_plan`: WHERE clause operator building

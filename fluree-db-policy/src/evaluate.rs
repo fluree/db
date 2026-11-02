@@ -3,7 +3,7 @@
 //! This module implements the core policy evaluation:
 //! - **Deny Overrides** combining: if any matching policy denies, access is denied
 //! - Required subset filtering AFTER class-applicability filter
-//! - Schema flake bypass (schema flakes always allowed)
+//! - Schema flake bypass on view only (writing one is judged like any other)
 //! - Identity grounding via random never-match IRI
 //! - Targeted `f:query` policies: if query returns false, deny (don't fall through)
 
@@ -135,12 +135,14 @@ impl PolicyContext {
         object: &FlakeValue,
         subject_classes: &[Sid],
     ) -> Result<bool> {
+        if is_schema_flake(property, object) {
+            return Ok(true);
+        }
         let tracker = Tracker::disabled();
         self.evaluate_flake(
             self.wrapper.view(),
             subject,
             property,
-            object,
             subject_classes,
             &tracker,
         )
@@ -155,11 +157,13 @@ impl PolicyContext {
         subject_classes: &[Sid],
         tracker: &Tracker,
     ) -> Result<bool> {
+        if is_schema_flake(property, object) {
+            return Ok(true);
+        }
         self.evaluate_flake(
             self.wrapper.view(),
             subject,
             property,
-            object,
             subject_classes,
             tracker,
         )
@@ -195,6 +199,9 @@ impl PolicyContext {
         executor: &dyn PolicyQueryExecutor,
         tracker: &Tracker,
     ) -> Result<bool> {
+        if is_schema_flake(property, object) {
+            return Ok(true);
+        }
         let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
         self.evaluate_flake_async(self.wrapper.view(), flake, executor, tracker)
             .await
@@ -246,6 +253,9 @@ impl PolicyContext {
         executor: &dyn PolicyQueryExecutor,
         tracker: &Tracker,
     ) -> Result<PolicyDecision<'a>> {
+        if is_schema_flake(property, object) {
+            return Ok(PolicyDecision::Allowed { restriction: None });
+        }
         let flake = FlakeEvalParams::new(subject, property, object, true, subject_classes);
         self.evaluate_flake_async_detailed(self.wrapper.view(), flake, executor, tracker)
             .await
@@ -271,7 +281,7 @@ impl PolicyContext {
         &self,
         subject: &Sid,
         property: &Sid,
-        object: &FlakeValue,
+        _object: &FlakeValue,
         subject_classes: &[Sid],
     ) -> Result<bool> {
         let tracker = Tracker::disabled();
@@ -279,7 +289,6 @@ impl PolicyContext {
             self.wrapper.modify(),
             subject,
             property,
-            object,
             subject_classes,
             &tracker,
         )
@@ -295,28 +304,24 @@ impl PolicyContext {
     /// (allow_view_flake_async, allow_modify_flake_async) for full f:query support.
     ///
     /// Implements policy evaluation semantics:
-    /// 1. Schema bypass first
-    /// 2. Collect candidates in order (property -> subject -> default)
-    /// 3. Filter by class applicability
-    /// 4. Apply required subset filtering
-    /// 5. Evaluate in order - return true on first allow
-    /// 6. Return default_allow if no policy allowed
+    /// 1. Collect candidates in order (property -> subject -> default)
+    /// 2. Filter by class applicability
+    /// 3. Apply required subset filtering
+    /// 4. Evaluate in order - return true on first allow
+    /// 5. Return default_allow if no policy allowed
+    ///
+    /// The view entry points let every schema flake through first
+    /// ([`is_schema_flake`]); writing one is judged like any other.
     fn evaluate_flake(
         &self,
         policy_set: &PolicySet,
         subject: &Sid,
         property: &Sid,
-        object: &FlakeValue,
         subject_classes: &[Sid],
         tracker: &Tracker,
     ) -> Result<bool> {
         // Root policy bypasses all checks
         if self.wrapper.is_root() {
-            return Ok(true);
-        }
-
-        // Schema flakes always allowed (before any policy evaluation)
-        if is_schema_flake(property, object) {
             return Ok(true);
         }
 
@@ -425,11 +430,6 @@ impl PolicyContext {
     ) -> Result<bool> {
         // Root policy bypasses all checks
         if self.wrapper.is_root() {
-            return Ok(true);
-        }
-
-        // Schema flakes always allowed (needed for query planning/formatting)
-        if is_schema_flake(flake.property, flake.object) {
             return Ok(true);
         }
 
@@ -583,11 +583,6 @@ impl PolicyContext {
             return Ok(PolicyDecision::Allowed { restriction: None });
         }
 
-        // Schema flakes always allowed (needed for query planning/formatting)
-        if is_schema_flake(flake.property, flake.object) {
-            return Ok(PolicyDecision::Allowed { restriction: None });
-        }
-
         // 1. Collect all candidate policy entries (property -> subject -> default order)
         let candidate_entries = policy_set.policy_entries_for_flake(
             flake.subject,
@@ -645,11 +640,6 @@ impl PolicyContext {
     ) -> Result<PolicyDecision<'a>> {
         // Root policy bypasses all checks
         if self.wrapper.is_root() {
-            return Ok(PolicyDecision::Allowed { restriction: None });
-        }
-
-        // Schema flakes always allowed (needed for internal operations)
-        if is_schema_flake(property, object) {
             return Ok(PolicyDecision::Allowed { restriction: None });
         }
 
@@ -848,16 +838,10 @@ impl PolicyContext {
         &'a self,
         subject: &Sid,
         property: &Sid,
-        object: &FlakeValue,
         subject_classes: &[Sid],
     ) -> Result<(bool, Vec<&'a PolicyRestriction>)> {
         // Root policy bypasses all checks
         if self.wrapper.is_root() {
-            return Ok((true, vec![]));
-        }
-
-        // Schema flakes always allowed
-        if is_schema_flake(property, object) {
             return Ok((true, vec![]));
         }
 
@@ -1594,5 +1578,75 @@ mod tests {
             .unwrap();
 
         assert!(result);
+    }
+
+    /// The schema exemption lives in the view entry points, not the shared
+    /// evaluators: under deny-all sets, a schema flake is visible but its
+    /// write is denied.
+    #[tokio::test]
+    async fn schema_flakes_bypass_view_policy_only() {
+        let deny_all = |action: PolicyAction| {
+            let mut deny_all = make_deny_restriction("deny-all", make_sid(RDFS, "subClassOf"));
+            deny_all.target_mode = TargetMode::Default;
+            deny_all.targets.clear();
+            deny_all.action = action;
+            let mut set = PolicySet::new();
+            set.restrictions.push(deny_all);
+            set.defaults.push(0);
+            set
+        };
+        let wrapper = PolicyWrapper::new(
+            deny_all(PolicyAction::View),
+            deny_all(PolicyAction::Modify),
+            false,
+            false,
+            std::collections::HashMap::new(),
+        );
+        let ctx = PolicyContext::new(wrapper, None);
+        let subject = make_sid(100, "Person");
+        let property = make_sid(RDFS, "subClassOf");
+        let object = FlakeValue::Ref(make_sid(100, "Thing"));
+        let tracker = Tracker::disabled();
+
+        let viewed = ctx
+            .allow_view_flake_async(&subject, &property, &object, &[], &SourceExecutor, &tracker)
+            .await
+            .unwrap();
+        assert!(viewed, "view lets a schema flake through");
+        let viewed = ctx
+            .allow_view_flake_async_detailed(
+                &subject,
+                &property,
+                &object,
+                &[],
+                &SourceExecutor,
+                &tracker,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(viewed, PolicyDecision::Allowed { .. }));
+
+        let write = WriteFlakeInfo {
+            lifecycle: crate::types::WriteVerb::Create,
+            op: true,
+            pre_classes: &[],
+            union_classes: &[],
+            type_object_class: None,
+        };
+        let written = ctx
+            .allow_modify_flake_write_async_detailed(
+                &subject,
+                &property,
+                &object,
+                write,
+                &SourceExecutor,
+                &tracker,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(written, PolicyDecision::Denied { .. }),
+            "modify judges a schema flake like any other"
+        );
     }
 }
