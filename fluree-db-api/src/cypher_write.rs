@@ -25,6 +25,7 @@ use fluree_db_cypher::ast::{
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_transact::ir::Txn;
+use fluree_db_transact::lower_cypher_update::{cypher_blank_label, CypherBlank};
 
 /// A lowered Cypher write: a ready-to-stage `Txn`, a conditional write that
 /// must probe the writer snapshot before it can be resolved, or a
@@ -728,9 +729,9 @@ pub fn plan_write_return(ast: &CypherAst) -> Result<Option<CypherWriteReturnPlan
             .as_ref()
             .map_or_else(|| v.name.clone(), |a| a.name.clone());
         let label = if created_rels.contains(v.name.as_str()) {
-            format!("cy_rel_{}", v.name)
+            cypher_blank_label(CypherBlank::RelVar(&v.name))
         } else if created_nodes.contains(v.name.as_str()) {
-            format!("cy_{}", v.name)
+            cypher_blank_label(CypherBlank::NodeVar(&v.name))
         } else {
             return Err(format!(
                 "RETURN of `{}` on a write statement is deferred — only entities created \

@@ -1407,6 +1407,12 @@ pub enum Commands {
         action: ModelAction,
     },
 
+    /// Ontology tools for document extraction: what an HTTP reader reads, conversion, slicing
+    Ontology {
+        #[command(subcommand)]
+        action: OntologyAction,
+    },
+
     /// Developer memory — store and recall facts, decisions, constraints
     Memory {
         #[command(subcommand)]
@@ -2631,6 +2637,117 @@ pub enum DocsAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `fluree ontology` subcommands.
+#[derive(Subcommand)]
+pub enum OntologyAction {
+    /// Write an ontology in the shape an extraction model reads well
+    ///
+    /// Reads an RDF ontology (Turtle or JSON-LD) and writes it with what the
+    /// model reads made explicit: SKOS labels and definitions moved into
+    /// rdfs:label and rdfs:comment, a label made from the IRI where there is
+    /// none, OWL restrictions and other blank-node constructs dropped, and OWL
+    /// axioms and annotation property declarations (which a reader would read
+    /// as catalog records) dropped.
+    /// Domains, ranges and other axioms are kept. With --seed, a large
+    /// vocabulary is sliced to the classes the seeds reach first.
+    ///
+    /// Examples:
+    ///   fluree ontology from fibo-module.ttl > ontology.ttl
+    ///   fluree ontology from schemaorg.jsonld --seed schema:Person,schema:Organization > ontology.ttl
+    #[command(verbatim_doc_comment)]
+    From(OntologyFromArgs),
+
+    /// Report what an HTTP reader will and won't read of an ontology
+    ///
+    /// Applies the ontology input policy of an HTTP reader (an extraction
+    /// model reached over HTTP, `fluree doc ingest`'s [doc.reader]) locally,
+    /// and reports what a request carrying this ontology (and catalog) would
+    /// fail for, what the reader reads another way, what it never sees, and
+    /// advice. Nothing is sent anywhere. Exits 1 when a request would be
+    /// refused. The language-model extractor of `fluree doc ingest` reads more
+    /// of an ontology (domains, ranges, every parent class).
+    ///
+    /// Examples:
+    ///   fluree ontology check ontology.ttl
+    ///   fluree ontology check ontology.ttl --catalog accounts.ttl
+    ///   fluree ontology check schemaorg.jsonld --seed schema:Person --json
+    #[command(verbatim_doc_comment)]
+    Check(OntologyCheckArgs),
+}
+
+/// RDF syntaxes `fluree ontology` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OntologyInputFormat {
+    Turtle,
+    Jsonld,
+}
+
+/// RDF syntaxes `fluree ontology` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum OntologyOutputFormat {
+    #[default]
+    Turtle,
+    Jsonld,
+}
+
+#[derive(Args, Debug)]
+pub struct OntologyFromArgs {
+    /// The ontology to convert (`-` reads stdin)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Keep only what these classes reach: IRIs, prefixed names or labels,
+    /// comma-separated or repeated
+    #[arg(long, value_delimiter = ',', value_name = "CLASSES")]
+    pub seed: Vec<String>,
+
+    /// Steps --seed follows from the seed classes (properties of a class, then
+    /// the classes in their ranges)
+    #[arg(long, default_value_t = 1, value_name = "N", requires = "seed")]
+    pub depth: usize,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t)]
+    pub format: OntologyOutputFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// The input's format, when its extension doesn't say
+    #[arg(long, value_enum)]
+    pub input_format: Option<OntologyInputFormat>,
+}
+
+#[derive(Args, Debug)]
+pub struct OntologyCheckArgs {
+    /// The ontology to check (`-` reads stdin). A saved extraction request
+    /// (JSON-LD with xt:ontology and xt:instances graphs) works too
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// A catalog of records to check with it (SKOS records)
+    #[arg(long, value_name = "FILE")]
+    pub catalog: Option<PathBuf>,
+
+    /// Check the slice these classes reach instead of the whole ontology:
+    /// IRIs, prefixed names or labels, comma-separated or repeated
+    #[arg(long, value_delimiter = ',', value_name = "CLASSES")]
+    pub seed: Vec<String>,
+
+    /// Steps --seed follows from the seed classes
+    #[arg(long, default_value_t = 1, value_name = "N", requires = "seed")]
+    pub depth: usize,
+
+    /// Emit the report as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// The input's format, when its extension doesn't say
+    #[arg(long, value_enum)]
+    pub input_format: Option<OntologyInputFormat>,
 }
 
 /// Server lifecycle subcommands.
