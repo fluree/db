@@ -171,6 +171,7 @@ literals.append(pa.table({
 literals = catalog.load_table("silver.literals")
 print("literals table_location:", literals.location())
 
+# ---------------------------------------------------------------------------
 # silver.cells: every physical column type, two snapshots (one file each).
 # ---------------------------------------------------------------------------
 # A column the mapping leaves un-annotated reads as an xsd:string of its

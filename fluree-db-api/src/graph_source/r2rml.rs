@@ -1150,11 +1150,9 @@ fn rendered_cell_literal(field_type: Option<&str>, s: &str) -> Option<LiteralVal
                 precision,
                 scale,
             };
-            let literal = LiteralValue::Decimal {
-                unscaled,
-                precision,
-                scale,
-            };
+            // The cell carries the column's precision; a literal has none of
+            // its own (the reader compares it against the column's type).
+            let literal = LiteralValue::Decimal { unscaled, scale };
             (cell, literal)
         }
         _ => return None,
@@ -5477,7 +5475,6 @@ mod tests {
             eq("amt", "-0.050000000"),
             Some(LiteralValue::Decimal {
                 unscaled: -50_000_000,
-                precision: 38,
                 scale: 9
             })
         );
