@@ -8,7 +8,7 @@ use fluree_db_core::{
 use fluree_db_novelty::{assemble_planner_stats, Novelty, StatsAssemblyError, StatsLookup};
 use std::collections::HashMap;
 use std::sync::Arc;
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::Xxh3;
 
 struct BinaryStoreStatsLookup<'a> {
     store: Option<&'a BinaryIndexStore>,
@@ -41,6 +41,21 @@ impl StatsLookup for BinaryStoreStatsLookup<'_> {
 }
 
 pub(crate) fn cached_stats_view_for_db(
+    db: GraphDbRef<'_>,
+    binary_store: Option<&Arc<BinaryIndexStore>>,
+    allow_semantic_elision: bool,
+) -> Option<Arc<StatsView>> {
+    // The one store-less cache every query in the process shares.
+    static STORELESS: StorelessStatsCache = StorelessStatsCache::new();
+    stats_view_for_db_in(&STORELESS, db, binary_store, allow_semantic_elision)
+}
+
+/// [`cached_stats_view_for_db`] with the store-less cache passed in. Tests
+/// that assert what the cache returns pass one of their own: lib tests run as
+/// threads of one process, so any eight insertions from other tests between
+/// two of a test's calls would evict its slot from the shared one.
+fn stats_view_for_db_in(
+    storeless: &StorelessStatsCache,
     db: GraphDbRef<'_>,
     binary_store: Option<&Arc<BinaryIndexStore>>,
     allow_semantic_elision: bool,
@@ -209,40 +224,52 @@ pub(crate) fn cached_stats_view_for_db(
         Arc::new(view)
     };
 
-    // Cache key: epoch() is a monotonic counter incremented on each overlay mutation
-    // (e.g. novelty commit). It is sufficient to discriminate cache entries because
-    // the same (ledger_id, snapshot.t, query t) with different overlay contents will
-    // always have different epoch values. Limitation: if an overlay is replaced by a
-    // wholly new instance (e.g. after ledger reload), epoch resets to 0, but in that
-    // case snapshot.t will also differ, so the key remains unique.
+    // The view is a function of the index root the snapshot's stats, schema
+    // and annotation arena came from, and `(ledger_id, snapshot.t)` doesn't
+    // name that root: a ledger dropped and created again under its name can
+    // reach the same `t` with different data, and the leaflet cache outlives
+    // the drop. The root's content id does name it, and stays the same across
+    // reloads of one root (a historical read loads its store again on every
+    // call). Root-derived content with no root id to name it can't be told
+    // apart from another snapshot's at the same `t`, so it's built rather
+    // than shared.
+    let index_root = db.snapshot.index_root_id();
+    if index_root.is_none()
+        && (db.snapshot.stats.is_some() || db.snapshot.annotation_index.is_some())
+    {
+        return Some(build_view());
+    }
+
+    // epoch() is a monotonic counter incremented on each overlay mutation
+    // (e.g. novelty commit), so the same ledger, root and query `t` with
+    // different overlay contents have different epochs. A replay of the same
+    // commits reaches the same epoch, which keeps historical reads that
+    // replay novelty on every call on one view.
     //
-    // We also fold in the annotation arena's identity (`forward_branch_cid` +
-    // `reverse_branch_cid`) so a reindex/rebuild that swaps the arena at the
-    // same `snapshot.t` produces a fresh cache slot — `merge_annotation_stats`
-    // depends on these contents, and CIDs are content-addressed so they
-    // rotate on any rebuild.
-    let arena_key = db
-        .snapshot
-        .annotation_index
-        .as_ref()
-        .map(|a| format!("{}:{}", a.forward_branch_cid, a.reverse_branch_cid))
-        .unwrap_or_else(|| "none".to_string());
-    let cache_key = xxh3_128(
-        format!(
-            "stats-view:{}:{}:{}:{}:{}:{}:{}",
-            db.snapshot.ledger_id,
-            db.snapshot.t,
-            db.t,
-            db.overlay.epoch(),
-            u8::from(db.runtime_small_dicts.is_some() || binary_store.is_some()),
-            u8::from(allow_semantic_elision),
-            arena_key,
-        )
-        .as_bytes(),
-    );
+    // The fields are hashed as they are rather than formatted into a string:
+    // this runs on every query, hit or miss.
+    let mut key = Xxh3::new();
+    key.update(b"stats-view\0");
+    key.update(db.snapshot.ledger_id.as_str().as_bytes());
+    key.update(&[0]);
+    key.update(&db.snapshot.t.to_le_bytes());
+    key.update(&db.t.to_le_bytes());
+    match index_root {
+        Some(root) => {
+            let digest = root.as_cid().hash().digest();
+            key.update(&[1, digest.len() as u8]);
+            key.update(digest);
+        }
+        None => key.update(&[0]),
+    }
+    key.update(&db.overlay.epoch().to_le_bytes());
+    key.update(&[
+        u8::from(db.runtime_small_dicts.is_some() || binary_store.is_some()),
+        u8::from(allow_semantic_elision),
+    ]);
 
     if let Some(cache) = binary_store.and_then(|store| store.leaflet_cache()) {
-        return Some(cache.get_or_build_stats_view(cache_key, build_view));
+        return Some(cache.get_or_build_stats_view(key.digest128(), build_view));
     }
 
     // No binary store (memory-mode / unindexed ledger): the leaflet-cache
@@ -253,12 +280,11 @@ pub(crate) fn cached_stats_view_for_db(
     // focus nodes. Fall back to a small process-global cache, keyed by the
     // same key PLUS the overlay's `content_version()` — the documented
     // globally-unique content stamp — since `epoch()` alone is only unique
-    // within one overlay instance's lifetime. No version stamp → no caching
+    // within one overlay instance's lineage. No version stamp → no caching
     // (identical to before).
     if let Some(version) = db.overlay.content_version() {
-        return Some(storeless_stats_cache_get_or_build(
-            cache_key, version, build_view,
-        ));
+        key.update(&version.to_le_bytes());
+        return Some(storeless.get_or_build(key.digest128(), build_view));
     }
 
     Some(build_view())
@@ -268,38 +294,43 @@ pub(crate) fn cached_stats_view_for_db(
 /// of slots suffices: one validation or transaction loop reuses a single
 /// entry thousands of times, and distinct concurrently-active memory ledgers
 /// are rare. Capacity-bounded so long-lived processes can't accumulate views.
-fn storeless_stats_cache_get_or_build(
-    cache_key: u128,
-    content_version: u64,
-    build_view: impl FnOnce() -> Arc<StatsView>,
-) -> Arc<StatsView> {
-    use parking_lot::Mutex;
+struct StorelessStatsCache {
+    slots: parking_lot::Mutex<Vec<(u128, Arc<StatsView>)>>,
+}
 
+impl StorelessStatsCache {
     const CAPACITY: usize = 8;
-    type Slot = (u128, u64, Arc<StatsView>);
-    static CACHE: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
 
-    {
-        let mut cache = CACHE.lock();
-        if let Some(pos) = cache
-            .iter()
-            .position(|(k, v, _)| *k == cache_key && *v == content_version)
-        {
-            let hit = cache.remove(pos);
-            let view = Arc::clone(&hit.2);
-            cache.push(hit); // most-recently-used at the back
-            return view;
+    const fn new() -> Self {
+        Self {
+            slots: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
-    // Build outside the lock — assembly walks the overlay and can be slow.
-    let view = build_view();
-    let mut cache = CACHE.lock();
-    if cache.len() >= CAPACITY {
-        cache.remove(0);
+    fn get_or_build(
+        &self,
+        cache_key: u128,
+        build_view: impl FnOnce() -> Arc<StatsView>,
+    ) -> Arc<StatsView> {
+        {
+            let mut cache = self.slots.lock();
+            if let Some(pos) = cache.iter().position(|(k, _)| *k == cache_key) {
+                let hit = cache.remove(pos);
+                let view = Arc::clone(&hit.1);
+                cache.push(hit); // most-recently-used at the back
+                return view;
+            }
+        }
+
+        // Build outside the lock — assembly walks the overlay and can be slow.
+        let view = build_view();
+        let mut cache = self.slots.lock();
+        if cache.len() >= Self::CAPACITY {
+            cache.remove(0);
+        }
+        cache.push((cache_key, Arc::clone(&view)));
+        view
     }
-    cache.push((cache_key, content_version, Arc::clone(&view)));
-    view
 }
 
 #[cfg(test)]
@@ -322,6 +353,15 @@ mod tests {
         )
     }
 
+    /// Builds through the test's own cache (see [`stats_view_for_db_in`]).
+    fn view(
+        cache: &StorelessStatsCache,
+        db: GraphDbRef<'_>,
+        allow_semantic_elision: bool,
+    ) -> Arc<StatsView> {
+        stats_view_for_db_in(cache, db, None, allow_semantic_elision).expect("stats view")
+    }
+
     /// The redundant-`rdf:type` coverage proof reads class usage through the
     /// view's retained `source` and IRI encoder. The builder must keep both
     /// when the proof is licensed, or the elision silently stops firing; and
@@ -329,6 +369,7 @@ mod tests {
     #[test]
     fn builder_keeps_class_usage_only_for_a_licensed_coverage_proof() {
         use fluree_db_core::{ClassPropertyUsage, ClassStatEntry, ValueTypeTag};
+        let cache = StorelessStatsCache::new();
         let ref_tag = ValueTypeTag::JSON_LD_ID.as_u8();
         let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("coverage-builder:main");
         snapshot
@@ -360,9 +401,7 @@ mod tests {
         let (p, c) = ("http://example.org/p", "http://example.org/C");
         let empty = Novelty::new(1);
 
-        let licensed =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 0), None, true)
-                .expect("view");
+        let licensed = view(&cache, GraphDbRef::new(&snapshot, 0, &empty, 0), true);
         assert!(licensed.predicate_subjects_all_in_class_by_iri(p, c));
         assert!(
             Arc::ptr_eq(
@@ -372,9 +411,7 @@ mod tests {
             "the licensed view shares the snapshot's stats rather than a copy"
         );
 
-        let unvouched =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 0), None, false)
-                .expect("view");
+        let unvouched = view(&cache, GraphDbRef::new(&snapshot, 0, &empty, 0), false);
         assert!(!unvouched.predicate_subjects_all_in_class_by_iri(p, c));
         assert!(unvouched.source.is_none());
 
@@ -386,17 +423,13 @@ mod tests {
                 &HashMap::new(),
             )
             .unwrap();
-        let merged =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &window, 2), None, true)
-                .expect("view");
+        let merged = view(&cache, GraphDbRef::new(&snapshot, 0, &window, 2), true);
         assert!(!merged.predicate_subjects_all_in_class_by_iri(p, c));
         assert!(merged.source.is_none(), "a merged copy is not retained");
         assert_eq!(merged.get_class_count_by_iri(c), Some(4));
 
         snapshot.t = 2;
-        let time_travel =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 1), None, true)
-                .expect("view");
+        let time_travel = view(&cache, GraphDbRef::new(&snapshot, 0, &empty, 1), true);
         assert!(
             !time_travel.predicate_subjects_all_in_class_by_iri(p, c),
             "class coverage at the index t does not hold below it"
@@ -406,6 +439,7 @@ mod tests {
 
     #[test]
     fn uncached_builder_still_merges_novelty_without_store() {
+        let cache = StorelessStatsCache::new();
         let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         snapshot.stats = Some(Arc::new(IndexStats {
             flakes: 1,
@@ -440,7 +474,7 @@ mod tests {
             .unwrap();
 
         let db = GraphDbRef::new(&snapshot, 0, &novelty, 2);
-        let first = cached_stats_view_for_db(db, None, false).expect("first stats view");
+        let first = view(&cache, db, false);
         assert_eq!(
             first
                 .get_property(&Sid::new(10, "score"))
@@ -457,6 +491,7 @@ mod tests {
     /// every execution.
     #[test]
     fn storeless_stats_view_is_reused_at_the_same_content_version() {
+        let cache = StorelessStatsCache::new();
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("cache-hit:main");
         let mut novelty = Novelty::new(1);
         novelty
@@ -472,12 +507,8 @@ mod tests {
             )
             .unwrap();
 
-        let first =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 2), None, false)
-                .expect("first view");
-        let second =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 2), None, false)
-                .expect("second view");
+        let first = view(&cache, GraphDbRef::new(&snapshot, 0, &novelty, 2), false);
+        let second = view(&cache, GraphDbRef::new(&snapshot, 0, &novelty, 2), false);
         assert!(
             Arc::ptr_eq(&first, &second),
             "an unchanged overlay must hit the cache, not rebuild"
@@ -490,6 +521,7 @@ mod tests {
     /// `content_version` stamp is what separates them.
     #[test]
     fn storeless_stats_view_misses_when_content_version_diverges() {
+        let cache = StorelessStatsCache::new();
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("cache-miss:main");
         let base = Novelty::new(1);
 
@@ -525,12 +557,8 @@ mod tests {
             "content versions must diverge"
         );
 
-        let view_one =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &one_flake, 2), None, false)
-                .expect("view one");
-        let view_two =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &two_flakes, 2), None, false)
-                .expect("view two");
+        let view_one = view(&cache, GraphDbRef::new(&snapshot, 0, &one_flake, 2), false);
+        let view_two = view(&cache, GraphDbRef::new(&snapshot, 0, &two_flakes, 2), false);
 
         let count = |v: &Arc<StatsView>| {
             v.get_property(&Sid::new(10, "score"))
@@ -541,26 +569,91 @@ mod tests {
         assert_eq!(count(&view_two), 2, "two-flake clone sees its own novelty");
     }
 
+    /// Two snapshots of one ledger at one `t`, with different stats and empty
+    /// novelty, agree on every other part of the key (a never-mutated
+    /// novelty's version is always 0). With no index root to name their
+    /// stats, neither view may be served for the other.
+    #[test]
+    fn stats_with_no_index_root_to_name_them_are_not_shared() {
+        let cache = StorelessStatsCache::new();
+        let at = |count| {
+            let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("unnamed-stats:main");
+            snapshot.t = 3;
+            snapshot.stats = Some(Arc::new(IndexStats {
+                properties: Some(vec![PropertyStatEntry {
+                    sid: (10, "score".to_string()),
+                    count,
+                    ndv_values: count,
+                    ndv_subjects: count,
+                    last_modified_t: 3,
+                    datatypes: vec![],
+                    observed_datatypes: vec![],
+                    historical_datatypes: vec![],
+                }]),
+                ..Default::default()
+            }));
+            snapshot
+        };
+        let empty = Novelty::new(1);
+        let count = |snapshot: &fluree_db_core::LedgerSnapshot| {
+            view(&cache, GraphDbRef::new(snapshot, 0, &empty, 3), false)
+                .get_property(&Sid::new(10, "score"))
+                .expect("score stat")
+                .count
+        };
+        let (one, two) = (at(1), at(2));
+        assert_eq!(count(&one), 1);
+        assert_eq!(
+            count(&two),
+            2,
+            "the second snapshot was served the first one's view"
+        );
+    }
+
+    /// The store-less cache keeps the eight most recently used views: a hit
+    /// moves a view to the back, and a ninth distinct view displaces the
+    /// least recently used one. Eight insertions are all it takes, which is
+    /// why each test here builds through a cache of its own.
+    #[test]
+    fn storeless_cache_keeps_the_eight_most_recently_used_views() {
+        let cache = StorelessStatsCache::new();
+        let build = || Arc::new(StatsView::default());
+        let views: Vec<_> = (0..8u64)
+            .map(|i| cache.get_or_build(u128::from(i), build))
+            .collect();
+
+        assert!(
+            Arc::ptr_eq(&cache.get_or_build(0, build), &views[0]),
+            "eight views fit"
+        );
+        cache.get_or_build(8, build);
+        assert!(
+            Arc::ptr_eq(&cache.get_or_build(0, build), &views[0]),
+            "a view that was just hit outlives the ninth insertion"
+        );
+        assert!(
+            !Arc::ptr_eq(&cache.get_or_build(1, build), &views[1]),
+            "the ninth insertion displaces the least recently used view"
+        );
+    }
+
     #[test]
     fn semantic_elision_vouch_gates_class_coverage_trust() {
         // Same empty-novelty db: coverage is trusted only when the caller vouches
         // (single-ledger, root policy, current-state). `false` must never trust,
         // even though novelty is empty — that is what keeps policy/dataset
         // executions, which pass `false`, from eliding type filters.
+        let cache = StorelessStatsCache::new();
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let novelty = Novelty::new(1); // empty
 
-        let untrusted =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 1), None, false)
-                .expect("view");
+        let untrusted = view(&cache, GraphDbRef::new(&snapshot, 0, &novelty, 1), false);
         assert!(
             !untrusted.class_coverage_trustworthy,
             "vouch=false must not trust coverage even with empty novelty"
         );
 
-        let trusted =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 1), None, true)
-                .expect("view");
+        let trusted = view(&cache, GraphDbRef::new(&snapshot, 0, &novelty, 1), true);
         assert!(
             trusted.class_coverage_trustworthy,
             "vouch=true + empty novelty must trust coverage"
@@ -587,11 +680,6 @@ mod tests {
         // Two predicates, both all-ref in current state as of the publish:
         // `knows` has never carried anything else, `age` carried an integer
         // that was deleted before the publish.
-        // The store-less stats cache is process-global and keyed by
-        // (ledger, snapshot.t, db.t, epoch, content_version) — none of which
-        // see the index root's historical boundary. Scenarios that differ
-        // only in `historical_since_t` therefore need distinct ledger ids,
-        // or the second read is served the first scenario's cached view.
         let stats_at = |ledger: &str, t: i64, since: Option<i64>| {
             let mut snapshot = fluree_db_core::LedgerSnapshot::genesis(ledger);
             snapshot.t = t;
@@ -618,15 +706,14 @@ mod tests {
             }));
             snapshot
         };
+        let cache = StorelessStatsCache::new();
         let novelty = Novelty::new(1); // empty: the base index answers all reads
         let knows = Sid::new(10, "knows");
         let age = Sid::new(10, "age");
 
         // Current-state read: both licence the fold, historical sets unused.
         let snapshot = stats_at("hist-boundary:main", 5, Some(0));
-        let current =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 5), None, false)
-                .expect("view");
+        let current = view(&cache, GraphDbRef::new(&snapshot, 0, &novelty, 5), false);
         assert_eq!(
             current.is_property_ref_only(&knows),
             Some(true),
@@ -636,9 +723,7 @@ mod tests {
 
         // Historical read at or above the boundary: the historical set is the
         // licence. Never-literal keeps the fold; deleted-literal loses it.
-        let historical =
-            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 3), None, false)
-                .expect("view");
+        let historical = view(&cache, GraphDbRef::new(&snapshot, 0, &novelty, 3), false);
         assert_eq!(
             historical.is_property_ref_only(&knows),
             Some(true),
@@ -655,9 +740,7 @@ mod tests {
         // Below the adoption boundary: no coverage, everything falls back to
         // "unknown" — even the never-literal predicate.
         let adopted = stats_at("hist-adopted:main", 5, Some(3));
-        let pre_adoption =
-            cached_stats_view_for_db(GraphDbRef::new(&adopted, 0, &novelty, 2), None, false)
-                .expect("view");
+        let pre_adoption = view(&cache, GraphDbRef::new(&adopted, 0, &novelty, 2), false);
         assert_eq!(
             pre_adoption.is_property_ref_only(&knows),
             Some(false),
@@ -668,9 +751,7 @@ mod tests {
         // An index without the boundary (an old blob) keeps today's
         // conservative behavior for every historical read.
         let old_blob = stats_at("hist-oldblob:main", 5, None);
-        let old_historical =
-            cached_stats_view_for_db(GraphDbRef::new(&old_blob, 0, &novelty, 3), None, false)
-                .expect("view");
+        let old_historical = view(&cache, GraphDbRef::new(&old_blob, 0, &novelty, 3), false);
         assert_eq!(old_historical.is_property_ref_only(&knows), Some(false));
     }
 }

@@ -1,0 +1,10 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix dc: <http://purl.org/dc/elements/1.1/> .
+@prefix ex: <https://ex.com/p/> .
+<https://ex.com/p> a owl:Ontology ; dc:creator "Someone" .
+dc:creator a owl:AnnotationProperty .
+ex:A a owl:Class ; rdfs:label "a thing" .
+ex:B a owl:Class ; rdfs:label "b thing" .
+[] a owl:AllDisjointClasses ; owl:members ( ex:A ex:B ) .
