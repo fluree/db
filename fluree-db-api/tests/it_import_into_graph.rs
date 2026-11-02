@@ -136,9 +136,18 @@ async fn import_into_graph(
     files: &[(&str, &str)],
     graph: &str,
 ) -> Result<fluree_db_api::ImportResult, String> {
+    import_into(fluree, LEDGER, files, graph).await
+}
+
+async fn import_into(
+    fluree: &Fluree,
+    ledger: &str,
+    files: &[(&str, &str)],
+    graph: &str,
+) -> Result<fluree_db_api::ImportResult, String> {
     let source = source_dir(files);
     fluree
-        .import_into_graph(LEDGER, graph)
+        .import_into_graph(ledger, graph)
         .import(source.path())
         .threads(2)
         .memory_budget_mb(256)
@@ -405,6 +414,107 @@ async fn later_writes_index_incrementally_over_the_spliced_root() {
         .await
         .expect("full rebuild");
     assert_eq!(statements(&fluree_at(dir.path())).await, incremental);
+}
+
+/// While an import runs, queries read the head it started from and a write
+/// waits, then lands on top of the import.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queries_go_on_and_writes_wait_while_an_import_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_t = indexed_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    let handle = fluree.ledger_cached(LEDGER).await.unwrap();
+
+    let (parked, release) = handle.gate_next_writer_exclusion_for_test();
+    let importer = fluree.clone();
+    let import =
+        tokio::spawn(
+            async move { import_into_graph(&importer, &[("a.ttl", SOURCE_A)], GRAPH).await },
+        );
+    parked.await.expect("the import parks holding the ledger");
+
+    let read = tokio::time::timeout(std::time::Duration::from_secs(10), handle.snapshot())
+        .await
+        .expect("a query is not held up by the import");
+    assert_eq!(read.to_ledger_state().t(), base_t);
+
+    let (writer, writer_handle) = (fluree.clone(), handle.clone());
+    let write = tokio::spawn(async move {
+        writer
+            .stage(&writer_handle)
+            .sparql_update(
+                "PREFIX ex: <http://example.org/> INSERT DATA { ex:dave ex:name \"Dave\" }",
+            )
+            .execute()
+            .await
+            .map(|r| r.receipt.t)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!write.is_finished(), "a write waits for the import");
+
+    release.send(true).unwrap();
+    let imported = import.await.unwrap().expect("graph import");
+    let written = write.await.unwrap().expect("the write after the import");
+    assert_eq!(written, imported.t + 1);
+    let read = statements(&fluree_at(dir.path())).await;
+    assert!(
+        read.contains(&"default: ex:dave ex:name Dave".to_string()),
+        "{read:?}"
+    );
+    assert!(
+        read.contains(&"g: ex:widget1 ex:name Widget".to_string()),
+        "{read:?}"
+    );
+}
+
+/// A branch forked from an indexed ledger starts on its parent's index root,
+/// whose txn-meta and config graphs are named for the parent. The roots its
+/// imports publish name them for the branch, so one import loads another's.
+#[tokio::test]
+async fn a_branch_takes_one_import_after_another() {
+    const BRANCH: &str = "it/graph-import:dev";
+    let dir = tempfile::tempdir().unwrap();
+    indexed_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    fluree
+        .create_branch("it/graph-import", "dev", None, None)
+        .await
+        .unwrap();
+
+    import_into(&fluree, BRANCH, &[("a.ttl", SOURCE_A)], GRAPH)
+        .await
+        .expect("first import");
+    let other = "http://example.org/graph/parts";
+    import_into(&fluree, BRANCH, &[("b.ttl", SOURCE_B)], other)
+        .await
+        .expect("second import");
+
+    let fresh = fluree_at(dir.path());
+    let ledger = fresh.ledger(BRANCH).await.unwrap();
+    let registry = &ledger.snapshot.graph_registry;
+    assert_eq!(
+        (registry.iri_for_graph_id(1), registry.iri_for_graph_id(2)),
+        (
+            Some(fluree_db_core::txn_meta_graph_iri(BRANCH).as_str()),
+            Some(fluree_db_core::config_graph_iri(BRANCH).as_str())
+        )
+    );
+    for (graph, subject) in [(GRAPH, "widget1"), (other, "bolt")] {
+        let query = json!({
+            "from": format!("{BRANCH}#{graph}"),
+            "select": "?name",
+            "where": {"@id": format!("{EX}{subject}"), format!("{EX}name"): "?name"}
+        });
+        let rows = fresh
+            .query_connection(&query)
+            .await
+            .expect("query the branch")
+            .to_jsonld(&ledger.snapshot)
+            .expect("jsonld");
+        assert_eq!(rows.as_array().map(Vec::len), Some(1), "{graph}: {rows}");
+    }
+    let main = fresh.ledger(LEDGER).await.unwrap();
+    assert_eq!(main.snapshot.graph_registry.graph_id_for_iri(GRAPH), None);
 }
 
 /// A refused import publishes nothing: the ledger stays at its head.

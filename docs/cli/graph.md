@@ -91,7 +91,7 @@ If the source holds statement annotations (RDF 1.2 / `f:reifies`), the ledger's 
 
 The following are refused with nothing written: a graph the ledger already has, the default graph (`urn:default`), the system `txn-meta` / `config` graphs, a ledger that does not exist, and the source formats above.
 
-**Routing:** with `--remote <name>`, or when the active ledger is tracked, the file is uploaded to the server and imported there; the server must advertise the `source-upload-graph` import mode (see [server-integration](server-integration.md#into-a-new-graph-of-an-existing-ledger)). With a local `fluree server` running against the same storage, the import is routed through it in the same way, as a single file. Pass `--direct` only when no server holds the storage.
+**Routing:** with `--remote <name>`, or when the active ledger is tracked, the file is uploaded to the server and imported there; the server must advertise the `source-upload-graph` import mode, and `source-upload-skolem` when `--skolem-namespace` is given (see [server-integration](server-integration.md#into-a-new-graph-of-an-existing-ledger)). With a local `fluree server` running against the same storage, the import is routed through it in the same way, as a single file. Pass `--direct` only when no server holds the storage.
 
 **Examples:**
 

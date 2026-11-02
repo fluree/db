@@ -165,6 +165,7 @@ async fn import_on_server(
     }
     let result = create::upload_source_import(
         client,
+        &cap,
         ledger_id,
         server_label,
         from,

@@ -87,6 +87,12 @@ pub struct SourceImportOptions {
     /// A new named graph of the existing ledger to import into, rather than
     /// a new ledger.
     pub graph: Option<String>,
+    /// Salt for blank-node ids instead of the ledger id.
+    pub skolem_namespace: Option<String>,
+    /// The uploaded file's own name. A single-file import keys its
+    /// blank-node ids on its file name, so the staged upload is imported
+    /// under it, as a direct import of that file would be.
+    pub file_name: Option<String>,
 }
 
 /// One negotiated-upload import job.

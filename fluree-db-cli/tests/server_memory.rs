@@ -604,9 +604,11 @@ async fn graph_import_runs_on_a_remote_server() {
     let source = project.path().join("products.ttl");
     std::fs::write(
         &source,
-        "@prefix ex: <http://example.org/> .\nex:widget ex:maker ex:alice ; ex:name \"Widget\" .\n",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:widget ex:maker ex:alice ; ex:name \"Widget\" ; ex:part [ ex:name \"Bolt\" ] .\n",
     )
     .unwrap();
+    const SALT: &str = "urn:test:products";
     let import = |remote: &str| {
         cli(
             project.path(),
@@ -621,9 +623,21 @@ async fn graph_import_runs_on_a_remote_server() {
                 LEDGER,
                 "--remote",
                 remote,
+                "--skolem-namespace",
+                SALT,
             ],
         )
     };
+    let blank_node = |text: &str| {
+        text.split(|c: char| c.is_whitespace() || "\"[]{},".contains(c))
+            .find(|tok| tok.starts_with("_:fdb-"))
+            .unwrap_or_else(|| panic!("no minted blank-node id in {text}"))
+            .to_string()
+    };
+    let part_query = json!({
+        "select": ["?part"],
+        "where": {"@id": "http://example.org/widget", "http://example.org/part": "?part"}
+    });
 
     let out = import("origin");
     let (stdout, stderr) = (
@@ -650,6 +664,50 @@ async fn graph_import_runs_on_a_remote_server() {
     assert_eq!(resp.status(), 200);
     let answer: Value = resp.json().await.unwrap();
     assert!(answer.to_string().contains("Alice"), "{answer}");
+
+    // Its blank node is named as a direct import of the file under the same
+    // namespace names it.
+    let mut on_server = part_query.clone();
+    on_server["from"] = json!(format!("{LEDGER}#{GRAPH}"));
+    let resp = client
+        .post(server.url("/query"))
+        .json(&on_server)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let remote_part = blank_node(&resp.text().await.unwrap());
+    let created = cli(
+        project.path(),
+        home,
+        &[
+            "create",
+            "parts-direct",
+            "--from",
+            source.to_str().unwrap(),
+            "--skolem-namespace",
+            SALT,
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let local = cli(
+        project.path(),
+        home,
+        &["query", "-l", "parts-direct", "-e", &part_query.to_string()],
+    );
+    assert!(
+        local.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    assert_eq!(
+        blank_node(&String::from_utf8_lossy(&local.stdout)),
+        remote_part
+    );
     server.stop().await;
 
     // Without source uploads, the server is refused before any upload.

@@ -244,6 +244,12 @@ impl ImportCapability {
         self.modes.iter().any(|m| m == "source-upload-graph")
     }
 
+    /// Whether a source upload may salt its blank-node ids. A server without
+    /// it would ignore the namespace and mint different ids.
+    pub fn supports_skolem_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload-skolem")
+    }
+
     /// Whether an archive of `size` bytes should take the negotiated upload
     /// path: a negotiated mode must be offered, and either direct isn't offered
     /// at all or the archive exceeds the advertised direct cap.
@@ -1724,6 +1730,7 @@ impl RemoteLedgerClient {
     /// extension, applies the CSV/Cypher conversion options, and runs the
     /// bulk-import pipeline on `complete`: creating `ledger`, or with `graph`
     /// filling that new graph of it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mint_source_import_upload(
         &self,
         ledger: &str,
@@ -1732,6 +1739,7 @@ impl RemoteLedgerClient {
         edge_policy: fluree_db_api::csv_import::EdgePolicy,
         base_iri: Option<&str>,
         graph: Option<&str>,
+        skolem_namespace: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.op_url_root("import-upload");
         let edge_properties = match edge_policy {
@@ -1753,6 +1761,9 @@ impl RemoteLedgerClient {
         }
         if let Some(graph) = graph {
             body["graph"] = serde_json::Value::from(graph);
+        }
+        if let Some(namespace) = skolem_namespace {
+            body["skolem_namespace"] = serde_json::Value::from(namespace);
         }
         self.send_json(
             reqwest::Method::POST,

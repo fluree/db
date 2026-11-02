@@ -12,9 +12,9 @@
 //!   the incremental indexer into the ledger's txn-meta graph.
 //!
 //! The ledger is held for the whole import: background indexing stops and
-//! writes wait on its write lock, while reads go on against the head the
-//! import started from. Both heads are published at the end, the commit
-//! head first and only if it has not moved.
+//! writes wait ([`crate::LedgerHandle::exclude_writers`]), while reads go on
+//! against the head the import started from. Both heads are published at the
+//! end, the commit head first and only if it has not moved.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -555,8 +555,8 @@ where
         Some(_) => Some(fluree.ledger_cached(&alias).await?),
         None => None,
     };
-    let mut write_guard = match &handle {
-        Some(handle) => Some(handle.lock_for_write().await),
+    let writers = match &handle {
+        Some(handle) => Some(handle.exclude_writers().await),
         None => None,
     };
 
@@ -637,13 +637,13 @@ where
         .await
         .map_err(|e| ImportError::Storage(format!("publish index: {e}")))?;
 
-    // A writer waiting on the lock resumes on the new head.
-    if let (Some(handle), Some(guard)) = (&handle, write_guard.as_mut()) {
+    // Writers held off resume on the new head.
+    if let (Some(handle), Some(writers)) = (&handle, writers) {
         let state = reload_state(fluree, &alias).await?;
+        let mut guard = writers.lock_state().await;
         handle.sync_binary_store_from_state(&state).await;
         guard.replace(state);
     }
-    drop(write_guard);
 
     result.graph = Some(crate::import::ImportedGraph {
         iri: seed.graph_iri,
@@ -675,6 +675,21 @@ async fn lookup(
     Ok(record)
 }
 
+/// Name `root`'s txn-meta and config graphs for `ledger_id`. A branch forked
+/// from an indexed ledger starts on its parent's root, which names them for
+/// the parent; the root this import publishes is the branch's own, and one
+/// whose txn-meta graph names another ledger no longer loads. The graphs keep
+/// their ids and data; only their IRIs change.
+fn bind_reserved_graphs(root: &mut IndexRoot, ledger_id: &str) {
+    root.ledger_id = ledger_id.to_string();
+    if let Some(iri) = root.graph_iris.get_mut(0) {
+        *iri = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
+    }
+    if let Some(iri) = root.graph_iris.get_mut(1) {
+        *iri = fluree_db_core::config_graph_iri(ledger_id);
+    }
+}
+
 /// Load what the import continues from: the published root at the head.
 async fn load_seed(
     fluree: &Fluree,
@@ -696,8 +711,9 @@ async fn load_seed(
         .get(&base_root_id)
         .await
         .map_err(|e| ImportError::Storage(format!("read index root {base_root_id}: {e}")))?;
-    let base_root = IndexRoot::decode(&root_bytes)
+    let mut base_root = IndexRoot::decode(&root_bytes)
         .map_err(|e| ImportError::Storage(format!("decode index root {base_root_id}: {e}")))?;
+    bind_reserved_graphs(&mut base_root, &record.ledger_id);
     let base_dicts = SharedResolverState::from_index_root(&base_root)
         .map_err(|e| ImportError::Storage(format!("index root dictionaries: {e}")))?;
 

@@ -342,6 +342,10 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             // (`"graph"` on mint). A server without this mode would ignore
             // the field and create a ledger, so clients check for it.
             import_modes.push("source-upload-graph");
+            // A source upload may salt its blank-node ids
+            // (`"skolem_namespace"` on mint); without this mode the field is
+            // ignored and the ids differ from a direct import's.
+            import_modes.push("source-upload-skolem");
         }
     }
     let mut import_doc = serde_json::json!({

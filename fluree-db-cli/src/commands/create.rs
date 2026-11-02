@@ -328,6 +328,7 @@ pub async fn run_remote_source_import(
 
     let result = upload_source_import(
         &client,
+        &cap,
         &ledger_id,
         remote_name,
         path,
@@ -357,8 +358,10 @@ pub async fn run_remote_source_import(
 /// a mint body that declares the source kind and filename so the server
 /// stages with the right extension and runs the pipeline on complete.
 /// Returns the job's result.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_source_import(
     client: &crate::remote_client::RemoteLedgerClient,
+    cap: &crate::remote_client::ImportCapability,
     ledger_id: &str,
     server_label: &str,
     path: &Path,
@@ -367,6 +370,12 @@ pub(crate) async fn upload_source_import(
 ) -> CliResult<serde_json::Value> {
     use colored::Colorize;
 
+    if import_opts.skolem_namespace.is_some() && !cap.supports_skolem_source_upload() {
+        return Err(CliError::Usage(format!(
+            "'{server_label}' would ignore --skolem-namespace (it does not offer \
+             source-upload-skolem); upgrade it, or import without the option"
+        )));
+    }
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -394,6 +403,7 @@ pub(crate) async fn upload_source_import(
             import_opts.edge_policy,
             import_opts.base_iri.as_deref(),
             graph,
+            import_opts.skolem_namespace.as_deref(),
         )
         .await
         .map_err(|e| {

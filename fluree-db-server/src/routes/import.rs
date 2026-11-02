@@ -150,6 +150,10 @@ struct MintRequest {
     /// creating `ledger`.
     #[serde(default)]
     graph: Option<String>,
+    /// Salt for the import's blank-node ids instead of the ledger id,
+    /// matching `fluree create --skolem-namespace`.
+    #[serde(default)]
+    skolem_namespace: Option<String>,
 }
 
 /// Pipeline-native single-file extensions (importable as staged, and the only
@@ -163,7 +167,9 @@ const SOURCE_CONVERT_EXTENSIONS: &[&str] = &["csv", "cypher", "cyp", "cql"];
 /// Validate a source upload's filename and return the extension suffix the
 /// staged file must keep (e.g. `ttl`, `ttl.gz`, `csv`, `cypher`) so the bulk
 /// pipeline's extension-based format sniffing sees the real format. Only the
-/// extension is trusted — the client's path/stem never touches the filesystem.
+/// extension decides anything; the client's path never touches the
+/// filesystem, and its last component names the file only inside the job's
+/// own scratch dir ([`SourceImportOptions::file_name`]).
 fn source_staged_extension(filename: &str) -> Result<String> {
     let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     let mut parts: Vec<&str> = name.split('.').collect();
@@ -258,6 +264,12 @@ fn source_import_options(req: &MintRequest) -> Result<SourceImportOptions> {
         edge_policy,
         base_iri: req.base_iri.clone(),
         graph,
+        skolem_namespace: req.skolem_namespace.clone(),
+        file_name: req
+            .filename
+            .as_deref()
+            .and_then(|name| name.rsplit(['/', '\\']).next())
+            .map(str::to_string),
     })
 }
 
@@ -882,18 +894,31 @@ async fn run_source_import(
         .await
         .map_err(|e| format!("conversion task failed: {e}"))??;
         (shards_dir.clone(), Some(ScratchDirGuard(shards_dir)))
+    } else if let Some(name) = options.file_name.as_deref() {
+        let named_dir = staged_path.with_extension(format!("{ext}.named"));
+        tokio::fs::create_dir_all(&named_dir)
+            .await
+            .map_err(|e| format!("failed to create import scratch dir: {e}"))?;
+        let named = named_dir.join(name);
+        tokio::fs::rename(staged_path, &named)
+            .await
+            .map_err(|e| format!("failed to name the staged upload: {e}"))?;
+        (named, Some(ScratchDirGuard(named_dir)))
     } else {
         (staged_path.to_path_buf(), None)
     };
 
     if let Some(graph) = &options.graph {
-        let result = state
-            .fluree
-            .import_into_graph(ledger_id, graph)
-            .import(&import_path)
-            .execute()
-            .await
-            .map_err(|e| e.to_string())?;
+        let result = skolemized(
+            state
+                .fluree
+                .import_into_graph(ledger_id, graph)
+                .import(&import_path),
+            options,
+        )
+        .execute()
+        .await
+        .map_err(|e| e.to_string())?;
         // Unlike a new ledger, no reindex follows an annotated graph: it
         // would rebuild the whole ledger. `has_annotations` tells the
         // caller its annotation arena waits for one.
@@ -914,10 +939,7 @@ async fn run_source_import(
         }));
     }
 
-    let result = state
-        .fluree
-        .create(ledger_id)
-        .import(&import_path)
+    let result = skolemized(state.fluree.create(ledger_id).import(&import_path), options)
         .execute()
         .await
         .map_err(|e| e.to_string())?;
@@ -953,6 +975,18 @@ async fn run_source_import(
         "index_t": result.index_t,
         "has_annotations": result.has_annotations,
     }))
+}
+
+/// `builder` salting blank-node ids with the upload's namespace, when it
+/// named one.
+fn skolemized<'a>(
+    builder: fluree_db_api::ImportBuilder<'a>,
+    options: &SourceImportOptions,
+) -> fluree_db_api::ImportBuilder<'a> {
+    match &options.skolem_namespace {
+        Some(namespace) => builder.skolem_namespace(namespace),
+        None => builder,
+    }
 }
 
 /// Deletes a conversion scratch dir when the import (success or failure)
