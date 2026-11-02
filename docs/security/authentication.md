@@ -122,10 +122,10 @@ Ledger lists hold ledger IDs, parsed when the token is verified. A bare name mea
 
 | Claim | Type | Description |
 |-------|------|-------------|
-| `fluree.ledger.audit.all` | Boolean | Raw commit access on every ledger whose history retention suppresses history |
+| `fluree.ledger.audit.all` | Boolean | Raw commit access on every ledger with a targeted removal |
 | `fluree.ledger.audit.ledgers` | Array of strings | The same, for specific ledgers |
 
-On a ledger with an [`f:noHistory` rule or a removal](../transactions/history-retention.md#audit-access), the commit log still holds what its history no longer serves. Commit show, commit export, pack, storage-proxy reads of commits, transactions and history-index blobs, vended storage credentials, and merge-preview change details then need an audit scope as well as their usual one. Read, write and storage scopes do not imply it. On other ledgers it is not checked.
+On a ledger with a [targeted removal](../transactions/history-retention.md#audit-access), the commit log still holds what its history no longer serves. Commit show, commit export, pack, storage-proxy reads of commits, transactions and history-index blobs, vended storage credentials, and merge-preview change details then need an audit scope as well as their usual one. Read, write and storage scopes do not imply it. On other ledgers it is not checked.
 
 #### Populating `fluree.storage.ledgers` (multi-tenant hint)
 

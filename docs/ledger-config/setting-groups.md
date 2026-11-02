@@ -390,7 +390,7 @@ and how configured properties interact with `@fulltext`-datatype values.
 
 **Group predicate**: `f:retentionDefaults`
 
-Gives predicates a default lifetime: every value of the predicate asserted after the config commit is retracted by the background retention worker once its lifetime ends. See [Time to live (TTL)](../transactions/ttl.md) for per-value lifetimes, renewal and how expiration runs. `f:noHistory` stops serving a predicate's superseded values; see [History retention](../transactions/history-retention.md).
+Gives predicates a default lifetime: every value of the predicate asserted after the config commit is retracted by the background retention worker once its lifetime ends. See [Time to live (TTL)](../transactions/ttl.md) for per-value lifetimes, renewal and how expiration runs. `f:noHistory` keeps a predicate's superseded values out of the index; see [History retention](../transactions/history-retention.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -402,7 +402,7 @@ Each `f:RetentionProperty` entry:
 |-------|------|---------|-------------|
 | `f:target` | IRI (exactly one) | required | The predicate the entry governs |
 | `f:ttl` | whole seconds, or a duration such as `"P1D"^^xsd:dayTimeDuration` | inherit | Lifetime from the commit time of each new assertion. `0` turns an inherited duration off for future assertions |
-| `f:noHistory` | boolean | inherit; system default `false` | `true` stops serving the predicate's superseded values: reads that need them fail with `410`, and the index drops them. See [History retention](../transactions/history-retention.md) |
+| `f:noHistory` | boolean | inherit; system default `false` | `true` keeps the predicate's superseded values out of the index; reads as of an earlier point see a current value from the transaction that asserted it. See [History retention](../transactions/history-retention.md) |
 
 ```json
 {
@@ -459,7 +459,8 @@ Entries merge by `f:target`, and each field merges on its own: an absent field i
 **Group predicate**: `f:indexingDefaults`
 
 Controls how the indexer lays out named graphs. It changes storage layout and
-performance, never query results.
+performance, never query results, except for a read as of an earlier point of
+an [`f:noHistory`](../transactions/history-retention.md#the-index) predicate.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

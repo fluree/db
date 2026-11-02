@@ -799,19 +799,6 @@ impl Fluree {
         {
             self.checkpoint_journal(ledger_id).await?;
         }
-        if journal_changed {
-            let pending = self
-                .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
-                .await;
-            if !pending.is_empty() {
-                tracing::warn!(
-                    ledger_id,
-                    ?pending,
-                    "replicas have not applied the history rules; they serve \
-                     history as of before the change until they do"
-                );
-            }
-        }
         Ok(report)
     }
 

@@ -1,6 +1,6 @@
-//! `f:noHistory` and targeted removal: reads that need suppressed history
-//! fail with history-unavailable; current reads, and reads of other
-//! predicates, are answered as before.
+//! `f:noHistory` and targeted removal: a `noHistory` property's history
+//! leaves the index, and every read of it is answered from what remains; a
+//! read that needs a removed occurrence fails with history-unavailable.
 
 use fluree_db_api::{ApiError, Fluree, FlureeBuilder};
 use serde_json::{json, Value as JsonValue};
@@ -80,8 +80,29 @@ fn unavailable(result: Result<Vec<JsonValue>, ApiError>) -> bool {
     matches!(result, Err(ApiError::HistoryUnavailable(_)))
 }
 
+async fn reindex(fluree: &Fluree, ledger_id: &str) {
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
+}
+
+/// The history rules `ledger_id`'s journal records.
+async fn history_rules(
+    fluree: &Fluree,
+    ledger_id: &str,
+) -> Vec<fluree_db_api::retention::journal::HistoryRule> {
+    fluree
+        .retention_status(ledger_id)
+        .await
+        .unwrap()
+        .registration
+        .map(|r| r.journal.history_rules)
+        .unwrap_or_default()
+}
+
 #[tokio::test]
-async fn no_history_refuses_reads_that_need_the_counters_past() {
+async fn a_no_history_property_is_read_from_what_the_index_keeps() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = ledger(&fluree, "it/nohist-counter").await;
     let t1 = upsert(
@@ -103,75 +124,61 @@ async fn no_history_refuses_reads_that_need_the_counters_past() {
         json!({"@context": ctx(), "@id": "ex:c", "ex:count": 3}),
     )
     .await;
-    // Before processing, history is still served.
+    fluree.run_retention(&id).await.expect("pass");
+    assert_eq!(history_rules(&fluree, &id).await.len(), 1);
+    assert!(
+        !fluree.history_suppressed(&id).await.unwrap(),
+        "a rule alone leaves raw commits ordinary data"
+    );
+    let at = |t: i64| json!(format!("{id}@t:{t}"));
+    // Until it is indexed, the counter's history is still there to read.
     assert_eq!(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t1}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-        .unwrap(),
+        read(&fluree, &id, at(t1), "ex:c", "ex:count")
+            .await
+            .unwrap(),
         vec![json!(1)]
     );
-    let report = fluree.run_retention(&id).await.expect("pass");
-    assert!(!report.inactive, "{report:?}");
-    let status = fluree.retention_status(&id).await.unwrap();
-    let journal = &status.registration.as_ref().unwrap().journal;
-    assert_eq!(journal.history_rules.len(), 1, "{status:?}");
 
-    // Current state is answered.
+    reindex(&fluree, &id).await;
+    // The counter reads from the t its current value was asserted...
+    assert!(read(&fluree, &id, at(t1), "ex:c", "ex:count")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        read(&fluree, &id, at(t4), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        vec![json!(3)]
+    );
     assert_eq!(
         read(&fluree, &id, json!(id), "ex:c", "ex:count")
             .await
             .unwrap(),
         vec![json!(3)]
     );
+    // ...while other predicates keep their history, under a variable
+    // predicate and a crawl too.
     assert_eq!(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t4}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-        .unwrap(),
-        vec![json!(3)],
-        "a pin at the head is a current read"
-    );
-    // A past point that reads the counter is refused...
-    assert!(unavailable(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t1}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-    ));
-    // ...a past point that reads another predicate is not.
-    assert_eq!(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t1}")),
-            "ex:c",
-            "ex:name"
-        )
-        .await
-        .unwrap(),
+        read(&fluree, &id, at(t1), "ex:c", "ex:name").await.unwrap(),
         vec![json!("C")]
     );
-    // A variable predicate could read the counter.
-    assert!(unavailable(
-        read(&fluree, &id, json!(format!("{id}@t:{t1}")), "ex:c", "?p").await
-    ));
-    // A history range over the counter is refused.
-    assert!(unavailable(
+    assert_eq!(
+        read(&fluree, &id, at(t1), "ex:c", "?p").await.unwrap(),
+        vec![json!("C")]
+    );
+    let crawl = json!({"@context": ctx(), "select": {"ex:c": ["*"]}});
+    for (t, expected) in [
+        (t1, json!([{"@id": "ex:c", "ex:name": "C"}])),
+        (t4, json!([{"@id": "ex:c", "ex:name": "C", "ex:count": 3}])),
+    ] {
+        let view = fluree.db_at_t(&id, t).await.unwrap();
+        let rows = fluree.query(&view, &crawl).await.expect("crawl");
+        let rows = rows.to_jsonld_async(view.as_graph_db_ref()).await.unwrap();
+        assert_eq!(rows, expected);
+    }
+    // A history range lists only the current value's assertion.
+    assert_eq!(
         read(
             &fluree,
             &id,
@@ -180,14 +187,39 @@ async fn no_history_refuses_reads_that_need_the_counters_past() {
             "ex:count"
         )
         .await
-    ));
+        .unwrap(),
+        vec![json!(3)]
+    );
+    // SPARQL and export read the same way.
+    let sparql = |t: i64| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?o FROM <{id}@t:{t}> WHERE {{ ex:c ex:count ?o }}"
+        )
+    };
+    let ledger = fluree.ledger(&id).await.unwrap();
+    for (t, expected) in [(t1, json!([])), (t4, json!([[3]]))] {
+        let rows = fluree.query_connection_sparql(&sparql(t)).await.unwrap();
+        assert_eq!(rows.to_jsonld(&ledger.snapshot).unwrap(), expected);
+    }
+    let mut out = Vec::new();
+    fluree
+        .export(&id)
+        .format(fluree_db_api::export::ExportFormat::NTriples)
+        .as_of(fluree_db_api::TimeSpec::AtT(t1))
+        .write_to(&mut out)
+        .await
+        .expect("export");
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("\"C\""), "{out}");
+    assert!(!out.contains("http://example.org/count"), "{out}");
 }
 
 #[tokio::test]
 async fn disabling_no_history_reopens_only_what_it_kept() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = ledger(&fluree, "it/nohist-disable").await;
-    let t1 = upsert(
+    upsert(
         &fluree,
         &id,
         json!({"@context": ctx(), "@id": "ex:c", "ex:count": 1}),
@@ -218,18 +250,8 @@ async fn disabling_no_history_reopens_only_what_it_kept() {
     let status = fluree.retention_status(&id).await.unwrap();
     let rule = &status.registration.as_ref().unwrap().journal.history_rules[0];
     assert_eq!(rule.until_t, Some(off), "{status:?}");
-    // Suppressed history stays suppressed.
-    assert!(unavailable(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t1}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-    ));
-    // History kept after the rule ended is served again.
+    reindex(&fluree, &id).await;
+    // History written after the rule ended stays in the index.
     assert_eq!(
         read(
             &fluree,
@@ -265,21 +287,22 @@ async fn ttl_composes_with_no_history() {
         .await
         .expect("pass");
     assert_eq!(report.expired, 1, "{report:?}");
-    // Expired from current state, and its history is not served either.
+    // Expired from current state, and once indexed, from its history too.
     assert!(read(&fluree, &id, json!(id), "ex:d", "ex:status")
         .await
         .unwrap()
         .is_empty());
-    assert!(unavailable(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t}")),
-            "ex:d",
-            "ex:status"
-        )
-        .await
-    ));
+    reindex(&fluree, &id).await;
+    assert!(read(
+        &fluree,
+        &id,
+        json!(format!("{id}@t:{t}")),
+        "ex:d",
+        "ex:status"
+    )
+    .await
+    .unwrap()
+    .is_empty());
 }
 
 async fn insert(fluree: &Fluree, ledger_id: &str, doc: JsonValue) -> i64 {
@@ -678,6 +701,58 @@ async fn a_search_index_behind_a_removal_is_not_served() {
     ));
 }
 
+/// `f:noHistory` refuses no search: a full-text index of the property is
+/// served while it lags the head, and as of an earlier point.
+#[tokio::test]
+async fn a_search_index_of_a_no_history_property_is_served() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/nohist-search").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "@type": "ex:Doc", "ex:status": "draft rust"}),
+    )
+    .await;
+    let built = set_no_history(&fluree, &id, "ex:status", true).await;
+    fluree.run_retention(&id).await.expect("pass");
+    let created = fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "nohist-search",
+            &id,
+            json!({
+                "@context": ctx(),
+                "where": [{"@id": "?x", "@type": "ex:Doc", "ex:status": "?s"}],
+                "select": {"?x": ["@id", "ex:status"]}
+            }),
+        ))
+        .await
+        .expect("create index");
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:status": "final rust"}),
+    )
+    .await;
+    for from in [json!(id), json!(format!("{id}@t:{built}"))] {
+        let result = fluree
+            .query_connection(&json!({
+                "@context": ctx(),
+                "from": from,
+                "where": [{
+                    "f:graphSource": &created.graph_source_id,
+                    "f:searchText": "rust",
+                    "f:searchLimit": 10,
+                    "f:searchResult": {"f:resultId": "?doc"}
+                }],
+                "select": ["?doc"]
+            }))
+            .await
+            .expect("served");
+        let hits: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+        assert_eq!(hits, 1, "{from}");
+    }
+}
+
 /// A full-text index that reads none of a removal's properties cannot hold
 /// what it removed: it is served behind the removal, as of now and earlier.
 /// One whose indexing query may read anything (`*`, or reasoning, which
@@ -933,18 +1008,19 @@ async fn a_policy_enabled_and_disabled_between_passes_still_covers_its_interval(
     let rule = &journal.history_rules[0];
     assert_eq!(rule.enabled_t, enabled_t);
     assert_eq!(rule.until_t, Some(disabled_t));
-    // The value it superseded while in force is not served.
-    assert!(unavailable(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t1}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-    ));
-    // Current state is.
+    // The value it superseded while in force leaves the index.
+    reindex(&fluree, &id).await;
+    assert!(read(
+        &fluree,
+        &id,
+        json!(format!("{id}@t:{t1}")),
+        "ex:c",
+        "ex:count"
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    // Current state stays.
     assert_eq!(
         read(&fluree, &id, json!(id), "ex:c", "ex:count")
             .await
@@ -1131,8 +1207,8 @@ async fn a_view_held_across_a_removal_refuses_the_removed_value() {
             .unwrap()
             .is_empty());
 
-        // Under `f:noHistory`, a held view's value superseded since is
-        // history too.
+        // `f:noHistory` refuses nothing: a held view answers with the
+        // value it holds.
         let counted = ledger(&fluree, "it/held-view-counter").await;
         set_no_history(&fluree, &counted, "ex:count", true).await;
         let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
@@ -1142,10 +1218,8 @@ async fn a_view_held_across_a_removal_refuses_the_removed_value() {
         upsert(&fluree, &counted, doc(2)).await;
         let count =
             json!({"@context": ctx(), "select": "?o", "where": {"@id": "ex:c", "ex:count": "?o"}});
-        assert!(matches!(
-            fluree.query(&view, &count).await,
-            Err(ApiError::HistoryUnavailable(_))
-        ));
+        let rows = fluree.query(&view, &count).await.expect("held view");
+        assert_eq!(rows.to_jsonld(&view.snapshot).unwrap(), json!([1]));
     }
     let fluree = FlureeBuilder::memory().build_memory();
 
@@ -1180,7 +1254,7 @@ async fn a_restored_copy_keeps_an_inherited_rule_through_rediscovery() {
         .unwrap();
     let id = ledger(&fluree, "it/inherited-rule").await;
     let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
-    let t1 = upsert(&fluree, &id, doc(1)).await;
+    upsert(&fluree, &id, doc(1)).await;
     upsert(&fluree, &id, doc(2)).await;
     let mut archive = Vec::new();
     fluree
@@ -1195,14 +1269,10 @@ async fn a_restored_copy_keeps_an_inherited_rule_through_rediscovery() {
         .await
         .expect("restore")
         .ledger_id;
-    let at_t1 = json!(format!("{copy}@t:{t1}"));
-    assert!(unavailable(
-        read(&fluree, &copy, at_t1.clone(), "ex:c", "ex:count").await
-    ));
+    let inherited = history_rules(&fluree, &copy).await;
+    assert_eq!(inherited.len(), 1, "{inherited:?}");
     fluree.run_retention(&copy).await.expect("pass on the copy");
-    assert!(unavailable(
-        read(&fluree, &copy, at_t1, "ex:c", "ex:count").await
-    ));
+    assert_eq!(history_rules(&fluree, &copy).await, inherited);
 }
 
 fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -1456,7 +1526,7 @@ async fn a_later_pass_publishes_a_journal_an_earlier_one_could_not() {
     let name = "it/unwritable-pass-checkpoint";
     let id = ledger(&fluree, name).await;
     let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
-    let t1 = upsert(&fluree, &id, doc(1)).await;
+    upsert(&fluree, &id, doc(1)).await;
     upsert(&fluree, &id, doc(2)).await;
     let mut archive = Vec::new();
     fluree
@@ -1487,16 +1557,7 @@ async fn a_later_pass_publishes_a_journal_an_earlier_one_could_not() {
         .await
         .expect("restore")
         .ledger_id;
-    assert!(unavailable(
-        read(
-            &fluree,
-            &copy,
-            json!(format!("{copy}@t:{t1}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-    ));
+    assert_eq!(history_rules(&fluree, &copy).await.len(), 1);
 }
 
 /// A restore retracts a removed occurrence the archive holds as current, but
@@ -2055,7 +2116,7 @@ async fn a_recreated_ledger_honors_its_own_removals() {
 async fn a_removal_before_the_first_pass_keeps_an_earlier_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = ledger(&fluree, "it/nohist-removal-first").await;
-    let t1 = upsert(
+    upsert(
         &fluree,
         &id,
         json!({"@context": ctx(), "@id": "ex:c", "ex:count": 1}),
@@ -2084,14 +2145,5 @@ async fn a_removal_before_the_first_pass_keeps_an_earlier_policy() {
     let status = fluree.retention_status(&id).await.unwrap();
     let journal = &status.registration.as_ref().unwrap().journal;
     assert_eq!(journal.history_rules.len(), 1, "{status:?}");
-    assert!(unavailable(
-        read(
-            &fluree,
-            &id,
-            json!(format!("{id}@t:{t1}")),
-            "ex:c",
-            "ex:count"
-        )
-        .await
-    ));
+    assert!(journal.history_rules[0].until_t.is_some(), "{status:?}");
 }

@@ -303,18 +303,18 @@ and [Iceberg → Access policy](../graph-sources/iceberg.md#where-policies-live-
 
 #### 410 Gone
 
-`err:db/HistoryUnavailable`: the read needs history that the ledger's [history retention](../transactions/history-retention.md) no longer serves. This happens for a query as of an earlier point, a history range, or an export that could touch an `f:noHistory` predicate or a removed occurrence. It also happens for a search of a full-text or vector index that has not yet synced past such a change.
+`err:db/HistoryUnavailable`: the read needs history that a [targeted removal](../transactions/history-retention.md#targeted-removal) took out. This happens for a query as of an earlier point, a history range, or an export that could touch a removed occurrence. It also happens for a search of a full-text or vector index that has not yet synced past a removal.
 
 ```json
 {
-  "error": "history unavailable: <https://example.org/count> keeps no history (f:noHistory) on mydb:main; read it as of the current head",
+  "error": "history unavailable: a removed occurrence of <https://example.org/email> on mydb:main falls in the requested range",
   "status": 410,
   "@type": "err:db/HistoryUnavailable"
 }
 ```
 
 **How to Fix:**
-- Read as of the current head, or narrow the query to predicates and subjects the retention does not cover
+- Read as of the current head, or narrow the query to predicates and subjects the removal does not cover
 - For a search index, retry once it has synced
 
 #### 413 Payload Too Large

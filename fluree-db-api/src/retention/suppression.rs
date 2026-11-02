@@ -1,11 +1,12 @@
-//! Refusing reads that need suppressed history.
+//! Refusing reads that need removed history.
 //!
 //! A read as of the head is answered from current state, which retention
 //! never hides beyond what was retracted. A read as of an earlier point, or a
-//! history range, may need what the removal journal suppresses; when its
-//! patterns could touch a suppressed predicate (or a removed occurrence) at
-//! a covered time, it fails with [`ApiError::HistoryUnavailable`] instead of
-//! answering from incomplete history. The check runs once per request, while
+//! history range, may need an occurrence a targeted removal took out; when
+//! its patterns could touch one at a covered time, it fails with
+//! [`ApiError::HistoryUnavailable`] instead of answering from incomplete
+//! history. `f:noHistory` refuses nothing: its property is read from what
+//! the index and novelty still hold. The check runs once per request, while
 //! the executable is built, and reads only the journal: a ledger without one
 //! pays one nameservice read on a historical query and nothing on a current
 //! one.
@@ -17,7 +18,7 @@ use fluree_db_core::{ContentId, LedgerSnapshot};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_query::ir::{Pattern, Query, Ref};
 
-use super::journal::{HistoryRule, Journal, Removal};
+use super::journal::{Journal, Removal};
 use super::registry;
 use super::watch::{Check, Seen};
 use crate::{ApiError, Fluree, Result};
@@ -30,16 +31,6 @@ pub(crate) enum Reads {
     Everything,
     /// These `(subject, predicate)` IRIs; a variable subject is `None`.
     Facts(Vec<(Option<String>, String)>),
-}
-
-impl Reads {
-    /// Whether the read could touch `predicate`, for any subject.
-    fn touches(&self, predicate: &str) -> bool {
-        match self {
-            Reads::Everything => true,
-            Reads::Facts(facts) => facts.iter().any(|(_, p)| p == predicate),
-        }
-    }
 }
 
 /// What `query` reads, in IRIs.
@@ -508,11 +499,9 @@ impl Fluree {
     }
 
     /// Refuse a search of a graph source that may still hold what its
-    /// source ledger's retention suppressed: one built before a removal it
-    /// has not yet indexed, one lagging the head of a ledger with
-    /// `f:noHistory` (a value it holds may since have been superseded), or
-    /// any earlier snapshot of it (`historical`). Only removals and rules of
-    /// properties the index may read count.
+    /// source ledger's removals took out: one built before a removal it has
+    /// not yet indexed, or any earlier snapshot of it (`historical`). Only
+    /// removals of properties the index may read count.
     pub(crate) async fn refuse_stale_search_sources(
         &self,
         query: &Query,
@@ -544,34 +533,23 @@ impl Fluree {
                     .iter()
                     .filter(|r| indexed.may_read(&r.predicate))
                     .collect();
-                let rules: Vec<&HistoryRule> = journal
-                    .history_rules
-                    .iter()
-                    .filter(|r| indexed.may_read(&r.predicate))
-                    .collect();
-                if removals.is_empty() && rules.is_empty() {
+                if removals.is_empty() {
                     continue;
                 }
                 if historical {
                     return Err(ApiError::HistoryUnavailable(format!(
                         "search index {id} is read as of an earlier point, and {ledger_id} \
-                         suppresses history; search it as of the current head"
+                         has removed history it may hold; search it as of the current head"
                     )));
                 }
                 let removed_through = removals
                     .iter()
                     .map(|r| r.until_t.unwrap_or(r.scope_t))
                     .max();
-                let lagging_removal = removed_through.filter(|t| record.index_t < *t);
-                let lagging_rules = rules.iter().any(|r| r.until_t.is_none())
-                    && match self.nameservice().lookup(&ledger_id).await? {
-                        Some(head) => record.index_t < head.commit_t,
-                        None => false,
-                    };
-                if lagging_removal.is_some() || lagging_rules {
+                if removed_through.is_some_and(|t| record.index_t < t) {
                     return Err(ApiError::HistoryUnavailable(format!(
                         "search index {id} has indexed {ledger_id} through t={}, before \
-                         retention changes it must reflect; retry once it has synced",
+                         a removal it must reflect; retry once it has synced",
                         record.index_t
                     )));
                 }
@@ -605,20 +583,6 @@ impl Fluree {
         }
         let (from, to) = (read.from_t.unwrap_or(read.to_t), read.to_t);
         let point = read.from_t.is_none();
-        for rule in &suppression.journal.history_rules {
-            let covered = if point {
-                rule.covers(to)
-            } else {
-                rule.overlaps(from, to)
-            };
-            if covered && read.reads.touches(&rule.predicate) {
-                return Err(ApiError::HistoryUnavailable(format!(
-                    "<{}> keeps no history (f:noHistory) on {ledger_id}; read it as of the \
-                     current head",
-                    rule.predicate
-                )));
-            }
-        }
         if let Some(predicate) = suppression.removal_needed(&read.reads, from, to, point) {
             return Err(ApiError::HistoryUnavailable(format!(
                 "a removed occurrence of <{predicate}> on {ledger_id} falls in the requested range"

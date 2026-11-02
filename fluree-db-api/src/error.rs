@@ -360,9 +360,9 @@ pub enum ApiError {
     #[error("{0}")]
     CommitNotFound(String),
 
-    /// A time-travel or history read needs history the ledger's retention
-    /// suppressed (`f:noHistory`, a targeted removal) — refused rather than
-    /// answered from incomplete history (410).
+    /// A time-travel or history read needs history a targeted removal
+    /// suppressed — refused rather than answered from incomplete history
+    /// (410).
     #[error("history unavailable: {0}")]
     HistoryUnavailable(String),
 

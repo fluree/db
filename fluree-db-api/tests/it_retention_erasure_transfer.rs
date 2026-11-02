@@ -2185,8 +2185,7 @@ async fn a_push_carries_the_removal_journal() {
 
 /// A push's journal brings removals, never history rules, which a receiver
 /// derives from the config commits it holds: a rule pushed without one is
-/// not taken, and the receiver goes on serving the history it would hide;
-/// the config commit enabling it brings it, once the receiver's retention
+/// not taken; the config commit enabling it brings it, once the receiver's retention
 /// pass reads it. (The copy has the source's name: a ledger's config graph
 /// is named for it.)
 #[tokio::test]
@@ -2269,11 +2268,10 @@ async fn a_push_takes_history_rules_only_from_config_commits() {
     let request = push_request(&source, &id, Some(&base)).await;
     push(&receiver, &copy, request, false).await.unwrap();
     receiver.run_retention(&copy).await.unwrap();
-    let refused = receiver.query_connection(&past).await;
-    assert!(
-        matches!(refused, Err(ApiError::HistoryUnavailable(_))),
-        "{refused:?}"
-    );
+    let status = receiver.retention_status(&copy).await.unwrap();
+    let rules = &status.registration.as_ref().unwrap().journal.history_rules;
+    assert_eq!(rules.len(), 1, "{status:?}");
+    assert_eq!(rules[0].predicate, "http://example.org/email");
 }
 
 /// Erasures published after the push of their requests go in a push of no

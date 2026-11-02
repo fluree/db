@@ -1,13 +1,13 @@
 # History retention: `f:noHistory` and targeted removal
 
-Fluree keeps every assertion and retraction, so a query can read any past state. Two retention features narrow what that history serves:
+Fluree keeps every assertion and retraction, so a query can read any past state. Two retention features change that:
 
-- **`f:noHistory`** on a predicate: its superseded values stop being served. A frequently updated counter keeps only its current value in ordinary views.
-- **Targeted removal**: selected occurrences of a fact stop being served, now and in history. One that is still current is retracted.
+- **`f:noHistory`** on a predicate: the index keeps only the predicate's current values. A counter that changes often stops adding to the index's history on every change. No read is refused; a read of an earlier point sees a current value from the transaction that asserted it.
+- **Targeted removal**: selected occurrences of a fact stop being served, now and in history. One that is still current is retracted. The commit log still holds the original operations, for audit access.
 
-Both are about *serving*. The commit log still holds the original operations, for audit access. Neither is erasure: backups and copies of the log still hold the values.
+Neither is erasure: the commit log, backups and copies of the log still hold the values.
 
-Ledgers that use neither feature behave exactly as before. They take the same query paths, and their commit log reads need no extra permission.
+Ledgers that use neither feature behave exactly as before. `f:noHistory` changes only what the index holds: queries take the same paths, and commit log reads need no extra permission unless a removal was made.
 
 ## `f:noHistory`
 
@@ -34,29 +34,29 @@ Set `f:noHistory true` on a predicate's entry in the ledger's [retention default
 }
 ```
 
-The current value of `ex:count` is always served. A read that might need one of its earlier values fails with `410` and `@type` `err:db/HistoryUnavailable` instead of answering from incomplete history. Three kinds of read can need them:
+Reads of `ex:count` are never refused. Once its changes are indexed, its earlier values are gone from the index, and every read answers from what is left:
 
-- a query as of an earlier point (`ledger@t:5`, `@iso:`, `@commit:`);
-- a history range (`from` … `to`);
-- a query of a view the application opened before a later commit: once the ledger has moved past it, the view is of an earlier point.
+- a query as of an earlier point (`ledger@t:5`, `@iso:`, `@commit:`) sees a current value from the transaction that asserted it, and no value of `ex:count` before then;
+- a history range (`from` … `to`) lists only the current values' assertions;
+- other predicates keep their full history, in the same query. A graph crawl (`select {"?s": ["*"]}`) as of an earlier point returns the subject's other properties as they were then.
 
-A view of a ledger that has since been dropped, or replaced by a new ledger under the same name, is refused (`404`) for every read, current or historical: its journal went with it.
+Changes not yet indexed still carry their history. Until the background indexer next runs, a read as of an earlier point can see a superseded value, and the same read stops seeing it once the change is indexed.
 
-A historical query that never touches the predicate is still answered. The check is per query, on the predicates its patterns name. A pattern with a variable predicate, a wildcard path, a graph crawl or hydration (`select {"?s": ["*"]}`), or reasoning counts as touching every predicate. So do shortest paths, geo searches and `SERVICE`.
-
-The same `f:noHistory` entry can carry an `f:ttl` too: values expire, and their history is not served.
+The same `f:noHistory` entry can carry an `f:ttl` too: values expire, and once indexed, their history goes too.
 
 ### Coverage
 
-- **Enabling covers existing history.** The values the predicate had before the config commit are no longer served either.
-- **Disabling covers only the past.** `f:noHistory false`, or removing the entry, ends the rule at that config commit. History written from then on is kept and served. History from the covered period stays unavailable, because the index no longer holds it.
+- **Enabling covers existing history.** The values the predicate had before the config commit leave the index too.
+- **Disabling covers only the past.** `f:noHistory false`, or removing the entry, ends the rule at that config commit. History written from then on is kept. History from the covered period stays out of the index.
 - **Graphs.** A ledger-wide entry governs the predicate in every data graph. A graph override with `f:noHistory false` keeps that graph's history.
 
-A rule takes effect when the retention worker next runs, within `--retention-interval-secs` (15 seconds by default) of the config commit. Until then, history is served as before. Status shows the rule once it is recorded.
+A rule takes effect when the retention worker next runs, within `--retention-interval-secs` (15 seconds by default) of the config commit. Until then, index builds keep the history. Status shows the rule once it is recorded.
 
 ### The index
 
-The background indexer leaves the covered history out of the index, in incremental builds as well as full rebuilds. History indexed before the rule was recorded stays in the index until a build rewrites the leaf that holds it. A [reindex](../indexing-and-search/reindex.md) drops all of it at once.
+The background indexer leaves the covered history out of the index, in incremental builds as well as full rebuilds. History indexed before the rule was recorded stays in the index until a build rewrites the leaf that holds it, and reads as of an earlier point can see it until then. A [reindex](../indexing-and-search/reindex.md) drops all of it at once.
+
+Small named graphs that share one set of index trees (see [graph placement](../ledger-config/setting-groups.md#indexing-defaults)) keep the predicate's history. A graph that outgrows them, past 16,384 history entries by default, moves to trees of its own, where the rule applies.
 
 ## Targeted removal
 
@@ -105,25 +105,26 @@ After the removal:
 
 ## Search indexes and exports
 
-Full-text (BM25) and vector graph sources index documents built from their source ledger, so a removal or a superseded `f:noHistory` value can survive in them until they sync. A search of such a graph source fails with `410` `err:db/HistoryUnavailable` while:
+Full-text (BM25) and vector graph sources index documents built from their source ledger, so a removal can survive in them until they sync. A search of such a graph source fails with `410` `err:db/HistoryUnavailable` while:
 
 - it has not yet indexed a removal of its source ledger;
-- it lags the head of a source ledger that has an `f:noHistory` rule;
-- it is read as of an earlier snapshot of a source ledger with either.
+- it is read as of an earlier snapshot of a source ledger with a removal.
 
-Only removals and rules of properties the graph source reads count: its indexing query's properties and, for a vector index, its embedding property. An index of `ex:bio` is served behind a removal of `ex:email`. When the indexing query's properties cannot all be listed (a `*` select, a variable predicate, a `@path` alias, patterns on another subject, or reasoning, which infers from properties the query does not name), every removal and rule counts.
+Only removals of properties the graph source reads count: its indexing query's properties and, for a vector index, its embedding property. An index of `ex:bio` is served behind a removal of `ex:email`. When the indexing query's properties cannot all be listed (a `*` select, a variable predicate, a `@path` alias, patterns on another subject, or reasoning, which infers from properties the query does not name), every removal counts.
 
 It is served again once it syncs. An export as of an earlier point is refused like a query that reads every predicate.
 
+`f:noHistory` refuses no search and no export. A graph source that lags its ledger can match a superseded value until it syncs, and an earlier snapshot holds the values it was built from.
+
 ## Audit access
 
-On a ledger whose journal records a rule or a removal, raw commit content is audit data. These reads need the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [token claim](../security/authentication.md#scope-claims), and answer `403` without it:
+On a ledger whose journal records a removal, raw commit content is audit data. These reads need the `fluree.ledger.audit.all` or `fluree.ledger.audit.ledgers` [token claim](../security/authentication.md#scope-claims), and answer `403` without it:
 
 - commit show (`GET /show/{ledger}`), commit export (`GET /commits/{ledger}`) and pack (`POST /pack/{ledger}`);
 - storage-proxy reads of commit, transaction and history-index blobs, and vended storage credentials;
 - the change and conflict details of a merge preview.
 
-Ordinary read, history, export and storage scopes do not imply audit access. On ledgers without a journal, these reads keep their usual permissions.
+Ordinary read, history, export and storage scopes do not imply audit access. On ledgers without a removal, these reads keep their usual permissions; an `f:noHistory` rule alone does not change them.
 
 ## Clusters
 
@@ -183,5 +184,5 @@ A history rule that has been turned off carries `untilT`, the config commit that
 - **Removal is not undone** by retracting or re-asserting data, or by resetting a branch. The journal lives in the branch's nameservice record, outside ledger content.
 - **Drops and restores.** A soft drop keeps each branch's retention state with the dropped ledger: its removal journal, expiry schedule and erasure requests. A restore reinstates it before the ledger is visible, so the restored ledger refuses the same history and its pending work resumes. Like an archive restore, it also takes what the lineage's checkpoint holds, so a removal made on another copy while the ledger was dropped is refused too, and retracted if the restored ledger still holds it as current. A soft drop whose retention state no longer fits in the nameservice's dropped-ledger entry (the limit some backends, such as DynamoDB, have) is refused and undone, leaving the ledger live. A ledger dropped by an earlier version kept none of this; its restore takes the journal from the lineage's checkpoint alone, and its erasure requests must be made again.
 - **Archives and restores.** Every journal change is also written to a checkpoint for the ledger's lineage (its genesis commit, which every copy shares), kept in storage under `@retention/journal/` outside any ledger's folder; drops, purges and the orphan sweep leave it. A checkpoint is a set of immutable objects whose union is the lineage's journal, so copies changing their journals at once each add to it. A removal or `f:noHistory` change that cannot write the checkpoint reports failure; a retry, or the worker's next pass, writes it. A ledger restored from a `.flpack` archive takes the archive's journal and that checkpoint, so a copy restored from an archive made before a removal, even after its source is purged, refuses the same history. A removed occurrence the archive still held as current is retracted before the restored ledger becomes visible, and the restore's `commit_t` is that retraction; the same value asserted again after the removal is a different occurrence and stays. A restore fails, and leaves nothing behind, when the checkpoint cannot be read. The restored ledger rebuilds its expiry schedule from its commits, and keeps the history rules it inherits, even ones enabled after the archive was made.
-- **Clones and pulls** copy the raw commit log; on a ledger with a journal, they need audit access. Through the pack protocol, the journal travels with the commits and the copy refuses the same history, from a named remote or an origin; a pull with no new commits still takes the journal. The paginated export, and an origin pull's object-by-object fallback, carry no journal.
+- **Clones and pulls** copy the raw commit log; on a ledger with a removal, they need audit access. Through the pack protocol, the journal travels with the commits and the copy refuses the same history, from a named remote or an origin; a pull with no new commits still takes the journal. The paginated export, and an origin pull's object-by-object fallback, carry no journal.
 - **Pushes** carry the journal too, and the server merges its removals into its own. Removals its journal lacks need the authority a removal request needs there. History rules are not taken from a push: the server derives them from the pushed config commits. A push with no new commits still carries the journal. A cluster takes the commits and keeps its own journal.

@@ -205,7 +205,7 @@ These predicates live in the ledger's `#config` named graph and declare which pr
 | `f:retentionDefaults` | `https://ns.flur.ee/db#retentionDefaults` | Setting group on `f:LedgerConfig` / `f:GraphConfig` |
 | `f:RetentionDefaults` | `https://ns.flur.ee/db#RetentionDefaults` | Class of the setting-group node |
 | `f:RetentionProperty` | `https://ns.flur.ee/db#RetentionProperty` | Class of each `f:property` entry |
-| `f:noHistory` | `https://ns.flur.ee/db#noHistory` | On an entry: stop serving the predicate's superseded values ([History retention](../transactions/history-retention.md)) |
+| `f:noHistory` | `https://ns.flur.ee/db#noHistory` | On an entry: keep the predicate's superseded values out of the index ([History retention](../transactions/history-retention.md)) |
 | `f:retentionControl` | `https://ns.flur.ee/db#retentionControl` | System txn-meta marker on a commit that carries retention input |
 
 ---
