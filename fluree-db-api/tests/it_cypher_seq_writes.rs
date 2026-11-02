@@ -666,8 +666,13 @@ async fn delete_in_chain_rejected_clearly() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cyseq:delete-chain");
 
+    // Reads first: the original spelling here put the `MATCH` *after* the
+    // `MERGE`, which #1873's parser guard now rejects earlier and for a more
+    // fundamental reason (the clause order would have been silently
+    // rearranged). Reordering keeps this test pointed at the DELETE deferral
+    // it exists to pin.
     let err = fluree
-        .transact_cypher(l, r#"MERGE (a:P {id: 1}) MATCH (b:Old) DELETE b"#)
+        .transact_cypher(l, r#"MATCH (b:Old) MERGE (a:P {id: 1}) DELETE b"#)
         .await
         .expect_err("DELETE in a multi-clause statement is deferred");
     assert!(
@@ -878,4 +883,98 @@ async fn commit_without_tracking_reports_no_tally() {
     let committed = fluree.commit_cypher_transaction(txn).await.expect("commit");
     assert!(committed.tally.is_none(), "no tally without tracking");
     assert!(committed.receipt.flake_count > 0);
+}
+
+// ===========================================================================
+// fluree/db#1873 — a read clause after a write clause was silently hoisted.
+//
+// Asserted on `receipt.flake_count`, not on the absence of an error: two of
+// the shapes below COMMITTED before the fix, so "the transaction succeeded"
+// would have passed against the bug. The rejection cases and the still-works
+// cases are in one test deliberately — a guard that rejected everything
+// would pass the first half alone.
+// ===========================================================================
+
+async fn seed_1873(f: &fluree_db_api::Fluree, id: &str) -> fluree_db_api::LedgerState {
+    let l0 = genesis_ledger(f, id);
+    f.insert(
+        l0,
+        &json!({"@context": {"xsd": "http://www.w3.org/2001/XMLSchema#"},
+                "@graph": [{"@id": "alice", "@type": "Person", "name": "Alice"},
+                           {"@id": "bob", "@type": "Person", "name": "Bob"}]}),
+    )
+    .await
+    .expect("seed")
+    .ledger
+}
+
+#[tokio::test]
+async fn issue1873_hoisted_read_after_write_is_rejected_not_committed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Each entry records what the shape did BEFORE the guard.
+    for (before, stmt) in [
+        (
+            "errored, blaming a policy that was not involved",
+            r#"MERGE (n:P {id: "w"}) WITH n SET n.nm = "b""#,
+        ),
+        (
+            "COMMITTED 4 flakes, writing one marker per pre-MERGE name onto the merged node",
+            r#"MERGE (n:P {name: "Zed"}) WITH n.name AS nm SET n.marker = nm"#,
+        ),
+        (
+            "errored with an internal `Duplicate VarId` leak",
+            r#"MERGE (n:P {id: "q"}) WITH n, n.id AS n SET n.nm = n"#,
+        ),
+        (
+            "COMMITTED 0 flakes: the filter ran before the SET it reads",
+            r#"MATCH (n:Person {name: "Alice"}) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2"#,
+        ),
+        (
+            "errored: the hoisted WITH left `n` unbound",
+            r#"CREATE (n:P {id: "c1"}) WITH n SET n.nm = "a""#,
+        ),
+    ] {
+        let l = seed_1873(&fluree, &format!("it/1873:r{}", stmt.len())).await;
+        let err = fluree
+            .transact_cypher(l, stmt)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("must be rejected (before: {before}): {stmt}"));
+        assert!(
+            err.to_string().contains("after a write clause"),
+            "must be the hoist guard, not an incidental error: {err} (for {stmt})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue1873_reads_before_writes_still_commit_their_flakes() {
+    // The paired half. `MATCH … WITH … MERGE … SET` is the important one: its
+    // AST is `[Match, With] / [Merge, Set]`, identical to a hoisted statement,
+    // and only the source positions distinguish them. A guard written against
+    // clause kinds rather than positions would reject this.
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (expected_flakes, stmt) in [
+        (
+            3,
+            r#"MATCH (a:Person {name: "Alice"}) WITH a MERGE (b:P {id: "z"}) SET b.x = 1"#,
+        ),
+        (
+            2,
+            r#"MATCH (n:Person) WITH n, n.name AS nm SET n.marker = nm"#,
+        ),
+        (3, r#"MERGE (n:P {id: "y"}) SET n.nm = "a""#),
+        (2, r#"CREATE (n:P {id: "c9"})"#),
+    ] {
+        let l = seed_1873(&fluree, &format!("it/1873:a{}", stmt.len())).await;
+        let res = fluree
+            .transact_cypher(l, stmt)
+            .await
+            .unwrap_or_else(|e| panic!("must still commit: {stmt}: {e}"));
+        assert_eq!(
+            res.receipt.flake_count, expected_flakes,
+            "flakes must still land, not merely 'no error': {stmt}"
+        );
+    }
 }
