@@ -25,6 +25,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::group_aggregate::TryCollectVec;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -110,14 +111,15 @@ impl GroupByOperator {
     }
 
     /// Extract group key from a row
-    fn extract_group_key(&self, row: &[Binding]) -> Vec<Binding> {
+    fn extract_group_key(&self, row: &[Binding]) -> Result<Vec<Binding>> {
         self.group_key_indices
             .iter()
             .map(|&idx| {
                 let (dicts, gv) = EqualityNorm::parts(&self.norm);
                 normalize_for_key(&row[idx], dicts, gv)
             })
-            .collect()
+            .try_collect_vec()
+            .map_err(Into::into)
     }
 
     /// Transform accumulated groups into output rows.
@@ -244,7 +246,7 @@ impl Operator for GroupByOperator {
                             .map(|col| batch.get_by_col(row_idx, col).clone())
                             .collect();
 
-                        let group_key = self.extract_group_key(&row);
+                        let group_key = self.extract_group_key(&row)?;
                         self.groups.entry(group_key).or_default().push(row);
                     }
                     process_rows_ms += (proc_start.elapsed().as_secs_f64() * 1000.0) as u64;
@@ -414,7 +416,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(30), xsd_long()),
         ];
 
-        let key = op.extract_group_key(&row);
+        let key = op.extract_group_key(&row).unwrap();
         assert_eq!(key.len(), 1);
         assert_eq!(
             key[0],

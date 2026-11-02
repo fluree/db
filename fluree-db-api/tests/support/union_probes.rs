@@ -1,0 +1,689 @@
+//! The union-probe fixture, for the nested-loop join's batched probes over
+//! a union of graphs: joins whose right side the subject, object and
+//! existence probes answer, and the keep/drop membership join, over facts
+//! two graphs both hold and facts only one does.
+//!
+//! The facts are written as data ([`facts`]), so the answer to each shape is
+//! computed from them by a plain evaluator ([`expected`]) that applies the
+//! union's semantics directly: the union is the set of facts, one fact per
+//! subject, predicate, term and list position. That evaluator is the oracle
+//! the lane and the general plan both answer to, beside the one-graph floor.
+//!
+//! The cases a union probe can get wrong are in the data:
+//! - a fact both graphs hold (one solution) beside facts one graph holds;
+//! - list positions: `y3 v ("a" "a")` in g1 and `("a")` in g2 are two facts,
+//!   `y4 v ("a")` in g1 and `("b" "a")` in g2 are three;
+//! - a bare constant matching two datatypes: `y5 score 1` in g1 and
+//!   `1.0e0` in g2 are two facts, `y6 score 1` in both is one;
+//! - NumBig values (every `xsd:decimal`) under one handle number in two
+//!   graphs: handles are numbered per `(graph, predicate)`, so g1's `1.5`
+//!   and g2's `2.5` on `y0 v` are both the first handle of their graph, and
+//!   g1's and g2's `3.5` on `y1 v` need not be the same handle;
+//! - a ref list: `x900 r (y9 y9)` in g1 and `(y9)` in g2 are two facts.
+//!
+//! The lists are list members as JSON-LD sees them. SPARQL sees RDF lists
+//! (`fluree_db_query::list_view`): a list is its owner edge to a head cell,
+//! a blank node local to its graph, so a list both graphs hold is two lists
+//! of the union. [`expected_on`] answers each surface by its own view, and
+//! the batched lanes stand down on SPARQL for a predicate holding lists.
+
+use crate::multigraph::{outcomes, switch};
+use crate::span_capture::init_test_tracing;
+use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions};
+use serde_json::{json, Value as JsonValue};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+pub const EX: &str = "http://example.org/";
+pub const G1: &str = "urn:g1";
+pub const G2: &str = "urn:g2";
+/// The union-probe fixture's g1 and g2.
+pub const LEDGER: &str = "it/union-probes:main";
+/// The union-probe fixture with a list-position duplicate on the membership join's
+/// predicate, which sends that join to its exact per-row path.
+pub const LEDGER_LISTS: &str = "it/union-probes-lists:main";
+/// Each ledger's union, once, in a default graph.
+pub const FLOOR: &str = "it/union-probes-floor:main";
+pub const FLOOR_LISTS: &str = "it/union-probes-floor-lists:main";
+
+/// Driving rows for the membership join: at least the planner's minimum
+/// (256), so it picks keep/drop over the nested loop.
+const N: usize = 300;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Obj {
+    Iri(String),
+    Str(String),
+    Int(i64),
+    /// A double, written as its lexical form.
+    Double(&'static str),
+    /// An `xsd:decimal` (a NumBig), written as its lexical form.
+    Dec(&'static str),
+    /// The head cell of a list in graph `.0`, as SPARQL sees a list: a blank
+    /// node, never written as data ([`sparql_view`]).
+    ListHead(&'static str),
+}
+
+impl Obj {
+    fn turtle(&self) -> String {
+        match self {
+            Obj::Iri(n) => format!("ex:{n}"),
+            Obj::Str(v) => format!("\"{v}\""),
+            Obj::Int(v) => v.to_string(),
+            Obj::Double(v) => format!("\"{v}\"^^xsd:double"),
+            Obj::Dec(v) => (*v).to_string(),
+            Obj::ListHead(_) => unreachable!("a list head is not written as data"),
+        }
+    }
+
+    /// The term as a SPARQL JSON result renders it: `value^^type`.
+    fn rendered(&self) -> String {
+        match self {
+            Obj::Iri(n) => n.clone(),
+            // A plain string renders with no datatype.
+            Obj::Str(v) => v.clone(),
+            Obj::Int(v) => format!("{v}^^integer"),
+            Obj::Double(v) => format!("{}^^double", v.replace('e', "E")),
+            Obj::Dec(v) => format!("{v}^^decimal"),
+            Obj::ListHead(_) => LIST_CELL.to_string(),
+        }
+    }
+}
+
+/// One fact: graph, subject, predicate, object, list position.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Fact {
+    pub g: &'static str,
+    pub s: String,
+    pub p: &'static str,
+    pub o: Obj,
+    pub i: Option<u32>,
+}
+
+pub fn fact(g: &'static str, s: impl Into<String>, p: &'static str, o: Obj) -> Fact {
+    Fact {
+        g,
+        s: s.into(),
+        p,
+        o,
+        i: None,
+    }
+}
+
+fn list(g: &'static str, s: &str, p: &'static str, items: &[Obj]) -> Vec<Fact> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, o)| Fact {
+            g,
+            s: s.to_string(),
+            p,
+            o: o.clone(),
+            i: Some(i as u32),
+        })
+        .collect()
+}
+
+fn iri(n: impl Into<String>) -> Obj {
+    Obj::Iri(n.into())
+}
+
+/// The union-probe fixture's facts; with `lists`, `y20 q` is the list `(x20 x20)` instead
+/// of the single fact `y20 q x20`.
+pub fn facts(lists: bool) -> Vec<Fact> {
+    let mut f = Vec::new();
+    for i in 0..N {
+        f.push(fact(G1, format!("x{i}"), "p", iri(format!("y{i}"))));
+        if !(lists && i == 20) {
+            f.push(fact(G1, format!("y{i}"), "q", iri(format!("x{i}"))));
+        }
+    }
+    if lists {
+        f.extend(list(G1, "y20", "q", &[iri("x20"), iri("x20")]));
+    }
+    for i in N / 2..N {
+        f.push(fact(G2, format!("x{i}"), "p", iri(format!("y{i}"))));
+        f.push(fact(G2, format!("y{i}"), "q", iri(format!("x{i}"))));
+    }
+    // Subject probe objects.
+    f.push(fact(G1, "y0", "v", Obj::Dec("1.5")));
+    f.push(fact(G1, "y1", "v", Obj::Dec("3.5")));
+    f.push(fact(G2, "y0", "v", Obj::Dec("2.5")));
+    f.push(fact(G2, "y10", "v", Obj::Dec("7.5")));
+    f.push(fact(G2, "y1", "v", Obj::Dec("3.5")));
+    for g in [G1, G2] {
+        f.push(fact(g, "y2", "v", Obj::Str("s".into())));
+    }
+    f.extend(list(
+        G1,
+        "y3",
+        "v",
+        &[Obj::Str("a".into()), Obj::Str("a".into())],
+    ));
+    f.extend(list(G2, "y3", "v", &[Obj::Str("a".into())]));
+    f.extend(list(G1, "y4", "v", &[Obj::Str("a".into())]));
+    f.extend(list(
+        G2,
+        "y4",
+        "v",
+        &[Obj::Str("b".into()), Obj::Str("a".into())],
+    ));
+    // The probed predicates are the large side of each join, so the planner
+    // drives from the selective `sel` / `tag` patterns and probes them.
+    for i in 100..N {
+        f.push(fact(G1, format!("y{i}"), "v", Obj::Str("pad".into())));
+        f.push(fact(G1, format!("y{i}"), "score", Obj::Int(2)));
+        f.push(fact(G1, format!("x{i}"), "r", iri(format!("z{i}"))));
+    }
+    for y in ["y0", "y1", "y2", "y3", "y4", "y5", "y6", "y10"] {
+        for g in [G1, G2] {
+            f.push(fact(g, format!("s_{y}"), "sel", iri(y)));
+        }
+    }
+    // Existence probe: `?y ex:score 1`.
+    f.push(fact(G1, "y5", "score", Obj::Int(1)));
+    f.push(fact(G2, "y5", "score", Obj::Double("1.0e0")));
+    for g in [G1, G2] {
+        f.push(fact(g, "y6", "score", Obj::Int(1)));
+    }
+    // Object probe: `?y ex:tag ex:T . ?x ex:r ?y`.
+    for g in [G1, G2] {
+        f.push(fact(g, "y7", "tag", iri("T")));
+        f.push(fact(g, "x7b", "r", iri("y7")));
+        f.push(fact(g, "y9", "tag", iri("T")));
+    }
+    f.push(fact(G2, "x7c", "r", iri("y7")));
+    f.extend(list(G1, "x900", "r", &[iri("y9"), iri("y9")]));
+    f.extend(list(G2, "x900", "r", &[iri("y9")]));
+    // The probed predicates again without their lists (`vf`, `rf`, `qf`):
+    // SPARQL reads a predicate holding lists through the list view, so the
+    // union probes run on SPARQL over these.
+    let twins: Vec<Fact> = f
+        .iter()
+        .filter(|x| x.i.is_none())
+        .filter_map(|x| {
+            let p = match x.p {
+                "v" => "vf",
+                "r" => "rf",
+                "q" => "qf",
+                _ => return None,
+            };
+            Some(Fact { p, ..x.clone() })
+        })
+        .collect();
+    f.extend(twins);
+    f
+}
+
+/// How a list cell, a blank node the request names, renders in a row.
+const LIST_CELL: &str = "_:list";
+
+/// `facts` as SPARQL's view of lists sees them: each list, per graph,
+/// subject and predicate, is one fact whose object is its head cell, and its
+/// members are not values of the predicate.
+pub fn sparql_view(facts: &[Fact]) -> Vec<Fact> {
+    let mut out: Vec<Fact> = facts.iter().filter(|f| f.i.is_none()).cloned().collect();
+    for f in facts.iter().filter(|f| f.i.is_some()) {
+        let head = fact(f.g, f.s.clone(), f.p, Obj::ListHead(f.g));
+        if !out.contains(&head) {
+            out.push(head);
+        }
+    }
+    out
+}
+
+/// A query surface: SPARQL, which sees RDF lists, or JSON-LD, which sees
+/// their members as values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    Sparql,
+    JsonLd,
+}
+
+pub const SURFACES: &[Surface] = &[Surface::JsonLd, Surface::Sparql];
+
+/// [`expected`] on `surface`.
+pub fn expected_on(surface: Surface, shape: Shape, facts: &[Fact]) -> Vec<String> {
+    match surface {
+        Surface::JsonLd => expected(shape, facts),
+        Surface::Sparql => expected(shape, &sparql_view(facts)),
+    }
+}
+
+/// Whether the predicate `shape` probes holds a list in `facts`: on SPARQL
+/// its join then reads it through the list view, and no batched lane runs.
+pub fn probes_a_list(shape: Shape, facts: &[Fact]) -> bool {
+    facts.iter().any(|f| f.i.is_some() && f.p == shape.probed())
+}
+
+/// The union's facts: one per subject, predicate, term and list position.
+pub fn union_of(facts: &[Fact]) -> Vec<Fact> {
+    let mut out: Vec<Fact> = facts.iter().map(|f| Fact { g: "", ..f.clone() }).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// TriG for `facts`, each fact in its own graph (`""`: the default graph).
+pub fn trig(facts: &[Fact]) -> String {
+    let mut by_graph: BTreeMap<&str, Vec<&Fact>> = BTreeMap::new();
+    for f in facts {
+        by_graph.entry(f.g).or_default().push(f);
+    }
+    let mut out = String::from(
+        "@prefix ex: <http://example.org/> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    for (g, facts) in by_graph {
+        if !g.is_empty() {
+            let _ = writeln!(out, "GRAPH <{g}> {{");
+        }
+        // Lists by (subject, predicate), in position order; the rest as triples.
+        let mut lists: BTreeMap<(&str, &str), Vec<&Fact>> = BTreeMap::new();
+        for f in facts {
+            match f.i {
+                Some(_) => lists.entry((f.s.as_str(), f.p)).or_default().push(f),
+                None => {
+                    let _ = writeln!(out, "  ex:{} ex:{} {} .", f.s, f.p, f.o.turtle());
+                }
+            }
+        }
+        for ((s, p), mut items) in lists {
+            items.sort_by_key(|f| f.i);
+            let items: Vec<String> = items.iter().map(|f| f.o.turtle()).collect();
+            let _ = writeln!(out, "  ex:{s} ex:{p} ( {} ) .", items.join(" "));
+        }
+        if !g.is_empty() {
+            out.push_str("}\n");
+        }
+    }
+    out
+}
+
+/// A join the batched probes answer, over the union-probe fixture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// The subject probe: `?x ex:sel ?y . ?y ex:v ?o`.
+    Subject,
+    /// The object probe: `?y ex:tag ex:T . ?x ex:r ?y`.
+    Object,
+    /// The existence probe: `?x ex:sel ?y . ?y ex:score 1`.
+    Exists,
+    /// The keep/drop membership join: `?x ex:p ?y . ?y ex:q ?x`.
+    Membership,
+    /// [`Shape::Subject`] over `ex:vf`, which holds no lists.
+    SubjectNoLists,
+    /// [`Shape::Object`] over `ex:rf`, which holds no lists.
+    ObjectNoLists,
+    /// [`Shape::Membership`] over `ex:qf`, which holds no lists.
+    MembershipNoLists,
+}
+
+pub const SHAPES: &[Shape] = &[
+    Shape::Subject,
+    Shape::Object,
+    Shape::Exists,
+    Shape::Membership,
+    Shape::SubjectNoLists,
+    Shape::ObjectNoLists,
+    Shape::MembershipNoLists,
+];
+
+impl Shape {
+    /// The join the shape is, whichever predicate it probes.
+    pub fn base(self) -> Shape {
+        match self {
+            Shape::SubjectNoLists => Shape::Subject,
+            Shape::ObjectNoLists => Shape::Object,
+            Shape::MembershipNoLists => Shape::Membership,
+            other => other,
+        }
+    }
+
+    pub fn body(self) -> String {
+        let p = self.probed();
+        match self.base() {
+            Shape::Subject => format!("?x ex:sel ?y . ?y ex:{p} ?o"),
+            Shape::Object => format!("?y ex:tag ex:T . ?x ex:{p} ?y"),
+            Shape::Exists => "?x ex:sel ?y . ?y ex:score 1".to_string(),
+            _ => format!("?x ex:p ?y . ?y ex:{p} ?x"),
+        }
+    }
+
+    pub fn vars(self) -> &'static [&'static str] {
+        match self.base() {
+            Shape::Subject => &["y", "o"],
+            Shape::Exists => &["y"],
+            _ => &["x", "y"],
+        }
+    }
+
+    /// The predicate the shape's join probes.
+    pub fn probed(self) -> &'static str {
+        match self {
+            Shape::Subject => "v",
+            Shape::Object => "r",
+            Shape::Exists => "score",
+            Shape::Membership => "q",
+            Shape::SubjectNoLists => "vf",
+            Shape::ObjectNoLists => "rf",
+            Shape::MembershipNoLists => "qf",
+        }
+    }
+
+    /// The shape's `where` in JSON-LD.
+    pub fn jsonld_where(self) -> JsonValue {
+        let pat = |s: &str, p: &str, o: JsonValue| json!({"@id": s, format!("ex:{p}"): o});
+        let p = self.probed();
+        match self.base() {
+            Shape::Subject => json!([pat("?x", "sel", json!("?y")), pat("?y", p, json!("?o"))]),
+            Shape::Object => json!([
+                pat("?y", "tag", json!({"@id": "ex:T"})),
+                pat("?x", p, json!("?y"))
+            ]),
+            Shape::Exists => json!([pat("?x", "sel", json!("?y")), pat("?y", "score", json!(1))]),
+            _ => json!([pat("?x", "p", json!("?y")), pat("?y", p, json!("?x"))]),
+        }
+    }
+
+    /// The routing-stamp site that answers the shape's join.
+    pub fn site(self) -> &'static str {
+        match self.base() {
+            Shape::Membership => "membership-join",
+            _ => "nested-loop-batched-union",
+        }
+    }
+}
+
+fn numeric_one(o: &Obj) -> bool {
+    match o {
+        Obj::Int(v) => *v == 1,
+        Obj::Double(v) => v.parse::<f64>().is_ok_and(|d| d == 1.0),
+        Obj::Dec(v) => v.parse::<f64>().is_ok_and(|d| d == 1.0),
+        _ => false,
+    }
+}
+
+/// The answer to `shape` over the union of `facts`, each row rendered as
+/// its variables' values joined by a space, sorted.
+pub fn expected(shape: Shape, facts: &[Fact]) -> Vec<String> {
+    let u = union_of(facts);
+    let with = |p: &'static str| u.iter().filter(move |f| f.p == p);
+    let mut rows: Vec<String> = Vec::new();
+    let probed = shape.probed();
+    match shape.base() {
+        Shape::Subject => {
+            for a in with("sel") {
+                let Obj::Iri(y) = &a.o else { continue };
+                for b in with(probed).filter(|b| &b.s == y) {
+                    rows.push(format!("{y} {}", b.o.rendered()));
+                }
+            }
+        }
+        Shape::Object => {
+            for t in with("tag").filter(|t| t.o == iri("T")) {
+                for a in with(probed).filter(|a| a.o == iri(t.s.clone())) {
+                    rows.push(format!("{} {}", a.s, t.s));
+                }
+            }
+        }
+        Shape::Exists => {
+            for a in with("sel") {
+                let Obj::Iri(y) = &a.o else { continue };
+                for _ in with("score").filter(|b| &b.s == y && numeric_one(&b.o)) {
+                    rows.push(y.clone());
+                }
+            }
+        }
+        _ => {
+            for a in with("p") {
+                let Obj::Iri(y) = &a.o else { continue };
+                for _ in with(probed).filter(|b| &b.s == y && b.o == iri(a.s.clone())) {
+                    rows.push(format!("{} {y}", a.s));
+                }
+            }
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// The union-probe fixture's ledgers, indexed, on one in-memory connection with background
+/// indexing off.
+pub struct Fixture {
+    pub fluree: Fluree,
+}
+
+impl Fixture {
+    pub async fn build() -> Self {
+        let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+        for (ledger, trig) in [
+            (LEDGER, trig(&facts(false))),
+            (LEDGER_LISTS, trig(&facts(true))),
+            (FLOOR, trig(&union_of(&facts(false)))),
+            (FLOOR_LISTS, trig(&union_of(&facts(true)))),
+        ] {
+            fluree.create_ledger(ledger).await.expect("create");
+            let handle = fluree.ledger_cached(ledger).await.expect("cache");
+            fluree
+                .stage(&handle)
+                .insert_turtle(&trig)
+                .execute()
+                .await
+                .expect("seed");
+            fluree
+                .reindex(ledger, ReindexOptions::default())
+                .await
+                .expect("index");
+            fluree.disconnect_ledger(ledger).await;
+        }
+        Self { fluree }
+    }
+
+    /// Commit `facts` to `ledger` without indexing them: novelty in each
+    /// fact's graph.
+    pub async fn write(&self, ledger: &str, facts: &[Fact]) {
+        let handle = self.fluree.ledger_cached(ledger).await.expect("ledger");
+        self.fluree
+            .stage(&handle)
+            .insert_turtle(&trig(facts))
+            .execute()
+            .await
+            .expect("write");
+    }
+
+    /// `shape` over `ledger` with `dataset` (`FROM …`, or empty) and an
+    /// optional prologue, rows rendered as [`expected`] renders them.
+    pub async fn sparql(
+        &self,
+        ledger: &str,
+        prologue: &str,
+        dataset: &str,
+        shape: Shape,
+    ) -> Result<Vec<String>, String> {
+        self.sparql_where(ledger, prologue, dataset, &shape.body(), shape.vars())
+            .await
+    }
+
+    /// `SELECT` of `vars` over `ledger` with `dataset` and `body` as the
+    /// whole `WHERE` clause, rows rendered as [`expected`] renders them.
+    pub async fn sparql_where(
+        &self,
+        ledger: &str,
+        prologue: &str,
+        dataset: &str,
+        body: &str,
+        vars: &[&str],
+    ) -> Result<Vec<String>, String> {
+        let query = format!(
+            "{prologue}PREFIX ex: <{EX}>\nSELECT ?{} {dataset} WHERE {{ {body} }}",
+            vars.join(" ?"),
+        );
+        let handle = self.fluree.ledger_cached(ledger).await.expect("ledger");
+        let view = GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
+        let json = view
+            .query(&self.fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+            .map_err(|e| format!("{query}: {e}"))?;
+        sparql_json_rows(&query, &json, vars)
+    }
+
+    /// `shape` in JSON-LD over `ledger`, its dataset given in SPARQL's
+    /// spelling (`prologue`, `dataset`) and translated, rows rendered as
+    /// [`expected`] renders them.
+    pub async fn jsonld(
+        &self,
+        ledger: &str,
+        prologue: &str,
+        dataset: &str,
+        shape: Shape,
+    ) -> Result<Vec<String>, String> {
+        let vars = shape.vars();
+        let mut q = json!({
+            "@context": {"ex": EX},
+            "select": vars.iter().map(|v| format!("?{v}")).collect::<Vec<_>>(),
+            "where": shape.jsonld_where(),
+        });
+        let graphs: Vec<String> = dataset
+            .split("FROM <")
+            .skip(1)
+            .map(|g| format!("{ledger}#{}", g.split('>').next().unwrap()))
+            .collect();
+        q["from"] = match graphs.len() {
+            0 => json!(ledger),
+            1 => json!(graphs[0]),
+            _ => json!(graphs),
+        };
+        if prologue.contains("union-default-graph") {
+            q["opts"] = json!({"unionDefaultGraph": true});
+        }
+        let result = self
+            .fluree
+            .query_connection(&q)
+            .await
+            .map_err(|e| format!("{q}: {e}"))?;
+        let state = self
+            .fluree
+            .ledger(ledger)
+            .await
+            .map_err(|e| e.to_string())?;
+        let json = result
+            .to_sparql_json(&state.snapshot)
+            .map_err(|e| format!("{q}: {e}"))?;
+        sparql_json_rows(&q.to_string(), &json, vars)
+    }
+
+    /// `shape` on `surface`.
+    pub async fn on(
+        &self,
+        surface: Surface,
+        ledger: &str,
+        prologue: &str,
+        dataset: &str,
+        shape: Shape,
+    ) -> Result<Vec<String>, String> {
+        match surface {
+            Surface::Sparql => self.sparql(ledger, prologue, dataset, shape).await,
+            Surface::JsonLd => self.jsonld(ledger, prologue, dataset, shape).await,
+        }
+    }
+}
+
+/// A SPARQL JSON result's rows over `vars`, rendered as [`expected`]
+/// renders them, sorted.
+fn sparql_json_rows(query: &str, json: &JsonValue, vars: &[&str]) -> Result<Vec<String>, String> {
+    let mut rows: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .ok_or_else(|| format!("{query}: {json}"))?
+        .iter()
+        .map(|b| {
+            vars.iter()
+                .map(|v| {
+                    let term = &b[*v];
+                    if term["type"] == "bnode" {
+                        return LIST_CELL.to_string();
+                    }
+                    let value = term["value"].as_str().unwrap_or_default();
+                    let value = value.strip_prefix(EX).unwrap_or(value);
+                    match term["datatype"].as_str() {
+                        Some(dt) => format!("{value}^^{}", dt.rsplit('#').next().unwrap()),
+                        None => value.to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    rows.sort();
+    Ok(rows)
+}
+
+/// What one run of a shape did: the answers with fast paths on and off, and
+/// the routing stamps of the fast run.
+pub struct Run {
+    pub fast: Result<Vec<String>, String>,
+    pub generic: Result<Vec<String>, String>,
+    pub proceeded: Vec<String>,
+    pub fell_back: Vec<(String, String)>,
+}
+
+/// `shape` on `surface`, with fast paths on and off.
+pub async fn run_on(
+    fx: &Fixture,
+    surface: Surface,
+    ledger: &str,
+    prologue: &str,
+    dataset: &str,
+    shape: Shape,
+) -> Run {
+    let _switch = switch().lock().await;
+    set_fast_paths_disabled(false);
+    let (store, guard) = init_test_tracing();
+    let fast = fx.on(surface, ledger, prologue, dataset, shape).await;
+    drop(guard);
+    set_fast_paths_disabled(true);
+    let generic = fx.on(surface, ledger, prologue, dataset, shape).await;
+    set_fast_paths_disabled(false);
+    Run::of(fast, generic, outcomes(&store))
+}
+
+/// A SPARQL `SELECT` of `vars` with `body` as the whole `WHERE` clause,
+/// with fast paths on and off.
+pub async fn run_where(
+    fx: &Fixture,
+    ledger: &str,
+    prologue: &str,
+    dataset: &str,
+    body: &str,
+    vars: &[&str],
+) -> Run {
+    let _switch = switch().lock().await;
+    set_fast_paths_disabled(false);
+    let (store, guard) = init_test_tracing();
+    let fast = fx.sparql_where(ledger, prologue, dataset, body, vars).await;
+    drop(guard);
+    set_fast_paths_disabled(true);
+    let generic = fx.sparql_where(ledger, prologue, dataset, body, vars).await;
+    set_fast_paths_disabled(false);
+    Run::of(fast, generic, outcomes(&store))
+}
+
+impl Run {
+    fn of(
+        fast: Result<Vec<String>, String>,
+        generic: Result<Vec<String>, String>,
+        stamps: Vec<(String, String)>,
+    ) -> Self {
+        Run {
+            fast,
+            generic,
+            proceeded: stamps
+                .iter()
+                .filter(|(_, o)| o == "proceed")
+                .map(|(s, _)| s.clone())
+                .collect(),
+            fell_back: stamps.into_iter().filter(|(_, o)| o != "proceed").collect(),
+        }
+    }
+}

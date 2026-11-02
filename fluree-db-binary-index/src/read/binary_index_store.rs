@@ -21,10 +21,10 @@ use fluree_db_core::ns_encoding::{canonical_split, NsLookup, NsSplitMode};
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::GraphId;
 use fluree_db_core::{
     ContentId, ContentStore, FlakeMeta, FlakeValue, PrefixTrie, RuntimeSmallDicts, Sid,
 };
+use fluree_db_core::{GraphId, NO_ARENA_GRAPH};
 use fluree_vocab::{geo_names, jsonld_names, namespaces, rdf_names, xsd_names};
 use parking_lot::RwLock;
 
@@ -3217,7 +3217,15 @@ impl NsLookup for BinaryIndexStore {
 // BinaryGraphView — graph-scoped wrapper
 // ============================================================================
 
-/// Graph-scoped view for V6 store. Binds a specific `g_id` for value decoding.
+/// A store's decoder for terms that are the same in every graph: subjects,
+/// predicates, string-dictionary values and inline literals, read through the
+/// store's dictionaries and, when `dict_novelty` is present, its novelty
+/// dictionaries.
+///
+/// It has no graph. An arena-backed literal (a big number or a vector) is a
+/// handle into one graph's arena, so decoding one takes that graph
+/// explicitly ([`Self::decode_value_from_kind`]): the literal's own, never
+/// the view's.
 ///
 /// When `dict_novelty` is present, all decode methods automatically perform
 /// watermark-based routing: IDs at or below the watermark delegate to the
@@ -3226,9 +3234,8 @@ impl NsLookup for BinaryIndexStore {
 ///
 /// When `dict_novelty` is `None`, all methods delegate straight to the store
 /// with zero overhead (single well-predicted branch).
-pub struct BinaryGraphView {
+pub struct TermView {
     store: Arc<BinaryIndexStore>,
-    g_id: GraphId,
     dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     namespace_codes_fallback: Option<Arc<HashMap<u16, String>>>,
     /// Optional fuel tracker. When set, each forward-pack dict touch (a call
@@ -3241,6 +3248,23 @@ pub struct BinaryGraphView {
     /// the life of the store and novelty window the view holds.
     subject_sids: SubjectMemo<Sid>,
     subject_iris: SubjectMemo<Arc<str>>,
+}
+
+/// A [`TermView`] bound to one graph, for a reader of that graph's index:
+/// it decodes the graph's own rows by `o_type` ([`Self::decode_value`]) and
+/// names its graph ([`Self::g_id`]). Everything else it decodes as its
+/// [`TermView`] does.
+pub struct BinaryGraphView {
+    terms: TermView,
+    g_id: GraphId,
+}
+
+impl std::ops::Deref for BinaryGraphView {
+    type Target = TermView;
+
+    fn deref(&self) -> &TermView {
+        &self.terms
+    }
 }
 
 /// Per-view id-to-name memo, bounded by clearing rather than evicting.
@@ -3275,15 +3299,7 @@ impl<V: Clone> SubjectMemo<V> {
 
 impl BinaryGraphView {
     pub fn new(store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
-        Self {
-            store,
-            g_id,
-            dict_novelty: None,
-            namespace_codes_fallback: None,
-            tracker: None,
-            subject_sids: SubjectMemo::new(),
-            subject_iris: SubjectMemo::new(),
-        }
+        Self::with_novelty(store, g_id, None)
     }
 
     /// Create a novelty-aware graph view.
@@ -3298,8 +3314,59 @@ impl BinaryGraphView {
         dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     ) -> Self {
         Self {
-            store,
+            terms: TermView::new(store, dict_novelty),
             g_id,
+        }
+    }
+
+    /// Attach a fuel tracker ([`TermView::with_tracker`]).
+    pub fn with_tracker(mut self, tracker: fluree_db_core::Tracker) -> Self {
+        self.terms = self.terms.with_tracker(tracker);
+        self
+    }
+
+    /// [`TermView::with_namespace_codes_fallback`].
+    pub fn with_namespace_codes_fallback(
+        mut self,
+        namespace_codes_fallback: Option<Arc<HashMap<u16, String>>>,
+    ) -> Self {
+        self.terms = self
+            .terms
+            .with_namespace_codes_fallback(namespace_codes_fallback);
+        self
+    }
+
+    pub fn g_id(&self) -> GraphId {
+        self.g_id
+    }
+
+    /// The view's terms, without its graph.
+    pub fn terms(&self) -> &TermView {
+        &self.terms
+    }
+
+    /// [`Self::terms`], by value.
+    pub fn into_terms(self) -> TermView {
+        self.terms
+    }
+
+    /// Decode a value of this graph's rows from `(o_type, o_key)`, an arena
+    /// handle through this graph's arena. Novelty-aware when `dict_novelty`
+    /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
+    /// watermark checks; all other types delegate directly to the store.
+    pub fn decode_value(&self, o_type: u16, o_key: u64, p_id: u32) -> io::Result<FlakeValue> {
+        self.terms.decode_value_in(o_type, o_key, p_id, self.g_id)
+    }
+}
+
+impl TermView {
+    /// A decoder over `store`'s dictionaries and, when present, `dict_novelty`.
+    pub fn new(
+        store: Arc<BinaryIndexStore>,
+        dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+    ) -> Self {
+        Self {
+            store,
             dict_novelty,
             namespace_codes_fallback: None,
             tracker: None,
@@ -3341,10 +3408,14 @@ impl BinaryGraphView {
         self.namespace_codes_fallback.clone()
     }
 
-    /// Decode a value from `(o_type, o_key)`. Novelty-aware when `dict_novelty`
-    /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
-    /// watermark checks; all other types delegate directly to the store.
-    pub fn decode_value(&self, o_type: u16, o_key: u64, p_id: u32) -> io::Result<FlakeValue> {
+    /// [`BinaryGraphView::decode_value`] for graph `g_id`'s rows.
+    fn decode_value_in(
+        &self,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+        g_id: GraphId,
+    ) -> io::Result<FlakeValue> {
         let ot = OType::from_u16(o_type);
         let kind = ot.decode_kind();
         if let Some(ref dn) = self.dict_novelty {
@@ -3392,10 +3463,16 @@ impl BinaryGraphView {
         ) {
             self.charge_dict_touch()?;
         }
-        self.store.decode_value_v3(o_type, o_key, p_id, self.g_id)
+        self.store.decode_value_v3(o_type, o_key, p_id, g_id)
     }
 
     /// Decode a value from `(o_kind, dt_id, lang_id)` fields. Novelty-aware.
+    ///
+    /// `arena_g_id` is the graph whose arena an arena-backed literal (a big
+    /// number or a vector) indexes: the literal's own, as it was bound. Every
+    /// other kind ignores it and carries [`NO_ARENA_GRAPH`]; an arena-backed
+    /// literal that carries it has no graph to be read through, and is an
+    /// error rather than a value read from some graph's arena.
     ///
     /// See [`BinaryIndexStore::decode_value_from_kind`] for the persisted path.
     pub fn decode_value_from_kind(
@@ -3405,7 +3482,16 @@ impl BinaryGraphView {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: GraphId,
     ) -> io::Result<FlakeValue> {
+        if arena_g_id == NO_ARENA_GRAPH
+            && (o_kind == ObjKind::NUM_BIG.as_u8() || o_kind == ObjKind::VECTOR_ID.as_u8())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("an arena-backed literal (kind {o_kind:#x}, handle {o_key}) has no graph"),
+            ));
+        }
         let novelty_initialized = self
             .dict_novelty
             .as_ref()
@@ -3437,10 +3523,10 @@ impl BinaryGraphView {
         }
         let result = self
             .store
-            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, self.g_id);
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id);
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
+                arena_g_id,
                 o_kind,
                 o_key,
                 p_id,
@@ -3449,7 +3535,7 @@ impl BinaryGraphView {
                 has_dict_novelty = self.dict_novelty.is_some(),
                 novelty_initialized,
                 error = %err,
-                "BinaryGraphView decode_value_from_kind failed"
+                "TermView decode_value_from_kind failed"
             );
         }
         result
@@ -3471,10 +3557,9 @@ impl BinaryGraphView {
                 if let Some(result) = self.resolve_novel_subject_iri(dn, s_id) {
                     if let Err(err) = &result {
                         tracing::debug!(
-                            g_id = self.g_id,
                             s_id,
                             error = %err,
-                            "BinaryGraphView novelty subject lookup failed"
+                            "TermView novelty subject lookup failed"
                         );
                     }
                     return result;
@@ -3494,11 +3579,10 @@ impl BinaryGraphView {
         });
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
                 s_id,
                 has_dict_novelty = self.dict_novelty.is_some(),
                 error = %err,
-                "BinaryGraphView persisted subject lookup failed"
+                "TermView persisted subject lookup failed"
             );
         }
         result
@@ -3538,10 +3622,6 @@ impl BinaryGraphView {
 
     pub fn clone_store(&self) -> Arc<BinaryIndexStore> {
         Arc::clone(&self.store)
-    }
-
-    pub fn g_id(&self) -> GraphId {
-        self.g_id
     }
 
     /// Check whether this view has DictNovelty attached.
@@ -4149,6 +4229,35 @@ impl ContentStoreRangeFetcher {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// An arena-backed literal is decoded through the graph it carries, and
+    /// one that carries none is refused before any graph's arena is read.
+    #[test]
+    fn an_arena_literal_without_a_graph_is_refused() {
+        let dir = std::env::temp_dir().join(format!("arena-graph-{}", std::process::id()));
+        let terms = TermView::new(Arc::new(BinaryIndexStore::empty(dir)), None);
+        for kind in [ObjKind::NUM_BIG, ObjKind::VECTOR_ID] {
+            let err = terms
+                .decode_value_from_kind(kind.as_u8(), 0, 1, 0, 0, NO_ARENA_GRAPH)
+                .expect_err("no graph to read the arena through");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{kind:?}: {err}");
+            // With a graph, the arena is looked up there (this store has none).
+            let err = terms
+                .decode_value_from_kind(kind.as_u8(), 0, 1, 0, 0, 2)
+                .expect_err("no arena in an empty store");
+            assert_eq!(err.kind(), io::ErrorKind::NotFound, "{kind:?}: {err}");
+        }
+        // A store-wide kind ignores the graph.
+        let long = terms.decode_value_from_kind(
+            ObjKind::NUM_INT.as_u8(),
+            ObjKey::encode_i64(7).as_u64(),
+            1,
+            DatatypeDictId::INTEGER.as_u16(),
+            0,
+            NO_ARENA_GRAPH,
+        );
+        assert!(long.is_ok(), "{long:?}");
+    }
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
     use fluree_db_core::o_type::OType;

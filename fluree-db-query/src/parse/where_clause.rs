@@ -60,18 +60,49 @@ fn parse_expr_with_ctx(
     value: &JsonValue,
     ctx: &JsonLdParseCtx,
 ) -> Result<super::ast::UnresolvedExpression> {
-    Ok(resolve_compact_iri_atoms(parse_filter_value(value)?, ctx))
+    resolve_compact_iri_atoms(parse_filter_value(value)?, ctx)
 }
 
 /// Walk an expression tree, expanding [`UnresolvedFilterValue::Curie`] atoms
-/// whose prefix the context knows into [`UnresolvedFilterValue::Iri`].
+/// whose prefix the context knows into [`UnresolvedFilterValue::Iri`],
+/// expanding a constant `str-dt` datatype as a JSON-LD `@type` is expanded
+/// (see [`expand_str_dt_datatype`]), and a constant `iri` argument as an
+/// `@id` is (see [`expand_iri_argument`]).
 pub(crate) fn resolve_compact_iri_atoms(
     expr: super::ast::UnresolvedExpression,
     ctx: &JsonLdParseCtx,
-) -> super::ast::UnresolvedExpression {
+) -> Result<super::ast::UnresolvedExpression> {
+    resolve_expression(expr, ctx, true)
+}
+
+/// Expand the constant `str-dt` datatypes and `iri` arguments of an
+/// array-form (data) filter, as [`resolve_compact_iri_atoms`] does for the
+/// other forms. Every element of the array form is a JSON string, so a bare
+/// atom there stays a string; only these two arguments, which name an IRI
+/// whatever their spelling, go through the `@context`.
+fn expand_constant_iri_arguments(
+    expr: super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> Result<super::ast::UnresolvedExpression> {
+    resolve_expression(expr, ctx, false)
+}
+
+/// The walk behind [`resolve_compact_iri_atoms`] (`atoms`) and
+/// [`expand_constant_iri_arguments`] (not `atoms`).
+fn resolve_expression(
+    expr: super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+    atoms: bool,
+) -> Result<super::ast::UnresolvedExpression> {
     use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
-    match expr {
-        E::Const(V::Curie(atom)) => match ctx.expand_iri(&atom) {
+    let resolve_all = |items: Vec<E>| -> Result<Vec<E>> {
+        items
+            .into_iter()
+            .map(|e| resolve_expression(e, ctx, atoms))
+            .collect()
+    };
+    Ok(match expr {
+        E::Const(V::Curie(atom)) if atoms => match ctx.expand_iri(&atom) {
             // Expansion changed the text *and* produced something that is
             // actually an IRI: the prefix was defined and meant a namespace.
             //
@@ -88,40 +119,78 @@ pub(crate) fn resolve_compact_iri_atoms(
             }
             _ => E::Const(V::Curie(atom)),
         },
-        E::And(items) => E::And(
-            items
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
-        ),
-        E::Or(items) => E::Or(
-            items
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
-        ),
-        E::Not(inner) => E::Not(Box::new(resolve_compact_iri_atoms(*inner, ctx))),
+        E::And(items) => E::And(resolve_all(items)?),
+        E::Or(items) => E::Or(resolve_all(items)?),
+        E::Not(inner) => E::Not(Box::new(resolve_expression(*inner, ctx, atoms)?)),
         E::In {
             expr,
             values,
             negated,
         } => E::In {
-            expr: Box::new(resolve_compact_iri_atoms(*expr, ctx)),
-            values: values
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
+            expr: Box::new(resolve_expression(*expr, ctx, atoms)?),
+            values: resolve_all(values)?,
             negated,
         },
-        E::Call { func, args } => E::Call {
-            func,
-            args: args
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
-        },
+        E::Call { func, args } => {
+            let mut args = resolve_all(args)?;
+            if func.eq_ignore_ascii_case("strdt") || func.eq_ignore_ascii_case("str-dt") {
+                if let Some(datatype) = args.get_mut(1) {
+                    expand_str_dt_datatype(datatype, ctx)?;
+                }
+            } else if func.eq_ignore_ascii_case("iri") {
+                if let Some(iri) = args.get_mut(0) {
+                    expand_iri_argument(iri, ctx)?;
+                }
+            }
+            E::Call { func, args }
+        }
         other => other,
+    })
+}
+
+/// Expand a constant `str-dt` datatype the way a JSON-LD insert expands a
+/// value's `@type`: through the `@context`, under the same compact-IRI guard.
+///
+/// `STRDT` builds its literal for any datatype IRI, including one in a
+/// namespace the ledger has never seen, so this is where a datatype written
+/// as a string is checked. `(str-dt ?v "ex:T")` with `ex` in the context is
+/// the expanded IRI, an absolute IRI (`http://…`, `urn:…`) is itself, and
+/// `"xsd:integer"` with no `xsd` prefix is the error the insert
+/// `{"@value": …, "@type": "xsd:integer"}` raises, not a literal typed with
+/// the IRI `xsd:integer`. A datatype computed at run time (a variable, `IRI()`)
+/// is already an IRI.
+fn expand_str_dt_datatype(
+    datatype: &mut super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> Result<()> {
+    use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
+    if let E::Const(V::String(raw) | V::Bare(raw) | V::Curie(raw)) = datatype {
+        let (expanded, _) = ctx.expand_vocab(raw)?;
+        *datatype = E::Const(V::String(Arc::from(expanded)));
     }
+    Ok(())
+}
+
+/// Expand a constant `iri` argument the way a JSON-LD insert expands an
+/// `@id`: through the `@context`, under the same compact-IRI guard.
+///
+/// An update writes the IRI `iri` builds in any namespace, as an insert
+/// does, so this is where an IRI written as a string is checked, as
+/// [`expand_str_dt_datatype`] checks a datatype. `(iri "ex:x")` with `ex` in
+/// the context is the expanded IRI, an absolute IRI is itself, and
+/// `"bad:thing"` with no `bad` prefix is the error the insert
+/// `{"@id": "bad:thing"}` raises, not the IRI `bad:thing`. An argument
+/// computed at run time (a variable, `str`) is taken as it is.
+fn expand_iri_argument(
+    iri: &mut super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> Result<()> {
+    use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
+    if let E::Const(V::String(raw) | V::Bare(raw) | V::Curie(raw)) = iri {
+        let (expanded, _) = ctx.expand_id(raw)?;
+        *iri = E::Const(V::String(Arc::from(expanded)));
+    }
+    Ok(())
 }
 
 /// Resolve compact-IRI atoms in the expression positions that sit outside the
@@ -135,25 +204,27 @@ pub(crate) fn resolve_compact_iri_atoms(
 pub(crate) fn resolve_atoms_outside_where(
     query: &mut super::ast::UnresolvedQuery,
     ctx: &JsonLdParseCtx,
-) {
+) -> Result<()> {
     use super::ast::{UnresolvedColumn as C, UnresolvedProjection as P};
 
-    let mut fix_column = |col: &mut C| {
+    let fix_column = |col: &mut C| -> Result<()> {
         if let C::Computation { expr, .. } = col {
             let taken =
                 std::mem::replace(expr, super::ast::UnresolvedExpression::Var(Arc::from("")));
-            *expr = resolve_compact_iri_atoms(taken, ctx);
+            *expr = resolve_compact_iri_atoms(taken, ctx)?;
         }
+        Ok(())
     };
     match &mut query.select {
-        P::Tuple(cols) => cols.iter_mut().for_each(&mut fix_column),
-        P::Scalar(col) => fix_column(col),
+        P::Tuple(cols) => cols.iter_mut().try_for_each(fix_column)?,
+        P::Scalar(col) => fix_column(col)?,
         P::Wildcard => {}
     }
 
     if let Some(having) = query.options.having.take() {
-        query.options.having = Some(resolve_compact_iri_atoms(having, ctx));
+        query.options.having = Some(resolve_compact_iri_atoms(having, ctx)?);
     }
+    Ok(())
 }
 
 /// Validate that a string looks like a variable (starts with ?)
@@ -437,9 +508,10 @@ pub fn parse_where_array_element(
             for expr_val in &arr[1..] {
                 let filter_expr = match expr_val {
                     // Array expressions may contain EXISTS/NOT EXISTS
-                    JsonValue::Array(_) => {
-                        super::filter_data::parse_filter_expr_ctx(expr_val, &pattern_parser)?
-                    }
+                    JsonValue::Array(_) => expand_constant_iri_arguments(
+                        super::filter_data::parse_filter_expr_ctx(expr_val, &pattern_parser)?,
+                        ctx,
+                    )?,
                     // Non-array values (strings, etc.) use the standard parser
                     _ => parse_expr_with_ctx(expr_val, ctx)?,
                 };

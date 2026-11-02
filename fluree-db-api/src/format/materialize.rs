@@ -77,13 +77,14 @@ fn materialize_encoded_lit(binding: &Binding, gv: &BinaryGraphView) -> std::io::
         lang_id,
         i_val,
         t,
+        arena_g_id,
     } = binding
     else {
         return Ok(binding.clone());
     };
 
     let store = gv.store();
-    let val = gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?;
+    let val = gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?;
     match val {
         FlakeValue::Ref(sid) => Ok(Binding::sid(sid)),
         other => {

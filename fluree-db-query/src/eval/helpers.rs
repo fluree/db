@@ -747,6 +747,7 @@ pub fn parse_datetime_from_binding(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => {
             let ctx = ctx?;
@@ -755,9 +756,9 @@ pub fn parse_datetime_from_binding(
             if !is_temporal_datatype(&dt_sid, datatypes) {
                 return None;
             }
-            let gv = ctx.graph_view()?;
+            let gv = ctx.term_view()?;
             let val = gv
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                 .ok()?;
             flake_value_to_datetime(&val, Some(&dt_sid), datatypes)
         }

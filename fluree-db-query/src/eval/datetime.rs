@@ -300,9 +300,10 @@ fn binding_epoch_millis(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => match ctx?
-            .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+            .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
             .ok()?
         {
             FlakeValue::Long(n) => Some(n),

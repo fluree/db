@@ -484,10 +484,11 @@ fn materialize_binding(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => {
             let value = ctx
-                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
                 .ok()?;
             let lang = if *lang_id != 0 {
                 ctx.lang_tag_for_id(*lang_id).map(|t| t.to_string())

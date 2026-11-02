@@ -384,7 +384,7 @@ impl OType {
 
     /// Determine the decode kind for this OType. Used by readers to select
     /// the correct deserialization path for `o_key`.
-    #[inline]
+    #[inline(always)]
     pub const fn decode_kind(self) -> DecodeKind {
         match self.tag() {
             TAG_EMBEDDED => self.decode_kind_embedded(),

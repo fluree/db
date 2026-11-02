@@ -33,6 +33,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -960,8 +961,9 @@ impl SqlBlockSource {
                     row.iter()
                         .find(|(v, b)| v == jv && b.is_bound())
                         .map(|(_, b)| join_key(b, ctx))
+                        .transpose()
                 })
-                .collect();
+                .try_collect_vec()?;
             if key.iter().all(Option::is_some) {
                 index
                     .entry(key.into_iter().map(Option::unwrap).collect())
@@ -1004,7 +1006,7 @@ impl SqlBlockSource {
                     poisoned = true;
                     break;
                 }
-                key.push(b.is_bound().then(|| join_key(b, ctx)));
+                key.push(b.is_bound().then(|| join_key(b, ctx)).transpose()?);
             }
             if poisoned {
                 continue;
@@ -1091,18 +1093,18 @@ impl SqlBlockSource {
         branch: usize,
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
-    ) -> Vec<Option<KeySet>> {
+    ) -> Result<Vec<Option<KeySet>>> {
         let lowered = self.lowered(branch);
         if lowered.seeds.is_empty() {
-            return vec![None];
+            return Ok(vec![None]);
         }
-        let gv = ctx.graph_view();
+        let gv = ctx.term_view();
         let child_schema = child_batch.schema();
         // Resolved once per batch, not once per seed per row.
         let mut seed_positions: Vec<usize> = Vec::with_capacity(lowered.seeds.len());
         for seed in &lowered.seeds {
             let Some(pos) = child_schema.iter().position(|v| *v == seed.var) else {
-                return vec![None];
+                return Ok(vec![None]);
             };
             seed_positions.push(pos);
         }
@@ -1117,12 +1119,10 @@ impl SqlBlockSource {
                 if !b.is_bound() {
                     // An unbound outer value joins with everything: no seeding.
                     tracing::debug!(var = ?seed.var, "sql pushdown: unbound outer value, no key set");
-                    return vec![None];
+                    return Ok(vec![None]);
                 }
-                let materialized = if crate::object_binding::is_numbig_encoded(b)
-                    || matches!(b, Binding::EncodedLit { .. })
-                {
-                    crate::group_aggregate::materialize_encoded(b, gv.as_ref())
+                let materialized = if matches!(b, Binding::EncodedLit { .. }) {
+                    crate::group_aggregate::materialize_encoded(b, gv.as_ref())?
                 } else {
                     b.clone()
                 };
@@ -1143,7 +1143,7 @@ impl SqlBlockSource {
             }
         }
         if rows.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let width = rows[0].len();
         let columns: Vec<(String, Option<fluree_db_tabular::FieldType>)> =
@@ -1162,7 +1162,7 @@ impl SqlBlockSource {
                     row_bytes,
                     "sql pushdown: outer key over the byte budget, no key set"
                 );
-                return vec![None];
+                return Ok(vec![None]);
             }
             if !current.is_empty() && (current.len() >= max_rows || bytes + row_bytes > byte_budget)
             {
@@ -1183,7 +1183,7 @@ impl SqlBlockSource {
                 rows: current,
             }));
         }
-        chunks
+        Ok(chunks)
     }
 
     fn build_join_plan(
@@ -1191,7 +1191,7 @@ impl SqlBlockSource {
         branch: usize,
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
-    ) -> JoinPlan {
+    ) -> Result<JoinPlan> {
         let child_schema = child_batch.schema();
         // Carry each join variable's column position, which is just its index
         // in the child schema, instead of re-scanning the schema for it once
@@ -1204,7 +1204,7 @@ impl SqlBlockSource {
             .map(|(pos, v)| (v, pos))
             .collect();
         if positioned.is_empty() {
-            return JoinPlan::Cross;
+            return Ok(JoinPlan::Cross);
         }
         let join_vars: Vec<VarId> = positioned.iter().map(|(v, _)| *v).collect();
         let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
@@ -1220,7 +1220,7 @@ impl SqlBlockSource {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(join_key(b, ctx)));
+                    key.push(Some(join_key(b, ctx)?));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -1238,11 +1238,11 @@ impl SqlBlockSource {
                 partial_rows.push((row_idx, key));
             }
         }
-        JoinPlan::Hash {
+        Ok(JoinPlan::Hash {
             join_vars,
             full_index,
             partial_rows,
-        }
+        })
     }
 
     fn emit_row(
@@ -1295,7 +1295,7 @@ impl SqlBlockSource {
                             .find(|(v, _)| v == jv)
                             .map(|(_, b)| join_key(b, ctx))
                     })
-                    .collect();
+                    .try_collect_vec()?;
                 if pkey.len() != join_vars.len() {
                     return Ok(());
                 }
@@ -1384,16 +1384,16 @@ impl SqlBlockSource {
 /// ledger `Sid`, an `IriMatch`, a raw `Iri`) keys by its IRI string, so an
 /// outer ledger value joins the block's raw IRI; anything else uses the
 /// engine's normalized key.
-fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> GroupKeyOwned {
+fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> Result<GroupKeyOwned> {
     match terms::iri_of_binding(b, Some(ctx.active_snapshot)) {
-        Some(iri) => GroupKeyOwned::MaterializedSid(0, iri.into()),
+        Some(iri) => Ok(GroupKeyOwned::MaterializedSid(0, iri.into())),
         None => {
-            let gv = ctx.graph_view();
-            binding_to_group_key_normalized(
+            let gv = ctx.term_view();
+            Ok(binding_to_group_key_normalized(
                 b,
                 crate::object_binding::TermDicts::of(ctx),
                 gv.as_ref(),
-            )
+            )?)
         }
     }
 }
@@ -1529,18 +1529,18 @@ impl Operator for SqlBlockSource {
                             continue;
                         }
                         seeded.push(branch);
-                        joins.push(self.build_join_plan(branch, &child_batch, &graph_ctx));
+                        joins.push(self.build_join_plan(branch, &child_batch, &graph_ctx)?);
                     }
                     // Grouped branches seed alike, so one branch's key sets
                     // are the group's, joined to the union once. A branch
                     // no outer row can match contributes nothing.
                     if self.grouped && seeded.len() > 1 {
-                        for ks in self.keysets_for(seeded[0], &child_batch, &graph_ctx) {
+                        for ks in self.keysets_for(seeded[0], &child_batch, &graph_ctx)? {
                             chunks.push_back((seeded.clone(), ks));
                         }
                     } else {
                         for branch in seeded {
-                            for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
+                            for ks in self.keysets_for(branch, &child_batch, &graph_ctx)? {
                                 chunks.push_back((vec![branch], ks));
                             }
                         }

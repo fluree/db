@@ -523,8 +523,8 @@ fn compute_clean(
 // overlay's net subject delta, and every predicate-scoped fold via an
 // overlay-merging cursor (linear in the *predicate's* rows, not the graph's).
 
-/// Whether the overlay-aware lane may run: a single-ledger, policy-cleared read
-/// carrying novelty, **at or after the persisted index** (`to_t >= max_t`) — the
+/// Whether the overlay-aware lane may run: a policy-cleared read of one graph
+/// ([`ExecutionContext::reads_exactly_one_graph`]) carrying novelty, **at or after the persisted index** (`to_t >= max_t`) — the
 /// exact condition that makes the directory-only [`compute_clean`] lane stale
 /// while keeping its `max_t` base counts valid. A read below the index
 /// (`to_t < max_t`, e.g. `GraphDb::as_of(t)` composed onto a live-overlay view)
@@ -537,7 +537,7 @@ fn overlay_lane_eligible(ctx: &crate::context::ExecutionContext<'_>) -> bool {
     ctx.binary_store
         .as_ref()
         .is_some_and(|store| ctx.to_t >= store.max_t())
-        && !ctx.is_multi_ledger()
+        && ctx.reads_exactly_one_graph()
         && !ctx.is_history_range()
         && ctx.allow_unfiltered()
         && crate::fast_path_common::overlay_has_novelty(ctx)

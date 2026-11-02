@@ -46,10 +46,11 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_binary_index::TermView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use rustc_hash::{FxBuildHasher, FxHashSet};
+use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::Instrument;
@@ -110,10 +111,13 @@ enum AggState {
 fn compare_for_minmax(
     a: &Binding,
     b: &Binding,
-    gv: Option<&BinaryGraphView>,
-) -> std::cmp::Ordering {
+    gv: Option<&TermView>,
+) -> std::result::Result<std::cmp::Ordering, Undecodable> {
     let Some(gv) = gv else {
-        return crate::sort::compare_bindings(a, b);
+        if a.is_encoded() || b.is_encoded() {
+            return Err(undecodable(if a.is_encoded() { a } else { b }, "no view"));
+        }
+        return Ok(crate::sort::compare_bindings(a, b));
     };
     let store = gv.store();
 
@@ -121,7 +125,7 @@ fn compare_for_minmax(
     if let (Binding::EncodedSid { s_id: a_id, .. }, Binding::EncodedSid { s_id: b_id, .. }) = (a, b)
     {
         if let Ok(ord) = store.compare_subject_iri_lex(*a_id, *b_id) {
-            return ord;
+            return Ok(ord);
         }
         // Fall back to materialize+compare if dictionary lookup fails unexpectedly.
     }
@@ -152,26 +156,82 @@ fn compare_for_minmax(
         if *a_kind == *b_kind && string_kinds.contains(a_kind) && a_dt == b_dt && a_lang == b_lang {
             if let (Ok(ak), Ok(bk)) = (u32::try_from(*a_key), u32::try_from(*b_key)) {
                 if let Ok(ord) = store.compare_string_lex(ak, bk) {
-                    return ord;
+                    return Ok(ord);
                 }
             }
         }
     }
 
     // General path: materialize then use SPARQL ordering comparator.
-    // BinaryGraphView handles novelty watermark routing internally.
-    let am = materialize_encoded(a, Some(gv));
-    let bm = materialize_encoded(b, Some(gv));
-    crate::sort::compare_bindings(&am, &bm)
+    // TermView handles novelty watermark routing internally.
+    let am = materialize_encoded(a, Some(gv))?;
+    let bm = materialize_encoded(b, Some(gv))?;
+    Ok(crate::sort::compare_bindings(&am, &bm))
 }
 
-pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView>) -> Binding {
+/// An encoded binding that cannot be decoded: an id the view's dictionaries
+/// do not hold, or no view at all. An encoded binding exists only where a
+/// store produced it, so either is a broken invariant, refused rather than
+/// passed on encoded to a reader that would read it through some other view
+/// or key it by an id.
+///
+/// A pointer, so the per-row key and decode paths that can return it stay the
+/// size of their success value; it becomes a [`QueryError`] where an operator
+/// returns it.
+// One thin pointer on purpose: `String` (24 B) or `Box<str>` (16 B) would
+// not fit beside the key in `Result<GroupKeyOwned, Undecodable>`.
+#[allow(clippy::box_collection)]
+#[derive(Debug)]
+pub(crate) struct Undecodable(Box<String>);
+
+impl From<Undecodable> for QueryError {
+    #[cold]
+    fn from(e: Undecodable) -> Self {
+        QueryError::dictionary_lookup(*e.0)
+    }
+}
+
+/// `collect` into a `Vec` for an iterator of `Result`s, as a plain loop.
+///
+/// `collect::<Result<Vec<_>, _>>()` goes through an adapter
+/// (`GenericShunt`) that the compiler leaves out of line, a call per item on
+/// the per-row key paths that build keys this way.
+pub(crate) trait TryCollectVec<T, E>:
+    Iterator<Item = std::result::Result<T, E>> + Sized
+{
+    #[inline]
+    fn try_collect_vec(self) -> std::result::Result<Vec<T>, E> {
+        let mut out = Vec::with_capacity(self.size_hint().0);
+        for item in self {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+}
+
+impl<T, E, I: Iterator<Item = std::result::Result<T, E>>> TryCollectVec<T, E> for I {}
+
+#[cold]
+pub(crate) fn undecodable(binding: &Binding, why: impl std::fmt::Display) -> Undecodable {
+    Undecodable(Box::new(format!("cannot decode {binding:?}: {why}")))
+}
+
+/// `binding` decoded through `gv`: an encoded literal, subject or predicate
+/// to its term, anything else unchanged. Fails closed: an encoded binding
+/// with no view, or one the view cannot decode, is an error.
+pub(crate) fn materialize_encoded(
+    binding: &Binding,
+    gv: Option<&TermView>,
+) -> std::result::Result<Binding, Undecodable> {
     let Some(gv) = gv else {
-        return binding.clone();
+        if binding.is_encoded() {
+            return Err(undecodable(binding, "no view to decode it through"));
+        }
+        return Ok(binding.clone());
     };
     let store = gv.store();
 
-    match binding {
+    Ok(match binding {
         Binding::EncodedLit {
             o_kind,
             o_key,
@@ -180,9 +240,10 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
             lang_id,
             i_val,
             t,
+            arena_g_id,
         } => {
-            // BinaryGraphView handles novelty watermark routing internally.
-            match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id) {
+            // TermView handles novelty watermark routing internally.
+            match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id) {
                 Ok(fluree_db_core::FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
                     let dt_sid = store
@@ -202,19 +263,19 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
                         p_id: Some(*p_id),
                     }
                 }
-                Err(_) => binding.clone(),
+                Err(e) => return Err(undecodable(binding, e)),
             }
         }
         Binding::EncodedSid { s_id, .. } => match gv.resolve_subject_sid(*s_id) {
             Ok(sid) => Binding::sid(sid),
-            Err(_) => binding.clone(),
+            Err(e) => return Err(undecodable(binding, e)),
         },
         Binding::EncodedPid { p_id } => match store.resolve_predicate_iri(*p_id) {
             Some(iri) => Binding::sid(store.encode_iri(iri)),
-            None => binding.clone(),
+            None => return Err(undecodable(binding, "unknown predicate id")),
         },
         _ => binding.clone(),
-    }
+    })
 }
 
 impl AggState {
@@ -259,8 +320,8 @@ impl AggState {
         &mut self,
         binding: &Binding,
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
-    ) {
+        gv: Option<&TermView>,
+    ) -> Result<()> {
         match self {
             AggState::Count { n } => {
                 // COUNT: count non-Unbound values (COUNT(*) counts all via CountAll variant)
@@ -276,7 +337,7 @@ impl AggState {
                     // Convert binding to owned group key for HashSet,
                     // normalizing decoded bindings so mixed-representation
                     // streams count as one value.
-                    let key = binding_to_group_key_normalized(binding, dicts, gv);
+                    let key = binding_to_group_key_normalized(binding, dicts, gv)?;
                     seen.insert(key);
                 }
             }
@@ -305,7 +366,7 @@ impl AggState {
                     match min {
                         None => *min = Some(binding.clone()),
                         Some(current) => {
-                            if compare_for_minmax(binding, current, gv) == std::cmp::Ordering::Less
+                            if compare_for_minmax(binding, current, gv)? == std::cmp::Ordering::Less
                             {
                                 *min = Some(binding.clone());
                             }
@@ -321,7 +382,7 @@ impl AggState {
                     match max {
                         None => *max = Some(binding.clone()),
                         Some(current) => {
-                            if compare_for_minmax(binding, current, gv)
+                            if compare_for_minmax(binding, current, gv)?
                                 == std::cmp::Ordering::Greater
                             {
                                 *max = Some(binding.clone());
@@ -345,9 +406,10 @@ impl AggState {
                 // encoded bindings would be silently dropped by the value
                 // matchers in `aggregate.rs` (e.g. GROUP_CONCAT returned
                 // Unbound for every indexed-ledger string).
-                values.push(materialize_encoded(binding, gv));
+                values.push(materialize_encoded(binding, gv)?);
             }
         }
+        Ok(())
     }
 
     /// Update for COUNT(*) - increment regardless of binding value
@@ -418,9 +480,10 @@ pub(crate) enum GroupKeyOwned {
     Lit {
         o_kind: u8,
         o_key: u64,
-        /// `p_id` is only required for NUM_BIG decoding (per-predicate arena).
-        /// For all other literal kinds, it must not affect grouping identity.
-        p_id_for_numbig: Option<u32>,
+        /// An arena handle's predicate and graph (NUM_BIG, VECTOR): the handle
+        /// names a value only with both. `None` for every other kind, whose
+        /// identity they must not affect.
+        arena: Option<(u32, fluree_db_core::GraphId)>,
         dt_id: u16,
         lang_id: u16,
     },
@@ -466,43 +529,38 @@ impl Hash for MaterializedLitKey {
 /// [`binding_to_group_key_owned`] with representation normalization, so
 /// mixed-representation streams (encoded scan output meeting decoded
 /// VALUES/UNION/BIND bindings) key identically. Pass the store whenever the
-/// stream may contain late-materialized bindings; pass the graph view so
-/// arena-backed NUM_BIG values key by decoded numeric value (handles are
-/// per-(graph, predicate) and not canonical across representations).
+/// stream may contain late-materialized bindings; pass the view so
+/// arena-backed literals key by decoded value (handles are per-(graph,
+/// predicate) and not canonical across representations).
 pub(crate) fn binding_to_group_key_normalized(
     binding: &Binding,
     dicts: Option<crate::object_binding::TermDicts<'_>>,
-    gv: Option<&BinaryGraphView>,
-) -> GroupKeyOwned {
+    gv: Option<&TermView>,
+) -> std::result::Result<GroupKeyOwned, Undecodable> {
     // An encoded subject id is its own canonical key.
     if let Binding::EncodedSid { s_id, .. } = binding {
-        return GroupKeyOwned::Sid(*s_id);
+        return Ok(GroupKeyOwned::Sid(*s_id));
     }
-    // See `normalize_for_key_cow`: an arena handle is never keyed unviewed.
-    debug_assert!(
-        gv.is_some() || !crate::object_binding::is_arena_encoded(binding),
-        "arena-backed literal keyed with no graph view: {binding:?}"
-    );
     if let Some(canonical) =
         dicts.and_then(|d| crate::object_binding::encoded_iri_canonical(binding, d))
     {
-        return binding_to_group_key_owned(canonical.as_ref().unwrap_or(binding));
+        return Ok(binding_to_group_key_owned(
+            canonical.as_ref().unwrap_or(binding),
+        ));
     }
-    if crate::object_binding::is_numbig_encoded(binding) {
-        if let Some(gv) = gv {
-            let materialized = materialize_encoded(binding, Some(gv));
-            if !matches!(materialized, Binding::EncodedLit { .. }) {
-                return binding_to_group_key_owned(&materialized);
-            }
-        }
-        return binding_to_group_key_owned(binding);
+    // An arena handle keys by its decoded value, and fails closed when it
+    // cannot be decoded (see `normalize_for_key_cow`).
+    if crate::object_binding::is_arena_encoded(binding) {
+        return Ok(binding_to_group_key_owned(&materialize_encoded(
+            binding, gv,
+        )?));
     }
     if let Some(dicts) = dicts {
         if let Some(normalized) = crate::object_binding::encoded_equivalent(binding, dicts) {
-            return binding_to_group_key_owned(&normalized);
+            return Ok(binding_to_group_key_owned(&normalized));
         }
     }
-    binding_to_group_key_owned(binding)
+    Ok(binding_to_group_key_owned(binding))
 }
 
 /// Convert a binding to an owned group key.
@@ -517,15 +575,12 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => GroupKeyOwned::Lit {
             o_kind: *o_kind,
             o_key: *o_key,
-            p_id_for_numbig: if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
-                Some(*p_id)
-            } else {
-                None
-            },
+            arena: crate::binding::is_arena_kind(*o_kind).then_some((*p_id, *arena_g_id)),
             dt_id: *dt_id,
             lang_id: *lang_id,
         },
@@ -682,14 +737,14 @@ impl CompositeGroupKey {
     pub(crate) fn normalized<'a>(
         bindings: impl IntoIterator<Item = &'a Binding>,
         norm: &Option<crate::object_binding::EqualityNorm>,
-    ) -> Self {
+    ) -> Result<Self> {
         let (dicts, gv) = crate::object_binding::EqualityNorm::parts(norm);
-        Self(
+        Ok(Self(
             bindings
                 .into_iter()
                 .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                .collect(),
-        )
+                .try_collect_vec()?,
+        ))
     }
 }
 
@@ -700,6 +755,11 @@ struct GroupState {
     /// Aggregate states (one per aggregate spec)
     agg_states: Vec<AggState>,
 }
+
+/// Routing stamp of the partitioned GROUP BY lane ([`GroupAggregateOperator`]
+/// aggregating key runs instead of hashing), recorded at open when the plan
+/// promised partitioned input.
+pub(crate) const PARTITIONED_GROUP_BY_SITE: &str = "partitioned_group_by";
 
 /// Streaming GROUP BY + Aggregate operator
 ///
@@ -718,16 +778,22 @@ pub struct GroupAggregateOperator {
     /// Accumulated groups: composite_key -> group_state
     groups: hashbrown::HashMap<CompositeGroupKey, GroupState, FxBuildHasher>,
     /// If true, input is already partitioned by the GROUP BY key(s), so we can
-    /// aggregate per-run without hashing each row into a map.
+    /// aggregate per-run without hashing each row into a map. Set at open:
+    /// the plan's hint ([`Self::partition_hint`]), held only when the scope
+    /// reads exactly one graph.
     partitioned: bool,
+    /// The plan's promise that the input arrives grouped by the key. A
+    /// default graph of several graphs drains its members one after another,
+    /// one sorted run per member, so the promise holds only for one graph.
+    partition_hint: bool,
     /// Accumulated groups in partitioned mode (in input order).
     partitioned_groups: Vec<GroupState>,
     /// Iterator for emitting results.
     emit_iter: Option<GroupEmitIter>,
     /// Graph view for materializing encoded bindings (used for MIN/MAX semantic ordering).
-    /// When novelty-aware (via `ExecutionContext::graph_view()`), watermark routing
+    /// When novelty-aware (via `ExecutionContext::one_graph_view()`), watermark routing
     /// for novelty-only subject/string IDs is handled internally.
-    graph_view: Option<BinaryGraphView>,
+    graph_view: Option<TermView>,
     /// Normalization for group keys and `COUNT(DISTINCT)`, so the forms one
     /// term takes key as one (see [`binding_to_group_key_normalized`]).
     norm: Option<crate::object_binding::EqualityNorm>,
@@ -761,7 +827,7 @@ impl GroupAggregateOperator {
         child: BoxedOperator,
         group_vars: Vec<VarId>,
         agg_specs: Vec<StreamingAggSpec>,
-        graph_view: Option<BinaryGraphView>,
+        graph_view: Option<TermView>,
         partitioned: bool,
     ) -> Self {
         let child_schema = child.schema().to_vec();
@@ -809,6 +875,7 @@ impl GroupAggregateOperator {
             agg_specs,
             groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             partitioned,
+            partition_hint: partitioned,
             partitioned_groups: Vec::new(),
             emit_iter: None,
             graph_view,
@@ -839,13 +906,15 @@ impl GroupAggregateOperator {
         row_idx: usize,
         key: &mut CompositeGroupKey,
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
-    ) {
+        gv: Option<&TermView>,
+    ) -> Result<()> {
         key.0.clear();
-        key.0.extend(self.group_key_indices.iter().map(|&col_idx| {
+        for &col_idx in &self.group_key_indices {
             let binding = batch.get_by_col(row_idx, col_idx);
-            binding_to_group_key_normalized(binding, dicts, gv)
-        }));
+            key.0
+                .push(binding_to_group_key_normalized(binding, dicts, gv)?);
+        }
+        Ok(())
     }
 
     /// Compose one solution into a hashable key, for `COUNT(DISTINCT *)`.
@@ -859,14 +928,15 @@ impl GroupAggregateOperator {
         row_idx: usize,
         cols: &[usize],
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
-    ) -> Vec<GroupKeyOwned> {
-        cols.iter()
+        gv: Option<&TermView>,
+    ) -> Result<Vec<GroupKeyOwned>> {
+        Ok(cols
+            .iter()
             .map(|&col_idx| {
                 let binding = batch.get_by_col(row_idx, col_idx);
                 binding_to_group_key_normalized(binding, dicts, gv)
             })
-            .collect()
+            .try_collect_vec()?)
     }
 
     /// Per-spec composed solutions for this row, empty when no aggregate needs
@@ -876,16 +946,16 @@ impl GroupAggregateOperator {
         batch: &Batch,
         row_idx: usize,
         dicts: Option<crate::object_binding::TermDicts<'_>>,
-        gv: Option<&BinaryGraphView>,
-    ) -> Vec<Vec<GroupKeyOwned>> {
+        gv: Option<&TermView>,
+    ) -> Result<Vec<Vec<GroupKeyOwned>>> {
         if !self.has_row_distinct {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.row_distinct_cols
             .iter()
             .map(|cols| match cols {
                 Some(cols) => self.extract_row_key(batch, row_idx, cols, dicts, gv),
-                None => Vec::new(),
+                None => Ok(Vec::new()),
             })
             .collect()
     }
@@ -925,10 +995,23 @@ impl Operator for GroupAggregateOperator {
         self.groups.clear();
         self.partitioned_groups.clear();
         self.emit_iter = None;
+        if self.partition_hint {
+            self.partitioned = ctx.reads_exactly_one_graph();
+            crate::fast_path_outcome::stamp_fast_path(
+                PARTITIONED_GROUP_BY_SITE,
+                if self.partitioned {
+                    crate::fast_path_outcome::FastPathOutcome::Proceed
+                } else {
+                    crate::fast_path_outcome::FastPathOutcome::Fallback(
+                        crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                    )
+                },
+            );
+        }
         // If the execution context has a binary store, use it to materialize
         // encoded bindings for correct MIN/MAX comparison semantics.
         if self.graph_view.is_none() {
-            self.graph_view = ctx.graph_view();
+            self.graph_view = ctx.term_view();
         }
         self.norm = crate::object_binding::equality_norm(ctx);
         Ok(())
@@ -960,18 +1043,33 @@ impl Operator for GroupAggregateOperator {
         }
 
         // A join can count matches before expanding them into output rows when
-        // all group keys come from its driving side. Other aggregates and
-        // DISTINCT retain ordinary row consumption.
+        // all group keys come from its driving side, and a union of graphs can
+        // count one pattern's rows from its members' indexes. Every aggregate
+        // must count rows: `COUNT(*)`, or `COUNT(?v)` of a variable the child
+        // shows bound in every row. Other aggregates and DISTINCT retain
+        // ordinary row consumption.
         if self.emit_iter.is_none()
             && !self.group_key_indices.is_empty()
             && !self.agg_specs.is_empty()
             && self
                 .agg_specs
                 .iter()
-                .all(|spec| matches!(spec.function, AggregateFn::CountAll))
+                .all(|spec| matches!(spec.function, AggregateFn::CountAll | AggregateFn::Count(_)))
         {
+            let bound_vars: SmallVec<[VarId; 4]> = self
+                .agg_specs
+                .iter()
+                .filter_map(|spec| match spec.function {
+                    AggregateFn::Count(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
             let group_vars = &self.in_schema[..self.group_key_indices.len()];
-            if let Some(groups) = self.child.drain_grouped_count(ctx, group_vars).await? {
+            if let Some(groups) = self
+                .child
+                .drain_grouped_count(ctx, group_vars, &bound_vars)
+                .await?
+            {
                 let states = groups
                     .into_iter()
                     .map(|group| {
@@ -1064,7 +1162,11 @@ impl Operator for GroupAggregateOperator {
 
                             // COUNT(DISTINCT *) reads a whole solution, so
                             // compose it before the group state is borrowed.
-                            let row_keys = self.extract_row_keys(&batch, row_idx, dicts, norm_gv);
+                            let row_keys = if self.has_row_distinct {
+                                self.extract_row_keys(&batch, row_idx, dicts, norm_gv)?
+                            } else {
+                                Vec::new()
+                            };
 
                             // Update aggregate states for current group.
                             let gv_ref = self.graph_view.as_ref();
@@ -1076,7 +1178,7 @@ impl Operator for GroupAggregateOperator {
                                     Some(col_idx) => {
                                         let binding = batch.get_by_col(row_idx, col_idx);
                                         group_state.agg_states[agg_idx]
-                                            .update(binding, dicts, gv_ref);
+                                            .update(binding, dicts, gv_ref)?;
                                     }
                                     // COUNT(DISTINCT *) - count distinct solutions
                                     None if matches!(
@@ -1147,11 +1249,15 @@ impl Operator for GroupAggregateOperator {
 
                         // Probe with a reused key buffer: a row joining an
                         // existing group allocates nothing.
-                        self.fill_group_key(&batch, row_idx, &mut group_key, dicts, norm_gv);
+                        self.fill_group_key(&batch, row_idx, &mut group_key, dicts, norm_gv)?;
 
                         // COUNT(DISTINCT *) reads a whole solution, so compose
                         // it here too — before the group state is borrowed.
-                        let row_keys = self.extract_row_keys(&batch, row_idx, dicts, norm_gv);
+                        let row_keys = if self.has_row_distinct {
+                            self.extract_row_keys(&batch, row_idx, dicts, norm_gv)?
+                        } else {
+                            Vec::new()
+                        };
 
                         // One hash per row; the key is cloned out of the
                         // buffer only when it opens a new group. The closure
@@ -1183,7 +1289,8 @@ impl Operator for GroupAggregateOperator {
                             match spec.input_col {
                                 Some(col_idx) => {
                                     let binding = batch.get_by_col(row_idx, col_idx);
-                                    group_state.agg_states[agg_idx].update(binding, dicts, gv_ref);
+                                    group_state.agg_states[agg_idx]
+                                        .update(binding, dicts, gv_ref)?;
                                 }
                                 // COUNT(DISTINCT *) - count distinct solutions
                                 None if matches!(
@@ -1318,7 +1425,7 @@ impl Operator for GroupAggregateOperator {
 /// arena would silently drop the values.
 fn extract_numeric_with_gv(
     binding: &Binding,
-    gv: Option<&BinaryGraphView>,
+    gv: Option<&TermView>,
 ) -> Option<crate::aggregate::NumericValue> {
     use fluree_db_core::ObjKind;
 
@@ -1328,18 +1435,88 @@ fn extract_numeric_with_gv(
         p_id,
         dt_id,
         lang_id,
+        arena_g_id,
         ..
     } = binding
     {
         if *o_kind == ObjKind::NUM_BIG.as_u8() {
             let gv = gv?;
             let val = gv
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                 .ok()?;
             return crate::aggregate::flake_value_to_numeric(&val);
         }
     }
     crate::aggregate::binding_to_numeric(binding)
+}
+
+#[cfg(test)]
+mod fail_closed_decode {
+    use super::*;
+    use fluree_db_binary_index::BinaryIndexStore;
+
+    fn empty_terms() -> TermView {
+        let dir = std::env::temp_dir().join(format!("fail-closed-{}", std::process::id()));
+        TermView::new(Arc::new(BinaryIndexStore::empty(dir)), None)
+    }
+
+    fn arena_lit(o_kind: u8, arena_g_id: u16) -> Binding {
+        Binding::EncodedLit {
+            o_kind,
+            o_key: 0,
+            p_id: 1,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+            arena_g_id,
+        }
+    }
+
+    /// An encoded binding is refused, never passed on encoded, when there is
+    /// no view to decode it or the view cannot; a decoded one passes.
+    #[test]
+    fn materialize_encoded_fails_closed() {
+        let sid = Binding::EncodedSid {
+            s_id: 7,
+            t: None,
+            op: None,
+        };
+        assert!(materialize_encoded(&sid, None).is_err(), "no view");
+        assert!(
+            materialize_encoded(&sid, Some(&empty_terms())).is_err(),
+            "an id the view does not hold"
+        );
+        let pid = Binding::EncodedPid { p_id: 9 };
+        assert!(materialize_encoded(&pid, Some(&empty_terms())).is_err());
+        let lit = arena_lit(fluree_db_core::ObjKind::NUM_BIG.as_u8(), 2);
+        assert!(materialize_encoded(&lit, Some(&empty_terms())).is_err());
+        let decoded = Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::new(2, "long"));
+        assert_eq!(materialize_encoded(&decoded, None).unwrap(), decoded);
+    }
+
+    /// An arena literal keys by its value or not at all: with no view, or one
+    /// that cannot decode it, every key surface refuses it.
+    #[test]
+    fn arena_keys_fail_closed() {
+        for kind in [
+            fluree_db_core::ObjKind::NUM_BIG,
+            fluree_db_core::ObjKind::VECTOR_ID,
+        ] {
+            let lit = arena_lit(kind.as_u8(), 2);
+            assert!(crate::object_binding::normalize_for_key_cow(&lit, None, None).is_err());
+            assert!(binding_to_group_key_normalized(&lit, None, None).is_err());
+            assert!(
+                binding_to_group_key_normalized(&lit, None, Some(&empty_terms())).is_err(),
+                "{kind:?}: no arena in an empty store"
+            );
+            let no_graph = arena_lit(kind.as_u8(), fluree_db_core::NO_ARENA_GRAPH);
+            assert!(
+                binding_to_group_key_normalized(&no_graph, None, Some(&empty_terms())).is_err(),
+                "{kind:?}: no graph"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

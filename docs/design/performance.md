@@ -593,11 +593,21 @@ The benefit is lower index build time and storage, with two fewer permutations
 to write on every reindex.
 
 **Undatatyped plain strings do not use the OPST preference.** A constant object
-that is a plain string with no datatype constraint may be either `xsd:string` or
-`rdf:langString`, so `(o_type, o_key)` may not be encodable when the scan opens.
+written as a bare JSON-LD string, or a Cypher property-map value, carries no
+datatype constraint: it matches its text under any string datatype or language
+tag, so `(o_type, o_key)` may not be encodable when the scan opens.
 `BinaryScanOperator` does not force OPST in that case, because doing so could
-produce a wide scan rather than a bounded one. Specifying a datatype enables the
-object-leading path.
+produce a wide scan rather than a bounded one. A SPARQL string constant carries
+its term (`xsd:string`, a language tag, or a datatype), as does a JSON-LD value
+object with `@type` or `@language`, and these use the object-leading path.
+
+**A pushed string comparison seeks the `xsd:string` slice.** `FILTER(?o = "a")`
+and string ranges become object bounds on the scan, and a string bound admits
+only `xsd:string` values. POST orders by `(p, o_type, o_key)`, so the scan seeks
+the predicate's `xsd:string` slice and skips its language-tagged and other typed
+values. An equality seeks the one string id, as the constant `?s :p "a"` does.
+A range whose string parses as a date or other temporal also seeks those
+temporal slices, since `<` and `>` order a string against a temporal value.
 
 **General operator trees are single-threaded.** Intra-query parallelism is
 limited to the fast paths and the count planner. A complex analytical join that
