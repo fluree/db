@@ -337,15 +337,34 @@ instantiated once for each: a triple that any solution inserts is kept,
 however many solutions delete it, and a stored triple that solutions both
 delete and insert is not committed at all.
 
-Once a fact is indexed, a DELETE is matched against what the index stores,
-which is less than was written for an integer too large for 64 bits: the index
-keeps no XSD subtype. A DELETE naming the same big integer under another
-integer datatype retracts such a fact. Storage holds such an integer as one
-fact per value, indexed yet or not, so when a transaction retracts one and
+An integer too large for 64 bits is matched by its value, not by the XSD
+subtype it was written with, since the index keeps no such subtype. A DELETE
+naming the same big integer under another integer datatype retracts it,
+whether it is indexed yet or not. Storage holds such an integer as one
+fact per value, so when a transaction retracts one and
 inserts the same value, the two cancel whatever subtype the insert names:
 `DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as for any value
 that is present, and neither does a write that retracts it and inserts it
 under another subtype.
+
+### Lists
+
+A delete reaches a list's members as values of the property that holds the
+list. Deleting a value deletes every entry of a list that holds it, and the
+value where it is also stored beside the list. With
+`{"@id": "ex:s", "ex:items": {"@list": [1, 2, 1, 3]}}` stored, this leaves
+`ex:items` as the list `(2 3)`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "delete": { "@id": "ex:s", "ex:items": 1 }
+}
+```
+
+To remove one entry of a list that repeats a value, or to replace a list,
+upsert the list. SPARQL deletes behave the same way: see
+[Writing lists](../query/sparql.md#writing-lists).
 
 ### No Cascading by Default
 

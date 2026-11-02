@@ -1,7 +1,7 @@
 //! Schema flake detection helpers
 //!
-//! Schema flakes must be allowed regardless of policy for query planning and
-//! formatting to work correctly.
+//! Schema flakes are visible under every view policy, for query planning and
+//! formatting; writing one is judged by modify policy like any other flake.
 
 use fluree_db_core::{
     is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of, is_rdfs_subproperty_of,
@@ -61,10 +61,14 @@ fn is_schema_type(object: &FlakeValue) -> bool {
     }
 }
 
-/// Check if a flake is a schema flake that should bypass policy
+/// Check if a flake is a schema flake, which every view policy lets through
 ///
-/// Schema flakes must be allowed regardless of policy for query planning
-/// and formatting to work correctly. This includes:
+/// Query planning and formatting read the ontology whatever the reader may
+/// see. Writing a schema flake is judged by modify policy like any other:
+/// policy targets widen through the class and property hierarchy, so an
+/// identity that could add `ex:ssn rdfs:subPropertyOf ex:name` unchecked
+/// could widen what a policy allowing `ex:name` lets others read. Schema
+/// flakes are:
 /// - `rdfs:subClassOf` assertions
 /// - `rdfs:subPropertyOf` assertions
 /// - `rdfs:domain` / `rdfs:range` assertions

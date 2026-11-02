@@ -88,12 +88,12 @@ impl crate::NameServiceLookup for MemoryNameService {
         Ok(self.records.read().values().cloned().collect())
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         Ok(self
             .records
             .read()
             .values()
-            .filter(|r| r.name == ledger_name && !r.retracted)
+            .filter(|r| r.name == ledger_name)
             .cloned()
             .collect())
     }
@@ -1576,7 +1576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_branches() {
+    async fn test_branch_records() {
         let ns = MemoryNameService::new();
         ns.init("mydb:main").await.unwrap();
         let cid = test_commit_id("commit-3");
@@ -1590,7 +1590,7 @@ mod tests {
         // Also create a different ledger to ensure filtering works
         ns.init("other:main").await.unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
+        let branches = ns.branch_records("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
         let mut names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
         names.sort();
@@ -1598,27 +1598,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_branches_unknown_ledger() {
+    async fn test_branch_records_unknown_ledger() {
         let ns = MemoryNameService::new();
-        let branches = ns.list_branches("nonexistent").await.unwrap();
+        let branches = ns.branch_records("nonexistent").await.unwrap();
         assert!(branches.is_empty());
     }
 
+    /// `branch_records` keeps retracted branches: a soft-dropped branch is
+    /// restorable, so GC must still see it.
     #[tokio::test]
-    async fn test_list_branches_excludes_retracted() {
+    async fn branch_records_keeps_retracted_branches() {
         let ns = MemoryNameService::new();
         ns.init("mydb:main").await.unwrap();
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
-
         ns.create_branch("mydb", "dead", "main", None)
             .await
             .unwrap();
         ns.retract("mydb:dead").await.unwrap();
+        ns.init("other:main").await.unwrap();
 
-        let branches = ns.list_branches("mydb").await.unwrap();
-        assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0].branch, "main");
+        let mut branches: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        branches.sort();
+        assert_eq!(branches, ["dead", "main"]);
     }
 
     #[tokio::test]

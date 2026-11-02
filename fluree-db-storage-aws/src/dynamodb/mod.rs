@@ -468,6 +468,18 @@ impl DynamoDbNameService {
         &self,
         kind: &str,
     ) -> std::result::Result<Vec<Item>, NameServiceError> {
+        self.query_gsi_by_kind_and_pk_prefix(kind, None).await
+    }
+
+    /// Query GSI1 for the meta items of a given kind, narrowed to partition
+    /// keys starting with `pk_prefix` when one is given. The index's sort key
+    /// is the partition key, so the narrowing is a key condition, not a
+    /// filter: only matching items are read.
+    async fn query_gsi_by_kind_and_pk_prefix(
+        &self,
+        kind: &str,
+        pk_prefix: Option<&str>,
+    ) -> std::result::Result<Vec<Item>, NameServiceError> {
         let mut items = Vec::new();
         let mut last_key = None;
 
@@ -477,9 +489,15 @@ impl DynamoDbNameService {
                 .query()
                 .table_name(&self.table_name)
                 .index_name(GSI1_NAME)
-                .key_condition_expression("#kind = :kind")
                 .expression_attribute_names("#kind", ATTR_KIND)
                 .expression_attribute_values(":kind", AttributeValue::S(kind.to_string()));
+            query = match pk_prefix {
+                Some(prefix) => query
+                    .key_condition_expression("#kind = :kind AND begins_with(#pk, :prefix)")
+                    .expression_attribute_names("#pk", ATTR_PK)
+                    .expression_attribute_values(":prefix", AttributeValue::S(prefix.to_string())),
+                None => query.key_condition_expression("#kind = :kind"),
+            };
 
             if let Some(key) = last_key.take() {
                 query = query.set_exclusive_start_key(Some(key));
@@ -690,6 +708,35 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
             let items = self.query_metadata_items(pk).await?;
             if let Some(record) = Self::items_to_ns_record(pk, &items) {
                 records.push(record);
+            }
+        }
+
+        Ok(records)
+    }
+
+    /// One GSI1 query narrowed to the ledger's `name:` key prefix, then a
+    /// query per branch, rather than a query per ledger in the table. GSI1 is
+    /// eventually consistent, so a branch created a moment ago can be missing,
+    /// as it can from `all_records`.
+    async fn branch_records(
+        &self,
+        ledger_name: &str,
+    ) -> std::result::Result<Vec<NsRecord>, NameServiceError> {
+        let prefix = format!("{ledger_name}:");
+        let meta_items = self
+            .query_gsi_by_kind_and_pk_prefix(KIND_LEDGER, Some(&prefix))
+            .await?;
+
+        let mut records = Vec::with_capacity(meta_items.len());
+        for item in &meta_items {
+            let Some(pk) = item.get(ATTR_PK).and_then(|v| v.as_s().ok()) else {
+                continue;
+            };
+            let items = self.query_metadata_items(pk).await?;
+            if let Some(record) = Self::items_to_ns_record(pk, &items) {
+                if record.name == ledger_name {
+                    records.push(record);
+                }
             }
         }
 

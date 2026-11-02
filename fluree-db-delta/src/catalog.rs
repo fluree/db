@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::UnityConfig;
 use crate::error::Result;
 use crate::unity::UnityClient;
+use fluree_db_iceberg::auth::IdentityContext;
 
 /// Schemas listed at once when a whole catalog's tables are asked for.
 const LISTING_CONCURRENCY: usize = 8;
@@ -88,10 +89,15 @@ pub struct DeclaredForeignKey {
     pub parent_columns: Vec<String>,
 }
 
-/// List what `unity` holds. `unity` must be hydrated.
-pub async fn browse_unity(unity: &UnityConfig, depth: BrowseDepth) -> Result<UnityListing> {
+/// List what `unity` holds. `unity` must be hydrated; its auth is built under
+/// `identity`.
+pub async fn browse_unity(
+    unity: &UnityConfig,
+    depth: BrowseDepth,
+    identity: &IdentityContext,
+) -> Result<UnityListing> {
     unity.validate()?;
-    let client = Arc::new(UnityClient::new(unity)?);
+    let client = Arc::new(UnityClient::new(unity, identity)?);
     browse(&client, unity, depth).await
 }
 
@@ -146,9 +152,10 @@ pub(crate) async fn browse(
 pub async fn describe_unity_tables(
     unity: &UnityConfig,
     table_names: &[String],
+    identity: &IdentityContext,
 ) -> Result<Vec<TableDescription>> {
     unity.validate()?;
-    let client = Arc::new(UnityClient::new(unity)?);
+    let client = Arc::new(UnityClient::new(unity, identity)?);
     describe_all(&client, unity, table_names).await
 }
 
@@ -177,9 +184,10 @@ pub(crate) async fn describe_all(
 pub async fn describe_unity_table(
     unity: &UnityConfig,
     table_name: &str,
+    identity: &IdentityContext,
 ) -> Result<TableDescription> {
     unity.validate()?;
-    UnityClient::new(unity)?
+    UnityClient::new(unity, identity)?
         .describe(&unity.full_name(table_name)?)
         .await
 }
@@ -208,7 +216,10 @@ mod tests {
 
     /// A plain HTTP client: the production one refuses the loopback mock.
     fn client(config: &UnityConfig) -> Arc<UnityClient> {
-        Arc::new(UnityClient::with_http(config, reqwest::Client::new()).unwrap())
+        Arc::new(
+            UnityClient::with_http(config, reqwest::Client::new(), &IdentityContext::default())
+                .unwrap(),
+        )
     }
 
     async fn serve(

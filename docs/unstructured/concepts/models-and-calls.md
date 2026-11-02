@@ -41,7 +41,7 @@ Every model interaction is a separate call. There are three kinds, and they are 
 |---|---|---|---|
 | Read a crop | `POST …/responses` (or `…/chat/completions`) with the crop image and a transcription prompt, intent `doc-parse` | `vlm`, else `llm` | Per crop, only for pages and regions the deterministic pass flagged. Answered from the reading cache when the pixels were seen before. |
 | Embed chunks | `POST …/embeddings` | `embedding` | Per document, in batches. |
-| Extract entities and relations | `POST …/responses` (or `…/chat/completions`) with the ontology as system prompt and the chunk with its known entities as the user turn, intent `extraction` | `llm` | Per chunk, when `--model` is given, several chunks at once. Answered from the extraction cache when the same ask was made before. |
+| Extract entities and relations | `POST …/responses` (or `…/chat/completions`) with the ontology as system prompt and the chunk with its known entities as the user turn, intent `extraction` | `llm` | Per chunk, when `--ontology` is given, several chunks at once. Answered from the extraction cache when the same ask was made before. |
 
 Against a Fluree AI gateway, the first and third go to the same route and the gateway routes each intent to the account's provider for it. Against your own endpoints, `vlm` and `llm` are simply two configurations, which may name the same model.
 
