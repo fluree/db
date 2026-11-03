@@ -6,7 +6,7 @@
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request};
 use axum::response::{IntoResponse, Response};
-use fluree_db_consensus::http::is_hop_by_hop;
+use fluree_db_consensus::http::{is_hop_by_hop, outbound_url};
 use http::{header::HeaderMap, Method, StatusCode};
 use reqwest::Client;
 use std::time::Duration;
@@ -40,20 +40,11 @@ impl ForwardingClient {
     /// The `Authorization` header IS forwarded to support downstream auth.
     pub async fn forward(&self, request: Request) -> Result<Response, ForwardingError> {
         let method = request.method().clone();
-        // A nested router strips its prefix (`/v1/fluree`) from the URI.
-        let uri = request
-            .extensions()
-            .get::<OriginalUri>()
-            .map_or_else(|| request.uri().clone(), |original| original.0.clone());
         let headers = request.headers().clone();
-
-        // Build target URL
-        let target_url = format!(
-            "{}{}",
-            self.base_url,
-            uri.path_and_query()
-                .map(http::uri::PathAndQuery::as_str)
-                .unwrap_or(uri.path())
+        let target_url = outbound_url(
+            &self.base_url,
+            request.extensions().get::<OriginalUri>().map(|o| &o.0),
+            request.uri(),
         );
 
         tracing::debug!(
