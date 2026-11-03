@@ -1,4 +1,6 @@
 # A vector key (`ArenaVector`) holds its store so a comparison can read the
-# vector's components on demand. The store's interior mutability is caches;
-# a key's hash and equality read only the key's own immutable fields.
+# vector's components on demand: equality against another arena's key or a
+# decoded vector reads them through the store. The store's interior mutability
+# is caches, and a key's hash and equality never depend on the store's mutable
+# caches.
 ignore-interior-mutability = ["fluree_db_binary_index::read::binary_index_store::ArenaVector"]
