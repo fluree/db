@@ -1342,6 +1342,9 @@ Mapping a source compiles the R2RML mapping (a mapping that does not parse or co
 | `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
 | `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
 | `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |
+| `columnNotFound` | `error` | `f:key on 'sales.orders' names column 'order_key', which the table does not have.` A declared key's column, checked as a query checks it (see [R2RML → Declaring a Table's Keys](r2rml.md#declaring-a-tables-keys-fkey)). |
+| `casingMismatch` | `error` | `f:key on 'sales.orders' names column 'ORDER_ID', which the schema spells 'order_id'; a key column must match exactly.` |
+| `nonKeyTypeSkipped` | `error` | `f:key on 'sales.orders' names column 'score' of type Float64; a floating-point value cannot identify a row (NaN is unequal to itself).` Also for a nested column. |
 
 Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
 

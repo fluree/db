@@ -148,6 +148,84 @@ Map relationships:
 
 Maps foreign key `customer_id` to RDF object property linking to customer resource.
 
+### Declaring a Table's Keys (`f:key`)
+
+An R2RML graph source answers over the set of triples its mapping defines, so
+two rows that mint the same triple yield it once, as a native ledger loaded
+with those triples would. A table is a bag of rows: a history table holds
+several versions of one customer, and a fact table can hold an exact
+duplicate row. Unless Fluree can prove that no two rows of a map mint the
+same subject, queries over the map remove repeated solutions as they read.
+A key proves it, and a query over a map whose subject is proven unique reads
+its rows straight through.
+
+Declare a key with `f:key` (`https://ns.flur.ee/db#key`) on the logical
+table: a list of the columns no two rows agree on.
+
+```turtle
+@prefix f: <https://ns.flur.ee/db#> .
+
+<#CurrentCustomers>
+  a rr:TriplesMap ;
+  rr:logicalTable [
+    rr:tableName "sales.customers_current" ;
+    f:key ( "customer_id" )
+  ] ;
+  rr:subjectMap [
+    rr:template "http://example.org/customer/{customer_id}" ;
+    rr:class ex:Customer
+  ] .
+```
+
+- A composite key is one list: `f:key ( "customer_id" "valid_from" )`.
+  Repeat `f:key` for each alternative key: `f:key ( "customer_id" ), ( "email" )`.
+- It means: no two rows with no NULL in the key columns agree on all of them.
+  Fluree trusts it and does not check the data. A key the data breaks makes
+  queries return the repeated solutions it promised were not there.
+- It describes the logical table's rows, so it applies to every triples map
+  that reads the same `rr:tableName`. On an `rr:sqlQuery` it describes the
+  query's rows only.
+
+A key makes a map's subjects unique only when the subject is built from it:
+
+- an `rr:column` subject over a column that is a key by itself, or
+- an `rr:template` subject whose placeholders include every column of a key,
+  and that keeps their values apart. Each value is percent-encoded into the
+  IRI (see [the percent-encoding contract](#bound-subject-key-pushdown)), and
+  letters, digits, `- . _ ~ ! $ & ' ( ) * + , ; = : @` and `%` itself can
+  appear in an encoded value. So the text between two adjacent placeholders
+  must hold a character outside that set, such as `/`, `#`, `?` or a space:
+  `.../{customer_id}/{region}` qualifies, while `.../{customer_id}-{region}`
+  and `.../{customer_id}{region}` do not (`("1-2", "3")` and `("1", "2-3")`
+  mint one IRI).
+
+A history table's natural key, `( "customer_id" "valid_from" )`, does not make
+a subject minted from `customer_id` alone unique, and queries over it still
+remove repeated solutions. Two things are deduplicated whatever the keys say:
+a triple one row can mint twice (two predicate-object maps for one predicate,
+or an `rr:class` beside an `rdf:type` map naming the same class), and a
+subject two triples maps can both mint (a current table and a history table
+minting customers from the same template).
+
+An Iceberg table's identifier fields (`identifier-field-ids` in its schema)
+count as a key without being declared, for tables of format version 1 to 3;
+format version 4 replaces them with table constraints, and Fluree does not
+read those yet. Delta and SQL sources report no key, so declare one there.
+
+`f:key` is checked when the mapping loads. Refused with
+`Failed to compile R2RML mapping: …`: an `f:key` that is not a list, an empty
+list, a list item that is not a plain string, a column named twice in one
+key, an `f:key` anywhere but on a logical table, and any other term in the
+`f:` namespace on a logical table (so a misspelled `f:keys` cannot leave the
+table silently keyless). Over an Iceberg source, a query is refused with HTTP
+`400` `err:db/InvalidQuery` when a declared key names a column the queried
+snapshot does not have (casing included), or a column whose values cannot
+identify a row: floating-point (NaN is unequal to itself, so a column declared
+unique can hold two NaNs that mint one subject), nested, or of a type values
+are not read from. `POST /iceberg/r2rml/validate` reports the same columns
+before you save the mapping (see
+[Iceberg → Schema Mismatch](iceberg.md#schema-mismatch)).
+
 ### Complex Queries
 
 Use SQL views for complex mappings:
@@ -421,6 +499,11 @@ A mapping that does not parse or compile is refused when the source is mapped, w
 - `Failed to parse R2RML Turtle: …`: the Turtle itself is malformed.
 - `Failed to compile R2RML mapping: …`: the Turtle parsed, but is not a mapping Fluree can load. The reason names the problem, for example `Missing required property: rr:tableName in logical table`, `Invalid value for …: …`, or `Unsupported feature: …` (see [Limitations](#limitations)).
 - `R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`
+- `Failed to compile R2RML mapping: Invalid value for f:key: …`: a declared key
+  is malformed or misplaced; see [Declaring a Table's Keys](#declaring-a-tables-keys-fkey).
+- At query time, `Graph source '…': Invalid value for f:key: on the logical table "…", a key names column "…", …`
+  (HTTP `400`): a declared key names a column the table does not have, or one
+  that cannot identify a row. Fix the key, or remove it.
 
 Table and column names are not checked when the source is mapped. A table or column the mapping names but the catalog does not have shows up at query time, as described in [Iceberg → Schema Mismatch](iceberg.md#schema-mismatch), which also covers `POST /iceberg/r2rml/validate`, the read-only check of a mapping's tables, columns, join key types and subject keys against the live catalog.
 
