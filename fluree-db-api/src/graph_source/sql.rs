@@ -561,26 +561,53 @@ impl SqlSource {
         table_name: &str,
     ) -> QueryResult<Option<Vec<Vec<String>>>> {
         use fluree_db_r2rml::mapping::KeyColumn;
+        use fluree_db_tabular::FieldType;
         let declared = mapping.declared_keys(table_name);
         let probed = self.probed_subject_key(mapping, table_name);
-        // The probe verified its key under the database's own equality, which
-        // never keeps apart two values that render one term: nothing to vet.
-        if declared.is_empty() {
-            return Ok(probed.map(|key| vec![key]));
+        if declared.is_empty() && probed.is_none() {
+            return Ok(None);
         }
         let source = match mapping.sql_query_for_table(table_name) {
             Some(sql) => RelSource::Query(sql.to_string()),
             None => RelSource::Table(table_name.to_string()),
         };
         let schema = self.source_schema(session, mapping, &source).await?;
+        // A timestamp decodes to the microsecond, so two values the database
+        // keeps a nanosecond apart render one term: a key over a timestamp
+        // finer than that, or of unreported precision, does not identify a
+        // term even where the probe found it unique.
+        let lossy = |name: &str| {
+            schema.field_by_name(name).is_some_and(|f| {
+                matches!(f.field_type, FieldType::Timestamp | FieldType::TimestampTz)
+                    && !schema.fractional_digits(name).is_some_and(|d| d <= 6)
+            })
+        };
         let column = |name: &str| match schema.field_by_name(name) {
+            Some(_) if lossy(name) => KeyColumn::Typed(None),
             Some(field) => KeyColumn::Typed(Some(field.field_type)),
             None => KeyColumn::Absent,
         };
-        declared.check_columns(table_name, column).map_err(|e| {
-            QueryError::InvalidQuery(format!("Graph source '{}': {e}", self.graph_source_id))
-        })?;
-        Ok(probed.map(|key| vec![key]))
+        let refuse = |message: String| {
+            QueryError::InvalidQuery(format!(
+                "Graph source '{}': {message}",
+                self.graph_source_id
+            ))
+        };
+        if let Some(name) = declared.iter().flatten().find(|c| lossy(c)) {
+            return Err(refuse(format!(
+                "f:key on the logical table \"{table_name}\" names column \"{name}\", a \
+                 timestamp finer than the microsecond its values are read to (or of unreported \
+                 precision), so two of its values can render one term"
+            )));
+        }
+        declared
+            .check_columns(table_name, column)
+            .map_err(|e| refuse(e.to_string()))?;
+        let Some(key) = probed else {
+            return Ok(None);
+        };
+        let reported = fluree_db_r2rml::TableKeys::new([key]).retain_usable(column);
+        Ok((!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect()))
     }
 
     /// The composite key the duplicate-subject probe verified for

@@ -477,10 +477,14 @@ Keys come from two places:
   answers with set semantics until a `check` succeeds. Because the probe
   checks one composite per table, a map whose subject uses only some of its
   columns is not proven unique by it.
-- **A declared key.** `f:key` on the logical table (see [R2RML](r2rml.md))
-  declares a key the data is trusted to hold. The lane checks that its
-  columns exist and can identify a row (a floating-point column cannot) and
-  refuses the query otherwise.
+- **A declared key.** `f:key` on the logical table (see [Declaring a
+  table's keys](r2rml.md#declaring-a-tables-keys-fkey)) declares a key the
+  data is trusted to hold. The lane checks that its columns exist and can
+  identify a row and refuses the query otherwise: a floating-point column
+  cannot, nor can a timestamp finer than the microsecond its values are read
+  to (or one whose precision the endpoint does not report), since two of its
+  values can render one term. A probed key over such a column is not
+  trusted either.
 
 Register with `allow_duplicate_subjects` to skip the probe: no table is
 refused, and every map without a declared key answers with set semantics.

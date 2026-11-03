@@ -1272,6 +1272,92 @@ async fn a_declared_key_the_table_cannot_hold_refuses_the_query() {
     }
 }
 
+/// A timestamp key identifies a term only to the microsecond its values are
+/// read to: two values a `timestamp(9)` keeps a nanosecond apart render one
+/// term, so a key declared over one refuses the query; one over a
+/// `timestamp(6)` holds.
+#[tokio::test(flavor = "current_thread")]
+async fn a_declared_key_over_a_nanosecond_timestamp_refuses_the_query() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let server = FakeSql::new()
+        .table(Table::new(
+            "sets.stamps",
+            &[
+                ("stamp9", "timestamp(9)"),
+                ("stamp6", "timestamp(6)"),
+                ("label", "varchar"),
+            ],
+            vec![vec![Value::Null, Value::Null, json!("a")]],
+        ))
+        .mount()
+        .await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = |key: &str| {
+        format!(
+            r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        @prefix f: <https://ns.flur.ee/db#> .
+        <http://example.org/mapping#Stamp>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.stamps" ; f:key ( "{key}" ) ] ;
+            rr:subjectMap [ rr:template "http://example.org/stamp/{{label}}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "label" ] ] .
+        "#
+        )
+    };
+    sql_source(&fluree, &server, "stamp9", &mapping("stamp9"), false).await;
+    sql_source(&fluree, &server, "stamp6", &mapping("stamp6"), false).await;
+    let sparql =
+        |from: &str| format!("{PREFIX}SELECT ?s ?l FROM <{from}:main> WHERE {{ ?s ex:label ?l }}");
+    let jsonld = |from: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": format!("{from}:main"),
+            "select": ["?s", "?l"],
+            "where": [{"@id": "?s", "ex:label": "?l"}],
+        })
+    };
+    let sparql_err = fluree
+        .query_from()
+        .sparql(&sparql("stamp9"))
+        .execute_formatted()
+        .await
+        .expect_err("SPARQL refuses")
+        .to_string();
+    let jsonld_err = fluree
+        .query_from()
+        .jsonld(&jsonld("stamp9"))
+        .execute_formatted()
+        .await
+        .expect_err("JSON-LD refuses")
+        .to_string();
+    for err in [sparql_err, jsonld_err] {
+        assert!(
+            err.contains("stamp9") && err.contains("microsecond"),
+            "{err}"
+        );
+    }
+    let rows = sparql_rows(&query_sparql(&fluree, &sparql("stamp6")).await);
+    assert_eq!(rows, ["l=a s=http://example.org/stamp/a"]);
+    fluree
+        .query_from()
+        .jsonld(&jsonld("stamp6"))
+        .execute_formatted()
+        .await
+        .expect("a microsecond timestamp key holds");
+}
+
+async fn query_sparql(fluree: &Fluree, sparql: &str) -> Value {
+    fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sparql}"))
+}
+
 // ---------------------------------------------------------------------------
 // Live databases behind the bridge
 // ---------------------------------------------------------------------------
