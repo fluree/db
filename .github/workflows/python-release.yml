@@ -40,9 +40,6 @@ jobs:
             runner: standalone-release-windows-x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
-    env:
-      # .cargo/config.toml's value; maturin reads it to tag the macOS wheel.
-      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - name: Enable long paths
         run: git config --global core.longpaths true
@@ -70,6 +67,16 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: "2_28"
           rust-toolchain: "1.97.0"
+
+      # pyproject.toml's deployment target, in the tag and in the binary.
+      # Without it the wheel builds for macOS 11 with no error.
+      - name: The macOS wheel targets macOS 14
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          whl=$(ls dist/*.whl); [[ $whl == *-macosx_14_0_arm64.whl ]]
+          unzip -q -o "$whl" 'fluree/*.so' -d "$RUNNER_TEMP/whl"
+          vtool -show-build "$RUNNER_TEMP"/whl/fluree/*.so | grep 'minos 14.0'
 
       # PyPI never takes a version twice, so a tag on the wrong commit must
       # not publish whatever version that commit carries.

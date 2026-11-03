@@ -1,6 +1,6 @@
 # Install Fluree
 
-Fluree Memory ships as part of the `fluree` CLI. Install the binary once and you have both the database and the memory tooling.
+Fluree Memory ships as part of the `fluree` CLI. Install the binary once and you have both the database and the memory tooling. On macOS it needs Apple silicon and macOS 14 (Sonoma) or later.
 
 ## macOS / Linux (installer script)
 

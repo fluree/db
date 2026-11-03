@@ -509,7 +509,7 @@ The first `fluree doc ingest` after the upgrade re-parses and re-ingests every d
 
 #### macOS builds need macOS 14 or later
 
-The CLI binary and the Python wheel for Apple silicon are built for macOS 14 (Sonoma) and later; earlier releases ran on macOS 11. On an older macOS the CLI does not start, and `pip install fluree` finds no wheel to install.
+The CLI binary and the Python wheel for Apple silicon are built for macOS 14 (Sonoma) and later; earlier releases ran on macOS 11. On an older macOS the CLI does not start, and Homebrew refuses to install or upgrade it, leaving the installed version in place. `pip install fluree` installs the last release built for macOS 11 instead; asking for a later version by number finds no wheel.
 
 #### `fluree-track-policy` is now parsed by the server
 

@@ -4,6 +4,8 @@ This guide will get the Fluree server running on your machine in minutes.
 
 ## Installation
 
+The macOS builds are for Apple silicon and need macOS 14 (Sonoma) or later.
+
 ### Option 1: Shell Installer (macOS / Linux)
 
 ```bash

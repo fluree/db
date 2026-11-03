@@ -45,6 +45,12 @@ module-name = "fluree._fluree"
 # cargo builds use whichever Python is installed.
 features = ["extension", "pyo3/extension-module", "pyo3/abi3-py310"]
 
+# Oldest macOS the Apple silicon wheel runs on, as in .cargo/config.toml.
+# maturin tags the wheel with it and passes it to cargo; without it, it would
+# set rustc's default, 11.0, over cargo's [env] table.
+[tool.maturin.target."aarch64-apple-darwin"]
+macos-deployment-target = "14.0"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
