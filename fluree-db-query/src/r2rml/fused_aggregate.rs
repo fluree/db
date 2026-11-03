@@ -40,6 +40,7 @@ use crate::r2rml::operator::{
     decimal_canonical_of, object_column_is_numeric, rdf_term_eq_object_constant_cached,
     LiteralEncoder,
 };
+#[cfg(test)]
 use crate::r2rml::rewrite_patterns_for_r2rml;
 use crate::r2rml::ObjectConstant;
 use crate::var_registry::VarId;
@@ -2386,19 +2387,34 @@ impl FusedR2rmlAggregateOperator {
         // Rewrite the inner triples for this graph using the active snapshot.
         // A non-R2RML graph (or an unconvertible pattern) leaves triples
         // unconverted → fall back.
-        let rr = rewrite_patterns_for_r2rml(
+        let rr = crate::r2rml::rewrite_patterns_for_r2rml_source(
+            ctx,
             &self.inner_patterns,
             &self.graph_iri,
-            ctx.active_snapshot,
             mapping.as_deref(),
-            ctx.reasoning_active,
             // Count/aggregate path never merges a projected type-var (it folds
             // scalar columns and materializes no type rows); keep the two-scan
             // rewrite so the browse merge is confined to the crawl projection path.
             false,
-        );
+        )
+        .await?;
         if rr.unconverted_count > 0 {
             return Ok(None);
+        }
+        // The fold counts and sums table rows, and the manifest COUNT counts
+        // them without reading any: both answer over the graph (a set of
+        // triples) only when each row the patterns read is a distinct solution.
+        // Otherwise the generic pipeline runs, whose scans remove repeats.
+        match mapping.as_deref() {
+            Some(m)
+                if crate::r2rml::set_semantics::rows_are_solutions(
+                    ctx,
+                    &rr.patterns,
+                    &self.graph_iri,
+                    m,
+                )
+                .await? => {}
+            _ => return Ok(None),
         }
         // The single-`R2rml` shape gate below also keeps this path decline-safe
         // against non-lowered sub-scopes (`rr.unsupported`): a surviving
@@ -5544,8 +5560,16 @@ mod tests {
             Term::Value(FlakeValue::String("Enterprise".to_string())),
         );
         let rewrite = |pats: &[Pattern]| {
-            rewrite_patterns_for_r2rml(pats, "gs:main", &snapshot, Some(&mapping), false, false)
-                .patterns
+            rewrite_patterns_for_r2rml(
+                pats,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                &crate::r2rml::set_semantics::TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+                false,
+                false,
+            )
+            .patterns
         };
 
         // q038: the direct-path ungrouped constrained COUNT splits into 2 patterns.
@@ -6132,7 +6156,7 @@ mod tests {
     /// the join column (the keep-min case).
     fn order_customer_mapping(customer_subject_template: &str) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#Order", "order")
                 .with_subject_template("http://ex/order/{OID}")
                 .with_predicate_object(PredicateObjectMap {
@@ -6354,7 +6378,7 @@ mod tests {
         amt_dt: &str,
     ) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#Event", "event")
                 .with_subject_template("http://ex/event/{EID}")
                 .with_predicate_object(PredicateObjectMap {
@@ -7708,7 +7732,7 @@ mod tests {
     fn crt_mapping(qty_dt: &str) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
         use fluree_vocab::xsd;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#OrderLine", "order_line")
                 .with_subject_template("http://ex/ol/{OLID}")
                 .with_predicate_object(PredicateObjectMap {
@@ -8067,6 +8091,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &crate::r2rml::set_semantics::TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             false,
         )
@@ -8142,14 +8167,22 @@ mod tests {
         if with_region {
             bgp.push(t(c, "http://ex/region", Term::Var(r)));
         }
-        rewrite_patterns_for_r2rml(&bgp, "gs:main", &snapshot, Some(&mapping), false, false)
-            .patterns
-            .into_iter()
-            .filter_map(|p| match p {
-                Pattern::R2rml(rp) => Some(rp),
-                _ => None,
-            })
-            .collect()
+        rewrite_patterns_for_r2rml(
+            &bgp,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            &crate::r2rml::set_semantics::TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+            false,
+            false,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect()
     }
 
     /// OVER-DECLINE GUARD (id=3717398030 refix): the rewrite folds a SOLE FK member into
@@ -8674,7 +8707,7 @@ mod tests {
     fn s1_mapping(qty_dt: &str) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
         use fluree_vocab::xsd;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#Ticket", "ticket")
                 .with_subject_template("http://ex/t/{TID}")
                 .with_predicate_object(PredicateObjectMap {

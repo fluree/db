@@ -75,11 +75,12 @@ const SQL_POMS: &str = "\
 
 /// `Cell` maps every column un-annotated (plus `extra`); `Twin` maps the same
 /// table again under its own subjects, reached from a cell by `ex:twin`, so a
-/// grouping key can come from the far side of a join.
+/// grouping key can come from the far side of a join. The table declares its
+/// key, `id`, so each subject is one row's and the fused aggregate may fold.
 fn cells_mapping(table: &str, extra: &str) -> String {
     let mut out = String::from(
         "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n\
-         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n@prefix f: <https://ns.flur.ee/db#> .\n",
     );
     let poms = |prefix: &str| -> String {
         std::iter::once("grp")
@@ -93,7 +94,7 @@ fn cells_mapping(table: &str, extra: &str) -> String {
     };
     out.push_str(&format!(
         "<http://example.org/mapping#Cell> a rr:TriplesMap ;\n\
-         \x20   rr:logicalTable [ rr:tableName \"{table}\" ] ;\n\
+         \x20   rr:logicalTable [ rr:tableName \"{table}\" ; f:key ( \"id\" ) ] ;\n\
          \x20   rr:subjectMap [ rr:template \"http://example.org/cell/{{id}}\" ; rr:class ex:Cell ] ;\n\
          \x20   rr:predicateObjectMap [ rr:predicate ex:id ; rr:objectMap [ rr:column \"id\" ] ] ;\n\
          {}{extra}\
@@ -101,7 +102,7 @@ fn cells_mapping(table: &str, extra: &str) -> String {
          \x20       rr:parentTriplesMap <http://example.org/mapping#Twin> ;\n\
          \x20       rr:joinCondition [ rr:child \"id\" ; rr:parent \"id\" ] ] ] .\n\
          <http://example.org/mapping#Twin> a rr:TriplesMap ;\n\
-         \x20   rr:logicalTable [ rr:tableName \"{table}\" ] ;\n\
+         \x20   rr:logicalTable [ rr:tableName \"{table}\" ; f:key ( \"id\" ) ] ;\n\
          \x20   rr:subjectMap [ rr:template \"http://example.org/twin/{{id}}\" ; rr:class ex:Twin ] ;\n\
          {}\
          \x20   rr:predicateObjectMap [ rr:predicate ex:tid ; rr:objectMap [ rr:column \"id\" ] ] .\n",

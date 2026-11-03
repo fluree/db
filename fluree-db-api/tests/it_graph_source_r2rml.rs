@@ -3349,15 +3349,17 @@ async fn temporal_values_compare_equal_by_value() {
 // (Store and Employee) — the predicate fan-out that caused unrelated dimension
 // tables to be scanned — and Store has a RefObjectMap to Geography, so we can
 // assert parents are pruned for unreferenced predicates yet kept for referenced
-// ones (R2RML dangling-FK semantics are not weakened).
+// ones (R2RML dangling-FK semantics are not weakened). Each table declares its
+// surrogate key, so each subject is one row's and the star may fuse.
 
 const EDW_GUARD_MAPPING_TTL: &str = r#"
 @prefix rr: <http://www.w3.org/ns/r2rml#> .
 @prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix f: <https://ns.flur.ee/db#> .
 
 <http://example.org/mapping#Store> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:logicalTable [ rr:tableName "dw.store" ; f:key ( "store_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
     rr:predicateObjectMap [ rr:predicate ex:storeId ; rr:objectMap [ rr:column "store_id" ] ] ;
     rr:predicateObjectMap [ rr:predicate ex:storeKey ; rr:objectMap [ rr:column "store_key" ; rr:datatype xsd:integer ] ] ;
@@ -3371,13 +3373,13 @@ const EDW_GUARD_MAPPING_TTL: &str = r#"
     ] .
 
 <http://example.org/mapping#Geography> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.geography" ] ;
+    rr:logicalTable [ rr:tableName "dw.geography" ; f:key ( "geo_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/geo/{geo_key}" ; rr:class ex:Geography ] ;
     rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] ;
     rr:predicateObjectMap [ rr:predicate ex:region ; rr:objectMap [ rr:column "region" ] ] .
 
 <http://example.org/mapping#Employee> a rr:TriplesMap ;
-    rr:logicalTable [ rr:tableName "dw.employee" ] ;
+    rr:logicalTable [ rr:tableName "dw.employee" ; f:key ( "emp_key" ) ] ;
     rr:subjectMap [ rr:template "http://example.org/emp/{emp_key}" ; rr:class ex:Employee ] ;
     rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "emp_name" ] ] .
 "#;

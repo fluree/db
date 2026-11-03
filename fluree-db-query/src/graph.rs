@@ -51,7 +51,7 @@ use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::{
-    r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml, unsupported_subscope_error,
+    r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml_source, unsupported_subscope_error,
 };
 use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::sort::SortSpec;
@@ -320,14 +320,14 @@ impl GraphOperator {
         let patterns_to_execute: std::borrow::Cow<'_, [Pattern]> = if is_r2rml_gs {
             // Rewrite triple patterns to R2RML patterns
             let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
-            let rewrite_result = rewrite_patterns_for_r2rml(
+            let rewrite_result = rewrite_patterns_for_r2rml_source(
+                ctx,
                 &crate::list_view::without_list_view(&self.inner_patterns),
                 &graph_iri,
-                ctx.active_snapshot,
                 mapping.as_deref(),
-                ctx.reasoning_active,
                 ctx.trust_fk_refs,
-            );
+            )
+            .await?;
 
             // If there are unconverted patterns in an R2RML graph source, refuse
             // with a typed error. R2RML graph sources have no ledger-backed index,
@@ -537,14 +537,14 @@ impl GraphOperator {
         }
 
         let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
-        let rewrite_result = rewrite_patterns_for_r2rml(
+        let rewrite_result = rewrite_patterns_for_r2rml_source(
+            ctx,
             &crate::list_view::without_list_view(&self.inner_patterns),
             &graph_iri,
-            ctx.active_snapshot,
             mapping.as_deref(),
-            ctx.reasoning_active,
             ctx.trust_fk_refs,
-        );
+        )
+        .await?;
         if rewrite_result.unconverted_count > 0 {
             return Err(r2rml_unsupported_pattern_error(
                 &graph_iri,

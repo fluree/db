@@ -125,6 +125,68 @@ impl TableKeyEvidence {
     }
 }
 
+#[cfg(test)]
+impl TableKeyEvidence {
+    /// Evidence that every table is keyed by the subject columns of each map
+    /// over it, for tests of fusion mechanics over keyed tables.
+    pub(crate) fn assume_keyed_by_subjects(mapping: &CompiledR2rmlMapping) -> Self {
+        let mut known: HashMap<String, TableKeys> = HashMap::new();
+        for tm in mapping.triples_maps.values() {
+            if let Some(table) = tm.table_name() {
+                let columns = subject_columns_of(tm);
+                let keys = known.remove(table).unwrap_or_default().union([columns]);
+                known.insert(table.to_string(), keys);
+            }
+        }
+        Self {
+            known,
+            wanted: Mutex::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl TableKeyEvidence {
+    /// Evidence that `table`'s keys were fetched and are `keys`.
+    pub(crate) fn with_known(mut self, table: &str, keys: TableKeys) -> Self {
+        self.known.insert(table.to_string(), keys);
+        self
+    }
+
+    /// The tables a question wanted keys for, sorted.
+    pub(crate) fn wanted_tables(&self) -> Vec<String> {
+        self.wanted.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+/// `maps` with each one's subject columns declared a key of its table, for
+/// tests that run lanes over tables whose rows hold one subject each.
+#[cfg(test)]
+pub(crate) fn keyed_by_subjects(maps: Vec<TriplesMap>) -> CompiledR2rmlMapping {
+    CompiledR2rmlMapping::new(
+        maps.into_iter()
+            .map(|tm| {
+                let columns = subject_columns_of(&tm);
+                tm.with_declared_key(columns)
+            })
+            .collect(),
+    )
+}
+
+/// The columns a map's subject reads, from its template text (maps built in
+/// tests carry no loader-computed column list).
+#[cfg(test)]
+fn subject_columns_of(tm: &TriplesMap) -> Vec<String> {
+    let sm = &tm.subject_map;
+    let mut columns: Vec<String> = sm
+        .template
+        .as_deref()
+        .map(fluree_db_r2rml::mapping::extract_template_columns)
+        .unwrap_or_default();
+    columns.extend(sm.column.clone());
+    columns
+}
+
 /// Whether one row of `tm` never yields the same solution of `pattern` twice.
 ///
 /// Read off the solution shapes the scan materializes for each pattern kind:
@@ -156,6 +218,78 @@ pub(crate) fn emits_distinct_for(pattern: &R2rmlPattern, tm: &TriplesMap) -> boo
     base.into_iter()
         .chain(pattern.star_bindings.iter().map(|(p, _)| p.as_str()))
         .all(|p| tm.emits_distinct_per_row(p))
+}
+
+/// The maps a scan of `pattern` can read: the pinned map, or every map
+/// declaring its class and naming its predicate. A superset of what the scan
+/// resolves (it prunes further), so a property every candidate has holds for
+/// every map the scan reads.
+pub(crate) fn candidate_maps<'m>(
+    pattern: &R2rmlPattern,
+    mapping: &'m CompiledR2rmlMapping,
+) -> Vec<&'m TriplesMap> {
+    if let Some(iri) = &pattern.triples_map_iri {
+        return mapping.get(iri).into_iter().collect();
+    }
+    mapping
+        .triples_maps
+        .values()
+        .filter(|tm| {
+            pattern
+                .class_filter
+                .as_ref()
+                .is_none_or(|c| tm.classes().contains(c))
+                && pattern.predicate_filter.as_deref().is_none_or(|p| {
+                    tm.predicate_object_maps
+                        .iter()
+                        .any(|pom| pom.predicate_map.as_constant() == Some(p))
+                })
+        })
+        .collect()
+}
+
+/// Whether a lane that turns each row of each map `patterns` read into one
+/// solution answers over the graph: for every pattern, every candidate map
+/// ([`candidate_maps`]) mints each subject from one row and each solution
+/// once per row, and no two candidates of one pattern can mint one subject.
+/// Lanes that fold rows without materializing solutions (the fused aggregate,
+/// its manifest COUNT) ask this before they run. A source that refuses a
+/// table's declared keys refuses the query.
+pub(crate) async fn rows_are_solutions(
+    ctx: &ExecutionContext<'_>,
+    patterns: &[crate::ir::Pattern],
+    graph_source_id: &str,
+    mapping: &CompiledR2rmlMapping,
+) -> Result<bool> {
+    let Some(provider) = ctx.r2rml_table_provider else {
+        return Ok(false);
+    };
+    let as_of_t = if ctx.explicit_dataset().is_some() {
+        None
+    } else {
+        Some(ctx.to_t)
+    };
+    let mut keys = TableKeyEvidence::default();
+    for pattern in patterns {
+        let crate::ir::Pattern::R2rml(pattern) = pattern else {
+            return Ok(false);
+        };
+        let maps = candidate_maps(pattern, mapping);
+        for (i, tm) in maps.iter().enumerate() {
+            let unique = keys
+                .subject_unique_fetching(provider, mapping, graph_source_id, as_of_t, tm)
+                .await?;
+            if !unique
+                || !emits_distinct_for(pattern, tm)
+                || maps[i + 1..]
+                    .iter()
+                    .any(|other| !tm.subjects_provably_disjoint(other))
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Estimated table overhead of one [`SeenSolutions`] entry: its slot (a boxed
