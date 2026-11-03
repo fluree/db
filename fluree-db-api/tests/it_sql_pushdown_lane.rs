@@ -2989,10 +2989,16 @@ const MYSQL: LiveBackend = LiveBackend {
 };
 
 /// Maps over the dialect tables, appended to the shop mapping for live runs.
+///
+/// `tags` references `words` on `word`, which is not the word's subject
+/// column, so the registration probe checks `(id, word)` together and proves
+/// `id` alone unique for no map; the declared key does.
 const LIVE_R2RML: &str = r#"
+    @prefix f: <https://ns.flur.ee/db#> .
+
     <http://example.org/mapping#Word>
         a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "words" ] ;
+        rr:logicalTable [ rr:tableName "words" ; f:key ( "id" ) ] ;
         rr:subjectMap [ rr:template "http://example.org/word/{id}" ; rr:class ex:Word ] ;
         rr:predicateObjectMap [ rr:predicate ex:word ; rr:objectMap [ rr:column "word" ] ] ;
         rr:predicateObjectMap [ rr:predicate ex:len ; rr:objectMap [ rr:column "len" ] ] .

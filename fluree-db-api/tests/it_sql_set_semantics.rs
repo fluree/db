@@ -30,7 +30,7 @@ mod span_capture;
 
 use fake_sql::{FakeSql, Table};
 use fluree_db_api::{
-    set_fast_paths_disabled, Fluree, FlureeBuilder, R2rmlCreateConfig, SqlCreateConfig,
+    set_fast_paths_disabled, Fluree, FlureeBuilder, R2rmlCreateConfig, SqlCreateConfig, SqlDialect,
 };
 use fluree_db_nameservice::GraphSourceType;
 use serde_json::{json, Value};
@@ -1270,4 +1270,114 @@ async fn a_declared_key_the_table_cannot_hold_refuses_the_query() {
             "{err}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live databases behind the bridge
+// ---------------------------------------------------------------------------
+
+/// The `sets.*` rows as statements every bridge backend runs, under
+/// unqualified table names.
+const LIVE_SEED: &[&str] = &[
+    "DROP TABLE IF EXISTS customers_history",
+    "DROP TABLE IF EXISTS customers_current",
+    "DROP TABLE IF EXISTS orders",
+    "CREATE TABLE customers_history (customer_id BIGINT, name VARCHAR(64), city VARCHAR(64), valid_from DATE, is_current INTEGER)",
+    "CREATE TABLE customers_current (customer_id BIGINT NOT NULL, name VARCHAR(64))",
+    "CREATE TABLE orders (order_id BIGINT, customer_id BIGINT, amount DECIMAL(10,2))",
+    "INSERT INTO customers_history VALUES (1, 'alice', 'Boston', '2024-01-01', 0), (2, 'bob', 'Austin', '2024-01-01', 0), (3, 'carol', 'Chicago', '2024-02-01', 1), (1, 'alice', 'Denver', '2024-06-01', 0), (5, 'erin', 'Miami', '2024-01-01', 0), (2, 'robert', 'Austin', '2024-05-01', 0), (2, 'robert', 'Austin', '2024-09-01', 1), (4, 'dave', NULL, '2024-03-01', 1), (1, 'alice', 'Denver', '2024-11-01', 1), (5, 'erin-m', 'Tampa', '2024-07-01', 1), (NULL, 'ghost', 'Nowhere', '2024-01-01', 0)",
+    "INSERT INTO customers_current VALUES (1, 'alice'), (2, 'robert'), (3, 'carol'), (4, 'dave'), (5, 'erin-m'), (6, 'frank')",
+    "INSERT INTO orders VALUES (100, 1, 10.00), (101, 2, 20.00), (102, 3, 5.50), (103, 5, 7.25), (101, 2, 20.00), (104, 99, 1.00), (105, NULL, 3.00), (106, 1, 2.00)",
+];
+
+/// The SQL lane over a live database answers what the native ledger does
+/// wherever it serves a shape. A shape it declines is the per-scan lane's
+/// (see [`every_other_lane_answers_the_same_set`]); the lane may decline a
+/// shape it serves over the fake endpoint only where the dialect's `DISTINCT`
+/// folds strings, or where `declines` names it (a column reaching the bridge
+/// as a type the aggregate lane cannot fold exactly).
+async fn live_set_semantics(dialect: SqlDialect, url_var: &str, declines: &[&str]) {
+    let Ok(url) = std::env::var(url_var) else {
+        eprintln!("{url_var} unset: live {dialect:?} set-semantics differential skipped");
+        return;
+    };
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let mut cfg = fluree_db_sql::SqlGsConfig::new(url.clone());
+    cfg.dialect = dialect;
+    let cfg = cfg.hydrate(None).await.expect("hydrate");
+    let auth = cfg
+        .auth
+        .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+        .expect("auth");
+    let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
+    for stmt in LIVE_SEED {
+        client
+            .execute_collect(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("seed failed: {e}\n{stmt}"));
+    }
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (name, mapping) in [("hist-sql", HIST_R2RML), ("both-sql", BOTH_R2RML)] {
+        let mut config = SqlCreateConfig::new(name, url.clone(), mapping.replace("sets.", ""));
+        config.dialect = dialect;
+        config.allow_duplicate_subjects = true;
+        fluree
+            .create_sql_graph_source(config)
+            .await
+            .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    }
+    seed_native(&fluree, "hist-native:main", false).await;
+    seed_native(&fluree, "both-native:main", true).await;
+
+    let folds_strings = matches!(dialect, SqlDialect::Mysql);
+    let (store, _guard) = span_capture::init_test_tracing();
+    let mut failures = Vec::new();
+    for c in &cases() {
+        let mut problems = Vec::new();
+        let oracle = native(&fluree, &store, c, &mut problems).await;
+        let a = answer(&fluree, &store, c, &format!("{}-sql:main", c.src), false).await;
+        let fired = a.sites.iter().any(|s| s == c.site);
+        match (c.routing, fired) {
+            (_, true) if a.rows != oracle[0] => problems.push(format!(
+                "SQL lane {:?} != native {:?}\n  sent {:#?}",
+                a.rows, oracle[0], a.sql
+            )),
+            (Routing::MustNotFire, true) => problems.push(format!("`{}` must not fire", c.site)),
+            (Routing::MustFire, false) if !folds_strings && !declines.contains(&c.name) => {
+                problems.push(format!("`{}` must fire [proceeded: {:?}]", c.site, a.sites));
+            }
+            _ => {}
+        }
+        if !problems.is_empty() {
+            failures.push(format!("{}:\n  {}", c.name, problems.join("\n  ")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{dialect:?}:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_bridge_sqlite_answers_each_triple_once() {
+    // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM over
+    // it declines (its datatype is decimal), as in the pushdown lane suite.
+    live_set_semantics(
+        SqlDialect::Sqlite,
+        "FLUREE_SQL_BRIDGE_URL",
+        &["SUM over a duplicated row adds its triple once"],
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_bridge_postgres_answers_each_triple_once() {
+    live_set_semantics(SqlDialect::Postgres, "FLUREE_SQL_BRIDGE_POSTGRES_URL", &[]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_bridge_mysql_answers_each_triple_once() {
+    live_set_semantics(SqlDialect::Mysql, "FLUREE_SQL_BRIDGE_MYSQL_URL", &[]).await;
 }
