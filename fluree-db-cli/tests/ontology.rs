@@ -729,3 +729,74 @@ fn a_dbt_project_resolves_doc_blocks_and_names_files_it_cannot_read() {
     assert!(ttl.contains("rdfs:comment \"One row per order.\""), "{ttl}");
     assert!(!ttl.contains("{{"), "{ttl}");
 }
+
+/// `CALL apoc.meta.schema() YIELD value RETURN value`, exported as JSON, for a
+/// small movies graph.
+const NEO4J_SCHEMA: &str = r#"[{"value": {
+  "Person": {"type": "node", "count": 133, "labels": [], "properties": {
+      "name": {"type": "STRING", "indexed": true, "unique": false, "existence": false},
+      "born": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "out", "count": 172, "labels": ["Movie"],
+                   "properties": {"roles": {"type": "LIST", "array": true}}},
+      "DIRECTED": {"direction": "out", "count": 44, "labels": ["Movie"], "properties": {}},
+      "REVIEWED": {"direction": "out", "count": 9, "labels": ["Movie"],
+                   "properties": {"summary": {"type": "STRING"}, "rating": {"type": "INTEGER"}}},
+      "FOLLOWS": {"direction": "out", "count": 3, "labels": ["Person"], "properties": {}}}},
+  "Movie": {"type": "node", "count": 38, "labels": [], "properties": {
+      "title": {"type": "STRING", "indexed": true, "unique": true, "existence": false},
+      "released": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false},
+      "tagline": {"type": "STRING", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "in", "count": 172, "labels": ["Person"], "properties": {}}}},
+  "ACTED_IN": {"type": "relationship", "count": 172, "properties": {"roles": {"type": "LIST", "array": true}}}
+}}]"#;
+
+#[test]
+fn from_a_neo4j_schema() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp, "movies-schema.json", NEO4J_SCHEMA);
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "movies-schema.json",
+            "--base",
+            "https://example.com/movies/",
+            "-o",
+            "movies.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("2 classes, 9 properties"))
+        .stderr(predicate::str::contains(
+            "3 relationship propert(ies) left out",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("movies.ttl")).unwrap();
+    assert!(ttl.contains("movies:actedIn a rdf:Property"), "{ttl}");
+    assert!(
+        ttl.contains("rdfs:comment \"A person acted in a movie.\""),
+        "{ttl}"
+    );
+    assert!(ttl.contains("rdfs:label \"acted in\""), "{ttl}");
+    assert!(ttl.contains("rdfs:range movies:Movie"), "{ttl}");
+    let (report, code) = check_json(&tmp, &["movies.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+}
+
+#[test]
+fn json_ld_is_never_read_as_another_source() {
+    let tmp = TempDir::new().unwrap();
+    // JSON-LD whose keys a converter might mistake for its own
+    write(
+        &tmp,
+        "data.json",
+        r#"{"@context": {"ex": "https://example.com/"}, "nodes": [], "relationships": [],
+            "datasets": [], "@graph": [{"@id": "ex:acme", "ex:name": "Acme"}]}"#,
+    );
+    fluree_cmd(&tmp)
+        .args(["ontology", "from", "data.json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no classes found"));
+}
