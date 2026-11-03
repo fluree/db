@@ -195,6 +195,17 @@ fn range_translation_cache() -> &'static std::sync::Mutex<RangeTranslationLru> {
     &CACHE
 }
 
+/// Every `store_id` that has put an entry in [`range_translation_cache`]. A
+/// test that rules an insertion out reads this, not the LRU: other tests'
+/// insertions can evict the entry before it looks.
+#[cfg(test)]
+fn range_translation_inserted_stores() -> &'static std::sync::Mutex<std::collections::BTreeSet<u64>>
+{
+    static INSERTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    &INSERTED
+}
+
 /// Translate the full (unfiltered) overlay for `(g_id, index, to_t)`, served
 /// from [`range_translation_cache`] when the overlay reports a
 /// [`content_version`](OverlayProvider::content_version). Returns `None`
@@ -262,6 +273,11 @@ fn cached_overlay_translation(
         raw: raw.into(),
         ephemeral_p_id_to_sid: Arc::new(ephemeral_p_id_to_sid),
     });
+    #[cfg(test)]
+    range_translation_inserted_stores()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.store_id);
     range_translation_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2179,6 +2195,8 @@ mod tests {
     /// leave the process-wide translation LRU alone. `NoOverlay` reports a
     /// content version, so each new `to_t` used to add an empty entry, and
     /// with eight slots a few commits evicted a live query's translation.
+    /// It checks the record of insertions rather than the LRU, which other
+    /// tests' insertions can empty of this store's entries first.
     #[test]
     fn an_empty_overlay_probe_leaves_the_translation_lru_alone() {
         let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
@@ -2199,14 +2217,12 @@ mod tests {
             );
             assert!(out.ops.is_empty() && out.untranslated.is_empty());
         }
-        let entries_for_store = range_translation_cache()
+        let inserted = range_translation_inserted_stores()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(key, _)| key.store_id == store.store_id())
-            .count();
-        assert_eq!(
-            entries_for_store, 0,
+            .contains(&store.store_id());
+        assert!(
+            !inserted,
             "an empty overlay must not occupy translation LRU slots"
         );
     }
