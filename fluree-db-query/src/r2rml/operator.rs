@@ -1875,7 +1875,7 @@ impl R2rmlScanOperator {
         let seen = self
             .dedupe_plan(ctx, table_provider, &mapping, &mut tms)
             .await?
-            .then(SeenSolutions::new);
+            .map(SeenSolutions::new);
 
         // Under a LIMIT, cap the materialize window at the remaining budget so a
         // `LIMIT n` does not explode a full 512K-row window into bindings before
@@ -1918,13 +1918,17 @@ impl R2rmlScanOperator {
     ///
     /// With fast paths disabled every map is checked: the differential oracle
     /// then never relies on a key.
+    ///
+    /// Returns, when some map is checked, the prefix every subject a checked
+    /// map mints starts with (the longest common constant prefix of their
+    /// subject templates), which the set leaves out of what it remembers.
     async fn dedupe_plan(
         &mut self,
         ctx: &ExecutionContext<'_>,
         provider: &dyn super::R2rmlTableProvider,
         mapping: &CompiledR2rmlMapping,
         tms: &mut [TmStream],
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         let fast_paths = !crate::execute::operator_tree::fast_paths_disabled();
         let maps: Vec<&TriplesMap> = tms
@@ -1978,7 +1982,35 @@ impl R2rmlScanOperator {
             };
             stamp_fast_path(PROVEN_DISTINCT_SITE, outcome);
         }
-        Ok(any)
+        if !any {
+            return Ok(None);
+        }
+        let mut strip: Option<&str> = None;
+        for (tm, stream) in maps.iter().zip(tms.iter()) {
+            if !stream.dedupe {
+                continue;
+            }
+            let sm = &tm.subject_map;
+            let prefix = match (&sm.constant, &sm.column, sm.template.as_deref()) {
+                (None, None, Some(t)) if sm.term_type == TermType::Iri => {
+                    super::rewrite::constant_prefix(t)
+                }
+                _ => "",
+            };
+            strip = Some(match strip {
+                None => prefix,
+                Some(s) => {
+                    let common = s
+                        .char_indices()
+                        .zip(prefix.chars())
+                        .take_while(|((_, a), b)| a == b)
+                        .last()
+                        .map_or(0, |((i, c), _)| i + c.len_utf8());
+                    &s[..common]
+                }
+            });
+        }
+        Ok(Some(strip.unwrap_or("").to_string()))
     }
 
     /// Read `source`'s parent whole into a [`CompleteParentLookup`], and keep
