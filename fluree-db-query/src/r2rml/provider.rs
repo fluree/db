@@ -63,12 +63,13 @@ pub enum ScanValue {
     /// column only (see `build_iceberg_filter`). NaN bounds never over-prune (the
     /// Iceberg compare treats a NaN operand as incomparable → keep).
     Double(f64),
-    /// A decimal value as its unscaled i128 + precision/scale (mirrors
+    /// A decimal value as its unscaled i128 and scale (mirrors
     /// `LiteralValue::Decimal`). Carries the LITERAL's scale; the column's scale
-    /// may differ and is normalized during comparison.
+    /// may differ and is normalized during comparison. There is deliberately no
+    /// precision: a literal has none, and the column's own `decimal(p, s)` is
+    /// what any consumer that needs one must use.
     Decimal {
         unscaled: i128,
-        precision: u8,
         scale: i8,
     },
     /// A raw column value recovered by reversing a subject template (bound-subject
@@ -155,6 +156,31 @@ pub struct ScanTopK {
     /// `true` for an `ASC` sort (admitted only for a required column; the provider
     /// re-checks nullability), `false` for `DESC`.
     pub ascending: bool,
+    /// How the engine orders the column's terms. The provider prunes by the
+    /// column's bounds only when the physical type's bounds sort the same way:
+    /// an un-annotated column's `"10"` sorts before `"9"`, which no integer bound
+    /// does, and an `xsd:integer` over a string column's `"9"` bound sits above
+    /// its `"100"`.
+    pub order: TermOrder,
+}
+
+/// The order the engine sorts an object map's terms in, from its datatype. A
+/// datatype with none of these (`xsd:time`, `xsd:gYear`, a custom IRI) is
+/// never offered to a scan as a top-k.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermOrder {
+    /// By code point: an un-annotated or `xsd:string` literal (the rendered
+    /// cell), a language-tagged literal, an IRI.
+    Lexical,
+    /// By number: the `xsd:integer` family, `xsd:decimal`, `xsd:double`,
+    /// `xsd:float`.
+    Numeric,
+    /// `xsd:date`, by day.
+    Date,
+    /// `xsd:dateTime`, by instant.
+    Instant,
+    /// `xsd:boolean`, false before true.
+    Boolean,
 }
 
 /// The table state a time-pinned graph-source query reads, in the source
@@ -198,11 +224,31 @@ pub trait R2rmlProvider: Debug + Send + Sync {
     /// # Returns
     ///
     /// `Ok(true)` if the graph source exists and has an R2RML mapping,
-    /// `Ok(false)` if the id names no mapped graph source (including an IRI
-    /// that is no graph-source id at all). An error when the answer cannot be
-    /// determined, for example because the nameservice is unavailable: the
-    /// caller fails the query rather than reading a graph source as an empty
-    /// native graph.
+    /// `Ok(false)` if the id names no graph source (including an IRI that is
+    /// no graph-source id at all, and a dropped source).
+    ///
+    /// # Errors
+    ///
+    /// Two kinds, and callers tell them apart, so an implementor must return
+    /// the right one:
+    ///
+    /// - The id names a graph source that no query reads as a graph: a mapped
+    ///   source with no mapping, an index source (BM25, vector, geo), or a
+    ///   family this build has no reader for. The error must be one for which
+    ///   [`QueryError::is_unreadable_graph_source`](crate::error::QueryError::is_unreadable_graph_source)
+    ///   is true. A query that names such a source in its text fails with it;
+    ///   a `GRAPH ?g` whose `?g` took the IRI from data reads the IRI as a
+    ///   graph outside the dataset and yields no rows for that binding. An
+    ///   `Ok(false)` here would query the source as an empty native graph, and
+    ///   any other error would fail a query whose data merely mentions it.
+    /// - The answer cannot be determined, for example because the nameservice
+    ///   is unavailable. This must NOT be an unreadable-source error: every
+    ///   caller fails the query rather than reading a graph source as an empty
+    ///   native graph.
+    ///
+    /// A provider that serves only mapped sources it holds (a test double, a
+    /// provisional mapping) never names an unreadable source and need not
+    /// return the first kind.
     async fn has_r2rml_mapping(&self, graph_source_id: &str) -> Result<bool>;
 
     /// Get the compiled R2RML mapping for a graph source alias.
@@ -219,7 +265,12 @@ pub trait R2rmlProvider: Debug + Send + Sync {
     /// # Returns
     ///
     /// The compiled mapping, or an error if the graph source doesn't exist or
-    /// the mapping couldn't be loaded.
+    /// the mapping couldn't be loaded. A mapping that defines no
+    /// `rr:TriplesMap` is an error for which
+    /// [`QueryError::is_unreadable_graph_source`](crate::error::QueryError::is_unreadable_graph_source)
+    /// is true: [`Self::has_r2rml_mapping`] cannot see an empty mapping
+    /// without compiling it, so the data-bound `GRAPH ?g` arm relies on this
+    /// error to yield no rows for such a source.
     async fn compiled_mapping(
         &self,
         graph_source_id: &str,

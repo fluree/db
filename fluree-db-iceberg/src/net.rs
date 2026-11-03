@@ -11,7 +11,7 @@
 //! enforcement lives at the client/connect layer:
 //!
 //! - [`hardened_client_builder`] builds a `reqwest::Client` that follows **no**
-//!   redirects and resolves through [`SsrfGuardResolver`], which denylists the
+//!   redirects and resolves through `SsrfGuardResolver`, which denylists the
 //!   resolved IPs and hands the connector only the checked addresses (blocking
 //!   DNS-rebinding — there is no resolve-then-reconnect gap).
 //! - [`validate_public_url`] is a cheap up-front check (scheme + literal IP) for
@@ -136,7 +136,7 @@ impl Resolve for SsrfGuardResolver {
 
 /// A `reqwest::ClientBuilder` hardened against SSRF: follows **no** redirects
 /// (so it only ever connects to the caller-validated URL) and resolves through
-/// [`SsrfGuardResolver`] (blocking names that map to internal addresses).
+/// `SsrfGuardResolver` (blocking names that map to internal addresses).
 ///
 /// Callers add their own timeouts / TLS as before.
 pub fn hardened_client_builder() -> reqwest::ClientBuilder {

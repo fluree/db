@@ -416,6 +416,21 @@ No stored format changes. These kinds of earlier data behave differently after t
 
 `@annotation` on a value of a reverse property (inside `@reverse`, or under a reverse-defined term) now annotates the edge in the direction it is stored.
 
+#### Graph-source requests are checked strictly (breaking)
+
+Every Iceberg route, `sql/map` and every Delta route now reads its connection, auth and storage identity through one codec, and refuses with `400` (`err:api/InvalidGraphSourceConfig`, the message naming the field, never its value) requests an earlier release accepted:
+
+- **An unknown field**, at the top level or inside a structured `catalog`, `io`, `auth` or `unity`. An earlier release ignored it, so a misspelled field (`warehose`, `auth_bearer_tokn`) did nothing and the source was registered without it. A route still ignores a field that another route of the same kind takes (`depth`, `table`, `name`, `r2rml`, …), so one body can go to browse, preview and map in turn: see [Iceberg connection](../api/endpoints.md#iceberg-connection) and [Delta catalog routes](../api/endpoints.md#post-api_base_urldeltacatalog-and-deltar2rml).
+- **Auth given two ways, or only partly.** On `sql/map`, OAuth2 used to win silently over a bearer token, and an OAuth2 token URL without its secret registered the source with no auth.
+- **An environment variable the operator does not list** in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning), for every `_env` field and `{"env_var": …}` on every route. `azure_client_secret_env` on the Delta routes skipped the list before.
+- **A catalog that states its `type` and is not that type**, such as `{"type": "direct", "uri": …}` with no `table_location`, which was read as a REST catalog.
+
+Registration also refuses what every query of the source would refuse, where it used to register a source that could not be read: a mapped Direct location that names no namespace and table, and a source whose storage the operator's host-identity policy refuses (`403`, `err:auth/HostIdentityRefused`; the policy allows every host identity unless [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) or `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS` is set).
+
+Google identity failures have their own codes where they were `500` (`err:system/InternalError`) on a query and `400` (`err:system/ConfigError`) on a preview: `err:auth/GoogleTokenExchange` (`401`, `403` or `502`), `err:auth/GoogleCredentialsInvalid` (`400`), `err:auth/HostIdentityRefused` (`403`) and `err:catalog/QuotaProjectRequired` (`403`). See [Errors](../api/errors.md).
+
+A `fluree sql map --remote` from this release sends a bearer token or OAuth2 client credentials as the flat fields, which an earlier server reads; a Google identity or an `_env` secret it sends is not read by an earlier server, which registers the source with no auth. A `fluree iceberg map --remote` from this release sends the structured `catalog` and `io`, which an earlier server does not read: it refuses the request with `400` (no `catalog_uri`). Use a CLI of the server's release against an earlier server.
+
 #### Lists in SPARQL updates and RDF text are stored as lists
 
 A `( … )` in a SPARQL update, and a list spelled out as `rdf:first`/`rdf:rest` triples over the document's own blank nodes in a Turtle, TriG or N-Triples insert or upsert or in a SPARQL update, used to be stored as those triples. They are now stored as a list, as a JSON-LD `@list` is, so `ex:s ex:items ?o` binds the members and `rdf:rest*/rdf:first` finds nothing for them. Lists already stored as triples stay triples, and read as them. A bulk import (`fluree create --from`) still stores a spelled-out list as its triples. See [Lists](../query/sparql.md#lists).
@@ -506,6 +521,10 @@ The `Garbage collection complete` log line's `retained_count` is replaced by `re
 #### `fluree doc` ledgers move to a new graph on the next ingest
 
 The first `fluree doc ingest` after the upgrade re-parses and re-ingests every document once, and the ledger moves to the new graph shape: `doco:Document` becomes `foaf:Document`, `doco:ListItem` goes away, and every chunk, mention, relation and structure-node IRI moves. The previous extraction is retracted in full. A triple you added to a chunk or relation node stays on that node's old IRI. Triples on the document node are unaffected, since its IRI doesn't move. An embedding model whose width differs from the one the ledger holds is refused ([Mixing models](../unstructured/concepts/vector-search.md#mixing-models)). See [What gets built](../unstructured/concepts/what-gets-built.md).
+
+#### macOS builds need macOS 14 or later
+
+The CLI binary and the Python wheel for Apple silicon are built for macOS 14 (Sonoma) and later; earlier releases ran on macOS 11. On an older macOS the CLI does not start, and Homebrew refuses to install or upgrade it, leaving the installed version in place. `pip install fluree` installs the last release built for macOS 11 instead; asking for a later version by number finds no wheel.
 
 #### `fluree-track-policy` is now parsed by the server
 
@@ -600,7 +619,7 @@ Fluree works with:
 
 **Server:**
 - Linux (x86_64, aarch64)
-- macOS (Intel, Apple Silicon)
+- macOS 14 or later (Apple silicon)
 - Windows (x86_64)
 
 **Clients:**
