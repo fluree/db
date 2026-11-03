@@ -17,6 +17,8 @@ $ fluree logout
 Signed out of fluree.ai as you@example.com (Your Org)
 ```
 
-When the machine isn't signed in, `fluree logout` prints `Not signed in` and does nothing.
+When the machine isn't signed in, `fluree logout` prints `Not signed in` and does nothing. When `account.toml` can't be read
+(damaged, or written by a newer CLI), `fluree logout` removes it and warns that the server wasn't told: disconnect the machine
+from the account's dashboard if it was signed in. `fluree login` also replaces such a file.
 
 Remote logins are separate: use [`fluree auth logout --remote <name>`](auth.md#fluree-auth-logout) for those.

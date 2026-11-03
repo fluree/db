@@ -8,7 +8,11 @@
 //!
 //! The access token is short-lived (an hour on fluree.ai); [`session`]
 //! returns one with time left, refreshing it through the account's exchange
-//! endpoint (`grant_type=refresh_token`) and saving the result.
+//! endpoint (`grant_type=refresh_token`) and saving the result. A refresh
+//! holds a lock on `account.toml.lock`, so two processes near expiry don't
+//! both spend the same refresh token. [`send`] makes a call with the
+//! session and, when the service says the token predates a configuration
+//! change (401 `config_stale`), refreshes and sends it once more.
 
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
@@ -107,7 +111,7 @@ pub fn load_from(path: &Path) -> CliResult<Option<StoredAccount>> {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).map(Some).map_err(|e| {
             CliError::Config(format!(
-                "{} is unreadable ({e}); run `fluree logout` and sign in again",
+                "{} is unreadable ({e}); `fluree login` signs in again (and `fluree logout` removes it)",
                 path.display()
             ))
         }),
@@ -139,12 +143,48 @@ pub fn save_to(path: &Path, account: &StoredAccount) -> CliResult<()> {
         "# Written by `fluree login`. It holds credentials for your fluree.ai account:\n\
          # keep it private, and sign out with `fluree logout`.\n\n{body}"
     );
-    let tmp = dir.join(format!(".{ACCOUNT_FILE}.{}", std::process::id()));
+    let tmp = dir.join(temp_name());
     write_private(&tmp, text.as_bytes())?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         CliError::Config(format!("failed to write {}: {e}", path.display()))
     })
+}
+
+/// A temp file name no other save shares: pid, a per-process counter and
+/// the time, so two saves in one process (or two processes) never collide.
+fn temp_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!(
+        ".{ACCOUNT_FILE}.{}.{}.{nanos}",
+        std::process::id(),
+        SAVES.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Holds `account.toml.lock` exclusively until dropped: refreshes from two
+/// processes take turns, and the second re-reads what the first saved.
+struct RefreshLock(#[allow(dead_code)] std::fs::File);
+
+fn lock_for(path: &Path) -> CliResult<RefreshLock> {
+    let lock_path = path.with_file_name(format!("{ACCOUNT_FILE}.lock"));
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CliError::Config(format!("failed to create {}: {e}", dir.display())))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| CliError::Config(format!("failed to open {}: {e}", lock_path.display())))?;
+    file.lock()
+        .map_err(|e| CliError::Config(format!("failed to lock {}: {e}", lock_path.display())))?;
+    Ok(RefreshLock(file))
 }
 
 #[cfg(unix)]
@@ -194,20 +234,51 @@ pub fn token_seconds_left(token: &str) -> Option<i64> {
     Some(exp - chrono::Utc::now().timestamp())
 }
 
+/// What a `grant_type=refresh_token` call answered: its status and JSON
+/// body. Shared by the account's refresh and a remote's.
+pub(crate) struct RefreshAnswer {
+    pub status: reqwest::StatusCode,
+    pub body: serde_json::Value,
+}
+
+impl RefreshAnswer {
+    pub fn access_token(&self) -> Option<&str> {
+        self.body.get("access_token").and_then(|v| v.as_str())
+    }
+
+    /// A refresh token the server rotated in, if it sent one.
+    pub fn refresh_token(&self) -> Option<&str> {
+        self.body.get("refresh_token").and_then(|v| v.as_str())
+    }
+}
+
+/// `POST exchange_url` with `grant_type=refresh_token`. Only transport
+/// failures are errors; the caller reads the status.
+pub(crate) async fn post_refresh(
+    http: &reqwest::Client,
+    exchange_url: &str,
+    refresh_token: &str,
+) -> Result<RefreshAnswer, reqwest::Error> {
+    let resp = http
+        .post(exchange_url)
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.json().await.unwrap_or_default();
+    Ok(RefreshAnswer { status, body })
+}
+
 /// Trade the refresh token for a new access token. Updates `account` in
 /// place (including a rotated refresh token, if the server sends one).
 pub async fn refresh(http: &reqwest::Client, account: &mut StoredAccount) -> CliResult<()> {
-    let resp = http
-        .post(&account.exchange_url)
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": account.refresh_token,
-        }))
-        .send()
+    let answer = post_refresh(http, &account.exchange_url, &account.refresh_token)
         .await
         .map_err(|e| CliError::Remote(format!("token refresh failed: {e}")))?;
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let (status, body) = (answer.status, &answer.body);
     if !status.is_success() {
         let desc = body
             .get("error_description")
@@ -224,36 +295,131 @@ pub async fn refresh(http: &reqwest::Client, account: &mut StoredAccount) -> Cli
             "token refresh failed ({status}): {desc}"
         )));
     }
-    let access_token = body
-        .get("access_token")
-        .and_then(|v| v.as_str())
+    let access_token = answer
+        .access_token()
         .ok_or_else(|| CliError::Remote("refresh response missing access_token".into()))?;
     account.access_token = access_token.to_string();
-    if let Some(rotated) = body.get("refresh_token").and_then(|v| v.as_str()) {
+    if let Some(rotated) = answer.refresh_token() {
         account.refresh_token = rotated.to_string();
     }
-    if let Some(summary) = AccountSummary::from_exchange(&body) {
+    if let Some(summary) = AccountSummary::from_exchange(body) {
         account.account = Some(summary);
     }
     Ok(())
 }
 
 /// An access token with time left for the signed-in account, refreshing
-/// (and saving) it first when it is about to expire. `Ok(None)` when this
-/// machine isn't signed in.
-pub async fn session(http: &reqwest::Client) -> CliResult<Option<AccountSession>> {
-    let Some(mut account) = load()? else {
+/// (and saving) it first when it is about to expire, or always with
+/// `force`. `Ok(None)` when this machine isn't signed in.
+pub async fn session(http: &reqwest::Client, force: bool) -> CliResult<Option<AccountSession>> {
+    session_at(http, &account_path()?, force).await
+}
+
+/// [`session`] for the sign-in stored at `path`.
+pub async fn session_at(
+    http: &reqwest::Client,
+    path: &Path,
+    force: bool,
+) -> CliResult<Option<AccountSession>> {
+    let fresh = |a: &StoredAccount| {
+        token_seconds_left(&a.access_token).is_some_and(|s| s > REFRESH_MARGIN_SECS)
+    };
+    let Some(seen) = load_from(path)? else {
         return Ok(None);
     };
-    let fresh = token_seconds_left(&account.access_token).is_some_and(|s| s > REFRESH_MARGIN_SECS);
-    if !fresh {
-        refresh(http, &mut account).await?;
-        save(&account)?;
+    if !force && fresh(&seen) {
+        return Ok(Some(AccountSession::of(seen)));
     }
-    Ok(Some(AccountSession {
-        api_base_url: account.api_base_url,
-        access_token: account.access_token,
-    }))
+    // Waiting for another process's refresh blocks, so not on the runtime.
+    let lock_path = path.to_path_buf();
+    let _lock = tokio::task::spawn_blocking(move || lock_for(&lock_path))
+        .await
+        .map_err(|e| CliError::Config(format!("waiting for the sign-in lock: {e}")))??;
+    // Re-read under the lock: another process may have refreshed already.
+    let Some(mut account) = load_from(path)? else {
+        return Ok(None);
+    };
+    let refreshed_meanwhile = account.access_token != seen.access_token;
+    if !(fresh(&account) && (refreshed_meanwhile || !force)) {
+        refresh(http, &mut account).await?;
+        save_to(path, &account)?;
+    }
+    Ok(Some(AccountSession::of(account)))
+}
+
+impl AccountSession {
+    fn of(account: StoredAccount) -> Self {
+        Self {
+            api_base_url: account.api_base_url,
+            access_token: account.access_token,
+        }
+    }
+}
+
+/// Whether a response says the access token predates a change to the
+/// account's configuration: 401 with `config_stale`, which a fresh token
+/// cures. The code sits at `error.error` (or a top-level `error`).
+pub fn is_config_stale(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        && body
+            .pointer("/error/error")
+            .or_else(|| body.get("error"))
+            .and_then(|v| v.as_str())
+            == Some("config_stale")
+}
+
+/// Send a request built by `build` with the signed-in account's token. On
+/// a 401 `config_stale` the token is refreshed and the request sent once
+/// more; any other 401 is an error. `Ok(None)` when this machine isn't
+/// signed in.
+pub async fn send<F>(http: &reqwest::Client, build: F) -> CliResult<Option<reqwest::Response>>
+where
+    F: Fn(&AccountSession) -> reqwest::RequestBuilder,
+{
+    send_at(http, &account_path()?, build).await
+}
+
+/// [`send`] for the sign-in stored at `path`.
+pub async fn send_at<F>(
+    http: &reqwest::Client,
+    path: &Path,
+    build: F,
+) -> CliResult<Option<reqwest::Response>>
+where
+    F: Fn(&AccountSession) -> reqwest::RequestBuilder,
+{
+    let Some(session) = session_at(http, path, false).await? else {
+        return Ok(None);
+    };
+    let resp = build(&session)
+        .send()
+        .await
+        .map_err(|e| CliError::Remote(e.to_string()))?;
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(Some(resp));
+    }
+    let status = resp.status();
+    let url = resp.url().to_string();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !is_config_stale(status, &body) {
+        // A refused token a refresh won't cure.
+        let message = body
+            .pointer("/error/message")
+            .or_else(|| body.get("error_description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("the sign-in was refused");
+        return Err(CliError::Remote(format!(
+            "{url} answered {status}: {message}"
+        )));
+    }
+    let Some(session) = session_at(http, path, true).await? else {
+        return Ok(None);
+    };
+    let resp = build(&session)
+        .send()
+        .await
+        .map_err(|e| CliError::Remote(e.to_string()))?;
+    Ok(Some(resp))
 }
 
 /// ` --url <url>` unless it is the default, for hints.

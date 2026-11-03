@@ -17,7 +17,7 @@ fluree login [--url <URL>] [--no-browser]
 
 | Option | Description |
 |--------|-------------|
-| `--url <URL>` | Account service to sign in to (default `https://fluree.ai`) |
+| `--url <URL>` | Account service to sign in to (default `https://fluree.ai`). It must be `https`, except to this machine (`localhost`, a loopback address) |
 | `--no-browser` | Print the approval link instead of opening a browser (for example over SSH) |
 
 ## What happens
@@ -50,10 +50,13 @@ Running `fluree login` again replaces the stored sign-in and signs the previous 
 (`~/Library/Application Support/fluree/` on macOS, `~/.config/fluree/` on Linux, `%LOCALAPPDATA%\fluree\` on Windows).
 It is written with owner-only permissions (0600 on Unix) and holds:
 
-- a short-lived access token (an hour on fluree.ai), renewed automatically when it is about to expire;
+- a short-lived access token (an hour on fluree.ai), renewed automatically when it is about to expire, and when a service
+  answers `401 config_stale` (the account's configuration changed after the token was issued), after which the call is sent
+  once more. Two processes renewing at once take turns (`account.toml.lock`), so the refresh credential is spent once;
 - a long-lived refresh credential for this machine. Treat the file like a password; `fluree logout` revokes it.
 
-`fluree auth status` shows the sign-in without contacting the server. Each signed-in machine also appears on the account's
+`fluree auth status` shows the sign-in without contacting the server, and `fluree auth token --account` prints its access token
+for scripts. Each signed-in machine also appears on the account's
 dashboard, where it can be disconnected.
 
 ## Signing out

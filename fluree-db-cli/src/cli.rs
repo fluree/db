@@ -3447,8 +3447,20 @@ pub enum AuthAction {
     /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "account")]
         remote: Option<String>,
+
+        /// The machine's fluree.ai sign-in (`fluree login`) instead of a
+        /// remote: an access token with time left, refreshed first if it
+        /// is about to expire. Needs no project.
+        #[arg(long)]
+        account: bool,
+
+        /// With `--account`: refresh the token even if it has time left,
+        /// e.g. after the account's configuration changed and the service
+        /// answers `config_stale`.
+        #[arg(long, requires = "account")]
+        refresh: bool,
     },
 }
 

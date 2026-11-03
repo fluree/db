@@ -131,7 +131,7 @@ means a Fluree data API):
   },
   "auth": {
     "type": "oidc_device",
-    "issuer": "https://fluree.ai",
+    "issuer": "https://fluree.ai/v1/oauth",
     "client_id": "fluree-cli",
     "exchange_url": "https://fluree.ai/v1/oauth/exchange",
     "scopes": ["openid"]
@@ -151,7 +151,9 @@ The flow is the one above with two requirements: the issuer's `openid-configurat
 which the CLI uses with `grant_type=refresh_token` whenever the access token is about to expire. The device request may
 carry a non-standard `device_name` form field (the machine's host name) for the approval page to show. Sign-out is
 `POST {account.api_base_url}/auth/disconnect` with the access token as Bearer; the server should revoke the machine's refresh
-credential.
+credential. A service that invalidates tokens when the account's configuration changes should answer such a token `401` with the
+code `config_stale` (top-level `error`, or `error.error`): the CLI then refreshes and sends the call once more, and
+`fluree auth token --account --refresh` forces the same renewal for scripts.
 
 ## Token exchange
 
