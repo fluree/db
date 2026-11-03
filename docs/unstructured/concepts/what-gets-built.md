@@ -33,7 +33,7 @@ A `doc:Chunk` is a retrieval unit cut along that structure. The chunker walks th
 
 ## The document node
 
-A `doc:SourceDocument` at the document's IRI records the file: `doc:fileName`, `doc:relativePath`, `doc:sha256`, `doc:mediaType`, `doc:byteSize`, `doc:pageCount`, `doc:escalatedCrops`, `doc:parserRevision`, `doc:chunkCount`, `doc:embeddingModel`, `doc:embeddingDimensions`, `doc:ingestedAt`, and, when extraction ran, `doc:extractionModel`, `doc:extractionFingerprint`, `doc:mentionCount`, `doc:entityCount`, `doc:relationCount`. It is what a later run compares against to decide whether the document is unchanged.
+A `doc:SourceDocument` at the document's IRI records the file: `doc:fileName`, `doc:relativePath`, `doc:sha256`, `doc:mediaType`, `doc:byteSize`, `doc:pageCount`, `doc:escalatedCrops`, `doc:parserRevision`, `doc:chunkCount`, `doc:embeddingModel`, `doc:embeddingDimensions`, `doc:ingestedAt`, and, when extraction ran, `doc:extractionModel`, `doc:extractionFingerprint`, `doc:mentionCount`, `doc:entityCount`, `doc:relationCount` (and, for a reader, `doc:readerPredicate`). It is what a later run compares against to decide whether the document is unchanged.
 
 ## Entities, mentions and relations
 

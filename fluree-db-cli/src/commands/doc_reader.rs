@@ -119,3 +119,13 @@ pub fn read_document(
             _ => CliError::from(e),
         })
 }
+
+/// What reading a document would take, with nothing sent (`--dry-run`):
+/// its calls, and how many a cached answer would serve.
+pub fn plan_document(
+    setup: &ReaderSetup,
+    doc: &PreparedDocument,
+    requests_to: Option<&std::path::Path>,
+) -> CliResult<(usize, usize)> {
+    Ok(setup.session.plan(doc, requests_to)?)
+}

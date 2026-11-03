@@ -7,7 +7,7 @@
 
 use super::client::{ReaderClient, Usage};
 use super::reading::{profile, read_answer, Frame, Vocabulary};
-use super::request::{self, Document, Limits, PromptSize, Structure};
+use super::request::{self, Document, Limits, Part, PromptSize, Structure};
 use crate::vocab::{DOC_NS, NIF_NS};
 use crate::{DocCache, DocError, PreparedDocument, Result};
 use fluree_graph_ir::Graph;
@@ -72,37 +72,35 @@ impl Session {
         self.size.ontology_terms
     }
 
-    pub fn catalog_records(&self) -> usize {
-        self.size.catalog_records
-    }
-
     /// Hash of the model, ontology and catalog: what makes an earlier
-    /// reading of an unchanged document still current.
-    pub fn fingerprint(&self) -> String {
-        let hash = |g: &Graph| crate::cache::sha256_hex(request::canonical_ntriples(g).as_bytes());
-        crate::cache::sha256_hex(
+    /// reading of an unchanged document still current. An error rather
+    /// than a hash of nothing when a graph can't be written.
+    pub fn fingerprint(&self) -> Result<String> {
+        let hash = |g: &Graph| -> Result<String> {
+            Ok(crate::cache::sha256_hex(
+                request::canonical_ntriples(g)?.as_bytes(),
+            ))
+        };
+        Ok(crate::cache::sha256_hex(
             format!(
                 "reader|{}|{}|{}",
                 self.model,
-                hash(&self.ontology),
-                hash(&self.catalog)
+                hash(&self.ontology)?,
+                hash(&self.catalog)?
             )
             .as_bytes(),
-        )
+        ))
     }
 
-    /// Read one parsed document: cut it into calls, read each, and gather
-    /// the answers in the document's own offsets. Blocking (the client is).
-    /// `on_wait` hears each wait for capacity, prefixed with the document's
-    /// path (and the call, when there are several). With `requests_to`,
-    /// each call's body is also written there as
+    /// A document's calls with their bodies, every one built and sized
+    /// before anything is sent; none for a document with no text. With
+    /// `requests_to`, each body is also written there as
     /// `<relative-path>.request-<n>.trig`.
-    pub fn read(
+    fn requests(
         &self,
         doc: &PreparedDocument,
         requests_to: Option<&Path>,
-        on_wait: &dyn Fn(&str),
-    ) -> Result<Read> {
+    ) -> Result<(Structure, Vec<(Part, String)>)> {
         let document = Document {
             iri: &doc.doc_iri,
             name: &doc.meta.file_name,
@@ -110,31 +108,82 @@ impl Session {
             doco: &doc.parsed.doco,
         };
         let structure = Structure::new(&document)?;
-        let parts = structure.plan(&Limits::default(), &self.size)?;
-        let mut read = Read {
-            calls: parts.len(),
-            ..Default::default()
-        };
-        for (i, part) in parts.iter().enumerate() {
-            let graph = structure.document_graph(&document, part);
-            let body = request::body(&graph, &self.ontology, &self.catalog, part)?;
-            if let Some(dir) = requests_to {
+        // No text, nothing to read: a call would bill the ontology and
+        // catalog for an empty reading.
+        if doc.parsed.text.trim().is_empty() {
+            return Ok((structure, Vec::new()));
+        }
+        let requests = structure.requests(
+            &document,
+            &self.ontology,
+            &self.catalog,
+            &Limits::default(),
+            &self.size,
+        )?;
+        if let Some(dir) = requests_to {
+            for (i, (_, body)) in requests.iter().enumerate() {
                 let name = format!(
                     "{}.request-{}.trig",
                     doc.meta.relative_path.replace('/', "__"),
                     i + 1
                 );
-                std::fs::write(dir.join(name), &body)?;
+                std::fs::write(dir.join(name), body)?;
             }
-            let key = DocCache::reading_key(
-                &format!(
-                    "reader|{}|{}",
-                    self.model,
-                    self.cache.as_deref().unwrap_or("")
-                ),
-                &body,
-                &[],
-            );
+        }
+        Ok((structure, requests))
+    }
+
+    /// Where an answer to `body` is cached. The endpoint is part of the
+    /// key: two readers serving one model name are two readers.
+    fn answer_key(&self, body: &str) -> String {
+        DocCache::reading_key(
+            &format!(
+                "reader|{}|{}|{}",
+                self.client.url(),
+                self.model,
+                self.cache.as_deref().unwrap_or("")
+            ),
+            body,
+            &[],
+        )
+    }
+
+    /// What reading a document would take, with nothing sent (a dry run):
+    /// its calls, and how many a cached answer would serve.
+    pub fn plan(&self, doc: &PreparedDocument, requests_to: Option<&Path>) -> Result<(usize, usize)> {
+        let (_, requests) = self.requests(doc, requests_to)?;
+        let cached = requests
+            .iter()
+            .filter(|(_, body)| {
+                self.doc_cache
+                    .as_ref()
+                    .and_then(|c| c.load_reading(&self.answer_key(body)))
+                    .flatten()
+                    .is_some()
+            })
+            .count();
+        Ok((requests.len(), cached))
+    }
+
+    /// Read one parsed document: cut it into calls, read each, and gather
+    /// the answers in the document's own offsets. Blocking (the client is).
+    /// `on_wait` hears each wait for capacity, prefixed with the document's
+    /// path (and the call, when there are several). `requests_to` as in
+    /// [`Session::plan`].
+    pub fn read(
+        &self,
+        doc: &PreparedDocument,
+        requests_to: Option<&Path>,
+        on_wait: &dyn Fn(&str),
+    ) -> Result<Read> {
+        let (structure, requests) = self.requests(doc, requests_to)?;
+        let parts = requests.len();
+        let mut read = Read {
+            calls: parts,
+            ..Default::default()
+        };
+        for (i, (part, body)) in requests.iter().enumerate() {
+            let key = self.answer_key(body);
             let cached = self
                 .doc_cache
                 .as_ref()
@@ -150,19 +199,14 @@ impl Session {
                     )
                 }
                 None => {
-                    let label = if parts.len() > 1 {
-                        format!(
-                            "{} (call {} of {})",
-                            doc.meta.relative_path,
-                            i + 1,
-                            parts.len()
-                        )
+                    let label = if parts > 1 {
+                        format!("{} (call {} of {parts})", doc.meta.relative_path, i + 1)
                     } else {
                         doc.meta.relative_path.clone()
                     };
                     let answer =
                         self.client
-                            .read(&body, &self.model, self.cache.as_deref(), &|wait| {
+                            .read(body, &self.model, self.cache.as_deref(), &|wait| {
                                 on_wait(&format!("{label}: {wait}"));
                             })?;
                     read.usage.add(&answer.usage);
@@ -186,7 +230,7 @@ impl Session {
                 doc_iri: &doc.doc_iri,
                 offset: part.begin,
                 part: i,
-                parts: parts.len(),
+                parts,
             };
             let reading = read_answer(&answer_body, &frame, self.vocabulary)?;
             read.mentions += reading.mentions;
@@ -221,10 +265,10 @@ pub struct Read {
     pub ontology_notes: Vec<String>,
 }
 
-/// A mention gets `doc:sourceElement`, the element its span sits in, as
-/// the language-model path gives one.
+/// A mention (see [`super::reading::is_occurrence`]) gets
+/// `doc:sourceElement`, the element its span sits in, as the
+/// language-model path gives one.
 fn source_elements(structure: &Structure, nodes: &mut [Value]) {
-    let mention = format!("{DOC_NS}Mention");
     let offset = |node: &Value, p: &str| {
         let v = node
             .get(format!("{NIF_NS}{p}"))?
@@ -236,10 +280,7 @@ fn source_elements(structure: &Structure, nodes: &mut [Value]) {
             .map(|n| n as usize)
     };
     for node in nodes {
-        let is_mention = node
-            .get("@type")
-            .and_then(Value::as_array)
-            .is_some_and(|t| t.iter().any(|t| t == &json!(mention)));
+        let is_mention = super::reading::is_occurrence(node);
         let key = format!("{DOC_NS}sourceElement");
         if !is_mention || node.get(&key).is_some() {
             continue;

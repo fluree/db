@@ -33,6 +33,9 @@ pub struct ExtractionStamp {
     pub mentions: usize,
     pub entities: usize,
     pub relations: usize,
+    /// Predicates a reader wrote outside the pipeline's own
+    /// ([`reader_predicates`]); recorded so a re-ingest takes back exactly these.
+    pub reader_predicates: Vec<String>,
 }
 
 /// `{document}-chunk-{n}`. Like the engine's `{document}-element-{n}`, it
@@ -77,8 +80,31 @@ pub fn document_node(
         node[vocab::MENTION_COUNT] = json!(x.mentions);
         node[vocab::ENTITY_COUNT] = json!(x.entities);
         node[vocab::RELATION_COUNT] = json!(x.relations);
+        if !x.reader_predicates.is_empty() {
+            node[vocab::READER_PREDICATE] = x
+                .reader_predicates
+                .iter()
+                .map(|p| json!({ "@id": p }))
+                .collect();
+        }
     }
     node
+}
+
+/// The predicates on a reading's expanded nodes that the pipeline does not
+/// own, sorted: what [`ExtractionStamp::reader_predicates`] records.
+pub fn reader_predicates(nodes: &[Value]) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for node in nodes {
+        if let Some(map) = node.as_object() {
+            for key in map.keys() {
+                if !key.starts_with('@') && !is_owned_predicate(key) {
+                    out.insert(key.clone());
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// One `doc:Chunk` node per chunk, embedding attached when present.
@@ -213,10 +239,12 @@ fn expand_owned(predicate: &str) -> String {
 
 /// SPARQL UPDATE that retracts everything a previous extraction of this
 /// document wrote: every node stamped with it, the table cells those hold,
-/// and the document node itself. A stamped node a reader minted under the
-/// document's own IRI (`<doc>/…`, `<doc>#…`) is the pipeline's whole, in
-/// whatever terms the reader wrote it, so it goes with every predicate. Re-extraction is retract-then-insert,
-/// never a diff; the earlier extraction stays queryable at its commit.
+/// and the document node itself. On a stamped node a reader minted under
+/// the document's own IRI (`<doc>/…`, `<doc>#…`), the predicates that
+/// reader wrote in its own terms go too: the document node lists them
+/// (`doc:readerPredicate`), so a predicate someone else added to such a
+/// node survives. Re-extraction is retract-then-insert, never a diff; the
+/// earlier extraction stays queryable at its commit.
 ///
 /// Cells are the one node the engine does not stamp: a cell is always one
 /// `po:contains` below its stamped table, and cells are most of a
@@ -257,7 +285,7 @@ pub fn retract_update(doc_iri: &str) -> String {
            }}\n  \
            UNION\n  \
            {{\n    \
-             ?s doc:sourceDocument <{iri}> . ?s ?p ?o\n    \
+             <{iri}> doc:readerPredicate ?p . ?s doc:sourceDocument <{iri}> . ?s ?p ?o\n    \
              FILTER ( STRSTARTS(STR(?s), \"{iri}/\") || STRSTARTS(STR(?s), \"{iri}#\") )\n  \
            }}\n\
          }}",
@@ -618,6 +646,7 @@ mod tests {
                 mentions: 1,
                 entities: 1,
                 relations: 1,
+                reader_predicates: vec!["http://example.org/r#score".into()],
             }),
         );
         let embeddings: Vec<Vec<f32>> = chunks.iter().map(|_| vec![0.0, 1.0, 0.0]).collect();

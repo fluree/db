@@ -181,7 +181,7 @@ pub fn read_answer(
             }
             reading.relations += 1;
         }
-        if types.contains(&format!("{DOC_NS}Mention")) {
+        if is_occurrence(node) {
             reading.mentions += 1;
         }
         if types.contains(&format!("{DOC_NS}Entity")) {
@@ -322,6 +322,86 @@ fn has_context(v: &Value) -> bool {
     }
 }
 
+/// `--relations` applied to a reading. `Direct` keeps it whole; `Reified`
+/// keeps each `doc:Relation` but takes away the edges the reading asserted
+/// for them (and their `doc:asserted`, which records that an edge was
+/// written); `Off` takes away the relations and those edges both. Returns
+/// how many relations remain.
+pub fn apply_relations(nodes: &mut Vec<Value>, mode: crate::extract::RelationMode) -> usize {
+    use crate::extract::RelationMode;
+    let relation = format!("{DOC_NS}Relation");
+    let asserted_p = format!("{DOC_NS}asserted");
+    let is_relation = |n: &Value| types(n).contains(&relation);
+    if mode == RelationMode::Direct {
+        return nodes.iter().filter(|n| is_relation(n)).count();
+    }
+    let first_iri = |n: &Value, p: &str| {
+        n.get(format!("{RDF_NS}{p}"))
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|v| v.get("@id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    // The edges the reading asserted for its relations.
+    let edges: BTreeSet<(String, String, String)> = nodes
+        .iter()
+        .filter(|n| is_relation(n) && n.get(&asserted_p).is_some())
+        .filter_map(|n| {
+            Some((
+                first_iri(n, "subject")?,
+                first_iri(n, "predicate")?,
+                first_iri(n, "object")?,
+            ))
+        })
+        .collect();
+    for node in nodes.iter_mut() {
+        let Some(s) = node.get("@id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        let Some(map) = node.as_object_mut() else {
+            continue;
+        };
+        let predicates: Vec<String> = map
+            .keys()
+            .filter(|k| !k.starts_with('@'))
+            .cloned()
+            .collect();
+        for p in predicates {
+            if let Some(Value::Array(values)) = map.get_mut(&p) {
+                values.retain(|v| {
+                    let o = v.get("@id").and_then(Value::as_str).unwrap_or_default();
+                    !edges.contains(&(s.clone(), p.clone(), o.to_string()))
+                });
+                if values.is_empty() {
+                    map.remove(&p);
+                }
+            }
+        }
+        map.remove(&asserted_p);
+    }
+    if mode == RelationMode::Off {
+        nodes.retain(|n| !is_relation(n));
+    }
+    nodes.iter().filter(|n| is_relation(n)).count()
+}
+
+/// Whether a node is a mention: typed `doc:Mention`, or any NIF string
+/// (`nif:RFC5147String`, `nif:String`, `nif:Phrase`, `nif:Word`) carrying
+/// `nif:beginIndex`, which is how a reader marks a span of the text
+/// whatever else it calls it. Counted and given `doc:sourceElement` the
+/// same way, so a reading in a reader's own terms still says what it found.
+pub fn is_occurrence(node: &Value) -> bool {
+    let types = types(node);
+    if types.iter().any(|t| t == &format!("{DOC_NS}Mention")) {
+        return true;
+    }
+    let nif_string = ["RFC5147String", "String", "Phrase", "Word"]
+        .iter()
+        .any(|local| types.iter().any(|t| *t == format!("{NIF_NS}{local}")));
+    nif_string && node.get(format!("{NIF_NS}beginIndex")).is_some()
+}
+
 fn types(node: &Value) -> Vec<String> {
     node.get("@type")
         .and_then(Value::as_array)
@@ -347,7 +427,9 @@ pub fn to_graph(nodes: &[Value]) -> Result<fluree_graph_ir::Graph> {
     let mut sink = fluree_graph_ir::GraphCollectorSink::new();
     fluree_graph_json_ld::adapter::to_graph_events(&Value::Array(nodes.to_vec()), &mut sink)
         .map_err(|e| DocError::Model(format!("reading: {e}")))?;
-    Ok(sink.into_graph())
+    let mut graph = sink.into_graph();
+    super::request::retype_native_literals(&mut graph);
+    Ok(graph)
 }
 
 /// The prefixes a printed reading is written with: this pipeline's own.
@@ -533,6 +615,69 @@ mod tests {
     }
 
     #[test]
+    fn a_nif_occurrence_in_a_readers_own_terms_counts_as_a_mention() {
+        let answer = json!([{ "@id": "urn:d/reading", "@graph": [
+            { "@id": "urn:d/reading#o1",
+              format!("{RDF_NS}type"): [{ "@id": format!("{EX}Occurrence") }, { "@id": format!("{NIF_NS}RFC5147String") }],
+              BEGIN: [{ "@value": 0 }], END: [{ "@value": 4 }] },
+            { "@id": "urn:d/reading#x",
+              format!("{RDF_NS}type"): [{ "@id": format!("{NIF_NS}RFC5147String") }] }
+        ]}])
+        .to_string();
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let r = read_answer(&answer, &frame, None).unwrap();
+        // The second has no offsets: not a mention.
+        assert_eq!(r.mentions, 1);
+    }
+
+    #[test]
+    fn relations_off_or_reified_take_away_what_they_should() {
+        use crate::extract::RelationMode;
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let read = || read_answer(&answer(), &frame, None).unwrap().nodes;
+        let edge = |nodes: &[Value]| {
+            node_in(nodes, "urn:d/entity/1")
+                .get("urn:onto:supplier")
+                .is_some()
+        };
+        let mut direct = read();
+        assert_eq!(apply_relations(&mut direct, RelationMode::Direct), 2);
+        assert!(edge(&direct));
+
+        let mut reified = read();
+        assert_eq!(apply_relations(&mut reified, RelationMode::Reified), 2);
+        assert!(!edge(&reified), "the asserted edge goes");
+        assert!(reified
+            .iter()
+            .all(|n| n.get(format!("{DOC_NS}asserted")).is_none()));
+        // A literal value the reading states is not a relation's edge.
+        assert!(node_in(&reified, "urn:d/entity/1")
+            .get("urn:onto:total")
+            .is_some());
+
+        let mut off = read();
+        assert_eq!(apply_relations(&mut off, RelationMode::Off), 0);
+        assert!(!edge(&off));
+        assert!(off
+            .iter()
+            .all(|n| !types(n).contains(&format!("{DOC_NS}Relation"))));
+    }
+
+    fn node_in<'a>(nodes: &'a [Value], id: &str) -> &'a Value {
+        nodes.iter().find(|n| n["@id"] == id).unwrap()
+    }
+
+    #[test]
     fn a_reading_prints_as_turtle_and_trig() {
         let frame = Frame {
             doc_iri: "urn:d",
@@ -554,10 +699,42 @@ mod tests {
             fluree_graph_ir::Term::integer(0),
         );
         let trig = trig("urn:d", &structure, &r.nodes).unwrap();
-        assert!(
-            trig.contains("<urn:d> {") && trig.contains("<urn:d/reading> {"),
-            "{trig}"
-        );
+        // Each graph holds what it should, not just a header.
+        let block = |name: &str| {
+            let start = trig
+                .find(&format!("{name} {{"))
+                .unwrap_or_else(|| panic!("no {name} graph in {trig}"));
+            let rest = &trig[start..];
+            rest[..rest.find("\n}").unwrap_or(rest.len())].to_string()
+        };
+        let (doc, reading) = (block("<urn:d>"), block("<urn:d/reading>"));
+        assert!(doc.contains("urn:d-element-1"), "{trig}");
+        assert!(!doc.contains("o4-9"), "{trig}");
+        assert!(reading.contains("o4-9"), "{trig}");
+        assert!(!reading.contains("urn:d-element-1"), "{trig}");
+    }
+
+    #[test]
+    fn a_native_json_number_prints_as_a_number() {
+        let answer = json!([{ "@id": "urn:d/reading", "@graph": [{
+            "@id": "urn:d/reading#o0-4",
+            format!("{RDF_NS}type"): [{ "@id": format!("{NIF_NS}RFC5147String") }],
+            BEGIN: [{ "@value": 31 }],
+            END: [{ "@value": 35 }],
+            format!("{EX}score"): [{ "@value": 0.5 }]
+        }]}])
+        .to_string();
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let r = read_answer(&answer, &frame, None).unwrap();
+        let ttl = turtle(&r.nodes).unwrap();
+        assert!(ttl.contains("beginIndex 31"), "{ttl}");
+        assert!(!ttl.contains("beginIndex \"31\""), "{ttl}");
+        assert!(!ttl.contains("\"0.5\""), "{ttl}");
     }
 
     #[test]

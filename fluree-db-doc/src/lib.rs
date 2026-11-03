@@ -67,6 +67,14 @@ pub enum DocError {
     Config(String),
     #[error("model endpoint: {0}")]
     Model(String),
+    /// An endpoint answered with an error status: its code, kept typed so a
+    /// caller can tell a refused credential from a refused request.
+    #[error("model endpoint: {model}: {status} {message}")]
+    Endpoint {
+        model: String,
+        status: u16,
+        message: String,
+    },
     /// The document asks the vision model for more crops than the caller
     /// allowed. Raised before any call is made, so nothing has been spent.
     #[error("{crops} crop(s) routed to the vision model, past the cap of {cap}")]

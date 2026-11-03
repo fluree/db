@@ -215,6 +215,10 @@ impl ReaderClient {
             let headers = response.headers().clone();
             let text = response
                 .body_mut()
+                // An answer echoes the structure graph beside the reading;
+                // ureq's 10 MiB default is too tight for a large document.
+                .with_config()
+                .limit(64 * 1024 * 1024)
                 .read_to_string()
                 .map_err(|e| DocError::Model(format!("{}: reading the answer: {e}", self.url)))?;
             if (200..300).contains(&status) {
@@ -249,15 +253,19 @@ impl ReaderClient {
                 .then(|| headers.get("retry-after"))
                 .flatten()
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok());
+                .and_then(retry_after_secs);
             match retry_after {
                 Some(secs) if attempt < ATTEMPTS => {
                     let wait = Duration::from_secs(secs.clamp(1, MAX_RETRY_AFTER));
                     if waited + wait > MAX_WAIT {
-                        return Err(DocError::Model(format!(
-                            "{model} had no capacity after {}s of waiting: {message}",
-                            waited.as_secs()
-                        )));
+                        return Err(DocError::Endpoint {
+                            model: model.to_string(),
+                            status,
+                            message: format!(
+                                "no capacity after {}s of waiting: {message}",
+                                waited.as_secs()
+                            ),
+                        });
                     }
                     on_wait(&format!(
                         "{model}: {message}; trying again in {}s (attempt {} of {ATTEMPTS})",
@@ -269,7 +277,11 @@ impl ReaderClient {
                     attempt += 1;
                 }
                 _ => {
-                    return Err(DocError::Model(format!("{model}: {status} {message}")));
+                    return Err(DocError::Endpoint {
+                        model: model.to_string(),
+                        status,
+                        message,
+                    });
                 }
             }
         }
@@ -286,6 +298,20 @@ fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// `Retry-After` as seconds to wait: delay-seconds, or an HTTP-date
+/// (RFC 9110) counted from now (at least a second).
+fn retry_after_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs);
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    let left = at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    Some(left.as_secs().max(1))
 }
 
 /// What an error body says: its `error` / `message` / `details`, else the
@@ -445,7 +471,8 @@ mod tests {
         );
     }
 
-    /// Without `Retry-After` the read may have run: never resent.
+    /// Only a 503 with `Retry-After` is resent: without it the read may have
+    /// run, and the resend rule covers no other status.
     #[test]
     fn a_503_without_retry_after_and_any_other_error_are_not_resent() {
         for response in [
@@ -511,6 +538,25 @@ mod tests {
             "unavailable: model is temporarily unavailable"
         );
         assert_eq!(error_message("plain text"), "plain text");
+    }
+
+    #[test]
+    fn retry_after_takes_seconds_or_an_http_date() {
+        assert_eq!(retry_after_secs(" 15 "), Some(15));
+        let soon = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(30));
+        let secs = retry_after_secs(&soon).unwrap();
+        assert!((28..=30).contains(&secs), "{secs}");
+        assert_eq!(retry_after_secs("Thu, 01 Jan 1970 00:00:00 GMT"), Some(1));
+        assert_eq!(retry_after_secs("soon"), None);
+    }
+
+    #[test]
+    fn an_error_status_is_kept_typed() {
+        let (url, _) = stub(vec![http("401 Unauthorized", &[], r#"{"error":"no"}"#)]);
+        match ReaderClient::new(&endpoint(&url)).read("x", "m", None, &|_| {}) {
+            Err(DocError::Endpoint { status: 401, .. }) => {}
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -305,24 +305,10 @@ pub async fn load_rdf(
     source: &Source,
     dirs: Option<&FlureeDir>,
 ) -> CliResult<fluree_graph_ir::Graph> {
-    use fluree_db_doc::reader::request::{parse_jsonld, parse_turtle};
+    use fluree_db_doc::reader::request::parse_turtle;
     let label = source.label();
     let graph = match &source.kind {
-        SourceKind::File(path) => {
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
-            if ext == "ttl" || ext == "nt" {
-                parse_turtle(&content)
-            } else {
-                parse_jsonld(&content)
-            }
-            .map_err(|e| CliError::Input(format!("{label}: {e}")))?
-        }
+        SourceKind::File(path) => read_rdf_file(path, &label)?,
         SourceKind::Ledger(alias) => {
             let opened = Opened::open(source, dirs).await?;
             if opened.graph_source {
@@ -347,21 +333,23 @@ pub async fn load_rdf(
     Ok(graph)
 }
 
-/// What a catalog record carries: its names, a short description, and its
-/// types. Everything else about a subject stays behind, because the whole
-/// catalog goes into every window a reader reads.
-const RECORD_PREDICATES: &[&str] = &[
-    "skos:prefLabel",
-    "skos:altLabel",
-    "skos:hiddenLabel",
-    "skos:definition",
-    "rdfs:label",
-    "rdfs:comment",
-    "schema:name",
-    "schema:alternateName",
-    "schema:legalName",
-    "schema:description",
-];
+/// A `.ttl` / `.nt` or JSON-LD file as a graph, read as it is.
+fn read_rdf_file(path: &std::path::Path, label: &str) -> CliResult<fluree_graph_ir::Graph> {
+    use fluree_db_doc::reader::request::{parse_jsonld, parse_turtle};
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "ttl" || ext == "nt" {
+        parse_turtle(&content)
+    } else {
+        parse_jsonld(&content)
+    }
+    .map_err(|e| CliError::Input(format!("{label}: {e}")))
+}
 
 pub struct LoadedCatalog {
     pub graph: fluree_graph_ir::Graph,
@@ -381,6 +369,24 @@ pub async fn load_catalog(
     let rdf_type = format!("{}type", fluree_db_doc::vocab::RDF_NS);
     for source in sources {
         check_class_scope(source)?;
+        // A file is read as it is, with the same selection the Python
+        // package makes, so both send the same records (and share answers
+        // in one cache).
+        if let SourceKind::File(path) = &source.kind {
+            let class = source.class.as_deref().map(expand_compact);
+            let records = fluree_db_doc::reader::request::catalog_records_of(
+                &read_rdf_file(path, &source.label())?,
+                class.as_deref(),
+            );
+            counts.push((
+                source.label(),
+                fluree_db_doc::reader::request::catalog_records(&records),
+            ));
+            for t in records.iter() {
+                graph.add(t.clone());
+            }
+            continue;
+        }
         let opened = Opened::open(source, dirs).await?;
         let anchor = |extra: (&str, &str)| {
             let mut node = serde_json::json!({ "@id": "?s", extra.0: extra.1 });
@@ -390,31 +396,30 @@ pub async fn load_catalog(
             node
         };
         let mut subjects = std::collections::BTreeSet::new();
-        for predicate in RECORD_PREDICATES {
+        // One list of record predicates, the reader request's.
+        for predicate in fluree_db_doc::reader::request::RECORD_PREDICATES {
             let query = serde_json::json!({
                 "@context": fluree_db_doc::model::query_context(),
                 "where": [anchor((predicate, "?v"))],
                 "select": ["?s", "?v"]
             });
             for row in opened.rows(&query).await? {
-                let (Some(s), Some(v)) = (row_cell(&row, 0), row_cell(&row, 1)) else {
+                let (Some(s), Some(v)) = (row_cell(&row, 0), row_literal(&row, 1)) else {
                     continue;
                 };
-                if s.starts_with("_:") || v.trim().is_empty() {
+                if s.starts_with("_:") {
                     continue;
                 }
                 let s = expand_compact(&s);
-                graph.add_triple(
-                    Term::iri(&s),
-                    Term::iri(expand_compact(predicate)),
-                    Term::string(v.trim()),
-                );
+                graph.add_triple(Term::iri(&s), Term::iri(expand_compact(predicate)), v);
                 subjects.insert(s);
             }
         }
+        // Unscoped: the label queries already chose the subjects (and a
+        // `#Class` scope written into this pattern would replace `?t`).
         let query = serde_json::json!({
             "@context": fluree_db_doc::model::query_context(),
-            "where": [anchor(("@type", "?t"))],
+            "where": [{ "@id": "?s", "@type": "?t" }],
             "select": ["?s", "?t"]
         });
         for row in opened.rows(&query).await? {
@@ -447,6 +452,35 @@ fn row_cell(row: &Value, i: usize) -> Option<String> {
             .map(str::to_string),
         _ => None,
     }
+}
+
+/// A label from a query row as a literal, keeping its language tag or
+/// datatype when the row carries one; `None` for an empty one.
+fn row_literal(row: &Value, i: usize) -> Option<fluree_graph_ir::Term> {
+    use fluree_graph_ir::{Datatype, Term};
+    let cell = row.get(i)?;
+    let (value, lang, datatype) = match cell {
+        Value::String(s) => (s.as_str(), None, None),
+        Value::Object(o) => (
+            o.get("@value").and_then(Value::as_str)?,
+            o.get("@language").and_then(Value::as_str),
+            o.get("@type").and_then(Value::as_str),
+        ),
+        _ => return None,
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(match (lang, datatype) {
+        (Some(l), _) => Term::lang_string(value, l),
+        (None, Some(dt))
+            if expand_compact(dt) != format!("{}string", fluree_db_doc::vocab::XSD_NS) =>
+        {
+            Term::typed(value, Datatype::from_iri(expand_compact(dt)))
+        }
+        _ => Term::string(value),
+    })
 }
 
 /// A compact IRI from a query row, with the prefixes the queries bind.

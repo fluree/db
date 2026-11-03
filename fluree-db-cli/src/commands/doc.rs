@@ -195,6 +195,9 @@ struct Totals {
     reader_usage: fluree_db_doc::reader::Usage,
     reader_calls: usize,
     reader_cached: usize,
+    /// Under `--dry-run`: the calls reading would have taken, none sent.
+    reader_planned: usize,
+    reader_planned_cached: usize,
     /// What the reader set aside or adapted in the ontology, said once.
     ontology_notes: std::collections::BTreeSet<String>,
 }
@@ -265,7 +268,7 @@ async fn setup_extraction(
                 drop_off_model: false,
             },
             concurrency: 1,
-            fingerprint: reader.session.fingerprint(),
+            fingerprint: reader.session.fingerprint()?,
             gazetteer_counts: reader.catalog_counts.clone(),
             reader: Some(Arc::new(reader)),
         }));
@@ -536,7 +539,8 @@ async fn run_extraction(
 
 /// A reader's account of a document in the shape the language-model path
 /// reports and commits: its nodes, and counts in the same columns.
-fn read_extracted(mut read: fluree_db_doc::reader::Read) -> Extracted {
+fn read_extracted(mut read: fluree_db_doc::reader::Read, relations: RelationMode) -> Extracted {
+    read.relations = fluree_db_doc::reader::reading::apply_relations(&mut read.nodes, relations);
     let stats = fluree_db_doc::extract::ExtractionStats {
         llm_mentions: read.mentions,
         entities_known: read.linked.len(),
@@ -768,23 +772,57 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         let (doc, extracted) = match &extraction {
             Some(Extraction {
                 reader: Some(reader),
+                policy,
                 ..
             }) => {
-                doc_reader::renew(reader).await?;
+                let reader_relations = policy.relations;
                 let reader = reader.clone();
                 let out_dir = args.out_dir.clone();
-                let (doc, read) = tokio::task::spawn_blocking(move || {
-                    let read = doc_reader::read_document(&reader, &doc, out_dir.as_deref());
-                    (doc, read)
-                })
-                .await
-                .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
-                match read {
-                    Ok(read) => (doc, Some(read_extracted(read))),
-                    Err(e) => {
-                        println!("  {} {label}  reading: {e}", "✗".red());
-                        totals.failed += 1;
-                        continue;
+                if args.dry_run {
+                    // A dry run reads nothing: a reader call is billed.
+                    let (doc, plan) = tokio::task::spawn_blocking(move || {
+                        let plan = doc_reader::plan_document(&reader, &doc, out_dir.as_deref());
+                        (doc, plan)
+                    })
+                    .await
+                    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
+                    match plan {
+                        Ok((calls, cached)) => {
+                            println!(
+                                "  {} {label}  would read in {calls} call(s){}",
+                                "~".dimmed(),
+                                if cached > 0 {
+                                    format!(", {cached} answered from cache")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            totals.reader_planned += calls;
+                            totals.reader_planned_cached += cached;
+                            (doc, None)
+                        }
+                        Err(e) => {
+                            println!("  {} {label}  reading: {e}", "✗".red());
+                            totals.failed += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    // A signed-in account's token, renewed before the call.
+                    doc_reader::renew(&reader).await?;
+                    let (doc, read) = tokio::task::spawn_blocking(move || {
+                        let read = doc_reader::read_document(&reader, &doc, out_dir.as_deref());
+                        (doc, read)
+                    })
+                    .await
+                    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
+                    match read {
+                        Ok(read) => (doc, Some(read_extracted(read, reader_relations))),
+                        Err(e) => {
+                            println!("  {} {label}  reading: {e}", "✗".red());
+                            totals.failed += 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -839,6 +877,10 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     relations: stats.map_or(0, |s| {
                         s.relations_valid + s.relations_repaired + s.relations_rejected
                     }),
+                    reader_predicates: match (&setup.reader, &extracted) {
+                        (Some(_), Some(x)) => graph::reader_predicates(&x.graph.nodes),
+                        _ => Vec::new(),
+                    },
                 }
             });
         let document = graph::document_node(
@@ -1026,6 +1068,17 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         elapsed.as_secs_f64(),
         if args.dry_run { " (dry run, nothing written)" } else { "" }
     );
+    if totals.reader_planned > 0 {
+        println!(
+            "  reading: {} call(s) planned{}, none sent (dry run)",
+            totals.reader_planned,
+            if totals.reader_planned_cached > 0 {
+                format!(" ({} answered from cache)", totals.reader_planned_cached)
+            } else {
+                String::new()
+            }
+        );
+    }
     if extraction.is_some() && totals.ingested > 0 {
         println!(
             "  extraction: {} mention(s), {} new entit{} ({} off-model), {} relation(s) ({} rejected), {} dropped ({} hallucinated, {} off-model), {} chunk(s) from cache{}",
@@ -1489,10 +1542,27 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         "→".dimmed(),
         setup.session.client.url()
     );
+    if let Some(vlm) = &vlm {
+        eprintln!(
+            "{} vision model {} reads what the parser cannot (--no-escalate to skip)",
+            "→".dimmed(),
+            vlm.model()
+        );
+    }
+    // The target is opened before the read: a call is billed, and a path
+    // that can't be written should fail first, by name.
+    let output = match &args.output {
+        Some(target) => Some((
+            target.clone(),
+            std::fs::File::create(target)
+                .map_err(|e| CliError::Input(format!("{}: {e}", target.display())))?,
+        )),
+        None => None,
+    };
 
     let (p, iri) = (path.clone(), doc_iri.clone());
     let format = args.format;
-    let (read, structure) = tokio::task::spawn_blocking(move || -> CliResult<_> {
+    let result = tokio::task::spawn_blocking(move || -> CliResult<_> {
         let (meta, parsed) =
             fluree_db_doc::parse_file(&p, &file_name, &iri, cache.as_ref(), vlm.as_ref())?;
         let doc = fluree_db_doc::PreparedDocument {
@@ -1501,8 +1571,17 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
             parsed,
             chunks: Vec::new(),
         };
+        if let Some(why) = &doc.parsed.escalation_skipped {
+            eprintln!(
+                "{} deterministic tier only: {why}; raise --max-crops to read them",
+                "!".yellow()
+            );
+        }
         for note in &doc.parsed.notes {
             eprintln!("{} {note}", "!".yellow());
+        }
+        if doc.parsed.text.trim().is_empty() {
+            eprintln!("{} no text to read: nothing was sent", "!".yellow());
         }
         let read = doc_reader::read_document(&setup, &doc, None)?;
         let structure = match format {
@@ -1515,7 +1594,17 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         Ok((read, structure))
     })
     .await
-    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))??;
+    .map_err(|e| CliError::Input(format!("reading task failed: {e}")));
+    let (read, structure) = match result.and_then(|r| r) {
+        Ok(r) => r,
+        Err(e) => {
+            // Nothing was read: take back the file opened for it.
+            if let Some((target, _)) = &output {
+                let _ = std::fs::remove_file(target);
+            }
+            return Err(e);
+        }
+    };
 
     let mut out = match (format, &structure) {
         (DocReadFormat::Jsonld, _) => serde_json::to_string_pretty(&json!({
@@ -1533,9 +1622,12 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     }
 
     let usage = read.usage.note();
+    // Nodes as received, beside what the reading's terms say they are: a
+    // reader in terms of its own still shows what it sent.
     eprintln!(
-        "{} {} mention(s), {} entit{}, {} relation(s); {} call(s){}{}",
+        "{} {} node(s): {} mention(s), {} entit{}, {} relation(s); {} call(s){}{}",
         "✓".green(),
+        read.nodes.len(),
         read.mentions,
         read.entities,
         if read.entities == 1 { "y" } else { "ies" },
@@ -1555,8 +1647,12 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     for note in &read.ontology_notes {
         eprintln!("  {} ontology {note}", "·".dimmed());
     }
-    match &args.output {
-        Some(target) => std::fs::write(target, out)?,
+    match output {
+        Some((target, mut file)) => {
+            use std::io::Write;
+            file.write_all(out.as_bytes())
+                .map_err(|e| CliError::Input(format!("{}: {e}", target.display())))?;
+        }
         None => {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();

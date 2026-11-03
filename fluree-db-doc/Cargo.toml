@@ -25,6 +25,8 @@ hayro-syntax.workspace = true
 # panics when dropped inside a tokio context.
 reqwest = { workspace = true }
 ureq = { version = "3", features = ["json"] }
+# Retry-After in its HTTP-date form.
+httpdate = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
