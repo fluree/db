@@ -1189,7 +1189,7 @@ async fn the_lane_trusts_only_what_the_probe_verified() {
     };
 
     let (rows, sent) = statements(&fluree, "cur-late:main", sparql).await;
-    assert_eq!(sent, [distinct.clone()], "an unprobed table proves nothing");
+    assert_eq!(sent, [distinct], "an unprobed table proves nothing");
     assert_eq!(config().await["verified_subject_keys"], json!({}));
 
     // The same record as an older registration wrote it: no field.

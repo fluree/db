@@ -399,7 +399,7 @@ pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Vec<Lowered>
                     l.distinct = true;
                     l.dedupes = true;
                 }
-                out.push(l)
+                out.push(l);
             }
             Ok(None) => {}
             Err(d) => return Ok(Err(d)),
@@ -641,7 +641,7 @@ impl<'a> Lowerer<'a> {
                                 if matches!(verdict, Verdict::ByClass { .. }) {
                                     self.class_policy.insert(alias.clone());
                                 }
-                                self.place_pred(pred)
+                                self.place_pred(pred);
                             }
                             Ok(Ok(None)) => {}
                             Ok(Err(Empty)) => return Ok(Ok(None)),
@@ -3033,7 +3033,7 @@ impl<'a> Lowerer<'a> {
                 Some(verdict) => match self.verdict_pred(&alias, tm, &verdict)? {
                     Ok(Some(p)) => {
                         class_policy |= matches!(verdict, Verdict::ByClass { .. });
-                        policy_on.push(p)
+                        policy_on.push(p);
                     }
                     Ok(None) => {}
                     Err(Empty) => return Ok(()),

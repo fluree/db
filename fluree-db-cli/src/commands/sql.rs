@@ -232,17 +232,18 @@ async fn run_sql_check_local(name: &str, dirs: &FlureeDir) -> CliResult<()> {
     };
     let result = fluree.check_sql_graph_source(&id).await?;
     println!("Checked SQL graph source '{}'", result.graph_source_id);
-    if result.duplicate_subject_tables.is_empty() {
+    if result.allow_duplicate_subjects {
+        println!(
+            "  Subject keys: not probed (registered with --allow-duplicate-subjects: \
+             queries answer with set semantics)"
+        );
+    } else if result.duplicate_subject_tables.is_empty() {
         println!("  Subject keys: unique in every probed table");
     } else {
         println!(
-            "  Subject keys: NOT unique in {} ({})",
+            "  Subject keys: NOT unique in {} (the pushdown lane refuses statements over \
+             these tables)",
             result.duplicate_subject_tables.join(", "),
-            if result.allow_duplicate_subjects {
-                "accepted: registered with --allow-duplicate-subjects"
-            } else {
-                "the pushdown lane refuses statements over these tables"
-            }
         );
     }
     print_mapping_warnings(&result.mapping_warnings);

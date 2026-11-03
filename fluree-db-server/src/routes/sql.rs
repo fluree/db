@@ -47,7 +47,9 @@ pub struct SqlMapRequest {
     pub model: Option<String>,
     /// `default-allow` for governed requests that match no policy.
     pub default_allow: Option<bool>,
-    /// Accept subject keys the registration probe finds non-unique.
+    /// Skip the duplicate-subject probe: no table is refused, and queries
+    /// answer with set semantics wherever no declared key proves a map's
+    /// subjects unique.
     #[serde(default)]
     pub allow_duplicate_subjects: Option<bool>,
     /// The endpoint's auth: the structured `auth` (exactly the stored

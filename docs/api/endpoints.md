@@ -3607,7 +3607,7 @@ POST {api_base_url}/sql/map
 | `session` | object | Session properties sent as `X-Trino-Session` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
-| `allow_duplicate_subjects` | bool | Accept subject keys the registration probe finds non-unique; without it the pushdown lane refuses statements over the flagged tables. See [Subject keys must be unique](../graph-sources/sql.md#subject-keys-must-be-unique). |
+| `allow_duplicate_subjects` | bool | Skip the duplicate-subject probe: no table is refused, and queries answer with set semantics wherever no key declared in the mapping proves a map's subjects unique. Without it, the pushdown lane refuses statements over tables the probe finds repeated. See [Repeated rows and subject keys](../graph-sources/sql.md#repeated-rows-and-subject-keys). |
 
 **Response:**
 

@@ -3909,8 +3909,9 @@ pub struct SqlMapArgs {
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
 
-    /// Accept subject keys the registration probe finds non-unique (the
-    /// probe still warns; the pushdown lane then runs over them)
+    /// Skip the duplicate-subject probe: no table is refused, and queries
+    /// answer with set semantics wherever no declared key proves a map's
+    /// subjects unique
     #[arg(long)]
     pub allow_duplicate_subjects: bool,
 }
