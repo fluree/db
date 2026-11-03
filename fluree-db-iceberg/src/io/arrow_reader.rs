@@ -197,6 +197,9 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
 
     let mut batches = Vec::new();
     let mut produced = 0usize;
+    // The row filter's literals, converted into the decoded column types once per
+    // file (a column's type cannot change between batches of one file).
+    let mut prepared: Option<Vec<PreparedComparison>> = None;
 
     for record_batch in reader {
         // Stop before decoding another batch once the row budget is met.
@@ -206,10 +209,14 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
         let mut record_batch =
             record_batch.map_err(|e| IcebergError::Storage(format!("Arrow decode error: {e}")))?;
         if let Some(plan) = &predicate_plan {
-            let mask = eval_conjunction(&record_batch, plan)
+            let prepared =
+                prepared.get_or_insert_with(|| prepare_comparisons(plan, &record_batch.schema()));
+            let mask = eval_conjunction(&record_batch, prepared)
                 .map_err(|e| IcebergError::Storage(format!("Row filter eval error: {e}")))?;
-            record_batch = filter_record_batch(&record_batch, &mask)
-                .map_err(|e| IcebergError::Storage(format!("Row filter apply error: {e}")))?;
+            if let Some(mask) = mask {
+                record_batch = filter_record_batch(&record_batch, &mask)
+                    .map_err(|e| IcebergError::Storage(format!("Row filter apply error: {e}")))?;
+            }
         }
         // Trim the final batch so we never emit more than the row budget. Safe:
         // the guard above guarantees `produced < budget` here.
@@ -517,69 +524,339 @@ fn collect_and_comparisons(
     }
 }
 
+/// One row-filter comparison prepared against its decoded column: the
+/// column's position and what to check there.
+struct PreparedComparison {
+    pos: usize,
+    check: Check,
+}
+
+/// What a prepared comparison does to a batch.
+enum Check {
+    /// Compare each cell with a literal of the column's comparison type.
+    Compare(ComparisonOp, Scalar<ArrayRef>),
+    /// No literal compares exactly with the column: keep every row, and the
+    /// in-engine FILTER decides.
+    KeepAll,
+    /// No cell can satisfy the comparison (an equality with a value the column
+    /// cannot hold).
+    DropAll,
+}
+
+/// Prepare `plan` against the schema of a decoded batch (see
+/// [`PreparedComparison`]).
+fn prepare_comparisons(
+    plan: &[ResolvedComparison],
+    schema: &arrow::datatypes::Schema,
+) -> Vec<PreparedComparison> {
+    plan.iter()
+        .map(|(pos, op, value)| {
+            let target = comparison_type(schema.field(*pos).data_type());
+            let check = match column_kind(&target) {
+                Some(column) if comparable(*op, literal_kind(value), column) => {
+                    match decimal_check(*op, value, &target) {
+                        Some(check) => check,
+                        None => exact_literal(value, &target)
+                            .and_then(|literal| total_order_zero(*op, literal))
+                            .map_or(Check::KeepAll, |literal| {
+                                Check::Compare(*op, Scalar::new(literal))
+                            }),
+                    }
+                }
+                _ => Check::KeepAll,
+            };
+            if matches!(check, Check::KeepAll) {
+                tracing::debug!(
+                    literal = ?value,
+                    column_type = ?target,
+                    "row filter: the literal does not compare exactly with the column, so \
+                     this comparison keeps every row and the in-engine FILTER decides"
+                );
+            }
+            PreparedComparison { pos: *pos, check }
+        })
+        .collect()
+}
+
 /// Evaluate the conjunction over a decoded `RecordBatch`, ANDing the per-
 /// comparison masks into a keep mask for `filter_record_batch`. A null cell
 /// yields a null mask entry, which `filter_record_batch` treats as "drop" —
-/// correct for R2RML, where a null column produces no triple.
+/// correct for R2RML, where a null column produces no triple. `None` means no
+/// comparison could narrow the batch: keep every row.
 fn eval_conjunction(
     batch: &RecordBatch,
-    plan: &[ResolvedComparison],
-) -> std::result::Result<BooleanArray, ArrowError> {
+    plan: &[PreparedComparison],
+) -> std::result::Result<Option<BooleanArray>, ArrowError> {
     let mut acc: Option<BooleanArray> = None;
-    for (pos, op, value) in plan {
-        let mask = eval_comparison(batch.column(*pos), op, value)?;
+    for comparison in plan {
+        let mask = match &comparison.check {
+            Check::KeepAll => continue,
+            Check::DropAll => BooleanArray::new(
+                arrow::buffer::BooleanBuffer::new_unset(batch.num_rows()),
+                None,
+            ),
+            Check::Compare(op, literal) => {
+                let column = normalize_column(batch.column(comparison.pos))?;
+                match op {
+                    ComparisonOp::Eq => cmp::eq(&column, literal),
+                    ComparisonOp::NotEq => cmp::neq(&column, literal),
+                    ComparisonOp::Lt => cmp::lt(&column, literal),
+                    ComparisonOp::LtEq => cmp::lt_eq(&column, literal),
+                    ComparisonOp::Gt => cmp::gt(&column, literal),
+                    ComparisonOp::GtEq => cmp::gt_eq(&column, literal),
+                }?
+            }
+        };
         acc = Some(match acc {
             Some(prev) => and(&prev, &mask)?,
             None => mask,
         });
     }
-    acc.ok_or_else(|| ArrowError::ComputeError("empty row-filter conjunction".to_string()))
+    Ok(acc)
 }
 
-/// Evaluate a single comparison against a column, returning a boolean mask.
-///
-/// The literal is cast into the column's own Arrow type before comparison, so
-/// an `xsd:integer` literal compared against a physically `Decimal` Iceberg
-/// column is scaled correctly (the exact case a manual evaluator mishandled).
-/// If the literal cannot be cast to the column type the comparison is treated
-/// as all-true (keep every row) so the in-engine FILTER decides.
-fn eval_comparison(
-    column: &ArrayRef,
-    op: &ComparisonOp,
-    value: &LiteralValue,
-) -> std::result::Result<BooleanArray, ArrowError> {
-    // Our tabular time representation is an integer count of microseconds.
-    // Normalize the column before comparison so a microsecond literal is never
-    // interpreted as milliseconds by an Arrow cast to Time32.
-    let normalized_time = match column.data_type() {
-        DataType::Time32(TimeUnit::Millisecond) => Some(cast(
-            &cast(column, &DataType::Time64(TimeUnit::Microsecond))?,
-            &DataType::Int64,
-        )?),
-        DataType::Time64(TimeUnit::Microsecond) => Some(cast(column, &DataType::Int64)?),
-        _ => None,
-    };
-    let column = normalized_time.as_ref().unwrap_or(column);
-    let literal = literal_to_array(value);
-    let casted = match cast(&literal, column.data_type()) {
-        Ok(c) => c,
-        Err(_) => return Ok(BooleanArray::from(vec![true; column.len()])),
-    };
-    let scalar = Scalar::new(casted);
-    match op {
-        ComparisonOp::Eq => cmp::eq(column, &scalar),
-        ComparisonOp::NotEq => cmp::neq(column, &scalar),
-        ComparisonOp::Lt => cmp::lt(column, &scalar),
-        ComparisonOp::LtEq => cmp::lt_eq(column, &scalar),
-        ComparisonOp::Gt => cmp::gt(column, &scalar),
-        ComparisonOp::GtEq => cmp::gt_eq(column, &scalar),
+/// The kind of value a literal holds or a column compares as, for deciding
+/// whether the row filter may compare the two at all (see [`comparable`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ValueKind {
+    Boolean,
+    Integer,
+    Decimal,
+    Float,
+    Text,
+    Binary,
+    Temporal,
+}
+
+fn literal_kind(value: &LiteralValue) -> ValueKind {
+    match value {
+        LiteralValue::Boolean(_) => ValueKind::Boolean,
+        LiteralValue::Int32(_) | LiteralValue::Int64(_) => ValueKind::Integer,
+        LiteralValue::Decimal { .. } => ValueKind::Decimal,
+        LiteralValue::Float32(_) | LiteralValue::Float64(_) => ValueKind::Float,
+        LiteralValue::String(_) => ValueKind::Text,
+        LiteralValue::Bytes(_) => ValueKind::Binary,
+        LiteralValue::Date(_) | LiteralValue::Timestamp(_) | LiteralValue::TimestampTz(_) => {
+            ValueKind::Temporal
+        }
     }
 }
 
+/// The kind a column of comparison type `t` compares as; `None` for a type the
+/// row filter does not compare (`Float16` among them: no Iceberg type decodes
+/// to it, and [`total_order_zero`] does not cover it).
+fn column_kind(t: &DataType) -> Option<ValueKind> {
+    use DataType as D;
+    Some(match t {
+        D::Boolean => ValueKind::Boolean,
+        D::Int8 | D::Int16 | D::Int32 | D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => {
+            ValueKind::Integer
+        }
+        D::Decimal128(..) | D::Decimal256(..) => ValueKind::Decimal,
+        D::Float32 | D::Float64 => ValueKind::Float,
+        D::Utf8 | D::LargeUtf8 | D::Utf8View => ValueKind::Text,
+        D::Binary | D::LargeBinary | D::BinaryView | D::FixedSizeBinary(_) => ValueKind::Binary,
+        D::Date32 | D::Date64 | D::Timestamp(..) => ValueKind::Temporal,
+        _ => return None,
+    })
+}
+
+/// Whether the row filter may compare a `literal` with a `column` by `op`:
+/// whether the column's own comparison keeps every row the engine's FILTER
+/// does.
+///
+/// An exact conversion is not enough. An integer literal converts exactly to a
+/// string column's `"1000"`, and the column then compares as text, where the
+/// engine reads an `xsd:integer` map over that column as numbers: `"999" <
+/// "1000"` is false, so the row filter would drop the 999 the FILTER keeps.
+/// Likewise `true` against a column holding `"1"`. So a literal compares only
+/// with a column of its own kind, or across kinds where both sides compare by
+/// value: integers with decimals and with floats (`exact_literal` refuses a
+/// value the column type cannot hold). A decimal and a float do not: a decimal
+/// round-trips through a float by rounding back (0.1), while the engine
+/// compares the two exactly.
+///
+/// A string compares with a date or timestamp column by any operator: the
+/// engine orders a plain string against a date or dateTime by parsing it as
+/// that type, which is what the cast does, and `exact_literal` accepts only
+/// the column's own rendering of a value. Against any other column a string
+/// compares only by `=`, where the round trip makes it the rendering of the
+/// one value it matches (`"10"`, never `"010"`): a cell that renders as the
+/// string is that value. Ordering it would compare values where the engine
+/// compares the string, or nothing at all.
+fn comparable(op: ComparisonOp, literal: ValueKind, column: ValueKind) -> bool {
+    use ValueKind as K;
+    literal == column
+        || matches!(
+            (literal, column),
+            (K::Integer, K::Decimal | K::Float)
+                | (K::Decimal | K::Float, K::Integer)
+                | (K::Text, K::Temporal)
+        )
+        || (literal == K::Text && op == ComparisonOp::Eq && column != K::Binary)
+}
+
+/// A float column compared with a zero literal, as the zero whose comparison
+/// the column's kernels agree on with the engine; `None` to keep every row.
+///
+/// arrow-ord's float comparisons follow IEEE 754 totalOrder, which puts -0.0
+/// below 0.0, where the engine (like SPARQL) holds the two equal: `?d >= 0`
+/// keeps a -0.0 cell in the engine, and `cmp::gt_eq(-0.0, 0.0)` is false. For
+/// the ordering operators one signed zero agrees: `< -0.0` and `>= -0.0` split
+/// the negatives from both zeros, `<= 0.0` and `> 0.0` both zeros from the
+/// positives. Equality would need both zeros, so it keeps every row. Any other
+/// literal orders against both zeros alike, and against NaN cells totalOrder
+/// can only keep extra rows (the engine compares nothing with NaN).
+fn total_order_zero(op: ComparisonOp, literal: ArrayRef) -> Option<ArrayRef> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, Float64Type};
+    let negative = match op {
+        ComparisonOp::Lt | ComparisonOp::GtEq => true,
+        ComparisonOp::LtEq | ComparisonOp::Gt => false,
+        ComparisonOp::Eq | ComparisonOp::NotEq => {
+            let zero = match literal.data_type() {
+                DataType::Float64 => literal.as_primitive::<Float64Type>().value(0) == 0.0,
+                DataType::Float32 => literal.as_primitive::<Float32Type>().value(0) == 0.0,
+                _ => false,
+            };
+            return (!zero).then_some(literal);
+        }
+    };
+    Some(match literal.data_type() {
+        DataType::Float64 if literal.as_primitive::<Float64Type>().value(0) == 0.0 => {
+            Arc::new(Float64Array::from(vec![if negative { -0.0 } else { 0.0 }]))
+        }
+        DataType::Float32 if literal.as_primitive::<Float32Type>().value(0) == 0.0 => {
+            Arc::new(Float32Array::from(vec![if negative { -0.0 } else { 0.0 }]))
+        }
+        _ => literal,
+    })
+}
+
+/// The type a column is compared in. Our tabular time representation is an
+/// integer count of microseconds, so time columns compare as `Int64` micros —
+/// a microsecond literal must never be read as milliseconds by a cast to
+/// `Time32`. Every other column compares in its own type.
+fn comparison_type(column_type: &DataType) -> DataType {
+    match column_type {
+        DataType::Time32(TimeUnit::Millisecond) | DataType::Time64(TimeUnit::Microsecond) => {
+            DataType::Int64
+        }
+        other => other.clone(),
+    }
+}
+
+/// `column` in its [`comparison_type`].
+fn normalize_column(column: &ArrayRef) -> std::result::Result<ArrayRef, ArrowError> {
+    match column.data_type() {
+        DataType::Time32(TimeUnit::Millisecond) => cast(
+            &cast(column, &DataType::Time64(TimeUnit::Microsecond))?,
+            &DataType::Int64,
+        ),
+        DataType::Time64(TimeUnit::Microsecond) => cast(column, &DataType::Int64),
+        _ => Ok(Arc::clone(column)),
+    }
+}
+
+/// An integer or decimal literal against a `decimal128(p, s)` column, as the
+/// check on the column's grid that keeps exactly the rows the comparison
+/// holds for; `None` for any other literal or column type.
+///
+/// Computed in integer arithmetic on the column's scale, never by a cast. A
+/// literal on the grid compares as itself, even beyond the column's
+/// precision (the kernels compare the unscaled values, so `?d < 1000` on
+/// `decimal(5,2)` keeps every row and `> 1000` none). A literal between two
+/// grid points `lo < x < hi` holds for exactly the cells at or below `lo`
+/// (`<`, `<=`) or at or above `hi` (`>`, `>=`): `< 1.0500000001` on
+/// `decimal(38,9)` is `<= 1.050000000`, and `> 1.0499999999` is
+/// `>= 1.050000000`. No cell equals it, so `=` drops every row and `!=` keeps
+/// every row. A grid point beyond `i128` saturates, which can only keep a cell
+/// it should not.
+fn decimal_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> Option<Check> {
+    let DataType::Decimal128(precision, column_scale) = *target else {
+        return None;
+    };
+    let (unscaled, scale) = match *value {
+        LiteralValue::Int32(n) => (i128::from(n), 0),
+        LiteralValue::Int64(n) => (i128::from(n), 0),
+        LiteralValue::Decimal { unscaled, scale } => (unscaled, scale),
+        _ => return None,
+    };
+    let (lo, hi, exact) = grid_neighbors(unscaled, scale, column_scale);
+    let (op, units) = if exact {
+        (op, lo)
+    } else {
+        match op {
+            ComparisonOp::Lt | ComparisonOp::LtEq => (ComparisonOp::LtEq, lo),
+            ComparisonOp::Gt | ComparisonOp::GtEq => (ComparisonOp::GtEq, hi),
+            ComparisonOp::Eq => return Some(Check::DropAll),
+            ComparisonOp::NotEq => return Some(Check::KeepAll),
+        }
+    };
+    let literal = Decimal128Array::from(vec![units])
+        .with_precision_and_scale(precision, column_scale)
+        .ok()?;
+    Some(Check::Compare(op, Scalar::new(Arc::new(literal))))
+}
+
+/// `unscaled × 10^-scale` on the grid of `column_scale`, in its units: the
+/// grid points just at or below and at or above it, and whether it lies on
+/// the grid. A value beyond `i128` is off the grid, with both neighbors
+/// saturated at that end.
+fn grid_neighbors(unscaled: i128, scale: i8, column_scale: i8) -> (i128, i128, bool) {
+    let shift = i32::from(column_scale) - i32::from(scale);
+    let saturated = if unscaled < 0 { i128::MIN } else { i128::MAX };
+    if shift >= 0 {
+        let units = 10i128
+            .checked_pow(shift.unsigned_abs())
+            .and_then(|f| unscaled.checked_mul(f));
+        return match units {
+            Some(u) => (u, u, true),
+            None => (saturated, saturated, false),
+        };
+    }
+    match 10i128.checked_pow(shift.unsigned_abs()) {
+        Some(divisor) => {
+            let lo = unscaled.div_euclid(divisor);
+            let exact = unscaled.rem_euclid(divisor) == 0;
+            (lo, if exact { lo } else { lo + 1 }, exact)
+        }
+        // A divisor beyond i128 exceeds every unscaled value: the literal lies
+        // strictly between -1 and 1 grid units (or is 0).
+        None => match unscaled.signum() {
+            0 => (0, 0, true),
+            1 => (0, 1, false),
+            _ => (-1, 0, false),
+        },
+    }
+}
+
+/// The literal as a single-element array of `target`, or `None` when it has
+/// no exact value there.
+///
+/// Arrow's cast cannot be trusted to say so: reducing a decimal's scale
+/// ROUNDS (half away from zero), and a value outside the target's range comes
+/// back NULL rather than as an error. Either would make the row filter drop
+/// rows that truly match (`?d < 1.0500000001` on `decimal(38,9)` losing
+/// `1.050000000`; `?d < 1000` on `decimal(5,2)` losing every row), and a
+/// dropped row never reaches the in-engine FILTER. So a conversion is accepted
+/// only when it is non-null and casts back to the original literal unchanged.
+fn exact_literal(value: &LiteralValue, target: &DataType) -> Option<ArrayRef> {
+    let literal = literal_to_array(value)?;
+    let converted = cast(&literal, target).ok()?;
+    if converted.is_null(0) {
+        return None;
+    }
+    let back = cast(&converted, literal.data_type()).ok()?;
+    let same = cmp::eq(&back, &literal).ok()?;
+    (same.is_valid(0) && same.value(0)).then_some(converted)
+}
+
 /// A single-element Arrow array holding the literal, in a natural type that
-/// `cast` can convert to the target column type.
-fn literal_to_array(value: &LiteralValue) -> ArrayRef {
-    match value {
+/// `cast` can convert to the target column type. `None` for a decimal that no
+/// `decimal128` can hold.
+fn literal_to_array(value: &LiteralValue) -> Option<ArrayRef> {
+    Some(match value {
         LiteralValue::Boolean(b) => Arc::new(BooleanArray::from(vec![*b])),
         LiteralValue::Int32(i) => Arc::new(Int32Array::from(vec![*i])),
         LiteralValue::Int64(i) => Arc::new(Int64Array::from(vec![*i])),
@@ -589,21 +866,37 @@ fn literal_to_array(value: &LiteralValue) -> ArrayRef {
         LiteralValue::Bytes(b) => Arc::new(BinaryArray::from(vec![b.as_slice()])),
         LiteralValue::Date(d) => Arc::new(Date32Array::from(vec![*d])),
         // Both timestamp flavors carry micros-since-epoch; `cast` adapts to the
-        // column's own (tz-tagged or not) timestamp type. If the cast can't adapt,
-        // `eval_comparison` keeps every row and the in-engine FILTER decides.
+        // column's own (tz-tagged or not) timestamp type, and `exact_literal`
+        // refuses an adaptation that loses anything.
         LiteralValue::Timestamp(t) | LiteralValue::TimestampTz(t) => {
             Arc::new(TimestampMicrosecondArray::from(vec![*t]))
         }
-        LiteralValue::Decimal {
-            unscaled,
-            precision,
-            scale,
-        } => Arc::new(
-            Decimal128Array::from(vec![*unscaled])
-                .with_precision_and_scale(*precision, *scale)
-                .expect("valid decimal precision/scale"),
+        LiteralValue::Decimal { unscaled, scale } => decimal_literal(*unscaled, *scale)?,
+    })
+}
+
+/// `unscaled × 10^-scale` as a `decimal128(38, s)`. A negative scale (`4E+2`
+/// normalizes to unscaled 4, scale -2) is rescaled exactly to scale 0. `None`
+/// when the value needs more than 38 digits or a scale above 38.
+fn decimal_literal(unscaled: i128, scale: i8) -> Option<ArrayRef> {
+    use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE};
+    let (unscaled, scale) = match u32::try_from(scale) {
+        Ok(_) => (unscaled, scale),
+        Err(_) => (
+            unscaled.checked_mul(10i128.checked_pow(u32::from(scale.unsigned_abs()))?)?,
+            0,
         ),
+    };
+    if scale > DECIMAL128_MAX_SCALE {
+        return None;
     }
+    let array = Decimal128Array::from(vec![unscaled])
+        .with_precision_and_scale(DECIMAL128_MAX_PRECISION, scale)
+        .ok()?;
+    array
+        .validate_decimal_precision(DECIMAL128_MAX_PRECISION)
+        .ok()?;
+    Some(Arc::new(array))
 }
 
 #[cfg(test)]
@@ -829,5 +1122,366 @@ mod direct_decode_tests {
         );
         // A Date field physically stored as plain INT32 (fallback, tags as Date).
         assert_direct_matches(&Int32Array::from(vec![Some(19_001), None]), FieldType::Date);
+    }
+}
+
+#[cfg(test)]
+mod row_filter_tests {
+    use super::*;
+    use arrow::datatypes::{Field, Schema as ArrowSchema};
+
+    const OPS: [ComparisonOp; 6] = [
+        ComparisonOp::Eq,
+        ComparisonOp::NotEq,
+        ComparisonOp::Lt,
+        ComparisonOp::LtEq,
+        ComparisonOp::Gt,
+        ComparisonOp::GtEq,
+    ];
+
+    /// The row positions the row filter keeps for `column op literal`.
+    fn kept(column: ArrayRef, op: ComparisonOp, literal: LiteralValue) -> Vec<usize> {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "c",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        let plan = vec![(0, op, literal)];
+        let prepared = prepare_comparisons(&plan, &batch.schema());
+        match eval_conjunction(&batch, &prepared).unwrap() {
+            None => (0..batch.num_rows()).collect(),
+            Some(mask) => (0..mask.len())
+                .filter(|&i| mask.is_valid(i) && mask.value(i))
+                .collect(),
+        }
+    }
+
+    fn holds(op: ComparisonOp, ord: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match op {
+            ComparisonOp::Eq => ord == Equal,
+            ComparisonOp::NotEq => ord != Equal,
+            ComparisonOp::Lt => ord == Less,
+            ComparisonOp::LtEq => ord != Greater,
+            ComparisonOp::Gt => ord == Greater,
+            ComparisonOp::GtEq => ord != Less,
+        }
+    }
+
+    /// `a × 10^-sa` against `b × 10^-sb`, exactly: in `i128` at the common
+    /// scale, or by the digits when that overflows.
+    fn decimal_ord(a: i128, sa: i8, b: i128, sb: i8) -> std::cmp::Ordering {
+        let scale = sa.max(sb);
+        let shift = |s: i8| u32::try_from(i32::from(scale) - i32::from(s)).unwrap();
+        let up = |v: i128, s: i8| 10i128.checked_pow(shift(s)).and_then(|f| v.checked_mul(f));
+        if let (Some(x), Some(y)) = (up(a, sa), up(b, sb)) {
+            return x.cmp(&y);
+        }
+        if a.signum() != b.signum() {
+            return a.signum().cmp(&b.signum());
+        }
+        let digits = |v: i128, s: i8| {
+            let mut d = v.unsigned_abs().to_string();
+            d.extend(std::iter::repeat_n('0', shift(s) as usize));
+            d.trim_start_matches('0').to_string()
+        };
+        let (x, y) = (digits(a, sa), digits(b, sb));
+        let magnitude = x.len().cmp(&y.len()).then_with(|| x.cmp(&y));
+        if a < 0 {
+            magnitude.reverse()
+        } else {
+            magnitude
+        }
+    }
+
+    fn decimal_column(values: &[i128], precision: u8, scale: i8) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values.to_vec())
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        )
+    }
+
+    /// Every op over a `decimal(38,9)` column — BigQuery's `NUMERIC` — against
+    /// literals that sit on, between and beside its grid keeps exactly the true
+    /// matches: one on the grid compares as itself, one between grid points as
+    /// its neighbor on the safe side (never drop a true match: the in-engine
+    /// FILTER cannot restore a row the row filter dropped).
+    #[test]
+    fn decimal_literals_keep_exactly_the_true_matches() {
+        // 0.049999999, 0.050000000, 0.050000001, 1.050000000, -0.050000000
+        let values = [
+            49_999_999,
+            50_000_000,
+            50_000_001,
+            1_050_000_000,
+            -50_000_000,
+        ];
+        let literals: [(i128, i8); 9] = [
+            (5, 2),               // 0.05: below one — panicked before
+            (-5, 2),              // -0.05
+            (500_000_001, 10),    // 0.0500000001: between grid points
+            (499_999_999, 10),    // 0.0499999999
+            (-500_000_001, 10),   // -0.0500000001
+            (10_500_000_001, 10), // 1.0500000001: valid precision, still off the grid
+            (4, -2),              // 4E+2, a negative scale
+            (1, 50),              // 1E-50: no decimal128 holds it
+            (-1, 50),             // -1E-50
+        ];
+        for (unscaled, scale) in literals {
+            for op in OPS {
+                let got = kept(
+                    decimal_column(&values, 38, 9),
+                    op,
+                    LiteralValue::Decimal { unscaled, scale },
+                );
+                let want: Vec<usize> = (0..values.len())
+                    .filter(|&i| holds(op, decimal_ord(values[i], 9, unscaled, scale)))
+                    .collect();
+                assert_eq!(got, want, "{op:?} {unscaled}e-{scale}");
+            }
+        }
+    }
+
+    /// A literal outside the column's range is not representable there. Arrow
+    /// casts it to NULL rather than failing, and a NULL comparison drops the
+    /// row — so before this fix `?d < 1000` on `decimal(5,2)` returned nothing.
+    /// It now compares as itself: below it every row, above it none.
+    #[test]
+    fn an_out_of_range_literal_keeps_exactly_the_true_matches() {
+        let column = || decimal_column(&[99_999, 100, -99_999], 5, 2);
+        for literal in [
+            LiteralValue::Decimal {
+                unscaled: 1000,
+                scale: 0,
+            },
+            LiteralValue::Int64(1000),
+            LiteralValue::Int32(1000),
+        ] {
+            for (op, want) in [
+                (ComparisonOp::Eq, vec![]),
+                (ComparisonOp::NotEq, vec![0, 1, 2]),
+                (ComparisonOp::Lt, vec![0, 1, 2]),
+                (ComparisonOp::LtEq, vec![0, 1, 2]),
+                (ComparisonOp::Gt, vec![]),
+                (ComparisonOp::GtEq, vec![]),
+            ] {
+                assert_eq!(
+                    kept(column(), op, literal.clone()),
+                    want,
+                    "{op:?} {literal:?}"
+                );
+            }
+        }
+        // An integer too wide for an `int` column, the same way.
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        assert_eq!(
+            kept(ints, ComparisonOp::Lt, LiteralValue::Int64(3_000_000_000)),
+            [0, 1]
+        );
+    }
+
+    /// The exactness check is not decimal-specific: any cast that loses
+    /// information is refused, e.g. a sub-millisecond instant against a
+    /// millisecond timestamp column (the cast truncates toward the epoch).
+    #[test]
+    fn a_lossy_conversion_of_any_type_is_refused() {
+        let millis: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![1_000]));
+        // 1.0005 s as micros. `< 1.0005 s` holds for the 1.000 s row.
+        assert_eq!(
+            kept(millis, ComparisonOp::Lt, LiteralValue::Timestamp(1_000_500)),
+            [0]
+        );
+        assert!(exact_literal(
+            &LiteralValue::Timestamp(1_000_500),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        )
+        .is_none());
+        assert!(exact_literal(
+            &LiteralValue::Timestamp(1_000_000),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        )
+        .is_some());
+    }
+
+    /// A literal converts exactly to a column whose own order is not the
+    /// engine's: an integer to a string column's "1000", which then compares
+    /// as text ("999" < "1000" is false), a boolean to "true" (where the cell
+    /// holds "1"), a decimal to a double (0.1 rounds back to itself). Those
+    /// keep every row; a string against a date column still compares as a
+    /// date, which is how the engine orders a plain string against one.
+    /// (Equality of an integer with a string cell would be sound for "1000",
+    /// but not for "01000", which the engine reads as 1000 too.)
+    #[test]
+    fn a_literal_compares_only_with_a_column_that_orders_as_the_engine() {
+        let text = || -> ArrayRef { Arc::new(StringArray::from(vec!["999", "1000", "1"])) };
+        for op in OPS {
+            assert_eq!(
+                kept(text(), op, LiteralValue::Int64(1000)),
+                [0, 1, 2],
+                "{op:?}"
+            );
+            assert_eq!(
+                kept(text(), op, LiteralValue::Int32(1000)),
+                [0, 1, 2],
+                "{op:?}"
+            );
+            assert_eq!(
+                kept(text(), op, LiteralValue::Boolean(true)),
+                [0, 1, 2],
+                "{op:?}"
+            );
+            let doubles: ArrayRef = Arc::new(Float64Array::from(vec![0.1, 0.2]));
+            let tenth = LiteralValue::Decimal {
+                unscaled: 1,
+                scale: 1,
+            };
+            assert_eq!(kept(doubles, op, tenth), [0, 1], "{op:?}");
+            let decimals = decimal_column(&[1, 2], 38, 1);
+            assert_eq!(
+                kept(decimals, op, LiteralValue::Float64(0.1)),
+                [0, 1],
+                "{op:?}"
+            );
+            // A string orders against a number nowhere but in a string column;
+            // by `=` it matches the one value it renders.
+            let ints: ArrayRef = Arc::new(Int64Array::from(vec![1, 1000]));
+            let want: &[usize] = if op == ComparisonOp::Eq {
+                &[1]
+            } else {
+                &[0, 1]
+            };
+            assert_eq!(
+                kept(ints, op, LiteralValue::String("1000".into())),
+                want,
+                "{op:?}"
+            );
+        }
+        // Same kind, or integers against floats and decimals: still compared.
+        assert_eq!(
+            kept(text(), ComparisonOp::Lt, LiteralValue::String("2".into())),
+            [1, 2]
+        );
+        let doubles: ArrayRef = Arc::new(Float64Array::from(vec![0.5, 2.0]));
+        assert_eq!(kept(doubles, ComparisonOp::Gt, LiteralValue::Int64(1)), [1]);
+        let days: ArrayRef = Arc::new(Date32Array::from(vec![19_723, 19_724]));
+        assert_eq!(
+            kept(
+                days,
+                ComparisonOp::Gt,
+                LiteralValue::String("2024-01-01".into())
+            ),
+            [1]
+        );
+    }
+
+    /// arrow-ord orders floats by IEEE totalOrder (-0.0 < 0.0); the engine
+    /// holds -0.0 = 0. Against every spelling of a zero literal, the ordering
+    /// operators keep exactly the IEEE matches (and, as for any literal, a NaN
+    /// cell totalOrder puts past it), and equality keeps every row.
+    #[test]
+    fn a_zero_literal_against_a_float_column_keeps_both_zeros() {
+        // -0.0, 0.0, 1.5, -1.5, NaN
+        let f64s =
+            || -> ArrayRef { Arc::new(Float64Array::from(vec![-0.0, 0.0, 1.5, -1.5, f64::NAN])) };
+        let f32s =
+            || -> ArrayRef { Arc::new(Float32Array::from(vec![-0.0, 0.0, 1.5, -1.5, f32::NAN])) };
+        let zeros = [
+            LiteralValue::Int64(0),
+            LiteralValue::Int32(0),
+            LiteralValue::Float64(0.0),
+            LiteralValue::Float64(-0.0),
+        ];
+        for column in [f64s, f32s] {
+            for zero in &zeros {
+                for (op, want) in [
+                    (ComparisonOp::Lt, vec![3]),
+                    (ComparisonOp::LtEq, vec![0, 1, 3]),
+                    (ComparisonOp::Gt, vec![2, 4]),
+                    (ComparisonOp::GtEq, vec![0, 1, 2, 4]),
+                    (ComparisonOp::Eq, vec![0, 1, 2, 3, 4]),
+                    (ComparisonOp::NotEq, vec![0, 1, 2, 3, 4]),
+                ] {
+                    assert_eq!(kept(column(), op, zero.clone()), want, "{op:?} {zero:?}");
+                }
+            }
+            // A non-zero literal orders against both zeros alike.
+            assert_eq!(
+                kept(column(), ComparisonOp::Gt, LiteralValue::Int64(-1)),
+                [0, 1, 2, 4]
+            );
+            assert_eq!(
+                kept(column(), ComparisonOp::Eq, LiteralValue::Int64(-1)),
+                Vec::<usize>::new()
+            );
+        }
+    }
+
+    /// Exhaustively, every grid value of a `decimal(2,1)` column against
+    /// literals of scale -2 to 4 on, between and around its grid points, its
+    /// limits and zero, and beyond `i128`: each op keeps exactly the rows the
+    /// comparison holds for, computed in integer arithmetic.
+    #[test]
+    fn decimal_rounding_is_exact_at_every_boundary() {
+        let values: Vec<i128> = (-99..=99).collect();
+        let column = decimal_column(&values, 2, 1);
+        let mut literals: Vec<(i128, i8)> = Vec::new();
+        for scale in -2i8..=4 {
+            // One grid unit of the column (0.1) in the literal's units, when it
+            // is at least one.
+            let unit = 10i128.pow(u32::try_from((scale - 1).max(0)).unwrap());
+            let max = 99 * unit; // 9.9
+            for centre in [0, max, -max, max / 2, -max / 3] {
+                for d in -25..=25 {
+                    literals.push((centre + d, scale));
+                }
+            }
+            for k in (-120..=120).step_by(3) {
+                literals.push((k * unit, scale));
+                literals.push((k * unit + unit / 2, scale));
+            }
+        }
+        for (unscaled, scale) in [
+            (1, 50),
+            (-1, 50),
+            (i128::MAX, 0),
+            (i128::MIN + 1, 0),
+            (i128::MAX, 38),
+            (10i128.pow(30), -20),
+            (-(10i128.pow(30)), -20),
+        ] {
+            literals.push((unscaled, scale));
+        }
+        let oracle = |v: i128, unscaled: i128, scale: i8| decimal_ord(v, 1, unscaled, scale);
+        let mut checked = 0usize;
+        let mut check = |literal: LiteralValue, unscaled: i128, scale: i8| {
+            let ords: Vec<_> = values.iter().map(|&v| oracle(v, unscaled, scale)).collect();
+            for op in OPS {
+                let got = kept(Arc::clone(&column), op, literal.clone());
+                let want: Vec<usize> = (0..values.len()).filter(|&i| holds(op, ords[i])).collect();
+                assert_eq!(got, want, "{op:?} {literal:?}");
+                checked += 1;
+            }
+        };
+        for &(unscaled, scale) in &literals {
+            check(LiteralValue::Decimal { unscaled, scale }, unscaled, scale);
+        }
+        // Integer literals take the same path at scale 0.
+        for n in -120i64..=120 {
+            check(LiteralValue::Int64(n), i128::from(n), 0);
+        }
+        assert!(checked > 15_000, "{checked}");
+    }
+
+    /// Exact literals still narrow: the conversion is not a blanket keep-all.
+    #[test]
+    fn an_exact_literal_still_filters() {
+        let column = decimal_column(&[99_999, 100, 5], 5, 2);
+        let five_cents = LiteralValue::Decimal {
+            unscaled: 5,
+            scale: 2,
+        };
+        assert_eq!(kept(column, ComparisonOp::Gt, five_cents), [0, 1]);
     }
 }

@@ -628,9 +628,10 @@ impl crate::Fluree {
             ..Default::default()
         };
 
-        // 1. Snapshot every record under this ledger name. Use `all_records`
-        // (not `list_branches`, which excludes retracted) so hard-drop cleans
-        // up retracted-but-not-purged branches too. Keep the snapshots in
+        // 1. Snapshot every record under this ledger name, retracted ones
+        // included, so hard-drop cleans up retracted-but-not-purged branches
+        // too. `all_records` rather than `branch_records`: the nested-ledger
+        // check needs the whole listing anyway. Keep the snapshots in
         // memory — the CID-walk fallback needs them after the records are
         // purged from the nameservice.
         // Enumeration failures propagate as errors: silently coercing them
@@ -1419,7 +1420,7 @@ impl crate::Fluree {
         warnings: &mut Vec<String>,
     ) -> Vec<ContentId> {
         let backend = self.backend();
-        let records = match self.nameservice().all_records().await {
+        let records = match self.nameservice().branch_records(ledger_id.name()).await {
             Ok(records) => records,
             Err(e) => {
                 warnings.push(format!(
@@ -2227,6 +2228,7 @@ impl crate::Fluree {
         let mut indexer_config = opts.indexer_config.clone().unwrap_or_default();
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
+        let gc_hard_max_old_indexes = indexer_config.gc_hard_max_old_indexes;
 
         // Resolve attachment events and read fulltext config off a single
         // `LedgerState` load so the reindex doesn't pay for two snapshot
@@ -2430,6 +2432,7 @@ impl crate::Fluree {
                 let gc_config = CleanGarbageConfig {
                     max_old_indexes: Some(gc_max_old_indexes),
                     min_time_garbage_mins: Some(gc_min_time_mins),
+                    hard_max_old_indexes: gc_hard_max_old_indexes,
                     ..Default::default()
                 };
                 let pass = async {
@@ -2454,10 +2457,10 @@ impl crate::Fluree {
                         }
                         _ => None,
                     };
-                    // A reindex is rare enough for a full listing; the
-                    // worker's own passes avoid one. A failed listing
-                    // defers every shared blob.
-                    let siblings = match gc_nameservice.all_records().await {
+                    // Listed inside the release window, so only this
+                    // ledger's branches. A failed listing defers every
+                    // shared blob.
+                    let siblings = match gc_nameservice.branch_records(gc_ledger_id.name()).await {
                         Ok(records) => {
                             let mut ids: Vec<LedgerId> = siblings_of(&records, &gc_ledger_id)
                                 .into_iter()
@@ -2606,9 +2609,10 @@ impl crate::Fluree {
     /// Hold every branch of `ledger_name` excluded from indexing and collect
     /// their index heads.
     ///
-    /// Enumerates through `all_records` rather than `list_branches` so that
-    /// **retracted** branches participate. A soft drop is reversible until the
-    /// name is purged, so a soft-dropped branch's index must survive a sweep.
+    /// Enumerates every record under the name, so that **retracted** branches
+    /// participate, through `all_records`, which the nested-ledger check needs
+    /// too. A soft drop is reversible until the name is purged, so a
+    /// soft-dropped branch's index must survive a sweep.
     /// Its own artifacts are safe either way — an unlisted branch contributes
     /// no prefix to scan — but dict blobs are shared across a ledger's
     /// branches, so omitting one would reclaim dicts it still reads.

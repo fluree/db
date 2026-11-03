@@ -274,6 +274,9 @@ pub(super) fn group_plan(
     // Keys: every column the key's term reads, grouped and projected.
     for v in group_by {
         let (src, cols) = var_of(*v)?;
+        if !database_eq_is_exact(src) {
+            return Err("key the database groups apart from its rendering");
+        }
         for col in cols {
             if field_type(col) == Some(FieldType::String) && !caps.string_distinct_is_binary {
                 return Err("string key under a collating dialect");
@@ -307,14 +310,9 @@ pub(super) fn group_plan(
                     return Err("MIN/MAX over a subject");
                 };
                 let orderable = match &src.key {
-                    Some(KeyShape::Column { class, .. }) => match class {
-                        RdfClass::Numeric
-                        | RdfClass::Date
-                        | RdfClass::DateTime
-                        | RdfClass::Bool => true,
-                        RdfClass::Str => caps.string_order_is_codepoint,
-                        _ => false,
-                    },
+                    Some(KeyShape::Column { class, .. }) => {
+                        super::lower::orders_as(class, field_type(col), caps)
+                    }
                     _ => false,
                 };
                 if !orderable {
@@ -364,7 +362,10 @@ pub(super) fn group_plan(
             }
             AggregateFn::Count(v) | AggregateFn::CountDistinct(v) => {
                 let distinct = matches!(f, AggregateFn::CountDistinct(_));
-                let (_, cols) = var_of(*v)?;
+                let (src, cols) = var_of(*v)?;
+                if distinct && !database_eq_is_exact(src) {
+                    return Err("COUNT DISTINCT the database counts apart from its rendering");
+                }
                 let col = if distinct {
                     let [col] = cols.as_slice() else {
                         return Err("COUNT DISTINCT over a template");
@@ -546,6 +547,15 @@ pub(super) fn group_plan(
         extremes,
         decodes,
     })
+}
+
+/// Whether the database's `=` on the variable's column groups as its terms do
+/// (see [`RdfClass::database_eq_is_exact`]); a template's columns always do.
+fn database_eq_is_exact(src: &super::lower::VarSource) -> bool {
+    match &src.key {
+        Some(KeyShape::Column { class, .. }) => class.database_eq_is_exact(),
+        _ => true,
+    }
 }
 
 /// The `HAVING` as a predicate over the grouped outputs: `AND`/`OR`/`NOT`

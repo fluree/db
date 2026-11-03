@@ -440,7 +440,13 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )?
             }
         };
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
@@ -769,6 +775,30 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
+        self.query_view_with_r2rml_tracker(
+            db,
+            q,
+            r2rml_provider,
+            r2rml_table_provider,
+            options,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::query_view_with_r2rml_options`] recording into `tracker`, a
+    /// tracked request's tracker (fuel, time and policy, with its fuel limit),
+    /// whose tally the caller reports. `None` tracks only the fuel limit the
+    /// query names, as an untracked query does.
+    pub(crate) async fn query_view_with_r2rml_tracker(
+        &self,
+        db: &GraphDb,
+        q: impl Into<QueryInput<'_>>,
+        r2rml_provider: &dyn R2rmlProvider,
+        r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
+        tracker: Option<&Tracker>,
+    ) -> Result<QueryResult> {
         let input = q.into();
 
         // #1473: parse SPARQL once. R2RML + within-ledger SPARQL FROM/FROM NAMED
@@ -789,10 +819,23 @@ impl Fluree {
             QueryInput::JsonLd(_) => None,
         };
 
-        // 0. Tracker (fuel limits only). Charge the floor up front so a
-        // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
-        let tracker = tracker_for_input_limits(&input, sparql_ast.as_ref());
-        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+        // 0. Tracker: the caller's, or one for fuel limits only. Charge the
+        // floor up front so a sub-floor `max-fuel` is rejected before
+        // parse/plan; no-op untracked.
+        let limits_only;
+        let tracker = match tracker {
+            Some(tracker) => {
+                // Whether policy governs the request, as the tracked entry
+                // points record it.
+                tracker.record_policy_enforcement(db.policy_enforcement());
+                tracker
+            }
+            None => {
+                limits_only = tracker_for_input_limits(&input, sparql_ast.as_ref());
+                &limits_only
+            }
+        };
+        charge_query_floor(tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
@@ -806,7 +849,13 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )?
             }
         };
 
@@ -826,7 +875,7 @@ impl Fluree {
                 db,
                 &vars,
                 &executable,
-                &tracker,
+                tracker,
                 crate::R2rmlProviders {
                     provider: r2rml_provider,
                     table_provider: r2rml_table_provider,
@@ -891,7 +940,6 @@ impl Fluree {
         let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_sparql_for_view(
             &db.snapshot,
-            db.overlay.as_ref(),
             sparql,
             db.default_context.as_ref(),
             params,
@@ -1026,8 +1074,14 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)
-                    .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )
+                .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
             }
         };
 
@@ -1182,8 +1236,14 @@ impl Fluree {
                 let ast = sparql_ast
                     .take()
                     .expect("SPARQL input carries a parsed AST");
-                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)
-                    .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
+                lower_sparql_ast(
+                    ast,
+                    &db.snapshot,
+                    db.default_context.as_ref(),
+                    sparql,
+                    options.rdf_list_view(),
+                )
+                .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
             }
         };
 
@@ -2649,31 +2709,37 @@ mod graph_source_guard_tests {
     /// top-level pattern with a `["graph", …]` block, the shape that suppresses
     /// the auto-wrap and reaches the guard, so an accidental refusal would
     /// surface here as an error rather than as an empty result.
+    ///
+    /// Only a mapped source is a dataset member (an index source is refused as
+    /// one), so this needs the iceberg reader. Its catalog does not exist:
+    /// registration's table check is non-fatal, and the `graph` block asks for
+    /// a predicate the mapping does not map, so nothing is scanned.
+    #[cfg(feature = "iceberg")]
     #[tokio::test]
     async fn a_named_only_graph_source_query_is_answered_not_refused() {
         let fluree = FlureeBuilder::memory().build_memory();
-        let ledger = fluree.create_ledger("gsguard-src").await.unwrap();
-        let txn = serde_json::json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "insert": [{"@id": "ex:a1", "@type": "ex:Article", "ex:title": "Graph sources"}]
-        });
-        let _ledger = fluree.insert(ledger, &txn).await.unwrap().ledger;
-
-        // A BM25 source registers in the nameservice without the iceberg
-        // feature, so the dataset resolves a real graph-source view.
-        let index_query = serde_json::json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "where": [{"@id": "?x", "@type": "ex:Article"}],
-            "select": {"?x": ["@id", "ex:title"]}
-        });
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/ns/mapping#Edge> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "ns.edge" ] ;
+                rr:subjectMap [ rr:template "http://example.org/ns/{src}" ] ;
+                rr:predicateObjectMap [
+                    rr:predicate <http://example.org/ns/edge> ;
+                    rr:objectMap [ rr:column "dst" ]
+                ] .
+        "#;
         let gs = fluree
-            .create_full_text_index(crate::Bm25CreateConfig::new(
-                "gsguard-search",
-                "gsguard-src:main",
-                index_query,
-            ))
+            .create_r2rml_graph_source(
+                crate::R2rmlCreateConfig::new(
+                    "gsguard-mapped",
+                    "https://example.invalid",
+                    "ns.edge",
+                    mapping,
+                )
+                .with_mapping_media_type("text/turtle"),
+            )
             .await
-            .expect("register the BM25 graph source");
+            .expect("register the mapped graph source");
 
         let body = serde_json::json!({
             "@context": {"ex": "http://example.org/ns/"},

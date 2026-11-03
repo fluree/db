@@ -374,6 +374,18 @@ async fn probe_helpers_merge_novelty() {
             Engage::SpotStarWalk,
         ),
         (
+            // ex:missing is no predicate of the ledger's, so the star probe
+            // reads nothing for it while it merges the other predicates'
+            // novelty: the star matches nothing, rather than refusing.
+            "property-join-spot-walk-unknown-predicate",
+            r#"PREFIX ex: <http://example.org/ns/>
+              SELECT ?s ?v ?m
+              WHERE { ?s ex:city "Quito" . ?s ex:age ?v . ?s ex:missing ?m }
+              ORDER BY ?s ?v ?m"#,
+            0,
+            Engage::SpotStarWalk,
+        ),
+        (
             // ex:nick exists only in novelty, so the whole-star SPOT plan
             // declines and the remaining base predicates take the chunked
             // batched probes instead (the novelty-only predicate full-scans).
@@ -504,11 +516,11 @@ async fn batched_object_join_merges_novelty() {
     let receipt = fluree
         .update(
             receipt.ledger,
-            // A constant delete names one entry of a value held at several
-            // list positions; a WHERE-driven delete would name every one.
+            // A delete naming a list position retracts that entry alone;
+            // naming the value would retract every entry holding it.
             &json!({
                 "@context": ctx(),
-                "delete": {"@id": "ex:b5", "ex:authors": {"@id": "ex:bob"}}
+                "delete": {"@id": "ex:b5", "ex:authors": {"@list": [{"@id": "ex:bob"}]}}
             }),
         )
         .await

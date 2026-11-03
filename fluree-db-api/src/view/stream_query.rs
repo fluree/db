@@ -119,6 +119,7 @@ impl Fluree {
                     &db.snapshot,
                     db.default_context.as_ref(),
                     params,
+                    options.rdf_list_view(),
                 )?
             }
         };
@@ -403,6 +404,7 @@ impl Fluree {
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 params,
+                options.rdf_list_view(),
             )?,
         };
 
@@ -546,6 +548,9 @@ fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
         // (mirrors the server `@type` `err:r2rml/UnsupportedPattern`) so the
         // streaming path is as machine-discriminable as the buffered one.
         QE::R2rmlUnsupportedPattern { .. } => "r2rml_unsupported_pattern",
+        QE::GraphSourceUnmapped { .. } => "graph_source_unmapped",
+        QE::GraphSourceUnsupported { .. } => "graph_source_unsupported",
+        QE::GraphSourceNotAGraph { .. } => "graph_source_not_a_graph",
         QE::InvalidQuery(_)
         | QE::UngroupedRead(_)
         | QE::InvalidFilter(_)

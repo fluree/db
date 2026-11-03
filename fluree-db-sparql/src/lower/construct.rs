@@ -76,6 +76,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         if let Some(grouping) = &level.grouping {
             construct_template.unbind_outside_group_row(grouping, self.vars);
         }
+        construct_template.mark_list_entries(&patterns, self.vars);
 
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
