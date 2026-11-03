@@ -2958,3 +2958,118 @@ async fn order_by_limit_over_a_joined_scan_answers_the_joined_top_k() {
         wrong.join("\n")
     );
 }
+
+/// The rows of a SPARQL (bindings) or JSON-LD (array of rows) result, each as
+/// the text of its `vars` (an IRI, or a literal's lexical form), sorted.
+fn answer_rows(result: &serde_json::Value, vars: &[&str]) -> Vec<Vec<String>> {
+    let text = |v: &serde_json::Value| -> String {
+        match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Object(o) => o
+                .get("value")
+                .or_else(|| o.get("@id"))
+                .or_else(|| o.get("@value"))
+                .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                .unwrap_or_else(|| panic!("not a term: {v}")),
+            other => panic!("not a term: {other}"),
+        }
+    };
+    let mut rows: Vec<Vec<String>> =
+        if let Some(bindings) = result["results"]["bindings"].as_array() {
+            bindings
+                .iter()
+                .map(|b| vars.iter().map(|v| text(&b[*v])).collect())
+                .collect()
+        } else {
+            result
+                .as_array()
+                .unwrap_or_else(|| panic!("not a result: {result}"))
+                .iter()
+                .map(|row| match row {
+                    serde_json::Value::Array(cells) => cells.iter().map(text).collect(),
+                    cell => vec![text(cell)],
+                })
+                .collect()
+        };
+    rows.sort();
+    rows
+}
+
+fn person(id: u32) -> String {
+    format!("http://example.org/person/{id}")
+}
+
+/// A `VALUES` block of subjects narrows the scan to their template keys (on
+/// five files with disjoint `id` ranges, the two subjects' files). Subjects the
+/// template cannot produce, or that no row holds, contribute nothing.
+#[tokio::test]
+async fn a_values_subject_set_answers_its_subjects() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("keys-window", &location, WINDOW_IDS_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let subjects = [
+        person(5),
+        person(2500),
+        person(99_999),
+        "http://other.example/person/7".to_string(),
+    ];
+    let expected = vec![
+        vec![person(2500), "person-2500".to_string()],
+        vec![person(5), "person-0005".to_string()],
+    ];
+    let sparql = format!(
+        "SELECT ?s ?n FROM <keys-window:main> WHERE {{ VALUES ?s {{ {} }} \
+         ?s <http://example.org/name> ?n }}",
+        subjects
+            .iter()
+            .map(|s| format!("<{s}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    assert_eq!(
+        answer_rows(&result, &["s", "n"]),
+        expected,
+        "SPARQL: {result}"
+    );
+
+    let ids: Vec<serde_json::Value> = subjects
+        .iter()
+        .map(|s| serde_json::json!({"@id": s}))
+        .collect();
+    let jsonld = serde_json::json!({
+        "from": "keys-window:main",
+        "select": ["?s", "?n"],
+        "where": [
+            ["values", ["?s", ids]],
+            {"@id": "?s", "http://example.org/name": "?n"}
+        ],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("JSON-LD: {e}"));
+    assert_eq!(
+        answer_rows(&result, &["s", "n"]),
+        expected,
+        "JSON-LD: {result}"
+    );
+}

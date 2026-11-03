@@ -78,10 +78,10 @@ pub enum ScanValue {
     /// skipped for field types not yet supported. The R2RML operator still enforces
     /// the subject equality, so a skipped or imperfect push is never wrong.
     TemplateKey(String),
-    /// A bounded set of scalar values for a [`ScanCmpOp::In`] membership filter
-    /// (from a `FILTER … IN` or single-var `VALUES`). Every member is one of the
-    /// scalar variants above — never a nested `Set`, never a `TemplateKey`. Only
-    /// ever produced by the set-lowering emit path; it is never wrapped in an
+    /// A bounded set of values for a [`ScanCmpOp::In`] membership filter: from
+    /// a `FILTER … IN` or single-var `VALUES` (scalar members), or from subject
+    /// IRIs reversed through a subject template (`TemplateKey` members, one set
+    /// per key column). Never a nested `Set`. It is never wrapped in an
     /// [`ObjectConstant`] (a constant object is a single scalar term), so the
     /// scalar-only match sites treat it defensively as "not a scalar constant".
     Set(Vec<ScanValue>),
@@ -370,6 +370,20 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         as_of_t: Option<i64>,
     ) -> Result<Option<u64>> {
         let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
+        Ok(None)
+    }
+
+    /// The table's row count when the provider already holds it (a cached scan
+    /// plan, say), without reading anything to learn it. A caller deciding
+    /// whether a table is small enough to cache whole asks first. `Ok(None)`
+    /// when the provider does not know (the default).
+    async fn known_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let _ = (graph_source_id, table_name, as_of_t);
         Ok(None)
     }
 

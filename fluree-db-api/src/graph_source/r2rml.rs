@@ -3074,6 +3074,51 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             .await
     }
 
+    /// The pinned snapshot's row count from what is already at hand, never
+    /// reading manifests to find out: the in-memory scan-files cache (a scan
+    /// of the table earlier in this process), the snapshot summary's
+    /// `total-records` (most writers record it), or the disk catalog cache.
+    async fn known_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<u64>> {
+        #[cfg(feature = "sql")]
+        if self.sql_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        let TableContext {
+            metadata,
+            metadata_location,
+            scope,
+            ..
+        } = self.load_table_context(graph_source_id, table_name).await?;
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
+            return Ok(Some(0));
+        };
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
+        if let Some(files) = self
+            .fluree
+            .r2rml_cache()
+            .get_scan_files(&scope, &cache_key)
+            .await
+        {
+            return Ok(Some(files.estimated_row_count as u64));
+        }
+        if let Some(total) = selected.snapshot.total_records() {
+            return Ok(u64::try_from(total).ok());
+        }
+        Ok(self
+            .catalog_disk_cache()
+            .get_scan_files(&scope, &cache_key)
+            .map(|files| files.estimated_row_count as u64))
+    }
+
     fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> QueryResult<()> {
         let mut pins = self
             .source_times

@@ -50,7 +50,7 @@ use fluree_db_r2rml::mapping::{
 use fluree_db_r2rml::materialize::{
     canonical_join, expand_template, get_join_key_from_batch, materialize_object_from_batch,
     materialize_predicate_from_batch, materialize_subject_from_batch, parent_key_insert_keep_min,
-    reverse_subject_template, RdfTerm,
+    reverse_subject_template, RdfTerm, TemplateReverser,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
@@ -247,6 +247,15 @@ fn topk_pushdown_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_TOPK_PUSHDOWN"))
 }
 
+/// Whether a scan is narrowed by keys its input already holds (#2239): the
+/// subject IRIs a child window binds, reversed through a map's subject
+/// template into key-column filters. Read once from `FLUREE_R2RML_KEY_PUSHDOWN`
+/// (family falsy spellings); off scans every map's table unfiltered by them.
+fn key_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_KEY_PUSHDOWN"))
+}
+
 /// F-AUD-3 kill switch: whether the non-aggregate scan/crawl path records its
 /// materialized windows and fact-parent lookup builds against the query memory
 /// budget. Default ON (`FLUREE_SCAN_MEM_ACCOUNTING`, family falsy spellings via
@@ -377,6 +386,99 @@ fn tm_passes_star_prune(
     true
 }
 
+/// What a child window's subject IRIs say about one map's table scan (#2239).
+#[derive(Debug)]
+enum SubjectKeys {
+    /// Nothing: the window's subjects are unknown, or the map's subject is not
+    /// a reversible IRI template.
+    Unknown,
+    /// No subject the window binds is one the map's template can produce, so
+    /// the map yields no row the join keeps.
+    NoneProducible,
+    /// Filters on the template's key columns keeping every row whose subject
+    /// the window binds: one per column, exact for a one-column key and a
+    /// superset for several (the join stays the exact check).
+    Filters(Vec<crate::r2rml::ScanFilter>),
+}
+
+impl SubjectKeys {
+    /// Derive `triples_map`'s keys from `iris`, the distinct subjects a child
+    /// window binds.
+    fn of(triples_map: &TriplesMap, iris: &[Arc<str>]) -> Self {
+        let subject = &triples_map.subject_map;
+        // Only a template subject that mints IRIs: a constant or column subject
+        // takes precedence over a template, and a blank node never equals an IRI
+        // the child binds but is not what the template text reverses either.
+        if subject.constant.is_some()
+            || subject.column.is_some()
+            || subject.term_type != TermType::Iri
+        {
+            return Self::Unknown;
+        }
+        let Some(reverser) = subject.template.as_deref().and_then(TemplateReverser::new) else {
+            return Self::Unknown;
+        };
+        let mut columns: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut producible = false;
+        for iri in iris {
+            // An IRI that does not reverse is one this template cannot produce
+            // (see `TemplateReverser`): it narrows nothing and adds no key.
+            let Some(values) = reverser.reverse(iri) else {
+                continue;
+            };
+            producible = true;
+            for (column, raw) in values {
+                columns.entry(column).or_default().insert(raw);
+            }
+        }
+        if !producible {
+            return Self::NoneProducible;
+        }
+        Self::Filters(
+            columns
+                .into_iter()
+                .map(|(column, raws)| {
+                    let mut raws: Vec<crate::r2rml::ScanValue> = raws
+                        .into_iter()
+                        .map(crate::r2rml::ScanValue::TemplateKey)
+                        .collect();
+                    if raws.len() == 1 {
+                        crate::r2rml::ScanFilter {
+                            column,
+                            op: crate::r2rml::ScanCmpOp::Eq,
+                            value: raws.remove(0),
+                        }
+                    } else {
+                        crate::r2rml::ScanFilter {
+                            column,
+                            op: crate::r2rml::ScanCmpOp::In,
+                            value: crate::r2rml::ScanValue::Set(raws),
+                        }
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+/// What a scan of one `(table, projection)` has taught this operator about
+/// pushing child keys into it (the perf guard of #2239). A pushed scan is
+/// filtered, so it bypasses the scan cache that replays a small table across
+/// child windows; pushing every window would re-read a small table each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPushSeen {
+    /// A window's keys were pushed; the table's size is unknown.
+    Pushed,
+    /// Too large to cache (its known row count says so, or an unfiltered scan
+    /// overflowed the cache window): the table is re-read every window
+    /// anyway, so pushing never costs a read.
+    Large,
+    /// Its known row count fits the cache window: read it unfiltered once,
+    /// and every later window replays it.
+    Small,
+}
+
 /// R2RML scan operator for `Pattern::R2rml`.
 ///
 /// Scans an Iceberg table through an R2RML mapping and produces RDF term bindings.
@@ -430,6 +532,13 @@ pub struct R2rmlScanOperator {
     /// correlated OPTIONAL rebuilds the whole operator per row, resetting any
     /// operator-scoped cache — that's PR-4b.)
     parent_lookup_cache: HashMap<LookupCacheKey, Arc<ParentLookup>>,
+    /// Per `(table, projection)`: what pushing child keys into its scan has
+    /// taught this operator (see [`KeyPushSeen`]).
+    key_push_seen: HashMap<(String, Vec<String>), KeyPushSeen>,
+    /// Whether this operator narrows its scans by keys its input holds (#2239).
+    /// Read once from [`key_pushdown_enabled`] at construction, per operator
+    /// like `parent_memo`, so a test can drive both regimes in one process.
+    key_pushdown: bool,
     /// Whether cross-batch parent memoization is on for this operator. Read once
     /// from `parent_memo_enabled()` at construction (per-operator, not a global
     /// `OnceLock`), so a test can drive both regimes deterministically in one
@@ -534,6 +643,8 @@ impl R2rmlScanOperator {
             child_pending: None,
             scan_cache: HashMap::new(),
             parent_lookup_cache: HashMap::new(),
+            key_push_seen: HashMap::new(),
+            key_pushdown: key_pushdown_enabled(),
             parent_memo: parent_memo_enabled(),
             row_budget: None,
             emitted: 0,
@@ -700,6 +811,87 @@ impl R2rmlScanOperator {
 
     fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
         pattern_scan_filters(&self.pattern, triples_map)
+    }
+
+    /// The distinct IRIs a child window binds this pattern's subject variable
+    /// to, or `None` when they cannot narrow the scan: key pushdown is off, the
+    /// subject is not a variable the child binds, a row leaves it unbound (that
+    /// row joins every produced row), a binding cannot be read as an IRI, or
+    /// there are more than the push cap. A row binding a literal, or a poisoned
+    /// one, joins no produced subject and adds nothing.
+    fn child_subject_iris(
+        &self,
+        child_schema: &[VarId],
+        child_batch: &Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> Option<Vec<Arc<str>>> {
+        if !self.key_pushdown {
+            return None;
+        }
+        let var = self.pattern.subject_var?;
+        let pos = child_schema.iter().position(|v| *v == var)?;
+        let cap = super::in_pushdown_max();
+        let mut iris: HashSet<Arc<str>> = HashSet::new();
+        for binding in child_batch.column_by_idx(pos)? {
+            let iri: Arc<str> = match binding {
+                Binding::Iri(iri) | Binding::IriMatch { iri, .. } => Arc::clone(iri),
+                Binding::Sid { sid, .. } => Arc::from(ctx.decode_sid(sid)?),
+                Binding::Lit { .. } | Binding::EncodedLit { .. } | Binding::Poisoned => continue,
+                _ => return None,
+            };
+            iris.insert(iri);
+            if iris.len() > cap {
+                return None;
+            }
+        }
+        Some(iris.into_iter().collect())
+    }
+
+    /// Whether to push child keys into a scan of `cache_key` that would
+    /// otherwise be cached (the perf guard of #2239): not when the table is
+    /// already cached (the replay reads nothing). Otherwise by its size, when
+    /// the provider already knows its row count: a table too large to cache
+    /// takes the keys every window, one that fits is read unfiltered once and
+    /// replayed. With no known count: the first window pushes, and a later one
+    /// pushes only once the table is known to be too large to cache; until
+    /// then it reads the table unfiltered, which caches a small one for every
+    /// window after it or shows that it is large. Either way at most one read
+    /// more than the best choice, and never more than an unpushed scan, which
+    /// reads the table every window it is not cached.
+    async fn key_push_wanted(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        provider: &dyn super::R2rmlTableProvider,
+        cache_key: &(String, Vec<String>),
+    ) -> Result<bool> {
+        if self.scan_cache.contains_key(cache_key) {
+            return Ok(false);
+        }
+        if !self.key_push_seen.contains_key(cache_key) {
+            let known = provider
+                .known_row_count(
+                    &self.pattern.graph_source_id,
+                    &cache_key.0,
+                    if ctx.explicit_dataset().is_some() {
+                        None
+                    } else {
+                        Some(ctx.to_t)
+                    },
+                )
+                .await?;
+            if let Some(rows) = known {
+                let seen = if rows > materialize_window_rows() as u64 {
+                    KeyPushSeen::Large
+                } else {
+                    KeyPushSeen::Small
+                };
+                self.key_push_seen.insert(cache_key.clone(), seen);
+            }
+        }
+        Ok(match self.key_push_seen.get(cache_key) {
+            None | Some(KeyPushSeen::Large) => true,
+            Some(KeyPushSeen::Pushed | KeyPushSeen::Small) => false,
+        })
     }
 
     /// Materialize one window of a TriplesMap's produced column batches into
@@ -993,6 +1185,10 @@ impl R2rmlScanOperator {
             .filter(|v| child_schema.contains(v))
             .collect();
 
+        // #2239: the subjects this child window binds, to narrow each map's scan
+        // to their template keys.
+        let child_subjects = self.child_subject_iris(&child_schema, &child_batch, ctx);
+
         let mut tms: Vec<TmStream> = Vec::with_capacity(triples_maps.len());
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -1002,6 +1198,19 @@ impl R2rmlScanOperator {
             // + plan) per map here without returning to `next_batch`.
             ctx.check_cancelled()?;
             if !seen.insert(triples_map.iri.clone()) {
+                continue;
+            }
+
+            let subject_keys = child_subjects
+                .as_deref()
+                .map_or(SubjectKeys::Unknown, |iris| {
+                    SubjectKeys::of(triples_map, iris)
+                });
+            if matches!(subject_keys, SubjectKeys::NoneProducible) {
+                tracing::debug!(
+                    triples_map = %triples_map.iri,
+                    "R2RML scan: TriplesMap skipped, its subject template produces none of the subjects the child binds"
+                );
                 continue;
             }
 
@@ -1074,7 +1283,32 @@ impl R2rmlScanOperator {
 
             // Scan the table, pushing resolved FILTER predicates for file pruning
             // (column resolution needs the mapping, so it happens here).
-            let scan_filters = self.build_scan_filters(triples_map);
+            let mut scan_filters = self.build_scan_filters(triples_map);
+            let cache_key = (table_name.to_string(), projection.clone());
+            if let SubjectKeys::Filters(keys) = subject_keys {
+                // A scan the cache would hold (unfiltered, unbudgeted, no top-k)
+                // takes the keys only when the perf guard says so; any other
+                // scan bypasses the cache already, so the keys cost nothing.
+                let would_cache = scan_cache_enabled()
+                    && scan_filters.is_empty()
+                    && self.row_budget.is_none()
+                    && self.topk.is_none();
+                if !would_cache
+                    || self
+                        .key_push_wanted(ctx, table_provider, &cache_key)
+                        .await?
+                {
+                    tracing::debug!(
+                        triples_map = %triples_map.iri,
+                        key_columns = keys.len(),
+                        "R2RML scan: pushing the child window's subject keys"
+                    );
+                    self.key_push_seen
+                        .entry(cache_key.clone())
+                        .or_insert(KeyPushSeen::Pushed);
+                    scan_filters.extend(keys);
+                }
+            }
             let as_of_t = if ctx.explicit_dataset().is_some() {
                 None
             } else {
@@ -1119,7 +1353,6 @@ impl R2rmlScanOperator {
                 && scan_filters.is_empty()
                 && self.row_budget.is_none()
                 && self.topk.is_none();
-            let cache_key = (table_name.to_string(), projection.clone());
             let stream: ColumnBatchStream = if !cacheable {
                 table_provider
                     .scan_table(
@@ -1151,6 +1384,8 @@ impl R2rmlScanOperator {
                         replay_stream(arc)
                     }
                     CollectedScan::Overflow(prefix, remainder) => {
+                        self.key_push_seen
+                            .insert(cache_key.clone(), KeyPushSeen::Large);
                         Box::pin(futures::stream::iter(prefix.into_iter().map(Ok)).chain(remainder))
                     }
                 }
@@ -3901,6 +4136,315 @@ mod tests {
             ),
             "a pushed filter the reader may apply only partly: no top-k"
         );
+    }
+
+    /// A provider for the key-pushdown tests: records each scan's table and
+    /// filters, and returns one batch of `ID` (and `B`) values, unfiltered (the
+    /// operator's join is the exact check).
+    mod key_push {
+        use super::*;
+        use crate::r2rml::{R2rmlTableProvider, ScanCmpOp, ScanFilter};
+        use crate::seed::BatchReplayOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        pub(super) struct Recorder {
+            pub scans: Mutex<Vec<(String, Vec<ScanFilter>)>>,
+            /// The row count the provider reports knowing, if any.
+            pub known_rows: Option<u64>,
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for Recorder {
+            async fn known_row_count(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _as_of_t: Option<i64>,
+            ) -> Result<Option<u64>> {
+                Ok(self.known_rows)
+            }
+
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                table_name: &str,
+                _projection: &[String],
+                filters: &[ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                self.scans
+                    .lock()
+                    .unwrap()
+                    .push((table_name.to_string(), filters.to_vec()));
+                let field = |name: &str, id| FieldInfo {
+                    name: name.to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    field_id: id,
+                };
+                let schema = Arc::new(BatchSchema::new(vec![field("ID", 1), field("B", 2)]));
+                let ids: Vec<Option<i64>> = (1..=5).map(Some).collect();
+                let bs: Vec<Option<i64>> = (1..=5).map(|i| Some(i * 10)).collect();
+                let batch =
+                    ColumnBatch::new(schema, vec![Column::Int64(ids), Column::Int64(bs)]).unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        fn people(template: &str) -> Arc<CompiledR2rmlMapping> {
+            let tm = TriplesMap::new("#Person", "people")
+                .with_subject_template(template)
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/id"),
+                    object_map: ObjectMap::column("ID"),
+                });
+            Arc::new(CompiledR2rmlMapping::new(vec![tm]))
+        }
+
+        fn subjects(bindings: Vec<Binding>) -> Batch {
+            let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+            Batch::new(schema, vec![bindings]).unwrap()
+        }
+
+        /// Scan `?s ex:id ?id` under one child batch binding `?s`; the scans
+        /// the provider saw and the `(?s, ?id)` rows produced.
+        type Scans = Vec<(String, Vec<ScanFilter>)>;
+
+        pub(super) fn run(template: &str, child: Batch) -> (Scans, Vec<(String, i64)>) {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let provider = Recorder::default();
+            let mut rows = Vec::new();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                let schema = child.schema_arc();
+                let mut replay = BatchReplayOperator::new(Arc::clone(&schema), vec![child]);
+                futures::executor::block_on(replay.open(&ctx)).unwrap();
+                let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                    .with_predicate("http://ex/id");
+                let mut op = R2rmlScanOperator::new(Box::new(replay), pattern);
+                op.mapping = Some(people(template));
+                op.state = OperatorState::Open;
+                while let Some(batch) = futures::executor::block_on(op.next_batch(&ctx)).unwrap() {
+                    for row in 0..batch.len() {
+                        let s = batch.column(VarId(0)).unwrap()[row].clone();
+                        let id = batch.column(VarId(1)).unwrap()[row].clone();
+                        let Binding::Iri(s) = s else { panic!("{s:?}") };
+                        let Binding::Lit { val, .. } = id else {
+                            panic!("{id:?}")
+                        };
+                        // An un-annotated column reads as its lexical text.
+                        let fluree_db_core::FlakeValue::String(id) = val else {
+                            panic!("{val:?}")
+                        };
+                        rows.push((s.to_string(), id.parse().unwrap()));
+                    }
+                }
+            }
+            rows.sort();
+            let scans = provider.scans.into_inner().unwrap();
+            (scans, rows)
+        }
+
+        fn keys(filter: &ScanFilter) -> (String, ScanCmpOp, Vec<String>) {
+            let raw = |v: &ScanValue| match v {
+                ScanValue::TemplateKey(k) => k.clone(),
+                other => panic!("not a template key: {other:?}"),
+            };
+            let values = match &filter.value {
+                ScanValue::Set(members) => members.iter().map(raw).collect(),
+                other => vec![raw(other)],
+            };
+            (filter.column.clone(), filter.op, values)
+        }
+
+        /// The subjects a child window binds narrow the scan to their template
+        /// keys: an IRI the template cannot produce and a literal add none,
+        /// duplicates collapse, and the answers are the join's as before.
+        #[test]
+        fn a_bound_subject_set_pushes_its_keys() {
+            let child = subjects(vec![
+                Binding::iri("http://ex/person/2"),
+                Binding::iri("http://ex/person/4"),
+                Binding::iri("http://other/9"),
+                Binding::lit(
+                    fluree_db_core::FlakeValue::Long(3),
+                    fluree_db_core::Sid::new(2, "long"),
+                ),
+                Binding::iri("http://ex/person/2"),
+            ]);
+            let (scans, rows) = run("http://ex/person/{ID}", child);
+            assert_eq!(scans.len(), 1);
+            let pushed: Vec<_> = scans[0].1.iter().map(keys).collect();
+            assert_eq!(
+                pushed,
+                [(
+                    "ID".to_string(),
+                    ScanCmpOp::In,
+                    vec!["2".to_string(), "4".to_string()]
+                )]
+            );
+            assert_eq!(
+                rows,
+                [
+                    ("http://ex/person/2".to_string(), 2),
+                    ("http://ex/person/2".to_string(), 2),
+                    ("http://ex/person/4".to_string(), 4),
+                ]
+            );
+        }
+
+        /// When no subject the child binds is one the map's template produces,
+        /// the map yields nothing the join keeps: its table is not read.
+        #[test]
+        fn a_map_producing_none_of_the_subjects_is_not_scanned() {
+            let child = subjects(vec![
+                Binding::iri("http://other/2"),
+                Binding::iri("http://ex/person/"),
+            ]);
+            let (scans, rows) = run("http://ex/person/{ID}/x", child);
+            assert!(scans.is_empty(), "{scans:?}");
+            assert!(rows.is_empty());
+        }
+
+        /// A row leaving the subject unbound joins every produced row, so
+        /// nothing is pushed; nor through a template that cannot be reversed.
+        #[test]
+        fn an_unbound_subject_or_an_irreversible_template_pushes_nothing() {
+            let child = subjects(vec![Binding::iri("http://ex/person/2"), Binding::Unbound]);
+            let (scans, rows) = run("http://ex/person/{ID}", child);
+            assert!(scans[0].1.is_empty(), "{scans:?}");
+            assert_eq!(rows.len(), 5 + 1, "the unbound row joins all five");
+
+            let child = subjects(vec![Binding::iri("http://ex/person/2;20")]);
+            let (scans, rows) = run("http://ex/person/{ID};{B}", child);
+            assert!(scans[0].1.is_empty(), "{scans:?}");
+            assert_eq!(rows, [("http://ex/person/2;20".to_string(), 2)]);
+        }
+
+        /// A composite key pushes one filter per column: the per-column sets
+        /// keep a superset of the bound pairs, and the join keeps the pairs.
+        #[test]
+        fn a_composite_key_pushes_one_filter_per_column() {
+            let child = subjects(vec![
+                Binding::iri("http://ex/p/1/10"),
+                Binding::iri("http://ex/p/3/40"),
+            ]);
+            let (scans, rows) = run("http://ex/p/{ID}/{B}", child);
+            let mut pushed: Vec<_> = scans[0].1.iter().map(keys).collect();
+            pushed.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                pushed,
+                [
+                    (
+                        "B".to_string(),
+                        ScanCmpOp::In,
+                        vec!["10".to_string(), "40".to_string()]
+                    ),
+                    (
+                        "ID".to_string(),
+                        ScanCmpOp::In,
+                        vec!["1".to_string(), "3".to_string()]
+                    ),
+                ]
+            );
+            assert_eq!(rows, [("http://ex/p/1/10".to_string(), 1)]);
+        }
+
+        /// A row count the provider already knows decides the push without the
+        /// learning detour: a table too large to cache takes the keys every
+        /// window; one that fits is read unfiltered once and replayed.
+        #[test]
+        fn a_known_row_count_decides_the_push() {
+            let pushes = |known_rows: u64| -> Vec<bool> {
+                let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+                let vars = VarRegistry::new();
+                let provider = Recorder {
+                    known_rows: Some(known_rows),
+                    ..Recorder::default()
+                };
+                {
+                    let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                    ctx.r2rml_table_provider = Some(&provider);
+                    let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                        .with_predicate("http://ex/id");
+                    let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+                    let child = BatchReplayOperator::new(schema, Vec::new());
+                    let mut op = R2rmlScanOperator::new(Box::new(child), pattern);
+                    op.mapping = Some(people("http://ex/person/{ID}"));
+                    for k in 1..=3 {
+                        let child = subjects(vec![Binding::iri(format!("http://ex/person/{k}"))]);
+                        futures::executor::block_on(op.build_progress(&ctx, child)).unwrap();
+                    }
+                }
+                let scans = provider.scans.into_inner().unwrap();
+                scans.iter().map(|(_, f)| !f.is_empty()).collect()
+            };
+            let large = materialize_window_rows() as u64 + 1;
+            assert_eq!(
+                pushes(large),
+                [true, true, true],
+                "too large to cache: every window"
+            );
+            assert_eq!(
+                pushes(10),
+                [false],
+                "fits: read once unfiltered, then replayed"
+            );
+        }
+
+        /// The perf guard: a table the scan cache would hold is pushed into on
+        /// the first child window only. The second reads it unfiltered, which
+        /// caches it (it is small), and the third replays the cache without a
+        /// scan. Once the table is known to be too large to cache, every window
+        /// pushes.
+        #[test]
+        fn a_cacheable_table_is_pushed_into_once_then_cached() {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let provider = Recorder::default();
+            let large_scans = {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                let new_op = || {
+                    let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                        .with_predicate("http://ex/id");
+                    let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+                    let child = BatchReplayOperator::new(schema, Vec::new());
+                    let mut op = R2rmlScanOperator::new(Box::new(child), pattern);
+                    op.mapping = Some(people("http://ex/person/{ID}"));
+                    op
+                };
+                let mut op = new_op();
+                for k in 1..=3 {
+                    let child = subjects(vec![Binding::iri(format!("http://ex/person/{k}"))]);
+                    futures::executor::block_on(op.build_progress(&ctx, child)).unwrap();
+                }
+                let small = provider.scans.lock().unwrap().len();
+                let mut op = new_op();
+                let projection = vec!["ID".to_string()];
+                op.key_push_seen
+                    .insert(("people".to_string(), projection), KeyPushSeen::Large);
+                for k in 1..=2 {
+                    let child = subjects(vec![Binding::iri(format!("http://ex/person/{k}"))]);
+                    futures::executor::block_on(op.build_progress(&ctx, child)).unwrap();
+                }
+                provider.scans.lock().unwrap().len() - small
+            };
+            let scans = provider.scans.into_inner().unwrap();
+            let pushed: Vec<bool> = scans.iter().map(|(_, f)| !f.is_empty()).collect();
+            assert_eq!(
+                pushed,
+                [true, false, true, true],
+                "window 1 pushes, 2 reads to cache, 3 replays; a large table pushes every window"
+            );
+            assert_eq!(large_scans, 2);
+        }
     }
 
     fn pom(pred: &str, col: &str) -> PredicateObjectMap {
