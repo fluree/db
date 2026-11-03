@@ -3,10 +3,10 @@
 Fluree Unstructured is part of the Fluree CLI. There is nothing else to install: the parsing engine is compiled in, and the caches and ledger live under your project.
 
 ```bash
-# Homebrew (macOS / Linux)
+# Homebrew (macOS 14 or later / Linux)
 brew install fluree/tap/fluree
 
-# or the shell installer (macOS / Linux)
+# or the shell installer (macOS 14 or later / Linux)
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh
 
 fluree --version

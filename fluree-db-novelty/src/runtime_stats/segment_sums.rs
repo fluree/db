@@ -21,7 +21,8 @@ use super::{
 };
 use crate::{Novelty, Segment};
 use fluree_db_core::{is_rdf_type, Flake, FlakeValue, GraphId, IndexStats, LedgerSnapshot, Sid};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -33,38 +34,38 @@ pub(crate) struct SegmentSumsSlot(Mutex<Option<(u64, Arc<SegmentSums>)>>);
 #[derive(Default)]
 pub(crate) struct SegmentSums {
     flakes: i64,
-    graph_flakes: HashMap<GraphId, i64>,
-    classes: HashMap<Sid, i64>,
-    properties: HashMap<Sid, PropertySums>,
-    graph_properties: HashMap<(GraphId, Sid), GraphPropertySums>,
+    graph_flakes: FxHashMap<GraphId, i64>,
+    classes: FxHashMap<Sid, i64>,
+    properties: FxHashMap<Sid, PropertySums>,
+    graph_properties: FxHashMap<(GraphId, Sid), GraphPropertySums>,
     /// Value and subject counts for the predicates the index has no ndv for.
-    ndv: HashMap<Sid, NdvSums>,
+    ndv: FxHashMap<Sid, NdvSums>,
 }
 
 #[derive(Default)]
 struct PropertySums {
     count: i64,
-    datatypes: HashMap<u8, i64>,
-    asserted: HashSet<u8>,
+    datatypes: FxHashMap<u8, i64>,
+    asserted: FxHashSet<u8>,
 }
 
 #[derive(Default)]
 struct GraphPropertySums {
     count: i64,
     last_modified_t: i64,
-    datatypes: HashMap<u8, i64>,
+    datatypes: FxHashMap<u8, i64>,
     observed: Vec<u8>,
 }
 
 /// Per value (keyed by [`value_key`]) and per subject, the net count.
 #[derive(Default)]
 struct NdvSums {
-    values: HashMap<u64, i64>,
-    subjects: HashMap<Sid, i64>,
+    values: FxHashMap<u64, i64>,
+    subjects: FxHashMap<Sid, i64>,
 }
 
 /// [`NdvSums`] merged across segments.
-type NdvRefs<'a> = (HashMap<u64, i64>, HashMap<&'a Sid, i64>);
+type NdvRefs<'a> = (FxHashMap<u64, i64>, FxHashMap<&'a Sid, i64>);
 
 /// A value's identity for distinct-value counting: a hash of the term, so
 /// sums hold no copy of a string or vector. Distinct values sharing a hash
@@ -78,7 +79,11 @@ fn value_key(flake: &Flake) -> u64 {
 impl SegmentSums {
     /// What the walk in `assemble_fast_stats_inner` does per flake under the
     /// estimate merge with counts-only classes, summed instead of applied.
-    fn of(flakes: &[Flake], snapshot: &LedgerSnapshot, indexed_ndv: &HashSet<(u16, &str)>) -> Self {
+    fn of(
+        flakes: &[Flake],
+        snapshot: &LedgerSnapshot,
+        indexed_ndv: &FxHashSet<(u16, &str)>,
+    ) -> Self {
         let mut sums = Self::default();
         for flake in flakes {
             let delta = if flake.op { 1 } else { -1 };
@@ -127,7 +132,7 @@ fn segment_sums(
     segment: &Segment,
     ndv_scope: u64,
     snapshot: &LedgerSnapshot,
-    indexed_ndv: &HashSet<(u16, &str)>,
+    indexed_ndv: &FxHashSet<(u16, &str)>,
 ) -> Arc<SegmentSums> {
     let slot = &segment.planner_sums.0;
     if let Some((scope, sums)) = slot
@@ -166,7 +171,7 @@ pub(super) fn planner_stats(
         return None;
     }
 
-    let indexed_ndv: HashSet<(u16, &str)> = indexed
+    let indexed_ndv: FxHashSet<(u16, &str)> = indexed
         .properties
         .as_ref()
         .map(|props| {
@@ -190,11 +195,11 @@ pub(super) fn planner_stats(
         .collect();
 
     let mut flakes_delta = 0i64;
-    let mut graph_flakes: HashMap<GraphId, i64> = HashMap::new();
+    let mut graph_flakes: FxHashMap<GraphId, i64> = FxHashMap::default();
     let mut class_count_deltas: HashMap<Sid, i64> = HashMap::new();
     let mut property_deltas = build_property_deltas(indexed);
-    let mut graph_properties: HashMap<(GraphId, &Sid), GraphPropertySums> = HashMap::new();
-    let mut ndv_acc: HashMap<(u16, &str), NdvRefs<'_>> = HashMap::new();
+    let mut graph_properties: FxHashMap<(GraphId, &Sid), GraphPropertySums> = FxHashMap::default();
+    let mut ndv_acc: FxHashMap<(u16, &str), NdvRefs<'_>> = FxHashMap::default();
     for segment in &sums {
         flakes_delta += segment.flakes;
         for (&g_id, &delta) in &segment.graph_flakes {
@@ -241,7 +246,7 @@ pub(super) fn planner_stats(
     }
 
     let mut graphs = graphs_without_classes(indexed);
-    let mut graph_index: HashMap<GraphId, usize> = graphs
+    let mut graph_index: FxHashMap<GraphId, usize> = graphs
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.g_id, idx))
@@ -272,7 +277,7 @@ pub(super) fn planner_stats(
         }
     }
 
-    let novelty_ndv: HashMap<(u16, &str), (u64, u64)> = ndv_acc
+    let novelty_ndv: FxHashMap<(u16, &str), (u64, u64)> = ndv_acc
         .into_iter()
         .map(|(sid, (values, subjects))| {
             (

@@ -3,13 +3,13 @@
 `fluree doc ingest` can go past structure and chunks and say what a document is *about*: which known things it mentions, where, and what it states about them. Two inputs ground that, and both are graphs you already have or can write in a few lines of Turtle.
 
 ```bash
-fluree doc ingest ./memos -l memos --model ./ontology.ttl --entities people --entities orgs.ttl#schema:Organization
+fluree doc ingest ./memos -l memos --ontology ./ontology.ttl --entities people --entities orgs.ttl#schema:Organization
 ```
 
-- `--model` is an ontology: the classes an entity may have and the properties a relation may use. A ledger or a `.ttl` / `.jsonld` file.
-- `--entities` is a gazetteer: subjects with labels, to be found in the text by name. A ledger or a file, repeatable, optionally scoped to one class with `#Class`.
+- `--ontology` is an ontology: the classes an entity may have and the properties a relation may use. A ledger or a `.ttl` / `.jsonld` file.
+- `--entities` (or `--catalog`) is a gazetteer: subjects with labels, to be found in the text by name. A ledger, a graph source mapped over a warehouse table (`fluree iceberg map`, `sql map`, `delta map`: map a name column to `skos:prefLabel`), or a file; repeatable, optionally scoped to one class with `#Class`.
 
-Either can be given alone. `--entities` without `--model` is a deterministic scan and needs no model at all. `--model` needs a language model in the `llm` slot, or a Fluree AI account.
+Either can be given alone. `--entities` without `--ontology` is a deterministic scan and needs no model at all. `--ontology` needs a language model in the `llm` slot, or a Fluree AI account.
 
 ## The one rule that matters: a known entity keeps its IRI
 

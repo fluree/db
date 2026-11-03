@@ -197,3 +197,61 @@ async fn indexed_ledger_load_keeps_dictionary_coverage() {
         "and still covers it after a commit"
     );
 }
+
+/// Upserting subjects the ledger has never seen over a novelty of many
+/// commits settles every one with the dictionary, reading no novelty, so the
+/// upsert costs the same however much the ledger holds unindexed.
+#[tokio::test(flavor = "current_thread")]
+async fn new_subjects_over_heavy_novelty_read_no_novelty() {
+    let (spans, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let mut ledger = fluree
+        .create_ledger("it/upsert-new-over-novelty:main")
+        .await
+        .unwrap();
+    for c in 0..20 {
+        let graph: Vec<_> = (0..50)
+            .map(|i| json!({"@id": format!("urn:it:old:{c}:{i}"), "ex:name": format!("O{c}-{i}")}))
+            .collect();
+        ledger = fluree
+            .upsert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+            .await
+            .unwrap()
+            .ledger;
+    }
+    assert!(ledger.novelty.len() >= 1000, "the commits stay in novelty");
+
+    let new: Vec<_> = (0..10)
+        .map(|i| json!({"@id": format!("urn:it:new:{i}"), "ex:name": format!("N{i}")}))
+        .collect();
+    fluree
+        .upsert(ledger, &json!({"@context": ctx(), "@graph": new}))
+        .await
+        .unwrap();
+
+    let events = spans.find_events("upsert deletion subject pre-check");
+    let last = events
+        .last()
+        .expect("generate_upsert_deletions must report its pre-check outcome");
+    let field = |k: &str| -> u64 {
+        last.fields
+            .get(k)
+            .unwrap_or_else(|| panic!("pre-check event missing field `{k}`"))
+            .parse()
+            .unwrap_or_else(|_| panic!("field `{k}` is not a number"))
+    };
+    assert_eq!(field("subject_count"), 10);
+    assert_eq!(
+        field("skipped_subjects"),
+        10,
+        "every new subject is skipped"
+    );
+    assert_eq!(
+        field("ruled_out_by_dictionary"),
+        10,
+        "the dictionary settles every new subject; a seek or a walk of \
+         novelty per subject makes the upsert grow with novelty"
+    );
+    assert_eq!(field("pattern_queries"), 0);
+}

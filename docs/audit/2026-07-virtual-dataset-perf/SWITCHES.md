@@ -117,7 +117,8 @@ need to revert them.
 | `FLUREE_R2RML_CRAWL_EXPAND` | on | Master enable for browse-crawl wildcard expansion. **Coupled** to `CRAWL_CLASS_FUSION`: expand-on + fusion-off would route a browse through the UNFUSED 16-table fan-out (429 storm), so disabling fusion also disables expansion. | No crawl expansion (fast empty/declined browse). | baseline (#1450) |
 | `FLUREE_R2RML_FILTER_CONSUMPTION` | on | Move a fully scan-local FILTER INTO the single R2RML scan (`consumed_filter`) so a LIMIT row-budget can reach the scan. | FILTER stays a separate plan operator. | baseline (#1450) |
 | `FLUREE_R2RML_SCAN_CACHE` | on | Cache inner correlated scan results per lookup key (never caches a pruned top-k subset). | No per-child-batch scan cache. | baseline (#1450) |
-| `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` (512×1024) | Bounded window size for exploding a columnar scan into `Binding` rows (caps a ~14GB full-table materialize). | — (a value; `0`/unparseable ⇒ default). | baseline (#1450) |
+| `FLUREE_R2RML_CHILD_WINDOW` | on | Join a correlated scan's child a window of rows per pass over its table (`FlushSchedule`: budget-sized under a LIMIT and growing, otherwise up to `MATERIALIZE_WINDOW_ROWS` rows), instead of one pass per child batch. | One table pass per child batch (quadratic under a large child). | #2199 |
+| `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` (512×1024) | Bounded window size for exploding a columnar scan into `Binding` rows (caps a ~14GB full-table materialize). Also caps a correlated scan's child window (`FLUREE_R2RML_CHILD_WINDOW`). | — (a value; `0`/unparseable ⇒ default). | baseline (#1450) |
 | `FLUREE_OPTIONAL_HASH_JOIN` | on | Master enable for the batched OPTIONAL hash-join (inverted `disabled` logic: off only on explicit `0`/`false`/`off`). | Correlated OPTIONAL (no hash-join). | baseline |
 | `FLUREE_HASH_JOIN` | on | General hash-join enable (used by the R2RML join/OPTIONAL paths). | Nested-loop join. | baseline |
 

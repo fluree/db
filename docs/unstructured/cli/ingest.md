@@ -26,8 +26,8 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `1500`). |
 | `--max-chars <N>` | Split a single element longer than this many characters (default `4000`). |
 | `--max-crops <N>` | Most crops one document may send to the vision model (default `70`). A document asking for more lands with the deterministic tier only and is flagged. |
-| `--model <LEDGER\|FILE>` | Ontology the language model extracts against: classes and properties from a ledger or a `.ttl` / `.jsonld` / `.nt` / `.json` file. Needs the `llm` slot or a Fluree AI account. |
-| `--entities <LEDGER\|FILE[#CLASS]>` | Known entities to find by label (`skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName`, `schema:alternateName`). Repeatable; `#Class` keeps only subjects of that type. A mention keeps the entity's own IRI. Works without `--model` and without any model. |
+| `--ontology <LEDGER\|FILE>` | Ontology the language model extracts against: classes and properties from a ledger or a `.ttl` / `.jsonld` / `.nt` / `.json` file. Needs the `llm` slot or a Fluree AI account. |
+| `--entities <LEDGER\|FILE[#CLASS]>` (alias `--catalog`) | Known entities (a catalog) from a ledger, a graph source mapped over a table (`fluree iceberg\|sql\|delta map`), or a file, found by label (`skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName`, `schema:alternateName`). Repeatable; `#Class` keeps only subjects of that type. A mention keeps the entity's own IRI. Works without `--ontology` and without any model. |
 | `--relations <MODE>` | `direct` (default) writes an edge for every predicate the ontology admits, plus the reified node; `reified` writes the nodes only; `off` extracts entities alone. |
 | `--guidance <FILE>` | Project priorities placed in the extraction prompt. Config: `doc.extraction.guidance`. |
 | `--system-prompt <FILE>` | Replaces the extraction system prompt; keep the `{model}` and `{guidance}` slots. Config: `doc.extraction.system_prompt`. |
@@ -35,7 +35,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--concurrency <N>` | Chunks sent to the language model at once (default `4`). Config: `doc.extraction.concurrency`. |
 | `--drop-off-model` | Drop new entities whose class is not in the ontology instead of keeping them flagged `doc:offModel`. Config: `doc.extraction.drop_off_model`. |
 | `--lang <CODE>` | Language for stemming in the entity scan (default `en`). |
-| `--no-extract` | Skip extraction even when `--model` or `--entities` is given. |
+| `--no-extract` | Skip extraction even when `--ontology` or `--entities` is given. |
 | `--dry-run` | Parse, chunk and embed, then report what would be written. Nothing is written. |
 | `--out-dir <DIR>` | Also write each document's transaction as `<relative-path>.jsonld` here. |
 
@@ -75,7 +75,7 @@ done: 2 ingested, 1 unchanged, 0 failed — 142 chunks, 41 pages, 2 crop(s) read
 With extraction on, the header names the ontology and the gazetteer, each document line adds its mentions, entities and relations, and a final line totals them:
 
 ```
-  model      ./ontology.ttl (14 classes, 22 properties)
+  ontology   ./ontology.ttl (14 classes, 22 properties)
   extraction auto (relations: reified + direct edges; off-model entities: kept, flagged; 4 chunk(s) at once)
   entities   people: 412 label(s)
   entities   orgs.ttl#schema:Organization: 38 label(s)
