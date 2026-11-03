@@ -8309,6 +8309,7 @@ async fn a_branch_of_an_unindexed_ledger_applies_its_config() {
     for indexed in [false, true] {
         if indexed {
             support::rebuild_and_publish_index(&fluree, &dev).await;
+            fluree.disconnect_ledger(&dev).await;
         }
         assert_eq!(unique_enabled(&fluree, &dev).await, Some(true), "{indexed}");
         let ledger = fluree.ledger(&dev).await.unwrap();
@@ -9093,4 +9094,146 @@ async fn a_push_carrying_config_under_two_iris_applies_both() {
         .build()
         .unwrap();
     assert_eq!(unique_enabled(&reloaded, remote).await, Some(false));
+}
+
+/// The policy a source's config sets governs a request carrying no policy of
+/// its own on a branch of the source, or on a copy under another name, as on
+/// the source: it sees what the policy allows and nothing else, and can change
+/// neither the config nor the policy rules, so it cannot grant itself access.
+/// A branch of an unindexed source, before and after the branch is indexed,
+/// and a copy.
+#[tokio::test]
+async fn a_sources_policy_governs_its_branch_and_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let name = "it/policy-source";
+    let source = format!("{name}:main");
+    fluree.create_ledger(name).await.unwrap();
+    fluree
+        .graph(&source)
+        .transact()
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice", "ex:ssn": "111-11-1111"},
+                {
+                    "@id": "ex:viewNames",
+                    "@type": ["f:AccessPolicy", "ex:UserPolicy"],
+                    "f:action": {"@id": "f:view"},
+                    "f:onProperty": [{"@id": "ex:name"}],
+                    "f:allow": true
+                }
+            ]
+        }))
+        .commit()
+        .await
+        .unwrap();
+    fluree
+        .graph(&source)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             @prefix ex: <http://example.org/> .
+             GRAPH <{}> {{
+                 <urn:config:main> a f:LedgerConfig ;
+                     f:policyDefaults <urn:config:policy> .
+                 <urn:config:policy> f:defaultAllow false ;
+                     f:policyClass ex:UserPolicy .
+             }}",
+            config_graph_iri(&source)
+        ))
+        .commit()
+        .await
+        .unwrap();
+    assert_policy_confines(&fluree, &source).await;
+
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    assert_policy_confines(&fluree, &dev).await;
+    support::rebuild_and_publish_index(&fluree, &dev).await;
+    fluree.disconnect_ledger(&dev).await;
+    assert_policy_confines(&fluree, &dev).await;
+
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&source, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/policy-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    assert_policy_confines(&fluree, &copy).await;
+}
+
+/// Under `ledger_id`'s config policy, a request with no policy of its own
+/// reads `ex:alice`'s name but not her SSN, and its writes to the config and to
+/// the policy rules are refused.
+async fn assert_policy_confines(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let alice = |property: &str| {
+        let mut query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": ledger_id,
+            "select": "?v",
+            "where": {"@id": "ex:alice"}
+        });
+        query["where"][property] = json!("?v");
+        query
+    };
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    for (property, expected) in [("ex:name", json!(["Alice"])), ("ex:ssn", json!([]))] {
+        let rows = fluree
+            .query_connection(&alice(property))
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(rows, expected, "{ledger_id}: {property}");
+    }
+
+    let policy = fluree_db_api::build_transact_policy_context(
+        fluree,
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &GovernanceOptions::default(),
+    )
+    .await
+    .unwrap()
+    .expect("the config's policy governs writes");
+    for (what, doc) in [
+        (
+            "open the config",
+            json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:policy",
+                "@graph": "config",
+                "f:defaultAllow": true
+            }),
+        ),
+        (
+            "grant itself access",
+            json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@id": "ex:viewAll",
+                "@type": ["f:AccessPolicy", "ex:UserPolicy"],
+                "f:action": {"@id": "f:view"},
+                "f:allow": true
+            }),
+        ),
+    ] {
+        let err = fluree
+            .stage_owned(ledger.clone())
+            .insert(&doc)
+            .policy(policy.clone())
+            .execute()
+            .await
+            .expect_err(what);
+        assert_eq!(err.status_code(), 403, "{ledger_id}: {what}: {err}");
+    }
 }
