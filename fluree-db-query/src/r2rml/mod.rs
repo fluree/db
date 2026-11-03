@@ -26,6 +26,7 @@ mod operator;
 pub(crate) mod policy;
 mod provider;
 mod rewrite;
+pub mod set_semantics;
 pub mod sql_lane;
 
 pub use fluree_db_tabular::plan;

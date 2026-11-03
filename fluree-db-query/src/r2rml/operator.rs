@@ -40,6 +40,9 @@ use crate::ir::R2rmlPattern;
 use crate::operator::flush::{pull_window, FlushSchedule};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::policy::R2rmlPolicyGate;
+use crate::r2rml::set_semantics::{
+    emits_distinct_for, SeenSolutions, TableKeyEvidence, PROVEN_DISTINCT_SITE,
+};
 use crate::r2rml::ColumnBatchStream;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -575,6 +578,10 @@ struct TmStream {
     /// a given `LookupCacheKey` populates exactly one of the two maps.
     ref_shortcuts: HashMap<LookupCacheKey, RefShortcut>,
     join: JoinPlan,
+    /// Whether this map's solutions go through the pass's
+    /// [`ScanProgress::seen`] set: it can yield a solution twice itself, or
+    /// another map in the pass can yield one of its solutions.
+    dedupe: bool,
 }
 
 /// In-flight streaming scan for one buffered child batch. The child is held
@@ -587,6 +594,20 @@ struct ScanProgress {
     tms: Vec<TmStream>,
     tm_idx: usize,
     window_rows: usize,
+    /// The solutions this pass has emitted, when some map's must be checked
+    /// against them ([`TmStream::dedupe`]). One set per pass: a pass joins the
+    /// whole produced side to one child window, so a solution seen in an
+    /// earlier pass met other child rows and is not a repeat here.
+    seen: Option<SeenSolutions>,
+}
+
+impl ScanProgress {
+    /// Return the pass's deduplication charge to the query budget.
+    fn release_seen(&mut self, ctx: &ExecutionContext<'_>) {
+        if let Some(seen) = self.seen.take() {
+            seen.release(ctx);
+        }
+    }
 }
 
 /// Whether PR-3 star TriplesMap-set pruning is enabled. Read once from
@@ -823,6 +844,11 @@ pub struct R2rmlScanOperator {
     /// View-policy gate, built at open when a non-root policy is active. `None`
     /// = unfiltered scan (see `r2rml::policy`).
     policy_gate: Option<R2rmlPolicyGate>,
+    /// The keys known for the tables this scan reads, deciding which maps'
+    /// solutions skip deduplication (see [`Self::dedupe_plan`]).
+    key_evidence: TableKeyEvidence,
+    /// Whether [`PROVEN_DISTINCT_SITE`] has been stamped for this operator.
+    proven_stamped: bool,
     /// State
     state: OperatorState,
 }
@@ -906,6 +932,8 @@ impl R2rmlScanOperator {
             topk: None,
             consumed_filter,
             policy_gate: None,
+            key_evidence: TableKeyEvidence::default(),
+            proven_stamped: false,
             state: OperatorState::Created,
         }
     }
@@ -1840,8 +1868,14 @@ impl R2rmlScanOperator {
                 pending: None,
                 ref_shortcuts,
                 join,
+                dedupe: true,
             });
         }
+
+        let seen = self
+            .dedupe_plan(ctx, table_provider, &mapping, &mut tms)
+            .await?
+            .then(SeenSolutions::new);
 
         // Under a LIMIT, cap the materialize window at the remaining budget so a
         // `LIMIT n` does not explode a full 512K-row window into bindings before
@@ -1863,7 +1897,88 @@ impl R2rmlScanOperator {
             tms,
             tm_idx: 0,
             window_rows,
+            seen,
         }))
+    }
+
+    /// Decide which of a pass's maps must have their solutions checked against
+    /// the pass's set of emitted solutions, setting each [`TmStream::dedupe`];
+    /// returns whether any must.
+    ///
+    /// The graph holds each triple once, while a table can hold rows minting
+    /// the same one. A map's own rows never repeat a solution of this pattern
+    /// when no two of its rows mint the same subject
+    /// ([`TableKeyEvidence::subject_unique`]) and one row never yields a
+    /// solution twice ([`emits_distinct_for`]). Two maps in the pass can yield
+    /// the same solution unless their subjects are provably disjoint
+    /// ([`TriplesMap::subjects_provably_disjoint`]), so a map overlapping
+    /// another is checked too, and so is that other one, which may see the
+    /// shared solution first. A map proven on both counts is not checked, so
+    /// its rows cost exactly what they did before.
+    ///
+    /// With fast paths disabled every map is checked: the differential oracle
+    /// then never relies on a key.
+    async fn dedupe_plan(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        provider: &dyn super::R2rmlTableProvider,
+        mapping: &CompiledR2rmlMapping,
+        tms: &mut [TmStream],
+    ) -> Result<bool> {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        let fast_paths = !crate::execute::operator_tree::fast_paths_disabled();
+        let maps: Vec<&TriplesMap> = tms
+            .iter()
+            .map(|s| {
+                mapping.get(&s.tm_iri).ok_or_else(|| {
+                    QueryError::Internal(format!(
+                        "TriplesMap '{}' missing from mapping mid-scan",
+                        s.tm_iri
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
+        let as_of_t = if ctx.explicit_dataset().is_some() {
+            None
+        } else {
+            Some(ctx.to_t)
+        };
+        let mut any = false;
+        for (i, tm) in maps.iter().enumerate() {
+            // Fetched for every map, whatever the pattern or the switch: the
+            // source checks the mapping's declared keys against the table
+            // there, and a query over a table whose declared key it cannot
+            // hold is refused, not answered.
+            let unique = self
+                .key_evidence
+                .subject_unique_fetching(
+                    provider,
+                    mapping,
+                    &self.pattern.graph_source_id,
+                    as_of_t,
+                    tm,
+                )
+                .await?;
+            let overlaps = maps
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && !tm.subjects_provably_disjoint(other));
+            let proven = fast_paths && unique && !overlaps && emits_distinct_for(&self.pattern, tm);
+            tms[i].dedupe = !proven;
+            any |= !proven;
+        }
+        if !self.proven_stamped && !tms.is_empty() {
+            self.proven_stamped = true;
+            let outcome = if !fast_paths {
+                FastPathOutcome::Fallback(FastPathFallback::KillSwitch)
+            } else if any {
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+            } else {
+                FastPathOutcome::Proceed
+            };
+            stamp_fast_path(PROVEN_DISTINCT_SITE, outcome);
+        }
+        Ok(any)
     }
 
     /// Read `source`'s parent whole into a [`CompleteParentLookup`], and keep
@@ -1998,7 +2113,17 @@ impl R2rmlScanOperator {
 
     /// Keep a finished scan's probe-built parent indexes for the next child
     /// window's scan.
-    fn retire_progress(&mut self, progress: ScanProgress) {
+    /// The `LIMIT` budget is met: no more rows, so the in-flight pass's
+    /// deduplication set is no longer needed.
+    fn exhaust_on_budget(&mut self, ctx: &ExecutionContext<'_>) {
+        self.state = OperatorState::Exhausted;
+        if let Some(progress) = self.progress.as_mut() {
+            progress.release_seen(ctx);
+        }
+    }
+
+    fn retire_progress(&mut self, ctx: &ExecutionContext<'_>, mut progress: ScanProgress) {
+        progress.release_seen(ctx);
         for tm in progress.tms {
             for (key, index) in tm.parent_lookups {
                 if let ParentIndex::Partial(partial) = index {
@@ -2143,6 +2268,11 @@ impl R2rmlScanOperator {
             };
 
             if !produced.is_empty() {
+                let seen = if progress.tms[i].dedupe {
+                    progress.seen.as_mut()
+                } else {
+                    None
+                };
                 emit_produced_window(
                     &self.out_pos,
                     &progress.child_schema,
@@ -2153,6 +2283,7 @@ impl R2rmlScanOperator {
                     ctx.batch_size,
                     columns,
                     &mut self.pending,
+                    seen,
                     ctx,
                 )?;
             }
@@ -2311,6 +2442,7 @@ fn emit_produced_window(
     batch_size: usize,
     columns: &mut [Vec<Binding>],
     pending: &mut VecDeque<Vec<Binding>>,
+    mut seen: Option<&mut SeenSolutions>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<()> {
     let mut emit = |child_row_idx: usize, prod: &[(VarId, Binding)]| -> Result<()> {
@@ -2334,6 +2466,13 @@ fn emit_produced_window(
             // No shared vars: every produced row pairs with every child row
             // (child is usually the single seed row).
             for prod in produced {
+                // A solution is remembered only once it reaches the output, so
+                // the set holds what the join keeps, not the whole table.
+                if let Some(seen) = seen.as_deref_mut() {
+                    if child_batch.is_empty() || !seen.first_sight(prod, ctx)? {
+                        continue;
+                    }
+                }
                 for child_row_idx in 0..child_batch.len() {
                     emit(child_row_idx, prod)?;
                 }
@@ -2361,6 +2500,19 @@ fn emit_produced_window(
                 if pkey.len() != join_vars.len() {
                     continue;
                 }
+                let agrees = |partial: &[Option<GroupKeyOwned>]| {
+                    partial
+                        .iter()
+                        .zip(pkey.iter())
+                        .all(|(c, p)| c.as_ref().is_none_or(|c| c == p))
+                };
+                if let Some(seen) = seen.as_deref_mut() {
+                    let joins = full_index.get(&pkey).is_some_and(|rows| !rows.is_empty())
+                        || partial_rows.iter().any(|(_, partial)| agrees(partial));
+                    if !joins || !seen.first_sight(prod, ctx)? {
+                        continue;
+                    }
+                }
                 // Fully-bound child rows: exact hash probe.
                 if let Some(rows) = full_index.get(&pkey) {
                     for &child_row_idx in rows {
@@ -2370,11 +2522,7 @@ fn emit_produced_window(
                 // Child rows with an unbound (wildcard) join var: match those that
                 // agree on every bound position.
                 for (child_row_idx, partial) in partial_rows {
-                    let agrees = partial
-                        .iter()
-                        .zip(pkey.iter())
-                        .all(|(c, p)| c.as_ref().is_none_or(|c| c == p));
-                    if agrees {
+                    if agrees(partial) {
                         emit(*child_row_idx, prod)?;
                     }
                 }
@@ -3761,7 +3909,7 @@ impl Operator for R2rmlScanOperator {
                 if self.consumed_filter.is_none() {
                     self.emitted += columns[0].len();
                     if self.row_budget.is_some_and(|b| self.emitted >= b) {
-                        self.state = OperatorState::Exhausted;
+                        self.exhaust_on_budget(ctx);
                     }
                     return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
                 }
@@ -3776,7 +3924,7 @@ impl Operator for R2rmlScanOperator {
                 if let Some(out) = self.finalize_batch(taken, ctx)? {
                     self.emitted += out.len();
                     if self.row_budget.is_some_and(|b| self.emitted >= b) {
-                        self.state = OperatorState::Exhausted;
+                        self.exhaust_on_budget(ctx);
                     }
                     return Ok(Some(out));
                 }
@@ -3793,7 +3941,7 @@ impl Operator for R2rmlScanOperator {
                 if more {
                     self.progress = Some(progress);
                 } else {
-                    self.retire_progress(progress);
+                    self.retire_progress(ctx, progress);
                 }
                 continue;
             }
@@ -4116,7 +4264,10 @@ mod tests {
             }
         }
 
+        // The key makes each subject one row's, so the scan keeps no set of
+        // seen solutions: what is charged and released is the windows alone.
         let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_declared_key(["STORE_KEY"])
             .with_subject_template("http://ex/store/{STORE_KEY}")
             .with_class("http://ex/Store")
             .with_predicate_object(PredicateObjectMap {
@@ -4178,6 +4329,112 @@ mod tests {
             windows >= N_WINDOWS,
             "the whole streaming scan must complete; got {windows} windows"
         );
+    }
+
+    /// The scan above without its key: the windows are released as before, but
+    /// a keyless map's solutions are remembered for the pass, and that set is
+    /// charged to the budget it lives under. Past it the scan aborts typed,
+    /// before the table is through, rather than growing until the process runs
+    /// out of memory.
+    #[tokio::test]
+    async fn a_dedupe_set_past_the_budget_aborts_typed() {
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::QueryCancellation;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        const N_WINDOWS: usize = 64;
+
+        #[derive(Debug)]
+        struct ManyRowsProvider;
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for ManyRowsProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "STORE_KEY".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                let batches: Vec<Result<ColumnBatch>> = (0..N_WINDOWS as i64)
+                    .map(|k| {
+                        Ok(ColumnBatch::new(
+                            Arc::clone(&schema),
+                            vec![Column::Int64(vec![Some(k + 1)])],
+                        )
+                        .unwrap())
+                    })
+                    .collect();
+                Ok(Box::pin(futures::stream::iter(batches)))
+            }
+        }
+
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/storeKey"),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let provider = ManyRowsProvider;
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(8000);
+        let mut ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+        ctx.r2rml_table_provider = Some(&provider);
+
+        let pattern =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        op.mapping = Some(Arc::clone(&mapping));
+        let mut progress = op
+            .build_progress(&ctx, Batch::single_empty())
+            .await
+            .expect("build_progress")
+            .expect("the wildcard resolves the one TriplesMap");
+        assert!(progress.seen.is_some(), "a keyless map deduplicates");
+        let num_cols = op.schema().len();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+        let mut windows = 0usize;
+        let err = loop {
+            progress.window_rows = 1;
+            match op
+                .advance_one_window(&ctx, &mut progress, num_cols, &mut columns)
+                .await
+            {
+                Ok(more) => {
+                    assert!(more, "the scan finished inside the budget");
+                    for c in &mut columns {
+                        c.clear();
+                    }
+                    op.pending.clear();
+                    windows += 1;
+                }
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+            "the set past the budget must abort typed, got {err:?}"
+        );
+        assert!(windows < N_WINDOWS, "aborted after {windows} windows");
+        // Releasing the pass returns the set's charge.
+        op.retire_progress(&ctx, progress);
+        assert!(ctx.mem_used() < 8000, "left charged: {}", ctx.mem_used());
     }
 
     /// F-AUD-3 site A2 — the fact-as-parent build. `build_parent_lookup` transiently
