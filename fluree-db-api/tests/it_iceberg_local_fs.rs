@@ -3250,7 +3250,7 @@ async fn a_materialize_read_before_a_rename_keeps_the_renamed_column() {
 
 /// `people_window` read as five files with disjoint `id` ranges (1..=600,
 /// 601..=1200, …), so a scan-side top-k by `id` can prune files.
-const WINDOW_IDS_R2RML: &str = r#"
+const WINDOW_PEOPLE_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
     @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -3412,7 +3412,7 @@ async fn order_by_limit_over_a_joined_scan_answers_the_joined_top_k() {
         "file://{}/tests/fixtures/iceberg/silver/people_window",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = R2rmlCreateConfig::new_direct("topk-window", &location, WINDOW_IDS_R2RML)
+    let config = R2rmlCreateConfig::new_direct("topk-window", &location, WINDOW_PEOPLE_R2RML)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
@@ -3528,7 +3528,7 @@ async fn a_values_subject_set_answers_its_subjects() {
         "file://{}/tests/fixtures/iceberg/silver/people_window",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = R2rmlCreateConfig::new_direct("keys-window", &location, WINDOW_IDS_R2RML)
+    let config = R2rmlCreateConfig::new_direct("keys-window", &location, WINDOW_PEOPLE_R2RML)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
@@ -3712,4 +3712,114 @@ async fn a_referencing_map_keeps_its_answers_when_the_parent_is_read_by_key() {
         }
     }
     assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+}
+
+/// Each `people_window` row references its own twin through a referencing
+/// object map over the same table.
+const WINDOW_TWIN_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:twin ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Twin> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Twin>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/twin/{id}" ] .
+"#;
+
+/// A parent read by key decides whether to probe from the keyed read's file
+/// counts, planned from the snapshot's kept file list like any scan: once the
+/// list is kept, the data manifests can go and a `LIMIT` (probing its first
+/// rows' keys) and a `VALUES` (pushing its subjects, then probing) still answer.
+/// A file-count plan that re-read the manifests would fail here.
+#[tokio::test]
+async fn a_parent_probe_plans_its_file_counts_from_the_kept_list() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_window");
+    copy_dir_all(&fixtures_dir().join("silver/people_window"), &table_dir);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        "window-twin",
+        format!("file://{}", table_dir.display()),
+        WINDOW_TWIN_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create window graph source");
+
+    let twin = |id: u32| format!("http://example.org/twin/{id}");
+    let values = format!("VALUES ?p {{ <{}> <{}> }}", person(5), person(2500));
+    let ask = |body: String, limit: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let sparql = format!(
+                "SELECT ?p ?q FROM <window-twin:main> WHERE {{ {body} \
+                 ?p <http://example.org/twin> ?q }}{limit}"
+            );
+            let result = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+            answer_rows(&result, &["p", "q"])
+        }
+    };
+    let ask_jsonld = || {
+        let fluree = &fluree;
+        async move {
+            let jsonld = serde_json::json!({
+                "from": "window-twin:main",
+                "select": ["?p", "?q"],
+                "where": [
+                    ["values", ["?p", [{"@id": person(5)}, {"@id": person(2500)}]]],
+                    {"@id": "?p", "http://example.org/twin": "?q"}
+                ],
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&jsonld)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("JSON-LD: {e}"));
+            answer_rows(&result, &["p", "q"])
+        }
+    };
+    let bound = vec![vec![person(2500), twin(2500)], vec![person(5), twin(5)]];
+    let twins = |rows: &[Vec<String>]| {
+        rows.len() == 2
+            && rows
+                .iter()
+                .all(|r| r[1] == r[0].replace("/person/", "/twin/"))
+    };
+
+    // The first queries read the manifests and keep the file list.
+    assert_eq!(ask(values.clone(), "").await, bound);
+    assert!(twins(&ask(String::new(), " LIMIT 2").await));
+    assert_eq!(
+        delete_data_manifests(&staging),
+        5,
+        "one manifest per append"
+    );
+
+    // Every plan now comes from the kept list, the probes' file counts too.
+    assert_eq!(ask(values, "").await, bound, "SPARQL VALUES");
+    assert_eq!(ask_jsonld().await, bound, "JSON-LD VALUES");
+    let limited = ask(String::new(), " LIMIT 2").await;
+    assert!(twins(&limited), "SPARQL LIMIT 2: {limited:?}");
 }
