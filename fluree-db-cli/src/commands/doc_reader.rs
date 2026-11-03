@@ -23,6 +23,8 @@ const CACHE_MODES: [&str; 3] = ["ontology", "catalog", "off"];
 /// What every document of a run is read with.
 pub struct ReaderSetup {
     pub client: ReaderClient,
+    /// The endpoint, as configured: part of each answer's cache key.
+    pub url: String,
     pub model: String,
     pub cache: Option<String>,
     ontology: fluree_graph_ir::Graph,
@@ -82,13 +84,14 @@ pub async fn setup(
     let fingerprint = fluree_db_doc::cache::sha256_hex(
         format!(
             "reader|{model}|{}|{}",
-            fluree_db_doc::cache::sha256_hex(ntriples(&ontology).as_bytes()),
-            fluree_db_doc::cache::sha256_hex(ntriples(&loaded.graph).as_bytes()),
+            fluree_db_doc::cache::sha256_hex(ntriples(&ontology)?.as_bytes()),
+            fluree_db_doc::cache::sha256_hex(ntriples(&loaded.graph)?.as_bytes()),
         )
         .as_bytes(),
     );
     Ok(ReaderSetup {
         client: ReaderClient::with_credential(&endpoint.url, credential(endpoint)),
+        url: endpoint.url.clone(),
         model: model.to_string(),
         cache: cache.filter(|c| c != "off"),
         ontology,
@@ -130,16 +133,14 @@ pub struct Read {
     pub ontology_notes: Vec<String>,
 }
 
-/// Read one parsed document: cut it into calls, read each, and gather the
-/// answers in the document's own offsets. Blocking (the client is), so run
-/// it on a blocking thread.
-/// With `requests_to`, each call's body is also written there as
+/// A document's calls with their bodies, every one built and sized before
+/// anything is sent. With `requests_to`, each body is also written there as
 /// `<relative-path>.request-<n>.trig`, beside `--out-dir`'s transactions.
-pub fn read_document(
+fn requests_of(
     setup: &ReaderSetup,
     doc: &PreparedDocument,
     requests_to: Option<&std::path::Path>,
-) -> CliResult<Read> {
+) -> CliResult<(Structure, Vec<(request::Part, String)>)> {
     let document = Document {
         iri: &doc.doc_iri,
         name: &doc.meta.file_name,
@@ -147,31 +148,79 @@ pub fn read_document(
         doco: &doc.parsed.doco,
     };
     let structure = Structure::new(&document)?;
-    let parts = structure.plan(&Limits::default(), &setup.size)?;
-    let mut read = Read {
-        calls: parts.len(),
-        ..Default::default()
-    };
-    for (i, part) in parts.iter().enumerate() {
-        let graph = structure.document_graph(&document, part);
-        let body = request::body(&graph, &setup.ontology, &setup.catalog, part)?;
-        if let Some(dir) = requests_to {
+    let requests = structure.requests(
+        &document,
+        &setup.ontology,
+        &setup.catalog,
+        &Limits::default(),
+        &setup.size,
+    )?;
+    if let Some(dir) = requests_to {
+        for (i, (_, body)) in requests.iter().enumerate() {
             let name = format!(
                 "{}.request-{}.trig",
                 doc.meta.relative_path.replace('/', "__"),
                 i + 1
             );
-            std::fs::write(dir.join(name), &body)?;
+            std::fs::write(dir.join(name), body)?;
         }
-        let key = DocCache::reading_key(
-            &format!(
-                "reader|{}|{}",
-                setup.model,
-                setup.cache.as_deref().unwrap_or("")
-            ),
-            &body,
-            &[],
-        );
+    }
+    Ok((structure, requests))
+}
+
+/// Where an answer to `body` is cached. The endpoint is part of the key:
+/// two readers serving one model name are two readers.
+fn answer_key(setup: &ReaderSetup, body: &str) -> String {
+    DocCache::reading_key(
+        &format!(
+            "reader|{}|{}|{}",
+            setup.url,
+            setup.model,
+            setup.cache.as_deref().unwrap_or("")
+        ),
+        body,
+        &[],
+    )
+}
+
+/// What reading a document would take, with nothing sent (`--dry-run`):
+/// its calls, and how many a cached answer would serve.
+pub fn plan_document(
+    setup: &ReaderSetup,
+    doc: &PreparedDocument,
+    requests_to: Option<&std::path::Path>,
+) -> CliResult<(usize, usize)> {
+    let (_, requests) = requests_of(setup, doc, requests_to)?;
+    let cached = requests
+        .iter()
+        .filter(|(_, body)| {
+            setup
+                .doc_cache
+                .as_ref()
+                .and_then(|c| c.load_reading(&answer_key(setup, body)))
+                .flatten()
+                .is_some()
+        })
+        .count();
+    Ok((requests.len(), cached))
+}
+
+/// Read one parsed document: cut it into calls, read each, and gather the
+/// answers in the document's own offsets. Blocking (the client is), so run
+/// it on a blocking thread. `requests_to` as in [`requests_of`].
+pub fn read_document(
+    setup: &ReaderSetup,
+    doc: &PreparedDocument,
+    requests_to: Option<&std::path::Path>,
+) -> CliResult<Read> {
+    let (structure, requests) = requests_of(setup, doc, requests_to)?;
+    let parts: Vec<&request::Part> = requests.iter().map(|(p, _)| p).collect();
+    let mut read = Read {
+        calls: parts.len(),
+        ..Default::default()
+    };
+    for (i, (part, body)) in requests.iter().enumerate() {
+        let key = answer_key(setup, body);
         let cached = setup
             .doc_cache
             .as_ref()
@@ -200,7 +249,7 @@ pub fn read_document(
                 let answer =
                     setup
                         .client
-                        .read(&body, &setup.model, setup.cache.as_deref(), &|wait| {
+                        .read(body, &setup.model, setup.cache.as_deref(), &|wait| {
                             eprintln!("    {} {label}: {wait}", "…".dimmed());
                         })?;
                 read.usage.add(&answer.usage);
@@ -238,11 +287,11 @@ pub fn read_document(
     Ok(read)
 }
 
-/// A mention gets `doc:sourceElement`, the element its span sits in, as
-/// the language-model path gives one.
+/// A mention (see [`fluree_db_doc::reader::reading::is_occurrence`]) gets
+/// `doc:sourceElement`, the element its span sits in, as the language-model
+/// path gives one.
 fn source_elements(structure: &Structure, nodes: &mut [Value]) {
     use fluree_db_doc::vocab::{DOC_NS, NIF_NS};
-    let mention = format!("{DOC_NS}Mention");
     let offset = |node: &Value, p: &str| {
         let v = node
             .get(format!("{NIF_NS}{p}"))?
@@ -254,10 +303,7 @@ fn source_elements(structure: &Structure, nodes: &mut [Value]) {
             .map(|n| n as usize)
     };
     for node in nodes {
-        let is_mention = node
-            .get("@type")
-            .and_then(Value::as_array)
-            .is_some_and(|t| t.iter().any(|t| t == &json!(mention)));
+        let is_mention = fluree_db_doc::reader::reading::is_occurrence(node);
         let key = format!("{DOC_NS}sourceElement");
         if !is_mention || node.get(&key).is_some() {
             continue;

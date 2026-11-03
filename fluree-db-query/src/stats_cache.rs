@@ -60,6 +60,17 @@ fn stats_view_for_db_in(
     binary_store: Option<&Arc<BinaryIndexStore>>,
     allow_semantic_elision: bool,
 ) -> Option<Arc<StatsView>> {
+    // A sequential write's virtual state plans from the stats of the state
+    // the write began on (estimates only), rather than walking the whole
+    // novelty window again for each of its operations.
+    if let Some(pinned) = db
+        .overlay
+        .as_any()
+        .downcast_ref::<Novelty>()
+        .and_then(Novelty::planner_stats_pin)
+    {
+        return Some(Arc::clone(pinned));
+    }
     let build_view = || {
         let _span = tracing::debug_span!("stats_view_build").entered();
         let started = Instant::now();
@@ -265,7 +276,18 @@ fn stats_view_for_db_in(
     key.update(&db.overlay.epoch().to_le_bytes());
     key.update(&[
         u8::from(db.runtime_small_dicts.is_some() || binary_store.is_some()),
-        u8::from(allow_semantic_elision),
+        // The vouch only changes the view when the class counts can be
+        // trusted (`class_coverage_trustworthy` in the view built above);
+        // otherwise both callers get the same view, and share one build.
+        u8::from(
+            allow_semantic_elision
+                && db
+                    .overlay
+                    .as_any()
+                    .downcast_ref::<Novelty>()
+                    .is_some_and(Novelty::is_empty)
+                && db.t >= db.snapshot.t,
+        ),
     ]);
 
     if let Some(cache) = binary_store.and_then(|store| store.leaflet_cache()) {
