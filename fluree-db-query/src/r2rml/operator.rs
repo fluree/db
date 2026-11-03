@@ -647,11 +647,17 @@ impl R2rmlScanOperator {
     /// gate `build_scan_filters` uses. The scan-side prune uses only this primary
     /// column; the `SortOperator` above still applies the exact compound order +
     /// LIMIT, so a `None` here is only a missed optimization, never wrong.
-    fn resolve_topk_directive(&self, triples_map: &TriplesMap) -> Option<crate::r2rml::ScanTopK> {
+    fn resolve_topk_directive(
+        &self,
+        triples_map: &TriplesMap,
+        scan_filters: &[crate::r2rml::ScanFilter],
+    ) -> Option<crate::r2rml::ScanTopK> {
         let (sort_var, k, ascending) = self.topk?;
-        // SOUNDNESS (heap feed): decline when a residual filter the operator
-        // enforces after the scan is present — the heap would see pre-filter rows.
-        if topk_residual_filter_present(&self.pattern) {
+        // SOUNDNESS (heap feed): decline when a row the scan emits may still be
+        // dropped before this operator's output — the heap would see rows that
+        // are not in the result. (A join with a child that binds a produced
+        // variable drops rows too; `set_topk` records no directive for that.)
+        if topk_feed_may_drop_rows(&self.pattern, scan_filters) {
             return None;
         }
         // The view-policy gate is a residual filter too: it drops rows AFTER the
@@ -1108,7 +1114,7 @@ impl R2rmlScanOperator {
             // load-bearing invariant is one-directional: NO path that could return
             // a pruned subset (`self.topk.is_some()`) is ever cacheable, so a
             // pruned result can never poison the `(table, projection)` cache.
-            let main_scan_topk = self.resolve_topk_directive(triples_map);
+            let main_scan_topk = self.resolve_topk_directive(triples_map, &scan_filters);
             let cacheable = scan_cache_enabled()
                 && scan_filters.is_empty()
                 && self.row_budget.is_none()
@@ -1937,13 +1943,42 @@ fn value_pushdown_column(om: &ObjectMap) -> Option<&str> {
 /// heap is fed the scan's EMITTED rows; a residual filter means those include
 /// rows that don't survive to the result, so the k-th bound would ride too high
 /// and prune files whose qualifying rows belong in the true top-k. When true, the
-/// top-k pushdown MUST be declined (→ full sort). Pushed `scan_filters` are NOT
-/// residual — the reader applies them, so the emitted batch is already filtered.
+/// top-k pushdown MUST be declined (→ full sort).
 fn topk_residual_filter_present(pattern: &R2rmlPattern) -> bool {
     pattern.consumed_filter.is_some()
         || pattern.object_constant.is_some()
         || pattern.subject_constant.is_some()
         || !pattern.star_constraints.is_empty()
+}
+
+/// Whether a row a scan EMITS may fail to reach this operator's output, which
+/// makes the scan-side top-k unsound: its heap is fed the emitted rows, so a
+/// row dropped later can hold the k-th bound above the true top-k and prune
+/// files holding the rows that belong there.
+///
+/// Three ways a row is dropped after the scan:
+/// - a residual filter the operator enforces per row
+///   ([`topk_residual_filter_present`]);
+/// - the join with the child, when the child binds a variable this scan
+///   produces: a produced row that matches no child row is dropped. A
+///   `VALUES` block, an earlier pattern, or the seed of a sub-select or GRAPH
+///   scope arrives as the child. That is known when the plan is built, so
+///   `set_topk` records no directive for such a scan (it then stays eligible
+///   for the scan cache); with no shared variable the join is a cross product
+///   and drops nothing;
+/// - any pushed scan filter. Each restates a condition enforced elsewhere
+///   ([`pattern_scan_filters`]), and the provider may apply it exactly,
+///   partly, or not at all: the Parquet reader skips a comparison on an
+///   unprojected column or one whose literal does not compare exactly with
+///   the column, row filtering can be switched off
+///   (`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`), and other providers apply only
+///   what they can state exactly. No provider promises the emitted rows are
+///   exactly the filtered rows, so a pushed filter counts as residual here.
+fn topk_feed_may_drop_rows(
+    pattern: &R2rmlPattern,
+    scan_filters: &[crate::r2rml::ScanFilter],
+) -> bool {
+    topk_residual_filter_present(pattern) || !scan_filters.is_empty()
 }
 
 /// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
@@ -3016,6 +3051,21 @@ impl Operator for R2rmlScanOperator {
         // pre-item-8 DESC-only scan. The planner offers ASC unconditionally so
         // the SQL pushdown lane, whose ORDER BY columns are required by
         // construction, is not tied to this scan's switch.
+        //
+        // Not recorded when the child binds a variable this scan produces: the
+        // scan joins each produced row to the child rows that agree with it, so
+        // the join drops rows the top-k heap has already seen (see
+        // `topk_feed_may_drop_rows`), and the child's own top-k may sit in
+        // files the table-wide bound skipped. Left unrecorded rather than
+        // declined at scan time, so the scan stays eligible for the scan cache.
+        if self
+            .pattern
+            .produced_vars()
+            .iter()
+            .any(|v| self.child.schema().contains(v))
+        {
+            return;
+        }
         let Some(primary) = ordering.first() else {
             return;
         };
@@ -3688,6 +3738,169 @@ mod tests {
             ObjectConstant::Scalar(ScanValue::Bool(true)),
         )];
         assert!(topk_residual_filter_present(&star_constraint));
+    }
+
+    /// `set_topk` records no directive for a scan whose child binds a variable
+    /// the scan produces: the join with the child drops the produced rows it
+    /// does not match, after the heap saw them. Unrecorded (rather than
+    /// declined at scan time), the scan stays eligible for the scan cache. A
+    /// root scan and a child sharing no variable (a cross product, which every
+    /// produced row survives) record it.
+    #[test]
+    fn topk_is_not_recorded_when_the_child_binds_a_produced_var() {
+        use crate::seed::{BatchReplayOperator, EmptyOperator};
+        use crate::sort::SortSpec;
+        let (order, total) = (VarId(1), VarId(2));
+        let pattern =
+            R2rmlPattern::new("gs:main", order, Some(total)).with_predicate("http://ex/orderTotal");
+        let child_binding = |var: VarId| -> BoxedOperator {
+            Box::new(BatchReplayOperator::new(
+                Arc::from(vec![var].into_boxed_slice()),
+                Vec::new(),
+            ))
+        };
+        let topk_of = |child: BoxedOperator| {
+            let mut op = R2rmlScanOperator::new(child, pattern.clone());
+            op.set_topk(&[SortSpec::desc(total)], 3);
+            op.topk
+        };
+        assert_eq!(
+            topk_of(Box::<EmptyOperator>::default()),
+            Some((total, 3, false)),
+            "a root scan records the directive"
+        );
+        assert_eq!(
+            topk_of(child_binding(VarId(9))),
+            Some((total, 3, false)),
+            "a child sharing no variable records it"
+        );
+        assert_eq!(
+            topk_of(child_binding(order)),
+            None,
+            "the child binds the subject"
+        );
+        assert_eq!(
+            topk_of(child_binding(total)),
+            None,
+            "the child binds the sort variable"
+        );
+    }
+
+    /// The scan-side top-k reaches `scan_table` only when every row the scan
+    /// emits reaches this operator's output. A child that binds a variable the
+    /// scan produces (a `VALUES` block, an earlier pattern) drops the produced
+    /// rows it does not match, and a pushed filter may be applied only partly
+    /// by the reader; either would feed the heap rows that are not in the
+    /// result, so its k-th bound could prune files holding the true top-k.
+    #[test]
+    fn topk_reaches_the_scan_only_when_every_emitted_row_is_output() {
+        use crate::ir::adapters::ScanPushdown;
+        use crate::r2rml::{R2rmlTableProvider, ScanCmpOp, ScanValue};
+        use crate::seed::{BatchReplayOperator, EmptyOperator};
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        /// Records whether each scan received a top-k directive.
+        #[derive(Debug, Default)]
+        struct TopkRecorder {
+            topk: Mutex<Vec<bool>>,
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for TopkRecorder {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                self.topk.lock().unwrap().push(topk.is_some());
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "ID".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: false,
+                    field_id: 1,
+                }]));
+                let batch = ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        let tm = TriplesMap::new("#Person", "people")
+            .with_subject_template("http://ex/person/{ID}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/id"),
+                object_map: ObjectMap::column("ID"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let base =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))).with_predicate("http://ex/id");
+
+        // Whether `scan_table` saw a top-k for `ORDER BY DESC(?id) LIMIT 2` over
+        // `pattern`, under a child of `child_schema` passing `child_batch`.
+        let scan_saw_topk =
+            |pattern: R2rmlPattern, child: BoxedOperator, child_batch: Batch| -> bool {
+                let provider = TopkRecorder::default();
+                {
+                    let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                    ctx.r2rml_table_provider = Some(&provider);
+                    let mut op = R2rmlScanOperator::new(child, pattern);
+                    op.mapping = Some(Arc::clone(&mapping));
+                    op.set_topk(&[crate::sort::SortSpec::desc(VarId(1))], 2);
+                    futures::executor::block_on(op.build_progress(&ctx, child_batch))
+                        .expect("build_progress");
+                }
+                let seen = provider.topk.lock().unwrap();
+                assert_eq!(seen.len(), 1, "one scan of the one table");
+                seen[0]
+            };
+
+        assert!(
+            scan_saw_topk(
+                base.clone(),
+                Box::<EmptyOperator>::default(),
+                Batch::single_empty()
+            ),
+            "under the seed every emitted row is output: the top-k is pushed"
+        );
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let child_batch = Batch::new(
+            Arc::clone(&schema),
+            vec![vec![Binding::iri("http://ex/person/1")]],
+        )
+        .unwrap();
+        assert!(
+            !scan_saw_topk(
+                base.clone(),
+                Box::new(BatchReplayOperator::new(schema, Vec::new())),
+                child_batch
+            ),
+            "a child binding the subject drops unmatched rows: no top-k"
+        );
+
+        let mut pushed = base.clone();
+        pushed.scan_filters.push(ScanPushdown {
+            var: VarId(1),
+            op: ScanCmpOp::In,
+            value: ScanValue::Set(vec![ScanValue::Int(5), ScanValue::Int(2500)]),
+        });
+        assert!(
+            !scan_saw_topk(
+                pushed,
+                Box::<EmptyOperator>::default(),
+                Batch::single_empty()
+            ),
+            "a pushed filter the reader may apply only partly: no top-k"
+        );
     }
 
     fn pom(pred: &str, col: &str) -> PredicateObjectMap {
