@@ -555,3 +555,117 @@ impl R2rmlTableProvider for NoOpR2rmlProvider {
         )))
     }
 }
+
+/// The keys that decide whether a map over `table_name` can skip removing
+/// duplicate solutions: what the mapping declares on the table (`f:key`),
+/// united with what the source reports ([`R2rmlTableProvider::table_keys`]).
+/// Pass the result to [`fluree_db_r2rml::TriplesMap::subject_unique_under`].
+///
+/// **The only way a lane obtains table keys for a uniqueness decision.** Never
+/// read [`CompiledR2rmlMapping::declared_keys`] directly for one: the
+/// provider's `table_keys` is also where a declared key is checked against the
+/// table's schema (a column the table lacks, a floating-point or nested
+/// column) and the query refused, so a lane that read the declaration itself
+/// would trust a key the table cannot hold.
+pub async fn effective_table_keys(
+    provider: &dyn R2rmlTableProvider,
+    mapping: &CompiledR2rmlMapping,
+    graph_source_id: &str,
+    table_name: &str,
+    as_of_t: Option<i64>,
+) -> Result<fluree_db_r2rml::TableKeys> {
+    let reported = provider
+        .table_keys(graph_source_id, table_name, as_of_t)
+        .await?;
+    Ok(mapping.declared_keys(table_name).with_reported(reported))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_r2rml::{TableKeys, TriplesMap};
+
+    /// Reports `reported` for every table, or refuses when it is `Err`.
+    #[derive(Debug)]
+    struct KeyedProvider {
+        reported: std::result::Result<Option<Vec<Vec<String>>>, String>,
+    }
+
+    #[async_trait]
+    impl R2rmlTableProvider for KeyedProvider {
+        async fn scan_table(
+            &self,
+            _graph_source_id: &str,
+            _table_name: &str,
+            _projection: &[String],
+            _filters: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
+            _as_of_t: Option<i64>,
+        ) -> Result<ColumnBatchStream> {
+            unreachable!("keys are not read from rows")
+        }
+
+        async fn table_keys(
+            &self,
+            _graph_source_id: &str,
+            _table_name: &str,
+            _as_of_t: Option<i64>,
+        ) -> Result<Option<Vec<Vec<String>>>> {
+            self.reported
+                .clone()
+                .map_err(crate::error::QueryError::InvalidQuery)
+        }
+    }
+
+    fn mapping() -> CompiledR2rmlMapping {
+        CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("<#Current>", "sets.customers_current")
+                .with_subject_template("http://example.org/customer/{customer_id}")
+                .with_declared_key(["customer_id"]),
+            TriplesMap::new("<#History>", "sets.customers_history")
+                .with_subject_template("http://example.org/customer/{customer_id}"),
+        ])
+    }
+
+    async fn keys(provider: &KeyedProvider, table: &str) -> Result<TableKeys> {
+        effective_table_keys(provider, &mapping(), "gs", table, None).await
+    }
+
+    #[tokio::test]
+    async fn effective_keys_unite_declared_and_reported() {
+        let none = KeyedProvider { reported: Ok(None) };
+        assert_eq!(
+            keys(&none, "sets.customers_current").await.unwrap(),
+            TableKeys::new([["customer_id"]])
+        );
+        assert!(keys(&none, "sets.customers_history")
+            .await
+            .unwrap()
+            .is_empty());
+
+        let reported = KeyedProvider {
+            reported: Ok(Some(vec![vec!["row_id".to_string()]])),
+        };
+        assert_eq!(
+            keys(&reported, "sets.customers_current").await.unwrap(),
+            TableKeys::new([["customer_id"], ["row_id"]])
+        );
+        assert_eq!(
+            keys(&reported, "sets.customers_history").await.unwrap(),
+            TableKeys::new([["row_id"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_refusal_is_the_lane_s_refusal() {
+        // A declared key the provider finds unusable refuses the query; the
+        // declaration alone is never handed back in its place.
+        let refusing = KeyedProvider {
+            reported: Err("a key names column \"score\" of type Float64".to_string()),
+        };
+        let err = keys(&refusing, "sets.customers_current")
+            .await
+            .expect_err("refused");
+        assert!(err.to_string().contains("Float64"), "{err}");
+    }
+}

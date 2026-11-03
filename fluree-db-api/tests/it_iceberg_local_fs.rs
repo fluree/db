@@ -3823,3 +3823,187 @@ async fn a_parent_probe_plans_its_file_counts_from_the_kept_list() {
     let limited = ask(String::new(), " LIMIT 2").await;
     assert!(twins(&limited), "SPARQL LIMIT 2: {limited:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Table keys over the `sets` fixtures: what an Iceberg source reports, and a
+// declared `f:key` checked against the pinned snapshot's schema.
+// ---------------------------------------------------------------------------
+
+/// `sets.customers_current` (customer_id an Iceberg identifier field) and
+/// `sets.customers_history` (no identifier field) minting the same subjects;
+/// `history_table_extra` follows the history table's name on its logical
+/// table (an `f:key`, or nothing).
+fn sets_customers_r2rml(history_table_extra: &str) -> String {
+    format!(
+        r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/mapping#Current>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_current" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/customer/{{customer_id}}" ;
+                rr:class ex:Customer
+            ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+        <http://example.org/mapping#History>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_history" {history_table_extra} ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/customer/{{customer_id}}" ;
+                rr:class ex:Customer
+            ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+    "#
+    )
+}
+
+/// A graph source `alias` over the committed `sets` tables (a warehouse root:
+/// each table name resolves to its directory), mapped by `mapping`.
+async fn sets_source(alias: &str, mapping: &str) -> fluree_db_api::Fluree {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/sets",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config =
+        R2rmlCreateConfig::new_direct(alias, &root, mapping).with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create sets graph source");
+    fluree
+}
+
+#[tokio::test]
+async fn an_iceberg_identifier_field_is_a_table_key() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider, R2rmlTableProvider};
+    let fluree = sets_source("sets-keys", &sets_customers_r2rml("")).await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let gs = "sets-keys:main";
+
+    assert_eq!(
+        provider
+            .table_keys(gs, "sets.customers_current", None)
+            .await
+            .expect("keys of customers_current"),
+        Some(vec![vec!["customer_id".to_string()]])
+    );
+    assert_eq!(
+        provider
+            .table_keys(gs, "sets.customers_history", None)
+            .await
+            .expect("keys of customers_history"),
+        None
+    );
+
+    // Through the one way a lane obtains keys: the current table's subjects
+    // are unique, the history table's are not.
+    let mapping = provider.compiled_mapping(gs, None).await.expect("mapping");
+    for (table, unique) in [
+        ("sets.customers_current", true),
+        ("sets.customers_history", false),
+    ] {
+        let keys = effective_table_keys(&provider, &mapping, gs, table, None)
+            .await
+            .expect("effective keys");
+        let tm = mapping.find_maps_for_table(table)[0];
+        assert_eq!(tm.subject_unique_under(&keys), unique, "{table}: {keys:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_declared_key_unites_with_what_the_table_reports() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider};
+    // The history table's natural key carries the version column, so it does
+    // not make the per-customer subject unique.
+    let fluree = sets_source(
+        "sets-declared",
+        &sets_customers_r2rml(r#"; f:key ( "customer_id" "valid_from" )"#),
+    )
+    .await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let gs = "sets-declared:main";
+    let mapping = provider.compiled_mapping(gs, None).await.expect("mapping");
+    let keys = effective_table_keys(&provider, &mapping, gs, "sets.customers_history", None)
+        .await
+        .expect("a usable declared key");
+    assert_eq!(
+        keys,
+        fluree_db_r2rml::TableKeys::new([["customer_id", "valid_from"]])
+    );
+    let history = mapping.find_maps_for_table("sets.customers_history")[0];
+    assert!(!history.subject_unique_under(&keys));
+}
+
+#[tokio::test]
+async fn a_declared_key_the_table_cannot_hold_is_refused() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider, R2rmlTableProvider};
+    // A column the snapshot lacks (a misspelling, or other casing).
+    for (key, says) in [
+        (
+            r#"( "customer_idx" )"#,
+            r#"column "customer_idx", which the table does not have"#,
+        ),
+        (
+            r#"( "Customer_ID" )"#,
+            r#"column "Customer_ID", which the table does not have"#,
+        ),
+    ] {
+        let alias = format!("sets-bad-{}", key.len());
+        let fluree = sets_source(&alias, &sets_customers_r2rml(&format!("; f:key {key}"))).await;
+        let provider = FlureeR2rmlProvider::new(&fluree);
+        let gs = format!("{alias}:main");
+        let err = provider
+            .table_keys(&gs, "sets.customers_history", None)
+            .await
+            .expect_err("a key the table cannot hold refuses");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(says) && msg.contains("sets.customers_history"),
+            "{key}: {msg}"
+        );
+        // The choke point every lane goes through refuses too, rather than
+        // falling back to the declaration.
+        let mapping = provider.compiled_mapping(&gs, None).await.expect("mapping");
+        assert!(
+            effective_table_keys(&provider, &mapping, &gs, "sets.customers_history", None)
+                .await
+                .is_err()
+        );
+        // A table that declares nothing is unaffected.
+        assert!(provider
+            .table_keys(&gs, "sets.customers_current", None)
+            .await
+            .is_ok());
+    }
+
+    // A floating-point column, on silver.people's `score`.
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = PEOPLE_R2RML.replace(
+        r#"rr:logicalTable [ rr:tableName "silver.people" ]"#,
+        r#"rr:logicalTable [ rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "score" ) ]"#,
+    );
+    assert_ne!(mapping, PEOPLE_R2RML, "the key was spliced in");
+    let config = R2rmlCreateConfig::new_direct("people-float-key", &table_location(), &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("registration compiles the mapping; the schema is checked at query time");
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let msg = provider
+        .table_keys("people-float-key:main", "silver.people", None)
+        .await
+        .expect_err("a floating-point key refuses")
+        .to_string();
+    assert!(
+        msg.contains(r#"column "score" of type Float64"#) && msg.contains("floating-point"),
+        "{msg}"
+    );
+}

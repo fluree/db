@@ -379,6 +379,79 @@ pub(crate) fn cross_check_live(
         }
     }
 
+    diagnostics.extend(declared_key_diagnostics(compiled, schemas));
+    diagnostics
+}
+
+/// Every declared key column (`f:key`) checked against its table's schema as
+/// an Iceberg query checks it before refusing: a column the table lacks, or
+/// one spelled with other casing, is [`DiagCode::ColumnNotFound`] /
+/// [`DiagCode::CasingMismatch`]; one whose values cannot identify a row
+/// (floating-point, nested, unreadable) is [`DiagCode::NonKeyTypeSkipped`].
+/// All errors, once per table and column however many maps read the table. A
+/// table with no schema already has its [`DiagCode::TableNotFound`].
+fn declared_key_diagnostics(
+    compiled: &CompiledR2rmlMapping,
+    schemas: &HashMap<String, Vec<LiveColumn>>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let tables: BTreeSet<&str> = compiled
+        .triples_maps
+        .values()
+        .filter_map(TriplesMap::table_name)
+        .collect();
+    for table in tables {
+        let Some(schema) = schemas.get(table) else {
+            continue;
+        };
+        let keys = compiled.declared_keys(table);
+        let columns: BTreeSet<&str> = keys.iter().flatten().map(String::as_str).collect();
+        for name in columns {
+            let (code, message) = match resolve_column(schema, name) {
+                ColumnResolution::Missing => (
+                    DiagCode::ColumnNotFound,
+                    format!(
+                        "f:key on '{table}' names column '{name}', which the table does not \
+                         have."
+                    ),
+                ),
+                ColumnResolution::Casing(ci) => (
+                    DiagCode::CasingMismatch,
+                    format!(
+                        "f:key on '{table}' names column '{name}', which the schema spells \
+                         '{}'; a key column must match exactly.",
+                        ci.name
+                    ),
+                ),
+                ColumnResolution::Exact(ci)
+                    if fluree_db_r2rml::mapping::usable_in_key(ci.field_type.as_ref()) =>
+                {
+                    continue
+                }
+                ColumnResolution::Exact(ci) => (
+                    DiagCode::NonKeyTypeSkipped,
+                    match &ci.field_type {
+                        Some(ty) => format!(
+                            "f:key on '{table}' names column '{name}' of type {ty:?}; a \
+                             floating-point value cannot identify a row (NaN is unequal to \
+                             itself)."
+                        ),
+                        None => format!(
+                            "f:key on '{table}' names column '{name}', whose type is nested \
+                             or not one values are read from."
+                        ),
+                    },
+                ),
+            };
+            diagnostics.push(Diagnostic::new(
+                Severity::Error,
+                code,
+                table.to_string(),
+                Some(name.to_string()),
+                message,
+            ));
+        }
+    }
     diagnostics
 }
 
@@ -590,6 +663,55 @@ mod tests {
             "a correct mapping must produce no diagnostics, got: {diags:?}"
         );
         assert!(!has_error(&diags));
+    }
+
+    #[test]
+    fn declared_key_columns_are_checked_like_a_query_checks_them() {
+        // Two maps over one table, each declaring keys: one diagnostic per
+        // table and column, whichever map declared it.
+        let mut schema = dim_store_schema();
+        schema
+            .columns
+            .push(col("RATING", FieldType::Float64, false, Some(0.0)));
+        let mut schemas = HashMap::new();
+        schemas.insert("DW.DIM_STORE".to_string(), schema);
+        let keyed = |iri: &str, key: &[&str]| {
+            let mut tm = dim_store_map().with_declared_key(key.iter().copied());
+            tm.iri = iri.to_string();
+            tm
+        };
+        let compiled = CompiledR2rmlMapping::new(vec![
+            keyed("<#A>", &["STORE_KEY"]),
+            keyed("<#B>", &["STORE_KEY", "NAME"]),
+        ]);
+        let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
+        assert!(diags.is_empty(), "usable key columns are clean: {diags:?}");
+
+        let compiled = CompiledR2rmlMapping::new(vec![
+            keyed("<#A>", &["STORE_ID"]),
+            keyed("<#B>", &["store_key", "RATING"]),
+            keyed("<#C>", &["STORE_ID"]),
+        ]);
+        let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
+        let by_column = |name: &str| -> Vec<&Diagnostic> {
+            diags
+                .iter()
+                .filter(|d| d.column.as_deref() == Some(name))
+                .collect()
+        };
+        let missing = by_column("STORE_ID");
+        assert_eq!(missing.len(), 1, "{diags:?}");
+        assert_eq!(missing[0].code, DiagCode::ColumnNotFound);
+        let casing = by_column("store_key");
+        assert_eq!(casing.len(), 1, "{diags:?}");
+        assert_eq!(casing[0].code, DiagCode::CasingMismatch);
+        let float = by_column("RATING");
+        assert_eq!(float.len(), 1, "{diags:?}");
+        assert_eq!(float[0].code, DiagCode::NonKeyTypeSkipped);
+        for d in missing.iter().chain(&casing).chain(&float) {
+            assert_eq!(d.severity, Severity::Error, "{d:?}");
+            assert!(d.message.contains("f:key on 'DW.DIM_STORE'"), "{d:?}");
+        }
     }
 
     #[test]

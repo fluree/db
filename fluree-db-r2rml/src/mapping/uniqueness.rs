@@ -21,7 +21,10 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use fluree_db_tabular::FieldType;
+
 use super::{ConstantValue, ObjectMap, PredicateMap, SubjectMap, TermType, TriplesMap};
+use crate::error::{R2rmlError, R2rmlResult};
 use crate::materialize::template_is_injective;
 
 /// What is known to identify a row of one logical table: zero or more keys,
@@ -110,6 +113,72 @@ impl TableKeys {
             .iter()
             .any(|key| key.iter().all(|col| columns.contains(&col.as_str())))
     }
+
+    /// Refuse a key that names a column the logical table `table` lacks, or
+    /// one whose values cannot identify a row ([`usable_in_key`]). `column`
+    /// says how the table holds the column of a given name.
+    ///
+    /// For keys the mapping declares, which their author can fix; a key a
+    /// source reports is filtered instead ([`Self::retain_usable`]).
+    pub fn check_columns(
+        &self,
+        table: &str,
+        mut column: impl FnMut(&str) -> KeyColumn,
+    ) -> R2rmlResult<()> {
+        for name in self.keys.iter().flatten() {
+            let problem = match column(name) {
+                KeyColumn::Typed(field_type) if usable_in_key(field_type.as_ref()) => continue,
+                KeyColumn::Absent => {
+                    format!("names column \"{name}\", which the table does not have")
+                }
+                KeyColumn::Typed(Some(field_type)) => format!(
+                    "names column \"{name}\" of type {field_type:?}, and a floating-point \
+                     value cannot identify a row (NaN is unequal to itself, so a column \
+                     declared unique can hold two NaNs that mint one subject)"
+                ),
+                KeyColumn::Typed(None) => format!(
+                    "names column \"{name}\", whose type is nested or not one values are \
+                     read from"
+                ),
+            };
+            return Err(R2rmlError::InvalidValue {
+                property: "f:key".to_string(),
+                message: format!("on the logical table \"{table}\", a key {problem}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Only the keys every column of which the table holds and can identify
+    /// a row by ([`usable_in_key`]): what a source reports is not its
+    /// reader's to fix, so a key that fails is dropped, not refused.
+    pub fn retain_usable(mut self, mut column: impl FnMut(&str) -> KeyColumn) -> Self {
+        self.keys.retain(|key| {
+            key.iter().all(
+                |name| matches!(column(name), KeyColumn::Typed(t) if usable_in_key(t.as_ref())),
+            )
+        });
+        self
+    }
+}
+
+/// How a logical table holds a column a key names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyColumn {
+    /// The table has no column of that name.
+    Absent,
+    /// The column's type; `None` for a column whose values are not read as
+    /// flat values (nested, or of a type the reader does not decode).
+    Typed(Option<FieldType>),
+}
+
+/// Whether a column of `field_type` can be part of a key: its values are
+/// decoded exactly and render to distinct terms. A floating-point column
+/// cannot (NaN is unequal to itself, so a column declared unique can hold two
+/// NaNs, and both render as one term), nor can one the reader does not decode
+/// (`None`).
+pub fn usable_in_key(field_type: Option<&FieldType>) -> bool {
+    matches!(field_type, Some(t) if !matches!(t, FieldType::Float32 | FieldType::Float64))
 }
 
 /// Where a subject map's term comes from, in the precedence the materializer
@@ -394,6 +463,68 @@ mod tests {
         assert_eq!(json, r#"[["customer_id","valid_from"]]"#);
         let back: TableKeys = serde_json::from_str(r#"[["valid_from","customer_id"],[]]"#).unwrap();
         assert_eq!(back, k);
+    }
+
+    fn columns(name: &str) -> KeyColumn {
+        match name {
+            "customer_id" => KeyColumn::Typed(Some(FieldType::Int64)),
+            "email" => KeyColumn::Typed(Some(FieldType::String)),
+            "valid_from" => KeyColumn::Typed(Some(FieldType::Date)),
+            "score" => KeyColumn::Typed(Some(FieldType::Float64)),
+            "ratio" => KeyColumn::Typed(Some(FieldType::Float32)),
+            "address" => KeyColumn::Typed(None),
+            _ => KeyColumn::Absent,
+        }
+    }
+
+    #[test]
+    fn declared_key_columns_must_exist_and_identify_a_row() {
+        let ok = keys(&[&["customer_id", "valid_from"], &["email"]]);
+        ok.check_columns("sets.customers_history", columns).unwrap();
+        TableKeys::none()
+            .check_columns("sets.customers_history", columns)
+            .unwrap();
+
+        let refusal = |k: TableKeys| match k.check_columns("sets.customers_history", columns) {
+            Err(R2rmlError::InvalidValue { property, message }) => {
+                assert_eq!(property, "f:key");
+                assert!(message.contains("\"sets.customers_history\""), "{message}");
+                message
+            }
+            other => panic!("expected an f:key refusal, got {other:?}"),
+        };
+        let msg = refusal(keys(&[&["customer_id"], &["customer_idx"]]));
+        assert!(
+            msg.contains("\"customer_idx\", which the table does not have"),
+            "{msg}"
+        );
+        for float in ["score", "ratio"] {
+            let msg = refusal(keys(&[&["customer_id", float]]));
+            assert!(
+                msg.contains(float) && msg.contains("floating-point"),
+                "{msg}"
+            );
+        }
+        let msg = refusal(keys(&[&["address"]]));
+        assert!(msg.contains("nested"), "{msg}");
+    }
+
+    #[test]
+    fn reported_keys_with_an_unusable_column_are_dropped() {
+        let reported = keys(&[
+            &["customer_id"],
+            &["customer_id", "score"],
+            &["gone"],
+            &["address"],
+        ]);
+        assert_eq!(reported.retain_usable(columns), keys(&[&["customer_id"]]));
+        assert!(usable_in_key(Some(&FieldType::Decimal {
+            precision: 10,
+            scale: 2
+        })));
+        assert!(usable_in_key(Some(&FieldType::TimestampTz)));
+        assert!(!usable_in_key(Some(&FieldType::Float64)));
+        assert!(!usable_in_key(None));
     }
 
     #[test]

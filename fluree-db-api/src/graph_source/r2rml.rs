@@ -1616,6 +1616,56 @@ struct SelectedSnapshot<'m> {
 /// Key for the per-snapshot file-list caches. `metadata_location` alone names
 /// the current snapshot's files (the key every pre-existing entry was written
 /// under); a historical snapshot's list is just as immutable and gets its own.
+/// The flat type a mapping reads an Iceberg field as: `None` for a nested
+/// field, or one of a type the reader does not decode.
+fn iceberg_flat_type(
+    field: &fluree_db_iceberg::metadata::SchemaField,
+) -> Option<fluree_db_iceberg::FieldType> {
+    use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
+    if field.is_nested() {
+        return None;
+    }
+    field
+        .type_string()
+        .and_then(fluree_db_iceberg::FieldType::from_iceberg_type)
+}
+
+/// [`R2rmlTableProvider::table_keys`] for an Iceberg table read under `schema`
+/// (the pinned snapshot's, under current names): refuse a declared key naming
+/// a column the schema lacks or one that cannot identify a row, then report
+/// the identifier fields as one key.
+///
+/// Identifier fields count only through format version 3: version 4 replaces
+/// them with table constraints, and its readers must ignore them. A key whose
+/// field is nested (no top-level column) or cannot identify a row is not
+/// reported.
+fn iceberg_table_keys(
+    format_version: i32,
+    schema: &fluree_db_iceberg::metadata::Schema,
+    table_name: &str,
+    declared: &fluree_db_r2rml::TableKeys,
+) -> fluree_db_r2rml::R2rmlResult<Option<Vec<Vec<String>>>> {
+    use fluree_db_r2rml::mapping::KeyColumn;
+    let column = |name: &str| match schema.field_by_name(name) {
+        Some(field) => KeyColumn::Typed(iceberg_flat_type(field)),
+        None => KeyColumn::Absent,
+    };
+    declared.check_columns(table_name, column)?;
+    if format_version > 3 || schema.identifier_field_ids.is_empty() {
+        return Ok(None);
+    }
+    let names: Option<Vec<String>> = schema
+        .identifier_field_ids
+        .iter()
+        .map(|id| schema.field(*id).map(|field| field.name.clone()))
+        .collect();
+    let Some(names) = names else {
+        return Ok(None);
+    };
+    let reported = fluree_db_r2rml::TableKeys::new([names]).retain_usable(column);
+    Ok((!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect()))
+}
+
 fn snapshot_cache_key(metadata_location: &str, selected: SelectedSnapshot<'_>) -> String {
     if selected.is_current {
         metadata_location.to_string()
@@ -3078,6 +3128,45 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         self.table_row_count_inner(graph_source_id, table_name, non_null_cols, _as_of_t)
             .instrument(span)
             .await
+    }
+
+    /// The keys the pinned snapshot's schema states: its identifier fields,
+    /// under the names a mapping reads them by, when the table's format still
+    /// has readers honor them (version 3 or older) and every one is a flat
+    /// column that can identify a row. Refuses the query when a key the
+    /// mapping declares on the table (`f:key`) names a column the snapshot
+    /// lacks or one whose values cannot identify a row, so no lane trusts a
+    /// key the table cannot hold. SQL and Delta sources report none.
+    async fn table_keys(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> QueryResult<Option<Vec<Vec<String>>>> {
+        #[cfg(feature = "sql")]
+        if self.sql_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        let TableContext { metadata, .. } =
+            self.load_table_context(graph_source_id, table_name).await?;
+        let schema = match self.select_snapshot(graph_source_id, table_name, &metadata)? {
+            Some(selected) => metadata.read_schema_for_snapshot(selected.snapshot),
+            // No snapshot holds no row; the declared keys are still checked.
+            None => metadata.current_schema().map(std::borrow::Cow::Borrowed),
+        };
+        let Some(schema) = schema else {
+            return Ok(None);
+        };
+        let declared = self
+            .compiled_mapping(graph_source_id, as_of_t)
+            .await?
+            .declared_keys(table_name);
+        iceberg_table_keys(metadata.format_version, &schema, table_name, &declared)
+            .map_err(|e| QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}")))
     }
 
     /// The pinned snapshot's row count from what is already at hand, never
@@ -5143,6 +5232,92 @@ mod tests {
                 field(6, "double_key", json!("double")),
                 field(7, "float_key", json!("float")),
             ],
+        }
+    }
+
+    /// A customers table whose identifier field is `customer_id`.
+    fn identified_schema(identifier_field_ids: Vec<i32>) -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids,
+            fields: vec![
+                field(1, "customer_id", json!("long")),
+                field(2, "name", json!("string")),
+                field(3, "score", json!("double")),
+                field(
+                    4,
+                    "address",
+                    json!({"type": "struct", "fields": [
+                        {"id": 5, "name": "city", "required": false, "type": "string"}
+                    ]}),
+                ),
+                field(6, "valid_from", json!("date")),
+            ],
+        }
+    }
+
+    fn reported(format_version: i32, ids: Vec<i32>) -> Option<Vec<Vec<String>>> {
+        iceberg_table_keys(
+            format_version,
+            &identified_schema(ids),
+            "sets.customers_current",
+            &fluree_db_r2rml::TableKeys::none(),
+        )
+        .expect("no declared key to refuse")
+    }
+
+    #[test]
+    fn identifier_fields_are_a_key_through_format_version_3() {
+        let one = Some(vec![vec!["customer_id".to_string()]]);
+        for v in [1, 2, 3] {
+            assert_eq!(reported(v, vec![1]), one, "format version {v}");
+        }
+        // A version-4 reader must ignore identifier fields.
+        assert_eq!(reported(4, vec![1]), None);
+        // None declared, none reported.
+        assert_eq!(reported(2, vec![]), None);
+        // A composite identifier is one key.
+        assert_eq!(
+            reported(2, vec![6, 1]),
+            Some(vec![vec![
+                "customer_id".to_string(),
+                "valid_from".to_string()
+            ]])
+        );
+    }
+
+    #[test]
+    fn an_identifier_that_cannot_identify_a_row_is_not_reported() {
+        // A floating-point field (the spec forbids it; a writer may not).
+        assert_eq!(reported(2, vec![1, 3]), None);
+        // A field nested in a struct is no column a template can read.
+        assert_eq!(reported(2, vec![5]), None);
+        // An id the schema does not hold.
+        assert_eq!(reported(2, vec![1, 99]), None);
+    }
+
+    #[test]
+    fn a_declared_key_is_checked_against_the_snapshot_schema() {
+        let check = |cols: &[&str]| {
+            iceberg_table_keys(
+                2,
+                &identified_schema(vec![]),
+                "sets.customers_current",
+                &fluree_db_r2rml::TableKeys::new([cols.to_vec()]),
+            )
+        };
+        assert_eq!(check(&["customer_id", "valid_from"]).unwrap(), None);
+        for (cols, says) in [
+            (&["customer_idx"][..], "which the table does not have"),
+            (&["Customer_ID"][..], "which the table does not have"),
+            (&["customer_id", "score"][..], "floating-point"),
+            (&["address"][..], "nested"),
+        ] {
+            let err = check(cols).expect_err("refused").to_string();
+            assert!(
+                err.contains(says) && err.contains("sets.customers_current"),
+                "{cols:?}: {err}"
+            );
         }
     }
 
