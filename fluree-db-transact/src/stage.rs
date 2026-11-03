@@ -2211,27 +2211,36 @@ fn subjects_with_prior_rows(
     Some(present)
 }
 
-/// Whether graph `g_id`'s novelty holds a flake with subject `subject`.
+/// Whether graph `g_id`'s novelty holds a flake with subject `subject`: no
+/// when [`dictionary_rules_out`] says so, and otherwise by
+/// [`novelty_seek_finds_subject`].
+fn novelty_holds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
+    !dictionary_rules_out(ledger, subject) && novelty_seek_finds_subject(ledger, g_id, subject)
+}
+
+/// Whether the dictionary novelty settles that no novelty flake has subject
+/// `subject`, with no read of novelty.
 ///
 /// A dictionary novelty that covers the ledger's novelty
 /// ([`DictNovelty::covers`](fluree_db_core::DictNovelty::covers)) holds every
 /// subject of a novelty flake that the persisted dictionary does not, so a
-/// subject in neither is in no novelty flake: the miss settles it with no
-/// read. Otherwise, and for a hit (the dictionary novelty spans every graph,
-/// and names ref objects too), a seek bounded to the subject decides, never a
-/// walk of the graph's novelty.
-fn novelty_holds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
-    use fluree_db_core::comparator::IndexType;
-
+/// subject in neither is in no novelty flake.
+fn dictionary_rules_out(ledger: &LedgerState, subject: &Sid) -> bool {
     let dict = &ledger.dict_novelty;
-    if dict.covers(ledger.novelty.t)
+    dict.covers(ledger.novelty.t)
         && dict
             .subjects
             .find_subject(subject.namespace_code, &subject.name)
             .is_none()
-    {
-        return false;
-    }
+}
+
+/// Whether a seek bounded to `subject` finds a flake of it in graph `g_id`'s
+/// novelty: what decides when the dictionary doesn't (no coverage, or a hit,
+/// since the dictionary novelty spans every graph and names ref objects too),
+/// never a walk of the graph's novelty.
+fn novelty_seek_finds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
+    use fluree_db_core::comparator::IndexType;
+
     let lo = Flake::min_for_subject(subject.clone());
     let hi = Flake::max_for_subject(subject.clone());
     let mut found = false;
@@ -4044,6 +4053,9 @@ async fn generate_upsert_deletions(
 
     let mut slots: Vec<Slot> = Vec::new();
     let mut skipped_subjects = 0usize;
+    // Skipped with no read of novelty: what keeps an upsert of new subjects
+    // flat in the novelty a ledger holds.
+    let mut ruled_out_by_dictionary = 0usize;
 
     for ((subject, graph_id), predicates) in &subject_groups {
         let ledger_g_id: Option<u16> = ledger_g_for_txn_g.get(graph_id).copied().flatten();
@@ -4068,12 +4080,16 @@ async fn generate_upsert_deletions(
 
         // Skip subjects with no persisted or novelty presence entirely. The
         // base dictionary is a point probe, so it is consulted first.
-        if can_decide_absence
-            && !subject_in_base(subject)
-            && !novelty_holds_subject(ledger, effective_g_id, subject)
-        {
-            skipped_subjects += 1;
-            continue;
+        if can_decide_absence && !subject_in_base(subject) {
+            if dictionary_rules_out(ledger, subject) {
+                ruled_out_by_dictionary += 1;
+                skipped_subjects += 1;
+                continue;
+            }
+            if !novelty_seek_finds_subject(ledger, effective_g_id, subject) {
+                skipped_subjects += 1;
+                continue;
+            }
         }
 
         slots.extend(predicates.iter().map(|p| Slot {
@@ -4088,6 +4104,7 @@ async fn generate_upsert_deletions(
     tracing::debug!(
         subject_count = subject_groups.len(),
         skipped_subjects,
+        ruled_out_by_dictionary,
         pattern_queries = slots.len(),
         "upsert deletion subject pre-check"
     );
