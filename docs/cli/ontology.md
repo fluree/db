@@ -30,14 +30,16 @@ fluree ontology <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `check` | Report what an HTTP reader will and won't read of an ontology (and catalog) |
-| `from` | Write an ontology in the shape extraction models read well: from tables (CSV, a workbook, SQL DDL), or from RDF, optionally sliced |
+| `from` | Write an ontology in the shape extraction models read well: from tables (CSV, a workbook, SQL DDL), a semantic layer (Snowflake, Genie, dbt, Apache Ossie), or RDF, optionally sliced |
 
 Ontologies are read as Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-`
 reads stdin, and `--input-format turtle|jsonld` says which when the extension
 doesn't. TriG is not read yet: pass the ontology as Turtle, or a saved request
 as JSON-LD. `from` also reads tables (`.csv`/`.tsv`, `.xlsx`, `.sql`) and
-semantic layers (a Snowflake semantic view as `.yaml`, a Databricks Genie
-export as `.json`).
+semantic layers: a Snowflake semantic view (`.yaml`), a Databricks Genie
+export (`.json`), a dbt project (its `.yml` files or its directory) and an
+Apache Ossie semantic model or ontology (`.yaml`, `.json`). YAML and JSON
+are told apart by what they hold.
 
 For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
@@ -275,6 +277,68 @@ naming a table the export doesn't have, join SQL with no `` `alias`.`column` ``
 pairs, and comments for tables the export doesn't have are counted in the
 summary.
 
+A **dbt project** gives two kinds of YAML, and `from` reads both, from one file
+or from the project's directory (every `.yml`/`.yaml` under it, `target/` and
+`dbt_packages/` passed over):
+
+- **semantic models** (MetricFlow): a semantic model is a class; its primary
+  entity is its key; a foreign entity is a relation to the semantic model whose
+  primary entity has that name (`customer` relates to the model keyed by
+  `customer`), else to the model its column's `relationships` test names, else
+  to the model whose name reads as the entity's (`store` and `stores`);
+  dimensions are properties (a `time` dimension a date, or a date-time below a
+  day's granularity); a measure that aggregates a column (`sum`, `average`,
+  `min`, `max`, `median`, `percentile`) is a decimal property, while counts
+  (including `agg: sum, expr: 1`), metrics and saved queries are left out;
+- **model properties** (`schema.yml`): column descriptions are copied, an
+  `accepted_values` test makes a column enumerated, a `relationships` test or a
+  `foreign_key` constraint (on the column or the model, including the pre-1.9
+  `expression:` form) makes it a foreign key, and a `primary_key` constraint, or
+  `unique` with `not_null` on `id`, makes it the key. A versioned model takes
+  its latest version's columns, and `ref('orders', v=2)` and `source(...)` name
+  their model or table.
+
+Descriptions written as `{{ doc('name') }}` are resolved from the project's
+`{% docs %}` blocks (in its `.md` files, when `from` reads the project's
+directory); one whose block isn't found is left out and counted, never kept as
+template text. Values are read as written (`accepted_values: [NO, 007]` stays
+that), a key given twice keeps its last value as dbt's own YAML reader does,
+and a `.yml` file that isn't valid YAML is named in the summary rather than
+skipped silently. Models and semantic models are separate name spaces in dbt: a
+model that shares a semantic model's name, and isn't its base, is read as
+`<name>_model`.
+
+A semantic model built on a model (`model: ref('fct_orders')`) stands for it:
+it takes the model's descriptions and accepted values for the columns it uses,
+and the model isn't repeated. Of the model's other columns, the ones that carry
+a relation (a `relationships` test or `foreign_key` constraint) or accepted
+values are kept, since a relation a metric didn't need is still something
+documents talk about; the rest (audit columns, surrogate keys, columns only a
+measure's expression uses) are left out, and the summary says how many. A
+`relationships` test that names a replaced model (`ref('fct_orders')`) points
+at the semantic model standing for it.
+
+An **Apache Ossie** document (0.2, `.yaml` or `.json`) is read by its layer:
+
+- a **semantic model** (`datasets`, `relationships`) converts like a Snowflake
+  semantic view: fields' `description`, `datatype` and `ai_context` synonyms
+  are copied, relationships are foreign keys from their `from` fields to the
+  `to` dataset, and metrics are left out;
+- an **ontology** (`ontology:` a list of concepts) is already conceptual, and
+  is written as RDF directly, **keeping the IRIs it gives** (`iri: schema:Airport`,
+  expanded with its `prefixes`). An `EntityType` concept is a class (with its
+  `extends` as parents, and its `iri` kept when it is one: an undeclared
+  prefix, no scheme or whitespace is reported, and the term minted instead); a
+  binary relationship is a property from the concept
+  that declares it to its role's concept, or to the datatype a `ValueType`
+  resolves to, described by its `description` or else its verbalization
+  (`'{Flight} uses {Aircraft}'` becomes "A flight uses an aircraft."); a unary
+  relationship (`'{Flight} was diverted'`) is a boolean property; one with
+  three or more roles is a class with a property per role; and a value type
+  whose `requires` lists its values (`Code == 'A' OR Code == 'B'`, or `IN`, in
+  any case) is a class with a catalog record per value. `derived_by`, other `requires` and
+  `identify_by` are logic, not what documents say, and are left out.
+
 A foreign key keeps its words without the key suffix (`origin_airport_code`
 becomes "origin airport", `employer_no` "employer"), and takes the target's
 label only when nothing is left (`id`). A key with the same name in several
@@ -303,7 +367,7 @@ not an empty ontology.
 | `--enum-max <N>` | Most distinct values an enumerated column may have, for CSV and workbooks (default: 12; 0 never enumerates) |
 | `--catalog-out <FILE>` | Write enumerated columns' records here instead of with the ontology |
 | `--comments <FILE>` | Unity Catalog comments for a Genie export (JSON) |
-| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake` or `genie`, when the extension doesn't say |
+| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake`, `genie`, `dbt` or `ossie`, when the extension or contents don't say |
 | `--format <FORMAT>` | `turtle` (default) or `jsonld` |
 | `-o, --output <FILE>` | Write to this file instead of stdout |
 
@@ -313,6 +377,8 @@ fluree ontology from accounts.csv -o ontology.ttl
 fluree ontology from crm.xlsx --catalog-out kinds.ttl -o ontology.ttl
 fluree ontology from sales_view.yaml --base https://example.com/sales/ > ontology.ttl
 fluree ontology from genie_space.json --comments uc_comments.json > ontology.ttl
+fluree ontology from ./my_dbt_project --base https://example.com/shop/ > ontology.ttl
+fluree ontology from flights.ossie.yaml > ontology.ttl
 ```
 
 From this DDL:

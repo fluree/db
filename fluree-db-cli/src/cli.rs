@@ -2651,8 +2651,11 @@ pub enum OntologyAction {
     /// Write an ontology in the shape an extraction model reads well
     ///
     /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), SQL
-    /// DDL (.sql), a Snowflake semantic view (.yaml) or a Databricks Genie space
-    /// export (.json, with --comments for Unity Catalog's descriptions).
+    /// DDL (.sql), a Snowflake semantic view (.yaml), a Databricks Genie space
+    /// export (.json, with --comments for Unity Catalog's descriptions), a dbt
+    /// project's semantic models and model properties (.yml, or the project's
+    /// directory), or an Apache Ossie semantic model (.yaml, .json). An Ossie
+    /// ontology is written as it is, keeping its IRIs.
     /// Tables become classes and columns properties, labelled
     /// in words (`employer_id` reads "employer"); foreign keys become
     /// relations; enumerated columns become a class with a catalog record per
@@ -2669,6 +2672,7 @@ pub enum OntologyAction {
     /// Examples:
     ///   fluree ontology from schema.sql > ontology.ttl
     ///   fluree ontology from sales_view.yaml > ontology.ttl
+    ///   fluree ontology from ./models --base https://example.com/shop/ > ontology.ttl
     ///   fluree ontology from accounts.csv --base https://example.com/crm/ > ontology.ttl
     ///   fluree ontology from schemaorg.jsonld --seed schema:Person,schema:Organization > ontology.ttl
     #[command(verbatim_doc_comment)]
@@ -2709,7 +2713,7 @@ pub enum OntologyOutputFormat {
 
 #[derive(Args, Debug)]
 pub struct OntologyFromArgs {
-    /// The ontology to convert (`-` reads stdin)
+    /// The file to convert (`-` reads stdin), or a dbt project's directory
     #[arg(value_name = "FILE")]
     pub file: PathBuf,
 
@@ -2767,6 +2771,10 @@ pub enum OntologyFromFormat {
     Snowflake,
     /// A Databricks Genie space export (JSON)
     Genie,
+    /// A dbt project's semantic models and model properties (YAML, or a directory of them)
+    Dbt,
+    /// An Apache Ossie semantic model or ontology (YAML or JSON)
+    Ossie,
 }
 
 /// `fluree catalog` subcommands.
