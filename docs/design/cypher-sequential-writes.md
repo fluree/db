@@ -70,16 +70,62 @@ decomposition:
      against the evolving virtual state; this lets each duplicate observe the
      preceding row's update. Simple literals and threaded row-column values
      remain batched.
-   - **SET / REMOVE**: one seeded Txn; row table unchanged.
-   - **DELETE** in a multi-clause chain: rejected (clear error) in v1 — its
-     relationship-existence / parallel-edge probes stay single-statement.
+   - **SET / REMOVE**: one seeded Txn; row table unchanged. A SET whose items
+     write one property key twice is split at the repeat into consecutive
+     SETs, since its items apply in order.
+   - **DETACH DELETE** of a node: one seeded Txn, like SET; its lowering finds
+     the node's triples in the state it stages on.
+   - A relationship's **DELETE** (`DELETE r`, or `DETACH DELETE r`): one
+     seeded Txn that re-matches the edge `r` is on, in the state it stages on,
+     so the LPG cleanup takes the properties earlier clauses set on `r`. The
+     re-match is `MATCH (s)-[r:T]->(o)`, seeded with `r` and the variables
+     that hold its endpoints at the end of the read clauses, so it is a point
+     lookup of the edge. A walk over the read clauses' scope decides which
+     variables are relationships and which hold their endpoints, following
+     `WITH` projections and aliases. The read prefix names an unnamed
+     endpoint, and a `WITH` that keeps a relationship but drops or rebinds an
+     endpoint also projects that endpoint under a name of the driver's own;
+     neither changes what the statement matches (an endpoint is a function of
+     its relationship, so no grouping or `DISTINCT` changes). So the names the
+     statement's `MATCH` gave the endpoints never point the re-match at
+     another edge. A pattern read in either direction has no subject to
+     carry; its re-match takes endpoint variables of its own, which the seeded
+     `r` and its `f:reifies*` bundle pin to the edge, at the cost of a scan of
+     the type's relationships per row.
+   - Seeding: a SET, REMOVE or DELETE is seeded only with the rows that bind
+     its target. When a row (from an `OPTIONAL MATCH`) leaves one of a
+     clause's targets unbound, the clause stages once per target, each part
+     seeded with the rows that bind it, so the row skips only its writes to
+     the unbound target. Items on different targets are independent once a
+     repeated key is split, so the parts write what the clause would; a
+     DELETE's relationship targets stage after its node targets.
+   - A bare node **DELETE** in a multi-clause chain: rejected (clear error) in
+     v1 — its relationship-existence probe stays single-statement.
+
+   A Cypher `DELETE r` marks its Txn with the delete template that retracts
+   `r`'s edge (`TxnOpts::relationship_deletes`), in the driver and in the
+   single `Txn` alike. Staging notes the edges those templates retract and,
+   where the `f:reifies*` cascade reads each edge's relationships, refuses one
+   of them that carries more than one: retracting the edge would take them
+   all. The check reads the state the Txn stages on (in the driver, the
+   virtual state, so a sibling an earlier clause created counts) and has no
+   view of `r`'s property map or `WHERE`. It covers `r`'s edges and no others:
+   an edge another delete template retracts too (a `DETACH DELETE` of one of
+   its endpoints, which takes every relationship on the node) is left to the
+   cascade.
 3. **Finish** — `SequentialStager::finish()` produces one `StageResult` over
    the original base: single commit at `t+1`, union namespace delta, folded
    flakes. Zero staged flakes → the ordinary no-op update path.
 4. **RETURN** — answered by one final read query (`VALUES(final rows) RETURN
    items`) against the final virtual state: full expression surface
    (projections, `DISTINCT`, `ORDER BY`, `SKIP`/`LIMIT`) rather than the
-   created-entity-only reconstruction single-Txn writes use.
+   created-entity-only reconstruction single-Txn writes use. The RETURN is
+   the only reader of the state after the last write clause, so a statement
+   without one stages its last clause (unless it's a MERGE, which probes its
+   own writes) without building that state, as SPARQL's last `;` operation
+   does. The final state reaches a caller only with the answered RETURN
+   (`AnsweredReturn`); the `cypher_unread_final_state` stamp records which way
+   a statement went.
 
 ## Row threading representation
 
@@ -102,7 +148,23 @@ so seeded rows satisfy `SET`/`REMOVE` target checks.
    MERGE (MERGE chains, CREATE+MERGE mixes, interleaved SET/REMOVE), and the
    previously-rejected node MERGE under a plain leading MATCH (the driver's
    per-row partition makes it correct: one create per distinct absent key,
-   every row binds).
+   every row binds). It also takes statements without a MERGE whose write
+   clauses can see or undo one another's writes (`interacting_writes`): two
+   clauses writing one property key or one label (on any variables, since two
+   can bind one node), a DETACH DELETE or a relationship's DELETE with any
+   other write, or a CREATE with
+   a clause whose lowering reads stored values (a SET or REMOVE of a property,
+   a map SET, DETACH DELETE — the `OPTIONAL` lookup adds rows the CREATE would
+   fire on), plus a SET writing one key twice. The single-`Txn` lowering
+   evaluates every clause against the state before the statement and stages
+   them as one operation, so for these it neither lets a later clause see an
+   earlier one nor lets the last write hold; the driver stages clause by
+   clause and the stager folds each fact to its last write, as for SPARQL `;`
+   updates. Clauses that can't meet (CREATE chains, SETs of different keys)
+   keep the single `Txn`, as do statements with a member the driver doesn't
+   stage (a bare node DELETE, `CALL { … }` before the writes, an
+   `OPTIONAL MATCH` before a CREATE), which the single `Txn`'s lowering
+   refuses in turn.
 3. Single-Txn lowering — everything else, including its existing clear errors.
 
 `WritePlan` gains a `Sequential` variant. Call sites:
@@ -124,13 +186,21 @@ statements.
 
 ## Non-impact guarantees
 
-- JSON-LD / Turtle / SPARQL transaction paths are untouched; `stage()` in
-  fluree-db-transact is not modified.
+- JSON-LD / Turtle / SPARQL transactions write what they wrote before. Two
+  changes reach code they share:
+  - `stage()`'s `f:reifies*` cascade refuses a parallel relationship on an
+    edge a Cypher `DELETE r` retracts (`TxnOpts::relationship_deletes`). No
+    other transaction sets the marker, and without it staging notes nothing.
+  - The sequential stager builds the planner stats once, for the state a
+    write begins on, and pins them (estimates only) onto every state it
+    advances to, so SPARQL's `;`-separated operations after the first plan
+    from those stats rather than assembling their own.
 - `stage_transaction_from_txns` keeps its `len == 1` fast path; only its
   N ≥ 2 loop body moved into `SequentialStager`.
-- Single-clause Cypher writes keep their existing plans byte-for-byte
-  (`detect_conditional` runs first; `detect_sequential` fires only on shapes
-  that previously errored).
+- Single-clause Cypher writes keep their existing plans byte-for-byte, except
+  a SET that writes one property key twice. Multi-clause writes without a
+  MERGE keep the single `Txn` unless their clauses can meet (above): those
+  wrote the wrong facts there.
 
 ## Costs
 

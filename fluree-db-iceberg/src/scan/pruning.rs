@@ -1135,11 +1135,7 @@ mod tests {
             field_id: 1,
             column: "v".to_string(),
             op,
-            value: LiteralValue::Decimal {
-                unscaled,
-                precision: 38,
-                scale,
-            },
+            value: LiteralValue::Decimal { unscaled, scale },
         };
 
         // v = 9.99 (scale 2) == 9.990 (rg0 max, scale 3): rg0 boundary-equal kept;
@@ -1223,11 +1219,7 @@ mod tests {
             field_id: 1,
             column: "v".to_string(),
             op,
-            value: LiteralValue::Decimal {
-                unscaled,
-                precision: 38,
-                scale: 0,
-            },
+            value: LiteralValue::Decimal { unscaled, scale: 0 },
         };
 
         // Positive prune: v = 15 (15.000) falls in the gap → BOTH groups pruned.
@@ -1357,7 +1349,6 @@ mod tests {
             op: ComparisonOp::Eq,
             value: LiteralValue::Decimal {
                 unscaled: 10000,
-                precision: 9,
                 scale: 2,
             },
         };

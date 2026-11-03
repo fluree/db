@@ -30,11 +30,18 @@ fluree ontology <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `check` | Report what an HTTP reader will and won't read of an ontology (and catalog) |
-| `from` | Write an ontology in the shape extraction models read well, optionally sliced |
+| `from` | Write an ontology in the shape extraction models read well: from tables (CSV, a workbook, SQL DDL), a semantic layer (Snowflake, Genie, dbt, Apache Ossie), or RDF, optionally sliced |
 
-Both read Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-` reads stdin, and
-`--input-format turtle|jsonld` says which when the extension doesn't. TriG is
-not read yet: pass the ontology as Turtle, or a saved request as JSON-LD.
+Ontologies are read as Turtle (`.ttl`) or JSON-LD (`.jsonld`, `.json`); `-`
+reads stdin, and `--input-format turtle|jsonld` says which when the extension
+doesn't. TriG is not read yet: pass the ontology as Turtle, or a saved request
+as JSON-LD. `from` also reads tables (`.csv`/`.tsv`, `.xlsx`, `.sql`) and
+semantic layers: a Snowflake semantic view (`.yaml`), a Databricks Genie
+export (`.json`), a dbt project (its `.yml` files or its directory) and an
+Apache Ossie semantic model or ontology (`.yaml`, `.json`). YAML and JSON
+are told apart by what they hold.
+
+For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
 ## What an HTTP reader reads
 
@@ -196,11 +203,224 @@ Finding codes: `no-ontology`, `no-class`, `no-label`, `owl-machinery`, `catalog-
 ## fluree ontology from
 
 ```bash
-fluree ontology from <FILE> [--seed <CLASSES>] [--depth <N>] [--format turtle|jsonld] [-o <FILE>]
+fluree ontology from <FILE> [--base <IRI>] [--enum-max <N>] [--catalog-out <FILE>] [--comments <FILE>] [--format turtle|jsonld] [-o <FILE>]
+fluree ontology from <FILE.ttl|.jsonld> [--seed <CLASSES>] [--depth <N>] [--format turtle|jsonld] [-o <FILE>]
 ```
 
-Reads an RDF ontology and writes it with what an HTTP reader reads made
-explicit:
+The ontology goes to stdout, or to the file `-o` names; a summary of what was
+made goes to stderr. Run `fluree ontology check` on the result to see what an
+HTTP reader will read of it.
+
+### From tables and semantic layers
+
+A CSV file (`.csv`, `.tsv`: one table, named for the file), a workbook
+(`.xlsx`: a table per sheet, the first row its header) or SQL DDL (`.sql`:
+`CREATE TABLE` statements) becomes an ontology by the rules that measurably
+help an extraction model:
+
+- **labels in words**: a table is a class labelled with its name in words,
+  singular (`DAMAGE_REPORTS` becomes "damage report"), and a column a
+  property labelled with its name in words (`opened_at` becomes "opened at");
+- **IRIs minted from the labels** (`DamageReport`, `openedAt`), since the
+  model reads the local name beside the label;
+- **foreign keys become relations** from the table's class to the class of
+  the table referenced, labelled without the key suffix (`employer_id`
+  becomes "employer"), with a short description ("A contact's employer: a
+  company.");
+- **enumerated columns become a class with a catalog record per value**, the
+  shape the model reads best for a closed set of kinds;
+- **descriptions are copied** from `COMMENT ON TABLE|COLUMN`, inline
+  `COMMENT '...'` and a table's `COMMENT = '...'`;
+- **primary keys are left out**, as are views, indexes and everything that
+  describes the database rather than the things in it.
+
+Keys and foreign keys are read from `PRIMARY KEY`, `REFERENCES` and
+`FOREIGN KEY` in `CREATE TABLE`, and from `ALTER TABLE … ADD CONSTRAINT`, which
+is where pg_dump writes them. In a CSV or a workbook, a column named `id`, or
+the table's name in the singular with `_id` (`company_id` in `companies`,
+`CustomerID` in `Customers`), is the primary key; any other column ending in
+`id` is a foreign key when it names another sheet (`customer_id` beside a
+`customers` sheet), and otherwise stays a value (`tax_id` reads "tax id").
+
+Enumerated columns come from `CHECK (col IN (...))` (or pg_dump's
+`(col)::text = ANY (ARRAY[...])`), a MySQL `ENUM(...)` type or a PostgreSQL
+`CREATE TYPE ... AS ENUM` in DDL. In a CSV or a workbook, a
+text column is enumerated when it has at most `--enum-max` distinct short
+values (default 12), each repeated (at least twice as many rows as values, and
+five rows). Column datatypes come from the DDL, or from the values (integers,
+decimals, ISO dates and date-times, booleans; a number with a leading zero is a
+code and stays text).
+
+A **Snowflake semantic view** (or Cortex Analyst semantic model) as YAML
+(`.yaml`, `.yml`) is a data dictionary, and converts the same way: tables'
+descriptions and synonyms are copied ("Also called: riders, clients."),
+dimensions, time dimensions and facts become properties typed from their
+`data_type`, a dimension with `is_enum: true` and `sample_values` is
+enumerated, and each relationship is a foreign key from its many side to its
+one side (`CUSTOMER_ID` in `orders_to_customers` becomes the relation
+"customer"). Metrics, filters and verified queries describe queries, not
+things, and are left out. Values are read as written: a dimension named `NO`
+or a sample value `007` stays that, rather than YAML's `false` or `7`, and a
+key given twice keeps its last value.
+
+A **Databricks Genie space** export (`.json`, the `serialized_space` its API
+returns) gives tables, columns (with any synonyms and descriptions the space
+sets, as strings or lists of strings; columns it excludes are left out) and
+join specs, read in the direction their relationship type gives (a one-to-many
+join is turned round; a many-to-many one makes no key). Table and column
+descriptions mostly live in Unity Catalog's comments instead: pass them with
+`--comments` as JSON, `{"table": {"": "table comment", "column": "column
+comment"}}` (one query on `information_schema` gives them). Columns the comments
+name that the export doesn't list are added, since an export may list only the
+columns that have settings. SQL snippets and instructions are left out. Joins
+naming a table the export doesn't have, join SQL with no `` `alias`.`column` ``
+pairs, and comments for tables the export doesn't have are counted in the
+summary.
+
+A **dbt project** gives two kinds of YAML, and `from` reads both, from one file
+or from the project's directory (every `.yml`/`.yaml` under it, `target/` and
+`dbt_packages/` passed over):
+
+- **semantic models** (MetricFlow): a semantic model is a class; its primary
+  entity is its key; a foreign entity is a relation to the semantic model whose
+  primary entity has that name (`customer` relates to the model keyed by
+  `customer`), else to the model its column's `relationships` test names, else
+  to the model whose name reads as the entity's (`store` and `stores`);
+  dimensions are properties (a `time` dimension a date, or a date-time below a
+  day's granularity); a measure that aggregates a column (`sum`, `average`,
+  `min`, `max`, `median`, `percentile`) is a decimal property, while counts
+  (including `agg: sum, expr: 1`), metrics and saved queries are left out;
+- **model properties** (`schema.yml`): column descriptions are copied, an
+  `accepted_values` test makes a column enumerated, a `relationships` test or a
+  `foreign_key` constraint (on the column or the model, including the pre-1.9
+  `expression:` form) makes it a foreign key, and a `primary_key` constraint, or
+  `unique` with `not_null` on `id`, makes it the key. A versioned model takes
+  its latest version's columns, and `ref('orders', v=2)` and `source(...)` name
+  their model or table.
+
+Descriptions written as `{{ doc('name') }}` are resolved from the project's
+`{% docs %}` blocks (in its `.md` files, when `from` reads the project's
+directory); one whose block isn't found is left out and counted, never kept as
+template text. Values are read as written (`accepted_values: [NO, 007]` stays
+that), a key given twice keeps its last value as dbt's own YAML reader does,
+and a `.yml` file that isn't valid YAML is named in the summary rather than
+skipped silently. Models and semantic models are separate name spaces in dbt: a
+model that shares a semantic model's name, and isn't its base, is read as
+`<name>_model`.
+
+A semantic model built on a model (`model: ref('fct_orders')`) stands for it:
+it takes the model's descriptions and accepted values for the columns it uses,
+and the model isn't repeated. Of the model's other columns, the ones that carry
+a relation (a `relationships` test or `foreign_key` constraint) or accepted
+values are kept, since a relation a metric didn't need is still something
+documents talk about; the rest (audit columns, surrogate keys, columns only a
+measure's expression uses) are left out, and the summary says how many. A
+`relationships` test that names a replaced model (`ref('fct_orders')`) points
+at the semantic model standing for it.
+
+An **Apache Ossie** document (0.2, `.yaml` or `.json`) is read by its layer:
+
+- a **semantic model** (`datasets`, `relationships`) converts like a Snowflake
+  semantic view: fields' `description`, `datatype` and `ai_context` synonyms
+  are copied, relationships are foreign keys from their `from` fields to the
+  `to` dataset, and metrics are left out;
+- an **ontology** (`ontology:` a list of concepts) is already conceptual, and
+  is written as RDF directly, **keeping the IRIs it gives** (`iri: schema:Airport`,
+  expanded with its `prefixes`). An `EntityType` concept is a class (with its
+  `extends` as parents, and its `iri` kept when it is one: an undeclared
+  prefix, no scheme or whitespace is reported, and the term minted instead); a
+  binary relationship is a property from the concept
+  that declares it to its role's concept, or to the datatype a `ValueType`
+  resolves to, described by its `description` or else its verbalization
+  (`'{Flight} uses {Aircraft}'` becomes "A flight uses an aircraft."); a unary
+  relationship (`'{Flight} was diverted'`) is a boolean property; one with
+  three or more roles is a class with a property per role; and a value type
+  whose `requires` lists its values (`Code == 'A' OR Code == 'B'`, or `IN`, in
+  any case) is a class with a catalog record per value. `derived_by`, other `requires` and
+  `identify_by` are logic, not what documents say, and are left out.
+
+A foreign key keeps its words without the key suffix (`origin_airport_code`
+becomes "origin airport", `employer_no` "employer"), and takes the target's
+label only when nothing is left (`id`). A key with the same name in several
+tables is one relation, described for them all ("The account of a contact,
+booking or quote.").
+
+The DDL is parsed with a generic SQL dialect, then PostgreSQL's, MySQL's and
+Snowflake's. When none parses the whole file (mysqldump's `DELIMITER`, say),
+each statement is tried on its own, split where the SQL tokenizer finds a
+semicolon (so one inside a string doesn't cut a statement short), and the
+statements none can parse are skipped and counted. Tables of the same name in
+two schemas (`crm.users`, `billing.users`) stay apart, named with their schema.
+
+Two source names never become one term. Two columns of the same name in
+different tables (`name`) share one property; any other clash gets a suffixed
+IRI, and a label already taken is qualified with the column's full name
+(`employer id` beside `employer`) or the table's name in front (`ticket status`
+beside `status`). Enumerated values that read alike in an IRI (`Net 30`,
+`net-30`) keep records of their own. Everything left out or qualified is
+counted in the summary on stderr, and a file that yields no classes is an error,
+not an empty ontology.
+
+| Option | Description |
+|--------|-------------|
+| `--base <IRI>` | Namespace for minted IRIs (default: `https://example.com/<file name>/`) |
+| `--enum-max <N>` | Most distinct values an enumerated column may have, for CSV and workbooks (default: 12; 0 never enumerates) |
+| `--catalog-out <FILE>` | Write enumerated columns' records here instead of with the ontology |
+| `--comments <FILE>` | Unity Catalog comments for a Genie export (JSON) |
+| `--input-format <FORMAT>` | `turtle`, `jsonld`, `csv`, `xlsx`, `sql`, `snowflake`, `genie`, `dbt` or `ossie`, when the extension or contents don't say |
+| `--format <FORMAT>` | `turtle` (default) or `jsonld` |
+| `-o, --output <FILE>` | Write to this file instead of stdout |
+
+```bash
+fluree ontology from schema.sql --base https://example.com/crm/ > ontology.ttl
+fluree ontology from accounts.csv -o ontology.ttl
+fluree ontology from crm.xlsx --catalog-out kinds.ttl -o ontology.ttl
+fluree ontology from sales_view.yaml --base https://example.com/sales/ > ontology.ttl
+fluree ontology from genie_space.json --comments uc_comments.json > ontology.ttl
+fluree ontology from ./my_dbt_project --base https://example.com/shop/ > ontology.ttl
+fluree ontology from flights.ossie.yaml > ontology.ttl
+```
+
+From this DDL:
+
+```sql
+CREATE TABLE companies (company_id SERIAL PRIMARY KEY, name VARCHAR(200));
+CREATE TABLE contacts (
+    id INTEGER PRIMARY KEY,
+    employer_id INTEGER REFERENCES companies(company_id),
+    status VARCHAR(10) CHECK (status IN ('active', 'left'))
+);
+COMMENT ON TABLE companies IS 'Customer accounts and partners.';
+```
+
+`fluree ontology from crm.sql --base https://example.com/crm/` writes (in part):
+
+```turtle
+crm:Company a rdfs:Class ;
+    rdfs:comment "Customer accounts and partners." ;
+    rdfs:label "company" .
+
+crm:employer a rdf:Property ;
+    rdfs:comment "A contact's employer: a company." ;
+    rdfs:domain crm:Contact ;
+    rdfs:label "employer" ;
+    rdfs:range crm:Company .
+
+crm:Status a rdfs:Class ;
+    rdfs:label "status" .
+
+<https://example.com/crm/Status/active> a crm:Status ;
+    skos:prefLabel "active" .
+```
+
+What tables can't say is what an extraction model gains most from next:
+descriptions that say what counts and name the words people use ("the desk"
+for the hire desk). `check` lists the terms without one.
+
+### From RDF
+
+An RDF ontology (Turtle or JSON-LD) is written back with what an HTTP reader
+reads made explicit:
 
 - SKOS labels and definitions moved into `rdfs:label` and `rdfs:comment` (the
   SKOS statement a fallback would read is replaced by the RDFS one);
@@ -219,9 +439,6 @@ Domains, ranges and other axioms are kept: an HTTP reader doesn't see
 them, but a reading can still be checked against them. Catalog records in the
 file are kept, and one with an `rdfs:label` but no SKOS label gets it as
 `skos:prefLabel` (and its `rdfs:comment` as `skos:definition`).
-
-A summary of what changed goes to stderr; the ontology goes to stdout, or to
-the file `-o` names.
 
 | Option | Description |
 |--------|-------------|
@@ -259,6 +476,7 @@ records are kept when they are typed with a kept class or have no type.
 
 ## See also
 
+- [`catalog`](catalog.md): a catalog of records from rows you already have
 - [`doc`](doc.md): `fluree doc ingest` extracts with an ontology; its
   language-model extractor reads more of an ontology than an HTTP reader does
 - [`validate`](validate.md): validate data against SHACL shapes

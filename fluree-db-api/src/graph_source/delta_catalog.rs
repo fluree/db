@@ -141,8 +141,18 @@ pub struct GenerateDeltaR2rmlResponse {
     pub tables: Vec<String>,
 }
 
-fn config_error(e: DeltaError) -> crate::ApiError {
-    crate::ApiError::Config(e.to_string())
+/// An onboarding failure: an identity refusal of the catalog's keeps its type
+/// and code, anything else is the caller's configuration.
+pub(crate) fn config_error(e: DeltaError) -> crate::ApiError {
+    match e {
+        DeltaError::Identity(refusal) => {
+            match crate::graph_source::iceberg_catalog::identity_query_error(refusal) {
+                Ok(typed) => crate::ApiError::Query(typed),
+                Err(other) => crate::ApiError::Config(other.to_string()),
+            }
+        }
+        other => crate::ApiError::Config(other.to_string()),
+    }
 }
 
 /// `catalog.schema.table` as the emitter's namespace and name.
@@ -264,7 +274,7 @@ impl crate::Fluree {
         depth: BrowseDepth,
     ) -> Result<UnityListing> {
         let unity = self.hydrate_unity(unity).await?;
-        fluree_db_delta::browse_unity(&unity, depth)
+        fluree_db_delta::browse_unity(&unity, depth, self.identity_context())
             .await
             .map_err(config_error)
     }
@@ -276,7 +286,7 @@ impl crate::Fluree {
         table: &str,
     ) -> Result<DeltaTablePreview> {
         let unity = self.hydrate_unity(unity).await?;
-        fluree_db_delta::describe_unity_table(&unity, table)
+        fluree_db_delta::describe_unity_table(&unity, table, self.identity_context())
             .await
             .map(DeltaTablePreview::from)
             .map_err(config_error)
@@ -300,9 +310,14 @@ impl crate::Fluree {
             .map_err(config_error)?;
         let full_name = unity.full_name(table).map_err(config_error)?;
         let read = async {
-            let table =
-                fluree_db_delta::DeltaTable::open_in_unity(&full_name, &unity, &full_name, &io)
-                    .await?;
+            let table = fluree_db_delta::DeltaTable::open_in_unity(
+                &full_name,
+                &unity,
+                &full_name,
+                &io,
+                self.identity_context(),
+            )
+            .await?;
             let snapshot = table.snapshot(VersionSelector::Latest).await?;
             let files = snapshot.file_count(&[]).await?;
             let probed = snapshot.probe_data_file().await?;
@@ -359,9 +374,10 @@ impl crate::Fluree {
         }
         let unity = self.hydrate_unity(&req.unity).await?;
         // In the request's order, and with it the mapping's.
-        let tables = fluree_db_delta::describe_unity_tables(&unity, &req.tables)
-            .await
-            .map_err(config_error)?;
+        let tables =
+            fluree_db_delta::describe_unity_tables(&unity, &req.tables, self.identity_context())
+                .await
+                .map_err(config_error)?;
         let overrides = keyed_overrides(&req.tables, &tables, &req.per_table_overrides)?;
         generate_from(&tables, &req.base_namespace, &req.options, overrides)
     }
@@ -414,7 +430,14 @@ impl crate::Fluree {
         let mut unread: HashMap<String, String> = HashMap::new();
         for name in &table_names {
             let read = async {
-                let table = open_placed(&gs_config, unity.as_ref(), &io, name).await?;
+                let table = open_placed(
+                    &gs_config,
+                    unity.as_ref(),
+                    &io,
+                    name,
+                    self.identity_context(),
+                )
+                .await?;
                 let snapshot = table.snapshot(VersionSelector::Latest).await?;
                 Ok::<_, DeltaError>(snapshot.columns())
             }
