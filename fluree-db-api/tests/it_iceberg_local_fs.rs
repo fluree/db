@@ -25,6 +25,17 @@
 //!   "999", "1000", …) and `xsd:boolean` (`btext`: "1", "true", …), and a
 //!   double column holding -0.0 and 0.0.
 //!
+//! Under `tests/fixtures/iceberg/sets/`, in their own namespace, tables whose
+//! rows mint the same triple more than once (R2RML set semantics; see the
+//! `sets.*` block of the script below):
+//!
+//! - `customers_history` — several versions per customer, no key covering
+//!   `customer_id` alone, in two files.
+//! - `customers_current` — one row per customer; `customer_id` is an Iceberg
+//!   identifier field.
+//! - `orders` — references `customers_history`; one exact duplicate row, one
+//!   copy in each file.
+//!
 //! The fixtures' metadata carries the ABSOLUTE paths they were written under
 //! (`file:///tmp/...`), so reading them from a checkout also proves the
 //! relocated-table location remap: the provider infers `metadata.location →
@@ -40,6 +51,22 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
 //! cp -r /tmp/fluree-local-iceberg/silver/literals fluree-db-api/tests/fixtures/iceberg/silver/literals
 //! ```
+//!
+//! The `sets` tables were written under `/tmp/fluree-local-iceberg-sets`, the
+//! path their metadata records. The script deletes and rewrites its whole
+//! warehouse argument, and every run mints new file names and snapshot ids,
+//! so give it its own directory and copy only the tables you mean to replace:
+//!
+//! ```bash
+//! python3 scripts/local/write_local_iceberg_table.py /tmp/fluree-local-iceberg-sets
+//! rm -rf fluree-db-api/tests/fixtures/iceberg/sets/{customers_history,customers_current,orders}
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/customers_history fluree-db-api/tests/fixtures/iceberg/sets/customers_history
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/customers_current fluree-db-api/tests/fixtures/iceberg/sets/customers_current
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/orders fluree-db-api/tests/fixtures/iceberg/sets/orders
+//! ```
+//!
+//! The `sql-sqlite` extra is what brings `sqlalchemy`, which the script's SQL
+//! catalog needs; install it in a virtualenv if the system Python lacks it.
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
 //! fixture to run those tests against any table with the same shape.
