@@ -761,7 +761,9 @@ fn prepare_exact(
                         }
                     } else {
                         match prepare_check(*op, value, &target) {
-                            Check::KeepAll => match integer_range_check(*op, value, &target) {
+                            Check::KeepAll => match integer_range_check(*op, value, &target)
+                                .or_else(|| off_grid_decimal_not_eq(*op, value, &target))
+                            {
                                 Some(check) => PreparedExact::Check { pos: *pos, check },
                                 None => {
                                     return Err(IcebergError::Scan(format!(
@@ -835,6 +837,32 @@ fn integer_range_check(op: ComparisonOp, value: &LiteralValue, target: &DataType
         | (ComparisonOp::Gt | ComparisonOp::GtEq, false) => Check::NotNull,
         _ => Check::DropAll,
     })
+}
+
+/// `<>` with a literal between two grid points of a decimal column: no cell
+/// equals it, so every non-null cell satisfies it, and a null cell is unknown.
+/// The advisory filter keeps every row here ([`decimal_check`]: the engine's
+/// FILTER drops the nulls after it); nothing re-checks an exact filter's rows,
+/// so it drops the nulls itself. `None` for anything else.
+fn off_grid_decimal_not_eq(
+    op: ComparisonOp,
+    value: &LiteralValue,
+    target: &DataType,
+) -> Option<Check> {
+    let DataType::Decimal128(_, column_scale) = *target else {
+        return None;
+    };
+    if op != ComparisonOp::NotEq {
+        return None;
+    }
+    let (unscaled, scale) = match *value {
+        LiteralValue::Int32(n) => (i128::from(n), 0),
+        LiteralValue::Int64(n) => (i128::from(n), 0),
+        LiteralValue::Decimal { unscaled, scale } => (unscaled, scale),
+        _ => return None,
+    };
+    let (_, _, on_grid) = grid_neighbors(unscaled, scale, column_scale);
+    (!on_grid).then_some(Check::NotNull)
 }
 
 /// The keep mask of `<float column> op value`, compared as IEEE numbers the
@@ -1049,7 +1077,7 @@ fn normalize_column(column: &ArrayRef) -> std::result::Result<ArrayRef, ArrowErr
 /// (`<`, `<=`) or at or above `hi` (`>`, `>=`): `< 1.0500000001` on
 /// `decimal(38,9)` is `<= 1.050000000`, and `> 1.0499999999` is
 /// `>= 1.050000000`. No cell equals it, so `=` drops every row and `!=` keeps
-/// every non-null row. A grid point beyond `i128` saturates, which can only keep a cell
+/// every row. A grid point beyond `i128` saturates, which can only keep a cell
 /// it should not.
 fn decimal_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> Option<Check> {
     let DataType::Decimal128(precision, column_scale) = *target else {
@@ -1069,7 +1097,7 @@ fn decimal_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> O
             ComparisonOp::Lt | ComparisonOp::LtEq => (ComparisonOp::LtEq, lo),
             ComparisonOp::Gt | ComparisonOp::GtEq => (ComparisonOp::GtEq, hi),
             ComparisonOp::Eq => return Some(Check::DropAll),
-            ComparisonOp::NotEq => return Some(Check::NotNull),
+            ComparisonOp::NotEq => return Some(Check::KeepAll),
         }
     };
     let literal = Decimal128Array::from(vec![units])
@@ -1521,6 +1549,34 @@ mod row_filter_tests {
                 assert_eq!(got, want, "{op:?} {unscaled}e-{scale}");
             }
         }
+    }
+
+    /// A literal between two grid points of a decimal column: no cell equals
+    /// it, so `=` drops every row, and the advisory filter keeps every row
+    /// under `<>`, a null cell included (the engine's FILTER drops the null).
+    /// The exact row filter drops that null itself; see
+    /// `exact_filter_off_grid_inequality_drops_nulls`.
+    #[test]
+    fn an_off_grid_inequality_keeps_every_row_null_included() {
+        let column = || -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(vec![Some(2020), Some(2024), None])
+                    .with_precision_and_scale(9, 0)
+                    .unwrap(),
+            )
+        };
+        let off_grid = LiteralValue::Decimal {
+            unscaled: 20205,
+            scale: 1,
+        };
+        assert_eq!(
+            kept(column(), ComparisonOp::NotEq, off_grid.clone()),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            kept(column(), ComparisonOp::Eq, off_grid),
+            Vec::<usize>::new()
+        );
     }
 
     /// A literal outside the column's range is not representable there. Arrow
