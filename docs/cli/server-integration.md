@@ -2429,7 +2429,7 @@ The CLI sends the connection **structured**: `catalog` and `io` objects exactly 
 
 **Validation rules:**
 - `name` must not be empty or contain `:`
-- `r2rml`, when given, must parse and compile as an R2RML mapping (it defines how table rows become RDF triples); its table and column names are not checked against the tables here (see [Iceberg → Schema Mismatch](../graph-sources/iceberg.md#schema-mismatch))
+- `r2rml` must parse and compile as an R2RML mapping (it defines how table rows become RDF triples); its table and column names are not checked against the tables here (see [Iceberg → Schema Mismatch](../graph-sources/iceberg.md#schema-mismatch))
 - `mode` must be one of `rest`, `direct`, `glue`, `s3tables` (any case)
 - REST mode requires `catalog_uri`; requires `table` unless specified in R2RML mapping's `rr:tableName`
 - Direct mode requires `table_location`: an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path, which is accepted only under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables))
