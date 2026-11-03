@@ -1,10 +1,11 @@
-//! Where `--model` and `--entities` come from.
+//! Where `--ontology` and `--entities` come from.
 //!
-//! A source is a ledger in the local store or an RDF file. A file is loaded
+//! A source is a ledger in the local store, a graph source mapped over a
+//! table (`fluree iceberg|sql|delta map`), or an RDF file. A file is loaded
 //! into a scratch in-memory ledger, so every source is queried the same
-//! way with the database's own parsers and no second RDF stack. Ledger
-//! names and file paths are told apart by extension: `.ttl`, `.nt`,
-//! `.jsonld` and `.json` are files.
+//! way with the database's own parsers and no second RDF stack. Names and
+//! file paths are told apart by extension: `.ttl`, `.nt`, `.jsonld` and
+//! `.json` are files.
 
 use crate::context;
 use crate::error::{CliError, CliResult};
@@ -12,6 +13,7 @@ use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::{Fluree, FlureeBuilder};
 use fluree_db_doc::gazetteer::{Gazetteer, GazetteerBuilder};
 use fluree_db_doc::model::{Model, ModelBuilder};
+use fluree_db_nameservice::{GraphSourceKind, GraphSourceType};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -74,6 +76,9 @@ fn is_rdf_file(spec: &str) -> bool {
 pub struct Opened {
     fluree: Fluree,
     alias: String,
+    /// Queried through the graph-source path, which maps the table's rows
+    /// to triples as it reads them; a ledger or file has flakes to read.
+    graph_source: bool,
 }
 
 impl Opened {
@@ -82,14 +87,30 @@ impl Opened {
             SourceKind::Ledger(alias) => {
                 let fluree = context::build_fluree(dirs).await?;
                 let ledger_id = context::to_ledger_id(alias)?;
-                if !fluree.ledger_exists(&ledger_id).await? {
-                    return Err(CliError::NotFound(format!(
-                        "{alias}: no such ledger (a file source needs a .ttl, .nt, .jsonld or .json extension)"
-                    )));
-                }
+                let graph_source = if fluree.ledger_exists(&ledger_id).await? {
+                    false
+                } else {
+                    match graph_source_type(&fluree, &ledger_id).await? {
+                        Some(t) if t.kind() == GraphSourceKind::Mapped => true,
+                        // An index answers searches, not the label queries
+                        // a source is read with.
+                        Some(t) => {
+                            return Err(CliError::Usage(format!(
+                                "{alias} is {}, not a table mapped as a graph source; a source is a ledger, a file, or a graph source from `fluree iceberg|sql|delta map`",
+                                describe(&t)
+                            )))
+                        }
+                        None => {
+                            return Err(CliError::NotFound(format!(
+                                "{alias}: no such ledger or graph source (a file source needs a .ttl, .nt, .jsonld or .json extension)"
+                            )))
+                        }
+                    }
+                };
                 Ok(Self {
                     fluree,
                     alias: alias.clone(),
+                    graph_source,
                 })
             }
             SourceKind::File(path) => {
@@ -114,16 +135,56 @@ impl Opened {
                     })?;
                     g.transact().insert(&json).commit().await?;
                 }
-                Ok(Self { fluree, alias })
+                Ok(Self {
+                    fluree,
+                    alias,
+                    graph_source: false,
+                })
             }
         }
     }
 
     pub async fn rows(&self, query: &Value) -> CliResult<Vec<Value>> {
+        if self.graph_source {
+            let json = self
+                .fluree
+                .graph(&self.alias)
+                .query()
+                .jsonld(query)
+                .execute_formatted()
+                .await?;
+            return Ok(json.as_array().cloned().unwrap_or_default());
+        }
         let view = self.fluree.db_with_default_context(&self.alias).await?;
         let result = self.fluree.query(&view, query).await?;
         let json = result.to_jsonld(&view.snapshot)?;
         Ok(json.as_array().cloned().unwrap_or_default())
+    }
+}
+
+/// The type of a live graph source named `id`, when this build can read
+/// one. Without the `iceberg` feature the table readers are not compiled
+/// in, so a graph source reads as missing rather than failing on its first
+/// query.
+async fn graph_source_type(fluree: &Fluree, id: &str) -> CliResult<Option<GraphSourceType>> {
+    if !cfg!(feature = "iceberg") {
+        return Ok(None);
+    }
+    Ok(fluree
+        .nameservice()
+        .lookup_graph_source(id)
+        .await?
+        .filter(|r| !r.retracted)
+        .map(|r| r.source_type))
+}
+
+/// A graph source that is not a mapped table, as an error names it.
+fn describe(t: &GraphSourceType) -> String {
+    match t {
+        GraphSourceType::Bm25 => "a BM25 full-text index".to_string(),
+        GraphSourceType::Vector => "a vector index".to_string(),
+        GraphSourceType::Geo => "a geospatial index".to_string(),
+        other => format!("a graph source of type {}", other.to_type_string()),
     }
 }
 
@@ -139,7 +200,7 @@ pub async fn load_model(source: &Source, dirs: &FlureeDir) -> CliResult<Model> {
     let model = builder.build();
     if model.is_empty() {
         return Err(CliError::Input(format!(
-            "--model {}: no classes or properties found (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty, or anything with rdfs:subClassOf / rdfs:domain / schema:domainIncludes)",
+            "--ontology {}: no classes or properties found (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty, or anything with rdfs:subClassOf / rdfs:domain / schema:domainIncludes)",
             source.label()
         )));
     }
@@ -206,6 +267,7 @@ pub async fn load_gazetteer(
         let opened = Opened {
             fluree: fluree.clone(),
             alias: alias.to_string(),
+            graph_source: false,
         };
         for (query, predicate) in Gazetteer::queries(Some(fluree_db_doc::vocab::ENTITY)) {
             builder.add_rows(&opened.rows(&query).await?, predicate);

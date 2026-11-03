@@ -5582,7 +5582,7 @@ fn doc_ingest_extracts_entities_and_relations_grounded_on_model_and_gazetteer() 
                 "docs",
                 "-l",
                 ledger,
-                "--model",
+                "--ontology",
                 "ont/model.ttl",
                 "--entities",
                 "ont/entities.ttl",
@@ -5595,7 +5595,7 @@ fn doc_ingest_extracts_entities_and_relations_grounded_on_model_and_gazetteer() 
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "model      ont/model.ttl (2 classes, 2 properties)",
+            "ontology   ont/model.ttl (2 classes, 2 properties)",
         ))
         .stderr(predicate::str::contains("gazetteer  1 entity"))
         .stdout(predicate::str::contains(
@@ -5714,12 +5714,14 @@ fn doc_ingest_entities_alone_scan_without_a_model_and_model_needs_an_llm() {
             "docs",
             "-l",
             "memos",
-            "--model",
+            "--ontology",
             "ont/model.ttl",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--model needs a language model"));
+        .stderr(predicate::str::contains(
+            "--ontology needs a language model",
+        ));
 
     fluree_cmd(&tmp)
         .args([
@@ -5734,6 +5736,63 @@ fn doc_ingest_entities_alone_scan_without_a_model_and_model_needs_an_llm() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("nowhere: no such ledger"));
+}
+
+/// `--catalog` is another name for `--entities`; `--ontology` took over
+/// `--model` outright, so the old spelling is a usage error, not an alias.
+#[test]
+fn doc_ingest_catalog_names_the_entities_and_model_is_no_longer_the_ontology() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--catalog",
+            "ont/entities.ttl#schema:Organization",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("gazetteer scan only"))
+        .stdout(predicate::str::contains("2 mention(s) of 1 entity (0 new)"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--model"));
+
+    // The first run built the ledger's full-text index, `memos-text`: a
+    // graph source, but an index, not a mapped table, so it is refused by
+    // what it is rather than read as a catalog with no labels.
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "notes",
+            "--catalog",
+            "memos-text",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "memos-text is a BM25 full-text index, not a table mapped as a graph source",
+        ));
 }
 
 #[test]
@@ -5754,7 +5813,7 @@ fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
                 "docs",
                 "-l",
                 "memos",
-                "--model",
+                "--ontology",
                 "ont/model.ttl",
                 "--entities",
                 "ont/entities.ttl",
@@ -5826,7 +5885,7 @@ fn doc_ingest_reingest_keeps_triples_the_pipeline_did_not_write() {
                 "docs",
                 "-l",
                 "memos",
-                "--model",
+                "--ontology",
                 "ont/model.ttl",
                 "--entities",
                 "ont/entities.ttl",
@@ -5959,7 +6018,7 @@ fn doc_ingest_reports_the_keys_and_items_the_schema_drops() {
             "docs",
             "-l",
             "memos",
-            "--model",
+            "--ontology",
             "ont/model.ttl",
             "--entities",
             "ont/entities.ttl",
@@ -6005,7 +6064,7 @@ fn doc_ingest_wire_body_carries_every_field_until_one_is_refused() {
             "docs",
             "-l",
             "memos",
-            "--model",
+            "--ontology",
             "ont/model.ttl",
             "--entities",
             "ont/entities.ttl",
@@ -6082,7 +6141,7 @@ fn doc_ingest_stores_assertion_mode_from_a_custom_prompt() {
             "docs",
             "-l",
             "memos",
-            "--model",
+            "--ontology",
             "ont/model.ttl",
             "--entities",
             "ont/entities.ttl",
@@ -6218,7 +6277,7 @@ fn doc_ingest_takes_three_corrections_in_one_call_without_spending_a_retry() {
             "docs",
             "-l",
             "memos",
-            "--model",
+            "--ontology",
             "ont/model.ttl",
             "--entities",
             "ont/entities.ttl",
@@ -6333,7 +6392,7 @@ fn doc_ingest_keeps_its_full_retry_budget_after_a_dialect_correction() {
             "docs",
             "-l",
             "memos",
-            "--model",
+            "--ontology",
             "ont/model.ttl",
             "--entities",
             "ont/entities.ttl",
