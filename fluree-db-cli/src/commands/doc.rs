@@ -191,9 +191,9 @@ struct Totals {
 
 const DEFAULT_CONCURRENCY: usize = 4;
 
-/// What `--model` and `--entities` set up, shared across documents.
+/// What `--ontology` and `--entities` set up, shared across documents.
 struct Extraction {
-    model: Option<Arc<Model>>,
+    ontology: Option<Arc<Model>>,
     gazetteer: Option<Arc<Gazetteer>>,
     extractor: Option<Arc<Extractor>>,
     policy: ResolvePolicy,
@@ -212,7 +212,7 @@ async fn setup_extraction(
     alias: &str,
     dirs: &FlureeDir,
 ) -> CliResult<Option<Extraction>> {
-    if args.no_extract || (args.model.is_none() && args.entities.is_empty()) {
+    if args.no_extract || (args.ontology.is_none() && args.entities.is_empty()) {
         return Ok(None);
     }
     let mode = match args.relations {
@@ -254,13 +254,13 @@ async fn setup_extraction(
         .unwrap_or(DEFAULT_CONCURRENCY)
         .max(1);
 
-    let model = match &args.model {
+    let ontology = match &args.ontology {
         Some(spec) => Some(Arc::new(
             doc_sources::load_model(&Source::parse(spec), dirs).await?,
         )),
         None => None,
     };
-    let extractor = match (&model, &config.llm) {
+    let extractor = match (&ontology, &config.llm) {
         (Some(m), Some(endpoint)) => Some(Arc::new(Extractor::new(
             LlmClient::new(endpoint.clone()),
             m,
@@ -275,7 +275,7 @@ async fn setup_extraction(
         )?)),
         (Some(_), None) => {
             return Err(CliError::Config(
-                "--model needs a language model: set [doc.llm] (fluree config set doc.llm.url …) or doc.remote for a Fluree AI account".into(),
+                "--ontology needs a language model: set [doc.llm] (fluree config set doc.llm.url …) or doc.remote for a Fluree AI account".into(),
             ))
         }
         (None, _) => None,
@@ -302,7 +302,7 @@ async fn setup_extraction(
         .as_bytes(),
     );
     Ok(Some(Extraction {
-        model,
+        ontology,
         gazetteer,
         extractor,
         policy,
@@ -334,7 +334,7 @@ async fn run_extraction(
 ) -> CliResult<Extracted> {
     let gazetteer = setup.gazetteer.clone();
     let extractor = setup.extractor.clone();
-    let model = setup.model.clone();
+    let ontology = setup.ontology.clone();
     let policy = setup.policy;
     let concurrency = setup.concurrency;
     let doc_iri = doc_iri.to_string();
@@ -412,7 +412,7 @@ async fn run_extraction(
             &entity_prefix,
             &inputs,
             gazetteer.as_deref(),
-            model.as_deref(),
+            ontology.as_deref(),
             policy,
         );
         Ok(Extracted {
@@ -904,7 +904,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         }
     }
     // Outside the extraction block on purpose: crop reading uses the same
-    // wire shape, so a run with no `--model` can still have been adjusted.
+    // wire shape, so a run with no `--ontology` can still have been adjusted.
     let recoveries = extraction
         .as_ref()
         .and_then(|x| x.extractor.as_ref())
@@ -962,10 +962,10 @@ fn announce(
     }
     match extraction {
         Some(x) => {
-            if let Some(m) = &x.model {
+            if let Some(m) = &x.ontology {
                 eprintln!(
-                    "  model      {} ({} classes, {} properties)",
-                    args.model.as_deref().unwrap_or(""),
+                    "  ontology   {} ({} classes, {} properties)",
+                    args.ontology.as_deref().unwrap_or(""),
                     m.classes().len(),
                     m.properties().len()
                 );
@@ -987,7 +987,7 @@ fn announce(
                     x.concurrency
                 ),
                 None => eprintln!(
-                    "  extraction gazetteer scan only; add --model for the language model"
+                    "  extraction gazetteer scan only; add --ontology for the language model"
                 ),
             }
             for (label, n) in &x.gazetteer_counts {

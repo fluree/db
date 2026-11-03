@@ -3,13 +3,13 @@
 `fluree doc ingest` can go past structure and chunks and say what a document is *about*: which known things it mentions, where, and what it states about them. Two inputs ground that, and both are graphs you already have or can write in a few lines of Turtle.
 
 ```bash
-fluree doc ingest ./memos -l memos --model ./ontology.ttl --entities people --entities orgs.ttl#schema:Organization
+fluree doc ingest ./memos -l memos --ontology ./ontology.ttl --entities people --entities orgs.ttl#schema:Organization
 ```
 
-- `--model` is an ontology: the classes an entity may have and the properties a relation may use. A ledger or a `.ttl` / `.jsonld` file.
-- `--entities` is a gazetteer: subjects with labels, to be found in the text by name. A ledger or a file, repeatable, optionally scoped to one class with `#Class`.
+- `--ontology` is an ontology: the classes an entity may have and the properties a relation may use. A ledger or a `.ttl` / `.jsonld` file.
+- `--entities` (or `--catalog`) is a gazetteer: subjects with labels, to be found in the text by name. A ledger, a graph source mapped over a warehouse table (`fluree iceberg map`, `sql map`, `delta map`: map a name column to `skos:prefLabel`), or a file; repeatable, optionally scoped to one class with `#Class`.
 
-Either can be given alone. `--entities` without `--model` is a deterministic scan and needs no model at all. `--model` needs a language model in the `llm` slot, or a Fluree AI account.
+Either can be given alone. `--entities` without `--ontology` is a deterministic scan and needs no model at all. `--ontology` needs a language model in the `llm` slot, or a Fluree AI account.
 
 ## The one rule that matters: a known entity keeps its IRI
 
@@ -124,9 +124,9 @@ On the document node rather than baked onto the edge, and that is the whole poin
 
 Store the factors and multiply at query time. That way each one can be corrected on its own.
 
-A re-ingest of the document leaves your triples alone. It retracts what the pipeline itself wrote — the `doc:`, `nif:` and `po:` terms, `rdf:type`, the reification triple and `rdfs:label` — and nothing else, on the document node and on every node stamped with it. Anything in your own vocabulary survives.
+A re-ingest of the document leaves your triples alone. It retracts what the pipeline itself wrote — the `doc:`, `nif:` and `po:` terms, `rdf:type`, the reification triple, `rdfs:label`, and `dcterms:title`, `dcterms:creator`, `dcterms:created` and `dcterms:modified` — and nothing else, on the document node and on every node stamped with it. Anything in your own vocabulary survives.
 
-**`doc:`, `nif:` and `po:` are reserved.** The boundary is the predicate, not who wrote it: a predicate in one of those three namespaces, on the document node or on any node stamped with it, is pipeline-owned and a re-ingest will retract it — including one you added yourself. So curate under your own namespace (`ex:trust`, above), not under `doc:`. `rdfs:label` and extra `@type` values on a pipeline node are reserved for the same reason: the emitters write both.
+**`doc:`, `nif:` and `po:` are reserved.** The boundary is the predicate, not who wrote it: a predicate in one of those three namespaces, on the document node or on any node stamped with it, is pipeline-owned and a re-ingest will retract it — including one you added yourself. So curate under your own namespace (`ex:trust`, above), not under `doc:`. `rdfs:label`, those four `dcterms:` terms and extra `@type` values on a pipeline node are reserved for the same reason: the emitters write them.
 
 ### Trust filtering is a query concern, not a policy one
 

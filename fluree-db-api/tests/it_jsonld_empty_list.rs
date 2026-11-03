@@ -70,8 +70,8 @@ async fn empty_jsonld_list_object_stores_rdf_nil() {
         "object must be rdf:nil, got {obj}"
     );
 
-    // A non-empty list reads, in SPARQL, as the RDF it denotes: an owner edge
-    // to its head, and its members through `rdf:rest*/rdf:first`.
+    // Non-empty lists keep the list_index storage shape: members stay
+    // direct objects and no rdf:first/rest spine is materialized.
     let items = rows(
         &fluree,
         &ledger,
@@ -79,21 +79,11 @@ async fn empty_jsonld_list_object_stores_rdf_nil() {
           SELECT ?o WHERE { ex:s ex:items ?o }",
     )
     .await;
-    assert_eq!(items.len(), 1, "one owner edge, to the head: {items:?}");
-    let members = rows(
-        &fluree,
-        &ledger,
-        r"PREFIX ex: <http://example.org/>
-          PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-          SELECT ?o WHERE { ex:s ex:items/rdf:rest*/rdf:first ?o }",
-    )
-    .await;
-    assert_eq!(members.len(), 3, "the members: {members:?}");
+    assert_eq!(items.len(), 3, "list members stay direct: {items:?}");
 
-    // The whole graph: the owner edge, three cells' rdf:first and rdf:rest,
-    // and the nil edge.
+    // The whole graph: 3 indexed list items + the nil edge.
     let all = rows(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
-    assert_eq!(all.len(), 1 + 3 * 2 + 1, "expected 8 statements: {all:?}");
+    assert_eq!(all.len(), 4, "expected 4 stored statements: {all:?}");
 }
 
 /// The two ingest surfaces must agree: the same statements through Turtle
