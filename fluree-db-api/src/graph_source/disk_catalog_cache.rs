@@ -16,6 +16,7 @@
 //! persistence — that "cold-data / warm-catalog" state is slice 2's DoD gate.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fluree_db_iceberg::metadata::TableMetadata;
@@ -384,8 +385,17 @@ impl DiskCatalogCache {
     }
 
     /// Write an entry via temp-file + atomic rename, so a crash mid-write can't
-    /// leave a torn file a later read would trust (a torn temp is just orphaned).
+    /// leave a torn file a later read would trust (a torn temp is just orphaned,
+    /// and counted and pruned like any other file by [`prune_dir`]).
     /// Best-effort: any failure just means a future miss.
+    ///
+    /// The temp name is unique to this write (process id plus a process-wide
+    /// counter), in the entry's own directory so the rename stays atomic. Two
+    /// writers of one key (two queries missing one snapshot at once, in one
+    /// process or two) sharing a temp file could truncate or overwrite the
+    /// file the other had just renamed into place, and a reader could then see
+    /// it partly written, or one writer's bytes under the other's tail; with a
+    /// temp file each, every rename installs one writer's complete bytes.
     fn write<T: Serialize>(&self, scope: &StorageScope, key: &str, suffix: &str, value: &T) {
         let path = self.path(scope, key, suffix);
         let env = Envelope {
@@ -396,7 +406,12 @@ impl DiskCatalogCache {
         let Ok(bytes) = serde_json::to_vec(&env) else {
             return;
         };
-        let tmp = path.with_extension("tmp");
+        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -697,6 +712,78 @@ mod tests {
                 "s3://bucket/warehouse/t/metadata/00043-def.metadata.json"
             )
             .is_none());
+    }
+
+    /// Writers racing on one key never leave a spliced or partial entry: every
+    /// read, during the race and after it, is a miss before the first write
+    /// lands and afterwards exactly one writer's complete list. The writers'
+    /// lists differ in length, so a writer whose bytes landed over a longer
+    /// one's would leave a tail that does not parse.
+    #[test]
+    fn writers_racing_on_one_key_never_leave_a_spliced_entry() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tmp_dir("race");
+        let loc = "s3://bucket/warehouse/t/metadata/00045-race.metadata.json";
+        let lists: Vec<Vec<String>> = (0..4)
+            .map(|w| {
+                (0..(w + 1) * 60)
+                    .map(|k| format!("s3://b/w{w}/file-{k:05}.parquet"))
+                    .collect()
+            })
+            .collect();
+        let entry = |paths: &[String]| {
+            CachedScanFiles::new(paths.iter().map(|p| data_file(p, 1)).collect(), false)
+        };
+        let paths_of = |sf: &CachedScanFiles| {
+            sf.data_files
+                .iter()
+                .map(|f| f.file_path.clone())
+                .collect::<Vec<_>>()
+        };
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let cache = DiskCatalogCache::for_dir(&dir);
+                let mut seen = false;
+                while !done.load(Ordering::Relaxed) {
+                    match cache.get_scan_files(&sh(), loc) {
+                        Some(sf) => {
+                            seen = true;
+                            assert!(lists.contains(&paths_of(&sf)), "a spliced entry");
+                        }
+                        None => assert!(!seen, "an entry vanished or was unreadable mid-race"),
+                    }
+                }
+            });
+            let writers: Vec<_> = lists
+                .iter()
+                .map(|paths| {
+                    let sf = entry(paths);
+                    let dir = &dir;
+                    scope.spawn(move || {
+                        let cache = DiskCatalogCache::for_dir(dir);
+                        for _ in 0..150 {
+                            cache.put_scan_files(&sh(), loc, &sf);
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+            reader.join().unwrap();
+        });
+        let last = DiskCatalogCache::for_dir(&dir)
+            .get_scan_files(&sh(), loc)
+            .expect("the final entry parses");
+        assert!(lists.contains(&paths_of(&last)));
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "every temp file was renamed into place");
     }
 
     /// Without a runtime the background write is synchronous; inside one it
