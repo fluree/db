@@ -2,8 +2,12 @@
 //!
 //! These utilities handle common tasks like IRI expansion and prefix mapping.
 
+use fluree_db_core::{GraphId, GraphPosition, LedgerSnapshot, TargetLedger, DEFAULT_GRAPH_ID};
+use fluree_db_query::ir::GraphReads;
+use fluree_db_query::parse::parse_query;
+use fluree_db_query::VarRegistry;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Extract prefix mappings from a JSON-LD @context.
 ///
@@ -138,6 +142,42 @@ pub fn expand_prefixed_iri(iri: &str, prefix_map: &HashMap<String, String>) -> O
     }
 
     None
+}
+
+/// The `t` of the latest drop of a graph an indexing `query` reads, against
+/// the `snapshot` it runs on: the default graph, each graph a `graph` pattern
+/// names, resolved as a query resolves it, and every graph when the query can
+/// read one no name lists, or does not parse. What a search index took from
+/// the ledger before that `t` may hold what the drop took.
+pub(crate) fn latest_drop_read(snapshot: &LedgerSnapshot, query: &JsonValue) -> Option<i64> {
+    let registry = &snapshot.graph_registry;
+    if !registry.has_drops() {
+        return None;
+    }
+    let mut vars = VarRegistry::new();
+    let read: Option<HashSet<GraphId>> = parse_query(query, snapshot, &mut vars, None)
+        .ok()
+        .map(|parsed| GraphReads::of(&parsed))
+        .filter(|reads| !reads.any)
+        .map(|reads| {
+            let target = TargetLedger::new(&snapshot.ledger_id, registry);
+            reads
+                .named
+                .iter()
+                .filter_map(|iri| match target.graph_position(iri) {
+                    GraphPosition::Registered { g_id, .. } => Some(g_id),
+                    GraphPosition::Default | GraphPosition::New(_) | GraphPosition::NotAGraph => {
+                        None
+                    }
+                })
+                .chain([DEFAULT_GRAPH_ID])
+                .collect()
+        });
+    registry
+        .graph_drops()
+        .filter(|(g_id, _)| read.as_ref().is_none_or(|read| read.contains(g_id)))
+        .map(|(_, drop)| drop.floor)
+        .max()
 }
 
 #[cfg(test)]
