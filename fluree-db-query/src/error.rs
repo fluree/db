@@ -320,6 +320,21 @@ impl QueryError {
         }
         Self::Internal(format!("{context}: {err}"))
     }
+
+    /// [`Self::from_io`] for an error that stays where it was recorded (a
+    /// shared slot every check reads), keeping the same typed variants.
+    pub fn from_io_ref(context: &str, err: &std::io::Error) -> Self {
+        if let Some(fe) = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<fluree_db_core::FuelExceededError>())
+        {
+            return Self::FuelLimitExceeded(fe.clone());
+        }
+        if let Some(nf) = fluree_db_core::storage::residency::NeedFetch::from_io_error(err) {
+            return Self::NeedFetch(nf.clone());
+        }
+        Self::Internal(format!("{context}: {err}"))
+    }
 }
 
 /// Result type for query operations

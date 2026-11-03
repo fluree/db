@@ -3430,6 +3430,30 @@ impl VectorIdentity {
     }
 }
 
+/// The first read failure met while building or comparing a hash-table key.
+/// `PartialEq` can't return an error, and counting the pair unequal (or
+/// keying a value by its arena handle) would answer wrong, so the failure is
+/// recorded here and the operator that owns the table fails the query on its
+/// next check. One slot per
+/// query: every view the query keys through carries it
+/// ([`BinaryGraphView::with_key_read_errors`]), and so does every key read
+/// from those views. The first error is kept as is, so a residency miss
+/// stays a typed `NeedFetch`.
+#[derive(Debug, Default)]
+pub struct KeyReadErrors(std::sync::OnceLock<io::Error>);
+
+impl KeyReadErrors {
+    /// Record `err`, unless an earlier failure is already recorded.
+    pub fn record(&self, err: io::Error) {
+        let _ = self.0.set(err);
+    }
+
+    /// The first failure recorded, if any.
+    pub fn first(&self) -> Option<&io::Error> {
+        self.0.get()
+    }
+}
+
 /// A stored vector as a key: the arena's identity (store, graph, predicate)
 /// and handle, its value hash, and how its value is reached ([`ArenaVectorForm`]).
 #[derive(Clone, Debug)]
@@ -3457,6 +3481,9 @@ pub enum ArenaVectorForm {
     Canonical {
         canonical: u32,
         pins: Arc<ShardPins>,
+        /// Where a comparison that can't return its read failure records
+        /// it: the query's slot, from the view that read the key.
+        read_errors: Arc<KeyReadErrors>,
     },
 }
 
@@ -3601,6 +3628,16 @@ impl ArenaVector {
             .components()?
             .is_some_and(|slice| fluree_db_core::value::vector_eq_f32_f64(slice.as_f32(), wide)))
     }
+
+    /// The query's read-failure slot this key records into: a key resolved
+    /// by the identity table carries one, since only it reads to compare. A
+    /// slice key holds its components and never fails a comparison.
+    pub fn read_errors(&self) -> Option<&KeyReadErrors> {
+        match &self.form {
+            ArenaVectorForm::Slice(_) => None,
+            ArenaVectorForm::Canonical { read_errors, .. } => Some(read_errors),
+        }
+    }
 }
 
 /// Graph-scoped view for V6 store. Binds a specific `g_id` for value decoding.
@@ -3630,6 +3667,10 @@ pub struct BinaryGraphView {
     /// The vector shard this view's keys read last, and that predicate's
     /// identity table if it was built. See [`Self::arena_vector`].
     vector_cursor: VectorCursor,
+    /// Where keys read from this view record a read failure they can't
+    /// return. Its own unless the query attaches its slot
+    /// ([`Self::with_key_read_errors`]).
+    key_read_errors: Arc<KeyReadErrors>,
 }
 
 /// Where a view's vector keys read: the shard read last, by
@@ -3705,6 +3746,7 @@ impl BinaryGraphView {
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
             vector_cursor: VectorCursor::default(),
+            key_read_errors: Arc::default(),
         }
     }
 
@@ -3728,7 +3770,21 @@ impl BinaryGraphView {
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
             vector_cursor: VectorCursor::default(),
+            key_read_errors: Arc::default(),
         }
+    }
+
+    /// Record the read failures of keys read from this view in `slot`, the
+    /// query's, so the operators that key through it can fail the query.
+    pub fn with_key_read_errors(mut self, slot: Arc<KeyReadErrors>) -> Self {
+        self.key_read_errors = slot;
+        self
+    }
+
+    /// Where keys read from this view record a read failure they can't
+    /// return; a caller that builds keys records its own failures here too.
+    pub fn key_read_errors(&self) -> &KeyReadErrors {
+        &self.key_read_errors
     }
 
     /// Attach a fuel tracker. When set, each forward-pack dict touch (a call
@@ -3990,7 +4046,11 @@ impl BinaryGraphView {
                 g_id: self.g_id,
                 p_id,
                 handle,
-                form: ArenaVectorForm::Canonical { canonical, pins },
+                form: ArenaVectorForm::Canonical {
+                    canonical,
+                    pins,
+                    read_errors: Arc::clone(&self.key_read_errors),
+                },
             }));
         }
         let Some(arena) = self

@@ -718,10 +718,11 @@ pub(crate) fn normalize_for_key_cow<'a>(
     // canonical key for one value across predicates or against decoded rows
     // (VALUES, BIND, novelty raw-merge). The vector arena does not
     // deduplicate either, so one vector stored twice under one predicate has
-    // two handles. The decoded value compares and hashes by value.
+    // two handles. The decoded value compares and hashes by value; a failed
+    // read fails the query rather than key by handle.
     if is_arena_encoded(binding) {
         if let Some(gv) = gv {
-            let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
+            let materialized = crate::group_aggregate::materialize_arena_key(binding, gv);
             if !matches!(materialized, Binding::EncodedLit { .. }) {
                 return Cow::Owned(materialized);
             }
@@ -777,10 +778,12 @@ pub(crate) fn same_term(
                 || crate::group_aggregate::is_vector_binding(b)
             {
                 use crate::group_aggregate::VectorKey;
-                return match (VectorKey::of_binding(a, gv), VectorKey::of_binding(b, gv)) {
-                    (Some(x), Some(y)) => x
-                        .same_value(&y)
-                        .map_err(|err| crate::error::QueryError::from_io("vector comparison", err)),
+                let read = |err| crate::error::QueryError::from_io("vector comparison", err);
+                return match (
+                    VectorKey::of_binding(a, gv).map_err(read)?,
+                    VectorKey::of_binding(b, gv).map_err(read)?,
+                ) {
+                    (Some(x), Some(y)) => x.same_value(&y).map_err(read),
                     _ => Ok(false),
                 };
             }

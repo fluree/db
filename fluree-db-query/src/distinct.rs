@@ -296,6 +296,10 @@ impl Operator for DistinctOperator {
                 }
             }
 
+            // A key comparison that failed to read counted its pair as
+            // distinct; fail rather than emit on it.
+            ctx.check_key_reads()?;
+
             if columns.first().map(std::vec::Vec::is_empty).unwrap_or(true) {
                 // All rows were duplicates, try next batch
                 continue;

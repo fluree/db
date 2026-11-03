@@ -169,9 +169,29 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
     let Some(gv) = gv else {
         return binding.clone();
     };
+    try_materialize_encoded(binding, gv).unwrap_or_else(|_| binding.clone())
+}
+
+/// [`materialize_encoded`] for an arena literal (a big number or a vector)
+/// that a caller is keying. Its handle names a value only within one
+/// predicate's arena, so keying it by handle after a failed read would split
+/// equal values. The failure is recorded in the view's slot instead, which
+/// fails the query ([`crate::context::ExecutionContext::check_key_reads`]);
+/// the binding comes back as is, keyed by handle only until then.
+pub(crate) fn materialize_arena_key(binding: &Binding, gv: &BinaryGraphView) -> Binding {
+    try_materialize_encoded(binding, gv).unwrap_or_else(|err| {
+        gv.key_read_errors().record(err);
+        binding.clone()
+    })
+}
+
+/// [`materialize_encoded`], with a failed literal read returned. A subject
+/// or predicate id that doesn't resolve comes back as is: its id is a
+/// canonical key on its own.
+fn try_materialize_encoded(binding: &Binding, gv: &BinaryGraphView) -> std::io::Result<Binding> {
     let store = gv.store();
 
-    match binding {
+    Ok(match binding {
         Binding::EncodedLit {
             o_kind,
             o_key,
@@ -202,7 +222,7 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
                         p_id: Some(*p_id),
                     }
                 }
-                Err(_) => binding.clone(),
+                Err(err) => return Err(err),
             }
         }
         Binding::EncodedSid { s_id, .. } => match gv.resolve_subject_sid(*s_id) {
@@ -214,7 +234,7 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
             None => binding.clone(),
         },
         _ => binding.clone(),
-    }
+    })
 }
 
 impl AggState {
@@ -471,9 +491,12 @@ impl VectorKey {
     }
 
     /// The key of an encoded vector, read from its arena without decoding.
-    /// `None` for any other binding, or a handle the arena doesn't hold
-    /// (which the caller decodes instead).
-    pub(crate) fn of_encoded(binding: &Binding, gv: &BinaryGraphView) -> Option<Self> {
+    /// `Ok(None)` for any other binding, or a handle the arena doesn't hold
+    /// (which the caller decodes instead); an error if the arena read fails.
+    pub(crate) fn try_of_encoded(
+        binding: &Binding,
+        gv: &BinaryGraphView,
+    ) -> std::io::Result<Option<Self>> {
         let Binding::EncodedLit {
             o_kind,
             o_key,
@@ -481,42 +504,48 @@ impl VectorKey {
             ..
         } = binding
         else {
-            return None;
+            return Ok(None);
         };
         if *o_kind != fluree_db_core::ObjKind::VECTOR_ID.as_u8() {
-            return None;
+            return Ok(None);
         }
-        let arena = gv.arena_vector(*p_id, *o_key as u32).ok()??;
-        Some(Self {
+        Ok(gv.arena_vector(*p_id, *o_key as u32)?.map(|arena| Self {
             hash: arena.hash,
             repr: VectorRepr::Arena(arena),
-        })
+        }))
     }
 
     /// The key of any vector binding: encoded through its arena (decoding it
     /// only if the arena doesn't hold the handle), decoded by its
-    /// components. `None` for a binding that isn't a vector.
-    pub(crate) fn of_binding(binding: &Binding, gv: Option<&BinaryGraphView>) -> Option<Self> {
+    /// components. `Ok(None)` for a binding that isn't a vector; an error if
+    /// the arena read fails.
+    pub(crate) fn of_binding(
+        binding: &Binding,
+        gv: Option<&BinaryGraphView>,
+    ) -> std::io::Result<Option<Self>> {
         match binding {
             Binding::Lit {
                 val: FlakeValue::Vector(v),
                 ..
-            } => Some(Self::decoded(v)),
+            } => Ok(Some(Self::decoded(v))),
             Binding::EncodedLit { o_kind, .. }
                 if *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8() =>
             {
-                let gv = gv?;
-                Self::of_encoded(binding, gv).or_else(|| {
-                    match materialize_encoded(binding, Some(gv)) {
-                        Binding::Lit {
-                            val: FlakeValue::Vector(v),
-                            ..
-                        } => Some(Self::decoded(&v)),
-                        _ => None,
-                    }
+                let Some(gv) = gv else {
+                    return Ok(None);
+                };
+                if let Some(key) = Self::try_of_encoded(binding, gv)? {
+                    return Ok(Some(key));
+                }
+                Ok(match materialize_encoded(binding, Some(gv)) {
+                    Binding::Lit {
+                        val: FlakeValue::Vector(v),
+                        ..
+                    } => Some(Self::decoded(&v)),
+                    _ => None,
                 })
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 }
@@ -554,14 +583,24 @@ impl VectorKey {
     }
 }
 
-/// A failed arena read reads as unequal: like a key whose arena read fails
-/// (which keys by handle, see [`VectorKey::of_binding`]), it can only fail to
-/// merge equal vectors, never merge distinct ones. Only a comparison that
-/// needs components a key doesn't hold reads, on a hash match.
+/// Equality for a hash table, which can't return an error. Only a
+/// comparison that needs components a key doesn't hold reads, on a hash
+/// match, and only a key the identity table resolved holds none. A failed
+/// read is recorded in that key's slot, the query's, and the operator that
+/// owns the table fails the query on its next check
+/// ([`crate::context::ExecutionContext::checkpoint`]): the pair reads as
+/// unequal only until then, and no row built on it is returned.
 impl PartialEq for VectorKey {
     fn eq(&self, other: &Self) -> bool {
         self.same_value(other).unwrap_or_else(|err| {
-            tracing::warn!(%err, "vector key comparison could not read its arena");
+            let slot = [self, other].into_iter().find_map(|key| match &key.repr {
+                VectorRepr::Arena(arena) => arena.read_errors(),
+                VectorRepr::Decoded(_) => None,
+            });
+            debug_assert!(slot.is_some(), "a key that holds no components read none");
+            if let Some(slot) = slot {
+                slot.record(err);
+            }
             false
         })
     }
@@ -644,13 +683,23 @@ pub(crate) fn binding_to_group_key_normalized(
     }
     if crate::object_binding::is_arena_encoded(binding) {
         if let Some(gv) = gv {
-            // A stored vector keys by a slice of its arena, undecoded.
-            if let (Some(key), Binding::EncodedLit { dt_id, .. }) =
-                (VectorKey::of_encoded(binding, gv), binding)
-            {
-                return GroupKeyOwned::MaterializedVector(key, vector_dtc(gv, *dt_id));
+            // A stored vector keys by its arena entry, undecoded. A failed
+            // read is recorded in the view's slot, which fails the query
+            // (`ExecutionContext::check_key_reads`); the handle keys it only
+            // until then.
+            match VectorKey::try_of_encoded(binding, gv) {
+                Ok(Some(key)) => {
+                    if let Binding::EncodedLit { dt_id, .. } = binding {
+                        return GroupKeyOwned::MaterializedVector(key, vector_dtc(gv, *dt_id));
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    gv.key_read_errors().record(err);
+                    return binding_to_group_key_owned(binding);
+                }
             }
-            let materialized = materialize_encoded(binding, Some(gv));
+            let materialized = materialize_arena_key(binding, gv);
             if !matches!(materialized, Binding::EncodedLit { .. }) {
                 return binding_to_group_key_owned(&materialized);
             }
@@ -1516,6 +1565,9 @@ impl Operator for GroupAggregateOperator {
             }
             .instrument(span)
             .await?;
+            // A key comparison that failed to read split one group in two:
+            // the groups are not an answer.
+            ctx.check_key_reads()?;
         }
 
         // Emit batches from accumulated groups
@@ -1663,6 +1715,7 @@ mod tests {
             ),
             None,
         )
+        .unwrap()
         .unwrap();
         for other in [&novelty, &values] {
             assert_eq!(&stored, other);

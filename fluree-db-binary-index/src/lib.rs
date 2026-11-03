@@ -23,8 +23,8 @@ pub use read::batched_lookup::{
 };
 pub use read::binary_cursor::BinaryCursor;
 pub use read::binary_index_store::{
-    ArenaVector, ArenaVectorForm, BinaryGraphView, BinaryIndexStore, ListCensus, RemoteLeafFetch,
-    ShardPins, SharedLeafBytes, VectorIdentity,
+    ArenaVector, ArenaVectorForm, BinaryGraphView, BinaryIndexStore, KeyReadErrors, ListCensus,
+    RemoteLeafFetch, ShardPins, SharedLeafBytes, VectorIdentity,
 };
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 pub use read::graph_names::HeadGraphNames;
