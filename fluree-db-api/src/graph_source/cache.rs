@@ -31,19 +31,93 @@ use fluree_db_sql::TrinoClient;
 #[cfg(feature = "iceberg")]
 use std::time::Duration;
 
+/// One snapshot's complete live data-file list, in plan order, as the scan
+/// planner read it from the manifests. Every scan of the snapshot, filtered or
+/// not, plans from it (`SendScanPlanner::plan_from_files`).
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone)]
 pub(crate) struct CachedScanFiles {
     pub data_files: Arc<Vec<DataFile>>,
-    pub estimated_row_count: i64,
-    pub files_selected: usize,
-    pub files_pruned: usize,
     /// Whether the source snapshot carried merge-on-read delete files. Only ever
     /// `true` when the fail-closed guard was overridden at plan time; carried on
-    /// the cache entry so a scan-files cache HIT (in-memory or disk) can re-refuse
-    /// if the override is later turned off, instead of silently serving a
+    /// the cache entry so a plan from it (in-memory or disk hit) re-refuses if
+    /// the override is later turned off, instead of silently serving a
     /// delete-bearing file list (audit F-AUD-1, cache-arm follow-up).
     pub has_delete_manifests: bool,
+    /// The sum of the files' record counts, computed once: an unfiltered
+    /// plan's estimate, so a warm scan does not re-sum it.
+    record_count: i64,
+    /// The entry's weight in the in-memory scan-files cache: the list's
+    /// approximate size in KiB (at least 1), computed once.
+    weight_kib: u32,
+}
+
+#[cfg(feature = "iceberg")]
+impl CachedScanFiles {
+    pub(crate) fn new(data_files: Vec<DataFile>, has_delete_manifests: bool) -> Self {
+        let (mut bytes, mut record_count) = (0usize, 0i64);
+        for file in &data_files {
+            bytes += file.approx_size_bytes();
+            record_count += file.record_count;
+        }
+        let weight_kib = u32::try_from(bytes.div_ceil(1024))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        Self {
+            data_files: Arc::new(data_files),
+            has_delete_manifests,
+            record_count,
+            weight_kib,
+        }
+    }
+
+    /// The list as the planner plans from it.
+    pub(crate) fn kept(&self) -> fluree_db_iceberg::scan::KeptFiles<'_> {
+        fluree_db_iceberg::scan::KeptFiles {
+            files: &self.data_files,
+            record_count: self.record_count,
+            has_delete_manifests: self.has_delete_manifests,
+        }
+    }
+
+    /// The sum of the files' record counts.
+    pub(crate) fn record_count(&self) -> i64 {
+        self.record_count
+    }
+
+    /// Approximate size of the file list in KiB (see [`DataFile::approx_size_bytes`]).
+    pub(crate) fn weight_kib(&self) -> u32 {
+        self.weight_kib
+    }
+}
+
+/// Default in-memory budget for the scan-files cache, in MiB.
+///
+/// The cache holds whole file lists, and a list's size is its file count
+/// times a few KiB of statistics per file, so it is bounded by bytes rather
+/// than entries: 128 entries of a 100,000-file table would be gigabytes, and
+/// 128 entries of 10-file tables a few megabytes. Override with
+/// `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB`.
+#[cfg(feature = "iceberg")]
+const DEFAULT_SCAN_FILES_CACHE_MB: u64 = 512;
+
+/// The scan-files cache: whole file lists weighed by their size in KiB
+/// against `budget_kib`.
+#[cfg(feature = "iceberg")]
+fn scan_files_cache(budget_kib: u64) -> SyncCache<String, Arc<CachedScanFiles>> {
+    SyncCache::builder()
+        .max_capacity(budget_kib)
+        .weigher(|_key: &String, files: &Arc<CachedScanFiles>| files.weight_kib())
+        .build()
+}
+
+#[cfg(feature = "iceberg")]
+fn scan_files_cache_budget_kib() -> u64 {
+    std::env::var("FLUREE_ICEBERG_SCAN_FILES_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCAN_FILES_CACHE_MB)
+        .saturating_mul(1024)
 }
 
 #[cfg(feature = "iceberg")]
@@ -118,7 +192,10 @@ pub struct R2rmlCache {
     #[cfg(feature = "iceberg")]
     table_metadata: SyncCache<String, Arc<TableMetadata>>,
 
-    /// Cache for manifest-derived file selections keyed by metadata location.
+    /// Each snapshot's live data-file list, keyed by metadata location (plus
+    /// `#snapshot=<id>` for a pinned read) qualified by the storage scope,
+    /// and weighed by approximate size in KiB against a byte budget
+    /// (`FLUREE_ICEBERG_SCAN_FILES_CACHE_MB`, default 512).
     #[cfg(feature = "iceberg")]
     scan_files: SyncCache<String, Arc<CachedScanFiles>>,
 
@@ -197,6 +274,9 @@ impl R2rmlCache {
     ///
     /// * `mapping_capacity` - Max compiled mappings to cache (default: 64)
     /// * `metadata_capacity` - Max table metadata entries to cache (default: 128)
+    ///
+    /// The scan-files cache is bounded by bytes instead (see
+    /// `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB`, default 512 MiB).
     pub fn new(mapping_capacity: usize, metadata_capacity: usize) -> Self {
         let mapping_cap = mapping_capacity.max(1) as u64;
         let metadata_cap = metadata_capacity.max(1) as u64;
@@ -206,7 +286,7 @@ impl R2rmlCache {
             Self {
                 compiled_mappings: SyncCache::new(mapping_cap),
                 table_metadata: SyncCache::new(metadata_cap),
-                scan_files: SyncCache::new(metadata_cap),
+                scan_files: scan_files_cache(scan_files_cache_budget_kib()),
                 manifest_list_totals: SyncCache::new(MANIFEST_LIST_TOTALS_CAPACITY),
                 parquet_footers: Arc::new(ParquetFooterCache::new(
                     (metadata_capacity.max(1) / 2).max(32),
@@ -253,6 +333,14 @@ impl R2rmlCache {
     /// Create a cache with default capacities.
     pub fn with_defaults() -> Self {
         Self::new(64, 128)
+    }
+
+    /// This cache with a scan-files budget of `budget_kib` instead of the
+    /// configured one (tests: the env var is read once per process).
+    #[cfg(all(test, feature = "iceberg"))]
+    pub(crate) fn with_scan_files_budget_kib(mut self, budget_kib: u64) -> Self {
+        self.scan_files = scan_files_cache(budget_kib);
+        self
     }
 
     /// Get a compiled mapping from cache.
@@ -302,17 +390,36 @@ impl R2rmlCache {
             .get(scope.qualify(metadata_location).as_ref())
     }
 
-    /// Store manifest-derived scan file selections for a metadata location, as
-    /// read under `scope`.
+    /// Keep a snapshot's file list in memory, as read under `scope`. Returns
+    /// whether it was kept.
+    ///
+    /// A list heavier than the cache's whole budget is not kept. moka would
+    /// accept the insert and then evict the entry at its next maintenance
+    /// pass, so for a moment it would be served and then silently vanish;
+    /// checking first makes the outcome deterministic. Such a list is still
+    /// written to the disk catalog cache by the caller, so a later scan reads
+    /// it from disk rather than from the manifests.
     #[cfg(feature = "iceberg")]
     pub(crate) async fn put_scan_files(
         &self,
         scope: &StorageScope,
         metadata_location: &str,
         scan_files: Arc<CachedScanFiles>,
-    ) {
+    ) -> bool {
+        let budget_kib = self.scan_files.policy().max_capacity().unwrap_or(0);
+        if u64::from(scan_files.weight_kib()) > budget_kib {
+            tracing::debug!(
+                metadata_location,
+                files = scan_files.data_files.len(),
+                weight_kib = scan_files.weight_kib(),
+                budget_kib,
+                "Iceberg scan-files list exceeds the in-memory cache budget; not cached in memory"
+            );
+            return false;
+        }
         self.scan_files
             .insert(scope.qualify(metadata_location).into_owned(), scan_files);
+        true
     }
 
     /// Get the totals read from the manifest list at `manifest_list_location`,
@@ -583,6 +690,81 @@ mod iceberg_tests {
     use crate::graph_source::catalog_session::CachedLoadTable;
     use chrono::{Duration, Utc};
     use fluree_db_iceberg::credential::VendedCredentials;
+
+    /// `n` files carrying bounds and counts for 20 columns (~3.5 KiB each).
+    fn file_list(n: usize) -> Vec<DataFile> {
+        let counts: std::collections::HashMap<i32, i64> = (1..=20).map(|id| (id, 100)).collect();
+        let bounds: std::collections::HashMap<i32, Vec<u8>> =
+            (1..=20).map(|id| (id, vec![0u8; 8])).collect();
+        (0..n)
+            .map(|i| DataFile {
+                file_path: format!("s3://b/t/data/{i:05}.parquet"),
+                file_format: fluree_db_iceberg::manifest::FileFormat::Parquet,
+                record_count: 100,
+                file_size_in_bytes: 1024,
+                partition: fluree_db_iceberg::manifest::PartitionData::default(),
+                column_sizes: None,
+                value_counts: Some(counts.clone()),
+                null_value_counts: Some(counts.clone()),
+                nan_value_counts: None,
+                lower_bounds: Some(bounds.clone()),
+                upper_bounds: Some(bounds.clone()),
+                split_offsets: None,
+                sort_order_id: None,
+            })
+            .collect()
+    }
+
+    /// The cache is weighed by the lists' size: two 10-file lists (~35 KiB
+    /// each) fit a 100 KiB budget; a 40-file list (~140 KiB) is heavier than
+    /// the whole budget and is refused outright, leaving the others in place.
+    #[tokio::test]
+    async fn scan_files_are_weighed_by_size_and_an_oversized_list_is_not_kept() {
+        let cache = R2rmlCache::with_defaults().with_scan_files_budget_kib(100);
+        let scope = StorageScope::shared();
+        let small = |n| Arc::new(CachedScanFiles::new(file_list(n), false));
+        let (a, b, big) = (small(10), small(10), small(40));
+        assert!((30..=40).contains(&a.weight_kib()), "{}", a.weight_kib());
+        assert!(big.weight_kib() > 100, "{}", big.weight_kib());
+
+        assert!(cache.put_scan_files(&scope, "s3://b/a.json", a).await);
+        assert!(cache.put_scan_files(&scope, "s3://b/b.json", b).await);
+        assert!(
+            !cache.put_scan_files(&scope, "s3://b/big.json", big).await,
+            "a list heavier than the whole budget is not kept"
+        );
+        cache.scan_files.run_pending_tasks();
+        assert!(cache
+            .get_scan_files(&scope, "s3://b/big.json")
+            .await
+            .is_none());
+        assert!(cache
+            .get_scan_files(&scope, "s3://b/a.json")
+            .await
+            .is_some());
+        assert!(cache
+            .get_scan_files(&scope, "s3://b/b.json")
+            .await
+            .is_some());
+        assert!(cache.scan_files.weighted_size() <= 100);
+    }
+
+    /// Why `put_scan_files` checks the weight first: moka accepts an entry
+    /// heavier than its whole capacity and drops it at the next maintenance
+    /// pass, without a trace. (Pins the dependency's behavior: if moka ever
+    /// keeps such an entry instead, the cache would overrun its budget.)
+    #[test]
+    fn moka_silently_drops_an_entry_heavier_than_its_capacity() {
+        let cache: moka::sync::Cache<&str, u32> = moka::sync::Cache::builder()
+            .max_capacity(100)
+            .weigher(|_k: &&str, v: &u32| *v)
+            .build();
+        cache.insert("fits", 10);
+        cache.insert("too-heavy", 101);
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"too-heavy"), None);
+        assert_eq!(cache.get(&"fits"), Some(10));
+    }
 
     fn creds(expires_in_secs: i64) -> VendedCredentials {
         VendedCredentials::S3(fluree_db_iceberg::credential::S3Credentials {

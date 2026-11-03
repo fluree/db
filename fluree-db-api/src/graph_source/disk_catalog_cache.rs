@@ -137,6 +137,11 @@ fn prune_dir(dir: &Path) {
 
 /// On-disk form of [`CachedScanFiles`] — a plain `Vec` (serde's `rc` feature is
 /// off, so `Arc` can't derive `Serialize`; the loader re-wraps in `Arc`).
+///
+/// `estimated_row_count`, `files_selected` and `files_pruned` describe the
+/// unfiltered list (its row total, its length, 0). Scans recompute their own
+/// counters from the list, so they are written for the format's sake and not
+/// read back.
 #[derive(Serialize, Deserialize)]
 struct PersistedScanFiles {
     data_files: Vec<DataFile>,
@@ -148,6 +153,17 @@ struct PersistedScanFiles {
     /// `CACHE_FORMAT_VERSION` 3; a v2 entry (pre-guard) lacks it and is a clean
     /// miss under the version check, so it is recomputed through the guard rather
     /// than served silently (audit F-AUD-1, cache-arm follow-up).
+    has_delete_manifests: bool,
+}
+
+/// [`PersistedScanFiles`] as written: the same fields, serialized from a
+/// borrowed list rather than a copy of it.
+#[derive(Serialize)]
+struct PersistedScanFilesRef<'a> {
+    data_files: &'a [DataFile],
+    estimated_row_count: i64,
+    files_selected: usize,
+    files_pruned: usize,
     has_delete_manifests: bool,
 }
 
@@ -419,13 +435,10 @@ impl DiskCatalogCache {
             return None;
         }
         let p: PersistedScanFiles = self.read(scope, metadata_location, "scanfiles")?;
-        Some(Arc::new(CachedScanFiles {
-            data_files: Arc::new(p.data_files),
-            estimated_row_count: p.estimated_row_count,
-            files_selected: p.files_selected,
-            files_pruned: p.files_pruned,
-            has_delete_manifests: p.has_delete_manifests,
-        }))
+        Some(Arc::new(CachedScanFiles::new(
+            p.data_files,
+            p.has_delete_manifests,
+        )))
     }
 
     pub(crate) fn put_scan_files(
@@ -437,14 +450,40 @@ impl DiskCatalogCache {
         if !self.enabled {
             return;
         }
-        let p = PersistedScanFiles {
-            data_files: (*sf.data_files).clone(),
-            estimated_row_count: sf.estimated_row_count,
-            files_selected: sf.files_selected,
-            files_pruned: sf.files_pruned,
+        let p = PersistedScanFilesRef {
+            data_files: &sf.data_files,
+            estimated_row_count: sf.record_count(),
+            files_selected: sf.data_files.len(),
+            files_pruned: 0,
             has_delete_manifests: sf.has_delete_manifests,
         };
         self.write(scope, metadata_location, "scanfiles", &p);
+    }
+
+    /// [`Self::put_scan_files`] on a blocking thread, off the caller's path:
+    /// a list of thousands of files is megabytes of JSON, and the first scan of
+    /// a snapshot should not wait for it. Without a tokio runtime it writes
+    /// before returning. The entry may land after the caller returns; a reader
+    /// that looks before then misses and reads the manifests, as it would have
+    /// with no entry. (A runtime dropped normally waits for running blocking
+    /// tasks, so a process that returns from `main` still writes it.)
+    pub(crate) fn put_scan_files_in_background(
+        self,
+        scope: StorageScope,
+        metadata_location: String,
+        sf: Arc<CachedScanFiles>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || {
+                    self.put_scan_files(&scope, &metadata_location, &sf);
+                });
+            }
+            Err(_) => self.put_scan_files(&scope, &metadata_location, &sf),
+        }
     }
 
     pub(crate) fn get_count_stats(
@@ -538,10 +577,14 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("fluree-catcache-test-{tag}-{}", std::process::id()));
+        let d = tmp_dir_path(tag);
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    /// [`tmp_dir`]'s path, without clearing it.
+    fn tmp_dir_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("fluree-catcache-test-{tag}-{}", std::process::id()))
     }
 
     fn data_file(path: &str, rows: i64) -> DataFile {
@@ -617,24 +660,36 @@ mod tests {
             cache.get_scan_files(&sh(), loc).is_none(),
             "empty is a miss"
         );
-        let sf = CachedScanFiles {
-            data_files: Arc::new(vec![
+        let sf = CachedScanFiles::new(
+            vec![
                 data_file("s3://b/f1.parquet", 23),
                 data_file("s3://b/f2.parquet", 7),
-            ]),
-            estimated_row_count: 30,
-            files_selected: 2,
-            files_pruned: 5,
-            has_delete_manifests: false,
-        };
+            ],
+            false,
+        );
         cache.put_scan_files(&sh(), loc, &sf);
         let got = cache.get_scan_files(&sh(), loc).expect("hit after put");
-        assert_eq!(got.data_files.len(), 2);
-        assert_eq!(got.estimated_row_count, 30);
-        assert_eq!(got.files_selected, 2);
-        assert_eq!(got.files_pruned, 5);
+        let paths: Vec<_> = got
+            .data_files
+            .iter()
+            .map(|f| f.file_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["s3://b/f1.parquet", "s3://b/f2.parquet"],
+            "order kept"
+        );
         assert_eq!(got.data_files[0].record_count, 23);
         assert!(!got.has_delete_manifests, "delete flag round-trips");
+        assert_eq!(got.weight_kib(), sf.weight_kib(), "weight is recomputed");
+        // The format-v3 counters are written as the unfiltered list's, so an
+        // entry stays what an older reader of this version expects.
+        let dir_entry = only_entry(&tmp_dir_path("scanfiles"));
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir_entry).unwrap()).unwrap();
+        assert_eq!(v["payload"]["estimated_row_count"], 30);
+        assert_eq!(v["payload"]["files_selected"], 2);
+        assert_eq!(v["payload"]["files_pruned"], 0);
         // A different (content-addressed) location is a clean miss.
         assert!(cache
             .get_scan_files(
@@ -642,6 +697,47 @@ mod tests {
                 "s3://bucket/warehouse/t/metadata/00043-def.metadata.json"
             )
             .is_none());
+    }
+
+    /// Without a runtime the background write is synchronous; inside one it
+    /// lands shortly after, off the caller's thread.
+    #[test]
+    fn scan_files_written_in_background_land_on_disk() {
+        let loc = "s3://bucket/warehouse/t/metadata/00044-bg.metadata.json";
+        let sf = || {
+            Arc::new(CachedScanFiles::new(
+                vec![data_file("s3://b/f.parquet", 9)],
+                false,
+            ))
+        };
+
+        let sync_dir = tmp_dir("bgsync");
+        DiskCatalogCache::for_dir(&sync_dir).put_scan_files_in_background(
+            sh(),
+            loc.to_string(),
+            sf(),
+        );
+        let got = DiskCatalogCache::for_dir(&sync_dir).get_scan_files(&sh(), loc);
+        assert_eq!(got.expect("written before returning").data_files.len(), 1);
+
+        let rt_dir = tmp_dir("bgruntime");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            DiskCatalogCache::for_dir(&rt_dir).put_scan_files_in_background(
+                sh(),
+                loc.to_string(),
+                sf(),
+            );
+        });
+        // Dropping the runtime waits for the blocking write.
+        drop(runtime);
+        let got = DiskCatalogCache::for_dir(&rt_dir).get_scan_files(&sh(), loc);
+        assert_eq!(
+            got.expect("written by the blocking task").data_files.len(),
+            1
+        );
     }
 
     #[test]
@@ -864,13 +960,7 @@ mod tests {
         let dir = tmp_dir("v2scanfiles");
         let cache = DiskCatalogCache::for_dir(&dir);
         let loc = "s3://b/warehouse/t/metadata/00007-mor.metadata.json";
-        let sf = CachedScanFiles {
-            data_files: Arc::new(vec![data_file("s3://b/live.parquet", 500)]),
-            estimated_row_count: 500,
-            files_selected: 1,
-            files_pruned: 0,
-            has_delete_manifests: true,
-        };
+        let sf = CachedScanFiles::new(vec![data_file("s3://b/live.parquet", 500)], true);
         cache.put_scan_files(&sh(), loc, &sf);
         // Downgrade the on-disk envelope to the pre-guard version, payload intact.
         let path = only_entry(&dir);
@@ -930,13 +1020,7 @@ mod tests {
         let bob = StorageScope::of(&[("kind", "google"), ("principal", "bob@p.iam")]);
 
         cache.put_count_stats(&alice, loc, &[data_file("gs://lake/f.parquet", 7)], false);
-        let sf = CachedScanFiles {
-            data_files: Arc::new(vec![data_file("gs://lake/f.parquet", 7)]),
-            estimated_row_count: 7,
-            files_selected: 1,
-            files_pruned: 0,
-            has_delete_manifests: false,
-        };
+        let sf = CachedScanFiles::new(vec![data_file("gs://lake/f.parquet", 7)], false);
         cache.put_scan_files(&alice, loc, &sf);
 
         assert!(cache.get_count_stats(&alice, loc).is_some());

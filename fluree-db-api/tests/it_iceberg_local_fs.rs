@@ -55,6 +55,9 @@
 use fluree_db_api::{ApiError, FlureeBuilder, FlureeR2rmlProvider, R2rmlCreateConfig};
 use futures::TryStreamExt;
 
+#[path = "support/span_capture.rs"]
+mod span_capture;
+
 const PEOPLE_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
@@ -2729,6 +2732,275 @@ async fn a_minus_keeps_the_scans_written_above_it() {
         "rows differ from ARQ/Oxigraph:\n{}",
         wrong.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Scan planning from the snapshot's kept file list. `people_window` is five
+// appends of 600 rows with disjoint ids (1..=600, 601..=1200, ...), one data
+// file each, so an id range selects whole files.
+// ---------------------------------------------------------------------------
+
+const WINDOW_IDS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#WindowIds>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] .
+"#;
+
+/// A private copy of `people_window` (so deleting its manifests touches no
+/// other test, and its cache keys are its own) behind a graph source `alias`.
+async fn staged_window(alias: &str) -> (fluree_db_api::Fluree, tempfile::TempDir) {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_window");
+    copy_dir_all(&fixtures_dir().join("silver/people_window"), &table_dir);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        alias,
+        format!("file://{}", table_dir.display()),
+        WINDOW_IDS_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create window graph source");
+    (fluree, staging)
+}
+
+/// Delete the staged table's data manifests (the manifest lists stay), so any
+/// later scan that reads a manifest fails.
+fn delete_data_manifests(staging: &tempfile::TempDir) -> usize {
+    let metadata = staging.path().join("people_window/metadata");
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(&metadata).expect("metadata dir") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with(".avro") && !name.starts_with("snap-") {
+            std::fs::remove_file(&path).expect("delete a data manifest");
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
+/// The ids (sorted) a SPARQL query over `from` returns, with `filter` as the
+/// body of a `FILTER(...)` over `?id` (none when empty).
+async fn sparql_window_ids(fluree: &fluree_db_api::Fluree, from: &str, filter: &str) -> Vec<i64> {
+    let filter = if filter.is_empty() {
+        String::new()
+    } else {
+        format!("FILTER({filter})")
+    };
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> SELECT ?id FROM <{from}> WHERE {{ ?s ex:id ?id {filter} }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut ids: Vec<i64> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| b["id"]["value"].as_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The JSON-LD twin of [`sparql_window_ids`]; `filter` is a JSON-LD filter
+/// expression over `?id`.
+async fn jsonld_window_ids(fluree: &fluree_db_api::Fluree, from: &str, filter: &str) -> Vec<i64> {
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?id"],
+        "where": [{"@id": "?s", "ex:id": "?id"}, ["filter", filter]],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut ids: Vec<i64> = result
+        .as_array()
+        .unwrap_or_else(|| panic!("rows for {query}: {result}"))
+        .iter()
+        .map(|row| {
+            let v = if row.is_array() { &row[0] } else { row };
+            v.as_i64().unwrap_or_else(|| panic!("an id in {result}"))
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn id_range(lo: i64, hi: i64) -> Vec<i64> {
+    (lo..=hi).collect()
+}
+
+/// Once a snapshot's file list is kept, a filtered scan plans from it and
+/// reads no manifest: the data manifests are deleted after the first
+/// (unfiltered) scan, and filtered scans on both surfaces still answer
+/// exactly. Before, a filtered scan re-read every manifest on every query.
+#[tokio::test]
+async fn a_filtered_scan_reads_no_manifest_once_the_file_list_is_kept() {
+    let (fluree, staging) = staged_window("kept-list").await;
+    let from = "kept-list:main";
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+    assert_eq!(
+        delete_data_manifests(&staging),
+        5,
+        "one manifest per append"
+    );
+
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id >= 700 && ?id < 1300").await,
+        id_range(700, 1299)
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id IN (5, 2500, 9999)").await,
+        vec![5, 2500]
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id > 2995").await,
+        id_range(2996, 3000)
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(and (>= ?id 700) (< ?id 1300))").await,
+        id_range(700, 1299)
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(= ?id 2500)").await,
+        vec![2500]
+    );
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+}
+
+/// A filtered first scan keeps the WHOLE file list, not its filtered
+/// selection: after it, with the manifests gone, a different filter and an
+/// unfiltered scan both answer from the kept list.
+#[tokio::test]
+async fn a_filtered_first_scan_keeps_the_whole_file_list() {
+    let (fluree, staging) = staged_window("first-filtered").await;
+    let from = "first-filtered:main";
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id >= 2950").await,
+        id_range(2950, 3000)
+    );
+    assert_eq!(delete_data_manifests(&staging), 5);
+
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id < 3").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(< ?id 3)").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "").await,
+        id_range(1, 3000)
+    );
+}
+
+/// Every scan records its file selection on `iceberg.scan_plan`, a scan
+/// planned from the kept list included: a warm unfiltered scan reports all
+/// five files (it used to record nothing), and a warm filtered one the files
+/// its filter kept and pruned.
+#[tokio::test(flavor = "current_thread")]
+async fn a_scan_from_the_kept_list_records_its_file_counts() {
+    let (fluree, _staging) = staged_window("kept-counts").await;
+    let from = "kept-counts:main";
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    let counts = |seen: usize| {
+        store.find_spans("iceberg.scan_plan")[seen..]
+            .iter()
+            .map(|s| {
+                (
+                    s.fields.get("files_selected").cloned().unwrap_or_default(),
+                    s.fields.get("files_pruned").cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let pair = |selected: &str, pruned: &str| vec![(selected.to_string(), pruned.to_string())];
+
+    // The first scan reads the manifests and keeps the list.
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+    assert_eq!(counts(0), pair("5", "0"));
+
+    for (filter, want, (selected, pruned)) in [
+        ("", 3000, ("5", "0")),
+        ("?id >= 700 && ?id < 1300", 600, ("2", "3")),
+        ("?id IN (5, 2500)", 2, ("2", "3")),
+        ("?id > 99999", 0, ("0", "5")),
+    ] {
+        let seen = store.find_spans("iceberg.scan_plan").len();
+        assert_eq!(
+            sparql_window_ids(&fluree, from, filter).await.len(),
+            want,
+            "{filter}"
+        );
+        assert_eq!(counts(seen), pair(selected, pruned), "{filter:?}");
+    }
+}
+
+/// A pinned scan keeps and plans from its own snapshot's list, apart from the
+/// current snapshot's, filtered or not, in either order.
+#[tokio::test]
+async fn a_pinned_filtered_scan_plans_from_its_own_snapshots_list() {
+    let (fluree, staging) = staged_window("pinned-kept").await;
+    // The second commit (ids 1..=1200), read from the final metadata.
+    let latest = std::fs::read_dir(staging.path().join("people_window/metadata"))
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(latest).expect("read metadata")).unwrap();
+    let second = meta["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sequence-number"] == 2)
+        .expect("a second commit")["snapshot-id"]
+        .as_i64()
+        .unwrap();
+    let current = "pinned-kept:main";
+    let pinned = format!("pinned-kept:main@snapshot:{second}");
+    let window = "?id >= 1100 && ?id < 1300";
+
+    for _ in 0..2 {
+        assert_eq!(
+            sparql_window_ids(&fluree, current, window).await,
+            id_range(1100, 1299)
+        );
+        assert_eq!(
+            sparql_window_ids(&fluree, &pinned, window).await,
+            id_range(1100, 1200)
+        );
+        assert_eq!(
+            jsonld_window_ids(&fluree, &pinned, "(>= ?id 1100)").await,
+            id_range(1100, 1200)
+        );
+        assert_eq!(sparql_window_ids(&fluree, &pinned, "").await.len(), 1200);
+        assert_eq!(sparql_window_ids(&fluree, current, "").await.len(), 3000);
+    }
 }
 
 const RENAMED_R2RML: &str = r#"
