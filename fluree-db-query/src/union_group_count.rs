@@ -81,10 +81,10 @@ pub(crate) fn grouped_position(
         .then_some(position)
 }
 
-/// Stamp why the union lane stands down for `query` where SPARQL reads its
-/// one pattern through its view of RDF lists (`crate::list_view`): a grouped
-/// count of a list-view triple `?s <p> ?o` by `?s` or `?o`, every aggregate a
-/// row count. That triple's rows are its stored rows that are not list
+/// Stamp why the union lane stands down for `query` where the request reads
+/// its one pattern as RDF lists (`crate::list_view`, the Graph Store `GET`): a
+/// grouped count of a list-view triple `?s <p> ?o` by `?s` or `?o`, every
+/// aggregate a row count. That triple's rows are its stored rows that are not list
 /// members plus the list triples, which no index range holds, so the planner
 /// wraps its scan and the lane is never asked. The kill switch, where it is
 /// on, is the reason given. For a plan over a default graph of several graphs

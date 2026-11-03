@@ -272,7 +272,7 @@ async fn index(fluree: &Fluree, ledger: &str) {
 }
 
 // ============================================================================
-// The list fixtures (#2159)
+// The list fixtures
 // ============================================================================
 
 /// The multigraph fixture's list, `L items ("v" "v")` in g2, as the TriG writes
@@ -309,11 +309,9 @@ const MULTIGRAPH_LIST_IN_G1: &str = r#"
 GRAPH <urn:g1> { ex:L ex:items ( "v" "v" ) . }
 "#;
 
-/// Where the list fixtures' lists are. SPARQL reads a pattern a list can
-/// match through its list view (#2159), so on these ledgers each union lane
-/// either answers as the general plan does or stands down with
-/// `fallback:list_view`. They have no
-/// hand-written answers: every shape is checked against the general plan.
+/// Where the list fixtures' lists are. Both surfaces read a list's members as
+/// values (#2217), so each lane's shape meets list members; the answers are
+/// [`list_expected`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListCase {
     /// Lists on every lane's predicate in g1 and in g2, as one list fact in
@@ -387,6 +385,187 @@ impl Fixture {
             assert_no_default_graph_leaf(&fluree, ledger).await;
         }
         Self { fluree, state }
+    }
+}
+
+/// The answer to `shape` over `graphs` of a list fixture, written by hand from
+/// the TriG. Lists read as their members, values of the predicate that holds
+/// them, on both surfaces (#2217): each member is a fact by its list position,
+/// so a repeated member is a row each time and counts count it each time; a
+/// list both members hold is one fact per position in the union; and a
+/// member is a fact apart from the same value held outside the list.
+///
+/// The lists, per graph that holds them ([`lists_in`], [`MULTIGRAPH_LIST`]):
+/// `L items (v v)`, `L1 items (w v)`, `Ln n (5 5)`, `Ln label ("Ln")`,
+/// `Lk kind (T1 T1)`, `Lm m (2)`, `t1a knows (t1b)` and `s1 sel (s2 s2)`.
+/// [`ListCase::TwoMembers`] holds them all in g1 and in g2.
+/// [`ListCase::NoveltyOnly`] holds them in g2 only, written by upsert, which
+/// replaces g2's own `s1 sel s2` with the list; g1 keeps its `s1 sel s2`.
+/// Over g1 alone that case holds no list.
+pub fn list_expected(case: ListCase, shape: Shape, graphs: Graphs) -> Rows {
+    let lists_in_g1 = case == ListCase::TwoMembers;
+    match graphs {
+        // The empty default graph holds no fact.
+        Graphs::G1G2WithEmptyG0 => return list_expected(case, shape, Graphs::G1G2),
+        Graphs::G1WithEmptyG0 => return list_expected(case, shape, Graphs::G1),
+        Graphs::Empty => {
+            return match shape {
+                Shape::BoundObjectCount | Shape::BoundNumericCount => rows(&[&["0"]]),
+                _ => Rows::new(),
+            }
+        }
+        Graphs::G1 | Graphs::G1G2 | Graphs::G0G1G2 => {}
+        Graphs::G0 | Graphs::G2 | Graphs::PerNamedGraph | Graphs::G0Other => {
+            unreachable!("no list fixture scope reads {graphs:?}")
+        }
+    }
+    // Over g1 g2, and g0 g1 g2, both cases hold the same facts: every list once
+    // per position, and `s1 sel s2` from g1.
+    let union = graphs != Graphs::G1;
+    let g0 = graphs == Graphs::G0G1G2;
+    match shape {
+        // ?x with an `n` above 0 and a label, a row per such `n`: s2 (g1's
+        // label; `n 2` in both is one fact), s3 (`n 3` in g1, its label in
+        // g2), Ln once per member of `n (5 5)` (its label is a list member),
+        // and a1 in g0.
+        Shape::ExistsInExpression => match (union, lists_in_g1) {
+            (false, false) => rows(&[&["s2"]]),
+            (false, true) => rows(&[&["Ln"], &["Ln"], &["s2"]]),
+            (true, _) if g0 => rows(&[&["Ln"], &["Ln"], &["a1"], &["s2"], &["s3"]]),
+            (true, _) => rows(&[&["Ln"], &["Ln"], &["s2"], &["s3"]]),
+        },
+        // `COUNT(?s)` of `?s kind T1`: a solution per fact, so Lk counts once
+        // per member of `kind (T1 T1)`.
+        Shape::BoundObjectCount => {
+            let n = match (union, lists_in_g1) {
+                (false, false) => 2,  // k1 k2
+                (false, true) => 4,   // k1 k2 Lk Lk
+                (true, _) if g0 => 6, // k0, then as below
+                (true, _) => 5,       // k1 (both) k2 k3 Lk Lk
+            };
+            rows(&[&[&n.to_string()]])
+        }
+        // `COUNT(?s)` of `?s m 2`, any numeric datatype: Lm's one member adds
+        // one.
+        Shape::BoundNumericCount => {
+            let n = match (union, lists_in_g1) {
+                (false, false) => 2, // q1 int, q2 int
+                (false, true) => 3,  // q1 int, q2 int, Lm
+                // q1 int, q1 dbl, q2 int (both), q3 dbl, q4 short, Lm; g0
+                // holds no `m`.
+                (true, _) => 6,
+            };
+            rows(&[&[&n.to_string()]])
+        }
+        // Facts per predicate. A list adds a fact per member: `items` 2 for L
+        // and 2 for L1, `n` 2 and `label` 1 for Ln, `kind` 2 for Lk, `m` 1 for
+        // Lm, `knows` 1 for t1a and `sel` 2 for s1.
+        Shape::PerPredicateCount => {
+            let counts: &[(&str, u32)] = match (union, lists_in_g1) {
+                (false, false) => &[
+                    ("big", 1),
+                    ("kind", 2),
+                    ("knows", 8),
+                    ("label", 1),
+                    ("m", 2),
+                    ("n", 3),
+                    ("sel", 2),
+                ],
+                (false, true) => &[
+                    ("big", 1),
+                    ("items", 4),
+                    ("kind", 4),
+                    ("knows", 9),
+                    ("label", 2),
+                    ("m", 3),
+                    ("n", 5),
+                    ("sel", 4),
+                ],
+                // g0 adds `n` 2 (a1, a2), `label` 2, `kind` 1 (k0) and `big`
+                // 1 (`b big 1.5`, a value g1 and g2 do not hold).
+                (true, _) if g0 => &[
+                    ("big", 2),
+                    ("items", 4),
+                    ("kind", 6),
+                    ("knows", 10),
+                    ("label", 5),
+                    ("m", 6),
+                    ("n", 8),
+                    ("only", 1),
+                    ("sel", 5),
+                ],
+                // `n`: s1 1, s1 2, s2 2 (both), s3 3, Ln ×2; `label`: s2, s3,
+                // Ln; `kind`: k1 (both), k2, k3, Lk ×2; `knows`: the nine of
+                // the fixture's union and t1a's member; `m`: the fixture's
+                // five and Lm; `sel`: `s1 sel s2` (g1), `a9 sel s3`,
+                // `s2 sel s1`, s1's two members.
+                (true, _) => &[
+                    ("big", 1),
+                    ("items", 4),
+                    ("kind", 5),
+                    ("knows", 10),
+                    ("label", 3),
+                    ("m", 6),
+                    ("n", 6),
+                    ("only", 1),
+                    ("sel", 5),
+                ],
+            };
+            let mut out: Rows = counts
+                .iter()
+                .map(|(p, n)| vec![(*p).to_string(), n.to_string()])
+                .collect();
+            out.sort();
+            out
+        }
+        // Each triangle's three rotations. t1's edge `t1a knows t1b` is held
+        // twice wherever its list is (once plain, once as a member), so each
+        // of t1's rotations is two solutions there.
+        Shape::Triangle if union => triangles(&[1, 1, 2, 3]),
+        Shape::Triangle if lists_in_g1 => triangles(&[1, 1, 3]),
+        Shape::Triangle => triangles(&[1, 3]),
+        // (v, solutions of `?s n v`): Ln's `n (5 5)` is two.
+        Shape::GroupByObject => match (union, lists_in_g1) {
+            (false, false) => rows(&[&["1", "1"], &["2", "1"], &["3", "1"]]),
+            (false, true) => rows(&[&["1", "1"], &["2", "1"], &["3", "1"], &["5", "2"]]),
+            (true, _) if g0 => rows(&[
+                &["0", "1"],
+                &["1", "2"],
+                &["2", "2"],
+                &["3", "1"],
+                &["5", "2"],
+            ]),
+            (true, _) => rows(&[&["1", "1"], &["2", "2"], &["3", "1"], &["5", "2"]]),
+        },
+        // `?x sel ?y . ?y n ?v`: `s1 sel s2` is three facts where the list is
+        // beside the plain edge (g1 in TwoMembers; the union, whose plain edge
+        // is g1's), each joining s2's one `n 2`.
+        Shape::SubjectProbe => match (union, lists_in_g1) {
+            (false, false) => rows(&[&["a9", "s3", "3"], &["s1", "s2", "2"]]),
+            (false, true) => rows(&[
+                &["a9", "s3", "3"],
+                &["s1", "s2", "2"],
+                &["s1", "s2", "2"],
+                &["s1", "s2", "2"],
+            ]),
+            (true, _) => rows(&[
+                &["a9", "s3", "3"],
+                &["s1", "s2", "2"],
+                &["s1", "s2", "2"],
+                &["s1", "s2", "2"],
+                &["s2", "s1", "1"],
+                &["s2", "s1", "2"],
+            ]),
+        },
+        // `?s label ?l FILTER(?l >= "s2")`: "Ln", "a1" and "a2" sort below
+        // "s2".
+        Shape::StringBound => {
+            if union {
+                rows(&[&["s2", "s2"], &["s3", "s3"]])
+            } else {
+                rows(&[&["s2", "s2"]])
+            }
+        }
     }
 }
 
@@ -1000,65 +1179,21 @@ fn triangles(ns: &[u8]) -> Rows {
 /// is identified with its list position, so a list's repeated value stays two
 /// rows in a union, as in one graph.
 ///
-/// A list reads as JSON-LD reads it, its members values of the owning
-/// predicate; SPARQL reads it as the RDF it denotes (#2159), see
-/// [`sparql_list_view`].
-pub fn expected(shape: Shape, graphs: Graphs, state: State, surface: Surface) -> Rows {
-    let rows = expected_members(shape, graphs, state);
-    match surface {
-        Surface::JsonLd => rows,
-        Surface::Sparql => sparql_list_view(shape, graphs, rows),
-    }
-}
-
-/// SPARQL's reading of the fixture's one list, `L items ("v" "v")` in g2
-/// (#2159): an owner edge to the list's head cell and, per member, a cell's
-/// `rdf:first` and `rdf:rest`. So a scope holding g2 counts `items` once and
-/// two each of `rdf:first` and `rdf:rest`, where JSON-LD counts its two
-/// members as `items`. No other shape reads `items`, `rdf:first` or
-/// `rdf:rest`.
-fn sparql_list_view(shape: Shape, graphs: Graphs, mut rows: Rows) -> Rows {
-    const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
-    const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
-    if shape != Shape::PerPredicateCount {
-        return rows;
-    }
-    let mut cells = Vec::new();
-    for row in &mut rows {
-        // `[p, c]`, or `[graph, p, c]` per named graph.
-        let (graph, p, c) = match row.as_slice() {
-            [p, c] => (None, p.clone(), c.clone()),
-            [g, p, c] => (Some(g.clone()), p.clone(), c.clone()),
-            _ => continue,
-        };
-        if p != "items" {
-            continue;
-        }
-        assert_eq!(c, "2", "{graphs:?}: the fixture's one list has two members");
-        *row.last_mut().expect("count") = "1".to_string();
-        for pred in [RDF_FIRST, RDF_REST] {
-            let mut cell = graph.iter().cloned().collect::<Vec<_>>();
-            cell.extend([pred.to_string(), "2".to_string()]);
-            cells.push(cell);
-        }
-    }
-    rows.extend(cells);
-    rows.sort();
-    rows
-}
-
-fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
+/// A list reads as its members, values of the owning predicate, on both
+/// surfaces (#2217): a repeated member is a row each time, and counts count
+/// members.
+pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
     // With the write at t 2 (Novelty, Indexed2), g2 holds k4, `s3 n 4` and all
     // of t2.
     let w = state != State::Indexed;
     match graphs {
         // The empty default graph holds no fact, so it adds no solution.
-        Graphs::G1G2WithEmptyG0 => expected_members(shape, Graphs::G1G2, state),
-        Graphs::G1WithEmptyG0 => expected_members(shape, Graphs::G1, state),
+        Graphs::G1G2WithEmptyG0 => expected(shape, Graphs::G1G2, state),
+        Graphs::G1WithEmptyG0 => expected(shape, Graphs::G1, state),
         Graphs::PerNamedGraph => {
             let mut out = Rows::new();
             for (iri, g) in [(G1, Graphs::G1), (G2, Graphs::G2)] {
-                for mut row in expected_members(shape, g, state) {
+                for mut row in expected(shape, g, state) {
                     row.insert(0, iri.to_string());
                     out.push(row);
                 }
@@ -1068,7 +1203,7 @@ fn expected_members(shape: Shape, graphs: Graphs, state: State) -> Rows {
         }
         _ => match shape {
             Shape::SubjectProbe | Shape::StringBound => {
-                panic!("{shape:?} has no hand-written answer: the list fixtures check it against the general plan")
+                panic!("{shape:?} has no answer over the multigraph fixture: see `list_expected`")
             }
             // ?x with an `n` above 0 and a label, one row per such `n`.
             Shape::ExistsInExpression => match graphs {
@@ -1493,7 +1628,7 @@ pub async fn check(
     failures: &mut Vec<String>,
 ) -> Run {
     let run = run(fx, scope, shape, surface).await;
-    let want = expected(shape, scope.graphs(), scope.answer_state(fx.state), surface);
+    let want = expected(shape, scope.graphs(), scope.answer_state(fx.state));
     for (lane, got) in [
         ("fast paths on", &run.fast),
         ("fast paths off", &run.generic),

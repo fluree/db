@@ -21,11 +21,8 @@
 //!   g1's and g2's `3.5` on `y1 v` need not be the same handle;
 //! - a ref list: `x900 r (y9 y9)` in g1 and `(y9)` in g2 are two facts.
 //!
-//! The lists are list members as JSON-LD sees them. SPARQL sees RDF lists
-//! (`fluree_db_query::list_view`): a list is its owner edge to a head cell,
-//! a blank node local to its graph, so a list both graphs hold is two lists
-//! of the union. [`expected_on`] answers each surface by its own view, and
-//! the batched lanes stand down on SPARQL for a predicate holding lists.
+//! The lists are list members, values of the predicate that holds them, as
+//! both SPARQL and JSON-LD read them (#2217).
 
 use crate::multigraph::{outcomes, switch};
 use crate::span_capture::init_test_tracing;
@@ -59,9 +56,6 @@ pub enum Obj {
     Double(&'static str),
     /// An `xsd:decimal` (a NumBig), written as its lexical form.
     Dec(&'static str),
-    /// The head cell of a list in graph `.0`, as SPARQL sees a list: a blank
-    /// node, never written as data ([`sparql_view`]).
-    ListHead(&'static str),
 }
 
 impl Obj {
@@ -72,7 +66,6 @@ impl Obj {
             Obj::Int(v) => v.to_string(),
             Obj::Double(v) => format!("\"{v}\"^^xsd:double"),
             Obj::Dec(v) => (*v).to_string(),
-            Obj::ListHead(_) => unreachable!("a list head is not written as data"),
         }
     }
 
@@ -85,7 +78,6 @@ impl Obj {
             Obj::Int(v) => format!("{v}^^integer"),
             Obj::Double(v) => format!("{}^^double", v.replace('e', "E")),
             Obj::Dec(v) => format!("{v}^^decimal"),
-            Obj::ListHead(_) => LIST_CELL.to_string(),
         }
     }
 }
@@ -195,9 +187,8 @@ pub fn facts(lists: bool) -> Vec<Fact> {
     f.push(fact(G2, "x7c", "r", iri("y7")));
     f.extend(list(G1, "x900", "r", &[iri("y9"), iri("y9")]));
     f.extend(list(G2, "x900", "r", &[iri("y9")]));
-    // The probed predicates again without their lists (`vf`, `rf`, `qf`):
-    // SPARQL reads a predicate holding lists through the list view, so the
-    // union probes run on SPARQL over these.
+    // The probed predicates again without their lists (`vf`, `rf`, `qf`), so
+    // each probe also runs over a predicate no list is held on.
     let twins: Vec<Fact> = f
         .iter()
         .filter(|x| x.i.is_none())
@@ -215,25 +206,7 @@ pub fn facts(lists: bool) -> Vec<Fact> {
     f
 }
 
-/// How a list cell, a blank node the request names, renders in a row.
-const LIST_CELL: &str = "_:list";
-
-/// `facts` as SPARQL's view of lists sees them: each list, per graph,
-/// subject and predicate, is one fact whose object is its head cell, and its
-/// members are not values of the predicate.
-pub fn sparql_view(facts: &[Fact]) -> Vec<Fact> {
-    let mut out: Vec<Fact> = facts.iter().filter(|f| f.i.is_none()).cloned().collect();
-    for f in facts.iter().filter(|f| f.i.is_some()) {
-        let head = fact(f.g, f.s.clone(), f.p, Obj::ListHead(f.g));
-        if !out.contains(&head) {
-            out.push(head);
-        }
-    }
-    out
-}
-
-/// A query surface: SPARQL, which sees RDF lists, or JSON-LD, which sees
-/// their members as values.
+/// A query surface. Both read a list's members as values (#2217).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
     Sparql,
@@ -242,16 +215,7 @@ pub enum Surface {
 
 pub const SURFACES: &[Surface] = &[Surface::JsonLd, Surface::Sparql];
 
-/// [`expected`] on `surface`.
-pub fn expected_on(surface: Surface, shape: Shape, facts: &[Fact]) -> Vec<String> {
-    match surface {
-        Surface::JsonLd => expected(shape, facts),
-        Surface::Sparql => expected(shape, &sparql_view(facts)),
-    }
-}
-
-/// Whether the predicate `shape` probes holds a list in `facts`: on SPARQL
-/// its join then reads it through the list view, and no batched lane runs.
+/// Whether the predicate `shape` probes holds a list in `facts`.
 pub fn probes_a_list(shape: Shape, facts: &[Fact]) -> bool {
     facts.iter().any(|f| f.i.is_some() && f.p == shape.probed())
 }
@@ -601,8 +565,10 @@ fn sparql_json_rows(query: &str, json: &JsonValue, vars: &[&str]) -> Result<Vec<
             vars.iter()
                 .map(|v| {
                     let term = &b[*v];
+                    // No fixture value is a blank node: one here is a list
+                    // cell, which no query should read (#2217).
                     if term["type"] == "bnode" {
-                        return LIST_CELL.to_string();
+                        return format!("_:{}", term["value"].as_str().unwrap_or_default());
                     }
                     let value = term["value"].as_str().unwrap_or_default();
                     let value = value.strip_prefix(EX).unwrap_or(value);

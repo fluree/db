@@ -19,14 +19,9 @@
 //! the union variant sits behind, and every lane run must stamp
 //! `cyclic_bgp_union` `proceed`.
 //!
-//! Every pair stored twice here is a list. SPARQL reads a list as the RDF it
-//! denotes (#2159): an owner edge to the list's head cell, so a list item is
-//! not an edge of its predicate, and a block reading one through that view
-//! is not the cyclic join's. The SPARQL cases answer that view, by hand and
-//! with the lane off; the one-graph lane stands down without a stamp, as
-//! main's does, and the union variant with `fallback:list_view`. JSON-LD and
-//! Cypher read the items as values, so their cases keep the multiplicity the
-//! lane must not collapse, and must stamp `proceed`.
+//! Every pair stored twice here is a list. SPARQL, JSON-LD and Cypher all read
+//! a list's items as values of its predicate (#2217), so every case keeps the
+//! multiplicity the lane must not collapse, and must stamp `proceed`.
 //!
 //! Env and switch mutation live in ONE test fn (and this file is its own test
 //! binary) so parallel test threads can't race on process-global state.
@@ -308,9 +303,6 @@ struct Case {
     query: String,
     vars: &'static [&'static str],
     want: Rows,
-    /// Whether the lane answers. Otherwise the query reads its lists through
-    /// SPARQL's view, and the lane stands down.
-    fires: bool,
 }
 
 /// A JSON-LD triangle (or square) over `preds`, each edge from the one
@@ -356,9 +348,6 @@ fn cases() -> Vec<Case> {
     };
     let square = times(&[(&["w1", "x1", "y1", "z1"], 2)]);
     vec![
-        // SPARQL's list view: `m → n`, `a1 → a2`, `b2 → b3`, `c3 → c1` and
-        // `z1 → w1` are owner edges to a head cell, so no cycle through them
-        // closes.
         Case {
             label: "knows triangle, the pair in each rotation's position",
             surface: Surface::Sparql,
@@ -366,12 +355,7 @@ fn cases() -> Vec<Case> {
                 "{PREFIXES}SELECT ?x ?y ?z WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
             ),
             vars: &["x", "y", "z"],
-            want: times(&[
-                (&["k1", "k2", "k3"], 1),
-                (&["k2", "k3", "k1"], 1),
-                (&["k3", "k1", "k2"], 1),
-            ]),
-            fires: false,
+            want: knows.clone(),
         },
         Case {
             label: "p/q/r triangles, the pair on p, on q, on r",
@@ -380,8 +364,7 @@ fn cases() -> Vec<Case> {
                 "{PREFIXES}SELECT ?x ?y ?z WHERE {{ ?x ex:p ?y . ?y ex:q ?z . ?z ex:r ?x }}"
             ),
             vars: &["x", "y", "z"],
-            want: times(&[(&["d1", "d2", "d3"], 1)]),
-            fires: false,
+            want: pqr.clone(),
         },
         Case {
             label: "square, the pair on its last edge",
@@ -391,8 +374,7 @@ fn cases() -> Vec<Case> {
                  WHERE {{ ?w ex:e1 ?x . ?x ex:e2 ?y . ?y ex:e3 ?z . ?z ex:e4 ?w }}"
             ),
             vars: &["w", "x", "y", "z"],
-            want: vec![],
-            fires: false,
+            want: square.clone(),
         },
         Case {
             label: "JSON-LD: knows triangle, the pair in each rotation's position",
@@ -400,7 +382,6 @@ fn cases() -> Vec<Case> {
             query: jsonld_cycle(&["ex:knows", "ex:knows", "ex:knows"], None, None),
             vars: &[],
             want: knows.clone(),
-            fires: true,
         },
         Case {
             label: "JSON-LD: p/q/r triangles, the pair on p, on q, on r",
@@ -408,7 +389,6 @@ fn cases() -> Vec<Case> {
             query: jsonld_cycle(&["ex:p", "ex:q", "ex:r"], None, None),
             vars: &[],
             want: pqr.clone(),
-            fires: true,
         },
         Case {
             label: "JSON-LD: square, the pair on its last edge",
@@ -416,7 +396,6 @@ fn cases() -> Vec<Case> {
             query: jsonld_cycle(&["ex:e1", "ex:e2", "ex:e3", "ex:e4"], None, None),
             vars: &[],
             want: square,
-            fires: true,
         },
         Case {
             label: "Cypher: knows triangle",
@@ -424,7 +403,6 @@ fn cases() -> Vec<Case> {
             query: cypher("knows", "knows", "knows"),
             vars: &[],
             want: knows,
-            fires: true,
         },
         Case {
             label: "Cypher: p/q/r triangles",
@@ -432,7 +410,6 @@ fn cases() -> Vec<Case> {
             query: cypher("p", "q", "r"),
             vars: &[],
             want: pqr,
-            fires: true,
         },
     ]
 }
@@ -488,18 +465,8 @@ async fn answer(fluree: &Fluree, handle: &LedgerHandle, case: &Case) -> Result<R
 
 /// The union cases: the triangle over g1 and g2, by `FROM` and as the union
 /// default graph (whose default graph adds only the novelty state's base
-/// edge, which closes no cycle). In SPARQL, m's list in each graph is an
-/// owner edge to that graph's head cell, and u's list in g2 another; only g1's
-/// plain `u → v` is an edge to v.
+/// edge, which closes no cycle), on SPARQL and JSON-LD alike.
 fn union_cases() -> Vec<Case> {
-    let list_view = times(&[
-        (&["u", "v", "w"], 1),
-        (&["v", "w", "u"], 1),
-        (&["w", "u", "v"], 1),
-        (&["x", "y", "z"], 1),
-        (&["y", "z", "x"], 1),
-        (&["z", "x", "y"], 1),
-    ]);
     let want = times(&[
         (&["m", "n", "o"], 2),
         (&["n", "o", "m"], 2),
@@ -524,16 +491,14 @@ fn union_cases() -> Vec<Case> {
             surface: Surface::Sparql,
             query: tri("", "FROM <urn:g1> FROM <urn:g2>"),
             vars: &["x", "y", "z"],
-            want: list_view.clone(),
-            fires: false,
+            want: want.clone(),
         },
         Case {
             label: "union: the union default graph",
             surface: Surface::Sparql,
             query: tri("# PRAGMA union-default-graph: true\n", ""),
             vars: &["x", "y", "z"],
-            want: list_view,
-            fires: false,
+            want: want.clone(),
         },
         Case {
             label: "union: JSON-LD, FROM g1 + g2",
@@ -548,7 +513,6 @@ fn union_cases() -> Vec<Case> {
             ),
             vars: &[],
             want: want.clone(),
-            fires: true,
         },
         Case {
             label: "union: JSON-LD, the union default graph",
@@ -560,7 +524,6 @@ fn union_cases() -> Vec<Case> {
             ),
             vars: &[],
             want,
-            fires: true,
         },
     ]
 }
@@ -587,7 +550,7 @@ async fn cyclic_join_keeps_the_multiplicity_of_a_pair_stored_twice() {
             let lane = answer(&fluree, &handle, &case).await;
             drop(guard);
             let ran = stamps(&store, "cyclic_bgp");
-            let want_ran: &[&str] = if case.fires { &["proceed"] } else { &[] };
+            let want_ran: &[&str] = &["proceed"];
             if ran != want_ran {
                 failures.push(format!(
                     "{label}: `cyclic_bgp` stamps {ran:?}, want {want_ran:?}"
@@ -618,11 +581,7 @@ async fn cyclic_join_keeps_the_multiplicity_of_a_pair_stored_twice() {
             let lane = answer(&fluree, &handle, &case).await;
             drop(guard);
             let ran = stamps(&store, "cyclic_bgp_union");
-            let want_ran: &[&str] = if case.fires {
-                &["proceed"]
-            } else {
-                &["fallback:list_view"]
-            };
+            let want_ran: &[&str] = &["proceed"];
             if ran != want_ran {
                 failures.push(format!(
                     "{label}: `cyclic_bgp_union` stamps {ran:?}, want {want_ran:?}"

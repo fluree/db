@@ -187,7 +187,7 @@ fn simple_exists_key(tp: &TriplePattern) -> Option<(VarId, Ref, VarId)> {
 
 /// Collect `(subject_var, predicate, object_var)` for every hoistable
 /// `EXISTS { ?s <p> ?o }` in `expr`. `list_view` is set when such an EXISTS
-/// reads its triple through SPARQL's view of RDF lists (`crate::list_view`):
+/// reads its triple as RDF lists (`crate::list_view`, the Graph Store `GET`):
 /// its rows are then not the predicate's stored rows, and it is not hoisted.
 ///
 /// The object variable is carried out so the caller can reject the pattern
@@ -253,7 +253,7 @@ fn build_exists_semijoin_cache(
     let mut list_view = false;
     collect_simple_exists_keys(expr, &mut exists_nodes, &mut list_view);
     if exists_nodes.is_empty() {
-        // An EXISTS of the cache's shape read through SPARQL's list view: the
+        // An EXISTS of the cache's shape read as RDF lists: the
         // cache over several graphs (or none) says why it stood down; the
         // one-graph cache stays silent, as it always has.
         let reason = match &source {

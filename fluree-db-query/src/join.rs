@@ -2075,8 +2075,9 @@ impl NestedLoopJoinOperator {
         use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::index_scope::IndexScope;
         if self.hide_list_members {
-            // SPARQL reads this triple through its view of RDF lists, which no
-            // stored row is (`hiding_list_members` turned the probes off).
+            // The request reads this triple as RDF lists (the Graph Store
+            // `GET`), which no stored row is (`hiding_list_members` turned the
+            // probes off).
             if let Some(IndexScope::Union(_)) = ctx.index_scope_policy_cleared() {
                 let reason = if crate::execute::fast_paths_disabled() {
                     FastPathFallback::KillSwitch

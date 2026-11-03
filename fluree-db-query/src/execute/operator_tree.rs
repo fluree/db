@@ -3106,8 +3106,8 @@ fn build_operator_tree_inner(
     }
 
     // The two count lanes below read stored rows, so neither answers a
-    // pattern SPARQL reads through its view of RDF lists (`crate::list_view`),
-    // and neither detector accepts one. Over a default graph of several
+    // pattern the request reads as RDF lists (`crate::list_view`, the Graph
+    // Store `GET`), and neither detector accepts one. Over a default graph of several
     // graphs (or of none) the union site says why it stood down where the
     // query is its shape apart from the view; the kill switch, where it is on,
     // is the reason given. The one-graph sites stay silent, as main's do.
@@ -3302,7 +3302,7 @@ fn build_operator_tree_inner(
         && stats.is_some()
     {
         // The count over several graphs reads stored rows, and does not
-        // answer for SPARQL's view of RDF lists: it stands down for the
+        // answer for the view of RDF lists: it stands down for the
         // general plan, saying so. Over one graph, the list census corrects
         // the stored counts where the view answers the query's one pattern.
         let detected = match detect_stats_count_by_predicate(query) {

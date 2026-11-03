@@ -2013,19 +2013,14 @@ async fn cyclic_union_lane_reads_past_an_empty_member() {
     failures.assert_none();
 }
 
-/// A triangle whose closing edge is a list. `c ex:knows ( a )` in g3 is, in
-/// SPARQL (#2159), an owner edge from c to the list's head cell, whose
-/// `rdf:first` is a: there is no edge `c → a`, so over g2 and g3 no triangle
-/// closes. The block holds a list-view triple, which the cyclic join does not
-/// read, and its union site says so with `fallback:list_view`. JSON-LD reads
-/// the member as a value of `ex:knows`, so the triangle closes three ways
-/// round, and the union variant answers it.
+/// A triangle whose closing edge is a list. `c ex:knows ( a )` in g3 holds a
+/// as a value of `ex:knows` on both surfaces (#2217), so over g2 and g3 the
+/// triangle closes three ways round, and the union variant answers it.
 ///
 /// The second triangle closes over `ex:likes` (two plain edges, the most
 /// selective predicate) and the list's `ex:knows` (beside ten edges no
-/// triangle uses), so the block opens with a stored triple and no seed: it
-/// is the planner's list-view guard, not a seed, that keeps the lane from
-/// reading the list's member as an edge.
+/// triangle uses), so the block opens with a stored triple and no seed, and
+/// the lane reads the list's member as the closing edge.
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
     let ledger_id = "it/cyclic-lane-lists:main";
@@ -2047,14 +2042,24 @@ async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
     let mut failures = Failures::default();
     let knows3 = "?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x";
     let likes2 = "?x ex:likes ?y . ?y ex:likes ?z . ?z ex:knows ?x";
-    for (label, prologue, ds, bgp) in [
-        ("FROM g2 + g3", "", "FROM <urn:g2> FROM <urn:g3>", knows3),
-        ("the union default graph", UNION_PRAGMA, "", knows3),
+    let abc = rows(&[&["a", "b", "c"], &["b", "c", "a"], &["c", "a", "b"]]);
+    for (label, prologue, ds, bgp, want) in [
+        (
+            "FROM g2 + g3",
+            "",
+            "FROM <urn:g2> FROM <urn:g3>",
+            knows3,
+            abc.clone(),
+        ),
+        // `i → j → k` closes over `likes`, so over every graph only a b c
+        // is a `knows` triangle.
+        ("the union default graph", UNION_PRAGMA, "", knows3, abc),
         (
             "FROM g4 + g5, opening on a stored triple",
             "",
             "FROM <urn:g4> FROM <urn:g5>",
             likes2,
+            rows(&[&["i", "j", "k"]]),
         ),
     ] {
         let query = format!("{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} WHERE {{ {bgp} }}");
@@ -2067,12 +2072,12 @@ async fn cyclic_union_lane_reads_a_list_as_each_surface_does() {
             .execute_formatted()
             .await
         {
-            Ok(json) => failures.eq(sparql_rows(&json, &["x", "y", "z"]), rows(&[]), label),
+            Ok(json) => failures.eq(sparql_rows(&json, &["x", "y", "z"]), want, label),
             Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
         }
         failures.eq(
             stamps(&store, before, "cyclic_bgp_union"),
-            vec!["fallback:list_view".to_string()],
+            vec!["proceed".to_string()],
             &format!("{label}: `cyclic_bgp_union` stamps"),
         );
         failures.eq(
@@ -2649,12 +2654,8 @@ async fn exists_semijoin_cache_over_one_graph_and_a_union() {
 }
 
 /// The EXISTS cache over a union where the EXISTS's predicate holds lists.
-/// SPARQL reads a list as the RDF it denotes (#2159), an owner edge to the
-/// list's head cell, so `EXISTS { ?x ex:tags ?t }` is read through the list
-/// view: the cache over several graphs stands down with `ListView` and the
-/// general plan answers. JSON-LD reads the members as values, and the cache
-/// answers. Either way a subject that owns a list has a tag, so the answers
-/// agree.
+/// Both surfaces read a list's members as values of `ex:tags` (#2217), so a
+/// subject that owns a list has a tag, and the cache answers on both.
 ///
 /// Tags: y1 owns a list in g2, y2 one in g3, w1 a plain tag in g2; z1 has
 /// none. Amounts: y1 and y2 in g2, w1 and z1 in g3.
@@ -2710,11 +2711,11 @@ async fn exists_semijoin_cache_over_a_union_reads_a_list_as_each_surface_does() 
             Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
         }
         let stamped = exists_stamps(&store, before);
-        check_exists_routing(&mut failures, label, &stamped, ExistsLane::Neither);
+        check_exists_routing(&mut failures, label, &stamped, ExistsLane::Union);
         failures.eq(
             stamped.1,
-            vec!["fallback:list_view".to_string()],
-            &format!("{label}: `{EXISTS_UNION_SITE}` decline"),
+            vec!["proceed".to_string()],
+            &format!("{label}: `{EXISTS_UNION_SITE}` stamps"),
         );
     }
     for (label, exists, want) in [
@@ -2945,12 +2946,8 @@ fn check_count_routing(
 /// subject ranges interleave with no subject in common; q00..q04 tagged `J` in
 /// g2 and q05..q09 in g3 hold disjoint ranges.
 ///
-/// A list reads two ways (#2159). SPARQL reads it as the RDF it denotes, an
-/// owner edge to the list's head cell: a member is not a value of its
-/// predicate, and a pattern on a predicate holding lists is read through the
-/// list view, which the union lanes leave to the general plan, stamping
-/// `fallback:list_view`. JSON-LD reads the members as values, and the union
-/// lanes count them, one fact per value and list position.
+/// A list's members are values of its predicate on both surfaces (#2217), and
+/// the union lanes count them, one fact per value and list position.
 #[tokio::test(flavor = "current_thread")]
 async fn object_count_over_one_graph_and_a_union() {
     let ledger_id = "it/object-count-graphs:main";
@@ -3062,26 +3059,24 @@ async fn object_count_over_one_graph_and_a_union() {
             n("4"),
             ObjectCount::Union(Some("merge")),
         ),
-        // SPARQL reads a list as the RDF it denotes (#2159): a member is not
-        // a value of its predicate, so a predicate holding lists is read
-        // through the list view, which the union lane does not answer.
+        // A list's members are values (#2217), a fact per list position.
         (
-            "D9 FROM g2 + g3, a list repeating the object: not a value in SPARQL",
+            "D9 FROM g2 + g3, a list repeating the object: f's two 5s and g's",
             count("", from23, "ex:q 5"),
-            n("1"),
-            ObjectCount::UnionDeclines("list_view", None),
+            n("3"),
+            ObjectCount::Union(Some("merge")),
         ),
         (
-            "D10 FROM g2 + g3, a list repeating the object (g2 only): not a value in SPARQL",
+            "D10 FROM g2 + g3, a list repeating the object (g2 only)",
             count("", from23, "ex:r 5"),
-            n("0"),
-            ObjectCount::UnionDeclines("list_view", None),
+            n("2"),
+            ObjectCount::Union(None),
         ),
         (
-            "D15 FROM g2 + g3, two lists repeating the object: not values in SPARQL",
+            "D15 FROM g2 + g3, two lists repeating the object: every item a fact",
             count("", from23, "ex:w 5"),
-            n("0"),
-            ObjectCount::UnionDeclines("list_view", None),
+            n("4"),
+            ObjectCount::Union(None),
         ),
         (
             "D11 FROM g2 + g3, a bare number with a decimal slice in one member",
@@ -3093,13 +3088,13 @@ async fn object_count_over_one_graph_and_a_union() {
             "D13 FROM g2 + g3, a predicate only g2 holds, past g3's last leaf, beside a list",
             count("", from23, "ex:zz 6"),
             n("1"),
-            ObjectCount::UnionDeclines("list_view", None),
+            ObjectCount::Union(Some("rows")),
         ),
         (
-            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf: not a value in SPARQL",
+            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf",
             count("", from23, "ex:zz 5"),
-            n("0"),
-            ObjectCount::UnionDeclines("list_view", None),
+            n("2"),
+            ObjectCount::Union(Some("rows")),
         ),
         (
             "D16 FROM g2 + g3, interleaved subject ranges, none in common: the merge",
@@ -3190,9 +3185,8 @@ async fn object_count_over_one_graph_and_a_union() {
         check_object_count_routing(&mut failures, label, &store, before, lane);
     }
 
-    // The list cases in JSON-LD, which reads a list's members as values of
-    // its predicate: over a union each item is a fact (one per value and list
-    // position), and the union lane counts them.
+    // The list cases' JSON-LD twins: over a union each item is a fact (one
+    // per value and list position), and the union lane counts them.
     let from23_jsonld = json!([
         {"@id": ledger_id, "graph": "urn:g2"},
         {"@id": ledger_id, "graph": "urn:g3"}
@@ -3280,10 +3274,10 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(None),
         ),
         (
-            "T4 FROM g2 + g3, a list: its head cell in SPARQL",
+            "T4 FROM g2 + g3, list rows: f's 5, 5 and 7, and g's 5",
             topk("", from23, "ex:q"),
-            rows(&[&["5", "1"], &["BLANK", "1"]]),
-            ObjectCount::UnionDeclines("list_view", None),
+            rows(&[&["5", "3"], &["7", "1"]]),
+            ObjectCount::Union(None),
         ),
         (
             "T5 FROM g2 + g3, decimal objects (arena handles)",
@@ -3309,7 +3303,7 @@ async fn object_count_over_one_graph_and_a_union() {
         check_count_routing(&mut failures, label, &store, before, TOPK_SITES, lane);
     }
     {
-        // T4 in JSON-LD, which reads the list's members as values.
+        // T4 in JSON-LD.
         let label = "JT4 JSON-LD, FROM g2 + g3, list rows: every item a fact";
         let query = json!({
             "@context": {"ex": EX},

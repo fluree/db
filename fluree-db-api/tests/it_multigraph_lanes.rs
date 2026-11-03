@@ -339,13 +339,9 @@ const PER_PREDICATE_ONE_PLANNED: &str = "stats_count_by_predicate";
 /// lane answers one current graph; nothing answers a GRAPH scope (not the
 /// shape) or two ledgers.
 ///
-/// The multigraph fixture holds a list, so SPARQL reads `?s ?p ?o` through its
-/// view of RDF lists (#2159): the owner edge and the cells'
-/// `rdf:first`/`rdf:rest` in place of the members. The union lane counts stored
-/// rows, so over several graphs or none it stands down at plan time with
-/// `ListView`, in every state, and the general plan answers; the one-graph lane
-/// corrects its counts from the list census. JSON-LD reads the members as
-/// values, and the union lane answers it.
+/// The multigraph fixture holds a list, `L items ("v" "v")`. Both surfaces read
+/// its members as values of `items` (#2217), so the union lane counts each
+/// member, the repeated one twice, and answers SPARQL as it does JSON-LD.
 async fn per_predicate_count_union(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -369,19 +365,6 @@ async fn per_predicate_count_union(state: State) {
             // member of any scope current.
             let current = state != State::Novelty && scope != Scope::TimeTravel;
             match scope.kind() {
-                Kind::Union | Kind::Empty if surface == Surface::Sparql => {
-                    assert_routing(&run, &[], &all, &mut failures);
-                    let list_view = (
-                        PER_PREDICATE_UNION.to_string(),
-                        "fallback:list_view".to_string(),
-                    );
-                    if !run.fell_back.contains(&list_view) {
-                        failures.push(format!(
-                            "{}: no ListView decline (fell back: {:?})",
-                            run.label, run.fell_back
-                        ));
-                    }
-                }
                 Kind::Union if current => {
                     assert_routing(
                         &run,
@@ -844,8 +827,8 @@ fn typed_rows(result: &serde_json::Value, vars: &[&str]) -> Rows {
 
 /// One of the grouped count's own queries over the multigraph fixture: its
 /// SPARQL (`{ds}` for the dataset clause) and, where it has one, its JSON-LD
-/// twin; the columns; the rows by hand; and whether the union lane answers it,
-/// or which outcome it declines with.
+/// twin, which answers the same rows; the columns; the rows by hand; and
+/// whether the union lane answers it, or which outcome it declines with.
 struct GroupCase {
     label: &'static str,
     sparql: &'static str,
@@ -853,19 +836,6 @@ struct GroupCase {
     columns: &'static [&'static str],
     /// Compare values with their datatypes (SPARQL only).
     typed: bool,
-    want: Rows,
-    fires: bool,
-    decline: Option<&'static str>,
-    /// JSON-LD's answer where it differs from SPARQL's: over a list, SPARQL
-    /// sees the RDF list view (the owner edge to the list's first cell,
-    /// `crate::list_view`), which the planner answers outside the scan, and
-    /// JSON-LD sees the members as values.
-    jsonld_view: Option<JsonLdView>,
-}
-
-/// A [`GroupCase`]'s JSON-LD rows, whether the union lane answers them, and
-/// which outcome it declines with.
-struct JsonLdView {
     want: Rows,
     fires: bool,
     decline: Option<&'static str>,
@@ -929,11 +899,8 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
         .await;
         surfaces.push(("JSON-LD", run));
     }
-    for (surface, run) in surfaces {
-        let (want, fires, decline) = match (&case.jsonld_view, surface) {
-            (Some(view), "JSON-LD") => (&view.want, view.fires, view.decline),
-            _ => (&case.want, case.fires, case.decline),
-        };
+    for (_, run) in surfaces {
+        let (want, fires, decline) = (&case.want, case.fires, case.decline);
         for (lane, got) in [
             ("fast paths on", &run.fast),
             ("fast paths off", &run.generic),
@@ -956,17 +923,15 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
                 failures,
             );
         }
-        match decline {
-            Some(outcome) => a_declined(&run, outcome, failures),
-            // The list view's decline is named only for the lane's shape.
-            None if run.fell_back.contains(&(
-                GROUPED_COUNT_UNION.to_string(),
-                "fallback:list_view".to_string(),
-            )) =>
-            {
-                failures.push(format!("{}: `fallback:list_view` off the shape", run.label));
-            }
-            None => {}
+        // No query reads a list's cells (#2217), so nothing stands down on them.
+        if run.fell_back.contains(&(
+            GROUPED_COUNT_UNION.to_string(),
+            "fallback:list_view".to_string(),
+        )) {
+            failures.push(format!("{}: `fallback:list_view`", run.label));
+        }
+        if let Some(outcome) = decline {
+            a_declined(&run, outcome, failures);
         }
     }
 }
@@ -978,11 +943,9 @@ async fn group_case(fx: &Fixture, graphs: &[&str], case: &GroupCase, failures: &
 /// holds, a count of the grouped key itself, another aggregate beside the
 /// count, a FILTER, and big numbers (an arena handle per graph and predicate).
 ///
-/// A list reads two ways. SPARQL sees the RDF list view: `?s ex:items ?v` is
-/// the owner edge to the list's first cell (`_:l0-0`), one row, planned as a
-/// list-view triple, so the union lane stands down with `ListView` where the
-/// query is its shape. JSON-LD sees the members as values, two facts by
-/// their list positions, and the lane answers them.
+/// A list's members are values on both surfaces (#2217): `?s ex:items ?v` over
+/// `L items ("v" "v")` is two facts by their list positions, and the lane
+/// answers them.
 #[tokio::test(flavor = "current_thread")]
 async fn grouped_count_union_group_counts_over_from_graphs() {
     use multigraph::{rows, G1, G2};
@@ -1008,7 +971,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["s1", "2"], &["s2", "1"], &["s3", "1"]]),
                 fires: true,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1028,7 +990,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 ]),
                 fires: true,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1043,7 +1004,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["1", "1", "1"], &["2", "2", "2"], &["3", "1", "1"]]),
                 fires: true,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1064,7 +1024,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["1", "1"], &["2", "2"], &["3", "1"]]),
                 fires: false,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1079,7 +1038,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["2", "2"], &["3", "1"]]),
                 fires: true,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1095,14 +1053,10 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 })),
                 columns: &["v", "k"],
                 typed: false,
-                want: rows(&[&["l0-0", "1"]]),
-                fires: false,
-                decline: Some("fallback:list_view"),
-                jsonld_view: Some(JsonLdView {
-                    want: rows(&[&["v", "2"]]),
-                    fires: true,
-                    decline: None,
-                }),
+                // `L items ("v" "v")` in g2: two members, a row each.
+                want: rows(&[&["v", "2"]]),
+                fires: true,
+                decline: None,
             },
         ),
         (
@@ -1118,14 +1072,9 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 })),
                 columns: &["s", "k"],
                 typed: false,
-                want: rows(&[&["L", "1"]]),
-                fires: false,
-                decline: Some("fallback:list_view"),
-                jsonld_view: Some(JsonLdView {
-                    want: rows(&[&["L", "2"]]),
-                    fires: true,
-                    decline: None,
-                }),
+                want: rows(&[&["L", "2"]]),
+                fires: true,
+                decline: None,
             },
         ),
         (
@@ -1143,7 +1092,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 ]),
                 fires: true,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1157,7 +1105,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["7", "1"]]),
                 fires: true,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1171,7 +1118,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[]),
                 fires: false,
                 decline: Some("fallback:gate_declined"),
-                jsonld_view: None,
             },
         ),
         (
@@ -1186,7 +1132,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["1", "1", "1"], &["2", "2", "2"], &["3", "1", "1"]]),
                 fires: false,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1204,14 +1149,9 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 })),
                 columns: &["v", "k", "d"],
                 typed: false,
-                want: rows(&[&["l0-0", "1", "1"]]),
+                want: rows(&[&["v", "2", "1"]]),
                 fires: false,
                 decline: None,
-                jsonld_view: Some(JsonLdView {
-                    want: rows(&[&["v", "2", "1"]]),
-                    fires: false,
-                    decline: None,
-                }),
             },
         ),
         (
@@ -1226,7 +1166,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["2", "2"], &["3", "1"]]),
                 fires: false,
                 decline: None,
-                jsonld_view: None,
             },
         ),
         (
@@ -1240,7 +1179,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["1.5", "1"], &["2.5", "1"]]),
                 fires: false,
                 decline: Some("fallback:arena_type"),
-                jsonld_view: None,
             },
         ),
         (
@@ -1254,7 +1192,6 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
                 want: rows(&[&["b", "2"]]),
                 fires: false,
                 decline: Some("fallback:arena_type"),
-                jsonld_view: None,
             },
         ),
     ];
@@ -1289,12 +1226,7 @@ async fn grouped_count_union_answers_to_the_kill_switch() {
         drop(guard);
         set_fast_paths_disabled(false);
         let label = format!("{} / {surface:?}", scope.name());
-        let want = multigraph::expected(
-            Shape::GroupByObject,
-            scope.graphs(),
-            State::Indexed,
-            surface,
-        );
+        let want = multigraph::expected(Shape::GroupByObject, scope.graphs(), State::Indexed);
         match got {
             Ok(rows) if rows == want => {}
             Ok(rows) => failures.push(format!("{label}: {rows:?}, want {want:?}")),
@@ -1466,14 +1398,12 @@ fn check_union_probes(
 /// keeps its keep/drop path under the union, and goes exact where a list
 /// position repeats a key.
 ///
-/// On JSON-LD a list's members are values, so every shape runs through its
-/// lane. On SPARQL a predicate holding lists is read through the list view,
-/// a list both graphs hold is two lists (its cells are blank nodes local to
-/// each graph), and no batched lane joins that predicate; its list-free twin
-/// on the same ledger is joined by the lane.
+/// A list's members are values on both surfaces (#2217), so every shape runs
+/// through its lane on both, over the predicates holding lists and over their
+/// list-free twins.
 #[tokio::test(flavor = "current_thread")]
 async fn union_probes_answer_by_fact() {
-    use union_probes::{Shape, Surface};
+    use union_probes::Shape;
     let fx = union_probes::Fixture::build().await;
     let mut failures = Vec::new();
     for &surface in union_probes::SURFACES {
@@ -1491,7 +1421,7 @@ async fn union_probes_answer_by_fact() {
             for &shape in union_probes::SHAPES {
                 let label =
                     |scope: &str| format!("{surface:?} / {shape:?} / {scope} / lists {lists}");
-                let want_floor = union_probes::expected_on(surface, shape, &floor_facts);
+                let want_floor = union_probes::expected(shape, &floor_facts);
                 match fx.on(surface, floor, "", "", shape).await {
                     Ok(rows) if rows == want_floor => {}
                     other => failures.push(format!(
@@ -1499,9 +1429,7 @@ async fn union_probes_answer_by_fact() {
                         label("floor")
                     )),
                 }
-                let want = union_probes::expected_on(surface, shape, &facts);
-                let list_view =
-                    surface == Surface::Sparql && union_probes::probes_a_list(shape, &facts);
+                let want = union_probes::expected(shape, &facts);
                 // The membership join's key repeats where its predicate's list
                 // holds one member twice (`y20 q (x20 x20)`).
                 let repeats = lists && union_probes::probes_a_list(shape, &facts);
@@ -1510,7 +1438,6 @@ async fn union_probes_answer_by_fact() {
                     let run =
                         union_probes::run_on(&fx, surface, ledger, prologue, dataset, shape).await;
                     let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
-                        _ if list_view => (&[], &[union_site, "nested-loop-batched"]),
                         // A list position repeating a key sends keep/drop
                         // exact.
                         Shape::Membership if repeats => (&[], &["membership-join"]),
@@ -1518,27 +1445,14 @@ async fn union_probes_answer_by_fact() {
                         _ => (&[union_site], &["nested-loop-batched"]),
                     };
                     check_union_probes(&label(name), &run, &want, fire, not_fire, &mut failures);
-                    // The union probe names why it stood down on the list view.
-                    if list_view
-                        && !run.fell_back.iter().any(|(site, outcome)| {
-                            site == "nested-loop-batched-union" && outcome == "fallback:list_view"
-                        })
-                    {
-                        failures.push(format!(
-                            "{}: no `fallback:list_view` at the union site ({:?})",
-                            label(name),
-                            run.fell_back
-                        ));
-                    }
                 }
                 // Over one graph the one-graph operators answer: the batched
                 // probes for the subject and existence joins (the planner picks
                 // another join for the object shape there), never the union's.
-                let want_g1 = union_probes::expected_on(surface, shape, &g1_facts);
+                let want_g1 = union_probes::expected(shape, &g1_facts);
                 let run =
                     union_probes::run_on(&fx, surface, ledger, "", "FROM <urn:g1>", shape).await;
                 let (fire, not_fire): (&[&str], &[&str]) = match shape.base() {
-                    _ if list_view => (&[], &["nested-loop-batched", "nested-loop-batched-union"]),
                     Shape::Membership if repeats => (&[], &["membership-join"]),
                     Shape::Membership => (&["membership-join"], &[]),
                     Shape::Object => (&[], &["nested-loop-batched-union"]),
@@ -1563,8 +1477,7 @@ async fn union_probes_answer_by_fact() {
 /// predicate, leaves the union probe running. A member the index has no branch
 /// for, whose novelty holds the probed predicate, stands it down (`Novelty`);
 /// for now so does a member with a branch and such novelty. Every answer is the
-/// union's. JSON-LD, where the probed predicate's list members are values and
-/// the probe runs (on SPARQL the list view joins it).
+/// union's, on both surfaces.
 #[tokio::test(flavor = "current_thread")]
 async fn union_probes_follow_each_members_novelty() {
     use union_probes::{fact, Obj, Shape, G2, LEDGER};
@@ -1580,59 +1493,55 @@ async fn union_probes_follow_each_members_novelty() {
     };
     let (from, pragma) = (UNION_SCOPES[0], UNION_SCOPES[1]);
     let union = "nested-loop-batched-union";
-    let json = union_probes::Surface::JsonLd;
 
     // Novelty in g2 on another predicate: g2 holds nothing new for `v`.
     let other = vec![fact(G2, "z", "other", Obj::Int(1))];
     fx.write(LEDGER, &other).await;
     facts.extend(other);
-    let run = union_probes::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
     let want = union_probes::expected(Shape::Subject, &in_g1_g2(&facts));
-    check_union_probes("other predicate", &run, &want, &[union], &[], &mut failures);
+    for &surface in union_probes::SURFACES {
+        let run = union_probes::run_on(&fx, surface, LEDGER, from.1, from.2, Shape::Subject).await;
+        let label = format!("{surface:?} / other predicate");
+        check_union_probes(&label, &run, &want, &[union], &[], &mut failures);
+    }
 
     // Novelty for `v` in the default graph, which the index has no branch
     // for: outside `FROM g1 FROM g2`, a member of the union default graph.
     let default_graph = vec![fact("", "y2", "v", Obj::Str("d".into()))];
     fx.write(LEDGER, &default_graph).await;
     facts.extend(default_graph);
-    let run = union_probes::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
-    let want = union_probes::expected(Shape::Subject, &in_g1_g2(&facts));
-    check_union_probes("novelty outside", &run, &want, &[union], &[], &mut failures);
-    let run = union_probes::run_on(&fx, json, LEDGER, pragma.1, pragma.2, Shape::Subject).await;
-    let want = union_probes::expected(Shape::Subject, &facts);
-    check_union_probes(
-        "branchless member",
-        &run,
-        &want,
-        &[],
-        &[union],
-        &mut failures,
-    );
-    if !run
-        .fell_back
-        .iter()
-        .any(|(s, o)| s == union && o == "fallback:novelty")
-    {
-        failures.push(format!(
-            "branchless member: no `{union}` novelty decline ({:?})",
-            run.fell_back
-        ));
+    let want_from = union_probes::expected(Shape::Subject, &in_g1_g2(&facts));
+    let want_pragma = union_probes::expected(Shape::Subject, &facts);
+    for &surface in union_probes::SURFACES {
+        let run = union_probes::run_on(&fx, surface, LEDGER, from.1, from.2, Shape::Subject).await;
+        let label = format!("{surface:?} / novelty outside");
+        check_union_probes(&label, &run, &want_from, &[union], &[], &mut failures);
+        let run =
+            union_probes::run_on(&fx, surface, LEDGER, pragma.1, pragma.2, Shape::Subject).await;
+        let label = format!("{surface:?} / branchless member");
+        check_union_probes(&label, &run, &want_pragma, &[], &[union], &mut failures);
+        if !run
+            .fell_back
+            .iter()
+            .any(|(s, o)| s == union && o == "fallback:novelty")
+        {
+            failures.push(format!(
+                "{label}: no `{union}` novelty decline ({:?})",
+                run.fell_back
+            ));
+        }
     }
 
     // Novelty for `v` in g2, which has a branch.
     let g2 = vec![fact(G2, "y0", "v", Obj::Dec("4.5"))];
     fx.write(LEDGER, &g2).await;
     facts.extend(g2);
-    let run = union_probes::run_on(&fx, json, LEDGER, from.1, from.2, Shape::Subject).await;
     let want = union_probes::expected(Shape::Subject, &in_g1_g2(&facts));
-    check_union_probes(
-        "member with novelty",
-        &run,
-        &want,
-        &[],
-        &[union],
-        &mut failures,
-    );
+    for &surface in union_probes::SURFACES {
+        let run = union_probes::run_on(&fx, surface, LEDGER, from.1, from.2, Shape::Subject).await;
+        let label = format!("{surface:?} / member with novelty");
+        check_union_probes(&label, &run, &want, &[], &[union], &mut failures);
+    }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -1772,8 +1681,8 @@ async fn encoded_union_rows_keep_each_arena_literal_in_its_graph() {
 }
 
 // ============================================================================
-// The list fixtures (#2159): every union lane over lists in two members, and
-// over a list only novelty holds
+// The list fixtures: every union lane over lists in two members, and over
+// lists only novelty holds
 // ============================================================================
 
 /// The shapes the list fixtures run, and the union site of the lane each
@@ -1791,84 +1700,82 @@ const LIST_SHAPES: &[(Shape, Option<&str>)] = &[
 ];
 
 /// Every lane shape over a list fixture, in every scope whose default graph
-/// is several graphs or none, on both surfaces: the answer with fast paths
-/// on equals the general plan's. Each lane's predicate holds lists, so under
-/// SPARQL's list view each union site either answers as the general plan
-/// does or stands down, and every lane names `fallback:list_view` at least
-/// once; JSON-LD reads members as values, and over lists in two indexed
-/// members every lane's union site answers at least once.
+/// is several graphs or none, on both surfaces, against the hand-written
+/// answer ([`multigraph::list_expected`]) with fast paths on and off. Each
+/// lane's predicate holds lists, whose members both surfaces read as values
+/// (#2217), so the lanes run on them: no run names `fallback:list_view`, SPARQL
+/// routes as JSON-LD does, and over lists two indexed members hold every lane's
+/// union site answers every union scope.
 async fn lanes_over_lists(case: ListCase) {
     let fx = Fixture::build_lists(case).await;
     let mut failures = Vec::new();
     let mut runs = 0;
-    // Per (shape, surface): the outcomes its lane's union site stamped.
-    let mut seen: Vec<(Shape, Surface, String)> = Vec::new();
     for &(shape, site) in LIST_SHAPES {
         for &scope in SCOPES {
             if !scope.applies(fx.state) || !matches!(scope.kind(), Kind::Union | Kind::Empty) {
                 continue;
             }
+            let want = multigraph::list_expected(case, shape, scope.graphs());
+            // The union site's outcomes per surface, to compare the two.
+            let mut routes: Vec<(Surface, Vec<String>)> = Vec::new();
             for surface in [Surface::Sparql, Surface::JsonLd] {
                 if !scope.supports(surface) {
                     continue;
                 }
                 let run = multigraph::run(&fx, scope, shape, surface).await;
                 runs += 1;
-                match (&run.fast, &run.generic) {
-                    (Ok(fast), Ok(generic)) if fast == generic => {}
-                    (fast, generic) => failures.push(format!(
-                        "{}: fast paths on {fast:?}, off {generic:?}",
-                        run.label
-                    )),
-                }
-                if let Some(site) = site {
-                    let outcomes = run
-                        .proceeded
-                        .iter()
-                        .filter(|s| *s == site)
-                        .map(|_| "proceed".to_string())
-                        .chain(
-                            run.fell_back
-                                .iter()
-                                .filter(|(s, _)| s == site)
-                                .map(|(_, o)| o.clone()),
-                        );
-                    for outcome in outcomes {
-                        seen.push((shape, surface, outcome));
+                for (lane, got) in [
+                    ("fast paths on", &run.fast),
+                    ("fast paths off", &run.generic),
+                ] {
+                    match got {
+                        Ok(rows) if *rows == want => {}
+                        Ok(rows) => {
+                            failures
+                                .push(format!("{}: {lane}: {rows:?}, want {want:?}", run.label));
+                        }
+                        Err(e) => failures.push(format!("{}: {lane}: failed: {e}", run.label)),
                     }
                 }
+                if let Some((site, _)) = run
+                    .fell_back
+                    .iter()
+                    .find(|(_, outcome)| outcome == "fallback:list_view")
+                {
+                    failures.push(format!(
+                        "{}: `{site}` names `fallback:list_view`",
+                        run.label
+                    ));
+                }
+                let Some(site) = site else { continue };
+                if case == ListCase::TwoMembers && scope.kind() == Kind::Union {
+                    assert_routing(&run, &[site], &[], &mut failures);
+                }
+                let mut outcomes: Vec<String> = run
+                    .proceeded
+                    .iter()
+                    .filter(|s| *s == site)
+                    .map(|_| "proceed".to_string())
+                    .chain(
+                        run.fell_back
+                            .iter()
+                            .filter(|(s, _)| s == site)
+                            .map(|(_, o)| o.clone()),
+                    )
+                    .collect();
+                outcomes.sort();
+                outcomes.dedup();
+                routes.push((surface, outcomes));
             }
-        }
-    }
-    for &(shape, _) in LIST_SHAPES {
-        for surface in [Surface::Sparql, Surface::JsonLd] {
-            let mut outcomes: Vec<&str> = seen
-                .iter()
-                .filter(|(sh, su, _)| *sh == shape && *su == surface)
-                .map(|(_, _, o)| o.as_str())
-                .collect();
-            outcomes.sort_unstable();
-            outcomes.dedup();
-            eprintln!("{case:?} {shape:?} {surface:?}: {outcomes:?}");
-        }
-    }
-    // Each lane was reached: under SPARQL it named its decline, and over
-    // indexed lists its union site answered JSON-LD.
-    for &(shape, site) in LIST_SHAPES {
-        if site.is_none() {
-            continue;
-        }
-        let stamped = |surface, outcome: &str| {
-            seen.iter()
-                .any(|(sh, su, o)| *sh == shape && *su == surface && o == outcome)
-        };
-        if !stamped(Surface::Sparql, "fallback:list_view") {
-            failures.push(format!("{case:?}: {shape:?} never declined with list_view"));
-        }
-        if case == ListCase::TwoMembers && !stamped(Surface::JsonLd, "proceed") {
-            failures.push(format!(
-                "{case:?}: {shape:?}'s union site never answered JSON-LD"
-            ));
+            if let [(_, sparql), (_, jsonld)] = routes.as_slice() {
+                if sparql != jsonld {
+                    failures.push(format!(
+                        "{case:?} / {} / {}: SPARQL routes {sparql:?}, JSON-LD {jsonld:?}",
+                        shape.name(),
+                        scope.name()
+                    ));
+                }
+            }
         }
     }
     assert!(runs > 0, "no scope ran");
@@ -1890,10 +1797,10 @@ async fn lanes_over_a_list_only_novelty_holds() {
     lanes_over_lists(ListCase::NoveltyOnly).await;
 }
 
-/// SPARQL's list view sees a list only novelty holds: over the union, `L`'s
-/// `items` is the list's head, one blank node, not its two members.
+/// SPARQL reads a list only novelty holds as its members (#2217): over the
+/// union, `L`'s `items` is its two members, `"v"` twice, not the list's head.
 #[tokio::test(flavor = "current_thread")]
-async fn the_list_view_reads_a_list_only_novelty_holds() {
+async fn sparql_reads_the_members_of_a_list_only_novelty_holds() {
     let fx = Fixture::build_lists(ListCase::NoveltyOnly).await;
     let query = format!(
         "PREFIX ex: <{}>\nSELECT ?o FROM <{G1}> FROM <{G2}> WHERE {{ ex:L ex:items ?o }}",
@@ -1911,9 +1818,84 @@ async fn the_list_view_reads_a_list_only_novelty_holds() {
         .as_array()
         .expect("bindings")
         .clone();
-    assert_eq!(bindings.len(), 1, "one owner edge: {bindings:?}");
+    let members: Vec<(&str, &str)> = bindings
+        .iter()
+        .map(|b| {
+            (
+                b["o"]["type"].as_str().unwrap_or_default(),
+                b["o"]["value"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
     assert_eq!(
-        bindings[0]["o"]["type"], "bnode",
-        "the list's head: {bindings:?}"
+        members,
+        [("literal", "v"), ("literal", "v")],
+        "L's two members: {bindings:?}"
     );
+}
+
+/// Where a request still reads lists as their RDF cells (the Graph Store
+/// `GET`'s execution option), a union lane stands down with
+/// `fallback:list_view` and the general plan answers: the per-predicate count
+/// over `FROM g1 FROM g2` sees `L items ("v" "v")` as its owner edge and two
+/// cells, an `rdf:first` and an `rdf:rest` each.
+#[tokio::test(flavor = "current_thread")]
+async fn the_rdf_list_view_stands_the_union_lanes_down() {
+    use fluree_db_api::QueryExecutionOptions;
+    use multigraph::{rows, run_query, sparql_rows, EX, LEDGER};
+    const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
+    const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
+    let fx = Fixture::build(State::Indexed).await;
+    let sparql = format!(
+        "PREFIX ex: <{EX}>\nSELECT ?p (COUNT(?s) AS ?c) FROM <{G1}> FROM <{G2}> \
+         WHERE {{ ?s ?p ?o }} GROUP BY ?p"
+    );
+    let view = fx.view(LEDGER).await;
+    let run = run_query("rdf list view / FROM g1 FROM g2".to_string(), || async {
+        let json = view
+            .query(&fx.fluree)
+            .sparql(&sparql)
+            .execution_options(QueryExecutionOptions::new().with_rdf_list_view(true))
+            .execute_formatted()
+            .await
+            .map_err(|e| format!("{sparql}: {e}"))?;
+        Ok(sparql_rows(&json, &["p", "c"]))
+    })
+    .await;
+    // The multigraph fixture's union over g1 g2, with L's list as RDF.
+    let want = rows(&[
+        &["big", "1"],
+        &["items", "1"],
+        &["kind", "3"],
+        &["knows", "9"],
+        &["label", "2"],
+        &["m", "5"],
+        &["n", "4"],
+        &["only", "1"],
+        &[RDF_FIRST, "2"],
+        &[RDF_REST, "2"],
+    ]);
+    let mut failures = Vec::new();
+    for (lane, got) in [
+        ("fast paths on", &run.fast),
+        ("fast paths off", &run.generic),
+    ] {
+        match got {
+            Ok(rows) if *rows == want => {}
+            Ok(rows) => failures.push(format!("{lane}: {rows:?}, want {want:?}")),
+            Err(e) => failures.push(format!("{lane}: failed: {e}")),
+        }
+    }
+    assert_routing(&run, &[], &[PER_PREDICATE_UNION], &mut failures);
+    let list_view = (
+        PER_PREDICATE_UNION.to_string(),
+        "fallback:list_view".to_string(),
+    );
+    if !run.fell_back.contains(&list_view) {
+        failures.push(format!(
+            "no ListView decline (fell back: {:?})",
+            run.fell_back
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

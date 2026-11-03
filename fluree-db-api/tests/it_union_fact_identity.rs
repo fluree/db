@@ -4,9 +4,9 @@
 //! with a graph that adds nothing answers as the graph alone.
 //!
 //! The cases are the ones where a dedup keyed on the emitted row loses the
-//! fact: the term a constant object matched (through SPARQL), and the list
-//! position (through JSON-LD, which reads a list's members as values; SPARQL
-//! reads the list as RDF, #2159). Each runs before the ledger is indexed (the
+//! fact: the term a constant object matched, and the list position (both
+//! surfaces read a list's members as values, #2217). Each runs before the
+//! ledger is indexed (the
 //! scan reads decoded flakes) and after (it reads index rows), with fast
 //! paths on and off, and every mismatch of every run is reported together.
 //! The kill switch is process-wide: the runs with fast paths on hold the
@@ -93,6 +93,7 @@ async fn check_sparql(fluree: &Fluree, state: &str, failures: &mut Vec<String>) 
     let int = "integer";
     let one_a = format!("o=1^^{int};s=a");
     let one_b = format!("o=1^^{int};s=b");
+    let five_d = format!("o=5^^{int};s=d");
     let cases: Vec<(&str, &str, Vec<String>)> = vec![
         // A bare number matches 1 and 1.0e0: two facts of a.
         (
@@ -126,28 +127,38 @@ async fn check_sparql(fluree: &Fluree, state: &str, failures: &mut Vec<String>) 
             G1_G2,
             want(&[&one_a, "o=1.0E0^^double;s=a", &one_b]),
         ),
-        // SPARQL reads a list as the RDF it denotes (#2159): its members are
-        // not values of `ex:q`, and `?s ex:q ?o` binds the list's head cell.
-        // Each graph's list is a list of its own, so g1 and g2 give two
-        // heads. The list-position identity is the JSON-LD twin's
-        // ([`check_jsonld`]), which reads the members as values.
-        ("SELECT ?s {ds} WHERE { ?s ex:q 5 }", G1, want(&[])),
-        ("SELECT ?s {ds} WHERE { ?s ex:q 5 }", G1_EMPTY, want(&[])),
-        ("SELECT ?s {ds} WHERE { ?s ex:q 5 }", G1_G2, want(&[])),
+        // A list's members are values of `ex:q` (#2217), a fact per list
+        // position: g1's `d q (5 5 7)` repeats 5, two facts, and g2's
+        // `d q (5)` is g1's first member.
+        (
+            "SELECT ?s {ds} WHERE { ?s ex:q 5 }",
+            G1,
+            want(&["s=d", "s=d"]),
+        ),
+        (
+            "SELECT ?s {ds} WHERE { ?s ex:q 5 }",
+            G1_EMPTY,
+            want(&["s=d", "s=d"]),
+        ),
+        (
+            "SELECT ?s {ds} WHERE { ?s ex:q 5 }",
+            G1_G2,
+            want(&["s=d", "s=d"]),
+        ),
         (
             "SELECT (COUNT(?s) AS ?c) {ds} WHERE { ?s ex:q 5 }",
             G1_EMPTY,
-            want(&["c=0^^integer"]),
+            want(&["c=2^^integer"]),
         ),
         (
             "SELECT ?s ?o {ds} WHERE { ?s ex:q ?o }",
             G1_EMPTY,
-            want(&["o=l0-0;s=d"]),
+            want(&[&five_d, &five_d, "o=7^^integer;s=d"]),
         ),
         (
             "SELECT ?s ?o {ds} WHERE { ?s ex:q ?o }",
             G1_G2,
-            want(&["o=l0-0;s=d", "o=l1-0;s=d"]),
+            want(&[&five_d, &five_d, "o=7^^integer;s=d"]),
         ),
         // A ground pattern: one empty solution per fact it matches.
         (
@@ -180,9 +191,9 @@ async fn check_sparql(fluree: &Fluree, state: &str, failures: &mut Vec<String>) 
     }
 }
 
-/// The list cases in JSON-LD, which reads a list's members as values of its
-/// predicate, through the connection. The list repeats 5: two facts, one per
-/// list position, and g2's first item is g1's first item.
+/// The list cases in JSON-LD, through the connection: the SPARQL cases' answer
+/// counts. The list repeats 5: two facts, one per list position, and g2's
+/// first item is g1's first item.
 async fn check_jsonld(fluree: &Fluree, state: &str, failures: &mut Vec<String>) {
     let query = |graphs: &[&str], object: JsonValue, select: &[&str]| {
         let from: Vec<String> = graphs.iter().map(|g| format!("{LEDGER}#{g}")).collect();
