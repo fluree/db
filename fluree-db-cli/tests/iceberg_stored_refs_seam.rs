@@ -271,6 +271,19 @@ async fn a_db_server_refuses_a_reference_and_registers_nothing() {
             "{refs:?}: {}",
             run.stderr
         );
+        // The command's context and the server's refusal make one message.
+        assert_eq!(
+            run.stderr.matches("error:").count(),
+            1,
+            "{refs:?}: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .contains("failed to map Iceberg graph source on 'origin': bad request:"),
+            "{refs:?}: {}",
+            run.stderr
+        );
     }
     assert!(state
         .fluree
