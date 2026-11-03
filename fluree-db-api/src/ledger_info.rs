@@ -205,6 +205,16 @@ pub struct PropertyStat {
     /// Flake/row count. `null` when unknown (virtual dataset, no scan).
     #[serde(default)]
     pub count: Option<i64>,
+    /// An upper bound on the true count, given when `count` is `null` because
+    /// it cannot be known from metadata but a bound can (a virtual source's
+    /// triples map that keeps only some of its table's rows contributes its
+    /// table's row count). The true count is at most this. Omitted otherwise.
+    #[serde(
+        rename = "count-upper-bound",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub count_upper_bound: Option<i64>,
     /// Native-only: most recent modifying `t`. Omitted for virtual datasets.
     #[serde(
         rename = "last-modified-t",
@@ -259,6 +269,16 @@ pub struct ClassInfo {
     /// Instance/row count. `null` when unknown (virtual dataset, no scan).
     #[serde(default)]
     pub count: Option<i64>,
+    /// An upper bound on the true count, given when `count` is `null` because
+    /// it cannot be known from metadata but a bound can; see
+    /// [`PropertyStat::count_upper_bound`]. The true count is at most this.
+    /// Omitted otherwise.
+    #[serde(
+        rename = "count-upper-bound",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub count_upper_bound: Option<i64>,
     /// Native-only schema hierarchy parents. Omitted when empty.
     #[serde(rename = "subclass-of", default, skip_serializing_if = "Vec::is_empty")]
     pub subclass_of: Vec<String>,
@@ -1385,14 +1405,104 @@ fn object_map_datatype(object_map: &ObjectMap) -> String {
 
 #[derive(Default)]
 struct PropertyAgg {
-    count: Option<i64>,
-    datatypes: BTreeMap<String, Option<i64>>,
+    count: CountAgg,
+    datatypes: BTreeMap<String, CountAgg>,
     /// FK relationship targets (`ref-classes`): for a ref (RefObjectMap)
     /// predicate, the parent triples-map's class IRI(s) → accumulated child row
     /// count. Empty for literal-column properties. Only the per-class
     /// aggregation populates this; the flat `stats.properties` view has no
     /// `ref-classes` field and leaves it empty.
-    ref_classes: BTreeMap<String, Option<i64>>,
+    ref_classes: BTreeMap<String, CountAgg>,
+}
+
+/// What one triples map contributes to a virtual count: its table's row count
+/// when every row yields one subject (`Exact`), or only a bound on it when the
+/// map keeps some of its table's rows (`AtMost`, an `rr:sqlQuery` with a
+/// `WHERE`). `None` inside either is an unknown row count.
+#[derive(Clone, Copy, Debug)]
+enum MapRows {
+    Exact(Option<i64>),
+    AtMost(Option<i64>),
+}
+
+/// A virtual count summed over the triples maps that contribute to it.
+///
+/// Exact contributions sum as before (an unknown one is skipped, so a known
+/// partial sum survives). Once any contribution is only a bound, the count is
+/// unknown, and the sum of every contribution's bound is reported as
+/// `count-upper-bound` instead, when every one of them is known.
+#[derive(Clone, Copy, Debug, Default)]
+struct CountAgg {
+    exact: Option<i64>,
+    bounded: bool,
+    upper: Option<i64>,
+    upper_unknown: bool,
+}
+
+impl CountAgg {
+    fn add(&mut self, rows: MapRows) {
+        let n = match rows {
+            MapRows::Exact(n) => {
+                self.exact = add_row_counts(self.exact, n);
+                n
+            }
+            MapRows::AtMost(n) => {
+                self.bounded = true;
+                n
+            }
+        };
+        match n {
+            Some(n) => self.upper = Some(self.upper.unwrap_or(0) + n),
+            None => self.upper_unknown = true,
+        }
+    }
+
+    /// `(count, count-upper-bound)`.
+    fn finish(self) -> (Option<i64>, Option<i64>) {
+        if self.bounded {
+            (None, self.upper.filter(|_| !self.upper_unknown))
+        } else {
+            (self.exact, None)
+        }
+    }
+
+    /// The count alone, for a map with no bound field (`null` when unknown).
+    fn count(self) -> Option<i64> {
+        self.finish().0
+    }
+}
+
+/// How a triples map's rows relate to its table, from the mapping alone: the
+/// table a virtual source reads, and whether every row of it yields a subject.
+///
+/// An `rr:sqlQuery` in the restricted subset an Iceberg source evaluates reads
+/// its `FROM` table; with a `WHERE` it keeps only some rows, so its row count is
+/// a bound. A query outside the subset (one a SQL engine runs) names no table
+/// the counts know, and bounds nothing.
+fn map_source(tm: &fluree_db_r2rml::mapping::TriplesMap) -> (Option<String>, bool) {
+    match tm.sql_query() {
+        None => (tm.table_name().map(str::to_string), true),
+        Some(sql) => match fluree_db_r2rml::mapping::RestrictedSelect::parse(sql) {
+            Ok(select) => {
+                let exact = select.conditions.is_empty();
+                (Some(select.table), exact)
+            }
+            Err(_) => (None, false),
+        },
+    }
+}
+
+/// The distinct tables a mapping's triples maps read, sorted: an `rr:sqlQuery`
+/// map's `FROM` table rather than its query alias.
+pub(crate) fn mapping_source_tables(mapping: &CompiledR2rmlMapping) -> Vec<String> {
+    let mut tables: Vec<String> = mapping
+        .triples_maps
+        .values()
+        .filter_map(|tm| map_source(tm).0)
+        .collect();
+    tables.sort();
+    tables.dedup();
+    tables
 }
 
 /// Build the native-shaped [`LedgerInfo`] for a virtual (query-in-place)
@@ -1418,7 +1528,7 @@ pub fn build_virtual_ledger_info(
     // class's properties; without it they saw only @id.
     #[derive(Default)]
     struct ClassAgg {
-        count: Option<i64>,
+        count: CountAgg,
         properties: BTreeMap<String, PropertyAgg>,
     }
     let mut classes: BTreeMap<String, ClassAgg> = BTreeMap::new();
@@ -1427,10 +1537,15 @@ pub fn build_virtual_ledger_info(
     if let Some(mapping) = mapping {
         for tm in mapping.triples_maps.values() {
             // One row -> one subject: the class/property counts of a triples map
-            // are the row count of its logical table.
-            let rows = tm
-                .table_name()
-                .and_then(|t| table_row_counts.get(t).copied());
+            // are the row count of its logical table, or bounded by it when the
+            // map keeps only some of the table's rows.
+            let (table, exact) = map_source(tm);
+            let table_rows = table.and_then(|t| table_row_counts.get(&t).copied());
+            let rows = if exact {
+                MapRows::Exact(table_rows)
+            } else {
+                MapRows::AtMost(table_rows)
+            };
 
             // The named predicates this triples map contributes (with datatypes).
             // Only constant predicates can be named without reading data.
@@ -1454,6 +1569,10 @@ pub fn build_virtual_ledger_info(
             // `classes()` rather than its `table_name()`. The ref predicate's
             // `@id` datatype already flows through `poms` above; this adds the
             // per-target-class counts the native `/info` carries.
+            //
+            // A parent that keeps only some of its table's rows drops the
+            // references to the rows it leaves out (no join partner, no
+            // triple), so the child's row count only bounds that predicate.
             let ref_targets: Vec<(String, Vec<String>)> = tm
                 .predicate_object_maps
                 .iter()
@@ -1466,16 +1585,35 @@ pub fn build_virtual_ledger_info(
                     Some((pred.to_string(), parent.classes().to_vec()))
                 })
                 .collect();
+            let bounded_refs: std::collections::BTreeSet<&str> = tm
+                .predicate_object_maps
+                .iter()
+                .filter_map(|pom| {
+                    let ObjectMap::RefObjectMap(rom) = &pom.object_map else {
+                        return None;
+                    };
+                    let parent = mapping.get(&rom.parent_triples_map)?;
+                    (!map_source(parent).1)
+                        .then(|| pom.predicate_map.as_constant())
+                        .flatten()
+                })
+                .collect();
+            let pred_rows = |pred: &str| match rows {
+                MapRows::Exact(n) if bounded_refs.contains(pred) => MapRows::AtMost(n),
+                rows => rows,
+            };
 
             for class in tm.classes() {
                 let cls = classes.entry(class.clone()).or_default();
-                cls.count = add_row_counts(cls.count, rows);
+                cls.count.add(rows);
                 // Per-class property membership (mirrors the native class->property map).
                 for (pred, datatype) in &poms {
                     let agg = cls.properties.entry(pred.clone()).or_default();
-                    agg.count = add_row_counts(agg.count, rows);
-                    let dt_entry = agg.datatypes.entry(datatype.clone()).or_insert(None);
-                    *dt_entry = add_row_counts(*dt_entry, rows);
+                    agg.count.add(pred_rows(pred));
+                    agg.datatypes
+                        .entry(datatype.clone())
+                        .or_default()
+                        .add(pred_rows(pred));
                 }
                 // Per-class FK relationship targets: accumulate the child row count
                 // onto each ref predicate's target class(es). The predicate entry
@@ -1484,18 +1622,20 @@ pub fn build_virtual_ledger_info(
                 for (pred, targets) in &ref_targets {
                     let agg = cls.properties.entry(pred.clone()).or_default();
                     for target_class in targets {
-                        let rc_entry = agg.ref_classes.entry(target_class.clone()).or_insert(None);
-                        *rc_entry = add_row_counts(*rc_entry, rows);
+                        agg.ref_classes
+                            .entry(target_class.clone())
+                            .or_default()
+                            .add(pred_rows(pred));
                     }
                 }
             }
 
             // Flat, dataset-wide property stats (`stats.properties`), unchanged.
             for (pred, datatype) in poms {
+                let rows = pred_rows(&pred);
                 let agg = properties.entry(pred).or_default();
-                agg.count = add_row_counts(agg.count, rows);
-                let dt_entry = agg.datatypes.entry(datatype).or_insert(None);
-                *dt_entry = add_row_counts(*dt_entry, rows);
+                agg.count.add(rows);
+                agg.datatypes.entry(datatype).or_default().add(rows);
             }
         }
     }
@@ -1519,21 +1659,29 @@ pub fn build_virtual_ledger_info(
                     (
                         piri,
                         PropertyInfo {
-                            types: pagg.datatypes,
+                            types: pagg
+                                .datatypes
+                                .into_iter()
+                                .map(|(dt, count)| (dt, count.count()))
+                                .collect(),
                             langs: BTreeMap::new(),
                             ref_classes: pagg
                                 .ref_classes
                                 .into_iter()
-                                .map(|(target_class, count)| (target_class, count.unwrap_or(0)))
+                                .map(|(target_class, count)| {
+                                    (target_class, count.count().unwrap_or(0))
+                                })
                                 .collect(),
                         },
                     )
                 })
                 .collect();
+            let (count, count_upper_bound) = agg.count.finish();
             (
                 iri,
                 ClassInfo {
-                    count: agg.count,
+                    count,
+                    count_upper_bound,
                     subclass_of: Vec::new(),
                     properties: props,
                     // Native emits an ordered `property-list`; a virtual dataset
@@ -1548,12 +1696,19 @@ pub fn build_virtual_ledger_info(
     let properties: BTreeMap<String, PropertyStat> = properties
         .into_iter()
         .map(|(iri, agg)| {
+            let (count, count_upper_bound) = agg.count.finish();
             (
                 iri,
                 PropertyStat {
-                    count: agg.count,
+                    count,
+                    count_upper_bound,
                     last_modified_t: None,
-                    datatypes: Some(agg.datatypes),
+                    datatypes: Some(
+                        agg.datatypes
+                            .into_iter()
+                            .map(|(dt, count)| (dt, count.count()))
+                            .collect(),
+                    ),
                     ndv_values: None,
                     ndv_subjects: None,
                     selectivity_value: None,
@@ -2057,9 +2212,11 @@ async fn build_iceberg_virtual_info(
     };
 
     // Distinct tables: union of the mapping's tables and the config's own table.
+    // An `rr:sqlQuery` map reads its `FROM` table: list (and count) that, never
+    // the query's alias.
     let mut tables: Vec<String> = mapping
         .as_deref()
-        .map(|m| m.table_names().into_iter().map(str::to_string).collect())
+        .map(mapping_source_tables)
         .unwrap_or_default();
     if let Some(cfg) = cfg.as_ref() {
         meta.model = cfg.model.clone();
@@ -2214,6 +2371,7 @@ fn decode_graph_property_stats(
             compacted,
             PropertyStat {
                 count: Some(entry.count as i64),
+                count_upper_bound: None,
                 last_modified_t: Some(entry.last_modified_t),
                 datatypes,
                 ndv_values,
@@ -2325,6 +2483,7 @@ fn decode_class_stats(
             compacted,
             ClassInfo {
                 count: Some(entry.count as i64),
+                count_upper_bound: None,
                 subclass_of,
                 properties,
                 // Native always emits `property-list` (possibly empty).
@@ -3927,6 +4086,134 @@ mod tests {
 
         let golden: JsonValue = serde_json::from_str(GOLDEN_VIRTUAL_NULL).unwrap();
         assert_eq!(got, golden, "typed LedgerInfo drifted from golden (null)");
+    }
+
+    /// A filtered map (an `rr:sqlQuery` with a `WHERE`) keeps only some of its
+    /// table's rows, so no metadata knows its count: every count it contributes
+    /// to is `null`, with `count-upper-bound` the sum of the contributing maps'
+    /// table row counts. A reference into a filtered parent is bounded too (a
+    /// child row whose parent the filter drops yields no triple). Unfiltered
+    /// counts keep their value and carry no bound.
+    #[test]
+    fn test_virtual_ledger_info_filtered_map_counts_are_bounds() {
+        let ttl = r#"
+            @base <http://ex.org/map/> .
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://ex.org/> .
+            <#Current> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/customer/{customer_id}" ; rr:class ex:Customer ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+            <#Archived> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "crm.customers_archive" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/archived/{customer_id}" ; rr:class ex:Customer ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+            <#Order> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "crm.orders" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/order/{order_id}" ; rr:class ex:Order ] ;
+                rr:predicateObjectMap [ rr:predicate ex:total ; rr:objectMap [ rr:column "total" ] ] ;
+                rr:predicateObjectMap [ rr:predicate ex:customer ; rr:objectMap [
+                    rr:parentTriplesMap <#Current> ;
+                    rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] .
+        "#;
+        let mapping = fluree_db_r2rml::R2rmlLoader::from_turtle(ttl)
+            .unwrap()
+            .compile()
+            .unwrap();
+        assert_eq!(
+            mapping_source_tables(&mapping),
+            [
+                "crm.customers_archive",
+                "crm.customers_history",
+                "crm.orders"
+            ],
+            "a query map lists its FROM table, never its alias"
+        );
+        let counts: HashMap<String, i64> = [
+            ("crm.customers_history", 10),
+            ("crm.customers_archive", 3),
+            ("crm.orders", 7),
+        ]
+        .into_iter()
+        .map(|(t, n)| (t.to_string(), n))
+        .collect();
+        let record = virtual_record("{}");
+        let info = serde_json::to_value(build_virtual_ledger_info(
+            &record,
+            Some(&mapping),
+            &iceberg_meta(),
+            &counts,
+        ))
+        .unwrap();
+        let stats = &info["stats"];
+        let customer = &stats["classes"]["http://ex.org/Customer"];
+        assert_eq!(customer["count"], JsonValue::Null, "{customer}");
+        assert_eq!(customer["count-upper-bound"], 13, "{customer}");
+        assert_eq!(
+            customer["properties"]["http://ex.org/name"]["types"]["xsd:string"],
+            JsonValue::Null
+        );
+        let order = &stats["classes"]["http://ex.org/Order"];
+        assert_eq!(
+            order["count"], 7,
+            "an unfiltered child keeps its exact count"
+        );
+        assert!(order.get("count-upper-bound").is_none(), "{order}");
+        let customer_ref = &order["properties"]["http://ex.org/customer"];
+        assert_eq!(
+            customer_ref["types"]["@id"],
+            JsonValue::Null,
+            "{customer_ref}"
+        );
+        assert_eq!(
+            order["properties"]["http://ex.org/total"]["types"]["xsd:string"],
+            7
+        );
+        let props = &stats["properties"];
+        assert_eq!(props["http://ex.org/customer"]["count"], JsonValue::Null);
+        assert_eq!(props["http://ex.org/customer"]["count-upper-bound"], 7);
+        assert_eq!(props["http://ex.org/name"]["count"], JsonValue::Null);
+        assert_eq!(props["http://ex.org/name"]["count-upper-bound"], 13);
+        assert_eq!(props["http://ex.org/total"]["count"], 7);
+        assert!(props["http://ex.org/total"]
+            .get("count-upper-bound")
+            .is_none());
+
+        // A bound needs every contributing table's count.
+        let mut partial = counts.clone();
+        partial.remove("crm.customers_archive");
+        let info = serde_json::to_value(build_virtual_ledger_info(
+            &record,
+            Some(&mapping),
+            &iceberg_meta(),
+            &partial,
+        ))
+        .unwrap();
+        let customer = &info["stats"]["classes"]["http://ex.org/Customer"];
+        assert_eq!(customer["count"], JsonValue::Null, "{customer}");
+        assert!(customer.get("count-upper-bound").is_none(), "{customer}");
+
+        // Merged into a native ledger's `/info`, the graph source's entry
+        // (bound included) replaces the native one.
+        let native: LedgerInfo = serde_json::from_value(serde_json::json!({
+            "ledger": {"alias":"ds","t":7,"commit-t":7,"index-t":7,"flakes":10,"size":0,
+                       "named-graphs":[{"iri":"urn:default","g-id":0,"flakes":10,"size":0}]},
+            "graph": "default",
+            "stats": {"flakes":10,"size":0,
+                      "classes":{"http://ex.org/Customer":{"count":5}},
+                      "properties":{}},
+            "commit": null
+        }))
+        .unwrap();
+        let virt = build_virtual_ledger_info(&record, Some(&mapping), &iceberg_meta(), &counts);
+        let merged = merge_virtual_into_native(native, virt);
+        let merged_customer = &merged.stats.classes["http://ex.org/Customer"];
+        assert_eq!(merged_customer.count, None);
+        assert_eq!(merged_customer.count_upper_bound, Some(13));
+        assert_eq!(
+            merged.stats.properties["http://ex.org/name"].count_upper_bound,
+            Some(13)
+        );
     }
 
     /// The typed `LedgerInfo` round-trips through JSON (so solo / conformance can
