@@ -18,6 +18,8 @@ thiserror = { workspace = true }
 csv = "1.4"
 fluree-doc-xlsx.workspace = true
 sqlparser = "0.63"
+# `ontology from`: semantic-layer YAML (Snowflake semantic views; dbt next)
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

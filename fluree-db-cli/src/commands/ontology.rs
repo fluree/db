@@ -11,7 +11,7 @@
 
 use crate::cli::{
     CatalogAction, CatalogFromArgs, OntologyAction, OntologyCheckArgs, OntologyFromArgs,
-    OntologyInputFormat, OntologyOutputFormat,
+    OntologyFromFormat, OntologyInputFormat, OntologyOutputFormat,
 };
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
@@ -24,7 +24,7 @@ use fluree_db_ontology::read::Quad;
 use fluree_db_ontology::vocab::{WELL_KNOWN_PREFIXES, XT_INSTANCES};
 use fluree_db_ontology::write::{self, OutputFormat};
 use fluree_db_ontology::{check, CheckOptions, Finding, RdfFormat, Report};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
@@ -304,11 +304,29 @@ enum Source {
     Csv,
     Workbook,
     Sql,
+    /// YAML, read by what it holds: an Ossie document, dbt, or a Snowflake
+    /// semantic view
+    Yaml,
+    Snowflake,
+    Genie,
+    Dbt,
+    Ossie,
 }
 
-fn source(path: &Path, flag: Option<OntologyInputFormat>) -> Source {
-    if flag.is_some() {
-        return Source::Rdf;
+fn source(path: &Path, flag: Option<OntologyFromFormat>) -> Source {
+    match flag {
+        Some(OntologyFromFormat::Turtle | OntologyFromFormat::Jsonld) => return Source::Rdf,
+        Some(OntologyFromFormat::Csv) => return Source::Csv,
+        Some(OntologyFromFormat::Xlsx) => return Source::Workbook,
+        Some(OntologyFromFormat::Sql) => return Source::Sql,
+        Some(OntologyFromFormat::Snowflake) => return Source::Snowflake,
+        Some(OntologyFromFormat::Genie) => return Source::Genie,
+        Some(OntologyFromFormat::Dbt) => return Source::Dbt,
+        Some(OntologyFromFormat::Ossie) => return Source::Ossie,
+        None => {}
+    }
+    if path.is_dir() {
+        return Source::Dbt;
     }
     let ext = path
         .extension()
@@ -318,8 +336,91 @@ fn source(path: &Path, flag: Option<OntologyInputFormat>) -> Source {
         Some("csv" | "tsv") => Source::Csv,
         Some("xlsx" | "xlsm") => Source::Workbook,
         Some("sql" | "ddl") => Source::Sql,
+        Some("yaml" | "yml") => Source::Yaml,
+        // Genie exports and Ossie documents are JSON too; anything else JSON is JSON-LD
+        Some("json") => match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        {
+            Some(v) if convert::semantic::is_genie(&v) => Source::Genie,
+            Some(v) if convert::ossie::is_semantic_model(&v) || convert::ossie::is_ontology(&v) => {
+                Source::Ossie
+            }
+            _ => Source::Rdf,
+        },
         _ => Source::Rdf,
     }
+}
+
+/// A YAML or JSON document.
+fn read_document(path: &Path) -> CliResult<serde_json::Value> {
+    convert::parse_document(&read_text(path)?)
+        .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))
+}
+
+/// A dbt project read from its directory: the YAML files that hold semantic
+/// models or model properties (`target/`, `dbt_packages/` and the like passed
+/// over), the `{% docs %}` blocks of its Markdown, and the files that couldn't
+/// be read (noted, never skipped silently).
+struct DbtProject {
+    files: Vec<(String, String)>,
+    blocks: HashMap<String, String>,
+    notes: Vec<String>,
+}
+
+fn dbt_project(dir: &Path) -> CliResult<DbtProject> {
+    let mut project = DbtProject {
+        files: Vec::new(),
+        blocks: HashMap::new(),
+        notes: Vec::new(),
+    };
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = std::fs::read_dir(&d)
+            .map_err(|e| CliError::Input(format!("failed to read {}: {e}", d.display())))?;
+        let mut paths: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                if !name.starts_with('.')
+                    && !matches!(name, "target" | "dbt_packages" | "node_modules" | "logs")
+                {
+                    stack.push(path);
+                }
+            } else if name.ends_with(".md") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    project.blocks.extend(convert::dbt::doc_blocks(&text));
+                }
+            } else if name.ends_with(".yml") || name.ends_with(".yaml") {
+                let shown = path.display().to_string();
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    project
+                        .notes
+                        .push(format!("{shown}: skipped, not readable as text"));
+                    continue;
+                };
+                // a .yml is YAML, even when it opens with `{`
+                match convert::from_yaml::<serde_json::Value>(&text) {
+                    Ok(doc) if convert::dbt::is_dbt(&doc) => project.files.push((shown, text)),
+                    Ok(_) => {}
+                    Err(e) => project
+                        .notes
+                        .push(format!("{shown}: skipped, not valid YAML ({e})")),
+                }
+            }
+        }
+    }
+    if project.files.is_empty() {
+        return Err(CliError::Input(format!(
+            "{}: no dbt semantic models or model properties found",
+            dir.display()
+        )));
+    }
+    Ok(project)
 }
 
 fn file_stem(path: &Path) -> String {
@@ -334,9 +435,15 @@ fn default_base(path: &Path) -> String {
     format!("https://example.com/{}/", convert::slug(&file_stem(path)))
 }
 
-/// A prefix for the minted namespace: the file name's letters, else `ex`.
-fn base_prefix(path: &Path) -> String {
-    let letters: String = file_stem(path)
+/// A prefix for the minted namespace: its last path segment's letters
+/// (`shop` for `https://example.com/shop/`), else `ex`.
+fn base_prefix(base: &str) -> String {
+    let segment = base
+        .trim_end_matches(['/', '#', ':'])
+        .rsplit(['/', '#', ':'])
+        .next()
+        .unwrap_or_default();
+    let letters: String = segment
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect::<String>()
@@ -400,29 +507,95 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
         .clone()
         .unwrap_or_else(|| default_base(&args.file));
     let mut notes = Vec::new();
-    let model = match kind {
+    let failed =
+        |e: &dyn std::fmt::Display| CliError::Input(format!("{}: {e}", args.file.display()));
+    let tables = |model: convert::Model| convert::emit(&model, &EmitOptions { base: base.clone() });
+    let kind = match kind {
+        Source::Yaml => {
+            let doc = read_document(&args.file)?;
+            if convert::ossie::is_semantic_model(&doc) || convert::ossie::is_ontology(&doc) {
+                Source::Ossie
+            } else if convert::dbt::is_dbt(&doc) {
+                Source::Dbt
+            } else {
+                Source::Snowflake
+            }
+        }
+        other => other,
+    };
+    let out = match kind {
         Source::Sql => {
-            let (model, skipped) = convert::sql::read(&read_text(&args.file)?)
-                .map_err(|e| CliError::Input(format!("{}: {e}", args.file.display())))?;
+            let (model, skipped) =
+                convert::sql::read(&read_text(&args.file)?).map_err(|e| failed(&e))?;
             if skipped > 0 {
                 notes.push(format!(
                     "{skipped} statement(s) no SQL dialect could parse were skipped"
                 ));
             }
-            model
+            tables(model)
         }
-        _ => tabular::model(&read_sheets(&args.file)?, args.enum_max),
+        Source::Snowflake => tables(
+            convert::semantic::from_snowflake(&read_text(&args.file)?).map_err(|e| failed(&e))?,
+        ),
+        Source::Genie => {
+            let export = read_document(&args.file)?;
+            let comments = args.comments.as_deref().map(read_document).transpose()?;
+            if comments.is_none() {
+                notes.push(
+                    "a Genie export has no descriptions; pass Unity Catalog's comments with --comments"
+                        .into(),
+                );
+            }
+            tables(
+                convert::semantic::from_genie(&export, comments.as_ref())
+                    .map_err(|e| failed(&e))?,
+            )
+        }
+        Source::Dbt => {
+            let project = if args.file.is_dir() {
+                dbt_project(&args.file)?
+            } else {
+                DbtProject {
+                    files: vec![(args.file.display().to_string(), read_text(&args.file)?)],
+                    blocks: HashMap::new(),
+                    notes: Vec::new(),
+                }
+            };
+            notes.extend(project.notes);
+            let (model, left_out) = convert::dbt::read(&project.files, &project.blocks);
+            if model.tables.is_empty() {
+                return Err(failed(&"no dbt semantic models or model properties"));
+            }
+            if left_out > 0 {
+                notes.push(format!(
+                    "{left_out} column(s) of models that semantic models stand for were left out (no relation or accepted values, and no semantic model uses them)"
+                ));
+            }
+            tables(model)
+        }
+        Source::Ossie => {
+            let doc = convert::ossie::document(&read_text(&args.file)?).map_err(|e| failed(&e))?;
+            if convert::ossie::is_ontology(&doc) {
+                convert::ossie::ontology(&doc, &base)
+            } else if convert::ossie::is_semantic_model(&doc) {
+                tables(convert::ossie::semantic_model(&doc))
+            } else {
+                return Err(failed(
+                    &"not an Ossie semantic model (`datasets:`) or ontology (`ontology:`)",
+                ));
+            }
+        }
+        _ => tables(tabular::model(&read_sheets(&args.file)?, args.enum_max)),
     };
-    let out = convert::emit(&model, &EmitOptions { base: base.clone() });
     // an empty ontology is never a result: say what was found instead
     if out.classes == 0 {
         return Err(CliError::Input(format!(
-            "{}: no tables found to make classes from",
+            "{}: no classes found to make an ontology from",
             args.file.display()
         )));
     }
     notes.extend(out.notes.iter().cloned());
-    let declared = vec![(base_prefix(&args.file), base.clone())];
+    let declared = vec![(base_prefix(&base), base.clone())];
     let format = output_format(args.format);
     match &args.catalog_out {
         Some(path) => {
@@ -458,7 +631,7 @@ fn run_from_tables(args: &OntologyFromArgs, kind: Source) -> CliResult<()> {
     if out.enum_classes > 0 {
         summary.push_str(&format!(
             "; {} made {}, with {}",
-            count(out.enum_classes, "enumerated column", "enumerated columns"),
+            count(out.enum_classes, "enumeration", "enumerations"),
             if out.enum_classes == 1 {
                 "a class"
             } else {
@@ -493,7 +666,12 @@ fn run_from(args: &OntologyFromArgs) -> CliResult<()> {
     if kind != Source::Rdf {
         return run_from_tables(args, kind);
     }
-    let (parsed, _) = parse_file(&args.file, args.input_format)?;
+    let rdf_format = match args.input_format {
+        Some(OntologyFromFormat::Turtle) => Some(OntologyInputFormat::Turtle),
+        Some(OntologyFromFormat::Jsonld) => Some(OntologyInputFormat::Jsonld),
+        _ => None,
+    };
+    let (parsed, _) = parse_file(&args.file, rdf_format)?;
     let out = write::rewrite(&parsed, &args.seed, args.depth)
         .map_err(|e| CliError::Usage(e.to_string()))?;
     let prefixes = write::used_prefixes(&out.quads, &parsed.prefixes);
@@ -593,7 +771,7 @@ fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
         base: base.clone(),
     };
     let out = catalog::from_sheet(sheet, &options).map_err(|e| CliError::Usage(e.to_string()))?;
-    declared.push((base_prefix(&args.file), base.clone()));
+    declared.push((base_prefix(&base), base.clone()));
     emit(
         &out.quads,
         &write::used_prefixes(&out.quads, &declared),
@@ -649,4 +827,22 @@ fn run_catalog_from(args: &CatalogFromArgs) -> CliResult<()> {
         eprintln!("class minted as <{class}>; pass --ontology to use your ontology's class");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prefix_is_named_for_the_namespace() {
+        assert_eq!(base_prefix("https://example.com/shop/"), "shop");
+        assert_eq!(base_prefix("https://example.com/crm#"), "crm");
+        assert_eq!(base_prefix("urn:acme:crm:"), "crm");
+        // a segment that isn't a usable prefix falls back to ex
+        assert_eq!(base_prefix("https://example.com/2026/"), "ex");
+        assert_eq!(
+            base_prefix("https://example.com/a-very-long-namespace-name/"),
+            "ex"
+        );
+    }
 }
