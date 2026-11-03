@@ -534,7 +534,8 @@ async fn run_extraction(
 
 /// A reader's account of a document in the shape the language-model path
 /// reports and commits: its nodes, and counts in the same columns.
-fn read_extracted(mut read: doc_reader::Read) -> Extracted {
+fn read_extracted(mut read: doc_reader::Read, relations: RelationMode) -> Extracted {
+    read.relations = fluree_db_doc::reader::reading::apply_relations(&mut read.nodes, relations);
     let stats = fluree_db_doc::extract::ExtractionStats {
         llm_mentions: read.mentions,
         entities_known: read.linked.len(),
@@ -766,8 +767,10 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         let (doc, extracted) = match &extraction {
             Some(Extraction {
                 reader: Some(reader),
+                policy,
                 ..
             }) => {
+                let reader_relations = policy.relations;
                 let reader = reader.clone();
                 let out_dir = args.out_dir.clone();
                 let (doc, read) = tokio::task::spawn_blocking(move || {
@@ -777,7 +780,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 .await
                 .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
                 match read {
-                    Ok(read) => (doc, Some(read_extracted(read))),
+                    Ok(read) => (doc, Some(read_extracted(read, reader_relations))),
                     Err(e) => {
                         println!("  {} {label}  reading: {e}", "✗".red());
                         totals.failed += 1;

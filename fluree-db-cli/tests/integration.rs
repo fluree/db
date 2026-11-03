@@ -7257,3 +7257,44 @@ fn doc_reader_configured_with_config_set_reads() {
         ));
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
+
+/// `--relations` holds for a reader as for the language model: `off` keeps
+/// no relation and no edge, `reified` keeps the relation but not its edge.
+#[test]
+fn doc_ingest_reader_honours_relations_off_and_reified() {
+    let edge =
+        "SELECT ?s WHERE { ?s <https://schema.org/worksFor> <https://example.org/org/acme> }";
+    let relation = "SELECT ?r WHERE { ?r a <https://ns.flur.ee/doc#Relation> }";
+    for (mode, edges, relations) in [("off", 0, 0), ("reified", 0, 1), ("direct", 1, 1)] {
+        let tmp = TempDir::new().unwrap();
+        fluree_cmd(&tmp).arg("init").assert().success();
+        write_extraction_fixtures(&tmp);
+        let (url, _seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+        fluree_cmd(&tmp)
+            .env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--no-embed",
+                "--ontology",
+                "ont/model.ttl",
+            ])
+            .args(["--model", "stub-reader", "--relations", mode])
+            .assert()
+            .success();
+        assert_eq!(
+            sparql_rows(&tmp, "memos", edge),
+            edges,
+            "edges with --relations {mode}"
+        );
+        assert_eq!(
+            sparql_rows(&tmp, "memos", relation),
+            relations,
+            "relations with --relations {mode}"
+        );
+    }
+}
