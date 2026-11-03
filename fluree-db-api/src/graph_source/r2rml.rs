@@ -4541,13 +4541,14 @@ impl FlureeR2rmlProvider<'_> {
                         )
                     })?;
                     // SOUNDNESS INVARIANT: the heap is fed the sort values of the
-                    // rows this scan EMITS — which are the QUALIFYING result rows
-                    // (post any pushed row filter). The directive is declined
-                    // upstream (`resolve_topk_directive`) whenever a RESIDUAL filter
-                    // the operator enforces after this scan is present, because
-                    // feeding pre-filter values would ride the k-th bound too high
-                    // and prune files whose qualifying rows belong in the true
-                    // top-k. Never feed a superset of the qualifying rows here.
+                    // rows this scan EMITS, which must be exactly the QUALIFYING
+                    // result rows. The directive is declined upstream
+                    // (`topk_feed_may_drop_rows`) whenever a row this scan emits
+                    // could still be dropped: a residual filter, a join with the
+                    // child on a shared variable, or any pushed filter (which
+                    // this reader may apply only partly). Feeding those rows
+                    // would ride the k-th bound too high and prune files whose
+                    // qualifying rows belong in the true top-k.
                     for b in &batches {
                         bound.observe_all(batch_sort_values(b, sort_field_id));
                     }
