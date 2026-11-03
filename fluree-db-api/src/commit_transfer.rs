@@ -339,11 +339,11 @@ impl Fluree {
         let ledger_id = &LedgerId::parse(ledger_id)?;
 
         // 0) Lock ledger state for write (serialize with transactions).
-        let guard = self
+        let mut guard = self
             .lock_ledger(ledger_id)
             .await?
             .ok_or_else(|| ApiError::internal("push requires a ledger manager"))?;
-        let mut base_state = guard.clone_state();
+        let mut base_state = guard.clone_state_for_staging();
 
         // 1) Read current head ref (CAS expected). Use the lookup
         //    surface rather than the publisher's `get_ref` so this
@@ -2438,7 +2438,7 @@ impl Fluree {
             .lock_ledger(ledger_id)
             .await?
             .ok_or_else(|| ApiError::internal("import requires a ledger manager"))?;
-        let base_state = guard.clone_state();
+        let base_state = guard.clone_state_for_staging();
 
         // 1) Read current head ref.
         let current_ref = self
