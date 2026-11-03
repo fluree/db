@@ -133,6 +133,7 @@ const ICEBERG_WORDING: Wording = Wording {
 pub(crate) enum QueryTables {
     /// The query's alias, as a table name: a source that refuses queries
     /// reports the alias as a table it cannot find.
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
     Alias,
     /// The `FROM` table of a query in the restricted subset an Iceberg source
     /// evaluates (see [`super::row_filter`]); a query outside it is an error.
@@ -432,7 +433,7 @@ pub(crate) fn cross_check_live(
         }
     }
 
-    diagnostics.extend(declared_key_diagnostics(compiled, schemas));
+    diagnostics.extend(declared_key_diagnostics(compiled, schemas, queries));
     diagnostics
 }
 
@@ -441,37 +442,71 @@ pub(crate) fn cross_check_live(
 /// one spelled with other casing, is [`DiagCode::ColumnNotFound`] /
 /// [`DiagCode::CasingMismatch`]; one whose values cannot identify a row
 /// (floating-point, nested, unreadable) is [`DiagCode::NonKeyTypeSkipped`].
-/// All errors, once per table and column however many maps read the table. A
-/// table with no schema already has its [`DiagCode::TableNotFound`].
+/// A key on an `rr:sqlQuery` logical table is checked against the query's
+/// `FROM` table, and a column its select list leaves out is
+/// [`DiagCode::ColumnNotFound`] too. All errors, once per logical table and
+/// column however many maps read it. A table with no schema already has its
+/// [`DiagCode::TableNotFound`].
 fn declared_key_diagnostics(
     compiled: &CompiledR2rmlMapping,
     schemas: &HashMap<String, Vec<LiveColumn>>,
+    queries: QueryTables,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let tables: BTreeSet<&str> = compiled
-        .triples_maps
-        .values()
-        .filter_map(TriplesMap::table_name)
-        .collect();
-    for table in tables {
-        let Some(schema) = schemas.get(table) else {
+    // Logical table name (a table, or a query's alias) -> the table its rows
+    // come from, and the query's select list when it has one.
+    let mut tables: std::collections::BTreeMap<&str, (String, Option<Vec<String>>)> =
+        std::collections::BTreeMap::new();
+    for tm in compiled.triples_maps.values() {
+        let Some(logical) = tm.table_name() else {
             continue;
         };
-        let keys = compiled.declared_keys(table);
+        let Some(table) = source_table(tm, queries) else {
+            continue;
+        };
+        let selected = match (queries, tm.sql_query()) {
+            (QueryTables::FromTable, Some(sql)) => {
+                RestrictedSelect::parse(sql).ok().and_then(|s| s.columns)
+            }
+            _ => None,
+        };
+        tables.entry(logical).or_insert((table, selected));
+    }
+    for (logical, (table, selected)) in tables {
+        let Some(schema) = schemas.get(&table) else {
+            continue;
+        };
+        let on = if logical == table {
+            format!("'{table}'")
+        } else {
+            format!("the rr:sqlQuery over '{table}'")
+        };
+        let table = table.as_str();
+        let keys = compiled.declared_keys(logical);
         let columns: BTreeSet<&str> = keys.iter().flatten().map(String::as_str).collect();
         for name in columns {
+            let unselected = selected
+                .as_ref()
+                .is_some_and(|selected| !selected.iter().any(|c| c == name));
             let (code, message) = match resolve_column(schema, name) {
+                ColumnResolution::Exact(_) | ColumnResolution::Casing(_) if unselected => (
+                    DiagCode::ColumnNotFound,
+                    format!(
+                        "f:key on {on} names column '{name}', which the query does not \
+                         select."
+                    ),
+                ),
                 ColumnResolution::Missing => (
                     DiagCode::ColumnNotFound,
                     format!(
-                        "f:key on '{table}' names column '{name}', which the table does not \
+                        "f:key on {on} names column '{name}', which the table does not \
                          have."
                     ),
                 ),
                 ColumnResolution::Casing(ci) => (
                     DiagCode::CasingMismatch,
                     format!(
-                        "f:key on '{table}' names column '{name}', which the schema spells \
+                        "f:key on {on} names column '{name}', which the schema spells \
                          '{}'; a key column must match exactly.",
                         ci.name
                     ),
@@ -485,12 +520,12 @@ fn declared_key_diagnostics(
                     DiagCode::NonKeyTypeSkipped,
                     match &ci.field_type {
                         Some(ty) => format!(
-                            "f:key on '{table}' names column '{name}' of type {ty:?}; a \
+                            "f:key on {on} names column '{name}' of type {ty:?}; a \
                              floating-point value cannot identify a row (NaN is unequal to \
                              itself)."
                         ),
                         None => format!(
-                            "f:key on '{table}' names column '{name}', whose type is nested \
+                            "f:key on {on} names column '{name}', whose type is nested \
                              or not one values are read from."
                         ),
                     },
@@ -760,6 +795,55 @@ mod tests {
                 && d.severity == Severity::Error
                 && d.message.contains("OR is not supported")),
             "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_on_a_query_is_checked_against_its_table_and_select_list() {
+        let mut schemas = HashMap::new();
+        schemas.insert("DW.DIM_STORE".to_string(), dim_store_schema());
+        let on_query = |sql: &str, key: &[&str]| {
+            let mut tm = dim_store_map().with_declared_key(key.iter().copied());
+            tm.logical_table = fluree_db_r2rml::mapping::LogicalTable::sql_query(sql);
+            CompiledR2rmlMapping::new(vec![tm])
+        };
+        for sql in [
+            "SELECT * FROM DW.DIM_STORE WHERE NAME IS NOT NULL",
+            "SELECT STORE_KEY, NAME FROM DW.DIM_STORE",
+        ] {
+            let diags = cross_check_mapping(&on_query(sql, &["STORE_KEY"]), &schemas, &no_errors());
+            assert!(diags.is_empty(), "{sql}: {diags:?}");
+        }
+        let diags = cross_check_mapping(
+            &on_query("SELECT NAME FROM DW.DIM_STORE", &["STORE_KEY"]),
+            &schemas,
+            &no_errors(),
+        );
+        let key: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.column.as_deref() == Some("STORE_KEY"))
+            .collect();
+        assert_eq!(key.len(), 1, "{diags:?}");
+        assert_eq!(key[0].code, DiagCode::ColumnNotFound);
+        assert_eq!(key[0].table.as_deref(), Some("DW.DIM_STORE"));
+        assert!(
+            key[0]
+                .message
+                .contains("the rr:sqlQuery over 'DW.DIM_STORE'")
+                && key[0].message.contains("does not select"),
+            "{:?}",
+            key[0]
+        );
+        let diags = cross_check_mapping(
+            &on_query("SELECT * FROM DW.DIM_STORE", &["STORE_ID"]),
+            &schemas,
+            &no_errors(),
+        );
+        assert!(
+            diags.iter().any(|d| d.code == DiagCode::ColumnNotFound
+                && d.column.as_deref() == Some("STORE_ID")
+                && d.message.contains("which the table does not have")),
+            "a key over a column the FROM table lacks: {diags:?}"
         );
     }
 

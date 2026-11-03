@@ -196,12 +196,14 @@ pub(crate) fn source_resolved_config(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SqlQueryPolicy {
     /// The source's engine runs the query (a SQL graph source).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     Execute,
     /// The source evaluates the restricted subset itself (Iceberg): one table
     /// narrowed by a conjunction of column comparisons; see
     /// [`super::row_filter`].
     RestrictedSubset,
     /// The source reads tables only (Delta).
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
     Refuse,
 }
 
@@ -1687,27 +1689,45 @@ fn iceberg_flat_type(
         .and_then(fluree_db_iceberg::FieldType::from_iceberg_type)
 }
 
-/// [`R2rmlTableProvider::table_keys`] for an Iceberg table read under `schema`
-/// (the pinned snapshot's, under current names): refuse a declared key naming
-/// a column the schema lacks or one that cannot identify a row, then report
-/// the identifier fields as one key.
+/// [`R2rmlTableProvider::table_keys`] for a logical table over an Iceberg
+/// table read under `schema` (the pinned snapshot's, under current names):
+/// refuse a declared key naming a column the schema lacks, one that cannot
+/// identify a row, or one the logical table's query does not select
+/// (`selects`), then report the identifier fields as one key. `logical_table`
+/// names the logical table in a refusal.
 ///
 /// Identifier fields count only through format version 3: version 4 replaces
 /// them with table constraints, and its readers must ignore them. A key whose
-/// field is nested (no top-level column) or cannot identify a row is not
-/// reported.
+/// field is nested (no top-level column), cannot identify a row, or is not
+/// selected is not reported. A row filter keeps a subset of the table's rows,
+/// and no two rows of a subset agree on a key no two rows of the table agree
+/// on, so the identifier fields hold for a filtered logical table too.
 fn iceberg_table_keys(
     format_version: i32,
     schema: &fluree_db_iceberg::metadata::Schema,
-    table_name: &str,
+    logical_table: &str,
     declared: &fluree_db_r2rml::TableKeys,
+    selects: impl Fn(&str) -> bool,
 ) -> fluree_db_r2rml::R2rmlResult<Option<Vec<Vec<String>>>> {
     use fluree_db_r2rml::mapping::KeyColumn;
     let column = |name: &str| match schema.field_by_name(name) {
-        Some(field) => KeyColumn::Typed(iceberg_flat_type(field)),
-        None => KeyColumn::Absent,
+        Some(field) if selects(name) => KeyColumn::Typed(iceberg_flat_type(field)),
+        _ => KeyColumn::Absent,
     };
-    declared.check_columns(table_name, column)?;
+    if let Some(name) = declared
+        .iter()
+        .flatten()
+        .find(|name| schema.field_by_name(name).is_some() && !selects(name))
+    {
+        return Err(fluree_db_r2rml::R2rmlError::InvalidValue {
+            property: "f:key".to_string(),
+            message: format!(
+                "on the logical table \"{logical_table}\", a key names column \"{name}\", \
+                 which the query does not select"
+            ),
+        });
+    }
+    declared.check_columns(logical_table, column)?;
     if format_version > 3 || schema.identifier_field_ids.is_empty() {
         return Ok(None);
     }
@@ -3268,9 +3288,13 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         if self.delta_source(graph_source_id).await?.is_some() {
             return Ok(None);
         }
-        let TableContext { metadata, .. } =
-            self.load_table_context(graph_source_id, table_name).await?;
-        let schema = match self.select_snapshot(graph_source_id, table_name, &metadata)? {
+        // An `rr:sqlQuery` alias names the query's rows: its keys are the ones
+        // declared on it, checked against the table it reads and its select
+        // list.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table = logical.table.as_str();
+        let TableContext { metadata, .. } = self.load_table_context(graph_source_id, table).await?;
+        let schema = match self.select_snapshot(graph_source_id, table, &metadata)? {
             Some(selected) => metadata.read_schema_for_snapshot(selected.snapshot),
             // No snapshot holds no row; the declared keys are still checked.
             None => metadata.current_schema().map(std::borrow::Cow::Borrowed),
@@ -3278,12 +3302,19 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         let Some(schema) = schema else {
             return Ok(None);
         };
-        let declared = self
-            .compiled_mapping(graph_source_id, as_of_t)
-            .await?
-            .declared_keys(table_name);
-        iceberg_table_keys(metadata.format_version, &schema, table_name, &declared)
-            .map_err(|e| QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}")))
+        let mapping = self.compiled_mapping(graph_source_id, as_of_t).await?;
+        let declared = mapping.declared_keys(table_name);
+        let described = mapping
+            .sql_query_for_table(table_name)
+            .map_or(table_name, str::trim);
+        iceberg_table_keys(
+            metadata.format_version,
+            &schema,
+            described,
+            &declared,
+            |column| logical.selects(column),
+        )
+        .map_err(|e| QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}")))
     }
 
     /// The pinned snapshot's row count from what is already at hand, never
@@ -3305,6 +3336,10 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         if self.delta_source(graph_source_id).await?.is_some() {
             return Ok(None);
         }
+        // A filtered logical table keeps at most its table's rows: the table's
+        // count bounds it, which is all a caller sizing a cache needs.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
         let TableContext {
             metadata,
             metadata_location,
@@ -3353,6 +3388,11 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         if self.delta_source(graph_source_id).await?.is_some() {
             return Ok(None);
         }
+        // A filtered logical table plans `filters` against the table it reads.
+        // Its row filter may prune more files than these counts show; they
+        // only decide whether a keyed read is worth making.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
         let TableContext {
             storage,
             metadata,
@@ -5542,6 +5582,7 @@ mod tests {
             &identified_schema(ids),
             "sets.customers_current",
             &fluree_db_r2rml::TableKeys::none(),
+            |_| true,
         )
         .expect("no declared key to refuse")
     }
@@ -5577,6 +5618,35 @@ mod tests {
     }
 
     #[test]
+    fn a_key_over_a_column_the_query_does_not_select_is_no_key() {
+        let selects = |column: &str| column != "customer_id";
+        let declared = iceberg_table_keys(
+            2,
+            &identified_schema(vec![]),
+            "SELECT name FROM sets.customers_current",
+            &fluree_db_r2rml::TableKeys::new([vec!["customer_id"]]),
+            selects,
+        )
+        .expect_err("a declared key the query does not select is refused")
+        .to_string();
+        assert!(
+            declared.contains("\"customer_id\", which the query does not select")
+                && declared.contains("SELECT name FROM sets.customers_current"),
+            "{declared}"
+        );
+        // An identifier field the query does not select is not reported.
+        let reported = iceberg_table_keys(
+            2,
+            &identified_schema(vec![1]),
+            "SELECT name FROM sets.customers_current",
+            &fluree_db_r2rml::TableKeys::none(),
+            selects,
+        )
+        .expect("nothing declared");
+        assert_eq!(reported, None);
+    }
+
+    #[test]
     fn a_declared_key_is_checked_against_the_snapshot_schema() {
         let check = |cols: &[&str]| {
             iceberg_table_keys(
@@ -5584,6 +5654,7 @@ mod tests {
                 &identified_schema(vec![]),
                 "sets.customers_current",
                 &fluree_db_r2rml::TableKeys::new([cols.to_vec()]),
+                |_| true,
             )
         };
         assert_eq!(check(&["customer_id", "valid_from"]).unwrap(), None);
