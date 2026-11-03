@@ -238,11 +238,11 @@ pub fn read_document(
     Ok(read)
 }
 
-/// A mention gets `doc:sourceElement`, the element its span sits in, as
-/// the language-model path gives one.
+/// A mention (see [`fluree_db_doc::reader::reading::is_occurrence`]) gets
+/// `doc:sourceElement`, the element its span sits in, as the language-model
+/// path gives one.
 fn source_elements(structure: &Structure, nodes: &mut [Value]) {
     use fluree_db_doc::vocab::{DOC_NS, NIF_NS};
-    let mention = format!("{DOC_NS}Mention");
     let offset = |node: &Value, p: &str| {
         let v = node
             .get(format!("{NIF_NS}{p}"))?
@@ -254,10 +254,7 @@ fn source_elements(structure: &Structure, nodes: &mut [Value]) {
             .map(|n| n as usize)
     };
     for node in nodes {
-        let is_mention = node
-            .get("@type")
-            .and_then(Value::as_array)
-            .is_some_and(|t| t.iter().any(|t| t == &json!(mention)));
+        let is_mention = fluree_db_doc::reader::reading::is_occurrence(node);
         let key = format!("{DOC_NS}sourceElement");
         if !is_mention || node.get(&key).is_some() {
             continue;

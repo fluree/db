@@ -6949,8 +6949,11 @@ fn stub_reading(score: f64, claim: bool) -> serde_json::Value {
     let doc = "urn:fluree:doc:memo.md";
     let mut reading = vec![serde_json::json!({
         "@id": format!("{doc}/reading#o31-35"),
-        // A reader may write the pipeline's own terms.
-        format!("{RDF}type"): [{ "@id": "https://ns.flur.ee/doc#Mention" }],
+        // In the reader's own terms, as a NIF string with offsets.
+        format!("{RDF}type"): [
+            { "@id": format!("{R}Occurrence") },
+            { "@id": format!("{NIF}RFC5147String") }
+        ],
         format!("{NIF}beginIndex"): [{ "@value": 31 }],
         format!("{NIF}endIndex"): [{ "@value": 35 }],
         format!("{R}refersTo"): [{ "@id": "https://example.org/org/acme" }],
@@ -7068,7 +7071,7 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
         sparql_rows(
             &tmp,
             "memos",
-            "SELECT ?e WHERE { ?m a <https://ns.flur.ee/doc#Mention> ; <https://ns.flur.ee/doc#sourceElement> ?e . ?e a <http://purl.org/spar/doco/Paragraph> }"
+            "SELECT ?e WHERE { ?m a <http://example.org/r#Occurrence> ; <https://ns.flur.ee/doc#sourceElement> ?e . ?e a <http://purl.org/spar/doco/Paragraph> }"
         ),
         1
     );

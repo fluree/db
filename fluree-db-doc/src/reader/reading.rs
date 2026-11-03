@@ -181,7 +181,7 @@ pub fn read_answer(
             }
             reading.relations += 1;
         }
-        if types.contains(&format!("{DOC_NS}Mention")) {
+        if is_occurrence(node) {
             reading.mentions += 1;
         }
         if types.contains(&format!("{DOC_NS}Entity")) {
@@ -320,6 +320,22 @@ fn has_context(v: &Value) -> bool {
         Value::Array(a) => a.iter().any(has_context),
         _ => false,
     }
+}
+
+/// Whether a node is a mention: typed `doc:Mention`, or any NIF string
+/// (`nif:RFC5147String`, `nif:String`, `nif:Phrase`, `nif:Word`) carrying
+/// `nif:beginIndex`, which is how a reader marks a span of the text
+/// whatever else it calls it. Counted and given `doc:sourceElement` the
+/// same way, so a reading in a reader's own terms still says what it found.
+pub fn is_occurrence(node: &Value) -> bool {
+    let types = types(node);
+    if types.iter().any(|t| t == &format!("{DOC_NS}Mention")) {
+        return true;
+    }
+    let nif_string = ["RFC5147String", "String", "Phrase", "Word"]
+        .iter()
+        .any(|local| types.iter().any(|t| *t == format!("{NIF_NS}{local}")));
+    nif_string && node.get(format!("{NIF_NS}beginIndex")).is_some()
 }
 
 fn types(node: &Value) -> Vec<String> {
@@ -492,6 +508,27 @@ mod tests {
             node(&r, "urn:d/entity/1")["@type"][0],
             "https://ns.flur.ee/doc#LocalEntity"
         );
+        assert_eq!(r.mentions, 1);
+    }
+
+    #[test]
+    fn a_nif_occurrence_in_a_readers_own_terms_counts_as_a_mention() {
+        let answer = json!([{ "@id": "urn:d/reading", "@graph": [
+            { "@id": "urn:d/reading#o1",
+              format!("{RDF_NS}type"): [{ "@id": format!("{EX}Occurrence") }, { "@id": format!("{NIF_NS}RFC5147String") }],
+              BEGIN: [{ "@value": 0 }], END: [{ "@value": 4 }] },
+            { "@id": "urn:d/reading#x",
+              format!("{RDF_NS}type"): [{ "@id": format!("{NIF_NS}RFC5147String") }] }
+        ]}])
+        .to_string();
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let r = read_answer(&answer, &frame, None).unwrap();
+        // The second has no offsets: not a mention.
         assert_eq!(r.mentions, 1);
     }
 
