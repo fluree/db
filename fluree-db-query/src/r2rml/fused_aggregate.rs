@@ -1364,9 +1364,6 @@ fn put_raw_value(column: &Column, row: usize, out: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Estimated table overhead of one remembered fold solution.
-const FOLD_SEEN_ENTRY_OVERHEAD_BYTES: usize = 32;
-
 /// A built keep-min dim map: FK/parent join key → the parent's group-key values.
 /// `Arc`d so ref group keys resolving to the SAME dim on the SAME parent join cols
 /// (e.g. shipTo/billTo → Customer) share one built map, not two (id=3717398042).
@@ -2108,11 +2105,10 @@ impl Operator for FusedR2rmlAggregateOperator {
         // (exact: `FoldDedupe`), each charged to the query budget. A column of
         // a type whose raw bytes do not tell its terms apart hands the query to
         // the generic pipeline, like an overflow.
-        let mut fold_seen: hashbrown::HashTable<Box<[u8]>> = hashbrown::HashTable::new();
+        let mut fold_seen: crate::r2rml::set_semantics::ChargedTable<Box<[u8]>> =
+            crate::r2rml::set_semantics::ChargedTable::new();
         let fold_hasher = rustc_hash::FxBuildHasher;
         let mut fold_scratch: Vec<u8> = Vec::new();
-        let mut fold_charged = 0usize;
-        let mut fold_since_checkpoint = 0usize;
         'scan: while let Some(batch) = stream.next().await {
             // Checkpoint per fused-aggregate scan batch (deadline + memory budget): a
             // deadline/abort stops a large fused rollup mid-sweep, and a high-cardinality
@@ -2244,23 +2240,16 @@ impl Operator for FusedR2rmlAggregateOperator {
                         put_raw_value(col, row, &mut fold_scratch);
                     }
                     let hash = fold_hasher.hash_one(fold_scratch.as_slice());
-                    if fold_seen
-                        .find(hash, |seen| **seen == *fold_scratch)
-                        .is_some()
-                    {
+                    if fold_seen.contains(hash, |seen| **seen == *fold_scratch) {
                         continue;
                     }
-                    let bytes = FOLD_SEEN_ENTRY_OVERHEAD_BYTES + fold_scratch.len();
-                    fold_seen.insert_unique(hash, fold_scratch.as_slice().into(), |seen| {
-                        fold_hasher.hash_one(&**seen)
-                    });
-                    ctx.record_alloc(bytes);
-                    fold_charged += bytes;
-                    fold_since_checkpoint += 1;
-                    if fold_since_checkpoint >= 1024 {
-                        fold_since_checkpoint = 0;
-                        ctx.checkpoint()?;
-                    }
+                    fold_seen.insert(
+                        hash,
+                        fold_scratch.as_slice().into(),
+                        crate::r2rml::set_semantics::alloc_size_class(fold_scratch.len()),
+                        |seen| fold_hasher.hash_one(&**seen),
+                        ctx,
+                    )?;
                 }
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit
@@ -2465,12 +2454,12 @@ impl Operator for FusedR2rmlAggregateOperator {
         if resolved.dedupe.is_some() {
             tracing::debug!(
                 solutions = fold_seen.len(),
-                charged_bytes = fold_charged,
+                charged_bytes = fold_seen.charged(),
+                peak_bytes = fold_seen.peak(),
                 "fused R2RML aggregate: deduplication set released"
             );
         }
-        drop(fold_seen);
-        ctx.release(fold_charged);
+        fold_seen.release(ctx);
 
         // An i128 accumulator overflowed (or a deduplicated column's type has
         // no exact raw encoding): the exact answer needs the normal pipeline,

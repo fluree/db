@@ -293,10 +293,123 @@ pub(crate) async fn rows_are_solutions(
     Ok(true)
 }
 
-/// Estimated table overhead of one [`SeenSolutions`] entry: its slot (a boxed
-/// slice's pointer and length, and the key's tag), its control byte, and the
-/// load factor's slack.
-const SEEN_ENTRY_OVERHEAD_BYTES: usize = 32;
+/// The size of the allocation that holds `n` bytes: the allocator hands out
+/// small blocks in 16-byte classes.
+pub(crate) fn alloc_size_class(n: usize) -> usize {
+    n.div_ceil(16) * 16
+}
+
+/// A hash table of remembered keys, charged to the query's memory budget for
+/// what it actually holds: the table's own allocation (every bucket's slot and
+/// control byte, occupied or not) plus each key's heap allocation.
+///
+/// Growing the table allocates the new buckets while the old ones are still
+/// live, so before growing it charges the new allocation on top of the old one
+/// and checks the budget (a growth the budget cannot hold fails the query with
+/// the typed `MemoryBudgetExceeded` before it allocates), then settles the
+/// charge to the new allocation once the old one is freed. [`Self::release`]
+/// returns everything when the table drops.
+pub(crate) struct ChargedTable<K> {
+    table: hashbrown::HashTable<K>,
+    /// Bytes recorded against the budget and not yet released.
+    charged: usize,
+    /// The part of `charged` that is the table's own allocation.
+    table_bytes: usize,
+    /// The most this table has held at once, growth transients included.
+    peak: usize,
+    since_checkpoint: usize,
+}
+
+/// How many inserts a [`ChargedTable`] makes between budget checkpoints when
+/// it does not grow (every growth checkpoints).
+const CHARGED_TABLE_CHECKPOINT_EVERY: usize = 1024;
+
+impl<K> ChargedTable<K> {
+    pub(crate) fn new() -> Self {
+        Self {
+            table: hashbrown::HashTable::new(),
+            charged: 0,
+            table_bytes: 0,
+            peak: 0,
+            since_checkpoint: 0,
+        }
+    }
+
+    /// Whether a key with `hash` satisfying `eq` is held.
+    pub(crate) fn contains(&self, hash: u64, eq: impl FnMut(&K) -> bool) -> bool {
+        self.table.find(hash, eq).is_some()
+    }
+
+    /// Hold `key` (not already held), whose own heap allocation is
+    /// `key_heap` bytes, growing the table first if it is full.
+    pub(crate) fn insert(
+        &mut self,
+        hash: u64,
+        key: K,
+        key_heap: usize,
+        hasher: impl Fn(&K) -> u64,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<()> {
+        if self.table.len() == self.table.capacity() {
+            let old = self.table_bytes;
+            let keys = self.charged - old;
+            // The new allocation is about twice the old one; charge it before
+            // allocating, with the old one still charged.
+            let estimate = (2 * old).max(4 * std::mem::size_of::<K>() + 32);
+            ctx.record_alloc(estimate);
+            self.charged += estimate;
+            self.peak = self.peak.max(self.charged);
+            ctx.checkpoint()?;
+            self.table.reserve(1, &hasher);
+            let new = self.table.allocation_size();
+            self.peak = self.peak.max(keys + old + new);
+            // The old allocation is freed: the table's charge is the new one.
+            let target = keys + new;
+            if self.charged > target {
+                ctx.release(self.charged - target);
+            } else {
+                ctx.record_alloc(target - self.charged);
+            }
+            self.charged = target;
+            self.table_bytes = new;
+        }
+        self.table.insert_unique(hash, key, hasher);
+        ctx.record_alloc(key_heap);
+        self.charged += key_heap;
+        self.peak = self.peak.max(self.charged);
+        self.since_checkpoint += 1;
+        if self.since_checkpoint >= CHARGED_TABLE_CHECKPOINT_EVERY {
+            self.since_checkpoint = 0;
+            ctx.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Bytes charged now.
+    pub(crate) fn charged(&self) -> usize {
+        self.charged
+    }
+
+    /// The most this table has held at once.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak
+    }
+
+    /// The table's own allocation, as the table reports it.
+    #[cfg(test)]
+    pub(crate) fn allocation_size(&self) -> usize {
+        self.table.allocation_size()
+    }
+
+    /// Return the table's charge to the query budget (it is about to drop).
+    pub(crate) fn release(self, ctx: &ExecutionContext<'_>) {
+        ctx.release(self.charged);
+    }
+}
 
 /// One remembered solution.
 ///
@@ -318,12 +431,12 @@ enum SeenKey {
 /// Streaming and first-seen: a solution passes the first time it is seen, in
 /// the scan's order, so a `LIMIT` above the scan still stops it early. Exact:
 /// entries identify the solutions themselves (never a hash alone), compactly
-/// where the encoding is exact. Each entry is charged to the query's memory
-/// budget as it is added; a set that outgrows the budget fails the query with
-/// the typed `MemoryBudgetExceeded`, and [`Self::release`] returns the charge
-/// when the pass ends.
+/// where the encoding is exact. The set is charged to the query's memory
+/// budget for what it holds ([`ChargedTable`]); a set that outgrows the
+/// budget fails the query with the typed `MemoryBudgetExceeded`, and
+/// [`Self::release`] returns the charge when the pass ends.
 pub(crate) struct SeenSolutions {
-    seen: hashbrown::HashTable<SeenKey>,
+    table: ChargedTable<SeenKey>,
     hasher: FxBuildHasher,
     /// A prefix every subject the pass's maps mint starts with; IRIs that
     /// start with it are remembered without it.
@@ -331,25 +444,18 @@ pub(crate) struct SeenSolutions {
     /// Datatypes and language tags met so far, remembered by position.
     dtcs: Vec<DatatypeConstraint>,
     scratch: Vec<u8>,
-    charged: usize,
-    since_checkpoint: usize,
 }
-
-/// How many entries a [`SeenSolutions`] adds between budget checkpoints.
-const SEEN_CHECKPOINT_EVERY: usize = 1024;
 
 impl SeenSolutions {
     /// A set whose subjects all start with `strip` (any prefix is exact; a
     /// longer one only saves more).
     pub(crate) fn new(strip: impl Into<String>) -> Self {
         Self {
-            seen: hashbrown::HashTable::new(),
+            table: ChargedTable::new(),
             hasher: FxBuildHasher,
             strip: strip.into(),
             dtcs: Vec::new(),
             scratch: Vec::new(),
-            charged: 0,
-            since_checkpoint: 0,
         }
     }
 
@@ -364,66 +470,62 @@ impl SeenSolutions {
         scratch.clear();
         let compact = encode_solution(solution, &self.strip, &mut self.dtcs, &mut scratch);
         let hasher = &self.hasher;
-        let (hash, found) = if compact {
-            let hash = hasher.hash_one((0u8, scratch.as_slice()));
-            let found = self.seen.find(
-                hash,
-                |entry| matches!(entry, SeenKey::Compact(bytes) if **bytes == *scratch),
-            );
-            (hash, found.is_some())
+        let hash = if compact {
+            hasher.hash_one((0u8, scratch.as_slice()))
         } else {
-            let hash = hasher.hash_one((1u8, solution));
-            let found = self.seen.find(
-                hash,
-                |entry| matches!(entry, SeenKey::Terms(terms) if **terms == *solution),
-            );
-            (hash, found.is_some())
+            hasher.hash_one((1u8, solution))
         };
-        if found {
+        let seen = self.table.contains(hash, |entry| match entry {
+            SeenKey::Compact(bytes) => compact && **bytes == *scratch,
+            SeenKey::Terms(terms) => !compact && **terms == *solution,
+        });
+        if seen {
             self.scratch = scratch;
             return Ok(false);
         }
-        let (key, bytes) = if compact {
-            let bytes = SEEN_ENTRY_OVERHEAD_BYTES + scratch.len();
-            (SeenKey::Compact(scratch.as_slice().into()), bytes)
+        let (key, key_heap) = if compact {
+            (
+                SeenKey::Compact(scratch.as_slice().into()),
+                alloc_size_class(scratch.len()),
+            )
         } else {
-            (SeenKey::Terms(solution.into()), term_entry_bytes(solution))
+            (SeenKey::Terms(solution.into()), terms_heap_bytes(solution))
         };
         self.scratch = scratch;
-        self.seen.insert_unique(hash, key, |entry| match entry {
-            SeenKey::Compact(bytes) => hasher.hash_one((0u8, &**bytes)),
-            SeenKey::Terms(terms) => hasher.hash_one((1u8, &**terms)),
-        });
-        ctx.record_alloc(bytes);
-        self.charged += bytes;
-        self.since_checkpoint += 1;
-        if self.since_checkpoint >= SEEN_CHECKPOINT_EVERY {
-            self.since_checkpoint = 0;
-            ctx.checkpoint()?;
-        }
+        self.table.insert(
+            hash,
+            key,
+            key_heap,
+            |entry| match entry {
+                SeenKey::Compact(bytes) => hasher.hash_one((0u8, &**bytes)),
+                SeenKey::Terms(terms) => hasher.hash_one((1u8, &**terms)),
+            },
+            ctx,
+        )?;
         Ok(true)
     }
 
     /// Return this set's charge to the query budget (it is about to drop).
     pub(crate) fn release(self, ctx: &ExecutionContext<'_>) {
         tracing::debug!(
-            solutions = self.seen.len(),
-            charged_bytes = self.charged,
+            solutions = self.table.len(),
+            charged_bytes = self.table.charged(),
+            peak_bytes = self.table.peak(),
             "R2RML scan: deduplication set released"
         );
-        ctx.release(self.charged);
+        self.table.release(ctx);
     }
 
-    /// Bytes charged so far.
+    /// Bytes charged now.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
-        self.charged
+        self.table.charged()
     }
 
     /// Distinct solutions held.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.seen.len()
+        self.table.len()
     }
 }
 
@@ -519,28 +621,22 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// Estimated resident bytes of one solution remembered as its terms: its
-/// slots, plus the text it keeps alive (an IRI's shared string, a string
-/// literal's copy).
-fn term_entry_bytes(solution: &[(VarId, Binding)]) -> usize {
-    SEEN_ENTRY_OVERHEAD_BYTES
-        + std::mem::size_of_val(solution)
+/// The heap a solution remembered as its terms holds: its slots' allocation
+/// and the text its terms keep alive (an IRI's shared string with its counts,
+/// a string literal's copy).
+fn terms_heap_bytes(solution: &[(VarId, Binding)]) -> usize {
+    alloc_size_class(std::mem::size_of_val(solution))
         + solution
             .iter()
-            .map(|(_, b)| binding_heap_bytes(b))
+            .map(|(_, b)| match b {
+                Binding::Iri(iri) => alloc_size_class(iri.len() + 2 * std::mem::size_of::<usize>()),
+                Binding::Lit {
+                    val: FlakeValue::String(s),
+                    ..
+                } => alloc_size_class(s.capacity()),
+                _ => 0,
+            })
             .sum::<usize>()
-}
-
-fn binding_heap_bytes(b: &Binding) -> usize {
-    match b {
-        // An `Arc<str>`: the text and its two counts.
-        Binding::Iri(iri) => iri.len() + 2 * std::mem::size_of::<usize>(),
-        Binding::Lit {
-            val: FlakeValue::String(s),
-            ..
-        } => s.capacity(),
-        _ => 0,
-    }
 }
 
 #[cfg(test)]
@@ -670,14 +766,15 @@ mod tests {
         assert!(seen.first_sight(&swapped, &ctx).unwrap());
         assert_eq!(seen.len(), 4);
         assert_eq!(ctx.mem_used() - before, seen.charged());
-        // Remembered compactly: well under the solutions' term form.
-        let as_terms: usize = (0..4)
-            .map(|_| term_entry_bytes(&row("ex:1", "alice")))
-            .sum();
+        // The table's own allocation is charged, and each key on top of it,
+        // remembered compactly: well under the solutions' term form.
+        let table = seen.table.allocation_size();
+        assert!(table > 0 && seen.charged() > table);
+        let as_terms = 4 * terms_heap_bytes(&row("ex:1", "alice"));
         assert!(
-            seen.charged() * 2 < as_terms,
+            (seen.charged() - table) * 2 < as_terms,
             "{} vs {as_terms}",
-            seen.charged()
+            seen.charged() - table
         );
         seen.release(&ctx);
         assert_eq!(ctx.mem_used(), before);
@@ -692,7 +789,7 @@ mod tests {
         let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
         let mut seen = SeenSolutions::new("http://example.org/s/");
         let mut failed = None;
-        for i in 0..10 * SEEN_CHECKPOINT_EVERY {
+        for i in 0..10 * CHARGED_TABLE_CHECKPOINT_EVERY {
             let row = [(VarId(0), Binding::iri(format!("http://example.org/s/{i}")))];
             match seen.first_sight(&row, &ctx) {
                 Ok(first) => assert!(first),
@@ -708,7 +805,10 @@ mod tests {
             "{err:?}"
         );
         // It fails at the first checkpoint past the budget, not at the end.
-        assert!(at < 2 * SEEN_CHECKPOINT_EVERY, "failed only at entry {at}");
+        assert!(
+            at < 2 * CHARGED_TABLE_CHECKPOINT_EVERY,
+            "failed only at entry {at}"
+        );
     }
 
     fn lit(val: FlakeValue, dt: &str) -> Binding {
@@ -802,5 +902,77 @@ mod tests {
             .first_sight(&[s.clone(), (VarId(1), long)], &ctx)
             .unwrap());
         assert!(!seen.first_sight(&[s, (VarId(1), decimal)], &ctx).unwrap());
+    }
+
+    fn budgeted(limit: Option<usize>) -> fluree_db_core::QueryCancellation {
+        let cancel = fluree_db_core::QueryCancellation::new();
+        if let Some(limit) = limit {
+            cancel.set_memory_limit(limit);
+        }
+        cancel
+    }
+
+    /// Insert `n` distinct `u64` keys with no heap of their own; the result
+    /// of each insert, and the table.
+    fn fill(ctx: &ExecutionContext<'_>, n: u64) -> (Vec<Result<()>>, ChargedTable<u64>) {
+        let mut table = ChargedTable::new();
+        let hasher = FxBuildHasher;
+        let mut results = Vec::new();
+        for k in 0..n {
+            let r = table.insert(hasher.hash_one(k), k, 0, |k| hasher.hash_one(*k), ctx);
+            let failed = r.is_err();
+            results.push(r);
+            if failed {
+                break;
+            }
+        }
+        (results, table)
+    }
+
+    #[test]
+    fn a_charged_table_charges_its_allocation_and_both_tables_while_growing() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("set-semantics:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(budgeted(None));
+        let (results, table) = fill(&ctx, 5000);
+        assert!(results.iter().all(Result::is_ok));
+        // Every bucket, occupied or not: what the table reports allocating.
+        assert_eq!(table.charged(), table.allocation_size());
+        assert_eq!(ctx.mem_used(), table.charged());
+        // The last growth held the old buckets and the new ones at once.
+        assert!(
+            table.peak() >= table.allocation_size() + table.allocation_size() / 2 - 64,
+            "peak {} for a final {}",
+            table.peak(),
+            table.allocation_size()
+        );
+        table.release(&ctx);
+        assert_eq!(ctx.mem_used(), 0);
+    }
+
+    #[test]
+    fn a_growth_the_budget_cannot_hold_fails_typed_before_it_allocates() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("set-semantics:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        // Unlimited, the 5000 keys end in one table; its last growth briefly
+        // held that table and the one before it.
+        let free = ExecutionContext::new(&snapshot, &vars).with_cancellation(budgeted(None));
+        let (_, table) = fill(&free, 5000);
+        let (fin, peak) = (table.allocation_size(), table.peak());
+        assert!(peak > fin);
+        // A budget the final table fits but the growth into it does not.
+        let limit = fin + (peak - fin) / 2;
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(budgeted(Some(limit)));
+        let (results, _) = fill(&ctx, 5000);
+        let err = results
+            .last()
+            .unwrap()
+            .as_ref()
+            .expect_err("the growth must fail");
+        assert!(
+            matches!(err, crate::error::QueryError::MemoryBudgetExceeded { .. }),
+            "{err:?}"
+        );
+        assert!(results.len() < 5000);
     }
 }
