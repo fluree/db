@@ -34,8 +34,8 @@ use fluree_db_iceberg::{
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
-    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanTopK,
-    ScanValue, SourceTime, TermOrder,
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFileCounts, ScanFilter,
+    ScanTopK, ScanValue, SourceTime, TermOrder,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
@@ -3117,6 +3117,58 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             .catalog_disk_cache()
             .get_scan_files(&scope, &cache_key)
             .map(|files| files.estimated_row_count as u64))
+    }
+
+    /// Plan the filtered scan against the same pinned snapshot the scan reads
+    /// (manifests only). Filters with nothing the planner can prune on report
+    /// no file skipped; SQL and Delta sources cannot tell.
+    async fn scan_file_counts(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<ScanFileCounts>> {
+        #[cfg(feature = "sql")]
+        if self.sql_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        let TableContext {
+            storage, metadata, ..
+        } = self.load_table_context(graph_source_id, table_name).await?;
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
+            return Ok(Some(ScanFileCounts {
+                selected: 0,
+                pruned: 0,
+            }));
+        };
+        let snapshot = selected.snapshot;
+        let Some(schema) = read_schema(&metadata, snapshot) else {
+            return Ok(None);
+        };
+        let Some(filter) = build_iceberg_filter(filters, schema.as_ref()) else {
+            return Ok(Some(ScanFileCounts {
+                selected: 0,
+                pruned: 0,
+            }));
+        };
+        let planner = SendScanPlanner::new(
+            storage.as_ref(),
+            &metadata,
+            ScanConfig::new().with_filter(filter),
+        );
+        let plan = planner
+            .plan_scan_for_snapshot(snapshot)
+            .await
+            .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+        Ok(Some(ScanFileCounts {
+            selected: plan.files_selected as u64,
+            pruned: plan.files_pruned as u64,
+        }))
     }
 
     fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> QueryResult<()> {

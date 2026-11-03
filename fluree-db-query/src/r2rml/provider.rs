@@ -134,6 +134,16 @@ pub struct ScanFilter {
     pub value: ScanValue,
 }
 
+/// The data files a scan with some filters would read and skip, from its scan
+/// plan alone ([`R2rmlTableProvider::scan_file_counts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanFileCounts {
+    /// Files the scan would read.
+    pub selected: u64,
+    /// Files the filters let it skip.
+    pub pruned: u64,
+}
+
 /// A scan-side top-k directive for a single-column `ORDER BY … LIMIT k` directly
 /// above a single-table R2RML scan (PR-5; ASC added in item 8, F-AUD-6). The scan
 /// reads files best-first (DESC: `upper_bound(sort_column)` descending; ASC:
@@ -384,6 +394,21 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         as_of_t: Option<i64>,
     ) -> Result<Option<u64>> {
         let _ = (graph_source_id, table_name, as_of_t);
+        Ok(None)
+    }
+
+    /// How many data files a scan of `table_name` with `filters` would read and
+    /// skip, from its scan plan alone: no data file is read. A caller pushing
+    /// keys asks before paying for a keyed read whether it skips anything.
+    /// `Ok(None)` when the provider cannot tell (the default).
+    async fn scan_file_counts(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        filters: &[ScanFilter],
+        as_of_t: Option<i64>,
+    ) -> Result<Option<ScanFileCounts>> {
+        let _ = (graph_source_id, table_name, filters, as_of_t);
         Ok(None)
     }
 

@@ -3073,3 +3073,126 @@ async fn a_values_subject_set_answers_its_subjects() {
         "JSON-LD: {result}"
     );
 }
+
+/// `people_window.id` references `cells.i32`, whose values 9 and 10 each sit
+/// on two rows (cells 2 and 4, cells 5 and 7) and whose 2 and 100 sit on one;
+/// every other person's reference dangles. The join keeps the smaller cell
+/// for a duplicated key and drops a dangling reference, whether the parent is
+/// read whole (no LIMIT: the first window holds 3,000 keys) or by the keys of
+/// a `LIMIT`'s first rows or a `VALUES` block's subjects.
+const PERSON_CELL_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:cell ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Cell> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "i32" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/cell/{id}" ] .
+"#;
+
+#[tokio::test]
+async fn a_referencing_map_keeps_its_answers_when_the_parent_is_read_by_key() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("person-cell", &root, PERSON_CELL_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cell = |id: u32| format!("http://example.org/cell/{id}");
+    let all = vec![
+        vec![person(10), cell(5)],
+        vec![person(100), cell(6)],
+        vec![person(2), cell(1)],
+        vec![person(9), cell(2)],
+    ];
+    let values = [person(9), person(10), person(11)];
+    let values_answer = vec![vec![person(10), cell(5)], vec![person(9), cell(2)]];
+
+    let mut wrong = Vec::new();
+    for (label, sparql_where, jsonld_values, limit) in [
+        ("all", String::new(), None, None),
+        ("LIMIT 2", String::new(), None, Some(2)),
+        (
+            "VALUES",
+            format!(
+                "VALUES ?p {{ {} }}",
+                values
+                    .iter()
+                    .map(|s| format!("<{s}>"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            Some(
+                values
+                    .iter()
+                    .map(|s| serde_json::json!({"@id": s}))
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        ),
+    ] {
+        let sparql = format!(
+            "SELECT ?p ?c FROM <person-cell:main> WHERE {{ {sparql_where} \
+             ?p <http://example.org/cell> ?c }}{}",
+            limit.map_or(String::new(), |k| format!(" LIMIT {k}"))
+        );
+        let sparql_result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+
+        let mut where_clause = Vec::new();
+        if let Some(ids) = jsonld_values {
+            where_clause.push(serde_json::json!(["values", ["?p", ids]]));
+        }
+        where_clause.push(serde_json::json!({"@id": "?p", "http://example.org/cell": "?c"}));
+        let mut jsonld = serde_json::json!({
+            "from": "person-cell:main",
+            "select": ["?p", "?c"],
+            "where": where_clause,
+        });
+        if let Some(k) = limit {
+            jsonld["limit"] = serde_json::json!(k);
+        }
+        let jsonld_result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD {label}: {e}"));
+
+        for (surface, result) in [("SPARQL", &sparql_result), ("JSON-LD", &jsonld_result)] {
+            let rows = answer_rows(result, &["p", "c"]);
+            let ok = match label {
+                "all" => rows == all,
+                "LIMIT 2" => rows.len() == 2 && rows.iter().all(|r| all.contains(r)),
+                _ => rows == values_answer,
+            };
+            if !ok {
+                wrong.push(format!("{surface} {label}: {rows:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+}
