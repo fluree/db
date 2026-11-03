@@ -52,6 +52,8 @@ The same `f:noHistory` entry can carry an `f:ttl` too: values expire, and once i
 
 A rule takes effect when the retention worker next runs, within `--retention-interval-secs` (15 seconds by default) of the config commit. Until then, index builds keep the history. Status shows the rule once it is recorded.
 
+An index build applies each rule only through the last commit the worker has saved as processed (status `watermarkT`). The worker saves it about every 30 seconds while commits arrive, so it can trail the head. History written after that point is kept, because a config commit there may have ended the rule; a later build that rewrites its leaf leaves it out if the rule still covers it.
+
 ### The index
 
 The background indexer leaves the covered history out of the index, in incremental builds as well as full rebuilds. History indexed before the rule was recorded stays in the index until a build rewrites the leaf that holds it, and reads as of an earlier point can see it until then. A [reindex](../indexing-and-search/reindex.md) drops all of it at once.

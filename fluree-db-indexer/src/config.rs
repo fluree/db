@@ -36,6 +36,19 @@ pub trait LedgerConfigProvider: std::fmt::Debug + Send + Sync {
     async fn indexing_config(&self, ledger_id: &str) -> LedgerIndexingConfig;
 }
 
+/// A predicate whose history an index build leaves out, over
+/// `[from_t, until_t)` (`f:noHistory`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuppressedHistory {
+    pub predicate_iri: String,
+    /// The graph the rule is limited to; `None` for every data graph.
+    pub graph_iri: Option<String>,
+    /// Graphs a ledger-wide rule leaves alone.
+    pub except_graph_iris: Vec<String>,
+    pub from_t: i64,
+    pub until_t: Option<i64>,
+}
+
 /// Scope of a configured full-text property entry.
 ///
 /// Mirrors the `f:targetGraph` sentinels used in config graph writes:
@@ -51,19 +64,6 @@ pub trait LedgerConfigProvider: std::fmt::Debug + Send + Sync {
 ///
 /// Keeping these distinct lets the indexer route scoping precisely:
 /// the hook's `any_graph` tier covers `AnyGraph`; the `per_graph` tier
-/// A predicate whose history an index build leaves out, over
-/// `[from_t, until_t)` (`f:noHistory`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SuppressedHistory {
-    pub predicate_iri: String,
-    /// The graph the rule is limited to; `None` for every data graph.
-    pub graph_iri: Option<String>,
-    /// Graphs a ledger-wide rule leaves alone.
-    pub except_graph_iris: Vec<String>,
-    pub from_t: i64,
-    pub until_t: Option<i64>,
-}
-
 /// covers the rest with the correct `GraphId`.
 #[derive(Debug, Clone)]
 pub enum ConfiguredFulltextScope {

@@ -276,7 +276,9 @@ impl Fluree {
 
     /// Run one retention pass over `ledger_id` now, committing directly. A
     /// branch not yet registered is activated first when its commits carry
-    /// retention input.
+    /// retention input. Unlike a background pass, it saves what it discovers
+    /// at once, so an index build after it applies `f:noHistory` through
+    /// the commits it discovered.
     pub async fn run_retention(&self, ledger_id: &str) -> Result<PassReport> {
         self.run_retention_at(ledger_id, now_ms()).await
     }
@@ -288,7 +290,10 @@ impl Fluree {
         if registry::read_stored(ns, ledger_id).await?.1.is_none() {
             self.probe_and_activate(ledger_id, 0).await?;
         }
-        let limits = RetentionLimits::default();
+        let limits = RetentionLimits {
+            checkpoint_ms: 0,
+            ..Default::default()
+        };
         self.retention_pass(
             &BorrowedWriter(self),
             &self.retention.cache,

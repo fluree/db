@@ -476,11 +476,22 @@ impl Fluree {
 
     #[cfg(not(target_arch = "wasm32"))]
     /// The history an index build of `ledger_id` leaves out: its
-    /// `f:noHistory` rules.
+    /// `f:noHistory` rules, through the retention worker's persisted
+    /// watermark only. A config commit after it may have turned a rule off,
+    /// and the journal does not know yet.
     pub(crate) async fn suppressed_history_for_index(
         &self,
         ledger_id: &str,
     ) -> Result<Vec<fluree_db_indexer::SuppressedHistory>> {
+        // Read before the journal, which reflects the config through at
+        // least the watermark it is persisted with.
+        let Some(stored) = registry::read_stored(&self.nameservice_mode, ledger_id)
+            .await?
+            .1
+        else {
+            return Ok(Vec::new());
+        };
+        let processed_until = registry::shell(&stored)?.watermark_t + 1;
         let Some(suppression) = self.suppression_for(ledger_id).await? else {
             return Ok(Vec::new());
         };
@@ -488,12 +499,16 @@ impl Fluree {
             .journal
             .history_rules
             .iter()
+            .filter(|rule| rule.from_t < processed_until)
             .map(|rule| fluree_db_indexer::SuppressedHistory {
                 predicate_iri: rule.predicate.clone(),
                 graph_iri: rule.graph.clone(),
                 except_graph_iris: rule.except_graphs.clone(),
                 from_t: rule.from_t,
-                until_t: rule.until_t,
+                until_t: Some(
+                    rule.until_t
+                        .map_or(processed_until, |t| t.min(processed_until)),
+                ),
             })
             .collect())
     }
