@@ -98,21 +98,38 @@ impl NoveltyFactState {
     }
 
     /// Drop the ops at or below `cutoff_t` from the window, as trimming
-    /// novelty through it does. A graph `drained` reports as left with no
-    /// novelty drops its whole map now, so a ledger whose novelty has all been
-    /// indexed holds none of it while idle; the rest move the cutoff and are
-    /// swept by later commits (see [`NoveltyFactState`]).
-    pub(crate) fn trim_through(&mut self, cutoff_t: i64, drained: impl Fn(GraphId) -> bool) {
-        for (g, map) in self.graphs.iter_mut().enumerate() {
-            if map.is_some() && drained(g as GraphId) {
-                *map = None;
-            }
-        }
+    /// novelty through it does. A graph whose remaining flakes `survivors`
+    /// hands over is rebuilt from them now, so a trim that leaves few, or none,
+    /// keeps none of the trimmed window resident on a ledger that goes idle;
+    /// the rest move the cutoff and are swept by later commits (see
+    /// [`NoveltyFactState`]).
+    pub(crate) fn trim_through<'a, I>(
+        &mut self,
+        cutoff_t: i64,
+        mut survivors: impl FnMut(GraphId) -> Option<I>,
+    ) where
+        I: Iterator<Item = &'a Flake>,
+    {
         self.cutoff = self.cutoff.max(cutoff_t);
+        let mut rebuilt = vec![false; self.graphs.len()];
+        for (g, rebuilt) in rebuilt.iter_mut().enumerate() {
+            if self.graphs[g].is_none() {
+                continue;
+            }
+            let Some(flakes) = survivors(g as GraphId) else {
+                continue;
+            };
+            self.graphs[g] = None;
+            for flake in flakes {
+                self.record(g as GraphId, flake);
+            }
+            *rebuilt = true;
+        }
         self.sweep = self
             .graphs
             .iter()
-            .map(|m| m.as_ref().map(|_| None))
+            .zip(&rebuilt)
+            .map(|(m, &rebuilt)| (m.is_some() && !rebuilt).then_some(None))
             .collect();
     }
 
@@ -137,7 +154,7 @@ impl NoveltyFactState {
                 None => std::ops::Bound::Unbounded,
             };
             let mut stale: Vec<FactKey> = Vec::new();
-            let mut last: Option<FactKey> = None;
+            let mut last: Option<&FactKey> = None;
             let mut examined = 0usize;
             for (key, &(t, _)) in m.range((lower, std::ops::Bound::Unbounded)) {
                 if examined == left {
@@ -147,8 +164,9 @@ impl NoveltyFactState {
                 if t <= self.cutoff {
                     stale.push(key.clone());
                 }
-                last = Some(key.clone());
+                last = Some(key);
             }
+            let last = last.cloned();
             for key in &stale {
                 m.remove(key);
             }
@@ -210,7 +228,7 @@ mod tests {
         for s in 0..100u16 {
             fs.record(0, &mk(s, i64::from(s % 10) + 1, true, None));
         }
-        fs.trim_through(5, |_| false);
+        fs.trim_through(5, |_| None::<std::iter::Empty<&Flake>>);
         let live = |fs: &NoveltyFactState| {
             (0..100u16)
                 .filter(|&s| fs.is_asserted(0, &mk(s, 0, true, None)))
