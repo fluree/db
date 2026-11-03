@@ -7214,6 +7214,132 @@ fn doc_ingest_model_without_a_reader_or_llm_says_what_is_missing() {
         ));
 }
 
+/// `doc read` needs no project: the reader comes from the environment, the
+/// reading goes to stdout and what it was billed to stderr.
+#[test]
+fn doc_read_prints_one_files_reading_without_a_project() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    // A global directory, with no project: it holds the reading cache.
+    std::fs::create_dir_all(tmp.path().join("home")).unwrap();
+    let read = |extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_HOME", tmp.path().join("home"))
+            .env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(["--catalog", "ont/entities.ttl", "--model", "stub-reader"])
+            .args(extra);
+        cmd
+    };
+
+    let out = read(&[]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("read memo.md with stub-reader via http://"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "3 node(s): 1 mention(s), 0 entities, 1 relation(s); 1 call(s), 1,032 tokens"
+        ),
+        "{stderr}"
+    );
+    let reading: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let nodes = reading["@graph"].as_array().unwrap();
+    // The stub answers in its own terms: a mention is a NIF string.
+    assert!(nodes
+        .iter()
+        .any(|n| n["@type"].as_array().is_some_and(|t| t.iter().any(
+            |t| t == "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#RFC5147String"
+        ))));
+    assert!(nodes
+        .iter()
+        .all(|n| n["https://ns.flur.ee/doc#sourceDocument"][0]["@id"] == "urn:fluree:doc:memo.md"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // The same request again is answered from the cache.
+    read(&["--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "@prefix doc: <https://ns.flur.ee/doc#>",
+        ))
+        .stderr(predicate::str::contains("(1 from cache)"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    read(&["--format", "trig", "--no-cache"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<urn:fluree:doc:memo.md/reading> {",
+        ))
+        .stdout(predicate::str::contains("<urn:fluree:doc:memo.md> {"))
+        // The stub writes offsets as native JSON numbers: still numbers.
+        .stdout(predicate::str::contains("beginIndex 31"))
+        .stdout(predicate::str::contains("beginIndex \"31\"").not());
+    // `--no-cache` read afresh.
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // An output path that can't be written fails before anything is sent,
+    // by name.
+    read(&["-o", "no/such/dir/out.jsonld"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no/such/dir/out.jsonld"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // A document with no text is not sent.
+    std::fs::write(tmp.path().join("docs/empty.md"), "").unwrap();
+    let mut empty = fluree_cmd(&tmp);
+    empty
+        .env("FLUREE_HOME", tmp.path().join("home"))
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "read",
+            "docs/empty.md",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no text to read"))
+        .stderr(predicate::str::contains("0 call(s)"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn doc_read_names_what_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    write_extraction_fixtures(&tmp);
+    let cmd = |args: &[&str]| {
+        let mut c = fluree_cmd(&tmp);
+        c.env("FLUREE_HOME", tmp.path().join("home"))
+            .args(["doc", "read", "docs/memo.md", "--ontology", "ont/model.ttl"])
+            .args(args);
+        c
+    };
+    cmd(&[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("name the extraction model"));
+    cmd(&["--model", "nobody"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model nobody: no [doc.reader] lists it",
+        ));
+}
+
 /// A catalog scoped to a class is sent with each record's types (the
 /// reader links by class) and its labels as written, language tag kept.
 #[test]

@@ -349,6 +349,11 @@ impl Structure {
         candidates.into_iter().rev().find(|&c| !splits(c))
     }
 
+    /// The structure graph as the parser wrote it.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     /// The innermost element holding characters `[begin, end)` of the
     /// document's text, for a mention's `doc:sourceElement`.
     pub fn element_at(&self, begin: usize, end: usize) -> Option<&str> {
@@ -532,13 +537,23 @@ pub fn canonical_ntriples(graph: &Graph) -> Result<String> {
 /// adapter keeps the native value but labels it `xsd:string`, which a
 /// reader then refuses (`doc:columnIndex must be an xsd:integer`).
 pub fn parse_jsonld(json: &str) -> std::result::Result<Graph, String> {
-    use fluree_graph_ir::LiteralValue;
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
     let expanded = fluree_graph_json_ld::expand(&value).map_err(|e| e.to_string())?;
     let mut sink = GraphCollectorSink::new();
     fluree_graph_json_ld::adapter::to_graph_events(&expanded, &mut sink)
         .map_err(|e| e.to_string())?;
     let mut graph = sink.into_graph();
+    retype_native_literals(&mut graph);
+    Ok(graph)
+}
+
+/// A native JSON number or boolean (`{"@value": 0}`) comes out of the
+/// JSON-LD adapter typed `xsd:string`; give it the datatype JSON-LD says it
+/// has (`xsd:integer`, `xsd:double`, `xsd:boolean`). Every graph read from
+/// JSON-LD here goes through this, so one document never prints one offset
+/// two ways.
+pub fn retype_native_literals(graph: &mut Graph) {
+    use fluree_graph_ir::LiteralValue;
     for t in graph.iter_mut() {
         let retyped = match t.object() {
             Term::Literal {
@@ -557,7 +572,6 @@ pub fn parse_jsonld(json: &str) -> std::result::Result<Graph, String> {
             *t = fluree_graph_ir::Triple::new(t.subject().clone(), t.predicate().clone(), object);
         }
     }
-    Ok(graph)
 }
 
 /// Turtle or N-Triples read into a graph.

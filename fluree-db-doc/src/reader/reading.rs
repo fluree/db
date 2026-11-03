@@ -421,6 +421,45 @@ fn push_type(node: &mut Value, t: &str) {
     }
 }
 
+/// A reading (expanded JSON-LD nodes) as a graph, for printing it as
+/// Turtle or TriG.
+pub fn to_graph(nodes: &[Value]) -> Result<fluree_graph_ir::Graph> {
+    let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+    fluree_graph_json_ld::adapter::to_graph_events(&Value::Array(nodes.to_vec()), &mut sink)
+        .map_err(|e| DocError::Model(format!("reading: {e}")))?;
+    let mut graph = sink.into_graph();
+    super::request::retype_native_literals(&mut graph);
+    Ok(graph)
+}
+
+/// The prefixes a printed reading is written with: this pipeline's own.
+pub fn prefixes() -> fluree_graph_format::PrefixMap {
+    fluree_graph_format::PrefixMap::from_context(&crate::vocab::context())
+}
+
+/// The reading as Turtle.
+pub fn turtle(nodes: &[Value]) -> Result<String> {
+    let graph = to_graph(nodes)?;
+    fluree_graph_format::format_turtle(&graph, &prefixes())
+        .map_err(|e| DocError::Model(format!("reading: {e}")))
+}
+
+/// The structure graph and the reading as TriG, each in its own named
+/// graph: `<doc>` and `<doc>/reading`.
+pub fn trig(doc_iri: &str, structure: &fluree_graph_ir::Graph, nodes: &[Value]) -> Result<String> {
+    let mut dataset = fluree_graph_ir::Dataset::new();
+    let doc = fluree_graph_ir::Term::iri(doc_iri);
+    for t in structure.iter() {
+        dataset.graph_mut(Some(&doc)).add(t.clone());
+    }
+    let reading = fluree_graph_ir::Term::iri(format!("{doc_iri}/reading"));
+    for t in to_graph(nodes)?.iter() {
+        dataset.graph_mut(Some(&reading)).add(t.clone());
+    }
+    fluree_graph_format::format_trig(&dataset, &prefixes())
+        .map_err(|e| DocError::Model(format!("reading: {e}")))
+}
+
 /// Offsets in a reading, for tests and for `doc read`: every `nif:beginIndex`
 /// in the nodes.
 pub fn begin_offsets(nodes: &[Value]) -> Vec<u64> {
@@ -636,6 +675,66 @@ mod tests {
 
     fn node_in<'a>(nodes: &'a [Value], id: &str) -> &'a Value {
         nodes.iter().find(|n| n["@id"] == id).unwrap()
+    }
+
+    #[test]
+    fn a_reading_prints_as_turtle_and_trig() {
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let r = read_answer(&answer(), &frame, None).unwrap();
+        let ttl = turtle(&r.nodes).unwrap();
+        assert!(
+            ttl.contains("@prefix doc: <https://ns.flur.ee/doc#>"),
+            "{ttl}"
+        );
+        assert!(ttl.contains("doc:Relation"), "{ttl}");
+        let mut structure = fluree_graph_ir::Graph::new();
+        structure.add_triple(
+            fluree_graph_ir::Term::iri("urn:d-element-1"),
+            fluree_graph_ir::Term::iri(BEGIN),
+            fluree_graph_ir::Term::integer(0),
+        );
+        let trig = trig("urn:d", &structure, &r.nodes).unwrap();
+        // Each graph holds what it should, not just a header.
+        let block = |name: &str| {
+            let start = trig
+                .find(&format!("{name} {{"))
+                .unwrap_or_else(|| panic!("no {name} graph in {trig}"));
+            let rest = &trig[start..];
+            rest[..rest.find("\n}").unwrap_or(rest.len())].to_string()
+        };
+        let (doc, reading) = (block("<urn:d>"), block("<urn:d/reading>"));
+        assert!(doc.contains("urn:d-element-1"), "{trig}");
+        assert!(!doc.contains("o4-9"), "{trig}");
+        assert!(reading.contains("o4-9"), "{trig}");
+        assert!(!reading.contains("urn:d-element-1"), "{trig}");
+    }
+
+    #[test]
+    fn a_native_json_number_prints_as_a_number() {
+        let answer = json!([{ "@id": "urn:d/reading", "@graph": [{
+            "@id": "urn:d/reading#o0-4",
+            format!("{RDF_NS}type"): [{ "@id": format!("{NIF_NS}RFC5147String") }],
+            BEGIN: [{ "@value": 31 }],
+            END: [{ "@value": 35 }],
+            format!("{EX}score"): [{ "@value": 0.5 }]
+        }]}])
+        .to_string();
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let r = read_answer(&answer, &frame, None).unwrap();
+        let ttl = turtle(&r.nodes).unwrap();
+        assert!(ttl.contains("beginIndex 31"), "{ttl}");
+        assert!(!ttl.contains("beginIndex \"31\""), "{ttl}");
+        assert!(!ttl.contains("\"0.5\""), "{ttl}");
     }
 
     #[test]
