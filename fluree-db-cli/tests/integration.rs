@@ -7161,3 +7161,59 @@ fn doc_ingest_model_without_a_reader_or_llm_says_what_is_missing() {
             "--cache is for a model a [doc.reader] serves",
         ));
 }
+
+/// A catalog scoped to a class is sent with each record's types (the
+/// reader links by class) and its labels as written, language tag kept.
+#[test]
+fn doc_ingest_reader_sends_a_scoped_catalog_with_types_and_language_tags() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::write(
+        tmp.path().join("ont/tagged.ttl"),
+        r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix schema: <https://schema.org/> .
+<https://example.org/org/acme> a schema:Organization ;
+    skos:prefLabel "Acme Corporation"@en ; skos:altLabel "Acme" .
+<https://example.org/person/jane> a schema:Person ; skos:prefLabel "Jane Doe" .
+"#,
+    )
+    .unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args([
+            "--catalog",
+            "ont/tagged.ttl#schema:Organization",
+            "--model",
+            "stub-reader",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "catalog    ont/tagged.ttl#schema:Organization: 1 record(s)",
+        ));
+    let seen = seen.lock().unwrap();
+    let body = &seen[0].1;
+    let instances = &body[body
+        .find("<https://ns.flur.ee/extract#instances> {")
+        .expect(body)..];
+    let instances = &instances[..instances.find("\n}").unwrap()];
+    assert!(
+        instances.contains("<https://example.org/org/acme> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://schema.org/Organization>"),
+        "{instances}"
+    );
+    assert!(instances.contains("\"Acme Corporation\"@en"), "{instances}");
+    assert!(!instances.contains("jane"), "{instances}");
+}
