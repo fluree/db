@@ -134,7 +134,7 @@ pub struct Read {
 }
 
 /// A document's calls with their bodies, every one built and sized before
-/// anything is sent. With `requests_to`, each body is also written there as
+/// anything is sent; none for a document with no text. With `requests_to`, each body is also written there as
 /// `<relative-path>.request-<n>.trig`, beside `--out-dir`'s transactions.
 fn requests_of(
     setup: &ReaderSetup,
@@ -148,6 +148,11 @@ fn requests_of(
         doco: &doc.parsed.doco,
     };
     let structure = Structure::new(&document)?;
+    // No text, nothing to read: a call would bill the ontology and catalog
+    // for an empty reading.
+    if doc.parsed.text.trim().is_empty() {
+        return Ok((structure, Vec::new()));
+    }
     let requests = structure.requests(
         &document,
         &setup.ontology,

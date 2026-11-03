@@ -7346,3 +7346,21 @@ fn doc_ingest_dry_run_with_a_reader_sends_nothing() {
     // A reader call is billed: a dry run makes none.
     assert_eq!(seen.lock().unwrap().len(), 0);
 }
+
+#[test]
+fn doc_ingest_reader_sends_nothing_for_a_document_with_no_text() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::create_dir_all(tmp.path().join("blank")).unwrap();
+    std::fs::write(tmp.path().join("blank/empty.md"), "  \n").unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "ingest", "blank", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+        .assert()
+        .success();
+    assert_eq!(seen.lock().unwrap().len(), 0);
+}
