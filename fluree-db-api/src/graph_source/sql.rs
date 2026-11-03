@@ -270,16 +270,33 @@ async fn probe_duplicate_subjects(
         let sql = fluree_db_sql::render_duplicate_probe(&source, &keys, client.dialect());
         match client.execute_collect(&sql).await {
             Ok((_, batches)) => {
-                let repeats = batches.iter().any(|b| b.num_rows > 0);
-                if !repeats {
-                    verified.insert(table.clone(), keys.clone());
-                }
-                if repeats {
+                if batches.iter().any(|b| b.num_rows > 0) {
                     warnings.push(format!(
-                        "table '{table}': subject key ({}) is not unique; a star over a repeated                          subject returns duplicate rows and the pushdown lane refuses statements                          over it (register with allow_duplicate_subjects to proceed anyway)",
+                        "table '{table}': subject key ({}) is not unique; the pushdown lane \
+                         refuses statements over it (register with allow_duplicate_subjects to \
+                         answer over it with set semantics)",
                         keys.join(", ")
                     ));
                     flagged.push(table);
+                    continue;
+                }
+                // Unique under the database's equality; recorded only where
+                // that is the equality of the terms the key's columns render.
+                match client.schema(&source).await {
+                    Ok(schema) => match keys.iter().find(|c| !usable_key_column(&schema, c)) {
+                        None => {
+                            verified.insert(table, keys);
+                        }
+                        Some(column) => warnings.push(format!(
+                            "table '{table}': subject key column '{column}' cannot identify a \
+                             term (floating point, or a timestamp finer than the microsecond its \
+                             values are read to); queries over the table remove repeated solutions"
+                        )),
+                    },
+                    Err(e) => warnings.push(format!(
+                        "table '{table}': could not read its schema to vet the subject key: {e}; \
+                         queries over the table remove repeated solutions until a `check` succeeds"
+                    )),
                 }
             }
             Err(e) => {
@@ -298,6 +315,46 @@ async fn probe_duplicate_subjects(
         warnings,
         verified,
     }
+}
+
+/// A key the duplicate-subject probe found unique on a table.
+enum ProbedKey {
+    /// Recorded by a probe that also vetted its columns' types.
+    Vetted(Vec<String>),
+    /// Inferred for a source registered before the probe recorded its
+    /// findings; its columns are vetted when it is reported.
+    Legacy(Vec<String>),
+}
+
+/// Whether `name` is a timestamp the source reports finer than the
+/// microsecond a value is read to, or without its precision: two values the
+/// database keeps apart can then render one term.
+fn lossy_timestamp(schema: &BatchSchema, name: &str) -> bool {
+    schema.field_by_name(name).is_some_and(|f| {
+        matches!(
+            f.field_type,
+            fluree_db_tabular::FieldType::Timestamp | fluree_db_tabular::FieldType::TimestampTz
+        ) && !schema.fractional_digits(name).is_some_and(|d| d <= 6)
+    })
+}
+
+/// How a relation holds a column a key names, for the shared key rules
+/// ([`fluree_db_r2rml::mapping::usable_in_key`]): a lossy timestamp
+/// ([`lossy_timestamp`]) counts as a type values are not read from exactly.
+fn key_column(schema: &BatchSchema, name: &str) -> fluree_db_r2rml::mapping::KeyColumn {
+    use fluree_db_r2rml::mapping::KeyColumn;
+    match schema.field_by_name(name) {
+        None => KeyColumn::Absent,
+        Some(_) if lossy_timestamp(schema, name) => KeyColumn::Typed(None),
+        Some(field) => KeyColumn::Typed(Some(field.field_type)),
+    }
+}
+
+/// Whether column `name` can be part of a key ([`key_column`]).
+fn usable_key_column(schema: &BatchSchema, name: &str) -> bool {
+    matches!(key_column(schema, name),
+        fluree_db_r2rml::mapping::KeyColumn::Typed(t)
+            if fluree_db_r2rml::mapping::usable_in_key(t.as_ref()))
 }
 
 impl crate::Fluree {
@@ -560,40 +617,32 @@ impl SqlSource {
         mapping: &CompiledR2rmlMapping,
         table_name: &str,
     ) -> QueryResult<Option<Vec<Vec<String>>>> {
-        use fluree_db_r2rml::mapping::KeyColumn;
-        use fluree_db_tabular::FieldType;
         let declared = mapping.declared_keys(table_name);
         let probed = self.probed_subject_key(mapping, table_name);
-        if declared.is_empty() && probed.is_none() {
-            return Ok(None);
+        // A key the probe recorded was vetted against the schema when it ran.
+        if declared.is_empty() {
+            match probed {
+                None => return Ok(None),
+                Some(ProbedKey::Vetted(key)) => return Ok(Some(vec![key])),
+                Some(ProbedKey::Legacy(_)) => {}
+            }
         }
         let source = match mapping.sql_query_for_table(table_name) {
             Some(sql) => RelSource::Query(sql.to_string()),
             None => RelSource::Table(table_name.to_string()),
         };
         let schema = self.source_schema(session, mapping, &source).await?;
-        // A timestamp decodes to the microsecond, so two values the database
-        // keeps a nanosecond apart render one term: a key over a timestamp
-        // finer than that, or of unreported precision, does not identify a
-        // term even where the probe found it unique.
-        let lossy = |name: &str| {
-            schema.field_by_name(name).is_some_and(|f| {
-                matches!(f.field_type, FieldType::Timestamp | FieldType::TimestampTz)
-                    && !schema.fractional_digits(name).is_some_and(|d| d <= 6)
-            })
-        };
-        let column = |name: &str| match schema.field_by_name(name) {
-            Some(_) if lossy(name) => KeyColumn::Typed(None),
-            Some(field) => KeyColumn::Typed(Some(field.field_type)),
-            None => KeyColumn::Absent,
-        };
         let refuse = |message: String| {
             QueryError::InvalidQuery(format!(
                 "Graph source '{}': {message}",
                 self.graph_source_id
             ))
         };
-        if let Some(name) = declared.iter().flatten().find(|c| lossy(c)) {
+        if let Some(name) = declared
+            .iter()
+            .flatten()
+            .find(|c| lossy_timestamp(&schema, c))
+        {
             return Err(refuse(format!(
                 "f:key on the logical table \"{table_name}\" names column \"{name}\", a \
                  timestamp finer than the microsecond its values are read to (or of unreported \
@@ -601,13 +650,17 @@ impl SqlSource {
             )));
         }
         declared
-            .check_columns(table_name, column)
+            .check_columns(table_name, |c| key_column(&schema, c))
             .map_err(|e| refuse(e.to_string()))?;
-        let Some(key) = probed else {
-            return Ok(None);
-        };
-        let reported = fluree_db_r2rml::TableKeys::new([key]).retain_usable(column);
-        Ok((!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect()))
+        Ok(match probed {
+            None => None,
+            Some(ProbedKey::Vetted(key)) => Some(vec![key]),
+            Some(ProbedKey::Legacy(key)) => {
+                let reported = fluree_db_r2rml::TableKeys::new([key])
+                    .retain_usable(|c| key_column(&schema, c));
+                (!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect())
+            }
+        })
     }
 
     /// The composite key the duplicate-subject probe verified for
@@ -619,7 +672,7 @@ impl SqlSource {
         &self,
         mapping: &CompiledR2rmlMapping,
         table_name: &str,
-    ) -> Option<Vec<String>> {
+    ) -> Option<ProbedKey> {
         let config = &self.config;
         let named = |tables: &[String]| tables.iter().any(|t| t == table_name);
         if config.allow_duplicate_subjects
@@ -629,11 +682,11 @@ impl SqlSource {
             return None;
         }
         match &config.verified_subject_keys {
-            Some(verified) => verified.get(table_name).cloned(),
+            Some(verified) => verified.get(table_name).cloned().map(ProbedKey::Vetted),
             None => duplicate_probe_keys(mapping)
                 .into_iter()
                 .find(|(t, _)| t == table_name)
-                .map(|(_, keys)| keys),
+                .map(|(_, keys)| ProbedKey::Legacy(keys)),
         }
     }
 

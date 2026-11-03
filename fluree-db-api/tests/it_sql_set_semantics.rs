@@ -1347,6 +1347,53 @@ async fn a_declared_key_over_a_nanosecond_timestamp_refuses_the_query() {
         .execute_formatted()
         .await
         .expect("a microsecond timestamp key holds");
+
+    // The probe records a key it found unique only where its columns can
+    // identify a term: not over the nanosecond timestamp.
+    let subject_over = |column: &str| {
+        format!(
+            r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <http://example.org/mapping#Stamp>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.stamps" ] ;
+            rr:subjectMap [ rr:template "http://example.org/stamp/{{{column}}}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "label" ] ] .
+        "#
+        )
+    };
+    for (name, column, recorded) in [
+        ("probed9", "stamp9", json!({})),
+        ("probed6", "stamp6", json!({"sets.stamps": ["stamp6"]})),
+    ] {
+        let created = fluree
+            .create_sql_graph_source(SqlCreateConfig::new(
+                name,
+                server.uri(),
+                subject_over(column),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create {name}: {e}"));
+        let record = fluree
+            .nameservice()
+            .lookup_graph_source(&format!("{name}:main"))
+            .await
+            .expect("lookup")
+            .expect("the record");
+        let config: Value = serde_json::from_str(&record.config).expect("config JSON");
+        assert_eq!(config["verified_subject_keys"], recorded, "{name}");
+        let warned = created
+            .mapping_warnings
+            .iter()
+            .any(|w| w.contains(column) && w.contains("cannot identify a term"));
+        assert_eq!(
+            warned,
+            column == "stamp9",
+            "{name}: {:?}",
+            created.mapping_warnings
+        );
+    }
 }
 
 async fn query_sparql(fluree: &Fluree, sparql: &str) -> Value {
