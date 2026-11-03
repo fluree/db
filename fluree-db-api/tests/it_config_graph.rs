@@ -8958,3 +8958,58 @@ async fn title_hits(fluree: &fluree_db_api::Fluree, ledger_id: &str, text: &str)
     hits.sort();
     hits
 }
+
+/// A push carrying config under two config graph IRIs, a branch's history with
+/// its source's config from before the fork and its own after, applies both
+/// to the config graph: a ledger of another name receiving it reads the config
+/// the branch does, as pushed and once reloaded.
+#[tokio::test]
+async fn a_push_carrying_config_under_two_iris_applies_both() {
+    let source = FlureeBuilder::memory().without_indexing().build_memory();
+    let name = "it/push-two-configs";
+    let main = source.create_ledger(name).await.unwrap();
+    let main = source.insert(main, &uniqueness_on()).await.unwrap().ledger;
+    source.insert(main, &unique_email("ex:u1")).await.unwrap();
+    source.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    let dev_config = config_graph_iri(&dev);
+    sparql_update(
+        &source,
+        source.ledger(&dev).await.unwrap(),
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             DELETE {{ GRAPH <{dev_config}> {{ <urn:config:transact> f:uniqueEnabled ?on }} }} \
+             INSERT {{ GRAPH <{dev_config}> {{ <urn:config:transact> f:uniqueEnabled false }} }} \
+             WHERE {{ GRAPH <{dev_config}> {{ <urn:config:transact> f:uniqueEnabled ?on }} }}"
+        ),
+    )
+    .await
+    .expect("turn uniqueness off on the branch");
+    assert_eq!(unique_enabled(&source, &dev).await, Some(false));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let target = FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let remote = "it/push-two-configs-remote:main";
+    target.create_ledger(remote).await.unwrap();
+    let pushed = target
+        .push_commits(
+            remote,
+            newest_commits(&source, &dev, 100).await,
+            &GovernanceOptions::default(),
+            &target.default_index_config(),
+        )
+        .await
+        .expect("push");
+    assert_eq!(pushed.accepted, 3);
+    assert_eq!(unique_enabled(&target, remote).await, Some(false));
+    drop(target);
+    let reloaded = FlureeBuilder::file(path)
+        .without_indexing()
+        .build()
+        .unwrap();
+    assert_eq!(unique_enabled(&reloaded, remote).await, Some(false));
+}

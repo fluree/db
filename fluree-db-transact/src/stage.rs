@@ -578,14 +578,15 @@ pub struct StageOptions<'a> {
 
     /// Graph routing map for named-graph flakes.
     ///
-    /// Maps `GraphId → Sid` so that `stage_flakes` can resolve each flake's
-    /// `Flake.g` to a `GraphId` for per-graph policy enforcement and SHACL validation.
+    /// Maps each flake's `Flake.g` to its `GraphId` for per-graph policy
+    /// enforcement and SHACL validation. Several Sids can name one graph: any
+    /// ledger's config graph IRI is the config graph.
     ///
     /// **Required** when any flake has `g != None`. If `None` is provided and
     /// named-graph flakes are present, `stage_flakes` will return an error.
     ///
     /// The normal `stage()` path builds this internally from `txn.write_graphs`.
-    pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
+    pub graph_ids: Option<&'a HashMap<Sid, GraphId>>,
 
     /// These flakes come from a commit that was already authored and written,
     /// not from a transaction being authored now.
@@ -627,8 +628,8 @@ impl<'a> StageOptions<'a> {
     }
 
     /// Set the graph routing map for named-graph flakes
-    pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<GraphId, Sid>) -> Self {
-        self.graph_sids = Some(graph_sids);
+    pub fn with_graph_ids(mut self, graph_ids: &'a HashMap<Sid, GraphId>) -> Self {
+        self.graph_ids = Some(graph_ids);
         self
     }
 
@@ -2410,7 +2411,7 @@ async fn enforce_single_target_reifiers(
 /// # Named Graph Support
 ///
 /// When flakes include named-graph data (`Flake.g = Some(_)`), the caller
-/// **must** provide `StageOptions.graph_sids` so that policy enforcement
+/// **must** provide `StageOptions.graph_ids` so that policy enforcement
 /// and SHACL validation can resolve each flake's graph. If named-graph flakes
 /// are present without a routing map, this function returns an error.
 ///
@@ -2445,15 +2446,15 @@ pub async fn stage_flakes(
 
         // 2. Build graph routing map.
         //
-        // If the caller provided graph_sids (push/import path), use it.
+        // If the caller provided graph_ids (push/import path), use it.
         // Otherwise, verify no named-graph flakes are present — stage_flakes
         // cannot correctly enforce policy/SHACL without a routing map.
-        let reverse_graph: HashMap<Sid, GraphId> = match options.graph_sids {
-            Some(gs) => build_reverse_graph_lookup(gs),
+        let reverse_graph: HashMap<Sid, GraphId> = match options.graph_ids {
+            Some(ids) => ids.clone(),
             None => {
                 if flakes.iter().any(|f| f.g.is_some()) {
                     return Err(TransactError::FlakeGeneration(
-                        "stage_flakes received named-graph flakes but no graph_sids \
+                        "stage_flakes received named-graph flakes but no graph_ids \
                          routing map was provided in StageOptions"
                             .to_string(),
                     ));
