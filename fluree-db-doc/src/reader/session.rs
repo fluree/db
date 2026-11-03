@@ -150,7 +150,11 @@ impl Session {
 
     /// What reading a document would take, with nothing sent (a dry run):
     /// its calls, and how many a cached answer would serve.
-    pub fn plan(&self, doc: &PreparedDocument, requests_to: Option<&Path>) -> Result<(usize, usize)> {
+    pub fn plan(
+        &self,
+        doc: &PreparedDocument,
+        requests_to: Option<&Path>,
+    ) -> Result<(usize, usize)> {
         let (_, requests) = self.requests(doc, requests_to)?;
         let cached = requests
             .iter()
