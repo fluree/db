@@ -7085,11 +7085,27 @@ fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
         .stdout(predicate::str::contains("reading from cache"));
     assert_eq!(seen.lock().unwrap().len(), 1);
 
+    // Someone annotates a node the reader minted.
+    let note = "SELECT ?c WHERE { <urn:fluree:doc:memo.md/reading#o31-35> <http://www.w3.org/2000/01/rdf-schema#comment> ?c }";
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "--ledger",
+            "memos",
+            "-e",
+            "<urn:fluree:doc:memo.md/reading#o31-35> <http://www.w3.org/2000/01/rdf-schema#comment> \"checked by hand\" .",
+        ])
+        .assert()
+        .success();
+    assert_eq!(sparql_rows(&tmp, "memos", note), 1);
+
     // A fresh read replaces the reading whole: the old score, the claim and
-    // the edge it asserted are gone.
+    // the edge it asserted are gone. The annotation, in a predicate the
+    // reader never wrote, stays.
     ingest(&["--force", "--no-cache"]).assert().success();
     assert_eq!(seen.lock().unwrap().len(), 2);
     assert_eq!(sparql_rows(&tmp, "memos", scores), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", note), 1);
     assert_eq!(sparql_rows(&tmp, "memos", asserted), 0);
     assert_eq!(sparql_rows(&tmp, "memos", edge), 0);
 
@@ -7297,4 +7313,36 @@ fn doc_ingest_reader_honours_relations_off_and_reified() {
             "relations with --relations {mode}"
         );
     }
+}
+
+#[test]
+fn doc_ingest_dry_run_with_a_reader_sends_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--dry-run",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "stub-reader",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would read in 1 call(s)"))
+        .stdout(predicate::str::contains(
+            "reading: 1 call(s) planned, none sent (dry run)",
+        ));
+    // A reader call is billed: a dry run makes none.
+    assert_eq!(seen.lock().unwrap().len(), 0);
 }

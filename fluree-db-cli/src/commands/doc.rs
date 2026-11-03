@@ -193,6 +193,9 @@ struct Totals {
     reader_usage: fluree_db_doc::reader::Usage,
     reader_calls: usize,
     reader_cached: usize,
+    /// Under `--dry-run`: the calls reading would have taken, none sent.
+    reader_planned: usize,
+    reader_planned_cached: usize,
     /// What the reader set aside or adapted in the ontology, said once.
     ontology_notes: std::collections::BTreeSet<String>,
 }
@@ -773,18 +776,49 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 let reader_relations = policy.relations;
                 let reader = reader.clone();
                 let out_dir = args.out_dir.clone();
-                let (doc, read) = tokio::task::spawn_blocking(move || {
-                    let read = doc_reader::read_document(&reader, &doc, out_dir.as_deref());
-                    (doc, read)
-                })
-                .await
-                .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
-                match read {
-                    Ok(read) => (doc, Some(read_extracted(read, reader_relations))),
-                    Err(e) => {
-                        println!("  {} {label}  reading: {e}", "✗".red());
-                        totals.failed += 1;
-                        continue;
+                if args.dry_run {
+                    // A dry run reads nothing: a reader call is billed.
+                    let (doc, plan) = tokio::task::spawn_blocking(move || {
+                        let plan = doc_reader::plan_document(&reader, &doc, out_dir.as_deref());
+                        (doc, plan)
+                    })
+                    .await
+                    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
+                    match plan {
+                        Ok((calls, cached)) => {
+                            println!(
+                                "  {} {label}  would read in {calls} call(s){}",
+                                "~".dimmed(),
+                                if cached > 0 {
+                                    format!(", {cached} answered from cache")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            totals.reader_planned += calls;
+                            totals.reader_planned_cached += cached;
+                            (doc, None)
+                        }
+                        Err(e) => {
+                            println!("  {} {label}  reading: {e}", "✗".red());
+                            totals.failed += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    let (doc, read) = tokio::task::spawn_blocking(move || {
+                        let read = doc_reader::read_document(&reader, &doc, out_dir.as_deref());
+                        (doc, read)
+                    })
+                    .await
+                    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))?;
+                    match read {
+                        Ok(read) => (doc, Some(read_extracted(read, reader_relations))),
+                        Err(e) => {
+                            println!("  {} {label}  reading: {e}", "✗".red());
+                            totals.failed += 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -839,6 +873,10 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     relations: stats.map_or(0, |s| {
                         s.relations_valid + s.relations_repaired + s.relations_rejected
                     }),
+                    reader_predicates: match (&setup.reader, &extracted) {
+                        (Some(_), Some(x)) => graph::reader_predicates(&x.graph.nodes),
+                        _ => Vec::new(),
+                    },
                 }
             });
         let document = graph::document_node(
@@ -1026,6 +1064,17 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         elapsed.as_secs_f64(),
         if args.dry_run { " (dry run, nothing written)" } else { "" }
     );
+    if totals.reader_planned > 0 {
+        println!(
+            "  reading: {} call(s) planned{}, none sent (dry run)",
+            totals.reader_planned,
+            if totals.reader_planned_cached > 0 {
+                format!(" ({} answered from cache)", totals.reader_planned_cached)
+            } else {
+                String::new()
+            }
+        );
+    }
     if extraction.is_some() && totals.ingested > 0 {
         println!(
             "  extraction: {} mention(s), {} new entit{} ({} off-model), {} relation(s) ({} rejected), {} dropped ({} hallucinated, {} off-model), {} chunk(s) from cache{}",
