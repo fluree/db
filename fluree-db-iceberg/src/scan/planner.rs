@@ -103,8 +103,9 @@ pub struct FileScanTask {
     pub data_file: DataFile,
     /// Field IDs to project (read only these columns).
     pub projected_field_ids: Vec<i32>,
-    /// Residual filter to apply after reading (predicates not fully evaluated by stats).
-    pub residual_filter: Option<Expression>,
+    /// Residual filter to apply after reading (predicates not fully evaluated by
+    /// stats). Shared: every task of a plan holds the same filter.
+    pub residual_filter: Option<Arc<Expression>>,
     /// Start position for split reading (0 for whole file).
     pub start: i64,
     /// Length for split reading (file size for whole file).
@@ -138,7 +139,7 @@ impl FileScanTask {
     pub fn for_whole_file(
         data_file: DataFile,
         projected_field_ids: Vec<i32>,
-        residual_filter: Option<Expression>,
+        residual_filter: Option<Arc<Expression>>,
     ) -> Self {
         let length = data_file.file_size_in_bytes;
         Self {
@@ -156,7 +157,7 @@ impl FileScanTask {
     pub fn for_whole_file_with_schema(
         data_file: DataFile,
         projected_field_ids: Vec<i32>,
-        residual_filter: Option<Expression>,
+        residual_filter: Option<Arc<Expression>>,
         schema: Arc<Schema>,
     ) -> Self {
         let length = data_file.file_size_in_bytes;
@@ -354,7 +355,7 @@ pub(crate) trait PlanFile {
     fn into_task(
         self,
         projection: &[i32],
-        residual: Option<&Expression>,
+        residual: Option<&Arc<Expression>>,
         schema: &Arc<Schema>,
     ) -> FileScanTask;
 }
@@ -367,7 +368,7 @@ impl PlanFile for &DataFile {
     fn into_task(
         self,
         projection: &[i32],
-        residual: Option<&Expression>,
+        residual: Option<&Arc<Expression>>,
         schema: &Arc<Schema>,
     ) -> FileScanTask {
         FileScanTask::for_whole_file_with_schema(
@@ -387,7 +388,7 @@ impl PlanFile for (DataFile, i64) {
     fn into_task(
         self,
         projection: &[i32],
-        residual: Option<&Expression>,
+        residual: Option<&Arc<Expression>>,
         schema: &Arc<Schema>,
     ) -> FileScanTask {
         let mut task = FileScanTask::for_whole_file_with_schema(
@@ -409,7 +410,7 @@ impl PlanFile for &(DataFile, i64) {
     fn into_task(
         self,
         projection: &[i32],
-        residual: Option<&Expression>,
+        residual: Option<&Arc<Expression>>,
         schema: &Arc<Schema>,
     ) -> FileScanTask {
         let mut task = FileScanTask::for_whole_file_with_schema(
@@ -444,6 +445,8 @@ pub(crate) fn select_files<F: PlanFile>(
     known_record_count: Option<i64>,
 ) -> ScanPlan {
     let schema_arc = Arc::new(schema.clone());
+    // One filter per plan, shared by its tasks as their residual.
+    let residual = filter.map(|f| Arc::new(f.clone()));
     let mut files_pruned = 0;
     let mut estimated_row_count = 0i64;
     let ids = &projected_field_ids;
@@ -471,7 +474,7 @@ pub(crate) fn select_files<F: PlanFile>(
             })
             .map(|file| {
                 estimated_row_count += file.data_file().record_count;
-                file.into_task(ids, Some(filter), &schema_arc)
+                file.into_task(ids, residual.as_ref(), &schema_arc)
             })
             .collect(),
     };

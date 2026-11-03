@@ -1079,6 +1079,17 @@ mod plan_from_files_tests {
                     assert!(task.iceberg_schema.is_some());
                 }
                 assert_eq!(plan.projected_columns, vec!["id", "region"]);
+                // One residual per plan, shared by its tasks rather than copied.
+                assert!(
+                    plan.tasks.windows(2).all(|w| {
+                        match (&w[0].residual_filter, &w[1].residual_filter) {
+                            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                    }),
+                    "{name} ({lane}): tasks share one residual"
+                );
             }
             // Sequence numbers: known when read from manifests, absent from a
             // kept list (it holds none).
