@@ -22,6 +22,10 @@
   timestamptz, binary, string, and numeric text), in two files, with values whose lexical order
   differs from their natural order, duplicates to group on, and a row that is
   null in every typed column.
+- `silver.renamed`: two snapshots across a column rename: three rows with
+  `id`, `name`; then `name` renamed to `full_name`; then two more rows. A
+  read pinned to the first snapshot must find its rows under the current
+  name.
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -244,3 +248,28 @@ cells.append(cells_batch(cells_rows[:4]))
 cells.append(cells_batch(cells_rows[4:]))
 cells = catalog.load_table("silver.cells")
 print("cells table_location:", cells.location())
+
+# ---------------------------------------------------------------------------
+# silver.renamed: a column renamed between two snapshots.
+# ---------------------------------------------------------------------------
+renamed = catalog.create_table("silver.renamed", schema=pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("name", pa.string()),
+]))
+renamed.append(pa.table({
+    "id": pa.array([1, 2, 3], pa.int64()),
+    "name": pa.array(["alice", "bob", "carol"]),
+}))
+with renamed.update_schema() as update:
+    update.rename_column("name", "full_name")
+renamed = catalog.load_table("silver.renamed")
+renamed.append(pa.table({
+    "id": pa.array([4, 5], pa.int64()),
+    "full_name": pa.array(["dave", "erin"]),
+}))
+renamed = catalog.load_table("silver.renamed")
+print("renamed table_location:", renamed.location())
+print("renamed snapshots:", [
+    (s.snapshot_id, s.sequence_number, s.schema_id)
+    for s in sorted(renamed.snapshots(), key=lambda s: s.sequence_number)
+])

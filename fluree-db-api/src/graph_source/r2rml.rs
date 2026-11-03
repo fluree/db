@@ -26,7 +26,8 @@ use fluree_db_iceberg::{
     metadata::{SnapshotSelection, TableMetadata, WindowCap},
     scan::{
         topk::{batch_sort_values, plan_topk_read, TopKBound},
-        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
+        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, ScanPlan,
+        SendScanPlanner,
     },
     stats::{aggregate_column_stats, send_read_snapshot_data_files},
     DeleteConvention, IcebergGsConfig,
@@ -2192,10 +2193,13 @@ impl<'a> FlureeR2rmlProvider<'a> {
                     table: snapshot_err_table.to_string(),
                     snapshot_id: to_snapshot_id,
                 })?;
+        // The mapping names columns as they are now: resolve them through the
+        // `to` snapshot's schema under current names, so a column renamed
+        // since `to` is still projected.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -2481,12 +2485,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
         let mut to_snapshot_id = to_snapshot.snapshot_id;
 
         // Schema AT the `to` snapshot (falls back to current when the snapshot
-        // carries no schema-id) — identical to current for an uncapped, unpinned
-        // read.
+        // carries no schema-id), under current column names: the mapping names
+        // columns as they are now, so a column renamed since `to` (a pinned or
+        // capped window) must still be projected. Identical to current for an
+        // uncapped, unpinned read.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -3423,37 +3429,6 @@ fn cached_metadata_serves_pin(pin: Option<SourceTime>, metadata: &TableMetadata)
     }
 }
 
-/// The schema a read of `snapshot` projects through: the snapshot's own schema,
-/// with every field the table still has carrying its current name. Iceberg
-/// reads by field id while the R2RML mapping names columns as they are now, so
-/// a column renamed since the snapshot still resolves, and one added since
-/// reads as absent, which it was. A field dropped since keeps its old name
-/// unless a current field has taken it.
-fn read_schema<'m>(
-    metadata: &'m TableMetadata,
-    snapshot: &fluree_db_iceberg::metadata::Snapshot,
-) -> Option<std::borrow::Cow<'m, fluree_db_iceberg::metadata::Schema>> {
-    use std::borrow::Cow;
-    let pinned = metadata.schema_for_snapshot(snapshot)?;
-    let Some(current) = metadata
-        .current_schema()
-        .filter(|current| current.schema_id != pinned.schema_id)
-    else {
-        return Some(Cow::Borrowed(pinned));
-    };
-    let mut schema = pinned.clone();
-    schema
-        .fields
-        .retain_mut(|field| match current.field(field.id) {
-            Some(now) => {
-                field.name.clone_from(&now.name);
-                true
-            }
-            None => current.field_by_name(&field.name).is_none(),
-        });
-    Some(Cow::Owned(schema))
-}
-
 /// The deferred builder of a table's store on the pointer rung: the same
 /// session-pin ladder as the eager arm ([`resolve_catalog_load_and_storage`]),
 /// run by the first read that misses every cache. A typed refusal is the
@@ -3650,7 +3625,7 @@ impl FlureeR2rmlProvider<'_> {
             return Ok(None);
         };
         let snapshot = selected.snapshot;
-        let Some(schema) = read_schema(&metadata, snapshot) else {
+        let Some(schema) = metadata.read_schema_for_snapshot(snapshot) else {
             return Ok(None);
         };
         let schema = schema.as_ref();
@@ -4372,7 +4347,8 @@ impl FlureeR2rmlProvider<'_> {
 
         // The schema at the snapshot being read (current for an unpinned read),
         // under current column names.
-        let schema = read_schema(&metadata, snapshot)
+        let schema = metadata
+            .read_schema_for_snapshot(snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
         let schema = schema.as_ref();
 
@@ -4406,128 +4382,72 @@ impl FlureeR2rmlProvider<'_> {
             )));
         }
 
-        let schema_arc = Arc::new(schema.clone());
-
         // Build an Iceberg pushdown predicate for file pruning. Filters resolve
         // to fields by name; unknown fields are skipped (conservative).
         let filter_expr = build_iceberg_filter(filters, schema);
+        let mut scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
+        if let Some(filter) = filter_expr {
+            scan_config = scan_config.with_filter(filter);
+        }
+        let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
 
-        // Reuse manifest-derived file selections across repeated scans of the
-        // same snapshot. Projection still varies per scan, so we rebuild tasks.
-        // The scan-files cache holds one snapshot's unfiltered file list, so it
-        // is bypassed when a pushdown filter is present (different filter → a
-        // different pruned file set).
-        let rebuild_tasks = |files: &CachedScanFiles| {
-            files
-                .data_files
-                .iter()
-                .cloned()
-                .map(|data_file| {
-                    FileScanTask::for_whole_file_with_schema(
-                        data_file,
-                        projected_field_ids.clone(),
-                        None,
-                        Arc::clone(&schema_arc),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let (tasks, files_selected, files_pruned, estimated_row_count) = if let Some(filter) =
-            &filter_expr
-        {
-            let scan_config = ScanConfig::new()
-                .with_projection(projected_field_ids.clone())
-                .with_filter(filter.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan_for_snapshot(snapshot)
-                .await
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-            (
-                plan.tasks,
-                plan.files_selected,
-                plan.files_pruned,
-                plan.estimated_row_count,
-            )
-        } else if let Some(cached) = cache.get_scan_files(&scope, &cache_key).await {
-            // F-AUD-1 cache-arm guard: an in-memory scan-files HIT rebuilds tasks
-            // without calling the guarded plan_scan, so re-check the delete flag.
-            guard_cached_scan_files(cached.has_delete_manifests, &metadata_location)?;
+        // A snapshot's live file list never changes, so it is read from the
+        // manifests once and kept: in memory, and in the disk catalog cache for
+        // later processes. Whatever this scan's filter, the list kept is the
+        // whole unfiltered one, and every scan of the snapshot plans from it in
+        // memory (`plan_from_files` prunes it with the same file test the
+        // manifest walk uses, and re-applies the merge-on-read refusal).
+        let plan = if let Some(cached) = cache.get_scan_files(&scope, &cache_key).await {
             debug!(
                 metadata_location = %metadata_location,
                 cached_files = cached.data_files.len(),
                 "Iceberg scan-files cache hit"
             );
-            (
-                rebuild_tasks(&cached),
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
+            planner
+                .plan_from_files(snapshot, cached.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?
         } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&scope, &cache_key) {
-            // F-AUD-1 cache-arm guard (the cross-process case): a persistent-disk
-            // scan-files entry survives restarts, so a delete-bearing list cached
-            // under the override by an earlier process must be re-checked before it
-            // is served or promoted into the in-memory cache. Pre-guard (v2) entries
-            // are already excluded by the CACHE_FORMAT_VERSION bump; this covers a v3
-            // entry written under the override.
-            guard_cached_scan_files(disk.has_delete_manifests, &metadata_location)?;
             // PR-8 slice 2: in-memory miss, but the persistent disk catalog
-            // cache has this snapshot's (unfiltered) file list — a warm-catalog
-            // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
-            // tasks from the file list exactly as the in-memory-hit arm does, and
-            // populate the in-memory cache for the rest of the process.
+            // cache has this snapshot's file list — a warm-catalog cold process
+            // skips the manifest read. The plan re-applies the merge-on-read
+            // refusal (F-AUD-1, the cross-process case: an entry written under
+            // the override by an earlier process) before the list is promoted
+            // into the in-memory cache.
             debug!(
                 metadata_location = %metadata_location,
                 cached_files = disk.data_files.len(),
                 "Iceberg scan-files disk-cache hit"
             );
-            cache
-                .put_scan_files(&scope, &cache_key, Arc::clone(&disk))
-                .await;
-            (
-                rebuild_tasks(&disk),
-                disk.files_selected,
-                disk.files_pruned,
-                disk.estimated_row_count,
-            )
+            let plan = planner
+                .plan_from_files(snapshot, disk.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+            cache.put_scan_files(&scope, &cache_key, disk).await;
+            plan
         } else {
             debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
-
-            // Create scan configuration with projection for the first plan.
-            let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan_for_snapshot(snapshot)
+            let (plan, files) = planner
+                .plan_scan_for_snapshot_retaining_files(snapshot)
                 .await
                 .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-
-            let cached = Arc::new(CachedScanFiles {
-                data_files: Arc::new(
-                    plan.tasks
-                        .iter()
-                        .map(|task| task.data_file.clone())
-                        .collect(),
-                ),
-                estimated_row_count: plan.estimated_row_count,
-                files_selected: plan.files_selected,
-                files_pruned: plan.files_pruned,
-                has_delete_manifests: plan.has_delete_manifests,
-            });
-            // Persist to the disk catalog cache (content-addressed, immutable).
-            self.catalog_disk_cache()
-                .put_scan_files(&scope, &cache_key, &cached);
-            cache
-                .put_scan_files(&scope, &cache_key, Arc::clone(&cached))
-                .await;
-
-            (
-                plan.tasks,
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
+            let cached = Arc::new(CachedScanFiles::new(files, plan.has_delete_manifests));
+            // Persist to the disk catalog cache (content-addressed, immutable),
+            // also when the list is too large for the in-memory cache. Written
+            // off this query's path: thousands of files are megabytes of JSON.
+            self.catalog_disk_cache().put_scan_files_in_background(
+                scope.clone(),
+                cache_key.clone(),
+                Arc::clone(&cached),
+            );
+            cache.put_scan_files(&scope, &cache_key, cached).await;
+            plan
         };
+        let ScanPlan {
+            tasks,
+            files_selected,
+            files_pruned,
+            estimated_row_count,
+            ..
+        } = plan;
 
         info!(
             files_selected,
@@ -4806,23 +4726,6 @@ impl FlureeR2rmlProvider<'_> {
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
 fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
-}
-
-/// Re-apply the fail-closed merge-on-read guard (audit F-AUD-1) to a cached
-/// scan-files selection. A scan-files cache HIT (in-memory or persistent disk)
-/// rebuilds tasks WITHOUT calling the guarded `plan_scan`, so a delete-bearing
-/// file list — which is only ever cacheable when the guard was overridden at plan
-/// time — must be re-checked here in case the override is now off. Cheap: the flag
-/// rides on the cache entry, no manifest re-read. Shared by both hit arms so the
-/// check cannot drift between them.
-fn guard_cached_scan_files(has_delete_manifests: bool, metadata_location: &str) -> QueryResult<()> {
-    let allow_mor = fluree_db_iceberg::mor_deletes_allowed();
-    fluree_db_iceberg::ensure_no_delete_manifests(
-        usize::from(has_delete_manifests),
-        metadata_location,
-        allow_mor,
-    )
-    .map_err(|e| storage_query_error("Refusing cached Iceberg scan", e))
 }
 
 /// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
@@ -5190,25 +5093,6 @@ mod tests {
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
-
-    /// F-AUD-1 cache-arm follow-up: the shared guard both scan-files hit arms call
-    /// must refuse a delete-bearing cached entry (guard active by default in the
-    /// test env) and pass a delete-free one — so a cache HIT can never silently
-    /// serve a merge-on-read file list around the plan-time guard.
-    #[test]
-    fn cached_scan_files_guard_refuses_delete_bearing_entry() {
-        assert!(
-            guard_cached_scan_files(false, "s3://b/t/metadata/00001.json").is_ok(),
-            "a delete-free cached entry is served"
-        );
-        let err = guard_cached_scan_files(true, "s3://b/dw.fact_orders/metadata/00007.json")
-            .expect_err("a delete-bearing cached entry must be refused with the guard active");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("FLUREE_ICEBERG_ALLOW_MOR_DELETES"),
-            "the refusal names the override switch: {msg}"
-        );
-    }
 
     fn field(id: i32, name: &str, ty: serde_json::Value) -> SchemaField {
         SchemaField {
@@ -7352,74 +7236,6 @@ mod tests {
             budget_at(large) > budget_at(small),
             "a builder-configured ceiling must move the budget; a fixed default \
              would mean the env var is still the only route that counts"
-        );
-    }
-
-    /// A pinned read resolves the mapping's (current) column names through field
-    /// ids: `name` was renamed `full_name`, `email` was added after snapshot 1,
-    /// and `legacy` was dropped with its name reused by the renamed `old_code`.
-    #[test]
-    fn read_schema_resolves_current_names_by_field_id() {
-        let fields = |fs: &[(i32, &str)]| {
-            fs.iter()
-                .map(|(id, name)| json!({"id": id, "name": name, "required": false, "type": "string"}))
-                .collect::<Vec<_>>()
-        };
-        let metadata = TableMetadata::from_json_str(
-            &json!({
-                "format-version": 2,
-                "location": "s3://b/t",
-                "last-sequence-number": 2,
-                "last-updated-ms": 2000,
-                "last-column-id": 5,
-                "current-schema-id": 1,
-                "schemas": [
-                    {"type": "struct", "schema-id": 0,
-                     "fields": fields(&[(1, "name"), (2, "score"), (3, "legacy"), (4, "old_code")])},
-                    {"type": "struct", "schema-id": 1,
-                     "fields": fields(&[(1, "full_name"), (2, "score"), (4, "legacy"), (5, "email")])},
-                ],
-                "current-snapshot-id": 2,
-                "snapshots": [
-                    {"snapshot-id": 1, "sequence-number": 1, "timestamp-ms": 1000, "schema-id": 0,
-                     "manifest-list": "s3://b/t/snap-1.avro", "summary": {"operation": "append"}},
-                    {"snapshot-id": 2, "parent-snapshot-id": 1, "sequence-number": 2,
-                     "timestamp-ms": 2000, "schema-id": 1,
-                     "manifest-list": "s3://b/t/snap-2.avro", "summary": {"operation": "append"}},
-                ],
-                "snapshot-log": [],
-                "default-spec-id": 0,
-                "partition-specs": [],
-                "last-partition-id": 0,
-                "sort-orders": [],
-                "default-sort-order-id": 0,
-                "properties": {}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let ids_by_name = |snapshot_id: i64| {
-            let schema = read_schema(&metadata, metadata.snapshot(snapshot_id).unwrap()).unwrap();
-            schema
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.id))
-                .collect::<Vec<_>>()
-        };
-        let named = |pairs: &[(&str, i32)]| {
-            pairs
-                .iter()
-                .map(|(n, id)| (n.to_string(), *id))
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            ids_by_name(1),
-            named(&[("full_name", 1), ("score", 2), ("legacy", 4)])
-        );
-        assert_eq!(
-            ids_by_name(2),
-            named(&[("full_name", 1), ("score", 2), ("legacy", 4), ("email", 5)])
         );
     }
 
