@@ -744,6 +744,86 @@ async fn incremental_builds_keep_a_span_that_outlives_the_rule() {
     }
 }
 
+/// As `incremental_builds_keep_a_span_that_outlives_the_rule`, in a named
+/// graph with trees of its own. Its history entries carry no graph, and the
+/// ones a build derives from novelty do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_builds_keep_a_span_that_outlives_the_rule_in_a_dedicated_graph() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_millis(200))
+            .build()
+            .unwrap(),
+    );
+    fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            ..Default::default()
+        }),
+    );
+    let id = ledger(&fluree, "it/nohist-dedicated-span").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <urn:fluree:{id}#config> {{
+               <urn:fluree:{id}:config:ledger> a f:LedgerConfig ;
+                 f:indexingDefaults [ f:graphPlacement f:PlacementDedicated ] .
+             }}"
+        ))
+        .commit()
+        .await
+        .expect("placement");
+    let write = |v: i64| {
+        let fluree = Arc::clone(&fluree);
+        let id = id.clone();
+        async move {
+            fluree
+                .graph(&id)
+                .transact()
+                .upsert_turtle(&format!(
+                    "@prefix ex: <http://example.org/> .
+                     GRAPH ex:g {{ ex:c ex:count {v} . }}"
+                ))
+                .commit()
+                .await
+                .expect("write")
+                .receipt
+                .t
+        }
+    };
+    let t1 = write(1).await;
+    caught_up(&fluree, &id).await;
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    rule_in_force(&fluree, &id, true).await;
+    let t3 = write(2).await;
+    caught_up(&fluree, &id).await;
+    set_no_history(&fluree, &id, "ex:count", false).await;
+    rule_in_force(&fluree, &id, false).await;
+    let t5 = write(3).await;
+    caught_up(&fluree, &id).await;
+
+    let at = |t: i64| json!({"@id": id, "t": t, "graph": "http://example.org/g"});
+    assert_eq!(
+        read(&fluree, &id, at(t1), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        Vec::<JsonValue>::new()
+    );
+    for (t, value) in [(t3, 2), (t5, 3)] {
+        assert_eq!(
+            read(&fluree, &id, at(t), "ex:c", "ex:count").await.unwrap(),
+            vec![json!(value)],
+            "t={t}"
+        );
+    }
+}
+
 /// As `a_rebuild_ahead_of_the_worker_keeps_history_written_after_a_rule_ended`,
 /// for incremental builds. Passes run only when called, so the background
 /// indexer builds before the pass that ends the rule.

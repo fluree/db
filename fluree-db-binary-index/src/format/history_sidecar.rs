@@ -414,6 +414,11 @@ mod tests {
         // Another predicate is untouched.
         let other = vec![make_entry(1, 8, 3, 10, 1, 1), make_entry(1, 8, 3, 10, 3, 0)];
         assert_eq!(kept(&until_4, other), vec![(10, 1, 1), (10, 3, 0)]);
+        // A named graph's tree: the assertion decoded without its graph, the
+        // retraction derived from novelty with it.
+        let mut named = span(20, 3, 5);
+        named[1].g_id = 5;
+        assert_eq!(kept(&until_4, named), vec![(20, 3, 1), (20, 5, 0)]);
     }
 
     #[test]
@@ -642,12 +647,14 @@ impl HistoryDrop {
             return;
         }
         if any_ranged {
-            type Fact = (u64, u32, u16, u64, u32, fluree_db_core::GraphId);
+            // Not by graph: a tree holds one, and an entry decoded from a
+            // sidecar says 0 where one derived from novelty names it.
+            type Fact = (u64, u32, u16, u64, u32);
             let mut facts: std::collections::HashMap<Fact, Vec<usize>> =
                 std::collections::HashMap::new();
             for (i, e) in entries.iter().enumerate() {
                 if self.by_p_id.contains_key(&e.p_id) {
-                    let fact = (e.s_id.as_u64(), e.p_id, e.o_type, e.o_key, e.o_i, e.g_id);
+                    let fact = (e.s_id.as_u64(), e.p_id, e.o_type, e.o_key, e.o_i);
                     facts.entry(fact).or_default().push(i);
                 }
             }
