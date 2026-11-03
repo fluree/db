@@ -5739,7 +5739,7 @@ fn doc_ingest_entities_alone_scan_without_a_model_and_model_needs_an_llm() {
 }
 
 /// `--catalog` is another name for `--entities`; `--ontology` took over
-/// `--model` outright, so the old spelling is a usage error, not an alias.
+/// `--model` outright, so an ontology passed as `--model` is not read as one.
 #[test]
 fn doc_ingest_catalog_names_the_entities_and_model_is_no_longer_the_ontology() {
     let tmp = TempDir::new().unwrap();
@@ -5772,8 +5772,10 @@ fn doc_ingest_catalog_names_the_entities_and_model_is_no_longer_the_ontology() {
             "ont/model.ttl",
         ])
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("--model"));
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model ont/model.ttl looks like an ontology (an RDF file); did you mean `--ontology ont/model.ttl`?",
+        ));
 
     // The first run built the ledger's full-text index, `memos-text`: a
     // graph source, but an index, not a mapped table, so it is refused by
@@ -6911,4 +6913,487 @@ fn issue_1512_sparql_from_reads_the_config_graph() {
             .stdout(predicate::str::contains("cfg-value"))
             .stdout(predicate::str::contains("in-default").not());
     }
+}
+
+/// Each request a stub saw: its lowercased head, and its body.
+type StubLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// A stub HTTP reader: records each request (head and body) and answers the
+/// n-th with `answers[n]` (the last one again past the end), billing 1,032
+/// tokens a call.
+fn spawn_stub_reader(answers: Vec<serde_json::Value>) -> (String, StubLog) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let request = loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= split + 4 + len {
+                    let body =
+                        String::from_utf8_lossy(&buf[split + 4..split + 4 + len]).to_string();
+                    break Some((head, body));
+                }
+            };
+            let Some(request) = request else { continue };
+            let n = {
+                let mut log = log.lock().unwrap();
+                log.push(request);
+                log.len() - 1
+            };
+            let payload = answers[n.min(answers.len() - 1)].to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nX-Fluree-Serialized-Tokens: 1032\r\nX-Fluree-Ontology-Not-Shown: rdfs:domain=1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}/extract"), seen)
+}
+
+/// A reading of `memo.md` in a vocabulary of the reader's own: the echoed
+/// document graph, a mention of Acme, and (with `claim`) a local entity
+/// for Jane Doe and the reified claim that she works for Acme.
+fn stub_reading(score: f64, claim: bool) -> serde_json::Value {
+    const R: &str = "http://example.org/r#";
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    const NIF: &str = "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#";
+    let doc = "urn:fluree:doc:memo.md";
+    let mut reading = vec![serde_json::json!({
+        "@id": format!("{doc}/reading#o31-35"),
+        // In the reader's own terms, as a NIF string with offsets.
+        format!("{RDF}type"): [
+            { "@id": format!("{R}Occurrence") },
+            { "@id": format!("{NIF}RFC5147String") }
+        ],
+        format!("{NIF}beginIndex"): [{ "@value": 31 }],
+        format!("{NIF}endIndex"): [{ "@value": 35 }],
+        format!("{R}refersTo"): [{ "@id": "https://example.org/org/acme" }],
+        format!("{R}score"): [{ "@value": score }]
+    })];
+    if claim {
+        reading.push(serde_json::json!({
+            "@id": format!("{doc}/entity/1"),
+            format!("{RDF}type"): [{ "@id": format!("{R}LocalEntity") }],
+            "https://schema.org/worksFor": [{ "@id": "https://example.org/org/acme" }]
+        }));
+        reading.push(serde_json::json!({
+            "@id": format!("{doc}/reading#r-0"),
+            format!("{RDF}type"): [{ "@id": format!("{RDF}Statement") }],
+            format!("{RDF}subject"): [{ "@id": format!("{doc}/entity/1") }],
+            format!("{RDF}predicate"): [{ "@id": "https://schema.org/worksFor" }],
+            format!("{RDF}object"): [{ "@id": "https://example.org/org/acme" }]
+        }));
+    }
+    serde_json::json!([
+        { "@id": doc, "@graph": [{ "@id": doc, format!("{NIF}isString"): [{ "@value": "echo" }] }] },
+        { "@id": format!("{doc}/reading"), "@graph": reading }
+    ])
+}
+
+fn sparql_rows(tmp: &TempDir, ledger: &str, query: &str) -> usize {
+    let out = fluree_cmd(tmp)
+        .args(["query", ledger, "--format", "json", "--sparql", query])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["results"]["bindings"].as_array().map_or(0, Vec::len)
+}
+
+#[test]
+fn doc_ingest_reads_with_an_http_reader_and_a_reread_replaces_the_reading() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true), stub_reading(0.5, false)]);
+    let config = tmp.path().join(".fluree/config.toml");
+    let mut toml = std::fs::read_to_string(&config).unwrap();
+    toml.push_str(&format!(
+        "\n[doc.reader]\nurl = \"{url}\"\napi_key = \"k-123\"\nauth_header = \"X-Api-Key\"\nmodels = [\"stub-reader\"]\n"
+    ));
+    std::fs::write(&config, toml).unwrap();
+    let ingest = |extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--catalog",
+            "ont/entities.ttl",
+            "--model",
+            "stub-reader",
+        ]);
+        cmd.args(extra);
+        cmd
+    };
+
+    ingest(&[])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "extraction stub-reader via http://",
+        ))
+        .stderr(predicate::str::contains(
+            "catalog    ont/entities.ttl: 1 record(s)",
+        ))
+        .stdout(predicate::str::contains(
+            "1 mention(s) of 0 entities (0 new)",
+        ))
+        .stdout(predicate::str::contains("1 relation(s), 1,032 tokens"))
+        .stdout(predicate::str::contains("reading: 1 call(s), 1,032 tokens"))
+        .stdout(predicate::str::contains(
+            "ontology not shown to the model: rdfs:domain=1",
+        ));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (head, body) = &seen[0];
+        assert!(head.contains("x-fluree-model: stub-reader"), "{head}");
+        assert!(head.contains("x-api-key: k-123"), "{head}");
+        assert!(head.contains("content-type: application/trig"), "{head}");
+        for role in ["document", "ontology", "instances"] {
+            assert!(
+                body.contains(&format!("<https://ns.flur.ee/extract#{role}> {{")),
+                "{body}"
+            );
+        }
+        assert!(body.contains("\"Acme Corporation\""), "{body}");
+        assert!(
+            body.contains("<https://ns.flur.ee/doc#SourceDocument>"),
+            "{body}"
+        );
+    }
+    let refers = "SELECT ?o WHERE { ?m <http://example.org/r#refersTo> ?o }";
+    let asserted = "SELECT ?r WHERE { ?r a <https://ns.flur.ee/doc#Relation> ; <https://ns.flur.ee/doc#asserted> true }";
+    let edge =
+        "SELECT ?s WHERE { ?s <https://schema.org/worksFor> <https://example.org/org/acme> }";
+    let scores = "SELECT ?v WHERE { ?m <http://example.org/r#score> ?v }";
+    assert_eq!(sparql_rows(&tmp, "memos", refers), 1);
+    // The mention sits in the paragraph that holds its span.
+    assert_eq!(
+        sparql_rows(
+            &tmp,
+            "memos",
+            "SELECT ?e WHERE { ?m a <http://example.org/r#Occurrence> ; <https://ns.flur.ee/doc#sourceElement> ?e . ?e a <http://purl.org/spar/doco/Paragraph> }"
+        ),
+        1
+    );
+    assert_eq!(sparql_rows(&tmp, "memos", asserted), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", edge), 1);
+
+    // The same request again is answered from the cache: nothing is sent.
+    ingest(&["--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reading from cache"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // Someone annotates a node the reader minted.
+    let note = "SELECT ?c WHERE { <urn:fluree:doc:memo.md/reading#o31-35> <http://www.w3.org/2000/01/rdf-schema#comment> ?c }";
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "--ledger",
+            "memos",
+            "-e",
+            "<urn:fluree:doc:memo.md/reading#o31-35> <http://www.w3.org/2000/01/rdf-schema#comment> \"checked by hand\" .",
+        ])
+        .assert()
+        .success();
+    assert_eq!(sparql_rows(&tmp, "memos", note), 1);
+
+    // A fresh read replaces the reading whole: the old score, the claim and
+    // the edge it asserted are gone. The annotation, in a predicate the
+    // reader never wrote, stays.
+    ingest(&["--force", "--no-cache"]).assert().success();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(sparql_rows(&tmp, "memos", scores), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", note), 1);
+    assert_eq!(sparql_rows(&tmp, "memos", asserted), 0);
+    assert_eq!(sparql_rows(&tmp, "memos", edge), 0);
+
+    // An unchanged document is not read again.
+    ingest(&[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn doc_ingest_model_without_a_reader_or_llm_says_what_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "nobody",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model nobody: no [doc.reader] lists it",
+        ));
+    // A ledger's name passed to --model, as an older script passes its
+    // ontology, is caught before it reaches any model.
+    fluree_cmd(&tmp)
+        .args(["create", "people-ontology"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "people-ontology",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--model people-ontology looks like an ontology (the ledger `people-ontology`); did you mean `--ontology people-ontology`?",
+        ));
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--ontology",
+            "ont/model.ttl",
+            "--cache",
+            "catalog",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--cache is for a model a [doc.reader] serves",
+        ));
+}
+
+/// A catalog scoped to a class is sent with each record's types (the
+/// reader links by class) and its labels as written, language tag kept.
+#[test]
+fn doc_ingest_reader_sends_a_scoped_catalog_with_types_and_language_tags() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::write(
+        tmp.path().join("ont/tagged.ttl"),
+        r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix schema: <https://schema.org/> .
+<https://example.org/org/acme> a schema:Organization ;
+    skos:prefLabel "Acme Corporation"@en ; skos:altLabel "Acme" .
+<https://example.org/person/jane> a schema:Person ; skos:prefLabel "Jane Doe" .
+"#,
+    )
+    .unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args([
+            "--catalog",
+            "ont/tagged.ttl#schema:Organization",
+            "--model",
+            "stub-reader",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "catalog    ont/tagged.ttl#schema:Organization: 1 record(s)",
+        ));
+    let seen = seen.lock().unwrap();
+    let body = &seen[0].1;
+    let instances = &body[body
+        .find("<https://ns.flur.ee/extract#instances> {")
+        .expect(body)..];
+    let instances = &instances[..instances.find("\n}").unwrap()];
+    assert!(
+        instances.contains("<https://example.org/org/acme> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://schema.org/Organization>"),
+        "{instances}"
+    );
+    assert!(instances.contains("\"Acme Corporation\"@en"), "{instances}");
+    assert!(!instances.contains("jane"), "{instances}");
+}
+
+/// The reader is configured with `fluree config set`, as the docs say: a
+/// `models` written as a string (what `config set` writes) is a list of one.
+#[test]
+fn doc_reader_configured_with_config_set_reads() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    for (key, value) in [
+        ("doc.reader.url", url.as_str()),
+        ("doc.reader.models", "stub-reader, other"),
+    ] {
+        fluree_cmd(&tmp)
+            .args(["config", "set", key, value])
+            .assert()
+            .success();
+    }
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "extraction stub-reader via http://",
+        ));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// `--relations` holds for a reader as for the language model: `off` keeps
+/// no relation and no edge, `reified` keeps the relation but not its edge.
+#[test]
+fn doc_ingest_reader_honours_relations_off_and_reified() {
+    let edge =
+        "SELECT ?s WHERE { ?s <https://schema.org/worksFor> <https://example.org/org/acme> }";
+    let relation = "SELECT ?r WHERE { ?r a <https://ns.flur.ee/doc#Relation> }";
+    for (mode, edges, relations) in [("off", 0, 0), ("reified", 0, 1), ("direct", 1, 1)] {
+        let tmp = TempDir::new().unwrap();
+        fluree_cmd(&tmp).arg("init").assert().success();
+        write_extraction_fixtures(&tmp);
+        let (url, _seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+        fluree_cmd(&tmp)
+            .env("FLUREE_DOC_READER_URL", &url)
+            .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--no-embed",
+                "--ontology",
+                "ont/model.ttl",
+            ])
+            .args(["--model", "stub-reader", "--relations", mode])
+            .assert()
+            .success();
+        assert_eq!(
+            sparql_rows(&tmp, "memos", edge),
+            edges,
+            "edges with --relations {mode}"
+        );
+        assert_eq!(
+            sparql_rows(&tmp, "memos", relation),
+            relations,
+            "relations with --relations {mode}"
+        );
+    }
+}
+
+#[test]
+fn doc_ingest_dry_run_with_a_reader_sends_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--dry-run",
+            "--ontology",
+            "ont/model.ttl",
+            "--model",
+            "stub-reader",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would read in 1 call(s)"))
+        .stdout(predicate::str::contains(
+            "reading: 1 call(s) planned, none sent (dry run)",
+        ));
+    // A reader call is billed: a dry run makes none.
+    assert_eq!(seen.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn doc_ingest_reader_sends_nothing_for_a_document_with_no_text() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::create_dir_all(tmp.path().join("blank")).unwrap();
+    std::fs::write(tmp.path().join("blank/empty.md"), "  \n").unwrap();
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_READER_URL", &url)
+        .env("FLUREE_DOC_READER_MODELS", "stub-reader")
+        .args(["doc", "ingest", "blank", "-l", "memos", "--no-embed"])
+        .args(["--ontology", "ont/model.ttl", "--model", "stub-reader"])
+        .assert()
+        .success();
+    assert_eq!(seen.lock().unwrap().len(), 0);
 }
