@@ -8959,6 +8959,87 @@ async fn title_hits(fluree: &fluree_db_api::Fluree, ledger_id: &str, text: &str)
     hits
 }
 
+/// Build `ledger_id`'s index as the background indexer does, its full-text
+/// properties read from the ledger's config at the build.
+async fn build_with_full_text_config(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let result = fluree_db_indexer::build_index_for_ledger(
+        fluree.branched_content_store(ledger_id).await.unwrap(),
+        fluree.nameservice(),
+        ledger_id,
+        fluree_db_indexer::IndexerConfig::default()
+            .with_fulltext_config_provider(fluree.fulltext_config_provider()),
+    )
+    .await
+    .expect("index build");
+    support::publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+}
+
+/// A branch, or a copy under another name, indexes the full-text property its
+/// source's config names: the indexer reads the config under the source's
+/// config graph IRI, at the first build and at the builds after it.
+#[tokio::test]
+async fn a_branch_or_copy_indexes_its_sources_full_text_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let source = "it/ft-source:main";
+    fluree.create_ledger("it/ft-source").await.unwrap();
+    for trig in [
+        full_text_title_in(&config_graph_iri(source)),
+        r#"@prefix ex: <http://example.org/> . ex:doc1 ex:title "Advanced Rust systems" ."#
+            .to_string(),
+    ] {
+        fluree
+            .graph(source)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+            .unwrap();
+    }
+    fluree
+        .create_branch("it/ft-source", "dev", None, None)
+        .await
+        .unwrap();
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(source, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/ft-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+
+    for ledger_id in ["it/ft-source:dev".to_string(), copy] {
+        build_with_full_text_config(&fluree, &ledger_id).await;
+        assert_eq!(
+            title_hits(&fluree, &ledger_id, "Rust").await,
+            ["ex:doc1"],
+            "{ledger_id}"
+        );
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .upsert_turtle(
+                r#"@prefix ex: <http://example.org/> . ex:doc2 ex:title "Rust in production" ."#,
+            )
+            .commit()
+            .await
+            .unwrap();
+        build_with_full_text_config(&fluree, &ledger_id).await;
+        assert_eq!(
+            title_hits(&fluree, &ledger_id, "Rust").await,
+            ["ex:doc1", "ex:doc2"],
+            "{ledger_id}"
+        );
+    }
+}
+
 /// A push carrying config under two config graph IRIs, a branch's history with
 /// its source's config from before the fork and its own after, applies both
 /// to the config graph: a ledger of another name receiving it reads the config
