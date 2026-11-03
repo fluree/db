@@ -443,8 +443,10 @@ pub use result::VectorStalenessCheck;
 #[cfg(feature = "vector")]
 pub use result::VectorSyncResult;
 
+pub use result::ConnectionCheck;
+
 #[cfg(feature = "iceberg")]
-pub use result::{ConnectionCheck, R2rmlCreateResult};
+pub use result::R2rmlCreateResult;
 
 // Re-export cache types
 pub use cache::R2rmlCache;

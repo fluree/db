@@ -250,6 +250,9 @@ pub use view::{
 
 #[cfg(feature = "sql")]
 pub use graph_source::sql_auth_from_json;
+/// A graph source's connection check, as a server reports it. Plain data, so
+/// a client built without `iceberg` can still read a server's outcome.
+pub use graph_source::ConnectionCheck;
 #[cfg(feature = "delta")]
 pub use graph_source::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
 /// The one codec every surface turns its graph-source input into the
@@ -263,13 +266,13 @@ pub use graph_source::{
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
     guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
-    CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, ConnectionCheck, Diagnostic,
-    FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse,
-    IcebergConnectionConfig, IcebergCreateConfig, MaterializeResult, PartitionFieldInfo,
-    PersistedMaterializeJob, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput,
-    ResolvedStorage, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    StorageAccessReport, StorageDecision, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
-    TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider,
+    GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
+    IcebergCreateConfig, MaterializeResult, PartitionFieldInfo, PersistedMaterializeJob,
+    R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, ResolvedStorage, RestCatalogMode,
+    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StorageDecision,
+    StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride, TablePreview,
+    TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 #[cfg(feature = "delta")]

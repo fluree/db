@@ -244,7 +244,6 @@ pub struct R2rmlCreateResult {
 /// Serialized with an `outcome` tag (`"verified"`, `"no_tables"`,
 /// `"client_failed"`, `"table_failed"`, `"catalog_unreachable"`,
 /// `"timed_out"`) and the fields of each.
-#[cfg(feature = "iceberg")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ConnectionCheck {
@@ -288,7 +287,6 @@ pub enum ConnectionCheck {
     },
 }
 
-#[cfg(feature = "iceberg")]
 impl ConnectionCheck {
     /// Whether every mapped table loaded.
     pub fn is_verified(&self) -> bool {
@@ -337,7 +335,7 @@ impl ConnectionCheck {
     }
 }
 
-#[cfg(all(test, feature = "iceberg"))]
+#[cfg(test)]
 mod tests {
     use super::ConnectionCheck;
 

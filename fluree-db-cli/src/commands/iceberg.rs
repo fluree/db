@@ -326,14 +326,12 @@ async fn run_iceberg_map_remote(
 /// the way a query will load it, through the catalog or, in Direct mode, at the
 /// table's location, within the registration check's time budget, and if not,
 /// why. No outcome fails `map`.
-#[cfg(feature = "iceberg")]
 fn connection_summary(check: &fluree_db_api::ConnectionCheck, mode: &str) -> String {
     check.summary(mode.eq_ignore_ascii_case("direct"))
 }
 
 /// [`connection_summary`] for a server's map response. A server that predates
 /// `connection_check` sends only `connection_tested`, which cannot say why.
-#[cfg(feature = "iceberg")]
 fn remote_connection_summary(result: &serde_json::Value, mode: &str) -> String {
     if let Some(check) = result
         .get("connection_check")
@@ -800,7 +798,6 @@ mod tests {
 
     /// The `Connection:` line says why a source is not verified, and a slow
     /// check reads as slow, not as a failure.
-    #[cfg(feature = "iceberg")]
     #[test]
     fn connection_line_names_each_outcome() {
         use fluree_db_api::ConnectionCheck;
@@ -863,7 +860,6 @@ mod tests {
 
     /// A server's `connection_check` reaches the line; one that sends only
     /// `connection_tested` (an older server) still gets an answer.
-    #[cfg(feature = "iceberg")]
     #[test]
     fn remote_connection_line_reads_the_servers_outcome() {
         let timed_out = serde_json::json!({
