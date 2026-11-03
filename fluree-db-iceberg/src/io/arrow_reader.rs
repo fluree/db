@@ -45,7 +45,10 @@ use crate::io::parquet::{
 };
 use crate::io::send_parquet::predicate_pushdown_enabled;
 use crate::metadata::Schema;
-use crate::scan::predicate::{ComparisonOp, Expression, LiteralValue};
+use crate::scan::predicate::{
+    ComparisonOp, ExactPredicate, ExactRowFilter, Expression, LiteralValue,
+};
+use crate::scan::pruning::row_group_can_contain;
 
 /// Rows per emitted `RecordBatch` for an unbounded scan. Batch boundaries do not
 /// affect query results (the R2RML operator streams batches), so this only tunes
@@ -79,10 +82,15 @@ pub(crate) fn read_num_row_groups<R: ChunkReader + 'static>(chunk_reader: R) -> 
 /// the whole file. At most `min(n, rows-in-first-row-group)` rows are returned.
 /// `None` is an unbounded scan and is behavior-identical to before this budget
 /// existed.
+///
+/// `residual_filter` is advisory (see its notes below); `exact_filter` is
+/// enforced on every row regardless of the pushdown switch, and a comparison
+/// it cannot decide fails the read (see [`ExactRowFilter`]).
 pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     chunk_reader: R,
     projected_field_ids: &[i32],
     residual_filter: Option<&Expression>,
+    exact_filter: Option<&ExactRowFilter>,
     iceberg_schema: Option<&Schema>,
     max_rows: Option<usize>,
     row_group_subset: Option<&[usize]>,
@@ -157,8 +165,23 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
         .filter(|_| predicate_pushdown_enabled())
         .and_then(|r| build_predicate_plan(r, &field_id_to_leaf, &leaf_to_pos));
 
+    // The exact filter, resolved to decoded positions. Unlike the advisory plan
+    // above it never drops a comparison: a column absent from this file reads
+    // as null, and a filter column the projection left out is an error.
+    let exact_plan = exact_filter
+        .map(|filter| build_exact_plan(filter, &field_id_to_leaf, &leaf_to_pos))
+        .transpose()?;
+
     let mut surviving =
         crate::io::send_parquet::surviving_row_groups(md, residual_filter, &field_id_to_leaf);
+    // Row-group pruning by the exact filter is an optimization like any other
+    // (the switch governs it); its enforcement below is not.
+    if let Some(expr) = exact_filter
+        .filter(|_| predicate_pushdown_enabled())
+        .and_then(ExactRowFilter::pruning_expression)
+    {
+        surviving.retain(|&rg| row_group_can_contain(&expr, md.row_group(rg), &field_id_to_leaf));
+    }
 
     // T2.3: a parallel decode assigns each blocking task a contiguous slice of the
     // file's row groups; keep only the surviving groups in this task's slice so the
@@ -200,6 +223,7 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     // The row filter's literals, converted into the decoded column types once per
     // file (a column's type cannot change between batches of one file).
     let mut prepared: Option<Vec<PreparedComparison>> = None;
+    let mut prepared_exact: Option<Vec<PreparedExact>> = None;
 
     for record_batch in reader {
         // Stop before decoding another batch once the row budget is met.
@@ -208,6 +232,18 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
         }
         let mut record_batch =
             record_batch.map_err(|e| IcebergError::Storage(format!("Arrow decode error: {e}")))?;
+        if let Some(plan) = &exact_plan {
+            let prepared = match &mut prepared_exact {
+                Some(prepared) => prepared,
+                None => prepared_exact.insert(prepare_exact(plan, &record_batch.schema())?),
+            };
+            let mask = eval_exact(&record_batch, prepared)
+                .map_err(|e| IcebergError::Storage(format!("Row filter eval error: {e}")))?;
+            if let Some(mask) = mask {
+                record_batch = filter_record_batch(&record_batch, &mask)
+                    .map_err(|e| IcebergError::Storage(format!("Row filter apply error: {e}")))?;
+            }
+        }
         if let Some(plan) = &predicate_plan {
             let prepared =
                 prepared.get_or_insert_with(|| prepare_comparisons(plan, &record_batch.schema()));
@@ -536,8 +572,12 @@ enum Check {
     /// Compare each cell with a literal of the column's comparison type.
     Compare(ComparisonOp, Scalar<ArrayRef>),
     /// No literal compares exactly with the column: keep every row, and the
-    /// in-engine FILTER decides.
+    /// in-engine FILTER decides. Never the answer for an exact filter, which
+    /// refuses instead.
     KeepAll,
+    /// Every non-null cell satisfies the comparison (an inequality with a
+    /// value the column cannot hold); a null cell, compared, is unknown.
+    NotNull,
     /// No cell can satisfy the comparison (an equality with a value the column
     /// cannot hold).
     DropAll,
@@ -552,19 +592,7 @@ fn prepare_comparisons(
     plan.iter()
         .map(|(pos, op, value)| {
             let target = comparison_type(schema.field(*pos).data_type());
-            let check = match column_kind(&target) {
-                Some(column) if comparable(*op, literal_kind(value), column) => {
-                    match decimal_check(*op, value, &target) {
-                        Some(check) => check,
-                        None => exact_literal(value, &target)
-                            .and_then(|literal| total_order_zero(*op, literal))
-                            .map_or(Check::KeepAll, |literal| {
-                                Check::Compare(*op, Scalar::new(literal))
-                            }),
-                    }
-                }
-                _ => Check::KeepAll,
-            };
+            let check = prepare_check(*op, value, &target);
             if matches!(check, Check::KeepAll) {
                 tracing::debug!(
                     literal = ?value,
@@ -576,6 +604,24 @@ fn prepare_comparisons(
             PreparedComparison { pos: *pos, check }
         })
         .collect()
+}
+
+/// How `<column of type target> op value` filters a batch; [`Check::KeepAll`]
+/// when no literal of the column's type compares exactly with `value`.
+fn prepare_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> Check {
+    match column_kind(target) {
+        Some(column) if comparable(op, literal_kind(value), column) => {
+            match decimal_check(op, value, target) {
+                Some(check) => check,
+                None => exact_literal(value, target)
+                    .and_then(|literal| total_order_zero(op, literal))
+                    .map_or(Check::KeepAll, |literal| {
+                        Check::Compare(op, Scalar::new(literal))
+                    }),
+            }
+        }
+        _ => Check::KeepAll,
+    }
 }
 
 /// Evaluate the conjunction over a decoded `RecordBatch`, ANDing the per-
@@ -591,21 +637,254 @@ fn eval_conjunction(
     for comparison in plan {
         let mask = match &comparison.check {
             Check::KeepAll => continue,
-            Check::DropAll => BooleanArray::new(
-                arrow::buffer::BooleanBuffer::new_unset(batch.num_rows()),
-                None,
-            ),
-            Check::Compare(op, literal) => {
-                let column = normalize_column(batch.column(comparison.pos))?;
-                match op {
-                    ComparisonOp::Eq => cmp::eq(&column, literal),
-                    ComparisonOp::NotEq => cmp::neq(&column, literal),
-                    ComparisonOp::Lt => cmp::lt(&column, literal),
-                    ComparisonOp::LtEq => cmp::lt_eq(&column, literal),
-                    ComparisonOp::Gt => cmp::gt(&column, literal),
-                    ComparisonOp::GtEq => cmp::gt_eq(&column, literal),
-                }?
+            check => check_mask(batch, comparison.pos, check)?,
+        };
+        acc = Some(match acc {
+            Some(prev) => and(&prev, &mask)?,
+            None => mask,
+        });
+    }
+    Ok(acc)
+}
+
+/// The keep mask of one prepared [`Check`].
+fn check_mask(
+    batch: &RecordBatch,
+    pos: usize,
+    check: &Check,
+) -> std::result::Result<BooleanArray, ArrowError> {
+    match check {
+        Check::KeepAll => Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+        Check::DropAll => Ok(drop_all(batch.num_rows())),
+        Check::NotNull => arrow::compute::is_not_null(batch.column(pos)),
+        Check::Compare(op, literal) => {
+            let column = normalize_column(batch.column(pos))?;
+            match op {
+                ComparisonOp::Eq => cmp::eq(&column, literal),
+                ComparisonOp::NotEq => cmp::neq(&column, literal),
+                ComparisonOp::Lt => cmp::lt(&column, literal),
+                ComparisonOp::LtEq => cmp::lt_eq(&column, literal),
+                ComparisonOp::Gt => cmp::gt(&column, literal),
+                ComparisonOp::GtEq => cmp::gt_eq(&column, literal),
             }
+        }
+    }
+}
+
+fn drop_all(rows: usize) -> BooleanArray {
+    BooleanArray::new(arrow::buffer::BooleanBuffer::new_unset(rows), None)
+}
+
+/// One conjunct of an exact filter, resolved against this file.
+enum ExactStep {
+    /// The column is decoded at `pos` of each batch.
+    At {
+        pos: usize,
+        predicate: ExactPredicate,
+    },
+    /// The column is absent from this file, so every cell is null: `IS NULL`
+    /// keeps every row and any other test drops every row.
+    Absent { keeps_all: bool },
+}
+
+/// Resolve an exact filter to decoded batch positions (see [`ExactStep`]). A
+/// column this file holds but the projection left out is an error: the caller
+/// must project every column the filter reads.
+fn build_exact_plan(
+    filter: &ExactRowFilter,
+    field_id_to_leaf: &HashMap<i32, usize>,
+    leaf_to_pos: &HashMap<usize, usize>,
+) -> Result<Vec<ExactStep>> {
+    filter
+        .predicates()
+        .iter()
+        .map(
+            |predicate| match field_id_to_leaf.get(&predicate.field_id()) {
+                None => Ok(ExactStep::Absent {
+                    keeps_all: matches!(predicate, ExactPredicate::IsNull { .. }),
+                }),
+                Some(leaf) => match leaf_to_pos.get(leaf) {
+                    Some(&pos) => Ok(ExactStep::At {
+                        pos,
+                        predicate: predicate.clone(),
+                    }),
+                    None => Err(IcebergError::Scan(format!(
+                        "row filter `{predicate}` reads a column the scan did not project"
+                    ))),
+                },
+            },
+        )
+        .collect()
+}
+
+/// A prepared exact step: the keep test for one conjunct.
+enum PreparedExact {
+    Check {
+        pos: usize,
+        check: Check,
+    },
+    /// A floating-point column compared as IEEE numbers: see [`float_mask`].
+    Float {
+        pos: usize,
+        op: ComparisonOp,
+        value: f64,
+    },
+    IsNull(usize),
+    DropAll,
+}
+
+/// Prepare an exact plan against the schema of a decoded batch. A comparison
+/// whose literal does not compare exactly with this file's column type fails
+/// the read: keeping the rows would emit what the filter excludes.
+fn prepare_exact(
+    plan: &[ExactStep],
+    schema: &arrow::datatypes::Schema,
+) -> Result<Vec<PreparedExact>> {
+    let mut prepared = Vec::with_capacity(plan.len());
+    for step in plan {
+        match step {
+            ExactStep::Absent { keeps_all: true } => {}
+            ExactStep::Absent { keeps_all: false } => prepared.push(PreparedExact::DropAll),
+            ExactStep::At { pos, predicate } => prepared.push(match predicate {
+                ExactPredicate::IsNull { .. } => PreparedExact::IsNull(*pos),
+                ExactPredicate::IsNotNull { .. } => PreparedExact::Check {
+                    pos: *pos,
+                    check: Check::NotNull,
+                },
+                ExactPredicate::Compare { op, value, .. } => {
+                    let target = comparison_type(schema.field(*pos).data_type());
+                    if let Some(value) = float_literal(value, &target) {
+                        PreparedExact::Float {
+                            pos: *pos,
+                            op: *op,
+                            value,
+                        }
+                    } else {
+                        match prepare_check(*op, value, &target) {
+                            Check::KeepAll => match integer_range_check(*op, value, &target) {
+                                Some(check) => PreparedExact::Check { pos: *pos, check },
+                                None => {
+                                    return Err(IcebergError::Scan(format!(
+                                        "row filter `{predicate}` cannot be evaluated exactly \
+                                         against a column stored as {target}"
+                                    )))
+                                }
+                            },
+                            check => PreparedExact::Check { pos: *pos, check },
+                        }
+                    }
+                }
+            }),
+        }
+    }
+    Ok(prepared)
+}
+
+/// The literal as an `f64` to compare a floating-point column with, or `None`
+/// when the column is not floating-point or the literal has no exact `f64`
+/// (an integer beyond ±2^53). A `float` cell widens to `f64` exactly, so a
+/// `float` and a `double` column compare alike.
+fn float_literal(value: &LiteralValue, target: &DataType) -> Option<f64> {
+    const EXACT: u64 = 1 << 53;
+    if !matches!(target, DataType::Float32 | DataType::Float64) {
+        return None;
+    }
+    match *value {
+        LiteralValue::Float64(v) => Some(v),
+        LiteralValue::Float32(v) => Some(f64::from(v)),
+        LiteralValue::Int32(n) => Some(f64::from(n)),
+        LiteralValue::Int64(n) if n.unsigned_abs() <= EXACT => Some(n as f64),
+        _ => None,
+    }
+}
+
+/// An integer literal beyond the range of an integer column's stored type,
+/// decided by the range alone: no cell equals it, and every non-null cell
+/// lies on one side of it. A column widened by schema evolution (`int` to
+/// `long`) still decodes its older files as `Int32`, where a `long` literal
+/// past `i32` has no exact form for [`prepare_check`]. `None` for anything
+/// else.
+fn integer_range_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> Option<Check> {
+    let n = match *value {
+        LiteralValue::Int32(n) => i128::from(n),
+        LiteralValue::Int64(n) => i128::from(n),
+        _ => return None,
+    };
+    let (min, max): (i128, i128) = match target {
+        DataType::Int8 => (i8::MIN.into(), i8::MAX.into()),
+        DataType::Int16 => (i16::MIN.into(), i16::MAX.into()),
+        DataType::Int32 => (i32::MIN.into(), i32::MAX.into()),
+        DataType::Int64 => (i64::MIN.into(), i64::MAX.into()),
+        DataType::UInt8 => (0, u8::MAX.into()),
+        DataType::UInt16 => (0, u16::MAX.into()),
+        DataType::UInt32 => (0, u32::MAX.into()),
+        DataType::UInt64 => (0, u64::MAX.into()),
+        _ => return None,
+    };
+    let above = if n > max {
+        true
+    } else if n < min {
+        false
+    } else {
+        return None;
+    };
+    // `above`: every cell is below the literal.
+    Some(match (op, above) {
+        (ComparisonOp::NotEq, _)
+        | (ComparisonOp::Lt | ComparisonOp::LtEq, true)
+        | (ComparisonOp::Gt | ComparisonOp::GtEq, false) => Check::NotNull,
+        _ => Check::DropAll,
+    })
+}
+
+/// The keep mask of `<float column> op value`, compared as IEEE numbers the
+/// way the engine compares `xsd:double` values: a NaN cell satisfies only
+/// `<>`, and -0.0 equals 0.0. arrow-ord's float kernels use IEEE totalOrder
+/// instead (NaN above every number and equal to itself, -0.0 below 0.0), which
+/// would keep rows the engine drops. A null cell yields a null entry (drop).
+fn float_mask(
+    column: &ArrayRef,
+    op: ComparisonOp,
+    value: f64,
+) -> std::result::Result<BooleanArray, ArrowError> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, Float64Type};
+    let test = move |cell: f64| match op {
+        ComparisonOp::Eq => cell == value,
+        ComparisonOp::NotEq => cell != value,
+        ComparisonOp::Lt => cell < value,
+        ComparisonOp::LtEq => cell <= value,
+        ComparisonOp::Gt => cell > value,
+        ComparisonOp::GtEq => cell >= value,
+    };
+    match column.data_type() {
+        DataType::Float64 => Ok(BooleanArray::from_unary(
+            column.as_primitive::<Float64Type>(),
+            test,
+        )),
+        DataType::Float32 => Ok(BooleanArray::from_unary(
+            column.as_primitive::<Float32Type>(),
+            |cell| test(f64::from(cell)),
+        )),
+        other => Err(ArrowError::InvalidArgumentError(format!(
+            "float comparison on a {other} column"
+        ))),
+    }
+}
+
+/// The keep mask of an exact plan over one batch; `None` when no step narrows
+/// it. A null mask entry (a comparison with a null cell) drops the row.
+fn eval_exact(
+    batch: &RecordBatch,
+    plan: &[PreparedExact],
+) -> std::result::Result<Option<BooleanArray>, ArrowError> {
+    let mut acc: Option<BooleanArray> = None;
+    for step in plan {
+        let mask = match step {
+            PreparedExact::DropAll => drop_all(batch.num_rows()),
+            PreparedExact::IsNull(pos) => arrow::compute::is_null(batch.column(*pos))?,
+            PreparedExact::Check { pos, check } => check_mask(batch, *pos, check)?,
+            PreparedExact::Float { pos, op, value } => float_mask(batch.column(*pos), *op, *value)?,
         };
         acc = Some(match acc {
             Some(prev) => and(&prev, &mask)?,
@@ -770,7 +1049,7 @@ fn normalize_column(column: &ArrayRef) -> std::result::Result<ArrayRef, ArrowErr
 /// (`<`, `<=`) or at or above `hi` (`>`, `>=`): `< 1.0500000001` on
 /// `decimal(38,9)` is `<= 1.050000000`, and `> 1.0499999999` is
 /// `>= 1.050000000`. No cell equals it, so `=` drops every row and `!=` keeps
-/// every row. A grid point beyond `i128` saturates, which can only keep a cell
+/// every non-null row. A grid point beyond `i128` saturates, which can only keep a cell
 /// it should not.
 fn decimal_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> Option<Check> {
     let DataType::Decimal128(precision, column_scale) = *target else {
@@ -790,7 +1069,7 @@ fn decimal_check(op: ComparisonOp, value: &LiteralValue, target: &DataType) -> O
             ComparisonOp::Lt | ComparisonOp::LtEq => (ComparisonOp::LtEq, lo),
             ComparisonOp::Gt | ComparisonOp::GtEq => (ComparisonOp::GtEq, hi),
             ComparisonOp::Eq => return Some(Check::DropAll),
-            ComparisonOp::NotEq => return Some(Check::KeepAll),
+            ComparisonOp::NotEq => return Some(Check::NotNull),
         }
     };
     let literal = Decimal128Array::from(vec![units])
@@ -1022,7 +1301,7 @@ mod direct_decode_tests {
                     value: LiteralValue::Int64(1_750_000),
                 };
                 let batches =
-                    decode_batches_arrow(bytes, &[42, 87], Some(&filter), None, None, None)
+                    decode_batches_arrow(bytes, &[42, 87], Some(&filter), None, None, None, None)
                         .unwrap();
                 let mut actual = Vec::new();
                 for batch in batches {
