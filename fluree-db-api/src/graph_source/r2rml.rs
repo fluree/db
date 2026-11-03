@@ -2196,10 +2196,13 @@ impl<'a> FlureeR2rmlProvider<'a> {
                     table: snapshot_err_table.to_string(),
                     snapshot_id: to_snapshot_id,
                 })?;
+        // The mapping names columns as they are now: resolve them through the
+        // `to` snapshot's schema under current names, so a column renamed
+        // since `to` is still projected.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -2485,12 +2488,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
         let mut to_snapshot_id = to_snapshot.snapshot_id;
 
         // Schema AT the `to` snapshot (falls back to current when the snapshot
-        // carries no schema-id) — identical to current for an uncapped, unpinned
-        // read.
+        // carries no schema-id), under current column names: the mapping names
+        // columns as they are now, so a column renamed since `to` (a pinned or
+        // capped window) must still be projected. Identical to current for an
+        // uncapped, unpinned read.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -3330,37 +3335,6 @@ fn cached_metadata_serves_pin(pin: Option<SourceTime>, metadata: &TableMetadata)
     }
 }
 
-/// The schema a read of `snapshot` projects through: the snapshot's own schema,
-/// with every field the table still has carrying its current name. Iceberg
-/// reads by field id while the R2RML mapping names columns as they are now, so
-/// a column renamed since the snapshot still resolves, and one added since
-/// reads as absent, which it was. A field dropped since keeps its old name
-/// unless a current field has taken it.
-fn read_schema<'m>(
-    metadata: &'m TableMetadata,
-    snapshot: &fluree_db_iceberg::metadata::Snapshot,
-) -> Option<std::borrow::Cow<'m, fluree_db_iceberg::metadata::Schema>> {
-    use std::borrow::Cow;
-    let pinned = metadata.schema_for_snapshot(snapshot)?;
-    let Some(current) = metadata
-        .current_schema()
-        .filter(|current| current.schema_id != pinned.schema_id)
-    else {
-        return Some(Cow::Borrowed(pinned));
-    };
-    let mut schema = pinned.clone();
-    schema
-        .fields
-        .retain_mut(|field| match current.field(field.id) {
-            Some(now) => {
-                field.name.clone_from(&now.name);
-                true
-            }
-            None => current.field_by_name(&field.name).is_none(),
-        });
-    Some(Cow::Owned(schema))
-}
-
 /// The deferred builder of a table's store on the pointer rung: the same
 /// session-pin ladder as the eager arm ([`resolve_catalog_load_and_storage`]),
 /// run by the first read that misses every cache. A typed refusal is the
@@ -3557,7 +3531,7 @@ impl FlureeR2rmlProvider<'_> {
             return Ok(None);
         };
         let snapshot = selected.snapshot;
-        let Some(schema) = read_schema(&metadata, snapshot) else {
+        let Some(schema) = metadata.read_schema_for_snapshot(snapshot) else {
             return Ok(None);
         };
         let schema = schema.as_ref();
@@ -4279,7 +4253,8 @@ impl FlureeR2rmlProvider<'_> {
 
         // The schema at the snapshot being read (current for an unpinned read),
         // under current column names.
-        let schema = read_schema(&metadata, snapshot)
+        let schema = metadata
+            .read_schema_for_snapshot(snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
         let schema = schema.as_ref();
 
@@ -7258,74 +7233,6 @@ mod tests {
             budget_at(large) > budget_at(small),
             "a builder-configured ceiling must move the budget; a fixed default \
              would mean the env var is still the only route that counts"
-        );
-    }
-
-    /// A pinned read resolves the mapping's (current) column names through field
-    /// ids: `name` was renamed `full_name`, `email` was added after snapshot 1,
-    /// and `legacy` was dropped with its name reused by the renamed `old_code`.
-    #[test]
-    fn read_schema_resolves_current_names_by_field_id() {
-        let fields = |fs: &[(i32, &str)]| {
-            fs.iter()
-                .map(|(id, name)| json!({"id": id, "name": name, "required": false, "type": "string"}))
-                .collect::<Vec<_>>()
-        };
-        let metadata = TableMetadata::from_json_str(
-            &json!({
-                "format-version": 2,
-                "location": "s3://b/t",
-                "last-sequence-number": 2,
-                "last-updated-ms": 2000,
-                "last-column-id": 5,
-                "current-schema-id": 1,
-                "schemas": [
-                    {"type": "struct", "schema-id": 0,
-                     "fields": fields(&[(1, "name"), (2, "score"), (3, "legacy"), (4, "old_code")])},
-                    {"type": "struct", "schema-id": 1,
-                     "fields": fields(&[(1, "full_name"), (2, "score"), (4, "legacy"), (5, "email")])},
-                ],
-                "current-snapshot-id": 2,
-                "snapshots": [
-                    {"snapshot-id": 1, "sequence-number": 1, "timestamp-ms": 1000, "schema-id": 0,
-                     "manifest-list": "s3://b/t/snap-1.avro", "summary": {"operation": "append"}},
-                    {"snapshot-id": 2, "parent-snapshot-id": 1, "sequence-number": 2,
-                     "timestamp-ms": 2000, "schema-id": 1,
-                     "manifest-list": "s3://b/t/snap-2.avro", "summary": {"operation": "append"}},
-                ],
-                "snapshot-log": [],
-                "default-spec-id": 0,
-                "partition-specs": [],
-                "last-partition-id": 0,
-                "sort-orders": [],
-                "default-sort-order-id": 0,
-                "properties": {}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let ids_by_name = |snapshot_id: i64| {
-            let schema = read_schema(&metadata, metadata.snapshot(snapshot_id).unwrap()).unwrap();
-            schema
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.id))
-                .collect::<Vec<_>>()
-        };
-        let named = |pairs: &[(&str, i32)]| {
-            pairs
-                .iter()
-                .map(|(n, id)| (n.to_string(), *id))
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            ids_by_name(1),
-            named(&[("full_name", 1), ("score", 2), ("legacy", 4)])
-        );
-        assert_eq!(
-            ids_by_name(2),
-            named(&[("full_name", 1), ("score", 2), ("legacy", 4), ("email", 5)])
         );
     }
 

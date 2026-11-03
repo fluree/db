@@ -2730,3 +2730,248 @@ async fn a_minus_keeps_the_scans_written_above_it() {
         wrong.join("\n")
     );
 }
+
+const RENAMED_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#Renamed>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.renamed" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "full_name" ]
+        ] .
+"#;
+
+/// A private copy of `silver.renamed` behind graph source `alias`, and the id
+/// of its first snapshot (written before the rename).
+async fn staged_renamed(alias: &str) -> (fluree_db_api::Fluree, tempfile::TempDir, i64) {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("renamed");
+    copy_dir_all(&fixtures_dir().join("silver/renamed"), &table_dir);
+    let latest = std::fs::read_dir(table_dir.join("metadata"))
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(latest).expect("read metadata")).unwrap();
+    let first = meta["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sequence-number"] == 1)
+        .expect("a first commit")["snapshot-id"]
+        .as_i64()
+        .unwrap();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        alias,
+        format!("file://{}", table_dir.display()),
+        RENAMED_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create renamed graph source");
+    (fluree, staging, first)
+}
+
+/// `(id, name)` pairs (sorted) a SPARQL query over `from` returns.
+async fn sparql_names(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    filter: &str,
+) -> Vec<(i64, String)> {
+    let filter = if filter.is_empty() {
+        String::new()
+    } else {
+        format!("FILTER({filter})")
+    };
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> SELECT ?id ?name FROM <{from}> \
+         WHERE {{ ?s ex:id ?id ; ex:name ?name {filter} }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut rows: Vec<(i64, String)> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| {
+            (
+                b["id"]["value"].as_str().unwrap().parse().unwrap(),
+                b["name"]["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The JSON-LD twin of [`sparql_names`] (a filter is required).
+async fn jsonld_names(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    filter: &str,
+) -> Vec<(i64, String)> {
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?id", "?name"],
+        "where": [{"@id": "?s", "ex:id": "?id", "ex:name": "?name"}, ["filter", filter]],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut rows: Vec<(i64, String)> = result
+        .as_array()
+        .unwrap_or_else(|| panic!("rows for {query}: {result}"))
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_i64().unwrap(),
+                row[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn people(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
+    rows.iter().map(|(id, n)| (*id, n.to_string())).collect()
+}
+
+/// A read pinned to a snapshot older than a column rename finds the column
+/// under its current name, whichever way the scan is planned: from the
+/// manifests (the first scan, filtered or not) or from the kept file list
+/// (later scans, filtered or not). Each plan's tasks name their columns by
+/// the schema they carry, and the mapping names columns as they are now.
+#[tokio::test]
+async fn a_pinned_read_finds_a_renamed_column_under_its_current_name() {
+    let early = people(&[(1, "alice"), (2, "bob"), (3, "carol")]);
+    let all = people(&[
+        (1, "alice"),
+        (2, "bob"),
+        (3, "carol"),
+        (4, "dave"),
+        (5, "erin"),
+    ]);
+
+    // Unfiltered first: planned from the manifests, then from the kept list.
+    let (fluree, _staging, first) = staged_renamed("renamed-a").await;
+    let pinned = format!("renamed-a:main@snapshot:{first}");
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "").await,
+        early,
+        "pinned, cold"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "").await,
+        early,
+        "pinned, warm"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "?id >= 2").await,
+        early[1..],
+        "pinned, filtered, warm"
+    );
+    assert_eq!(
+        jsonld_names(&fluree, &pinned, "(>= ?id 2)").await,
+        early[1..],
+        "pinned, filtered, warm (JSON-LD)"
+    );
+    assert_eq!(sparql_names(&fluree, "renamed-a:main", "").await, all);
+
+    // Filtered first: the filtered plan is the one read from the manifests.
+    let (fluree, _staging, first) = staged_renamed("renamed-b").await;
+    let pinned = format!("renamed-b:main@snapshot:{first}");
+    assert_eq!(
+        jsonld_names(&fluree, &pinned, "(<= ?id 2)").await,
+        early[..2],
+        "pinned, filtered, cold (JSON-LD)"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "?id <= 2").await,
+        early[..2],
+        "pinned, filtered, warm"
+    );
+    assert_eq!(
+        sparql_names(&fluree, "renamed-b:main", "?id > 3").await,
+        all[3..],
+        "current, filtered"
+    );
+}
+
+/// A materialize read whose window ends at a snapshot older than a column
+/// rename keeps the column: the projection is resolved, and the batches are
+/// named, under current names, so a twin built from it carries every row's
+/// value. Covers the incremental read and the streaming read pinned to that
+/// snapshot.
+#[tokio::test]
+async fn a_materialize_read_before_a_rename_keeps_the_renamed_column() {
+    let (fluree, _staging, first) = staged_renamed("renamed-m").await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let projection = vec!["id".to_string(), "full_name".to_string()];
+    let names_of = |batches: &[fluree_db_iceberg::ColumnBatch]| {
+        let mut rows: Vec<(i64, String)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b.column_by_name("id").expect("an id column");
+                let names = b
+                    .column_by_name("full_name")
+                    .unwrap_or_else(|| panic!("a full_name column in {:?}", b.schema));
+                (0..b.num_rows)
+                    .map(|i| {
+                        (
+                            ids.get_i64(i).expect("an id"),
+                            names.get_string(i).expect("a name").to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let early = people(&[(1, "alice"), (2, "bob"), (3, "carol")]);
+
+    let batches = provider
+        .scan_table_incremental("renamed-m:main", "silver.renamed", &projection, None, first)
+        .await
+        .expect("incremental read to the first snapshot");
+    assert_eq!(names_of(&batches), early, "incremental");
+
+    let scan = provider
+        .scan_for_materialize_stream(
+            "renamed-m:main",
+            "silver.renamed",
+            &projection,
+            None,
+            Some(first),
+            None,
+        )
+        .await
+        .expect("pinned materialize read");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream batches");
+    assert_eq!(names_of(&batches), early, "pinned stream");
+}
