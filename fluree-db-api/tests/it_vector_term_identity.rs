@@ -811,3 +811,124 @@ async fn a_join_on_a_vector_pairs_values_not_handles() {
     };
     assert_eq!(rows, want);
 }
+
+/// The vector shard files (`VAS1` header) under `dir`.
+fn vector_shard_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if std::fs::read(&path).is_ok_and(|bytes| bytes.starts_with(b"VAS1")) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Queries that key `ex:j1`'s and `ex:j2`'s vectors into one hash table
+/// (DISTINCT, GROUP BY, COUNT(DISTINCT), a join, MINUS), with their answers.
+/// The two predicates share one vector, each under its own arena, so the
+/// tables meet equal vectors from two arenas. None renders a vector.
+const CROSS_ARENA: [(&str, &[&str]); 5] = [
+    (
+        "SELECT (COUNT(*) AS ?n) WHERE { SELECT DISTINCT ?v \
+         WHERE { { ?s ex:j1 ?v } UNION { ?s ex:j2 ?v } } }",
+        &["n=3"],
+    ),
+    (
+        "SELECT (COUNT(*) AS ?n) WHERE { SELECT ?v (COUNT(?s) AS ?c) \
+         WHERE { { ?s ex:j1 ?v } UNION { ?s ex:j2 ?v } } GROUP BY ?v }",
+        &["n=3"],
+    ),
+    (
+        "SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE { { ?s ex:j1 ?v } UNION { ?s ex:j2 ?v } }",
+        &["n=3"],
+    ),
+    (
+        "SELECT ?s ?t WHERE { ?s ex:j1 ?v . ?t ex:j2 ?v }",
+        &["s=f,t=f"],
+    ),
+    // MINUS keys a vector by its decoded value, not its arena entry.
+    (
+        "SELECT ?s WHERE { ?s ex:j1 ?v MINUS { ?t ex:j2 ?v } }",
+        &["s=g"],
+    ),
+];
+
+/// Remove every vector shard file of the ledger in `dirs` and drop the
+/// shards already cached, so the next read of a vector's components fails,
+/// then expect each [`CROSS_ARENA`] query to fail, in both lanes: a vector
+/// read that fails while a hash table keys or compares a vector must not
+/// count the pair unequal, which would answer wrong.
+async fn cross_arena_queries_fail_without_their_shards(
+    fluree: &Fluree,
+    db: &GraphSnapshot<'_>,
+    dirs: &[TempDir],
+) {
+    let shards = vector_shard_files(dirs[0].path());
+    assert!(!shards.is_empty(), "no vector shard files under the ledger");
+    for shard in shards {
+        std::fs::remove_file(shard).expect("remove shard");
+    }
+    fluree.leaflet_cache().invalidate_all();
+    for fast_paths_off in [true, false] {
+        set_fast_paths_disabled(fast_paths_off);
+        for (query, _) in CROSS_ARENA {
+            let body = format!("PREFIX ex: <{EX}>\n{query}");
+            let result = db.query().sparql(&body).execute_formatted().await;
+            assert!(
+                result.is_err(),
+                "fast paths off: {fast_paths_off}: answered {:?} with a vector unread: {query}",
+                result.map(|r| sparql_rows(&r)).unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// With the identity tables built, a stored vector's key holds no
+/// components, so a comparison with another arena's vector reads them, on a
+/// hash match, inside the hash table's equality. A failed read there fails
+/// the query. A comparison that reads nothing still answers.
+#[tokio::test]
+async fn a_failed_vector_read_inside_a_hash_table_fails_the_query() {
+    let ledger_id = "vector-identity/failed-compare:main";
+    let (dirs, fluree) = ledger(Condition::Indexed, ledger_id).await;
+    let db = fluree.graph(ledger_id).load().await.expect("load");
+    let _switch = FAST_PATH_SWITCH.write().await;
+    let _restore = FastPathsGuard;
+    for (query, rows) in CROSS_ARENA {
+        assert_eq!(sparql(&db, query).await, rows, "{query}");
+    }
+    for p in ["j1", "j2", "w"] {
+        let body = format!("SELECT (COUNT(DISTINCT ?v) AS ?n) WHERE {{ ?s ex:{p} ?v }}");
+        sparql(&db, &body).await;
+    }
+    cross_arena_queries_fail_without_their_shards(&fluree, &db, &dirs).await;
+    // Keys of one tabled arena compare by canonical handle and read nothing.
+    let read_free = "SELECT (COUNT(*) AS ?n) WHERE { SELECT DISTINCT ?v WHERE { ?s ex:w ?v } }";
+    for fast_paths_off in [true, false] {
+        set_fast_paths_disabled(fast_paths_off);
+        assert_eq!(
+            sparql(&db, read_free).await,
+            ["n=2"],
+            "fast paths off: {fast_paths_off}"
+        );
+    }
+}
+
+/// Without the identity tables, building a vector's key reads its shard. A
+/// failed read there fails the query too, rather than key the vector by its
+/// handle, which no other arena's equal vector shares.
+#[tokio::test]
+async fn a_failed_vector_read_while_keying_fails_the_query() {
+    let ledger_id = "vector-identity/failed-key:main";
+    let (dirs, fluree) = ledger(Condition::Indexed, ledger_id).await;
+    let db = fluree.graph(ledger_id).load().await.expect("load");
+    let _switch = FAST_PATH_SWITCH.write().await;
+    let _restore = FastPathsGuard;
+    cross_arena_queries_fail_without_their_shards(&fluree, &db, &dirs).await;
+}
