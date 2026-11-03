@@ -99,6 +99,14 @@ To RDF triples:
   ex:customerId "1" .
 ```
 
+A `rr:column` with no `rr:datatype` reads as the `xsd:string` of its rendered
+value, whatever the column's type: `ex:customerId "1"` above is a string, so it
+groups, orders and compares as text (`"10"` sorts before `"9"`), and comparing
+it with a number (`FILTER(?id < 5)`) matches no row. Add an `rr:datatype`
+(`xsd:integer`, `xsd:decimal`, `xsd:date`, `xsd:dateTime`, …) to group, order
+and compare a column by value. This holds for every R2RML source: Iceberg,
+Delta and SQL.
+
 ### Foreign Key Mapping
 
 Map relationships:

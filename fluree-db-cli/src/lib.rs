@@ -781,6 +781,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         // Reads files only: no project, no ledger.
         Commands::Ontology { action } => commands::ontology::run(action),
+        Commands::Catalog { action } => commands::ontology::run_catalog(action),
 
         Commands::Memory { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
@@ -992,6 +993,15 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 None => config::find_or_global_fluree_dir(),
             };
             commands::doc::run_parse(args, fluree_dir.as_ref()).await
+        }
+        Commands::Doc {
+            action: cli::DocAction::Read(args),
+        } => {
+            let fluree_dir = match config_path {
+                Some(_) => Some(config::require_fluree_dir_or_global(config_path)?),
+                None => config::find_or_global_fluree_dir(),
+            };
+            commands::doc::run_read(args, fluree_dir.as_ref()).await
         }
         Commands::Doc { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;

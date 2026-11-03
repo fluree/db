@@ -569,13 +569,21 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::ResourceLimit(_)
         | QueryError::NeedFetch(_)
         | QueryError::StorageAccessDenied { .. }
+        | QueryError::StorageSchemeNotServed { .. }
         | QueryError::Nameservice(_)
         | QueryError::CatalogCredentialsNotVended { .. }
         | QueryError::CatalogAccessDenied { .. }
+        | QueryError::CatalogQuotaProjectRequired { .. }
+        | QueryError::GoogleTokenExchange { .. }
+        | QueryError::GoogleCredentialsInvalid(_)
+        | QueryError::HostIdentityRefused { .. }
+        | QueryError::GoogleTokenHostRefused { .. }
         | QueryError::Policy(_)
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
         | QueryError::NoSnapshotAtTime { .. }
+        | QueryError::GraphSourceUnmapped { .. }
+        | QueryError::GraphSourceUnsupported { .. }
         | QueryError::R2rml(_)
         | QueryError::Core(_)
         | QueryError::Batch(_)
@@ -590,6 +598,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::InvalidExpression(_)
         | QueryError::UnsupportedFeature(_)
         | QueryError::R2rmlUnsupportedPattern { .. }
+        | QueryError::GraphSourceNotAGraph { .. }
         | QueryError::Arithmetic(_)
         | QueryError::Comparison(_) => false,
         // The caller names the variables first (`QueryError::name_variables`),
@@ -895,9 +904,16 @@ mod tests {
             ];
             QueryError::StorageAccessDenied { .. } => true, [
                 QueryError::StorageAccessDenied {
+                    scheme: "s3",
                     bucket: s(),
                     key: s(),
                     region: None,
+                    message: s(),
+                },
+            ];
+            QueryError::StorageSchemeNotServed { .. } => true, [
+                QueryError::StorageSchemeNotServed {
+                    scheme: s(),
                     message: s(),
                 },
             ];
@@ -908,6 +924,26 @@ mod tests {
             QueryError::CatalogAccessDenied { .. } => true, [
                 QueryError::CatalogAccessDenied { table: s(), message: s() },
             ];
+            QueryError::CatalogQuotaProjectRequired { .. } => true, [
+                QueryError::CatalogQuotaProjectRequired { table: s(), message: s() },
+            ];
+            QueryError::GoogleTokenExchange { .. } => true, [
+                QueryError::GoogleTokenExchange {
+                    stage: s(),
+                    status: Some(403),
+                    reason: None,
+                    message: s(),
+                },
+            ];
+            QueryError::GoogleCredentialsInvalid(_) => true, [
+                QueryError::GoogleCredentialsInvalid(s()),
+            ];
+            QueryError::HostIdentityRefused { .. } => true, [
+                QueryError::HostIdentityRefused { kind: s(), message: s() },
+            ];
+            QueryError::GoogleTokenHostRefused { .. } => true, [
+                QueryError::GoogleTokenHostRefused { kind: s(), host: s(), message: s() },
+            ];
             QueryError::Policy(_) => true, [QueryError::Policy(s())];
             QueryError::TimeRangeNotCovered { .. } => true, [
                 QueryError::TimeRangeNotCovered { requested_t: 1, base_t: 2 },
@@ -917,6 +953,19 @@ mod tests {
             ];
             QueryError::NoSnapshotAtTime { .. } => true, [
                 QueryError::NoSnapshotAtTime { table: s(), requested: s(), oldest: None },
+            ];
+            QueryError::GraphSourceUnmapped { .. } => true, [
+                QueryError::GraphSourceUnmapped {
+                    graph_source_id: s(),
+                    empty_mapping: false,
+                },
+            ];
+            QueryError::GraphSourceUnsupported { .. } => true, [
+                QueryError::GraphSourceUnsupported {
+                    graph_source_id: s(),
+                    family: "an Iceberg".into(),
+                    cause: "c".into(),
+                },
             ];
             QueryError::R2rml(_) => true, [
                 QueryError::R2rml(fluree_db_r2rml::R2rmlError::Parse(s())),
@@ -951,6 +1000,13 @@ mod tests {
             QueryError::UnsupportedFeature(_) => false, [QueryError::UnsupportedFeature(s())];
             QueryError::R2rmlUnsupportedPattern { .. } => false, [
                 QueryError::R2rmlUnsupportedPattern { detail: s() },
+            ];
+            QueryError::GraphSourceNotAGraph { .. } => false, [
+                QueryError::GraphSourceNotAGraph {
+                    graph_source_id: s(),
+                    index: s(),
+                    remedy: "r",
+                },
             ];
             QueryError::Arithmetic(_) => false, [
                 QueryError::Arithmetic(ArithmeticError::DivideByZero),

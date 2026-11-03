@@ -23,8 +23,11 @@ doctest = false
 # it the crate is empty, so a workspace build (the CLI release's, under fat
 # LTO) does not link a second copy of the engine it never ships.
 extension = [
+    "dep:base64",
     "dep:bytes",
     "dep:fluree-db-api",
+    "dep:fluree-db-doc",
+    "dep:fluree-graph-ir",
     "dep:fluree-db-core",
     "dep:fluree-db-nameservice",
     "dep:fluree-db-query",
@@ -36,12 +39,20 @@ extension = [
     "dep:serde_json",
     "dep:stacker",
     "dep:tokio",
+    "dep:toml",
     "dep:tracing",
     "dep:tracing-subscriber",
+    "dep:ureq",
 ]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 bytes = { version = "1", optional = true }
+# `fluree.doc.read`: the document parser and the HTTP reader, as the CLI's.
+fluree-db-doc = { path = "../fluree-db-doc", optional = true }
+fluree-graph-ir = { path = "../fluree-graph-ir", optional = true }
+toml = { version = "0.8", optional = true }
+ureq = { version = "3", features = ["json"], optional = true }
 # The engine features the CLI ships with (fluree-db-cli's default set, less
 # its server): S3/DynamoDB storage, SHACL, Iceberg / SQL / Delta graph
 # sources, and GraphQL.

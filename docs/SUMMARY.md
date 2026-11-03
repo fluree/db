@@ -56,6 +56,7 @@
   - [bm25](cli/bm25.md)
   - [doc](cli/doc.md)
   - [ontology](cli/ontology.md)
+  - [catalog](cli/catalog.md)
   - [materialize](cli/materialize.md)
   - [completions](cli/completions.md)
 
@@ -251,6 +252,7 @@
     - [ingest](unstructured/cli/ingest.md)
     - [search](unstructured/cli/search.md)
     - [parse](unstructured/cli/parse.md)
+    - [read](unstructured/cli/read.md)
   - [Reference](unstructured/reference/README.md)
     - [Configuration](unstructured/reference/configuration.md)
     - [Vocabulary](unstructured/reference/vocabulary.md)

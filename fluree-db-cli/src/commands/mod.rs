@@ -10,6 +10,7 @@ pub mod context_cmd;
 pub mod create;
 pub mod delta;
 pub mod doc;
+pub mod doc_reader;
 pub mod doc_sources;
 pub mod docs;
 pub mod drop;
@@ -44,6 +45,8 @@ pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod show;
+#[cfg(feature = "iceberg")]
+pub mod source_auth;
 pub mod sql;
 pub mod sweep;
 pub mod sync;

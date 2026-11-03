@@ -54,6 +54,11 @@ pub struct BatchSchema {
     field_id_to_index: HashMap<i32, usize>,
     /// Convenience lookup by name (debug/UX).
     name_to_index: HashMap<String, usize>,
+    /// Fractional-second digits a temporal field holds at its source, by field
+    /// id, where the source reports them (`timestamp(3)`). A `Column` keeps
+    /// microseconds, so a field with more digits decodes distinct source
+    /// values to one cell.
+    fractional_digits: HashMap<i32, u8>,
 }
 
 impl BatchSchema {
@@ -74,7 +79,23 @@ impl BatchSchema {
             fields,
             field_id_to_index,
             name_to_index,
+            fractional_digits: HashMap::new(),
         }
+    }
+
+    /// The schema with the source-reported fractional-second digits of its
+    /// temporal fields, as `(field_id, digits)`.
+    #[must_use]
+    pub fn with_fractional_digits(mut self, digits: impl IntoIterator<Item = (i32, u8)>) -> Self {
+        self.fractional_digits.extend(digits);
+        self
+    }
+
+    /// The fractional-second digits the source reported for the named field,
+    /// if it reported any.
+    pub fn fractional_digits(&self, name: &str) -> Option<u8> {
+        let field = self.field_by_name(name)?;
+        self.fractional_digits.get(&field.field_id).copied()
     }
 
     /// Get field index by field_id (canonical).
@@ -480,7 +501,13 @@ impl ColumnBatch {
             new_columns.push(self.columns[idx].clone());
         }
 
-        let new_schema = Arc::new(BatchSchema::new(new_fields));
+        let digits = field_ids.iter().filter_map(|id| {
+            self.schema
+                .fractional_digits
+                .get(id)
+                .map(|&digits| (*id, digits))
+        });
+        let new_schema = Arc::new(BatchSchema::new(new_fields).with_fractional_digits(digits));
         Ok(Self {
             schema: new_schema,
             columns: new_columns,
@@ -622,5 +649,34 @@ mod tests {
         assert!(projected.column_by_id(1).is_some());
         assert!(projected.column_by_id(2).is_none()); // name was not projected
         assert!(projected.column_by_id(3).is_some());
+    }
+
+    /// A projected batch keeps the source-reported fractional-second digits of
+    /// the fields it keeps, and only those.
+    #[test]
+    fn project_keeps_the_kept_fields_fractional_digits() {
+        let field = |name: &str, field_id| FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::Timestamp,
+            nullable: true,
+            field_id,
+        };
+        let schema = Arc::new(
+            BatchSchema::new(vec![field("ms", 1), field("ns", 2), field("us", 3)])
+                .with_fractional_digits([(1, 3), (2, 9), (3, 6)]),
+        );
+        let columns = vec![
+            Column::Timestamp(vec![Some(0)]),
+            Column::Timestamp(vec![Some(0)]),
+            Column::Timestamp(vec![Some(0)]),
+        ];
+        let projected = ColumnBatch::new(schema, columns)
+            .unwrap()
+            .project(&[3, 2])
+            .unwrap();
+        assert_eq!(projected.schema.fractional_digits("ns"), Some(9));
+        assert_eq!(projected.schema.fractional_digits("us"), Some(6));
+        assert_eq!(projected.schema.fractional_digits("ms"), None);
+        assert_eq!(projected.schema.fractional_digits.len(), 2);
     }
 }
