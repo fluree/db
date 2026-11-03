@@ -602,6 +602,28 @@ mod tests {
         assert_eq!(runs, vec![(0, 5), (5, 10), (10, 14)]);
     }
 
+    /// A cut that would clip a container is refused while a clean one
+    /// exists: two 10-character sections of two leaves each, 15 at most a
+    /// call, cut at 10 (between the sections), not at 15 (inside the second).
+    #[test]
+    fn a_cut_backs_off_to_a_container_boundary_when_there_is_one() {
+        let text = "aaaabbbbbbccccdddddd";
+        let s = structure(
+            text,
+            &[
+                ("s1", 0, 10, &["a", "b"]),
+                ("a", 0, 4, &[]),
+                ("b", 4, 10, &[]),
+                ("s2", 10, 20, &["c", "d"]),
+                ("c", 10, 14, &[]),
+                ("d", 14, 20, &[]),
+            ],
+        );
+        let parts = s.plan(&limits(15), &PromptSize::default()).unwrap();
+        let runs: Vec<_> = parts.iter().map(|p| (p.begin, p.end)).collect();
+        assert_eq!(runs, vec![(0, 10), (10, 20)]);
+    }
+
     #[test]
     fn a_container_too_long_for_one_call_is_cut_between_its_leaves_and_clipped() {
         let text = "aaaa bbbb";
