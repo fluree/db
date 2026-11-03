@@ -427,7 +427,9 @@ pub fn to_graph(nodes: &[Value]) -> Result<fluree_graph_ir::Graph> {
     let mut sink = fluree_graph_ir::GraphCollectorSink::new();
     fluree_graph_json_ld::adapter::to_graph_events(&Value::Array(nodes.to_vec()), &mut sink)
         .map_err(|e| DocError::Model(format!("reading: {e}")))?;
-    Ok(sink.into_graph())
+    let mut graph = sink.into_graph();
+    super::request::retype_native_literals(&mut graph);
+    Ok(graph)
 }
 
 /// The prefixes a printed reading is written with: this pipeline's own.
@@ -697,10 +699,42 @@ mod tests {
             fluree_graph_ir::Term::integer(0),
         );
         let trig = trig("urn:d", &structure, &r.nodes).unwrap();
-        assert!(
-            trig.contains("<urn:d> {") && trig.contains("<urn:d/reading> {"),
-            "{trig}"
-        );
+        // Each graph holds what it should, not just a header.
+        let block = |name: &str| {
+            let start = trig
+                .find(&format!("{name} {{"))
+                .unwrap_or_else(|| panic!("no {name} graph in {trig}"));
+            let rest = &trig[start..];
+            rest[..rest.find("\n}").unwrap_or(rest.len())].to_string()
+        };
+        let (doc, reading) = (block("<urn:d>"), block("<urn:d/reading>"));
+        assert!(doc.contains("urn:d-element-1"), "{trig}");
+        assert!(!doc.contains("o4-9"), "{trig}");
+        assert!(reading.contains("o4-9"), "{trig}");
+        assert!(!reading.contains("urn:d-element-1"), "{trig}");
+    }
+
+    #[test]
+    fn a_native_json_number_prints_as_a_number() {
+        let answer = json!([{ "@id": "urn:d/reading", "@graph": [{
+            "@id": "urn:d/reading#o0-4",
+            format!("{RDF_NS}type"): [{ "@id": format!("{NIF_NS}RFC5147String") }],
+            BEGIN: [{ "@value": 31 }],
+            END: [{ "@value": 35 }],
+            format!("{EX}score"): [{ "@value": 0.5 }]
+        }]}])
+        .to_string();
+        let frame = Frame {
+            doc_iri: "urn:d",
+            offset: 0,
+            part: 0,
+            parts: 1,
+        };
+        let r = read_answer(&answer, &frame, None).unwrap();
+        let ttl = turtle(&r.nodes).unwrap();
+        assert!(ttl.contains("beginIndex 31"), "{ttl}");
+        assert!(!ttl.contains("beginIndex \"31\""), "{ttl}");
+        assert!(!ttl.contains("\"0.5\""), "{ttl}");
     }
 
     #[test]

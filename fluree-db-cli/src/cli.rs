@@ -4538,8 +4538,9 @@ pub struct DocReadArgs {
     pub model: Option<String>,
 
     /// What the reader may keep for the next request sharing it: `ontology`,
-    /// or `catalog`. Config: `doc.reader.cache`
-    #[arg(long, value_name = "ontology|catalog")]
+    /// `catalog`, or `off` (nothing, overriding `doc.reader.cache`). Config:
+    /// `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog|off")]
     pub cache: Option<String>,
 
     /// `jsonld` prints the reading; `turtle` the same as Turtle; `trig` the

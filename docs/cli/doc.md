@@ -200,7 +200,9 @@ The output is the engine's own JSON-LD, insertable as it is: `fluree insert docs
 
 ## fluree doc read
 
-Parses one file as `parse` does, reads it with the [HTTP reader](#an-http-reader) that serves `--model`, and prints the reading: mentions linked to catalog records, entities, and claims, each anchored to the text's offsets, in the same shape `ingest` would commit. No ledger is written or needed. The reader comes from the project's `[doc.reader]` when there is a project, else the global config's, else `FLUREE_DOC_READER_*`; files as ontology and catalog need no project, a ledger does.
+Parses one file as `parse` does, reads it with the [HTTP reader](#an-http-reader) that serves `--model`, and prints the reading: mentions linked to catalog records, entities, and claims, each anchored to offsets in the parser's text, in the same shape `ingest` would commit. No ledger is written or needed. The reader is the `[doc.reader]` of the project when there is one, and of the global config otherwise (a project's config is read alone, not merged with the global one); `FLUREE_DOC_READER_*` overrides any of its fields one by one, so setting only `FLUREE_DOC_READER_URL` still sends the configured key and models. Files as ontology and catalog need no project, a ledger does.
+
+The offsets index the text the parser made of the file, which is what `fluree doc parse --format text` prints (and the `nif:isString` of the document in `--format trig`), not the file's own bytes: a Markdown file's markup, or a PDF's layout, is not counted.
 
 ### Usage
 
@@ -215,14 +217,14 @@ fluree doc read <FILE> --ontology <FILE|LEDGER> [OPTIONS]
 | `--ontology <FILE\|LEDGER>` | Ontology to read against. Required. |
 | `--entities <FILE\|LEDGER[#CLASS]>` (alias `--catalog`) | Known entities to link mentions to: a file, a ledger, or a graph source mapped over a table. Repeatable; `#Class` scopes to one type. |
 | `--model <ID>` | The extraction model, one a `[doc.reader]` lists in `models`. Default: `doc.model`. |
-| `--cache <ontology\|catalog>` | What the reader may keep for the next request that shares it. Config: `doc.reader.cache`. |
+| `--cache <ontology\|catalog\|off>` | What the reader may keep for the next request that shares it; `off` keeps nothing, overriding `doc.reader.cache`. Config: `doc.reader.cache`. |
 | `--format <FORMAT>` | `jsonld` (default): the reading. `turtle`: the reading as Turtle. `trig`: the structure graph in `<doc>` and the reading in `<doc>/reading`. |
-| `-o, --output <FILE>` | Write to this file instead of stdout. |
+| `-o, --output <FILE>` | Write to this file instead of stdout. It is opened before the read, so a path that can't be written fails before anything is sent. |
 | `--base-iri <IRI>`, `--doc-iri <IRI>` | The document IRI, as for `parse`. |
 | `--no-escalate`, `--max-crops <N>` | Vision-model escalation during the parse, as for `parse`. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 
-The reading goes to stdout. Stderr says what was read with which model, then the counts, the calls made (and how many the cache answered), what the reader billed, and what it set aside or adapted in the ontology.
+The reading goes to stdout. Stderr says what was read with which model (and the vision model, when one reads what the parser can't), then the nodes received and the counts among them, the calls made (and how many the cache answered), what the reader billed, and what it set aside or adapted in the ontology. A file with no text is not sent: the reading is empty and no call is made.
 
 ### Examples
 

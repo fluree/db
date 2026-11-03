@@ -1539,10 +1539,27 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         "→".dimmed(),
         setup.client.url()
     );
+    if let Some(vlm) = &vlm {
+        eprintln!(
+            "{} vision model {} reads what the parser cannot (--no-escalate to skip)",
+            "→".dimmed(),
+            vlm.model()
+        );
+    }
+    // The target is opened before the read: a call is billed, and a path
+    // that can't be written should fail first, by name.
+    let output = match &args.output {
+        Some(target) => Some((
+            target.clone(),
+            std::fs::File::create(target)
+                .map_err(|e| CliError::Input(format!("{}: {e}", target.display())))?,
+        )),
+        None => None,
+    };
 
     let (p, iri) = (path.clone(), doc_iri.clone());
     let format = args.format;
-    let (read, structure) = tokio::task::spawn_blocking(move || -> CliResult<_> {
+    let result = tokio::task::spawn_blocking(move || -> CliResult<_> {
         let (meta, parsed) =
             fluree_db_doc::parse_file(&p, &file_name, &iri, cache.as_ref(), vlm.as_ref())?;
         let doc = fluree_db_doc::PreparedDocument {
@@ -1551,8 +1568,17 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
             parsed,
             chunks: Vec::new(),
         };
+        if let Some(why) = &doc.parsed.escalation_skipped {
+            eprintln!(
+                "{} deterministic tier only: {why}; raise --max-crops to read them",
+                "!".yellow()
+            );
+        }
         for note in &doc.parsed.notes {
             eprintln!("{} {note}", "!".yellow());
+        }
+        if doc.parsed.text.trim().is_empty() {
+            eprintln!("{} no text to read: nothing was sent", "!".yellow());
         }
         let read = doc_reader::read_document(&setup, &doc, None)?;
         let structure = match format {
@@ -1565,7 +1591,17 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
         Ok((read, structure))
     })
     .await
-    .map_err(|e| CliError::Input(format!("reading task failed: {e}")))??;
+    .map_err(|e| CliError::Input(format!("reading task failed: {e}")));
+    let (read, structure) = match result.and_then(|r| r) {
+        Ok(r) => r,
+        Err(e) => {
+            // Nothing was read: take back the file opened for it.
+            if let Some((target, _)) = &output {
+                let _ = std::fs::remove_file(target);
+            }
+            return Err(e);
+        }
+    };
 
     let mut out = match (format, &structure) {
         (DocReadFormat::Jsonld, _) => serde_json::to_string_pretty(&json!({
@@ -1583,9 +1619,12 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     }
 
     let usage = doc_reader::usage_note(&read.usage);
+    // Nodes as received, beside what the reading's terms say they are: a
+    // reader in terms of its own still shows what it sent.
     eprintln!(
-        "{} {} mention(s), {} entit{}, {} relation(s); {} call(s){}{}",
+        "{} {} node(s): {} mention(s), {} entit{}, {} relation(s); {} call(s){}{}",
         "✓".green(),
+        read.nodes.len(),
         read.mentions,
         read.entities,
         if read.entities == 1 { "y" } else { "ies" },
@@ -1605,8 +1644,12 @@ pub async fn run_read(args: DocReadArgs, dirs: Option<&FlureeDir>) -> CliResult<
     for note in &read.ontology_notes {
         eprintln!("  {} ontology {note}", "·".dimmed());
     }
-    match &args.output {
-        Some(target) => std::fs::write(target, out)?,
+    match output {
+        Some((target, mut file)) => {
+            use std::io::Write;
+            file.write_all(out.as_bytes())
+                .map_err(|e| CliError::Input(format!("{}: {e}", target.display())))?;
+        }
         None => {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
