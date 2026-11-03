@@ -1240,6 +1240,24 @@ pub enum Commands {
         action: AuthAction,
     },
 
+    /// Sign this machine in to a fluree.ai account
+    ///
+    /// Opens the account's approval page in a browser and waits while you
+    /// approve the code it shows. The sign-in is kept once per machine (not
+    /// per project) and refreshes itself; `fluree auth status` shows it.
+    Login {
+        /// Account service to sign in to
+        #[arg(long, value_name = "URL", default_value = crate::account::DEFAULT_ACCOUNT_URL)]
+        url: String,
+
+        /// Print the approval link instead of opening a browser (e.g. over SSH)
+        #[arg(long)]
+        no_browser: bool,
+    },
+
+    /// Sign this machine out of its fluree.ai account
+    Logout,
+
     /// Manage upstream tracking configuration
     Upstream {
         #[command(subcommand)]
@@ -3395,7 +3413,7 @@ pub enum RemoteAction {
 
 #[derive(Subcommand)]
 pub enum AuthAction {
-    /// Show authentication status for a remote
+    /// Show this machine's fluree.ai sign-in and a remote's authentication status
     Status {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]
@@ -3429,8 +3447,20 @@ pub enum AuthAction {
     /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "account")]
         remote: Option<String>,
+
+        /// The machine's fluree.ai sign-in (`fluree login`) instead of a
+        /// remote: an access token with time left, refreshed first if it
+        /// is about to expire. Needs no project.
+        #[arg(long)]
+        account: bool,
+
+        /// With `--account`: refresh the token even if it has time left,
+        /// e.g. after the account's configuration changed and the service
+        /// answers `config_stale`.
+        #[arg(long, requires = "account")]
+        refresh: bool,
     },
 }
 
