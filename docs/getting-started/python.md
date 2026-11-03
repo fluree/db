@@ -112,20 +112,28 @@ import fluree
 reading = fluree.doc.read("invoice.pdf", ontology="invoices.ttl",
                           catalog="suppliers.ttl", model="reader-small")
 print(reading.usage.note)                  # 1,032 tokens
-for m in reading.mentions():               # text, begin, end, class, entity, score, element
+for m in reading.mentions():               # text, begin, end, entity, element
     print(m["text"], "->", m["entity"])
 
 with fluree.connect("./data") as conn:
     conn.create("invoices").insert(reading.to_jsonld())
 ```
 
-`text=` reads a string instead of a file; `catalog` takes several files, each
+`text=` reads a string instead of a file, under an IRI derived from its
+content unless `doc_iri=` names one; `catalog` takes a list of files, each
 optionally `(file, class IRI)`; `to_turtle()` and `claims()` give the reading
-as Turtle and as rows. The credential is the first present of: `api_key` with
-`auth_header` (sent as is to `url`), `api_key` alone (a Fluree.ai API key,
-traded for an hour's token), this machine's `fluree login`,
-and `FLUREE_AI_API_KEY`. With `cache_dir`, a request read once is answered
-from there afterwards.
+as Turtle and as rows. Offsets index the parser's text (what
+`fluree doc parse --format text` prints), not the file's bytes. The rows read
+NIF offsets and the pipeline's `doc:` terms; a reader writing terms of its own
+keeps them, as written, in `reading.nodes` and `to_jsonld()`.
+
+The credential: `api_key` with `auth_header` is sent as is to `url`;
+`api_key` alone is traded for an hour's token when it is a Fluree.ai API key
+(`flk_…`) and sent as a bearer token otherwise; with no key, this machine's
+`fluree login`, else `FLUREE_AI_API_KEY`, each only to its own service (a
+`url` elsewhere is called with no credential). With `cache_dir`, a request
+read once is answered from there afterwards. Python does no vision
+escalation: pages the parser can't read are listed in `reading.notes`.
 
 ## Next steps
 

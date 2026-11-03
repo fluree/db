@@ -3,30 +3,82 @@
 //! the reading's shape are `fluree_db_doc`'s, shared with the CLI; this
 //! module only finds the credential and hands the result to Python as data.
 //!
-//! The credential, first found wins:
-//! 1. `api_key` with `auth_header`: that key, in that header, as is;
-//! 2. `api_key` alone: a fluree.ai API key (`flk_…`), traded for an hour's
-//!    access token at `<service>/v1/auth/token`;
-//! 3. this machine's `fluree login` (`account.toml` in the global config
-//!    directory), refreshed when it is about to expire, as the CLI does;
-//! 4. `FLUREE_AI_API_KEY`, as in 2.
+//! The credential:
+//! 1. `api_key` with `auth_header`: that key, in that header, as is, to `url`;
+//! 2. `api_key` alone: a Fluree.ai API key (`flk_…`) is traded for an hour's
+//!    access token at `<service>/v1/auth/token` (and reused while it lasts);
+//!    any other key goes as `Authorization: Bearer`, as the CLI's
+//!    `[doc.reader] api_key` does;
+//! 3. with no `api_key`: this machine's `fluree login` (`account.toml` in the
+//!    global config directory, refreshed when it is about to expire, as the
+//!    CLI does), else `FLUREE_AI_API_KEY` as in 2. Either is sent only to its
+//!    own service: a `url` on another origin is called with no credential.
 //!
-//! With no `url`, a fluree.ai credential reads at its account's
+//! With no `url`, a Fluree.ai credential reads at its account's
 //! `<api base>/grounding`.
 
-use crate::error::{fluree_error, invalid_request};
-use fluree_db_doc::reader::{request, Credential, ReaderClient, Session};
-use fluree_db_doc::{DocCache, PreparedDocument};
+use crate::error::{fluree_error, invalid_request, raise_status};
+use fluree_db_doc::reader::{request, Credential, ReaderClient, Session, CACHE_MODES};
+use fluree_db_doc::{DocCache, DocError, PreparedDocument};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Where an API key is traded for a token when nothing names the service.
 const DEFAULT_SERVICE: &str = "https://fluree.ai";
 /// `fluree login`'s file in the global config directory.
 const ACCOUNT_FILE: &str = "account.toml";
-/// Refresh a sign-in with less than this left, as the CLI does.
+/// Refresh a sign-in, or trade a key again, with less than this left.
 const REFRESH_MARGIN_SECS: i64 = 60;
+
+/// Why a read failed, kept typed across the GIL release so Python gets the
+/// right exception class.
+enum ReadError {
+    /// The arguments can't make a read: a bad cache mode, a header with no
+    /// key, a missing sign-in.
+    Invalid(String),
+    /// A credential was refused (401/403), by the reader or the service.
+    Refused {
+        status: u16,
+        message: String,
+    },
+    Other(String),
+}
+
+impl ReadError {
+    fn into_py(self) -> PyErr {
+        match self {
+            ReadError::Invalid(m) => invalid_request(m),
+            ReadError::Refused { status, message } => {
+                raise_status("PermissionDeniedError", message, status)
+            }
+            ReadError::Other(m) => fluree_error(m),
+        }
+    }
+
+    /// A `fluree_db_doc` error for a read with `model`. The reader's refusals
+    /// come back as `"<model>: <status> <message>"`; a 401 or 403 there is a
+    /// refused credential.
+    fn from_doc(e: DocError, model: &str) -> Self {
+        match e {
+            DocError::Config(m) | DocError::Unsupported(m) => ReadError::Invalid(m),
+            DocError::Model(m) => {
+                let status = m
+                    .strip_prefix(model)
+                    .and_then(|rest| rest.strip_prefix(": "))
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|s| s.parse::<u16>().ok());
+                match status {
+                    Some(status @ (401 | 403)) => ReadError::Refused { status, message: m },
+                    _ => ReadError::Other(m),
+                }
+            }
+            other => ReadError::Other(other.to_string()),
+        }
+    }
+}
 
 /// Read `path` with `model` and return the reading as plain data.
 #[pyfunction]
@@ -49,12 +101,21 @@ pub(crate) fn read_document(
     base_iri: String,
     cache_dir: Option<PathBuf>,
 ) -> PyResult<Bound<'_, PyDict>> {
-    let read = py.detach(|| -> Result<_, String> {
+    if let Some(c) = &cache {
+        if !CACHE_MODES.contains(&c.trim().to_ascii_lowercase().as_str()) {
+            return Err(invalid_request(format!(
+                "cache={c:?}: expected one of {}",
+                CACHE_MODES.join(", ")
+            )));
+        }
+    }
+    let read = py.detach(|| -> Result<_, ReadError> {
         let (url, credential) = resolve(url, api_key, auth_header)?;
-        let ontology = load_rdf(&ontology)?;
+        let ontology = load_rdf(&ontology).map_err(ReadError::Invalid)?;
         let mut records = fluree_graph_ir::Graph::new();
         for (file, class) in &catalog {
-            for t in request::catalog_records_of(&load_rdf(file)?, class.as_deref()).iter() {
+            let graph = load_rdf(file).map_err(ReadError::Invalid)?;
+            for t in request::catalog_records_of(&graph, class.as_deref()).iter() {
                 records.add(t.clone());
             }
         }
@@ -69,7 +130,7 @@ pub(crate) fn read_document(
             records,
             doc_cache.clone(),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ReadError::from_doc(e, &model))?;
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -77,27 +138,22 @@ pub(crate) fn read_document(
         let iri = doc_iri.unwrap_or_else(|| fluree_db_doc::ingest::document_iri(&base_iri, &name));
         let (meta, parsed) =
             fluree_db_doc::parse_file(&path, &name, &iri, doc_cache.as_ref(), None)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| ReadError::from_doc(e, &model))?;
+        let notes = parsed.notes.clone();
         let doc = PreparedDocument {
             meta,
             doc_iri: iri,
             parsed,
             chunks: Vec::new(),
         };
+        // A wait for capacity can last minutes: warn, so the default
+        // `fluree.engine` logger shows it.
         let read = session
-            .read(&doc, None, &|wait| tracing::info!("{wait}"))
-            .map_err(|e| e.to_string())?;
-        Ok((read, url))
+            .read(&doc, None, &|wait| tracing::warn!("{wait}"))
+            .map_err(|e| ReadError::from_doc(e, &model))?;
+        Ok((read, url, notes))
     });
-    let (read, url) = read.map_err(|e| {
-        if e.contains(" 4") && (e.contains(": 401 ") || e.contains(": 403 ")) {
-            crate::error::raise_status("PermissionDeniedError", e, 401)
-        } else if e.starts_with("sign in") || e.contains("no ontology") {
-            invalid_request(e)
-        } else {
-            fluree_error(e)
-        }
-    })?;
+    let (read, url, notes) = read.map_err(ReadError::into_py)?;
     let out = PyDict::new(py);
     out.set_item(
         "nodes",
@@ -119,6 +175,7 @@ pub(crate) fn read_document(
     out.set_item("cached", read.cached)?;
     out.set_item("release", read.release)?;
     out.set_item("ontology_notes", read.ontology_notes)?;
+    out.set_item("notes", notes)?;
     out.set_item("url", url)?;
     Ok(out)
 }
@@ -161,34 +218,93 @@ fn resolve(
     url: Option<String>,
     api_key: Option<String>,
     auth_header: Option<String>,
-) -> Result<(String, Option<Credential>), String> {
-    if let Some(key) = api_key.clone().filter(|_| auth_header.is_some()) {
-        let url = url.ok_or("a key in `auth_header` needs the reader's `url`")?;
-        let header = auth_header.unwrap_or_default();
-        let credential = if header.eq_ignore_ascii_case("authorization") {
-            Credential::Bearer(key)
-        } else {
-            Credential::Header {
-                name: header,
-                value: key,
-            }
-        };
-        return Ok((url, Some(credential)));
+) -> Result<(String, Option<Credential>), ReadError> {
+    match (api_key, auth_header) {
+        (None, Some(header)) => Err(ReadError::Invalid(format!(
+            "auth_header={header:?} names a header for a key, but no api_key= was given"
+        ))),
+        (Some(key), Some(header)) => {
+            let url = url.ok_or_else(|| {
+                ReadError::Invalid("a key in `auth_header` needs the reader's `url`".into())
+            })?;
+            let credential = if header.eq_ignore_ascii_case("authorization") {
+                Credential::Bearer(key)
+            } else {
+                Credential::Header {
+                    name: header,
+                    value: key,
+                }
+            };
+            Ok((url, Some(credential)))
+        }
+        (Some(key), None) if is_service_key(&key) => {
+            let service = service_for(url.as_deref());
+            exchange_key(service, url, &key)
+        }
+        (Some(key), None) => {
+            let url = url.ok_or_else(|| {
+                ReadError::Invalid(
+                    "api_key= that isn't a Fluree.ai key (flk_…) is sent as a bearer token, and needs the reader's url=".into(),
+                )
+            })?;
+            Ok((url, Some(Credential::Bearer(key))))
+        }
+        (None, None) => resolve_ambient(url),
     }
-    if let Some(key) = api_key {
-        return exchange_key(url, &key);
-    }
-    if let Some((api_base, token)) = account_session()? {
-        let url = url.unwrap_or_else(|| format!("{}/grounding", api_base.trim_end_matches('/')));
-        return Ok((url, Some(Credential::Bearer(token))));
+}
+
+/// No key given: this machine's sign-in, else `FLUREE_AI_API_KEY`, each sent
+/// only to its own service.
+fn resolve_ambient(url: Option<String>) -> Result<(String, Option<Credential>), ReadError> {
+    if let Some(account) = Account::load()? {
+        if url
+            .as_deref()
+            .is_none_or(|u| origin(u) == origin(&account.api_base()))
+        {
+            let (api_base, token) = account.session()?;
+            let url =
+                url.unwrap_or_else(|| format!("{}/grounding", api_base.trim_end_matches('/')));
+            return Ok((url, Some(Credential::Bearer(token))));
+        }
     }
     if let Some(key) = std::env::var("FLUREE_AI_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
     {
-        return exchange_key(url, &key);
+        let service = env_service();
+        if url.as_deref().is_none_or(|u| origin(u) == origin(&service)) {
+            return exchange_key(service, url, &key);
+        }
     }
-    Err("sign in with `fluree login`, or set FLUREE_AI_API_KEY (or pass api_key=)".into())
+    match url {
+        Some(url) => Ok((url, None)),
+        None => Err(ReadError::Invalid(
+            "sign in with `fluree login`, or set FLUREE_AI_API_KEY (or pass api_key=)".into(),
+        )),
+    }
+}
+
+/// A Fluree.ai API key, the kind traded for an access token.
+fn is_service_key(key: &str) -> bool {
+    key.starts_with("flk_")
+}
+
+/// The service a key is traded at: `url`'s origin when given, else
+/// `FLUREE_AI_URL`, else fluree.ai.
+fn service_for(url: Option<&str>) -> String {
+    match url {
+        Some(u) => origin(u),
+        None => env_service(),
+    }
+}
+
+fn env_service() -> String {
+    std::env::var("FLUREE_AI_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVICE.to_string())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn agent() -> ureq::Agent {
@@ -202,133 +318,212 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-/// A fluree.ai API key traded for an access token. The service is `url`'s
-/// origin when given, else `FLUREE_AI_URL`, else fluree.ai.
-fn exchange_key(url: Option<String>, key: &str) -> Result<(String, Option<Credential>), String> {
-    let service = match &url {
-        Some(u) => origin(u),
-        None => std::env::var("FLUREE_AI_URL").unwrap_or_else(|_| DEFAULT_SERVICE.to_string()),
-    };
-    let service = service.trim_end_matches('/').to_string();
+/// Tokens traded for API keys in this process, by `(service, key)`, with
+/// the Unix second each expires: one trade an hour, not one a read.
+type TokenCache = Mutex<HashMap<(String, String), (String, i64)>>;
+
+fn tokens() -> &'static TokenCache {
+    static TOKENS: OnceLock<TokenCache> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A Fluree.ai API key traded for an access token at `service`, reused from
+/// an earlier trade while more than a minute of it is left.
+fn exchange_key(
+    service: String,
+    url: Option<String>,
+    key: &str,
+) -> Result<(String, Option<Credential>), ReadError> {
+    let url = url.unwrap_or_else(|| format!("{service}/v1/grounding"));
+    let slot = (service.clone(), key.to_string());
+    if let Some((token, expires)) = tokens().lock().expect("token cache").get(&slot) {
+        if expires - now_secs() > REFRESH_MARGIN_SECS {
+            return Ok((url, Some(Credential::Bearer(token.clone()))));
+        }
+    }
     let mut response = agent()
         .post(&format!("{service}/v1/auth/token"))
         .header("X-API-Key", key)
         .send_empty()
-        .map_err(|e| format!("{service}/v1/auth/token: {e}"))?;
+        .map_err(|e| ReadError::Other(format!("{service}/v1/auth/token: {e}")))?;
     let status = response.status().as_u16();
     let body: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
-    let token = body
+    let Some(token) = body
         .get("accessToken")
         .and_then(|v| v.as_str())
         .filter(|_| status == 200)
-        .ok_or_else(|| {
-            format!(
-                "{service}/v1/auth/token: {status} {}",
-                body.get("message")
-                    .or_else(|| body.get("error"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("the API key was refused")
-            )
-        })?;
-    let url = url.unwrap_or_else(|| format!("{service}/v1/grounding"));
+    else {
+        let message = format!(
+            "{service}/v1/auth/token: {status} {}",
+            body.get("message")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("the API key was refused")
+        );
+        return Err(match status {
+            401 | 403 => ReadError::Refused { status, message },
+            _ => ReadError::Other(message),
+        });
+    };
+    // An answer with no expiry is used for this read and not kept.
+    if let Some(expires) = body.get("expiresAt").and_then(serde_json::Value::as_i64) {
+        tokens()
+            .lock()
+            .expect("token cache")
+            .insert(slot, (token.to_string(), expires));
+    }
     Ok((url, Some(Credential::Bearer(token.to_string()))))
 }
 
 fn origin(url: &str) -> String {
     let after_scheme = url.find("://").map_or(0, |i| i + 3);
-    match url[after_scheme..].find('/') {
-        Some(i) => url[..after_scheme + i].to_string(),
-        None => url.to_string(),
-    }
+    let origin = match url[after_scheme..].find('/') {
+        Some(i) => &url[..after_scheme + i],
+        None => url,
+    };
+    origin.trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// `fluree login`'s sign-in, refreshed and saved when it is about to expire:
-/// `(api base, access token)`, or `None` when this machine isn't signed in.
-/// The file and its refresh are the CLI's (`fluree login`); this reads and
-/// renews it the same way.
-fn account_session() -> Result<Option<(String, String)>, String> {
-    let Some(dirs) = fluree_db_api::server_defaults::FlureeDir::global() else {
-        return Ok(None);
-    };
-    let path = dirs.config_dir().join(ACCOUNT_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    let mut account: toml::Table =
-        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let field = |t: &toml::Table, k: &str| t.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    let (Some(api_base), Some(token)) = (
-        field(&account, "api_base_url"),
-        field(&account, "access_token"),
-    ) else {
-        return Err(format!(
-            "{} is unreadable; run `fluree logout` and sign in again",
-            path.display()
-        ));
-    };
-    if seconds_left(&token).is_some_and(|s| s > REFRESH_MARGIN_SECS) {
-        return Ok(Some((api_base, token)));
+/// `fluree login`'s sign-in (`account.toml`), read and renewed the way the
+/// CLI's `account` module does: the same keys, the same refresh, the same
+/// owner-only atomic save.
+struct Account {
+    path: PathBuf,
+    table: toml::Table,
+}
+
+impl Account {
+    /// The stored sign-in, or `None` when this machine isn't signed in.
+    fn load() -> Result<Option<Self>, ReadError> {
+        let Some(dirs) = fluree_db_api::server_defaults::FlureeDir::global() else {
+            return Ok(None);
+        };
+        let path = dirs.config_dir().join(ACCOUNT_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(ReadError::Other(format!("{}: {e}", path.display()))),
+        };
+        let table: toml::Table = toml::from_str(&text).map_err(|e| {
+            ReadError::Invalid(format!(
+                "{} is unreadable ({e}); run `fluree logout` and sign in again",
+                path.display()
+            ))
+        })?;
+        Ok(Some(Self { path, table }))
     }
-    let (Some(exchange), Some(refresh)) = (
-        field(&account, "exchange_url"),
-        field(&account, "refresh_token"),
-    ) else {
-        return Err(format!(
-            "{} has no refresh credential; run `fluree login`",
-            path.display()
-        ));
-    };
-    let mut response = agent()
-        .post(&exchange)
-        .send_json(serde_json::json!({ "grant_type": "refresh_token", "refresh_token": refresh }))
-        .map_err(|e| format!("refreshing the sign-in: {e}"))?;
-    let status = response.status().as_u16();
-    let body: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
-    let Some(token) = body
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .filter(|_| status == 200)
-    else {
-        let why = body
-            .get("error_description")
-            .or_else(|| body.get("error"))
+
+    fn field(&self, key: &str) -> Option<String> {
+        self.table
+            .get(key)
             .and_then(|v| v.as_str())
-            .unwrap_or("refresh rejected");
-        return Err(format!(
-            "sign in again with `fluree login`: refreshing the sign-in failed ({status}: {why})"
-        ));
-    };
-    account.insert(
-        "access_token".into(),
-        toml::Value::String(token.to_string()),
-    );
-    if let Some(rotated) = body.get("refresh_token").and_then(|v| v.as_str()) {
-        account.insert(
-            "refresh_token".into(),
-            toml::Value::String(rotated.to_string()),
-        );
+            .map(str::to_string)
     }
-    save_account(&path, &account)?;
-    Ok(Some((api_base, token.to_string())))
-}
 
-/// Write the sign-in back as `fluree login` does: owner-only, replaced
-/// atomically.
-fn save_account(path: &Path, account: &toml::Table) -> Result<(), String> {
-    let body = toml::to_string(account).map_err(|e| e.to_string())?;
-    let text = format!(
-        "# Written by `fluree login`. It holds credentials for your fluree.ai account:\n\
-         # keep it private, and sign out with `fluree logout`.\n\n{body}"
-    );
-    let dir = path.parent().ok_or("bad account path")?;
-    let tmp = dir.join(format!(".{ACCOUNT_FILE}.{}", std::process::id()));
-    write_private(&tmp, text.as_bytes()).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })
+    fn api_base(&self) -> String {
+        self.field("api_base_url").unwrap_or_default()
+    }
+
+    /// `(api base, access token)`, refreshing and saving the sign-in first
+    /// when its token is about to expire.
+    fn session(mut self) -> Result<(String, String), ReadError> {
+        let (Some(api_base), Some(token)) =
+            (self.field("api_base_url"), self.field("access_token"))
+        else {
+            return Err(ReadError::Invalid(format!(
+                "{} is unreadable; run `fluree logout` and sign in again",
+                self.path.display()
+            )));
+        };
+        if seconds_left(&token).is_some_and(|s| s > REFRESH_MARGIN_SECS) {
+            return Ok((api_base, token));
+        }
+        let (Some(exchange), Some(refresh)) =
+            (self.field("exchange_url"), self.field("refresh_token"))
+        else {
+            return Err(ReadError::Invalid(format!(
+                "{} has no refresh credential; run `fluree login`",
+                self.path.display()
+            )));
+        };
+        let mut response = agent()
+            .post(&exchange)
+            .send_json(
+                serde_json::json!({ "grant_type": "refresh_token", "refresh_token": refresh }),
+            )
+            .map_err(|e| ReadError::Other(format!("refreshing the sign-in: {e}")))?;
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
+        let Some(token) = body
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|_| status == 200)
+            .map(str::to_string)
+        else {
+            let error = body.get("error").and_then(|v| v.as_str());
+            let why = body
+                .get("error_description")
+                .and_then(|v| v.as_str())
+                .or(error)
+                .unwrap_or("refresh rejected");
+            // The server revoked this machine's sign-in (logout, or
+            // disconnected from the dashboard), as against a failed refresh.
+            if error == Some("invalid_grant") {
+                return Err(ReadError::Refused {
+                    status: 401,
+                    message: format!(
+                        "your sign-in is no longer valid ({why}); run `fluree login` again"
+                    ),
+                });
+            }
+            return Err(ReadError::Other(format!(
+                "refreshing the sign-in failed ({status}: {why}); run `fluree login` if it persists"
+            )));
+        };
+        self.table
+            .insert("access_token".into(), toml::Value::String(token.clone()));
+        if let Some(rotated) = body.get("refresh_token").and_then(|v| v.as_str()) {
+            self.table.insert(
+                "refresh_token".into(),
+                toml::Value::String(rotated.to_string()),
+            );
+        }
+        if let Some(summary) = body.get("account").and_then(serde_json::Value::as_object) {
+            let mut account = toml::Table::new();
+            for key in ["account_id", "org_name", "email", "tier"] {
+                if let Some(v) = summary.get(key).and_then(|v| v.as_str()) {
+                    account.insert(key.into(), toml::Value::String(v.to_string()));
+                }
+            }
+            self.table
+                .insert("account".into(), toml::Value::Table(account));
+        }
+        self.save().map_err(ReadError::Other)?;
+        Ok((api_base, token))
+    }
+
+    /// Write the sign-in back as `fluree login` does: owner-only, replaced
+    /// atomically.
+    fn save(&self) -> Result<(), String> {
+        let body = toml::to_string(&self.table).map_err(|e| e.to_string())?;
+        let text = format!(
+            "# Written by `fluree login`. It holds credentials for your fluree.ai account:\n\
+             # keep it private, and sign out with `fluree logout`.\n\n{body}"
+        );
+        let dir = self.path.parent().ok_or("bad account path")?;
+        let tmp = dir.join(format!(".{ACCOUNT_FILE}.{}", std::process::id()));
+        write_private(&tmp, text.as_bytes()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", self.path.display())
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -358,9 +553,5 @@ fn seconds_left(token: &str) -> Option<i64> {
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let exp = claims.get("exp")?.as_i64()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    Some(exp - now)
+    Some(exp - now_secs())
 }
