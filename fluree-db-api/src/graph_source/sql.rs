@@ -563,8 +563,10 @@ impl SqlSource {
         use fluree_db_r2rml::mapping::KeyColumn;
         let declared = mapping.declared_keys(table_name);
         let probed = self.probed_subject_key(mapping, table_name);
-        if declared.is_empty() && probed.is_none() {
-            return Ok(None);
+        // The probe verified its key under the database's own equality, which
+        // never keeps apart two values that render one term: nothing to vet.
+        if declared.is_empty() {
+            return Ok(probed.map(|key| vec![key]));
         }
         let source = match mapping.sql_query_for_table(table_name) {
             Some(sql) => RelSource::Query(sql.to_string()),
@@ -578,11 +580,7 @@ impl SqlSource {
         declared.check_columns(table_name, column).map_err(|e| {
             QueryError::InvalidQuery(format!("Graph source '{}': {e}", self.graph_source_id))
         })?;
-        let Some(key) = probed else {
-            return Ok(None);
-        };
-        let reported = fluree_db_r2rml::TableKeys::new([key]).retain_usable(column);
-        Ok((!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect()))
+        Ok(probed.map(|key| vec![key]))
     }
 
     /// The composite key the duplicate-subject probe verified for

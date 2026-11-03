@@ -2849,12 +2849,18 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
 
     /// Get the compiled R2RML mapping for a graph source.
     ///
-    /// This method uses the R2RML cache to avoid repeated parsing and compilation.
+    /// This method uses the R2RML cache to avoid repeated parsing and
+    /// compilation, and resolves each source once per query session: every
+    /// schema probe and key lookup would otherwise repeat the nameservice
+    /// lookup.
     async fn compiled_mapping(
         &self,
         graph_source_id: &str,
         _as_of_t: Option<i64>,
     ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        if let Some(mapping) = self.session.mapping(graph_source_id) {
+            return Ok(mapping);
+        }
         // Look up the graph source record
         let record = self
             .fluree
@@ -2899,6 +2905,8 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
                 cache_key = %cache_key,
                 "R2RML mapping cache hit"
             );
+            self.session
+                .memo_mapping(graph_source_id, Arc::clone(&cached));
             return Ok(cached);
         }
 
@@ -2979,6 +2987,8 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             "Loaded, compiled, and cached R2RML mapping"
         );
 
+        self.session
+            .memo_mapping(graph_source_id, Arc::clone(&compiled));
         Ok(compiled)
     }
 
