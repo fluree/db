@@ -1164,30 +1164,43 @@ See [SPARQL: Remote Fluree Federation](../query/sparql.md#remote-fluree-federati
 
 ## Memory Allocator (mimalloc)
 
-`fluree-db-server` and `fluree-db-cli` expose an opt-in `mimalloc` Cargo feature
-that swaps the global allocator to [mimalloc](https://github.com/microsoft/mimalloc).
-It is **off by default** — enable it in your release build:
+The `fluree` binary (`fluree-db-cli`), `fluree-db-server` and the Python package
+use [mimalloc](https://github.com/microsoft/mimalloc) as their global allocator.
+It is the `mimalloc` Cargo feature, on by default.
+
+**Why it is the default:**
+
+- Under sustained writes with frequent index builds, the system allocator
+  (glibc) keeps most of the memory the process frees, so resident memory climbs
+  until the host runs out. On a 64 GB host serving a 236M-flake ledger, RSS
+  reached 42–63 GB with glibc, of which a `malloc_trim` could return about 30 GB;
+  with mimalloc it stayed between 16 and 32 GB.
+- Allocation-heavy, multicore query paths run faster, most notably
+  R2RML/Iceberg graph-source scans, which materialize many RDF terms in
+  parallel: TPC-H Q1 over a 6M-row Iceberg table took ~62s with the system
+  allocator and ~31s with mimalloc.
+
+**Building without it:** turn off default features and list the ones you
+want, for example
 
 ```bash
-cargo build --release -p fluree-db-cli --features mimalloc
+cargo build --release -p fluree-db-cli --no-default-features \
+  --features server,iceberg,sql,delta,shacl,aws,graphql
 ```
 
-**When it helps:** allocation-heavy, multicore query paths — most notably
-R2RML/Iceberg graph-source scans, which materialize many RDF terms in parallel.
-On those workloads the system allocator's lock contention caps the parallel
-speedup; mimalloc roughly doubles the realized gain (e.g. TPC-H Q1 over a 6M-row
-Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
+**Embedding Fluree in your own binary:** a library cannot choose the
+allocator for the program that links it, so an application built on
+`fluree-db-api` (or `fluree-db-server` as a library) uses whatever allocator
+it declares. To get the same behavior, declare mimalloc in the application's
+binary:
 
-**Tradeoffs (operational, not semantic):**
+```rust
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
 
-- Changes the allocator for *every* allocation in the process (HTTP, query,
-  import, caches, AWS/Iceberg clients, tracing buffers).
-- Usually better multicore throughput and lower fragmentation, but may retain
-  more RSS due to per-thread heaps — relevant for large scans that already peak
-  high. Track RSS, p95 query latency, and concurrent-query behavior during a
-  soak before making it the default.
-- New native dependency in the binary; verify it builds for your target
-  (e.g. musl/cross builds) and keep a system-allocator fallback build.
+The Python package's extension module declares it for its own allocations
+only; Python's objects stay with Python's allocator.
 
 Pair it with bounded query parallelism so a single large scan cannot monopolize
 cores and allocator pressure under concurrent load.
