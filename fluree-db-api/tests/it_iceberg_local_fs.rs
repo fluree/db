@@ -4041,3 +4041,60 @@ async fn a_declared_key_the_table_cannot_hold_is_refused() {
         "{msg}"
     );
 }
+
+/// A graph source's answer streams out of the GRAPH scope that reads it, one
+/// batch at a time, rather than being held whole and handed on as one batch:
+/// the 3,000 rows of `people_window` arrive in batches no larger than the
+/// batch size, through a FROM, on SPARQL and JSON-LD.
+#[tokio::test]
+async fn a_graph_sources_answer_streams_in_batches() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("streamed-people", &location, WINDOW_PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let sizes = |result: &fluree_db_api::QueryResult| -> Vec<usize> {
+        result
+            .batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .collect()
+    };
+    let check = |label: &str, sizes: Vec<usize>| {
+        assert_eq!(sizes.iter().sum::<usize>(), 3000, "{label}: {sizes:?}");
+        assert!(
+            sizes.len() > 1 && sizes.iter().all(|&n| n <= 1000),
+            "{label}: the answer came in batches of {sizes:?}"
+        );
+    };
+
+    let sparql = "PREFIX ex: <http://example.org/> SELECT ?s ?n \
+                  FROM <streamed-people:main> WHERE { ?s ex:name ?n }";
+    let result = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute()
+        .await
+        .expect("FROM");
+    check("SPARQL FROM", sizes(&result));
+    let jsonld = serde_json::json!({
+        "from": "streamed-people:main",
+        "select": ["?s", "?n"],
+        "where": {"@id": "?s", "http://example.org/name": "?n"},
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute()
+        .await
+        .expect("JSON-LD FROM");
+    check("JSON-LD FROM", sizes(&result));
+}
