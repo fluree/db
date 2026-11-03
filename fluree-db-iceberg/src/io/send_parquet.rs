@@ -37,7 +37,7 @@ use crate::io::parquet::{
 use crate::io::scope::StorageScope;
 use crate::io::SendIcebergStorage;
 use crate::metadata::Schema;
-use crate::scan::predicate::Expression;
+use crate::scan::predicate::{ExactRowFilter, Expression};
 use crate::scan::pruning::row_group_can_contain;
 use crate::scan::FileScanTask;
 
@@ -631,6 +631,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     file_bytes,
                     &task.projected_field_ids,
                     task.residual_filter.as_deref(),
+                    task.exact_filter.as_ref(),
                     task.iceberg_schema.as_deref(),
                     None,
                     None,
@@ -680,6 +681,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             file_bytes,
             &task.projected_field_ids,
             task.residual_filter.as_deref(),
+            task.exact_filter.as_ref(),
             task.iceberg_schema.as_deref(),
             None,
             None,
@@ -700,6 +702,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         let file_size = task.data_file.file_size_in_bytes as u64;
         let projected_field_ids = task.projected_field_ids.clone();
         let residual_filter = task.residual_filter.clone();
+        let exact_filter = task.exact_filter.clone();
         let iceberg_schema = task.iceberg_schema.clone();
         let runtime = Handle::current();
 
@@ -718,6 +721,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     file_size,
                     projected_field_ids,
                     residual_filter,
+                    exact_filter,
                     iceberg_schema,
                     runtime,
                     None,
@@ -758,6 +762,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         file_size,
                         projected_field_ids,
                         residual_filter,
+                        exact_filter,
                         iceberg_schema,
                         runtime,
                         None,
@@ -776,6 +781,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             file_size,
             projected_field_ids,
             residual_filter,
+            exact_filter,
             iceberg_schema,
             runtime,
             None,
@@ -802,6 +808,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         file_size: u64,
         projected_field_ids: Vec<i32>,
         residual_filter: Option<Arc<Expression>>,
+        exact_filter: Option<ExactRowFilter>,
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
         max_rows: Option<usize>,
@@ -837,6 +844,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     let path = path.clone();
                     let projected = projected_field_ids.clone();
                     let residual = residual_filter.clone();
+                    let exact = exact_filter.clone();
                     let schema = iceberg_schema.clone();
                     let runtime = runtime.clone();
                     handles.push(tokio::task::spawn_blocking(move || {
@@ -845,6 +853,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                             cr,
                             &projected,
                             residual.as_deref(),
+                            exact.as_ref(),
                             schema.as_deref(),
                             None,
                             Some(&chunk),
@@ -870,6 +879,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 chunk_reader,
                 &projected_field_ids,
                 residual_filter.as_deref(),
+                exact_filter.as_ref(),
                 iceberg_schema.as_deref(),
                 max_rows,
                 None,
@@ -910,6 +920,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             file_size,
             task.projected_field_ids.clone(),
             task.residual_filter.clone(),
+            task.exact_filter.clone(),
             task.iceberg_schema.clone(),
             Handle::current(),
             Some(max_rows),
@@ -1726,11 +1737,13 @@ mod tests {
         };
         let bytes = multitype_parquet(); // row group 0 = ids [1, 2], row group 1 = id [3]
 
-        let full = decode_batches_arrow(bytes.clone(), &[], None, None, None, None).unwrap();
+        let full = decode_batches_arrow(bytes.clone(), &[], None, None, None, None, None).unwrap();
         assert_eq!(id_of(&full), vec![Some(1), Some(2), Some(3)]);
 
-        let rg0 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[0])).unwrap();
-        let rg1 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[1])).unwrap();
+        let rg0 =
+            decode_batches_arrow(bytes.clone(), &[], None, None, None, None, Some(&[0])).unwrap();
+        let rg1 =
+            decode_batches_arrow(bytes.clone(), &[], None, None, None, None, Some(&[1])).unwrap();
         let mut combined = id_of(&rg0);
         combined.extend(id_of(&rg1));
         assert_eq!(
@@ -1739,7 +1752,8 @@ mod tests {
             "subset [0] ++ subset [1] must equal the full sequential decode"
         );
 
-        let empty = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[])).unwrap();
+        let empty =
+            decode_batches_arrow(bytes.clone(), &[], None, None, None, None, Some(&[])).unwrap();
         assert_eq!(empty.iter().map(|b| b.num_rows).sum::<usize>(), 0);
     }
 
@@ -2032,6 +2046,341 @@ mod tests {
         });
         // year 2020 dropped, year 2024 kept, year null dropped.
         assert_eq!(ids, vec![Some(2)], "decimal-backed integer filter mismatch");
+    }
+
+    fn multitype_schema() -> Arc<Schema> {
+        schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ])
+    }
+
+    fn exact(predicates: Vec<crate::scan::ExactPredicate>) -> Option<crate::scan::ExactRowFilter> {
+        crate::scan::ExactRowFilter::new(predicates)
+    }
+
+    fn cmp_pred(
+        field_id: i32,
+        column: &str,
+        op: crate::scan::predicate::ComparisonOp,
+        value: crate::scan::predicate::LiteralValue,
+    ) -> crate::scan::ExactPredicate {
+        crate::scan::ExactPredicate::Compare {
+            field_id,
+            column: column.to_string(),
+            op,
+            value,
+        }
+    }
+
+    async fn exact_ids(
+        bytes: &Bytes,
+        schema: Arc<Schema>,
+        filter: Option<crate::scan::ExactRowFilter>,
+    ) -> Result<Vec<Option<i64>>> {
+        use crate::io::batch::Column;
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let task = whole_file_task(bytes, None, Some(schema)).with_exact_filter(filter);
+        let batches = SendParquetReader::new(&source).read_task(&task).await?;
+        Ok(flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        }))
+    }
+
+    /// An exact filter keeps exactly the rows satisfying every conjunct, with
+    /// SQL null semantics: a comparison with a null cell drops the row, `IS
+    /// NULL` keeps it. Rows: (1, alice, 10, true), (2, null, 20, false),
+    /// (3, carol, null, true).
+    #[tokio::test]
+    async fn exact_filter_keeps_exactly_the_satisfying_rows() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        use crate::scan::ExactPredicate;
+        let bytes = multitype_parquet();
+        let schema = multitype_schema();
+        let cases: Vec<(Vec<ExactPredicate>, Vec<Option<i64>>)> = vec![
+            (
+                vec![
+                    cmp_pred(3, "active", Op::Eq, Lit::Boolean(true)),
+                    ExactPredicate::IsNotNull {
+                        field_id: 1,
+                        column: "name".into(),
+                    },
+                ],
+                vec![Some(1), Some(3)],
+            ),
+            (
+                vec![ExactPredicate::IsNull {
+                    field_id: 2,
+                    column: "age".into(),
+                }],
+                vec![Some(3)],
+            ),
+            // The null age is unknown under `<>`, so row 3 is dropped too.
+            (
+                vec![cmp_pred(2, "age", Op::NotEq, Lit::Int32(10))],
+                vec![Some(2)],
+            ),
+            (
+                vec![cmp_pred(1, "name", Op::Gt, Lit::String("alice".into()))],
+                vec![Some(3)],
+            ),
+            (
+                vec![
+                    cmp_pred(0, "id", Op::GtEq, Lit::Int64(2)),
+                    cmp_pred(3, "active", Op::Eq, Lit::Boolean(false)),
+                ],
+                vec![Some(2)],
+            ),
+        ];
+        for (predicates, expected) in cases {
+            let shown: Vec<String> = predicates.iter().map(ToString::to_string).collect();
+            let ids = exact_ids(&bytes, Arc::clone(&schema), exact(predicates))
+                .await
+                .expect("decode");
+            assert_eq!(ids, expected, "{shown:?}");
+        }
+    }
+
+    /// A filter column absent from the data file (added to the schema after the
+    /// file was written) reads as null in every row.
+    #[tokio::test]
+    async fn exact_filter_reads_an_absent_column_as_null() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        use crate::scan::ExactPredicate;
+        let bytes = multitype_parquet();
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+            ("valid_to", "int"),
+        ]);
+        let all = exact_ids(
+            &bytes,
+            Arc::clone(&schema),
+            exact(vec![ExactPredicate::IsNull {
+                field_id: 5,
+                column: "valid_to".into(),
+            }]),
+        )
+        .await
+        .expect("decode");
+        assert_eq!(all, vec![Some(1), Some(2), Some(3)]);
+        for predicate in [
+            ExactPredicate::IsNotNull {
+                field_id: 5,
+                column: "valid_to".into(),
+            },
+            cmp_pred(5, "valid_to", Op::NotEq, Lit::Int32(0)),
+        ] {
+            let none = exact_ids(&bytes, Arc::clone(&schema), exact(vec![predicate]))
+                .await
+                .expect("decode");
+            assert!(none.is_empty(), "{none:?}");
+        }
+    }
+
+    /// A literal that does not compare exactly with the column fails the read
+    /// rather than keeping rows the filter may exclude (the advisory filter
+    /// keeps them all and lets the engine decide; nothing decides after this).
+    #[tokio::test]
+    async fn exact_filter_refuses_a_comparison_it_cannot_decide() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = multitype_parquet();
+        let err = exact_ids(
+            &bytes,
+            multitype_schema(),
+            exact(vec![cmp_pred(1, "name", Op::Eq, Lit::Boolean(true))]),
+        )
+        .await
+        .expect_err("a boolean literal cannot compare with a string column");
+        assert!(
+            err.to_string().contains("cannot be evaluated exactly"),
+            "{err}"
+        );
+    }
+
+    /// The caller must project every column the filter reads.
+    #[tokio::test]
+    async fn exact_filter_refuses_an_unprojected_column() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let mut task =
+            whole_file_task(&bytes, None, Some(multitype_schema())).with_exact_filter(exact(vec![
+                cmp_pred(3, "active", Op::Eq, Lit::Boolean(true)),
+            ]));
+        task.projected_field_ids = vec![0];
+        let err = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect_err("the filter column is not projected");
+        assert!(err.to_string().contains("did not project"), "{err}");
+    }
+
+    /// `<>` with a decimal literal off the column's grid holds for every
+    /// non-null cell, and is unknown (dropped) for a null one. Rows of the
+    /// decimal(9,0) column: 2020, 2024, null.
+    #[tokio::test]
+    async fn exact_filter_off_grid_inequality_drops_nulls() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = decimal_backed_int_parquet();
+        let schema = schema_of(&[("id", "long"), ("year", "decimal(9, 0)")]);
+        let ids = exact_ids(
+            &bytes,
+            schema,
+            exact(vec![cmp_pred(
+                1,
+                "year",
+                Op::NotEq,
+                Lit::Decimal {
+                    unscaled: 20205,
+                    scale: 1,
+                },
+            )]),
+        )
+        .await
+        .expect("decode");
+        assert_eq!(ids, vec![Some(1), Some(2)]);
+    }
+
+    /// Rows (id, score double, ratio float): (1, -0.0, 0.5), (2, 0.0, NaN),
+    /// (3, NaN, 2.0), (4, 5.0, null), (5, null, -0.0), (6, 7.5, 3.0).
+    fn float_parquet() -> Bytes {
+        use parquet::data_type::{DoubleType, FloatType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let message = "
+            message schema {
+              OPTIONAL INT64 id;
+              OPTIONAL DOUBLE score;
+              OPTIONAL FLOAT ratio;
+            }";
+        let schema = Arc::new(parse_message_type(message).unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            let mut rg = writer.next_row_group().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<Int64Type>()
+                .write_batch(&[1, 2, 3, 4, 5, 6], Some(&[1, 1, 1, 1, 1, 1]), None)
+                .unwrap();
+            c.close().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<DoubleType>()
+                .write_batch(
+                    &[-0.0, 0.0, f64::NAN, 5.0, 7.5],
+                    Some(&[1, 1, 1, 1, 0, 1]),
+                    None,
+                )
+                .unwrap();
+            c.close().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<FloatType>()
+                .write_batch(
+                    &[0.5, f32::NAN, 2.0, -0.0, 3.0],
+                    Some(&[1, 1, 1, 0, 1, 1]),
+                    None,
+                )
+                .unwrap();
+            c.close().unwrap();
+            rg.close().unwrap();
+            writer.close().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// Floating-point columns compare as IEEE numbers, as the engine compares
+    /// `xsd:double`: a NaN cell satisfies only `<>`, -0.0 equals 0.0, and a
+    /// `float` cell compares with an integer literal exactly (widened to
+    /// `f64`). arrow-ord's totalOrder kernels would keep NaN under `>` and
+    /// split the zeros.
+    #[tokio::test]
+    async fn exact_filter_compares_floats_as_ieee_numbers() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = float_parquet();
+        let schema = schema_of(&[("id", "long"), ("score", "double"), ("ratio", "float")]);
+        let cases: Vec<(crate::scan::ExactPredicate, Vec<Option<i64>>)> = vec![
+            (
+                cmp_pred(1, "score", Op::Eq, Lit::Float64(0.0)),
+                vec![Some(1), Some(2)],
+            ),
+            (
+                cmp_pred(1, "score", Op::NotEq, Lit::Float64(5.0)),
+                vec![Some(1), Some(2), Some(3), Some(6)],
+            ),
+            (
+                cmp_pred(1, "score", Op::Gt, Lit::Float64(0.0)),
+                vec![Some(4), Some(6)],
+            ),
+            (
+                cmp_pred(1, "score", Op::GtEq, Lit::Float64(0.0)),
+                vec![Some(1), Some(2), Some(4), Some(6)],
+            ),
+            (
+                cmp_pred(1, "score", Op::Lt, Lit::Int64(6)),
+                vec![Some(1), Some(2), Some(4)],
+            ),
+            (
+                cmp_pred(2, "ratio", Op::Gt, Lit::Float64(1.0)),
+                vec![Some(3), Some(6)],
+            ),
+            (cmp_pred(2, "ratio", Op::Eq, Lit::Int32(0)), vec![Some(5)]),
+        ];
+        for (predicate, expected) in cases {
+            let shown = predicate.to_string();
+            let ids = exact_ids(&bytes, Arc::clone(&schema), exact(vec![predicate]))
+                .await
+                .expect("decode");
+            assert_eq!(ids, expected, "{shown}");
+        }
+    }
+
+    /// A `long` column widened from `int` still decodes older files as
+    /// `Int32`; a literal beyond `i32` is decided by the range, not refused.
+    /// Ages: 10, 20, null.
+    #[tokio::test]
+    async fn exact_filter_decides_a_literal_beyond_a_promoted_columns_range() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = multitype_parquet();
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "long"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ]);
+        let big = 3_000_000_000_i64;
+        let cases = [
+            (Op::Lt, big, vec![Some(1), Some(2)]),
+            (Op::NotEq, big, vec![Some(1), Some(2)]),
+            (Op::Gt, big, vec![]),
+            (Op::Eq, big, vec![]),
+            (Op::Gt, -big, vec![Some(1), Some(2)]),
+            (Op::LtEq, -big, vec![]),
+        ];
+        for (op, n, expected) in cases {
+            let ids = exact_ids(
+                &bytes,
+                Arc::clone(&schema),
+                exact(vec![cmp_pred(2, "age", op, Lit::Int64(n))]),
+            )
+            .await
+            .expect("decode");
+            assert_eq!(ids, expected, "age {op} {n}");
+        }
     }
 
     /// Bounded first-row-group "peek": `read_task_sample` returns at most `n`

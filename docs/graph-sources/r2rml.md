@@ -230,6 +230,8 @@ before you save the mapping (see
 
 ### Complex Queries
 
+A [SQL source](sql.md#rrsqlquery) hands an `rr:sqlQuery` logical table to its engine, so a joined or aggregated view like the one below works there. An Iceberg source has no engine; it accepts only a row filter over one table (`SELECT * FROM t WHERE <column> <op> <literal> [AND ...]`), evaluated exactly. See [Iceberg → Row filters](iceberg.md#row-filters-rrsqlquery).
+
 Use SQL views for complex mappings:
 
 ```turtle

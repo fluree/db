@@ -374,7 +374,7 @@ impl crate::Fluree {
                 &graph_source_id,
                 &config.mapping,
                 config.mapping_media_type.as_deref(),
-                true,
+                super::r2rml::SqlQueryPolicy::Execute,
             )
             .await?;
         let (triples_map_count, table_names, mapping_validated) = registered.summary();
