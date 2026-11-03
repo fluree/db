@@ -174,6 +174,8 @@ curl "http://localhost:8090/v1/fluree/info/mydb:main"
 }
 ```
 
+For a graph source (a virtual dataset), a class or property `count` is exact or `null`; a `null` count may carry `count-upper-bound`, the most it can be, and a `null` entry of `ref-classes` may have its bound under `ref-classes-upper-bound`. See [Iceberg → `info`](../graph-sources/iceberg.md) for when a count is exact.
+
 #### Stats freshness (real-time vs indexed)
 
 - **Real-time (includes novelty)**:

@@ -1677,7 +1677,7 @@ struct SelectedSnapshot<'m> {
 /// under); a historical snapshot's list is just as immutable and gets its own.
 /// The flat type a mapping reads an Iceberg field as: `None` for a nested
 /// field, or one of a type the reader does not decode.
-fn iceberg_flat_type(
+pub(crate) fn iceberg_flat_type(
     field: &fluree_db_iceberg::metadata::SchemaField,
 ) -> Option<fluree_db_iceberg::FieldType> {
     use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
@@ -2248,6 +2248,20 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
         Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
+    }
+
+    /// The current metadata of `table_name` (a table, never an `rr:sqlQuery`
+    /// alias), resolved as a scan resolves it. `/info` reads a Direct
+    /// source's tables through here: it has no catalog to ask.
+    pub(crate) async fn table_metadata(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<Arc<TableMetadata>> {
+        Ok(self
+            .load_table_context(graph_source_id, table_name)
+            .await?
+            .metadata)
     }
 
     /// The table's current snapshot id and top-level column names, both

@@ -186,7 +186,22 @@ table: a list of the columns no two rows agree on.
   queries return the repeated solutions it promised were not there.
 - It describes the logical table's rows, so it applies to every triples map
   that reads the same `rr:tableName`. On an `rr:sqlQuery` it describes the
-  query's rows only.
+  query's rows only, so a key that holds only for the rows a filter keeps
+  (`customer_id` among `WHERE is_current = 1` rows of a history table) is
+  declared there:
+
+  ```turtle
+  rr:logicalTable [
+    rr:sqlQuery "SELECT * FROM sales.customers_history WHERE is_current = 1" ;
+    f:key ( "customer_id" )
+  ] ;
+  ```
+
+  A key on an Iceberg `rr:sqlQuery` can name only columns its select list
+  selects (any column, for `SELECT *`); one that names another column is
+  refused when the source is mapped. The table's identifier fields hold for
+  any subset of its rows, so they also count as a key of a query over the
+  table, when the query selects their columns.
 
 A key makes a map's subjects unique only when the subject is built from it:
 

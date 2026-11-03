@@ -1207,3 +1207,110 @@ fn normalize_docs(result: &Value) -> Vec<BTreeMap<String, Vec<String>>> {
         })
         .collect()
 }
+
+/// `/info` over the local fixtures: a count is exact where the table's
+/// metadata proves it and `null` otherwise, with `count-upper-bound` where a
+/// bound is provable. A Direct source reads each table's metadata file for
+/// its row count (snapshot summary) and schema.
+#[tokio::test]
+async fn info_counts_are_exact_or_null_with_a_provable_bound() {
+    let _serial = SERIAL.lock().await;
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/sets",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mapping = format!(
+        r#"{PREFIXES}
+        <http://example.org/mapping#Current> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_current" ] ;
+            rr:subjectMap [ rr:template "http://example.org/customer/{{customer_id}}" ;
+                            rr:class ex:CurrentCustomer ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+        <http://example.org/mapping#History> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_history" ] ;
+            rr:subjectMap [ rr:template "http://example.org/history/{{customer_id}}" ;
+                            rr:class ex:HistoryCustomer ] .
+        <http://example.org/mapping#Active> a rr:TriplesMap ;
+            rr:logicalTable [ rr:sqlQuery "SELECT * FROM sets.customers_history WHERE is_current = 1" ;
+                              f:key ( "customer_id" ) ] ;
+            rr:subjectMap [ rr:template "http://example.org/active/{{customer_id}}" ;
+                            rr:class ex:Active ] .
+        <http://example.org/mapping#Order> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.orders" ] ;
+            rr:subjectMap [ rr:template "http://example.org/order/{{order_id}}" ; rr:class ex:Order ] ;
+            rr:predicateObjectMap [ rr:predicate ex:customer ; rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Current> ;
+                rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] .
+        <http://example.org/mapping#Parent> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.parents_dup" ] ;
+            rr:subjectMap [ rr:template "http://example.org/parent/{{id}}" ; rr:class ex:Parent ] ;
+            rr:predicateObjectMap [ rr:predicate ex:sameCode ; rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Parent> ;
+                rr:joinCondition [ rr:child "code" ; rr:parent "code" ] ] ] .
+        "#
+    );
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("sets-info", &root, mapping)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let info = fluree
+        .ledger_info("sets-info:main")
+        .execute()
+        .await
+        .expect("graph source info");
+    let counts = |entry: &Value| {
+        (
+            entry["count"].as_i64(),
+            entry.get("count-upper-bound").and_then(Value::as_i64),
+        )
+    };
+    let class = |name: &str| counts(&info["stats"]["classes"][ex(name)]);
+    let property = |name: &str| counts(&info["stats"]["properties"][ex(name)]);
+
+    assert_eq!(
+        info["source"]["table-row-counts"],
+        json!({
+            "sets.customers_current": 6,
+            "sets.customers_history": 11,
+            "sets.orders": 8,
+            "sets.parents_dup": 8,
+        }),
+        "{info}"
+    );
+    // Keyed by its identifier field, the key column required: exact.
+    assert_eq!(class("CurrentCustomer"), (Some(6), None), "{info}");
+    // Its `name` column is nullable: a row may mint no name.
+    assert_eq!(property("name"), (None, Some(6)), "{info}");
+    // No key: a customer has several versions.
+    assert_eq!(class("HistoryCustomer"), (None, Some(11)), "{info}");
+    // A key holds for the filtered rows, but no metadata counts them.
+    assert_eq!(class("Active"), (None, Some(11)), "{info}");
+    // Keyless and nullable: bounded by the rows.
+    assert_eq!(class("Order"), (None, Some(8)), "{info}");
+    // A customer id matches at most one current customer: one reference per
+    // order row at most.
+    assert_eq!(property("customer"), (None, Some(8)), "{info}");
+    let customer_ref = &info["stats"]["classes"][ex("Order")]["properties"][ex("customer")];
+    assert_eq!(
+        customer_ref["ref-classes"][ex("CurrentCustomer")],
+        Value::Null,
+        "{customer_ref}"
+    );
+    assert_eq!(
+        customer_ref["ref-classes-upper-bound"][ex("CurrentCustomer")],
+        8,
+        "{customer_ref}"
+    );
+    // A code matches several parents (fan-out): no bound.
+    assert_eq!(property("sameCode"), (None, None), "{info}");
+    let same_code = &info["stats"]["classes"][ex("Parent")]["properties"][ex("sameCode")];
+    assert!(
+        same_code.get("ref-classes-upper-bound").is_none(),
+        "{same_code}"
+    );
+}
