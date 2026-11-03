@@ -73,6 +73,9 @@ fluree-db-docs = { path = "../fluree-db-docs" }
 # Document ingestion (`fluree doc`): parse, chunk, embed
 fluree-db-doc = { path = "../fluree-db-doc" }
 
+# Ontology and catalog tools for document extraction (`fluree ontology`)
+fluree-db-ontology = { path = "../fluree-db-ontology" }
+
 # Unified MCP service (stdio) — selectable memory/docs toolsets
 fluree-db-mcp = { path = "../fluree-db-mcp" }
 

@@ -756,6 +756,25 @@ mod tests {
         assert_ne!(anon[0], anon[1], "`[]` in two blocks is two nodes");
     }
 
+    /// An upsert scopes a document's blank nodes by its content, so an
+    /// anonymous node's stored id ends in the label minted here. Re-upserting a
+    /// payload resolves to the nodes it made before only while this spelling
+    /// holds, so it is pinned exactly.
+    #[test]
+    fn anonymous_nodes_mint_the_labels_an_upsert_resolves_by() {
+        let (parsed, ns) = parse_ok(
+            &format!("{EX}[] ex:p 1 .\n[] ex:p 2 .\n"),
+            Placement::AsWritten,
+        );
+        let subjects: Vec<String> = parsed
+            .parts
+            .templates
+            .iter()
+            .map(|t| term(&ns, &t.subject))
+            .collect();
+        assert_eq!(subjects, ["_:-b1", "_:-b2"]);
+    }
+
     /// A stable Fluree blank-node id (`_:fdb-…`) in a block addresses the
     /// stored node; any other label stays a blank node, minted at staging.
     #[test]

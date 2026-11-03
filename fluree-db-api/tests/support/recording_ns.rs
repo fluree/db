@@ -110,8 +110,8 @@ impl NameServiceLookup for RecordingLookups {
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
         self.inner.all_records().await
     }
-    async fn list_branches(&self, name: &str) -> Result<Vec<NsRecord>> {
-        self.inner.list_branches(name).await
+    async fn branch_records(&self, name: &str) -> Result<Vec<NsRecord>> {
+        self.inner.branch_records(name).await
     }
     async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
         self.record(Asked::Record, id);

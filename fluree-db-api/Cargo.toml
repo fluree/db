@@ -162,6 +162,8 @@ fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 wiremock = { workspace = true }
+# it_iceberg_local_fs writes a modified manifest list into a staged table copy.
+apache-avro = { workspace = true }
 # Residency-mode read arms for the wasm read-path recovery tests
 # (it_residency_retry): dev-only feature unification — production native
 # builds keep the feature off and compile the pre-residency read path.
@@ -221,6 +223,21 @@ name = "it_iceberg_policy"
 path = "tests/it_iceberg_policy.rs"
 required-features = ["iceberg", "native"]
 
+# Standalone: re-executes itself so the child reads the host-identity policy
+# from an environment of the test's choosing (the policy is read once per
+# process).
+[[test]]
+name = "it_host_identity_env_default"
+path = "tests/it_host_identity_env_default.rs"
+required-features = ["iceberg"]
+
+# Standalone: points the operator-only Google/GCS overrides at mocks, which
+# are read once per process.
+[[test]]
+name = "it_google_storage_billing"
+path = "tests/it_google_storage_billing.rs"
+required-features = ["iceberg"]
+
 # Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
 # every Direct entry point, against the committed fixture's parent directory.
 [[test]]
@@ -253,6 +270,15 @@ required-features = ["sql", "native"]
 [[test]]
 name = "it_sql_pushdown_lane"
 path = "tests/it_sql_pushdown_lane.rs"
+required-features = ["sql", "native"]
+
+# Un-annotated R2RML columns: every lane (fused aggregate, scan pushdowns, SQL
+# block and aggregate lanes) against the generic pipeline, over the local
+# Iceberg `cells` fixture and a fake Trino endpoint. Own binary: it flips the
+# process-wide fast-path switch and asserts the absence of routing stamps.
+[[test]]
+name = "it_r2rml_untyped_columns"
+path = "tests/it_r2rml_untyped_columns.rs"
 required-features = ["sql", "native"]
 
 [[test]]

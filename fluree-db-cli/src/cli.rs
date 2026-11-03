@@ -1407,6 +1407,18 @@ pub enum Commands {
         action: ModelAction,
     },
 
+    /// Ontology tools for document extraction: what an HTTP reader reads, conversion, slicing
+    Ontology {
+        #[command(subcommand)]
+        action: OntologyAction,
+    },
+
+    /// Catalog tools for document extraction: records an extraction model links names to
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
+
     /// Developer memory — store and recall facts, decisions, constraints
     Memory {
         #[command(subcommand)]
@@ -2633,6 +2645,213 @@ pub enum DocsAction {
     },
 }
 
+/// `fluree ontology` subcommands.
+#[derive(Subcommand)]
+pub enum OntologyAction {
+    /// Write an ontology in the shape an extraction model reads well
+    ///
+    /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), or
+    /// SQL DDL (.sql). Tables become classes and columns properties, labelled
+    /// in words (`employer_id` reads "employer"); foreign keys become
+    /// relations; enumerated columns become a class with a catalog record per
+    /// value; primary keys are left out.
+    ///
+    /// From RDF (Turtle or JSON-LD): the ontology with what the model reads
+    /// made explicit: SKOS labels and definitions moved into rdfs:label and
+    /// rdfs:comment, identifier-style labels in words, OWL restrictions and
+    /// other blank-node constructs dropped, and OWL axioms and annotation
+    /// property declarations (which a reader would read as catalog records)
+    /// dropped. With --seed, a large vocabulary is
+    /// sliced to the classes the seeds reach first.
+    ///
+    /// Examples:
+    ///   fluree ontology from schema.sql > ontology.ttl
+    ///   fluree ontology from accounts.csv --base https://example.com/crm/ > ontology.ttl
+    ///   fluree ontology from schemaorg.jsonld --seed schema:Person,schema:Organization > ontology.ttl
+    #[command(verbatim_doc_comment)]
+    From(OntologyFromArgs),
+
+    /// Report what an HTTP reader will and won't read of an ontology
+    ///
+    /// Applies the ontology input policy of an HTTP reader (an extraction
+    /// model reached over HTTP, `fluree doc ingest`'s [doc.reader]) locally,
+    /// and reports what a request carrying this ontology (and catalog) would
+    /// fail for, what the reader reads another way, what it never sees, and
+    /// advice. Nothing is sent anywhere. Exits 1 when a request would be
+    /// refused. The language-model extractor of `fluree doc ingest` reads more
+    /// of an ontology (domains, ranges, every parent class).
+    ///
+    /// Examples:
+    ///   fluree ontology check ontology.ttl
+    ///   fluree ontology check ontology.ttl --catalog accounts.ttl
+    ///   fluree ontology check schemaorg.jsonld --seed schema:Person --json
+    #[command(verbatim_doc_comment)]
+    Check(OntologyCheckArgs),
+}
+
+/// RDF syntaxes `fluree ontology` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OntologyInputFormat {
+    Turtle,
+    Jsonld,
+}
+
+/// RDF syntaxes `fluree ontology` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum OntologyOutputFormat {
+    #[default]
+    Turtle,
+    Jsonld,
+}
+
+#[derive(Args, Debug)]
+pub struct OntologyFromArgs {
+    /// The ontology to convert (`-` reads stdin)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Keep only what these classes reach: IRIs, prefixed names or labels,
+    /// comma-separated or repeated
+    #[arg(long, value_delimiter = ',', value_name = "CLASSES")]
+    pub seed: Vec<String>,
+
+    /// Steps --seed follows from the seed classes (properties of a class, then
+    /// the classes in their ranges)
+    #[arg(long, default_value_t = 1, value_name = "N", requires = "seed")]
+    pub depth: usize,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t)]
+    pub format: OntologyOutputFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Write enumerated columns' records here instead of with the ontology
+    #[arg(long, value_name = "FILE")]
+    pub catalog_out: Option<PathBuf>,
+
+    /// Namespace for the IRIs minted from tables (default:
+    /// https://example.com/<file name>/)
+    #[arg(long, value_name = "IRI")]
+    pub base: Option<String>,
+
+    /// A text column with at most this many distinct values, each repeated,
+    /// becomes a class with a record per value (0: never; CSV and workbooks)
+    #[arg(long, default_value_t = 12, value_name = "N")]
+    pub enum_max: usize,
+
+    /// The input's format, when its extension doesn't say
+    #[arg(long, value_enum)]
+    pub input_format: Option<OntologyInputFormat>,
+}
+
+/// `fluree catalog` subcommands.
+#[derive(Subcommand)]
+pub enum CatalogAction {
+    /// Write a catalog of SKOS records from a CSV file or a workbook sheet
+    ///
+    /// Each row becomes a record of --class: skos:prefLabel from --label,
+    /// skos:altLabel from --alt columns (several in a cell split on ; or |;
+    /// email addresses go to skos:hiddenLabel), skos:hiddenLabel from --code
+    /// columns, and skos:definition from --definition or written from
+    /// --describe columns. Reports the catalog's size against what one
+    /// extraction window holds, since the whole catalog goes in every window.
+    ///
+    /// Examples:
+    ///   fluree catalog from accounts.csv --class Organization --label name --alt aliases > accounts.ttl
+    ///   fluree catalog from crm.xlsx --sheet Accounts --class organization --ontology ontology.ttl --label Name --code "Account No" > accounts.ttl
+    #[command(verbatim_doc_comment)]
+    From(CatalogFromArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CatalogFromArgs {
+    /// The rows: a CSV file (.csv, .tsv) or a workbook (.xlsx)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// The class every record is typed with: an IRI, or a name (resolved
+    /// against --ontology when given, else minted under --base)
+    #[arg(long, value_name = "CLASS")]
+    pub class: String,
+
+    /// The column holding each record's name
+    #[arg(long, value_name = "COLUMN")]
+    pub label: String,
+
+    /// Columns holding other names for it (repeatable)
+    #[arg(long, value_name = "COLUMN")]
+    pub alt: Vec<String>,
+
+    /// Columns holding codes a document may use for it, such as account
+    /// numbers or tickers (repeatable)
+    #[arg(long, value_name = "COLUMN")]
+    pub code: Vec<String>,
+
+    /// The column holding a short description
+    #[arg(long, value_name = "COLUMN", conflicts_with = "describe")]
+    pub definition: Option<String>,
+
+    /// Columns to write a description from, as "column: value; ..."
+    #[arg(long, value_delimiter = ',', value_name = "COLUMNS")]
+    pub describe: Vec<String>,
+
+    /// The column holding each record's id, for its IRI (default: the label)
+    #[arg(long, value_name = "COLUMN")]
+    pub id: Option<String>,
+
+    /// Namespace for record IRIs (default: https://example.com/<file name>/)
+    #[arg(long, value_name = "IRI")]
+    pub base: Option<String>,
+
+    /// An ontology to find --class in, by IRI, prefixed name or label
+    #[arg(long, value_name = "FILE")]
+    pub ontology: Option<PathBuf>,
+
+    /// The workbook sheet to read (default: the first)
+    #[arg(long, value_name = "NAME")]
+    pub sheet: Option<String>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t)]
+    pub format: OntologyOutputFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct OntologyCheckArgs {
+    /// The ontology to check (`-` reads stdin). A saved extraction request
+    /// (JSON-LD with xt:ontology and xt:instances graphs) works too
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// A catalog of records to check with it (SKOS records)
+    #[arg(long, value_name = "FILE")]
+    pub catalog: Option<PathBuf>,
+
+    /// Check the slice these classes reach instead of the whole ontology:
+    /// IRIs, prefixed names or labels, comma-separated or repeated
+    #[arg(long, value_delimiter = ',', value_name = "CLASSES")]
+    pub seed: Vec<String>,
+
+    /// Steps --seed follows from the seed classes
+    #[arg(long, default_value_t = 1, value_name = "N", requires = "seed")]
+    pub depth: usize,
+
+    /// Emit the report as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// The input's format, when its extension doesn't say
+    #[arg(long, value_enum)]
+    pub input_format: Option<OntologyInputFormat>,
+}
+
 /// Server lifecycle subcommands.
 #[derive(Subcommand)]
 pub enum ServerAction {
@@ -3423,41 +3642,9 @@ pub struct DeltaUnityArgs {
     #[arg(long, requires = "unity_uri")]
     pub unity_schema: Option<String>,
 
-    /// Databricks token for Unity Catalog (stored with the graph source;
-    /// prefer --auth-bearer-env)
-    #[arg(long, requires = "unity_uri", conflicts_with = "auth_bearer_env")]
-    pub auth_bearer: Option<String>,
-
-    /// Environment variable holding the Databricks token, read by the process
-    /// that reads the tables. With --remote, the server must list the variable
-    /// in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
-    #[arg(long, value_name = "VAR", requires = "unity_uri")]
-    pub auth_bearer_env: Option<String>,
-
-    /// Application id of a Databricks service principal
-    #[arg(long, requires = "unity_uri")]
-    pub oauth2_client_id: Option<String>,
-
-    /// The service principal's OAuth secret (stored with the graph source;
-    /// prefer --oauth2-client-secret-env)
-    #[arg(
-        long,
-        requires = "unity_uri",
-        conflicts_with = "oauth2_client_secret_env"
-    )]
-    pub oauth2_client_secret: Option<String>,
-
-    /// Environment variable holding the OAuth secret; as --auth-bearer-env
-    #[arg(long, value_name = "VAR", requires = "unity_uri")]
-    pub oauth2_client_secret_env: Option<String>,
-
-    /// OAuth2 token URL (default: the workspace's own, <unity-uri>/oidc/v1/token)
-    #[arg(long, requires = "unity_uri")]
-    pub oauth2_token_url: Option<String>,
-
-    /// OAuth2 scope (default: all-apis)
-    #[arg(long, requires = "unity_uri")]
-    pub oauth2_scope: Option<String>,
+    // A Databricks token, or a service principal's OAuth2 client id and secret.
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 }
 
 /// S3 options for tables read with credentials that name no region.
@@ -3705,29 +3892,11 @@ pub struct SqlMapArgs {
     #[arg(long)]
     pub user: Option<String>,
 
-    /// Bearer token for endpoint authentication
-    #[arg(long)]
-    pub auth_bearer: Option<String>,
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 
-    /// OAuth2 token URL for client credentials auth
-    #[arg(long)]
-    pub oauth2_token_url: Option<String>,
-
-    /// OAuth2 client ID
-    #[arg(long)]
-    pub oauth2_client_id: Option<String>,
-
-    /// OAuth2 client secret
-    #[arg(long)]
-    pub oauth2_client_secret: Option<String>,
-
-    /// OAuth2 scope
-    #[arg(long)]
-    pub oauth2_scope: Option<String>,
-
-    /// OAuth2 audience
-    #[arg(long)]
-    pub oauth2_audience: Option<String>,
+    #[command(flatten)]
+    pub google: GoogleAuthArgs,
 
     /// Session property (repeatable): --session query_max_run_time=5m
     #[arg(long = "session", value_name = "KEY=VALUE")]
@@ -3833,49 +4002,23 @@ pub struct IcebergMapArgs {
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
 
-    /// Bearer token for REST catalog authentication. Stored with the graph
-    /// source; prefer --auth-bearer-env
-    #[arg(long, conflicts_with = "auth_bearer_env")]
-    pub auth_bearer: Option<String>,
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 
-    /// Environment variable holding the bearer token, read by the process that
-    /// reads the tables. The token is not stored. With --remote, the server
-    /// must list the variable in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
-    #[arg(long, value_name = "VAR")]
-    pub auth_bearer_env: Option<String>,
-
-    /// OAuth2 token URL for client credentials auth
-    #[arg(long)]
-    pub oauth2_token_url: Option<String>,
-
-    /// OAuth2 client ID
-    #[arg(long)]
-    pub oauth2_client_id: Option<String>,
-
-    /// OAuth2 client secret. Stored with the graph source; prefer
-    /// --oauth2-client-secret-env
-    #[arg(long, conflicts_with = "oauth2_client_secret_env")]
-    pub oauth2_client_secret: Option<String>,
-
-    /// Environment variable holding the OAuth2 client secret; as --auth-bearer-env
-    #[arg(long, value_name = "VAR")]
-    pub oauth2_client_secret_env: Option<String>,
-
-    /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon / Polaris)
-    #[arg(long)]
-    pub oauth2_scope: Option<String>,
-
-    /// OAuth2 audience
-    #[arg(long)]
-    pub oauth2_audience: Option<String>,
+    #[command(flatten)]
+    pub google: GoogleAuthArgs,
 
     /// Warehouse identifier (REST mode)
     #[arg(long)]
     pub warehouse: Option<String>,
 
-    /// Disable vended credentials (REST mode, enabled by default)
-    #[arg(long)]
+    /// Disable vended credentials (REST mode, enabled by default); the same
+    /// as --storage-identity ambient
+    #[arg(long, conflicts_with = "storage_identity")]
     pub no_vended_credentials: bool,
+
+    #[command(flatten)]
+    pub storage: StorageIdentityArgs,
 
     /// S3 region override
     #[arg(long)]
@@ -3888,6 +4031,138 @@ pub struct IcebergMapArgs {
     /// Use path-style S3 URLs
     #[arg(long)]
     pub s3_path_style: bool,
+}
+
+/// How a catalog or SQL endpoint is authenticated: a bearer token, or OAuth2
+/// client credentials (or, for an Iceberg REST catalog or SQL endpoint, a
+/// Google identity; see [`GoogleAuthArgs`]). At most one; a partial OAuth2
+/// set is refused.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct CatalogAuthArgs {
+    /// Bearer token. Stored with the graph source; prefer --auth-bearer-env
+    #[arg(long, conflicts_with = "auth_bearer_env")]
+    pub auth_bearer: Option<String>,
+
+    /// Environment variable holding the bearer token, read by the process that
+    /// reads the tables. The token is not stored. With --remote, the server
+    /// must list the variable in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
+    #[arg(long, value_name = "VAR")]
+    pub auth_bearer_env: Option<String>,
+
+    /// OAuth2 token URL for client credentials auth (for a Unity Catalog,
+    /// defaults to the workspace's own, <unity-uri>/oidc/v1/token)
+    #[arg(long)]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 client ID (a Databricks service principal's application id)
+    #[arg(long)]
+    pub oauth2_client_id: Option<String>,
+
+    /// OAuth2 client secret. Stored with the graph source; prefer
+    /// --oauth2-client-secret-env
+    #[arg(long, conflicts_with = "oauth2_client_secret_env")]
+    pub oauth2_client_secret: Option<String>,
+
+    /// Environment variable holding the OAuth2 client secret; as --auth-bearer-env
+    #[arg(long, value_name = "VAR")]
+    pub oauth2_client_secret_env: Option<String>,
+
+    /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon /
+    /// Polaris; for a Unity Catalog, defaults to all-apis)
+    #[arg(long)]
+    pub oauth2_scope: Option<String>,
+
+    /// OAuth2 audience
+    #[arg(long)]
+    pub oauth2_audience: Option<String>,
+}
+
+/// A Google identity for an Iceberg REST catalog (BigLake) or SQL endpoint:
+/// one credential source, refreshed automatically.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct GoogleAuthArgs {
+    /// Authenticate with the GCE/GKE metadata server's service account (a host
+    /// identity: the operator can refuse it with FLUREE_GRAPH_SOURCE_HOST_IDENTITIES)
+    #[arg(long)]
+    pub auth_google_metadata: bool,
+
+    /// Authenticate with the host's application-default credentials
+    /// (GOOGLE_APPLICATION_CREDENTIALS, else gcloud's), e.g. after
+    /// `gcloud auth application-default login`; a host identity
+    #[arg(long)]
+    pub auth_google_adc: bool,
+
+    /// Environment variable holding a service-account key's JSON, read by the
+    /// process that reads the tables. The key is not stored
+    #[arg(long, value_name = "VAR")]
+    pub auth_google_service_account_env: Option<String>,
+
+    /// A Workload Identity Federation credential configuration (what
+    /// `gcloud iam workload-identity-pools create-cred-config ... --aws`
+    /// prints). Not a secret: it is stored with the graph source
+    #[arg(long, value_name = "FILE")]
+    pub auth_google_wif_config: Option<PathBuf>,
+
+    /// The Google Cloud project catalog requests bill to (x-goog-user-project).
+    /// BigLake requires one for every identity; default: the project a
+    /// bq://projects/<P>/… or bl://projects/<P>/… warehouse names. Never sent
+    /// with storage reads
+    #[arg(long, value_name = "PROJECT")]
+    pub auth_google_quota_project: Option<String>,
+
+    /// OAuth scopes, comma-separated (default: cloud-platform)
+    #[arg(long, value_name = "SCOPES")]
+    pub auth_google_scopes: Option<String>,
+}
+
+/// Which identity reads an Iceberg source's metadata and data files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StorageIdentity {
+    /// The catalog's per-table vended credentials, required (the default for
+    /// a REST catalog, and for a bl:// BigLake warehouse)
+    Vended,
+    /// The host's ambient AWS credential chain
+    Ambient,
+    /// The REST catalog's own Google identity reads gs:// (the default for a
+    /// bq:// BigLake federation warehouse, which never vends)
+    Catalog,
+    /// A Google identity of the source's own (--storage-google-*), e.g. for
+    /// --mode direct on gs://
+    Google,
+}
+
+/// Which identity reads a source's files, and the source's own Google
+/// identity when it is `google`.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct StorageIdentityArgs {
+    /// Which identity reads the table's files. Default: catalog for a bq://
+    /// warehouse, vended for a bl:// one, otherwise vended for a REST catalog
+    /// (unless --no-vended-credentials) and ambient for the other modes
+    #[arg(long, value_enum)]
+    pub storage_identity: Option<StorageIdentity>,
+
+    /// Read the files as the GCE/GKE metadata server's service account
+    #[arg(long)]
+    pub storage_google_metadata: bool,
+
+    /// Read the files with the host's application-default credentials
+    #[arg(long)]
+    pub storage_google_adc: bool,
+
+    /// Read the files as the service account whose key JSON this environment
+    /// variable holds (the key is not stored)
+    #[arg(long, value_name = "VAR")]
+    pub storage_google_service_account_env: Option<String>,
+
+    /// Read the files through this Workload Identity Federation credential
+    /// configuration (stored with the graph source)
+    #[arg(long, value_name = "FILE")]
+    pub storage_google_wif_config: Option<PathBuf>,
+
+    /// The project storage requests bill to (requester pays). Never defaulted,
+    /// and never the catalog's quota project
+    #[arg(long, value_name = "PROJECT")]
+    pub storage_google_quota_project: Option<String>,
 }
 
 #[cfg(test)]
@@ -4082,13 +4357,14 @@ pub struct DocIngestArgs {
     /// Ontology the language model extracts against: a ledger, or a
     /// `.ttl` / `.jsonld` file. Needs `[doc.llm]` (or a Fluree AI account)
     #[arg(long, value_name = "LEDGER|FILE")]
-    pub model: Option<String>,
+    pub ontology: Option<String>,
 
-    /// Known entities to find by their labels (`skos:prefLabel`, `skos:altLabel`,
-    /// `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a ledger or a
-    /// `.ttl` / `.jsonld` file, optionally scoped to one class with `#Class`.
-    /// Repeatable. A mention keeps the entity's own IRI
-    #[arg(long, value_name = "LEDGER|FILE[#CLASS]", action = clap::ArgAction::Append)]
+    /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
+    /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
+    /// ledger, a graph source mapped over a table (`fluree iceberg|sql|delta
+    /// map`), or a `.ttl` / `.jsonld` file, optionally scoped to one class
+    /// with `#Class`. Repeatable. A mention keeps the entity's own IRI
+    #[arg(long, visible_alias = "catalog", value_name = "LEDGER|FILE[#CLASS]", action = clap::ArgAction::Append)]
     pub entities: Vec<String>,
 
     /// What becomes of the relations the language model reports: `direct`
@@ -4126,7 +4402,7 @@ pub struct DocIngestArgs {
     #[arg(long, default_value = "en", value_name = "CODE")]
     pub lang: String,
 
-    /// Skip entity and relation extraction even when `--model` or `--entities` is given
+    /// Skip entity and relation extraction even when `--ontology` or `--entities` is given
     #[arg(long)]
     pub no_extract: bool,
 
