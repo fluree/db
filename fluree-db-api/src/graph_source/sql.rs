@@ -212,10 +212,30 @@ fn duplicate_probe_keys(mapping: &CompiledR2rmlMapping) -> Vec<(String, Vec<Stri
     out
 }
 
+/// What a duplicate-subject probe found: tables whose keys repeat, tables it
+/// could not probe, warnings, and the key it verified for every other table.
+struct ProbeFindings {
+    flagged: Vec<String>,
+    unverified: Vec<String>,
+    warnings: Vec<String>,
+    verified: BTreeMap<String, Vec<String>>,
+}
+
+impl ProbeFindings {
+    /// Store the findings on `config`: what the lane refuses, and what it
+    /// may trust as a table key.
+    fn record(self, config: &mut SqlGsConfig) -> Vec<String> {
+        config.duplicate_subject_tables = self.flagged;
+        config.unverified_subject_tables = self.unverified;
+        config.verified_subject_keys = Some(self.verified);
+        self.warnings
+    }
+}
+
 /// Probe every table's subject keys for duplicates.
 ///
 /// Returns the tables found non-unique, the tables whose probe could not run,
-/// and human-readable warnings. A probe that errors used to warn and leave the
+/// human-readable warnings, and the key verified for each other table. A probe that errors used to warn and leave the
 /// table unflagged, so the lane then ran statements over a table whose
 /// uniqueness was unknown — the one thing the lane's contract does not allow.
 /// Those tables come back separately: the lane refuses them too, with advice
@@ -229,12 +249,18 @@ async fn probe_duplicate_subjects(
     client: &TrinoClient,
     mapping: &CompiledR2rmlMapping,
     allow_duplicate_subjects: bool,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+) -> ProbeFindings {
     let mut flagged = Vec::new();
     let mut unverified = Vec::new();
     let mut warnings = Vec::new();
+    let mut verified = BTreeMap::new();
     if allow_duplicate_subjects {
-        return (flagged, unverified, warnings);
+        return ProbeFindings {
+            flagged,
+            unverified,
+            warnings,
+            verified,
+        };
     }
     for (table, keys) in duplicate_probe_keys(mapping) {
         let source = match mapping.sql_query_for_table(&table) {
@@ -244,7 +270,11 @@ async fn probe_duplicate_subjects(
         let sql = fluree_db_sql::render_duplicate_probe(&source, &keys, client.dialect());
         match client.execute_collect(&sql).await {
             Ok((_, batches)) => {
-                if batches.iter().any(|b| b.num_rows > 0) {
+                let repeats = batches.iter().any(|b| b.num_rows > 0);
+                if !repeats {
+                    verified.insert(table.clone(), keys.clone());
+                }
+                if repeats {
                     warnings.push(format!(
                         "table '{table}': subject key ({}) is not unique; a star over a repeated                          subject returns duplicate rows and the pushdown lane refuses statements                          over it (register with allow_duplicate_subjects to proceed anyway)",
                         keys.join(", ")
@@ -262,7 +292,12 @@ async fn probe_duplicate_subjects(
             }
         }
     }
-    (flagged, unverified, warnings)
+    ProbeFindings {
+        flagged,
+        unverified,
+        warnings,
+        verified,
+    }
 }
 
 impl crate::Fluree {
@@ -295,15 +330,13 @@ impl crate::Fluree {
             Ok(client) => match client.execute_collect("SELECT 1").await {
                 Ok(_) => {
                     if let Some(mapping) = &compiled_for_probe {
-                        let (flagged, unverified, warnings) = probe_duplicate_subjects(
+                        mapping_warnings = probe_duplicate_subjects(
                             &client,
                             mapping,
                             gs_config.allow_duplicate_subjects,
                         )
-                        .await;
-                        gs_config.duplicate_subject_tables = flagged;
-                        gs_config.unverified_subject_tables = unverified;
-                        mapping_warnings = warnings;
+                        .await
+                        .record(&mut gs_config);
                     }
                     true
                 }
@@ -318,6 +351,8 @@ impl crate::Fluree {
             }
         };
         if !connection_tested {
+            // Nothing was probed, so no table's key is verified.
+            gs_config.verified_subject_keys = Some(BTreeMap::new());
             mapping_warnings.push(
                 "subject key uniqueness was not probed (endpoint unreachable); run `fluree sql check`                  once it is"
                     .to_string(),
@@ -403,10 +438,11 @@ impl crate::Fluree {
         let client = build_sql_client(&config, self.identity_context())
             .await
             .map_err(sql_api_error)?;
-        let (flagged, unverified, mapping_warnings) =
-            probe_duplicate_subjects(&client, &compiled, config.allow_duplicate_subjects).await;
-        config.duplicate_subject_tables = flagged.clone();
-        config.unverified_subject_tables = unverified;
+        let mapping_warnings =
+            probe_duplicate_subjects(&client, &compiled, config.allow_duplicate_subjects)
+                .await
+                .record(&mut config);
+        let flagged = config.duplicate_subject_tables.clone();
         let (name, branch) = graph_source_id
             .rsplit_once(':')
             .unwrap_or((graph_source_id, "main"));
@@ -508,6 +544,72 @@ impl SqlSource {
             config,
             client,
         })
+    }
+
+    /// The keys this source reports for `table_name`
+    /// (`R2rmlTableProvider::table_keys`): the key the duplicate-subject probe
+    /// verified, as long as nothing refuses the table. A source registered
+    /// with `allow_duplicate_subjects` probed nothing and reports none.
+    ///
+    /// Refuses the query when a key the mapping declares on the table
+    /// (`f:key`) names a column the relation lacks or one whose values cannot
+    /// identify a row, so no lane trusts a key the table cannot hold.
+    pub(crate) async fn table_keys(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+    ) -> QueryResult<Option<Vec<Vec<String>>>> {
+        use fluree_db_r2rml::mapping::KeyColumn;
+        let declared = mapping.declared_keys(table_name);
+        let probed = self.probed_subject_key(mapping, table_name);
+        if declared.is_empty() && probed.is_none() {
+            return Ok(None);
+        }
+        let source = match mapping.sql_query_for_table(table_name) {
+            Some(sql) => RelSource::Query(sql.to_string()),
+            None => RelSource::Table(table_name.to_string()),
+        };
+        let schema = self.source_schema(session, mapping, &source).await?;
+        let column = |name: &str| match schema.field_by_name(name) {
+            Some(field) => KeyColumn::Typed(Some(field.field_type)),
+            None => KeyColumn::Absent,
+        };
+        declared.check_columns(table_name, column).map_err(|e| {
+            QueryError::InvalidQuery(format!("Graph source '{}': {e}", self.graph_source_id))
+        })?;
+        let Some(key) = probed else {
+            return Ok(None);
+        };
+        let reported = fluree_db_r2rml::TableKeys::new([key]).retain_usable(column);
+        Ok((!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect()))
+    }
+
+    /// The composite key the duplicate-subject probe verified for
+    /// `table_name`, when the lane does not refuse the table. A source
+    /// registered before the probe recorded what it verified keeps the trust
+    /// the lane always gave it: every table neither flagged nor unverified,
+    /// on the key the probe checks.
+    fn probed_subject_key(
+        &self,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+    ) -> Option<Vec<String>> {
+        let config = &self.config;
+        let named = |tables: &[String]| tables.iter().any(|t| t == table_name);
+        if config.allow_duplicate_subjects
+            || named(&config.duplicate_subject_tables)
+            || named(&config.unverified_subject_tables)
+        {
+            return None;
+        }
+        match &config.verified_subject_keys {
+            Some(verified) => verified.get(table_name).cloned(),
+            None => duplicate_probe_keys(mapping)
+                .into_iter()
+                .find(|(t, _)| t == table_name)
+                .map(|(_, keys)| keys),
+        }
     }
 
     /// A table name, or the `rr:sqlQuery` text behind a query alias.

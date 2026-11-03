@@ -32,6 +32,7 @@ use fake_sql::{FakeSql, Table};
 use fluree_db_api::{
     set_fast_paths_disabled, Fluree, FlureeBuilder, R2rmlCreateConfig, SqlCreateConfig,
 };
+use fluree_db_nameservice::GraphSourceType;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use wiremock::MockServer;
@@ -44,7 +45,9 @@ const SQL_AGG: &str = "sql_aggregate_pushdown";
 
 const PREFIX: &str = "PREFIX ex: <http://example.org/>\n";
 
-/// Customer versions and the orders that reference them.
+/// Customer versions, the orders that reference them, and a reference from
+/// a version to every version sharing its city: a join on a column that is
+/// not the parent's subject.
 const HIST_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -56,6 +59,26 @@ const HIST_R2RML: &str = r#"
         rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ; rr:class ex:Customer ] ;
         rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
         rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
+
+    <http://example.org/mapping#Neighbor>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sets.customers_history" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:neighbor ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#History> ;
+                rr:joinCondition [ rr:child "city" ; rr:parent "city" ]
+            ]
+        ] .
+
+    # A version subject whose template is not injective: `-` separates the
+    # two values, and the IRI escape writes `-` inside a value too.
+    <http://example.org/mapping#Version>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sets.customers_history" ] ;
+        rr:subjectMap [ rr:template "http://example.org/version/{customer_id}-{name}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:at ; rr:objectMap [ rr:column "city" ] ] .
 
     <http://example.org/mapping#Order>
         a rr:TriplesMap ;
@@ -109,7 +132,14 @@ const CURRENT_R2RML: &str = r#"
 "#;
 
 fn current_mapping(keyed: bool) -> String {
-    CURRENT_R2RML.replace("{KEY}", if keyed { "; f:key ( \"customer_id\" )" } else { "" })
+    CURRENT_R2RML.replace(
+        "{KEY}",
+        if keyed {
+            "; f:key ( \"customer_id\" )"
+        } else {
+            ""
+        },
+    )
 }
 
 /// The rows of the Iceberg fixture `sets.*`
@@ -159,7 +189,13 @@ fn sets_tables() -> FakeSql {
             history
                 .iter()
                 .map(|(id, name, city, from, current)| {
-                    vec![json!(id), json!(name), json!(city), json!(from), json!(current)]
+                    vec![
+                        json!(id),
+                        json!(name),
+                        json!(city),
+                        json!(from),
+                        json!(current),
+                    ]
                 })
                 .collect(),
         ))
@@ -188,7 +224,10 @@ fn sets_tables() -> FakeSql {
 /// The triples `HIST_R2RML` (`with_current: false`) or `BOTH_R2RML`
 /// (`true`) define over those rows, written out by hand.
 async fn seed_native(fluree: &Fluree, ledger_id: &str, with_current: bool) {
-    let ledger = fluree.create_ledger(ledger_id).await.expect("native ledger");
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("native ledger");
     let ex = "http://example.org/";
     let customer = |id: u32, names: &[&str], cities: &[&str]| {
         let mut c = json!({
@@ -211,6 +250,28 @@ async fn seed_native(fluree: &Fluree, ledger_id: &str, with_current: bool) {
     if with_current {
         graph.push(customer(6, &["frank"], &[]));
     } else {
+        for (version, city) in [
+            ("1-alice", "Boston"),
+            ("1-alice", "Denver"),
+            ("2-bob", "Austin"),
+            ("2-robert", "Austin"),
+            ("3-carol", "Chicago"),
+            ("5-erin", "Miami"),
+            ("5-erin-m", "Tampa"),
+        ] {
+            graph.push(json!({
+                "@id": format!("{ex}version/{version}"),
+                format!("{ex}at"): city,
+            }));
+        }
+        // Every version shares its city only with versions of its own
+        // customer.
+        for id in [1, 2, 3, 5] {
+            graph.push(json!({
+                "@id": format!("{ex}customer/{id}"),
+                format!("{ex}neighbor"): {"@id": format!("{ex}customer/{id}")},
+            }));
+        }
         let order = |id: u32, customer: Option<u32>, amount: &str| {
             let mut o = json!({
                 "@id": format!("{ex}order/{id}"),
@@ -315,7 +376,7 @@ fn cases() -> Vec<Case> {
             vars: &["?s", "?n"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             expect: &[
                 "n=alice s=http://example.org/customer/1",
                 "n=bob s=http://example.org/customer/2",
@@ -334,7 +395,7 @@ fn cases() -> Vec<Case> {
             vars: &["?s"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."city" AS "c1" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."city" IS NOT NULL"#],
             expect: &[
                 "s=http://example.org/customer/1",
                 "s=http://example.org/customer/1",
@@ -352,7 +413,7 @@ fn cases() -> Vec<Case> {
             vars: &["?n"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "t0"."name" AS "c0" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."customer_id" = 1 AND "t0"."name" IS NOT NULL"#],
             expect: &["n=alice"],
         },
         Case {
@@ -363,7 +424,7 @@ fn cases() -> Vec<Case> {
             vars: &["?o", "?c"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "t0"."order_id" AS "c0", "t1"."customer_id" AS "c1" FROM "sets"."orders" AS "t0" JOIN "sets"."customers_history" AS "t1" ON "t0"."customer_id" = "t1"."customer_id" WHERE "t0"."order_id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL"#],
             expect: &[
                 "c=http://example.org/customer/1 o=http://example.org/order/100",
                 "c=http://example.org/customer/1 o=http://example.org/order/106",
@@ -383,7 +444,7 @@ fn cases() -> Vec<Case> {
             vars: &["?o", "?n"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "t0"."order_id" AS "c0", "t1"."customer_id" AS "c1", "t1"."name" AS "c2" FROM "sets"."orders" AS "t0" JOIN "sets"."customers_history" AS "t1" ON "t0"."customer_id" = "t1"."customer_id" WHERE "t0"."order_id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t1"."name" IS NOT NULL"#],
             expect: &[
                 "n=alice o=http://example.org/order/100",
                 "n=alice o=http://example.org/order/106",
@@ -395,6 +456,97 @@ fn cases() -> Vec<Case> {
             ],
         },
         Case {
+            name: "a reference on a keyless parent's non-subject column is one edge per pair",
+            src: "hist",
+            sparql: "SELECT ?a ?b FROM <SRC> WHERE { ?a ex:neighbor ?b }",
+            jsonld: json!({"select": ["?a", "?b"], "where": [{"@id": "?a", "ex:neighbor": "?b"}]}),
+            vars: &["?a", "?b"],
+            site: SQL_BLOCK,
+            routing: Routing::MustFire,
+            sql: &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t1"."customer_id" AS "c1" FROM "sets"."customers_history" AS "t0" JOIN "sets"."customers_history" AS "t1" ON "t0"."city" = "t1"."city" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."city" IS NOT NULL AND "t1"."customer_id" IS NOT NULL"#],
+            expect: &[
+                "a=http://example.org/customer/1 b=http://example.org/customer/1",
+                "a=http://example.org/customer/2 b=http://example.org/customer/2",
+                "a=http://example.org/customer/3 b=http://example.org/customer/3",
+                "a=http://example.org/customer/5 b=http://example.org/customer/5",
+            ],
+        },
+        Case {
+            name: "a reference on a keyless parent's non-subject column reads every row of it",
+            src: "hist",
+            sparql: "SELECT ?a ?n FROM <SRC> WHERE { ?a ex:neighbor ?b . ?b ex:name ?n }",
+            jsonld: json!({"select": ["?a", "?n"], "where": [
+                {"@id": "?a", "ex:neighbor": "?b"},
+                {"@id": "?b", "ex:name": "?n"}
+            ]}),
+            vars: &["?a", "?n"],
+            site: SQL_BLOCK,
+            routing: Routing::MustNotFire,
+            sql: &[],
+            expect: &[
+                "a=http://example.org/customer/1 n=alice",
+                "a=http://example.org/customer/2 n=bob",
+                "a=http://example.org/customer/2 n=robert",
+                "a=http://example.org/customer/3 n=carol",
+                "a=http://example.org/customer/5 n=erin",
+                "a=http://example.org/customer/5 n=erin-m",
+            ],
+        },
+        Case {
+            name: "a subject template that is not injective declines",
+            src: "hist",
+            sparql: "SELECT ?v ?c FROM <SRC> WHERE { ?v ex:at ?c }",
+            jsonld: json!({"select": ["?v", "?c"], "where": [{"@id": "?v", "ex:at": "?c"}]}),
+            vars: &["?v", "?c"],
+            site: SQL_BLOCK,
+            routing: Routing::MustNotFire,
+            sql: &[],
+            expect: &[
+                "c=Austin v=http://example.org/version/2-bob",
+                "c=Austin v=http://example.org/version/2-robert",
+                "c=Boston v=http://example.org/version/1-alice",
+                "c=Chicago v=http://example.org/version/3-carol",
+                "c=Denver v=http://example.org/version/1-alice",
+                "c=Miami v=http://example.org/version/5-erin",
+                "c=Tampa v=http://example.org/version/5-erin-m",
+            ],
+        },
+        Case {
+            name: "distinct VALUES rows over a keyless map join each solution once",
+            src: "hist",
+            sparql: "SELECT ?s ?n FROM <SRC> WHERE { VALUES ?s { <http://example.org/customer/1> <http://example.org/customer/2> } ?s ex:name ?n }",
+            jsonld: json!({"select": ["?s", "?n"], "where": [
+                ["values", ["?s", [{"@id": "ex:customer/1"}, {"@id": "ex:customer/2"}]]],
+                {"@id": "?s", "ex:name": "?n"}
+            ]}),
+            vars: &["?s", "?n"],
+            site: SQL_BLOCK,
+            routing: Routing::MustFire,
+            sql: &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_history" AS "t0" JOIN (VALUES (1), (2)) AS "v0" ("k0") ON "v0"."k0" = "t0"."customer_id" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            expect: &[
+                "n=alice s=http://example.org/customer/1",
+                "n=bob s=http://example.org/customer/2",
+                "n=robert s=http://example.org/customer/2",
+            ],
+        },
+        Case {
+            name: "a VALUES row given twice joins each solution twice",
+            src: "hist",
+            sparql: "SELECT ?s ?n FROM <SRC> WHERE { VALUES ?s { <http://example.org/customer/1> <http://example.org/customer/1> } ?s ex:name ?n }",
+            jsonld: json!({"select": ["?s", "?n"], "where": [
+                ["values", ["?s", [{"@id": "ex:customer/1"}, {"@id": "ex:customer/1"}]]],
+                {"@id": "?s", "ex:name": "?n"}
+            ]}),
+            vars: &["?s", "?n"],
+            site: SQL_BLOCK,
+            routing: Routing::MustNotFire,
+            sql: &[],
+            expect: &[
+                "n=alice s=http://example.org/customer/1",
+                "n=alice s=http://example.org/customer/1",
+            ],
+        },
+        Case {
             name: "a DISTINCT above keeps its one DISTINCT",
             src: "hist",
             sparql: "SELECT DISTINCT ?n FROM <SRC> WHERE { ?s ex:name ?n }",
@@ -402,7 +554,7 @@ fn cases() -> Vec<Case> {
             vars: &["?n"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "t0"."name" AS "c0" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             expect: &[
                 "n=alice", "n=bob", "n=carol", "n=dave", "n=erin", "n=erin-m", "n=robert",
             ],
@@ -416,7 +568,7 @@ fn cases() -> Vec<Case> {
             vars: &["?s", "?n"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL ORDER BY "t0"."name" ASC LIMIT 3"#],
             expect: &[
                 "n=alice s=http://example.org/customer/1",
                 "n=bob s=http://example.org/customer/2",
@@ -433,7 +585,7 @@ fn cases() -> Vec<Case> {
             vars: &["?s", "?v"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2" FROM (SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."city" AS "c1", 1 AS "c2" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."city" IS NOT NULL) AS "u""#],
             expect: &[
                 "s=http://example.org/customer/1 v=Boston",
                 "s=http://example.org/customer/1 v=Denver",
@@ -505,7 +657,7 @@ fn cases() -> Vec<Case> {
             vars: &["?s"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "u0"."c1" AS "c0", "u0"."c0" AS "c1" FROM (SELECT "t0"."customer_id" AS "c0", 0 AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL UNION ALL SELECT "t1"."customer_id" AS "c0", 0 AS "c1" FROM "sets"."customers_history" AS "t1" WHERE "t1"."customer_id" IS NOT NULL) AS "u0""#],
             expect: &[
                 "s=http://example.org/customer/1",
                 "s=http://example.org/customer/2",
@@ -523,7 +675,7 @@ fn cases() -> Vec<Case> {
             vars: &["?s", "?n"],
             site: SQL_BLOCK,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT DISTINCT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."customer_id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."customer_id" AS "c0", "t1"."name" AS "c1", 0 AS "c2" FROM "sets"."customers_history" AS "t1" WHERE "t1"."customer_id" IS NOT NULL AND "t1"."name" IS NOT NULL) AS "u0""#],
             expect: &[
                 "n=alice s=http://example.org/customer/1",
                 "n=bob s=http://example.org/customer/2",
@@ -543,7 +695,7 @@ fn cases() -> Vec<Case> {
             vars: &["?k"],
             site: SQL_AGG,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT COUNT(*) AS "c0" FROM (SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_history" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL) AS "s""#],
             expect: &["k=7"],
         },
         Case {
@@ -554,7 +706,7 @@ fn cases() -> Vec<Case> {
             vars: &["?t"],
             site: SQL_AGG,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT SUM("s"."c1") AS "c0", COUNT("s"."c1") AS "c1" FROM (SELECT DISTINCT "t0"."order_id" AS "c0", "t0"."amount" AS "c1" FROM "sets"."orders" AS "t0" WHERE "t0"."order_id" IS NOT NULL AND "t0"."amount" IS NOT NULL) AS "s""#],
             expect: &["t=48.75"],
         },
         Case {
@@ -566,7 +718,7 @@ fn cases() -> Vec<Case> {
             vars: &["?c", "?k"],
             site: SQL_AGG,
             routing: Routing::MustFire,
-            sql: &[],
+            sql: &[r#"SELECT "s"."c1" AS "c0", COUNT("s"."c0") AS "c1" FROM (SELECT DISTINCT "t0"."order_id" AS "c0", "t1"."customer_id" AS "c1" FROM "sets"."orders" AS "t0" JOIN "sets"."customers_history" AS "t1" ON "t0"."customer_id" = "t1"."customer_id" WHERE "t0"."order_id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL) AS "s" GROUP BY "s"."c1""#],
             expect: &[
                 "c=http://example.org/customer/1 k=2",
                 "c=http://example.org/customer/2 k=1",
@@ -606,7 +758,7 @@ fn subquery_cases() -> Vec<Case> {
         vars: &["?c", "?k"],
         site: SQL_BLOCK,
         routing: Routing::MustFire,
-        sql: &[],
+        sql: &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2" FROM "sets"."customers_history" AS "t0" JOIN (SELECT "s"."c1" AS "c0", COUNT("s"."c0") AS "c1" FROM (SELECT DISTINCT "t3"."order_id" AS "c0", "t4"."customer_id" AS "c1" FROM "sets"."orders" AS "t3" JOIN "sets"."customers_history" AS "t4" ON "t3"."customer_id" = "t4"."customer_id" WHERE "t3"."order_id" IS NOT NULL AND "t3"."customer_id" IS NOT NULL AND "t4"."customer_id" IS NOT NULL) AS "s" GROUP BY "s"."c1") AS "d0" ON "t0"."customer_id" = "d0"."c0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
         expect: &[
             "c=http://example.org/customer/1 k=2",
             "c=http://example.org/customer/2 k=1",
@@ -747,7 +899,10 @@ async fn answer(
             .await
             .map(|t| (jsonld_rows(&t.result, c.vars), t.sql))
     } else {
-        let sparql = format!("{PREFIX}{}", c.sparql.replace("<SRC>", &format!("<{from}>")));
+        let sparql = format!(
+            "{PREFIX}{}",
+            c.sparql.replace("<SRC>", &format!("<{from}>"))
+        );
         fluree
             .query_from()
             .sparql(&sparql)
@@ -821,6 +976,9 @@ async fn check_sql_lane(fluree: &Fluree, cases: &[Case]) -> Vec<String> {
                 }
                 _ => {}
             }
+            if c.routing == Routing::MustNotFire && !a.sql.is_empty() {
+                problems.push(format!("{surface}: a declined shape sent {:#?}", a.sql));
+            }
             if c.routing == Routing::MustFire {
                 if a.rows != oracle[i] {
                     problems.push(format!(
@@ -882,8 +1040,7 @@ async fn every_other_lane_answers_the_same_set() {
                 continue;
             }
             set_fast_paths_disabled(!fast);
-            for (i, (surface, jsonld)) in
-                [("sparql", false), ("json-ld", true)].iter().enumerate()
+            for (i, (surface, jsonld)) in [("sparql", false), ("json-ld", true)].iter().enumerate()
             {
                 let a = answer(&fluree, &store, c, &from, *jsonld).await;
                 if a.rows != oracle[i] {
@@ -932,25 +1089,44 @@ async fn proven_keys_keep_the_statement_byte_for_byte() {
     set_fast_paths_disabled(false);
     let server = sets_tables().mount().await;
     let fluree = FlureeBuilder::memory().build_memory();
-    sql_source(&fluree, &server, "cur-probed", &current_mapping(false), true).await;
+    sql_source(
+        &fluree,
+        &server,
+        "cur-probed",
+        &current_mapping(false),
+        true,
+    )
+    .await;
     sql_source(&fluree, &server, "cur-keyed", &current_mapping(true), false).await;
     sql_source(&fluree, &server, "cur-bare", &current_mapping(false), false).await;
 
     let shapes: &[(&str, &[&str], &[&str])] = &[
         (
             "SELECT ?s ?n FROM <SRC> WHERE { ?s ex:name ?n }",
-            &[r#"SELECT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
-            &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            &[
+                r#"SELECT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#,
+            ],
+            &[
+                r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#,
+            ],
         ),
         (
             "SELECT ?s ?n FROM <SRC> WHERE { ?s a ex:Customer ; ex:name ?n }",
-            &[r#"SELECT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
-            &[r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            &[
+                r#"SELECT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#,
+            ],
+            &[
+                r#"SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#,
+            ],
         ),
         (
             "SELECT (COUNT(*) AS ?k) FROM <SRC> WHERE { ?s ex:name ?n }",
-            &[r#"SELECT COUNT(*) AS "c0" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
-            &[r#"SELECT COUNT(*) AS "c0" FROM (SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL) AS "s""#],
+            &[
+                r#"SELECT COUNT(*) AS "c0" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#,
+            ],
+            &[
+                r#"SELECT COUNT(*) AS "c0" FROM (SELECT DISTINCT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL) AS "s""#,
+            ],
         ),
     ];
     let mut failures = Vec::new();
@@ -975,4 +1151,123 @@ async fn proven_keys_keep_the_statement_byte_for_byte() {
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
+
+/// What the duplicate-subject probe verified is what the lane trusts. An
+/// endpoint unreachable at registration verifies nothing, so the lane removes
+/// repeated solutions until `fluree sql check` records the key; a source
+/// registered before the probe recorded its findings keeps the trust it had.
+#[tokio::test(flavor = "current_thread")]
+async fn the_lane_trusts_only_what_the_probe_verified() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    // Answers nothing yet: the registration's connection test fails.
+    let server = MockServer::start().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let created = fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "cur-late",
+            server.uri(),
+            current_mapping(false),
+        ))
+        .await
+        .expect("registers despite the unreachable endpoint");
+    assert!(!created.connection_tested);
+    sets_tables().mount_on(&server).await;
+
+    let sparql = "SELECT ?s ?n FROM <SRC> WHERE { ?s ex:name ?n }";
+    let plain = r#"SELECT "t0"."customer_id" AS "c0", "t0"."name" AS "c1" FROM "sets"."customers_current" AS "t0" WHERE "t0"."customer_id" IS NOT NULL AND "t0"."name" IS NOT NULL"#;
+    let distinct = format!("SELECT DISTINCT {}", &plain["SELECT ".len()..]);
+    let config = || async {
+        let record = fluree
+            .nameservice()
+            .lookup_graph_source("cur-late:main")
+            .await
+            .expect("lookup")
+            .expect("the record");
+        serde_json::from_str::<Value>(&record.config).expect("config JSON")
+    };
+
+    let (rows, sent) = statements(&fluree, "cur-late:main", sparql).await;
+    assert_eq!(sent, [distinct.clone()], "an unprobed table proves nothing");
+    assert_eq!(config().await["verified_subject_keys"], json!({}));
+
+    // The same record as an older registration wrote it: no field.
+    let mut legacy = config().await;
+    legacy
+        .as_object_mut()
+        .expect("config object")
+        .remove("verified_subject_keys");
+    fluree
+        .publisher()
+        .expect("publisher")
+        .publish_graph_source(
+            "cur-late",
+            "main",
+            GraphSourceType::Sql,
+            &legacy.to_string(),
+            &[],
+        )
+        .await
+        .expect("republish");
+    let (legacy_rows, sent) = statements(&fluree, "cur-late:main", sparql).await;
+    assert_eq!(
+        sent,
+        [plain.to_string()],
+        "a legacy record keeps today's trust"
+    );
+    assert_eq!(legacy_rows, rows);
+
+    // `check` probes the now reachable table and records its key.
+    let checked = fluree
+        .check_sql_graph_source("cur-late:main")
+        .await
+        .expect("check");
+    assert!(checked.duplicate_subject_tables.is_empty());
+    assert_eq!(
+        config().await["verified_subject_keys"],
+        json!({"sets.customers_current": ["customer_id"]})
+    );
+    let (checked_rows, sent) = statements(&fluree, "cur-late:main", sparql).await;
+    assert_eq!(sent, [plain.to_string()]);
+    assert_eq!(checked_rows, rows);
+}
+
+/// A key the mapping declares must name columns the SQL table holds, of a
+/// type that can identify a row: the query refuses on both surfaces rather
+/// than trust a key the table cannot hold.
+#[tokio::test(flavor = "current_thread")]
+async fn a_declared_key_the_table_cannot_hold_refuses_the_query() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let server = sets_tables().mount().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = CURRENT_R2RML.replace("{KEY}", "; f:key ( \"customer_ref\" )");
+    sql_source(&fluree, &server, "cur-badkey", &mapping, true).await;
+    let sparql = format!("{PREFIX}SELECT ?s ?n FROM <cur-badkey:main> WHERE {{ ?s ex:name ?n }}");
+    let sparql_err = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .expect_err("SPARQL refuses")
+        .to_string();
+    let jsonld_err = fluree
+        .query_from()
+        .jsonld(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "cur-badkey:main",
+            "select": ["?s", "?n"],
+            "where": [{"@id": "?s", "ex:name": "?n"}],
+        }))
+        .execute_formatted()
+        .await
+        .expect_err("JSON-LD refuses")
+        .to_string();
+    for err in [sparql_err, jsonld_err] {
+        assert!(
+            err.contains("customer_ref") && err.contains("sets.customers_current"),
+            "{err}"
+        );
+    }
 }

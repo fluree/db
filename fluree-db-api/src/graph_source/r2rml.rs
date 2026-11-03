@@ -3169,7 +3169,8 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     /// column that can identify a row. Refuses the query when a key the
     /// mapping declares on the table (`f:key`) names a column the snapshot
     /// lacks or one whose values cannot identify a row, so no lane trusts a
-    /// key the table cannot hold. SQL and Delta sources report none.
+    /// key the table cannot hold. A SQL source reports the key its
+    /// duplicate-subject probe verified; a Delta source reports none.
     async fn table_keys(
         &self,
         graph_source_id: &str,
@@ -3177,8 +3178,9 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         as_of_t: Option<i64>,
     ) -> QueryResult<Option<Vec<Vec<String>>>> {
         #[cfg(feature = "sql")]
-        if self.sql_source(graph_source_id).await?.is_some() {
-            return Ok(None);
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, as_of_t).await?;
+            return sql.table_keys(&self.session, &mapping, table_name).await;
         }
         #[cfg(feature = "delta")]
         if self.delta_source(graph_source_id).await?.is_some() {
