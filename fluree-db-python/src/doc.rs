@@ -58,21 +58,17 @@ impl ReadError {
         }
     }
 
-    /// A `fluree_db_doc` error for a read with `model`. The reader's refusals
-    /// come back as `"<model>: <status> <message>"`; a 401 or 403 there is a
-    /// refused credential.
-    fn from_doc(e: DocError, model: &str) -> Self {
+    /// A `fluree_db_doc` error for a read. A reader's refusal comes back
+    /// typed (`DocError::Endpoint`); a 401 or 403 there is a refused
+    /// credential.
+    fn from_doc(e: DocError) -> Self {
         match e {
             DocError::Config(m) | DocError::Unsupported(m) => ReadError::Invalid(m),
-            DocError::Model(m) => {
-                let status = m
-                    .strip_prefix(model)
-                    .and_then(|rest| rest.strip_prefix(": "))
-                    .and_then(|rest| rest.split(' ').next())
-                    .and_then(|s| s.parse::<u16>().ok());
+            e @ DocError::Endpoint { status, .. } => {
+                let message = e.to_string();
                 match status {
-                    Some(status @ (401 | 403)) => ReadError::Refused { status, message: m },
-                    _ => ReadError::Other(m),
+                    401 | 403 => ReadError::Refused { status, message },
+                    _ => ReadError::Other(message),
                 }
             }
             other => ReadError::Other(other.to_string()),
@@ -130,7 +126,7 @@ pub(crate) fn read_document(
             records,
             doc_cache.clone(),
         )
-        .map_err(|e| ReadError::from_doc(e, &model))?;
+        .map_err(ReadError::from_doc)?;
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -138,7 +134,7 @@ pub(crate) fn read_document(
         let iri = doc_iri.unwrap_or_else(|| fluree_db_doc::ingest::document_iri(&base_iri, &name));
         let (meta, parsed) =
             fluree_db_doc::parse_file(&path, &name, &iri, doc_cache.as_ref(), None)
-                .map_err(|e| ReadError::from_doc(e, &model))?;
+                .map_err(ReadError::from_doc)?;
         let notes = parsed.notes.clone();
         let doc = PreparedDocument {
             meta,
@@ -150,7 +146,7 @@ pub(crate) fn read_document(
         // `fluree.engine` logger shows it.
         let read = session
             .read(&doc, None, &|wait| tracing::warn!("{wait}"))
-            .map_err(|e| ReadError::from_doc(e, &model))?;
+            .map_err(ReadError::from_doc)?;
         Ok((read, url, notes))
     });
     let (read, url, notes) = read.map_err(ReadError::into_py)?;

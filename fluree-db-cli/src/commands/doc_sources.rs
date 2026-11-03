@@ -305,24 +305,10 @@ pub async fn load_rdf(
     source: &Source,
     dirs: Option<&FlureeDir>,
 ) -> CliResult<fluree_graph_ir::Graph> {
-    use fluree_db_doc::reader::request::{parse_jsonld, parse_turtle};
+    use fluree_db_doc::reader::request::parse_turtle;
     let label = source.label();
     let graph = match &source.kind {
-        SourceKind::File(path) => {
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
-            if ext == "ttl" || ext == "nt" {
-                parse_turtle(&content)
-            } else {
-                parse_jsonld(&content)
-            }
-            .map_err(|e| CliError::Input(format!("{label}: {e}")))?
-        }
+        SourceKind::File(path) => read_rdf_file(path, &label)?,
         SourceKind::Ledger(alias) => {
             let opened = Opened::open(source, dirs).await?;
             if opened.graph_source {
@@ -347,21 +333,23 @@ pub async fn load_rdf(
     Ok(graph)
 }
 
-/// What a catalog record carries: its names, a short description, and its
-/// types. Everything else about a subject stays behind, because the whole
-/// catalog goes into every window a reader reads.
-const RECORD_PREDICATES: &[&str] = &[
-    "skos:prefLabel",
-    "skos:altLabel",
-    "skos:hiddenLabel",
-    "skos:definition",
-    "rdfs:label",
-    "rdfs:comment",
-    "schema:name",
-    "schema:alternateName",
-    "schema:legalName",
-    "schema:description",
-];
+/// A `.ttl` / `.nt` or JSON-LD file as a graph, read as it is.
+fn read_rdf_file(path: &std::path::Path, label: &str) -> CliResult<fluree_graph_ir::Graph> {
+    use fluree_db_doc::reader::request::{parse_jsonld, parse_turtle};
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "ttl" || ext == "nt" {
+        parse_turtle(&content)
+    } else {
+        parse_jsonld(&content)
+    }
+    .map_err(|e| CliError::Input(format!("{label}: {e}")))
+}
 
 pub struct LoadedCatalog {
     pub graph: fluree_graph_ir::Graph,
@@ -381,6 +369,24 @@ pub async fn load_catalog(
     let rdf_type = format!("{}type", fluree_db_doc::vocab::RDF_NS);
     for source in sources {
         check_class_scope(source)?;
+        // A file is read as it is, with the same selection the Python
+        // package makes, so both send the same records (and share answers
+        // in one cache).
+        if let SourceKind::File(path) = &source.kind {
+            let class = source.class.as_deref().map(expand_compact);
+            let records = fluree_db_doc::reader::request::catalog_records_of(
+                &read_rdf_file(path, &source.label())?,
+                class.as_deref(),
+            );
+            counts.push((
+                source.label(),
+                fluree_db_doc::reader::request::catalog_records(&records),
+            ));
+            for t in records.iter() {
+                graph.add(t.clone());
+            }
+            continue;
+        }
         let opened = Opened::open(source, dirs).await?;
         let anchor = |extra: (&str, &str)| {
             let mut node = serde_json::json!({ "@id": "?s", extra.0: extra.1 });
@@ -390,7 +396,8 @@ pub async fn load_catalog(
             node
         };
         let mut subjects = std::collections::BTreeSet::new();
-        for predicate in RECORD_PREDICATES {
+        // One list of record predicates, the reader request's.
+        for predicate in fluree_db_doc::reader::request::RECORD_PREDICATES {
             let query = serde_json::json!({
                 "@context": fluree_db_doc::model::query_context(),
                 "where": [anchor((predicate, "?v"))],
