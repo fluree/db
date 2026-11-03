@@ -299,6 +299,15 @@ name = "it_r2rml_untyped_columns"
 path = "tests/it_r2rml_untyped_columns.rs"
 required-features = ["sql", "native"]
 
+# Set semantics on the SQL lane: tables that repeat triples, answered against
+# a native ledger holding the triples, with the per-scan and Iceberg lanes over
+# the same rows (the local `sets.*` fixture). Own binary: it flips the
+# process-wide fast-path switch and sets `FLUREE_ICEBERG_LOCAL_ROOTS`.
+[[test]]
+name = "it_sql_set_semantics"
+path = "tests/it_sql_set_semantics.rs"
+required-features = ["sql", "native"]
+
 [[test]]
 name = "grp_index"
 path = "tests/grp_index.rs"
