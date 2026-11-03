@@ -115,6 +115,7 @@ pub async fn resolve_schema_bundle(
         follow_imports,
     };
     if let Some(cached) = global_schema_bundle_cache().get(&cache_key) {
+        refuse_dropped_sources(snapshot, to_t, &cached.sources)?;
         return Ok(Some(cached));
     }
 
@@ -136,6 +137,8 @@ pub async fn resolve_schema_bundle(
         }
     }
 
+    refuse_dropped_sources(snapshot, to_t, &sources)?;
+
     let bundle = Arc::new(ResolvedSchemaBundle {
         ledger_id: Arc::from(snapshot.ledger_id.as_str()),
         to_t,
@@ -144,6 +147,27 @@ pub async fn resolve_schema_bundle(
     global_schema_bundle_cache().insert(cache_key, bundle.clone());
 
     Ok(Some(bundle))
+}
+
+/// Refuse a bundle reading a named graph that a commit after `to_t` dropped,
+/// as a `GRAPH` naming it as of `to_t` is refused: what it held then is gone,
+/// and reasoning without it would answer something else. Checked on cache
+/// hits too, since a bundle cached as of `to_t` before the drop still lists
+/// the graph and its flakes. (The default graph is never a cached source:
+/// [`fluree_db_query::schema_bundle::build_schema_bundle_flakes`] leaves it
+/// to the query's own reads.)
+fn refuse_dropped_sources(snapshot: &LedgerSnapshot, to_t: i64, sources: &[GraphId]) -> Result<()> {
+    let registry = &snapshot.graph_registry;
+    for &g_id in sources.iter().filter(|g_id| **g_id != DEFAULT_GRAPH_ID) {
+        if let Some(floor) = registry.drop_after(g_id, to_t) {
+            let iri = registry.iri_for_graph_id(g_id).unwrap_or_default();
+            return Err(ApiError::GraphNotFound(format!(
+                "schema source graph <{iri}> was dropped at t={floor}; what it held as of \
+                 t={to_t} is no longer queryable"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a `GraphSourceRef` to a local `GraphId` in the current ledger.
