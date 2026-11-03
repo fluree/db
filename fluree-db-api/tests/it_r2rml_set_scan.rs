@@ -49,6 +49,9 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 
 const EX: &str = "http://example.org/";
 const FUSED: &str = "fused_r2rml_aggregate";
+/// The fused fold's stamp when it folds each solution of a map whose rows can
+/// repeat one exactly once.
+const FOLD_DEDUPE: &str = "fused_r2rml_aggregate_dedupe";
 /// The scan's routing stamp: `proceed` when every map it reads is proven to
 /// mint each triple once, so it skips deduplication.
 const PROVEN: &str = "r2rml_scan_proven_distinct";
@@ -91,6 +94,18 @@ const ORDERS: [(i64, Option<i64>); 8] = [
     (106, Some(1)),
 ];
 
+/// `sets.orders`: `(order_id, amount)`, in the same row order.
+const AMOUNTS: [(i64, &str); 8] = [
+    (100, "10.00"),
+    (101, "20.00"),
+    (102, "5.50"),
+    (103, "7.25"),
+    (101, "20.00"),
+    (104, "1.00"),
+    (105, "3.00"),
+    (106, "2.00"),
+];
+
 const HISTORY_MAP: &str = r#"
     <http://example.org/mapping#History>
         a rr:TriplesMap ;
@@ -117,6 +132,17 @@ const ORDER_MAP: &str = r#"
                 rr:parentTriplesMap <http://example.org/mapping#History> ;
                 rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ]
             ]
+        ] .
+"#;
+
+const AMOUNT_MAP: &str = r#"
+    <http://example.org/mapping#Amount>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sets.orders" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:amount ;
+            rr:objectMap [ rr:column "amount" ; rr:datatype xsd:decimal ]
         ] .
 "#;
 
@@ -159,6 +185,7 @@ const PREFIXES: &str = r"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
     @prefix f: <https://ns.flur.ee/db#> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 ";
 
 fn ex(local: &str) -> String {
@@ -198,6 +225,12 @@ const KEYED: Source = Source {
     alias: "sets-keyed",
     native: "sets-keyed-native:main",
     maps: &[KEYED_MAPS],
+};
+/// The orders' amounts, no key declared, an exact duplicate row.
+const AMOUNTS_SRC: Source = Source {
+    alias: "sets-amount",
+    native: "sets-amount-native:main",
+    maps: &[AMOUNT_MAP],
 };
 /// The current table alone, no key declared: its Iceberg identifier field
 /// is the key.
@@ -262,6 +295,11 @@ impl Source {
                 }
             }
         }
+        if has(AMOUNT_MAP) {
+            for (oid, amount) in AMOUNTS {
+                add(order(oid), "amount", format!("decimal:{amount}"));
+            }
+        }
         if has(KEYED_MAPS) {
             for (id, name) in CURRENT {
                 add(customer(id), "@type", iri(ex("Customer")));
@@ -289,7 +327,13 @@ impl Source {
                             |o| match o.strip_prefix('<').and_then(|o| o.strip_suffix('>')) {
                                 Some(i) if p == "@type" => json!(i),
                                 Some(i) => json!({ "@id": i }),
-                                None => json!(o),
+                                None => match o.strip_prefix("decimal:") {
+                                    Some(d) => json!({
+                                        "@value": d,
+                                        "@type": "http://www.w3.org/2001/XMLSchema#decimal"
+                                    }),
+                                    None => json!(o),
+                                },
                             },
                         )
                         .collect();
@@ -751,27 +795,31 @@ fn history_cases() -> Vec<Case> {
             &["n"],
         )
         .rows(7),
+        // A single pattern over one keyless map folds each solution once.
         count(
             "COUNT a predicate over versions",
             "?s ex:name ?n",
             "n",
             json!({ "@id": "?s", name.clone(): "?n" }),
         )
-        .stamp(FUSED, false),
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, true),
         count(
             "COUNT a class over versions",
             "?s a ex:Customer",
             "s",
             json!({ "@id": "?s", "@type": customer_class.clone() }),
         )
-        .stamp(FUSED, false),
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, true),
         count(
             "COUNT a class over a duplicate row",
             "?o a ex:Order",
             "o",
             json!({ "@id": "?o", "@type": ex("Order") }),
         )
-        .stamp(FUSED, false),
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, true),
         count(
             "COUNT a referencing map over a duplicate row",
             "?o ex:customer ?c",
@@ -790,7 +838,8 @@ fn history_cases() -> Vec<Case> {
             &["c", "k"],
         )
         .rows(6)
-        .stamp(FUSED, false),
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, true),
     ]
 }
 
@@ -836,6 +885,35 @@ fn union_cases() -> Vec<Case> {
     ]
 }
 
+/// Aggregates over a decimal column with an exact duplicate row: the fused
+/// fold folds each solution once.
+fn amount_cases() -> Vec<Case> {
+    let amount = ex("amount");
+    vec![
+        case(
+            "SUM over a duplicate row",
+            "SELECT (SUM(?a) AS ?t) FROM <{from}> WHERE { ?o ex:amount ?a }",
+            json!({ "select": ["(as (sum ?a) ?t)"], "where": { "@id": "?o", amount.clone(): "?a" } }),
+            &["t"],
+        )
+        .rows(1)
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, true),
+        case(
+            "GROUP BY a decimal over a duplicate row",
+            "SELECT ?a (COUNT(?o) AS ?k) FROM <{from}> WHERE { ?o ex:amount ?a } GROUP BY ?a",
+            json!({
+                "select": ["?a", "(as (count ?o) ?k)"],
+                "where": { "@id": "?o", amount.clone(): "?a" },
+                "groupBy": ["?a"],
+            }),
+            &["a", "k"],
+        )
+        // The fused fold does not group by a decimal; the generic lane answers.
+        .rows(7),
+    ]
+}
+
 /// Maps whose declared key makes each subject one row's: every existing fast
 /// path still serves them.
 fn keyed_cases() -> Vec<Case> {
@@ -872,14 +950,16 @@ fn keyed_cases() -> Vec<Case> {
             "v",
             json!({ "@id": "?v", "@type": ex("Version") }),
         )
-        .stamp(FUSED, true),
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, false),
         count(
             "COUNT a keyed predicate",
             "?v ex:city ?c",
             "c",
             json!({ "@id": "?v", city.clone(): "?c" }),
         )
-        .stamp(FUSED, true),
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, false),
         case(
             "a keyed star's constant",
             "SELECT ?v ?n FROM <{from}> WHERE { ?v ex:name ?n ; ex:city \"Miami\" }",
@@ -912,7 +992,8 @@ fn identifier_cases() -> Vec<Case> {
             "s",
             json!({ "@id": "?s", "@type": ex("Customer") }),
         )
-        .stamp(FUSED, true),
+        .stamp(FUSED, true)
+        .stamp(FOLD_DEDUPE, false),
     ]
 }
 
@@ -923,9 +1004,10 @@ async fn patterns_over_repeated_rows_match_each_triple_once() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();
     let fluree = FlureeBuilder::memory().build_memory();
-    seed(&fluree, &[&HIST, &UNION]).await;
+    seed(&fluree, &[&HIST, &UNION, &AMOUNTS_SRC]).await;
     let mut failures = check(&fluree, &history_cases(), &HIST).await;
     failures.extend(check(&fluree, &union_cases(), &UNION).await);
+    failures.extend(check(&fluree, &amount_cases(), &AMOUNTS_SRC).await);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

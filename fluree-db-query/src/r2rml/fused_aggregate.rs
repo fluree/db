@@ -26,7 +26,7 @@
 //! general graph-source semantics are unchanged.
 
 use rustc_hash::FxHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::aggregate::NumericAcc;
 use crate::binding::{Batch, Binding, BindingRow};
@@ -378,6 +378,10 @@ fn fused_r2rml_agg_enabled() -> bool {
 /// folds from column batches, `Fallback(GateDeclined)` when its open-time
 /// gates send the query to the fallback pipeline.
 pub const FUSED_R2RML_AGGREGATE_SITE: &str = "fused_r2rml_aggregate";
+
+/// Routing stamp for a fused fold over a map whose rows can repeat a solution:
+/// `proceed` when the fold runs and folds each solution once.
+pub const FUSED_R2RML_AGGREGATE_DEDUPE_SITE: &str = "fused_r2rml_aggregate_dedupe";
 
 /// Detect the fused shape: a single `GRAPH { triples }` block feeding an
 /// aggregation (implicit, or GROUP BY) of only `COUNT` / `SUM` / `AVG`, with no
@@ -1236,7 +1240,132 @@ struct Resolved {
     /// `Binding`s (datatype Sids pre-resolved from the fact TriplesMap). `None`
     /// when there are no MIN/MAX folds.
     minmax_encoder: Option<LiteralEncoder>,
+    /// When the scanned map can mint one solution from several rows: the
+    /// columns identifying a solution, so the fold folds each solution once.
+    /// `None` when every row is a distinct solution.
+    dedupe: Option<FoldDedupe>,
 }
+
+/// The columns that identify one solution of a fused fold's pattern, read raw
+/// from each row: the subject template's columns (an injective template, so
+/// two rows mint one subject exactly when they agree on them) and the
+/// object's column. A row whose solution an earlier row already yielded is
+/// not folded again.
+struct FoldDedupe {
+    columns: Vec<(String, RawTerm)>,
+}
+
+/// How a column's raw value becomes its term, as far as telling two values
+/// apart goes: the term is a one-to-one function of the raw value for the
+/// physical types [`RawTerm::exact_for`] admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawTerm {
+    /// The value's text: a subject template placeholder, or an object column
+    /// without a datatype, or `xsd:string`, or with a language tag.
+    Rendered,
+    /// Coerced to an integer.
+    Integer,
+    /// Coerced to a decimal.
+    Decimal,
+    Date,
+    Boolean,
+}
+
+impl RawTerm {
+    /// The object map's coercion, or `None` when the fold cannot tell its
+    /// terms apart by raw value (a coercion that maps two texts to one term,
+    /// such as "01" and "1" to the integer 1, or floating point).
+    fn of_object(datatype: Option<&str>, language: Option<&str>) -> Option<Self> {
+        use fluree_vocab::xsd;
+        if language.is_some() {
+            return Some(Self::Rendered);
+        }
+        match datatype {
+            None => Some(Self::Rendered),
+            Some(dt) if dt == xsd::STRING => Some(Self::Rendered),
+            Some(dt) if dt == xsd::INTEGER || dt == xsd::LONG || dt == xsd::INT => {
+                Some(Self::Integer)
+            }
+            Some(dt) if dt == xsd::DECIMAL => Some(Self::Decimal),
+            Some(dt) if dt == xsd::DATE => Some(Self::Date),
+            Some(dt) if dt == xsd::BOOLEAN => Some(Self::Boolean),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether distinct raw values of `column` always become distinct terms.
+    fn exact_for(self, column: &Column) -> bool {
+        matches!(
+            (self, column),
+            (
+                Self::Rendered,
+                Column::Int32(_)
+                    | Column::Int64(_)
+                    | Column::String(_)
+                    | Column::Date(_)
+                    | Column::Boolean(_)
+                    | Column::Decimal { .. },
+            ) | (Self::Integer, Column::Int32(_) | Column::Int64(_))
+                | (
+                    Self::Decimal,
+                    Column::Int32(_) | Column::Int64(_) | Column::Decimal { .. }
+                )
+                | (Self::Date, Column::Date(_))
+                | (Self::Boolean, Column::Boolean(_))
+        )
+    }
+}
+
+/// Append row `row` of `column` to `out` so that two rows' bytes are equal
+/// exactly when their values are (an integer is one value whether the file
+/// stores it in 32 or 64 bits). `false` for a type with no such encoding.
+fn put_raw_value(column: &Column, row: usize, out: &mut Vec<u8>) -> bool {
+    match column {
+        Column::Int32(v) => {
+            out.push(1);
+            out.extend_from_slice(&i64::from(v[row].unwrap_or_default()).to_le_bytes());
+        }
+        Column::Int64(v) => {
+            out.push(1);
+            out.extend_from_slice(&v[row].unwrap_or_default().to_le_bytes());
+        }
+        Column::String(v) => {
+            let s = v[row].as_deref().unwrap_or_default().as_bytes();
+            out.push(2);
+            // The length as a LEB128 varint, so a string's bytes cannot run
+            // into the next value's.
+            let mut n = s.len();
+            loop {
+                let byte = (n & 0x7f) as u8;
+                n >>= 7;
+                if n == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out.extend_from_slice(s);
+        }
+        Column::Date(v) => {
+            out.push(3);
+            out.extend_from_slice(&v[row].unwrap_or_default().to_le_bytes());
+        }
+        Column::Boolean(v) => {
+            out.push(4);
+            out.push(u8::from(v[row].unwrap_or_default()));
+        }
+        Column::Decimal { values, scale, .. } => {
+            out.push(5);
+            out.extend_from_slice(&scale.to_le_bytes());
+            out.extend_from_slice(&values[row].unwrap_or_default().to_le_bytes());
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Estimated table overhead of one remembered fold solution.
+const FOLD_SEEN_ENTRY_OVERHEAD_BYTES: usize = 32;
 
 /// A built keep-min dim map: FK/parent join key → the parent's group-key values.
 /// `Arc`d so ref group keys resolving to the SAME dim on the SAME parent join cols
@@ -1704,6 +1833,66 @@ impl FusedR2rmlAggregateOperator {
 
     /// Resolve the single TriplesMap for the rewritten pattern, requiring exactly
     /// one (explicit IRI, or an unambiguous class/predicate match).
+    /// The columns identifying a solution of `patterns`, when the fold can
+    /// fold each solution once by reading them raw: one pattern over one
+    /// candidate map, no folded constraints from other patterns (a constraint
+    /// checked against its own row would miss a subject that holds it on
+    /// another), no projected predicate or type, a subject minted by an
+    /// injective IRI template, and an object (when the pattern binds one) read
+    /// from a column whose coercion keeps distinct values distinct. `None`
+    /// otherwise: the fold declines.
+    fn fold_dedupe_plan(
+        patterns: &[Pattern],
+        mapping: &CompiledR2rmlMapping,
+    ) -> Option<FoldDedupe> {
+        let [Pattern::R2rml(p)] = patterns else {
+            return None;
+        };
+        if !p.star_bindings.is_empty()
+            || !p.star_constraints.is_empty()
+            || p.predicate_var.is_some()
+            || p.type_var.is_some()
+            || p.subject_constant.is_some()
+        {
+            return None;
+        }
+        let maps = crate::r2rml::set_semantics::candidate_maps(p, mapping);
+        let [tm] = maps.as_slice() else {
+            return None;
+        };
+        if !crate::r2rml::set_semantics::emits_distinct_for(p, tm) {
+            return None;
+        }
+        let sm = &tm.subject_map;
+        if sm.constant.is_some() || sm.column.is_some() || sm.term_type != TermType::Iri {
+            return None;
+        }
+        let template = sm.template.as_deref()?;
+        if !fluree_db_r2rml::materialize::template_is_injective(template) {
+            return None;
+        }
+        let mut columns: Vec<(String, RawTerm)> = extract_template_columns(template)
+            .into_iter()
+            .map(|c| (c, RawTerm::Rendered))
+            .collect();
+        if p.object_var.is_some() {
+            let predicate = p.predicate_filter.as_deref()?;
+            match tm.object_map_for(predicate)? {
+                ObjectMap::Column {
+                    column,
+                    datatype,
+                    language,
+                    ..
+                } => {
+                    let raw = RawTerm::of_object(datatype.as_deref(), language.as_deref())?;
+                    columns.push((column.clone(), raw));
+                }
+                _ => return None,
+            }
+        }
+        Some(FoldDedupe { columns })
+    }
+
     fn resolve_triples_map<'m>(
         pattern: &R2rmlPattern,
         mapping: &'m CompiledR2rmlMapping,
@@ -1810,6 +1999,9 @@ impl Operator for FusedR2rmlAggregateOperator {
                 "fused R2RML aggregate: folding from column batches"
             );
             stamp_fast_path(FUSED_R2RML_AGGREGATE_SITE, FastPathOutcome::Proceed);
+            if self.resolved.as_ref().is_some_and(|r| r.dedupe.is_some()) {
+                stamp_fast_path(FUSED_R2RML_AGGREGATE_DEDUPE_SITE, FastPathOutcome::Proceed);
+            }
         }
         self.state = OperatorState::Open;
         Ok(())
@@ -1851,12 +2043,16 @@ impl Operator for FusedR2rmlAggregateOperator {
         // whole fused path (a disabled switch fails detection, so this is never
         // reached). The emitted binding is byte-identical to the scan+fold result
         // (`Acc::Count(n).finalize()`).
-        if count_shortcut_eligible(
-            resolved.filter.is_some(),
-            &resolved.group_cols,
-            &resolved.fact_constraints,
-            &resolved.folds,
-        ) {
+        // The manifest counts rows, so it answers only where every row is a
+        // distinct solution.
+        if resolved.dedupe.is_none()
+            && count_shortcut_eligible(
+                resolved.filter.is_some(),
+                &resolved.group_cols,
+                &resolved.fact_constraints,
+                &resolved.folds,
+            )
+        {
             let gs = resolved.pattern.graph_source_id.clone();
             let table = resolved.table_name.clone();
             let non_null_cols = resolved.count_non_null_cols.clone();
@@ -1907,6 +2103,16 @@ impl Operator for FusedR2rmlAggregateOperator {
         let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
             std::collections::HashMap::new();
         let mut overflowed = false;
+        // Set semantics over a map that can mint a solution from several rows:
+        // the solutions folded so far, as their identifying columns' raw bytes
+        // (exact: `FoldDedupe`), each charged to the query budget. A column of
+        // a type whose raw bytes do not tell its terms apart hands the query to
+        // the generic pipeline, like an overflow.
+        let mut fold_seen: hashbrown::HashTable<Box<[u8]>> = hashbrown::HashTable::new();
+        let fold_hasher = rustc_hash::FxBuildHasher;
+        let mut fold_scratch: Vec<u8> = Vec::new();
+        let mut fold_charged = 0usize;
+        let mut fold_since_checkpoint = 0usize;
         'scan: while let Some(batch) = stream.next().await {
             // Checkpoint per fused-aggregate scan batch (deadline + memory budget): a
             // deadline/abort stops a large fused rollup mid-sweep, and a high-cardinality
@@ -1914,6 +2120,22 @@ impl Operator for FusedR2rmlAggregateOperator {
             // typed before OOM.
             ctx.checkpoint()?;
             let batch = batch?;
+            let dedupe_cols: Option<Vec<&Column>> = match &resolved.dedupe {
+                None => None,
+                Some(dedupe) => {
+                    let mut cols = Vec::with_capacity(dedupe.columns.len());
+                    for (name, raw) in &dedupe.columns {
+                        match batch.column_by_name(name) {
+                            Some(col) if raw.exact_for(col) => cols.push(col),
+                            _ => {
+                                overflowed = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                    Some(cols)
+                }
+            };
             let groups_before = if vfold {
                 group_accs.len()
             } else {
@@ -2013,6 +2235,32 @@ impl Operator for FusedR2rmlAggregateOperator {
                 if !Self::row_passes_semi_joins(&resolved.semi_joins, &batch, row, &mut fk_scratch)
                 {
                     continue;
+                }
+                // Fold each solution once: a row whose solution an earlier row
+                // already yielded adds nothing to the set of triples.
+                if let Some(cols) = &dedupe_cols {
+                    fold_scratch.clear();
+                    for col in cols {
+                        put_raw_value(col, row, &mut fold_scratch);
+                    }
+                    let hash = fold_hasher.hash_one(fold_scratch.as_slice());
+                    if fold_seen
+                        .find(hash, |seen| **seen == *fold_scratch)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let bytes = FOLD_SEEN_ENTRY_OVERHEAD_BYTES + fold_scratch.len();
+                    fold_seen.insert_unique(hash, fold_scratch.as_slice().into(), |seen| {
+                        fold_hasher.hash_one(&**seen)
+                    });
+                    ctx.record_alloc(bytes);
+                    fold_charged += bytes;
+                    fold_since_checkpoint += 1;
+                    if fold_since_checkpoint >= 1024 {
+                        fold_since_checkpoint = 0;
+                        ctx.checkpoint()?;
+                    }
                 }
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit
@@ -2214,9 +2462,20 @@ impl Operator for FusedR2rmlAggregateOperator {
             ctx.tracker.consume_fuel(1)?;
         }
 
-        // An i128 accumulator overflowed: the exact answer needs BigDecimal, so
-        // run the whole query on the normal pipeline instead (nothing has been
-        // emitted yet, so this is a clean handoff).
+        if resolved.dedupe.is_some() {
+            tracing::debug!(
+                solutions = fold_seen.len(),
+                charged_bytes = fold_charged,
+                "fused R2RML aggregate: deduplication set released"
+            );
+        }
+        drop(fold_seen);
+        ctx.release(fold_charged);
+
+        // An i128 accumulator overflowed (or a deduplicated column's type has
+        // no exact raw encoding): the exact answer needs the normal pipeline,
+        // so run the whole query there instead (nothing has been emitted yet,
+        // so this is a clean handoff).
         if overflowed {
             self.use_fallback = true;
             self.fallback.open(ctx).await?;
@@ -2404,18 +2663,27 @@ impl FusedR2rmlAggregateOperator {
         // The fold counts and sums table rows, and the manifest COUNT counts
         // them without reading any: both answer over the graph (a set of
         // triples) only when each row the patterns read is a distinct solution.
-        // Otherwise the generic pipeline runs, whose scans remove repeats.
-        match mapping.as_deref() {
-            Some(m)
-                if crate::r2rml::set_semantics::rows_are_solutions(
-                    ctx,
-                    &rr.patterns,
-                    &self.graph_iri,
-                    m,
-                )
-                .await? => {}
-            _ => return Ok(None),
-        }
+        // Where that is not proven, a single-pattern fold can still run by
+        // folding each solution once (`fold_dedupe_plan`); any other shape runs
+        // on the generic pipeline, whose scans remove repeats.
+        let Some(m) = mapping.as_deref() else {
+            return Ok(None);
+        };
+        let fold_dedupe = if crate::r2rml::set_semantics::rows_are_solutions(
+            ctx,
+            &rr.patterns,
+            &self.graph_iri,
+            m,
+        )
+        .await?
+        {
+            None
+        } else {
+            match Self::fold_dedupe_plan(&rr.patterns, m) {
+                Some(plan) => Some(plan),
+                None => return Ok(None),
+            }
+        };
         // The single-`R2rml` shape gate below also keeps this path decline-safe
         // against non-lowered sub-scopes (`rr.unsupported`): a surviving
         // PropertyPath/Subquery breaks the shape, so we fall back to the normal
@@ -2741,6 +3009,10 @@ impl FusedR2rmlAggregateOperator {
             super::operator::pattern_scan_filters(&pushing, tm)
         };
 
+        // The fold reads a solution's identifying columns to fold it once.
+        if let Some(dedupe) = &fold_dedupe {
+            projection.extend(dedupe.columns.iter().map(|(c, _)| c.clone()));
+        }
         projection.sort();
         projection.dedup();
 
@@ -2853,6 +3125,7 @@ impl FusedR2rmlAggregateOperator {
             fact_constraints,
             minmax_folds,
             minmax_encoder,
+            dedupe: fold_dedupe,
         }))
     }
 
@@ -4026,6 +4299,9 @@ impl FusedR2rmlAggregateOperator {
             fact_constraints: fact_checks,
             minmax_folds,
             minmax_encoder,
+            // Only a single-table fold deduplicates; a join is admitted only
+            // over maps whose rows are distinct solutions.
+            dedupe: None,
         }))
     }
 
@@ -4397,6 +4673,109 @@ impl FusedR2rmlAggregateOperator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_raw_key_is_exact_only_where_the_coercion_keeps_values_apart() {
+        use fluree_vocab::xsd;
+        let ints = Column::Int64(vec![Some(1)]);
+        let strs = Column::String(vec![Some("01".to_string())]);
+        let floats = Column::Float64(vec![Some(1.0)]);
+        let rendered = RawTerm::of_object(None, None).unwrap();
+        assert!(rendered.exact_for(&ints) && rendered.exact_for(&strs));
+        assert!(!rendered.exact_for(&floats), "float text is not one-to-one");
+        // "01" and "1" are one integer: a string column under xsd:integer is not exact.
+        let integer = RawTerm::of_object(Some(xsd::INTEGER), None).unwrap();
+        assert!(integer.exact_for(&ints) && !integer.exact_for(&strs));
+        assert!(RawTerm::of_object(Some(xsd::DOUBLE), None).is_none());
+        assert_eq!(
+            RawTerm::of_object(Some(xsd::INTEGER), Some("en")),
+            Some(RawTerm::Rendered)
+        );
+        // One integer whether a file stores it in 32 or 64 bits.
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        assert!(put_raw_value(&Column::Int32(vec![Some(7)]), 0, &mut a));
+        assert!(put_raw_value(&Column::Int64(vec![Some(7)]), 0, &mut b));
+        assert_eq!(a, b);
+        // Strings are length-prefixed: ("ab","c") is not ("a","bc").
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for (out, parts) in [(&mut x, ["ab", "c"]), (&mut y, ["a", "bc"])] {
+            for part in parts {
+                put_raw_value(&Column::String(vec![Some(part.to_string())]), 0, out);
+            }
+        }
+        assert_ne!(x, y);
+        assert!(!put_raw_value(&floats, 0, &mut Vec::new()));
+    }
+
+    #[test]
+    fn a_fold_deduplicates_only_a_single_pattern_it_can_key_exactly() {
+        use fluree_db_r2rml::mapping::PredicateMap;
+        const NAME: &str = "http://example.org/name";
+        let pom = |column: &str, datatype: Option<&str>| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(NAME),
+            object_map: ObjectMap::Column {
+                column: column.to_string(),
+                datatype: datatype.map(str::to_string),
+                language: None,
+                term_type: TermType::Literal,
+            },
+        };
+        let history = |template: &str, datatype: Option<&str>| {
+            TriplesMap::new("#History", "history")
+                .with_subject_template(template)
+                .with_predicate_object(pom("name", datatype))
+        };
+        let pattern = || R2rmlPattern::new("gs", VarId(0), Some(VarId(1))).with_predicate(NAME);
+        let plan = |maps: Vec<TriplesMap>, p: R2rmlPattern| {
+            FusedR2rmlAggregateOperator::fold_dedupe_plan(
+                &[Pattern::R2rml(p)],
+                &CompiledR2rmlMapping::new(maps),
+            )
+            .map(|d| d.columns)
+        };
+        assert_eq!(
+            plan(vec![history("http://ex/c/{id}", None)], pattern()),
+            Some(vec![
+                ("id".to_string(), RawTerm::Rendered),
+                ("name".to_string(), RawTerm::Rendered)
+            ])
+        );
+        // Two placeholders separated by a character the escape passes through.
+        assert!(plan(vec![history("http://ex/c/{a}-{b}", None)], pattern()).is_none());
+        // An integer coercion is admitted here; whether the column's values
+        // keep apart under it (an integer column, not a string one) is checked
+        // against each batch (`RawTerm::exact_for`), which hands a string
+        // column to the generic pipeline.
+        assert_eq!(
+            plan(
+                vec![history(
+                    "http://ex/c/{id}",
+                    Some(fluree_vocab::xsd::INTEGER)
+                )],
+                pattern()
+            )
+            .map(|c| c[1].1),
+            Some(RawTerm::Integer)
+        );
+        // A coercion that is never one-to-one declines here.
+        assert!(plan(
+            vec![history("http://ex/c/{id}", Some(fluree_vocab::xsd::DOUBLE))],
+            pattern()
+        )
+        .is_none());
+        // Two candidate maps.
+        let other = TriplesMap::new("#Other", "other")
+            .with_subject_template("http://ex/o/{id}")
+            .with_predicate_object(pom("name", None));
+        assert!(plan(vec![history("http://ex/c/{id}", None), other], pattern()).is_none());
+        // A constant folded from another pattern is checked against its own row.
+        let mut constrained = pattern();
+        constrained.star_constraints = vec![(
+            "http://example.org/city".to_string(),
+            ObjectConstant::Scalar(crate::r2rml::ScanValue::Str("Miami".to_string())),
+        )];
+        assert!(plan(vec![history("http://ex/c/{id}", None)], constrained).is_none());
+    }
+
     use super::*;
     use crate::ir::grouping::AggregateSpec;
 
