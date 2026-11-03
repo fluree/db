@@ -3437,6 +3437,7 @@ dependencies = [
  "fluree-graph-turtle",
  "hayro-syntax",
  "hex",
+ "httpdate",
  "image",
  "reqwest 0.13.5",
  "rust-stemmers",
