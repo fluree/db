@@ -148,6 +148,8 @@ Map relationships:
 
 Maps foreign key `customer_id` to RDF object property linking to customer resource.
 
+The join links a child row to every parent row whose `rr:parent` columns equal its `rr:child` columns, and the graph holds one triple per distinct parent subject. So when the parent's join columns are not unique, a child row links to each distinct subject the matching rows mint: rows that mint the same subject (several versions of one customer, say) give one triple, and rows minting different subjects give one triple each. A null in a join column joins nothing.
+
 ### Declaring a Table's Keys (`f:key`)
 
 An R2RML graph source answers over the set of triples its mapping defines, so

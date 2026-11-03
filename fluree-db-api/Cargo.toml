@@ -216,6 +216,15 @@ name = "it_fused_aggregate_routing"
 path = "tests/it_fused_aggregate_routing.rs"
 required-features = ["iceberg", "native"]
 
+# A referencing object map over a non-unique parent key, on every lane and the
+# twin builder, checked against a native ledger holding the same triples.
+# Own binary: it flips the process-wide fast-path switch, sets
+# FLUREE_ICEBERG_LOCAL_ROOTS, and asserts routing stamps.
+[[test]]
+name = "it_r2rml_ref_fanout"
+path = "tests/it_r2rml_ref_fanout.rs"
+required-features = ["iceberg", "native"]
+
 # View-policy enforcement on R2RML / Iceberg graph sources, checked against a
 # native twin of the same fixture as the oracle.
 [[test]]

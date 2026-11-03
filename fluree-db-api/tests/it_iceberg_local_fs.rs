@@ -3620,10 +3620,10 @@ async fn a_values_subject_set_answers_its_subjects() {
 
 /// `people_window.id` references `cells.i32`, whose values 9 and 10 each sit
 /// on two rows (cells 2 and 4, cells 5 and 7) and whose 2 and 100 sit on one;
-/// every other person's reference dangles. The join keeps the smaller cell
-/// for a duplicated key and drops a dangling reference, whether the parent is
-/// read whole (no LIMIT: the first window holds 3,000 keys) or by the keys of
-/// a `LIMIT`'s first rows or a `VALUES` block's subjects.
+/// every other person's reference dangles. The join reaches both cells of a
+/// duplicated key and drops a dangling reference, whether the parent is read
+/// whole (no LIMIT: the first window holds 3,000 keys) or by the keys of a
+/// `LIMIT`'s first rows or a `VALUES` block's subjects.
 const PERSON_CELL_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
@@ -3664,12 +3664,19 @@ async fn a_referencing_map_keeps_its_answers_when_the_parent_is_read_by_key() {
     let cell = |id: u32| format!("http://example.org/cell/{id}");
     let all = vec![
         vec![person(10), cell(5)],
+        vec![person(10), cell(7)],
         vec![person(100), cell(6)],
         vec![person(2), cell(1)],
         vec![person(9), cell(2)],
+        vec![person(9), cell(4)],
     ];
     let values = [person(9), person(10), person(11)];
-    let values_answer = vec![vec![person(10), cell(5)], vec![person(9), cell(2)]];
+    let values_answer = vec![
+        vec![person(10), cell(5)],
+        vec![person(10), cell(7)],
+        vec![person(9), cell(2)],
+        vec![person(9), cell(4)],
+    ];
 
     let mut wrong = Vec::new();
     for (label, sparql_where, jsonld_values, limit) in [

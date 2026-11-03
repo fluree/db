@@ -18,9 +18,9 @@ mod term;
 // Whole-graph triple enumeration (bulk materialization / twin builder).
 pub use graph::{
     canonical_join, dependency_order, emit_batch, emit_row, emit_row_terms, enumerate_by_waves,
-    enumerate_from_batches, parent_key_insert_keep_min, plan, render_term, subject_sort_key,
-    MaterializationPlan, MaterializeStats, NTriplesCollector, ParentIndexSet, TmEmitContext,
-    TripleObserver,
+    enumerate_from_batches, parent_key_insert, plan, render_term, subject_sort_key,
+    MaterializationPlan, MaterializeStats, NTriplesCollector, ParentIndexSet, ParentKeyInsert,
+    ParentSubjects, TmEmitContext, TripleObserver,
 };
 
 // HashMap-based API (for testing and simple use)

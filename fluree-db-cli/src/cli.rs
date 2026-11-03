@@ -1526,13 +1526,9 @@ pub enum Commands {
         #[arg(long)]
         allow_mor_deletes: bool,
 
-        /// Proceed even if a foreign-key parent join key maps to MORE THAN ONE
-        /// parent row. By default the build is refused: the twin would bake one
-        /// deterministically-chosen parent per key (the lexicographically smallest)
-        /// and silently drop the rest — an R2RML RefObjectMap fan-out the builder
-        /// does not yet emit. With this flag the twin builds anyway and records the
-        /// anomaly (per-parent ambiguous-key counts) in its completion stamp.
-        /// Default: fail closed.
+        /// No effect; accepted for compatibility. A foreign-key parent join key
+        /// that matches more than one parent row gives one edge per distinct
+        /// parent subject, as R2RML specifies, so no source is refused for it.
         #[arg(long)]
         allow_duplicate_parent_keys: bool,
 

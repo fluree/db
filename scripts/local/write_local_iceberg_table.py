@@ -29,6 +29,12 @@
 - `sets.customers_history`, `sets.customers_current`, `sets.orders`: tables
   whose rows mint duplicate triples, for R2RML set semantics (their own
   namespace; see the block's comment).
+- `sets.parents_dup`: a table whose `code` and `tier` columns repeat across
+  rows that mint different subjects (`id` is unique), in two files, with a
+  null in each. A mapping joining it to itself on `code` gives a
+  referencing object map whose parent key matches several parent subjects
+  (R2RML fan-out); a parent map minting one subject per `code` gives the
+  history shape (a repeated key, one subject).
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -387,3 +393,47 @@ sets_orders.append(sets_orders_batch([
 ]))
 sets_orders = catalog.load_table("sets.orders")
 print("sets.orders table_location:", sets_orders.location())
+
+# ---------------------------------------------------------------------------
+# sets.parents_dup: repeated join keys minting different subjects (fan-out).
+# ---------------------------------------------------------------------------
+# `id` is unique; `code` repeats (A twice, C three times, across both files),
+# as does `tier`; row 7 has no `code`, row 8 no `tier`. Self-contained: it
+# creates the `sets` namespace if no other block has.
+from pyiceberg.exceptions import NamespaceAlreadyExistsError
+
+try:
+    catalog.create_namespace("sets")
+except NamespaceAlreadyExistsError:
+    pass
+parents_dup_schema = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("code", pa.string()),
+    pa.field("tier", pa.string()),
+    pa.field("name", pa.string()),
+])
+parents_dup = catalog.create_table("sets.parents_dup", schema=parents_dup_schema)
+parents_dup_rows = [
+    (1, "A", "gold", "alpha"),
+    (2, "A", "silver", "bravo"),
+    (3, "B", "gold", "charlie"),
+    (4, "C", "silver", "delta"),
+    (5, "C", "gold", "echo"),
+    (6, "C", "silver", "foxtrot"),
+    (7, None, "gold", "golf"),
+    (8, "D", None, "hotel"),
+]
+
+def parents_dup_batch(rows):
+    col = lambda i: [r[i] for r in rows]
+    return pa.table({
+        "id": pa.array(col(0), pa.int64()),
+        "code": pa.array(col(1), pa.string()),
+        "tier": pa.array(col(2), pa.string()),
+        "name": pa.array(col(3), pa.string()),
+    }, schema=parents_dup_schema)
+
+parents_dup.append(parents_dup_batch(parents_dup_rows[:4]))
+parents_dup.append(parents_dup_batch(parents_dup_rows[4:]))
+parents_dup = catalog.load_table("sets.parents_dup")
+print("parents_dup table_location:", parents_dup.location())

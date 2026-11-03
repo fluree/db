@@ -53,8 +53,8 @@ use fluree_db_r2rml::mapping::{
 use fluree_db_r2rml::materialize::{
     canonical_join, expand_template, fill_join_key_from_batch, get_join_key_from_batch,
     materialize_object_from_batch, materialize_predicate_from_batch,
-    materialize_subject_from_batch, parent_key_insert_keep_min, reverse_subject_template, RdfTerm,
-    TemplateReverser,
+    materialize_subject_from_batch, parent_key_insert, reverse_subject_template, ParentKeyInsert,
+    ParentSubjects, RdfTerm, TemplateReverser,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
@@ -64,9 +64,10 @@ use std::sync::Arc;
 
 /// Lookup table for RefObjectMap joins.
 ///
-/// Maps parent join key (as `Vec<String>`) to materialized parent subject IRI.
-/// The key is a composite key of all parent columns specified in join conditions.
-pub type ParentLookup = HashMap<Vec<String>, RdfTerm>;
+/// Maps a parent join key (as `Vec<String>`, a composite of all parent columns
+/// in the join conditions) to the distinct subjects its parent rows mint: a
+/// referencing row joins each of them (#1583).
+pub type ParentLookup = HashMap<Vec<String>, ParentSubjects>;
 
 /// A parent lookup holding every parent row's key. Only a full read of the
 /// parent table ([`build_parent_lookup`]) makes one, and the caches that share
@@ -74,15 +75,20 @@ pub type ParentLookup = HashMap<Vec<String>, RdfTerm>;
 /// `parent_lookup_cache`, the query's `r2rml_parent_memo`) hold only this
 /// type, so a lookup built from a key-filtered read is never served as whole.
 #[derive(Debug)]
-pub struct CompleteParentLookup(ParentLookup);
+pub struct CompleteParentLookup {
+    lookup: ParentLookup,
+    /// The subjects the lookup holds, over all its keys.
+    subjects: usize,
+}
 
 impl CompleteParentLookup {
     fn lookup(&self) -> &ParentLookup {
-        &self.0
+        &self.lookup
     }
 
-    fn len(&self) -> usize {
-        self.0.len()
+    /// The subjects held: the lookup's resident size, which the caches bound.
+    fn subjects(&self) -> usize {
+        self.subjects
     }
 }
 
@@ -107,9 +113,9 @@ impl ParentIndex {
 /// A parent index built by semi-join probes (#2239): for a window of
 /// referencing rows, the parent is read with the window's unresolved join
 /// keys pushed as filters, and the rows read are folded in. The filter keeps
-/// every parent row whose key it keeps, so each key read is complete (its
-/// keep-min is exact), and a probed key nothing came back for is absent from
-/// the parent (a dangling FK, never probed again).
+/// every parent row whose key it keeps, so each key read is complete (it holds
+/// every subject the key's rows mint), and a probed key nothing came back for
+/// is absent from the parent (a dangling FK, never probed again).
 #[derive(Debug)]
 struct PartialParentIndex {
     /// The resolved keys present in the parent.
@@ -363,7 +369,7 @@ impl R2rmlParentMemoInner {
         if self.map.contains_key(&key) {
             return true;
         }
-        let rows = lookup.len();
+        let rows = lookup.subjects();
         if self.total_rows.saturating_add(rows) > total_cap {
             return false;
         }
@@ -2041,7 +2047,7 @@ impl R2rmlScanOperator {
             .await?;
         let lookup =
             Arc::new(build_parent_lookup(ctx, parent_tm, &source.parent_cols, stream).await?);
-        if self.parent_memo && lookup.len() <= materialize_window_rows() {
+        if self.parent_memo && lookup.subjects() <= materialize_window_rows() {
             self.parent_lookup_cache
                 .insert(lookup_key.clone(), Arc::clone(&lookup));
             // PR-8b: also publish to the query-scoped memo so a later operator
@@ -3018,16 +3024,33 @@ fn push_scalar_eq_filter(
     }
 }
 
-/// Materialize the object term for one POM at a table row, resolving a
+/// The objects one predicate-object map gives a table row: none or one, or for a
+/// RefObjectMap, each parent subject its join key matches (borrowed from the
+/// parent lookup).
+enum PomObjects<'a> {
+    Owned(Option<RdfTerm>),
+    Parents(&'a [RdfTerm]),
+}
+
+impl PomObjects<'_> {
+    fn as_slice(&self) -> &[RdfTerm] {
+        match self {
+            Self::Owned(term) => term.as_slice(),
+            Self::Parents(subjects) => subjects,
+        }
+    }
+}
+
+/// Materialize the object terms for one POM at a table row, resolving a
 /// RefObjectMap through the pre-built parent lookup. Free fn so it runs off the
 /// operator inside a rayon worker.
-fn materialize_pom_object(
+fn materialize_pom_object<'a>(
     pom: &PredicateObjectMap,
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
-    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
+    parent_lookups: &'a HashMap<LookupCacheKey, ParentIndex>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
-) -> Result<Option<RdfTerm>> {
+) -> Result<PomObjects<'a>> {
     if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
         // MAJOR-1 (#1529 review): resolve the join through the SHARED `canonical_join`
         // so the child probe key is built in the SAME column order the parent index
@@ -3042,7 +3065,7 @@ fn materialize_pom_object(
         let child_key = match get_join_key_from_batch(&child_columns, iceberg_batch, table_row_idx)
         {
             Some(k) => k,
-            None => return Ok(None),
+            None => return Ok(PomObjects::Owned(None)),
         };
         let lookup_key = (rom.parent_triples_map.clone(), parent_join_cols.clone());
         // Trusted browse crawl: render the parent IRI from the child's own FK
@@ -3052,27 +3075,32 @@ fn materialize_pom_object(
         // one pair. Byte-identical to the scan path for a matched row (same template
         // + `iri_escape`; the join guarantees the child FK value equals the parent
         // key), differing only for a dangling FK (a templated IRI instead of no
-        // triple — the intended browse relaxation).
+        // triple — the intended browse relaxation). Every placeholder is a join
+        // column, so all the parent rows of a key mint this one subject.
         if let Some(sc) = ref_shortcuts.get(&lookup_key) {
             let values: HashMap<String, Option<String>> = parent_join_cols
                 .iter()
                 .zip(&child_key)
                 .map(|(pc, cv)| (pc.clone(), Some(cv.clone())))
                 .collect();
-            return Ok(expand_template(&sc.subject_template, &values)
-                .ok()
-                .map(RdfTerm::iri));
+            return Ok(PomObjects::Owned(
+                expand_template(&sc.subject_template, &values)
+                    .ok()
+                    .map(RdfTerm::iri),
+            ));
         }
         Ok(parent_lookups
             .get(&lookup_key)
             .and_then(|index| index.lookup().get(&child_key))
-            .cloned())
+            .map_or(PomObjects::Owned(None), |subjects| {
+                PomObjects::Parents(subjects.as_slice())
+            }))
     } else {
-        Ok(materialize_object_from_batch(
+        Ok(PomObjects::Owned(materialize_object_from_batch(
             &pom.object_map,
             iceberg_batch,
             table_row_idx,
-        )?)
+        )?))
     }
 }
 
@@ -3242,18 +3270,21 @@ fn row_passes_star_constraints(
             .iter()
             .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
         {
-            if let Some(t) = materialize_pom_object(
+            let objects = materialize_pom_object(
                 pom,
                 iceberg_batch,
                 table_row_idx,
                 parent_lookups,
                 ref_shortcuts,
-            )? {
-                let numeric = object_column_is_numeric(pom, iceberg_batch);
-                if rdf_term_eq_object_constant_cached(&t, required, numeric, canon.as_deref()) {
-                    matched = true;
-                    break;
-                }
+            )?;
+            let numeric = object_column_is_numeric(pom, iceberg_batch);
+            if objects
+                .as_slice()
+                .iter()
+                .any(|t| rdf_term_eq_object_constant_cached(t, required, numeric, canon.as_deref()))
+            {
+                matched = true;
+                break;
             }
         }
         if !matched {
@@ -3370,14 +3401,17 @@ fn derived_row_classes(
         {
             continue;
         }
-        if let Some(RdfTerm::Iri(iri)) = materialize_pom_object(
+        let objects = materialize_pom_object(
             pom,
             iceberg_batch,
             table_row_idx,
             parent_lookups,
             ref_shortcuts,
-        )? {
-            classes.push(iri);
+        )?;
+        for object in objects.as_slice() {
+            if let RdfTerm::Iri(iri) = object {
+                classes.push(iri.clone());
+            }
         }
     }
     Ok(classes)
@@ -3444,15 +3478,17 @@ fn materialize_row(
                 .iter()
                 .filter(|p| p.predicate_map.as_constant() == Some(*pred))
             {
-                if let Some(t) = materialize_pom_object(
+                // A RefObjectMap whose key matches several parent subjects gives
+                // one value each; the cross product below pairs them with the
+                // other members' values, as the graph's per-subject join does.
+                let objects = materialize_pom_object(
                     pom,
                     iceberg_batch,
                     table_row_idx,
                     parent_lookups,
                     ref_shortcuts,
-                )? {
-                    vals.push(encoder.encode(&t));
-                }
+                )?;
+                vals.extend(objects.as_slice().iter().map(|t| encoder.encode(t)));
             }
             if vals.is_empty() {
                 row_ok = false;
@@ -3525,23 +3561,19 @@ fn materialize_row(
                     .as_deref()
                     .is_some_and(|pf| pom.predicate_map.as_constant() == Some(pf))
             }) {
-                if let Some(t) = materialize_pom_object(
+                let objects = materialize_pom_object(
                     pom,
                     iceberg_batch,
                     table_row_idx,
                     parent_lookups,
                     ref_shortcuts,
-                )? {
-                    let numeric = object_column_is_numeric(pom, iceberg_batch);
-                    if rdf_term_eq_object_constant_cached(
-                        &t,
-                        required,
-                        numeric,
-                        object_constant_canon,
-                    ) {
-                        matched = true;
-                        break;
-                    }
+                )?;
+                let numeric = object_column_is_numeric(pom, iceberg_batch);
+                if objects.as_slice().iter().any(|t| {
+                    rdf_term_eq_object_constant_cached(t, required, numeric, object_constant_canon)
+                }) {
+                    matched = true;
+                    break;
                 }
             }
             if matched {
@@ -3607,14 +3639,43 @@ fn materialize_row(
             .as_deref()
             .is_none_or(|pf| pom.predicate_map.as_constant() == Some(pf))
     }) {
-        if let Some(t) = materialize_pom_object(
+        let objects = materialize_pom_object(
             pom,
             iceberg_batch,
             table_row_idx,
             parent_lookups,
             ref_shortcuts,
-        )? {
-            let object_binding = encoder.encode(&t);
+        )?;
+        let objects = objects.as_slice();
+        if objects.is_empty() {
+            continue;
+        }
+        // Variable-predicate wildcard (`?s ?p ?o` / `<iri> ?p ?o`): bind
+        // `?p` to this POM's predicate IRI. A templated/column (non-
+        // constant) predicate — rare but representable — is materialized
+        // from the row; when it expands to nothing (NULL column) the
+        // triple does not exist for this row, so the POM is SKIPPED
+        // rather than emitting a solution with a bound object and an
+        // unbound predicate.
+        let mut predicate = match pattern.predicate_var {
+            None => None,
+            Some(pv) => match pom.predicate_map.as_constant() {
+                Some(pred_iri) => Some((pv, Binding::iri(pred_iri))),
+                None => match materialize_predicate_from_batch(
+                    &pom.predicate_map,
+                    iceberg_batch,
+                    table_row_idx,
+                )? {
+                    Some(pred_iri) => Some((pv, Binding::iri(pred_iri))),
+                    None => continue,
+                },
+            },
+        };
+        // One row per object: a RefObjectMap whose key matches several parent
+        // subjects joins each (#1583). The last row takes the predicate binding,
+        // so a single object costs no clone.
+        for (i, t) in objects.iter().enumerate() {
+            let object_binding = encoder.encode(t);
             // Build the (subject?, predicate?, object) prefix once. Capacity
             // accounts for the extra type slot (a fused browse crawl also
             // projects `?type`) so no push reallocates on this hottest scan
@@ -3624,25 +3685,13 @@ fn materialize_row(
             if let Some(sv) = pattern.subject_var {
                 base.push((sv, subject_binding.clone()));
             }
-            // Variable-predicate wildcard (`?s ?p ?o` / `<iri> ?p ?o`): bind
-            // `?p` to this POM's predicate IRI. A templated/column (non-
-            // constant) predicate — rare but representable — is materialized
-            // from the row; when it expands to nothing (NULL column) the
-            // triple does not exist for this row, so the POM is SKIPPED
-            // rather than emitting a solution with a bound object and an
-            // unbound predicate.
-            if let Some(pv) = pattern.predicate_var {
-                match pom.predicate_map.as_constant() {
-                    Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
-                    None => match materialize_predicate_from_batch(
-                        &pom.predicate_map,
-                        iceberg_batch,
-                        table_row_idx,
-                    )? {
-                        Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
-                        None => continue,
-                    },
-                }
+            let predicate = if i + 1 == objects.len() {
+                predicate.take()
+            } else {
+                predicate.clone()
+            };
+            if let Some(predicate) = predicate {
+                base.push(predicate);
             }
             base.push((obj_var, object_binding));
             // When the pattern ALSO projects a type-var (a browse crawl fused
@@ -3714,7 +3763,7 @@ async fn build_parent_lookup(
     mut stream: ColumnBatchStream,
 ) -> Result<CompleteParentLookup> {
     let mut lookup = ParentLookup::new();
-    let mut dup_key_collisions = 0u64;
+    let mut subjects = 0usize;
     loop {
         // T3.1a: cancellation checkpoint before decoding the next batch, so a
         // deadline/abort stops a parent read mid-sweep instead of folding the
@@ -3740,32 +3789,31 @@ async fn build_parent_lookup(
             ctx.record_alloc(batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES));
             ctx.checkpoint()?;
         }
-        dup_key_collisions +=
-            fold_parent_batch(&mut lookup, parent_tm, parent_columns, &batch, None);
+        subjects += fold_parent_batch(&mut lookup, parent_tm, parent_columns, &batch, None);
     }
 
     tracing::debug!(
         parent_tm = %parent_tm.iri,
-        lookup_size = lookup.len(),
-        dup_key_collisions,
+        keys = lookup.len(),
+        subjects,
         "Built parent lookup table for RefObjectMap join"
     );
 
-    Ok(CompleteParentLookup(lookup))
+    Ok(CompleteParentLookup { lookup, subjects })
 }
 
-/// Fold one batch of a parent table into `lookup`: each row's join key maps to
-/// its subject, and a duplicate key keeps the minimum subject. Every non-null
-/// key read is also added to `keys_read` when given. Returns the number of
-/// duplicate-key collisions.
+/// Fold one batch of a parent table into `lookup`: each row's join key gains
+/// the subject the row mints (a key's rows may mint several, #1583). Every
+/// non-null key read is also added to `keys_read` when given. The one site that
+/// inserts into a [`ParentLookup`]. Returns the number of subjects added.
 fn fold_parent_batch(
     lookup: &mut ParentLookup,
     parent_tm: &TriplesMap,
     parent_columns: &[String],
     batch: &ColumnBatch,
     mut keys_read: Option<&mut HashSet<Vec<String>>>,
-) -> u64 {
-    let mut dup_key_collisions = 0u64;
+) -> usize {
+    let mut added = 0usize;
     for row_idx in 0..batch.num_rows {
         // Extract join key from parent row
         let key = match get_join_key_from_batch(parent_columns, batch, row_idx) {
@@ -3794,17 +3842,15 @@ fn fold_parent_batch(
                 }
             };
 
-        // Deterministic keep-min on a duplicate join key (shared with the
-        // materialize twin builder via `parent_key_insert_keep_min`), so the
-        // virtual path and the twin resolve the SAME parent and both are
-        // reproducible regardless of scan / IO-completion order — NOT the old
-        // scan-order-dependent last-wins. The true R2RML fan-out (one edge per
-        // matching parent) is a tracked shared-path follow-up.
-        if parent_key_insert_keep_min(lookup, key, subject_term) {
-            dup_key_collisions += 1;
+        // Shared with the materialize twin builder, so the virtual path and the
+        // twin join a referencing row to the same parent subjects, whatever
+        // order the parent's files arrive in.
+        match parent_key_insert(lookup, key, subject_term) {
+            ParentKeyInsert::NewKey | ParentKeyInsert::AnotherSubject => added += 1,
+            ParentKeyInsert::SameSubject => {}
         }
     }
-    dup_key_collisions
+    added
 }
 
 #[async_trait]
@@ -4578,20 +4624,17 @@ mod tests {
         let obj =
             materialize_pom_object(&pom, &child_batch, 0, &lookups, &shortcuts).expect("no error");
         assert_eq!(
-            obj,
-            Some(RdfTerm::iri("http://ex/zone/99_10")),
+            obj.as_slice(),
+            [RdfTerm::iri("http://ex/zone/99_10")],
             "composite FK with disagreeing name order must resolve via canonical_join"
         );
     }
 
     #[test]
-    fn build_parent_lookup_keeps_min_subject_on_duplicate_join_key() {
-        // MAJOR-5 (#1529 review): build_parent_lookup's last-wins -> keep-min swap
-        // changes which parent a LIVE virtual query binds on a duplicate join key,
-        // yet reverting it left the whole suite green. Two parent rows share join key
-        // 1 but mint distinct subjects; keep-min must bind the lexicographically
-        // smaller IRI regardless of row order (rows are a-then-b, so last-wins would
-        // pick 'b' — this pins the keep-min semantics on the live query path).
+    fn a_parent_lookup_holds_every_subject_a_join_key_mints() {
+        // #1583: parent rows sharing join key 1 mint subjects b, a and b again;
+        // the key holds a and b, sorted and distinct, whatever order the rows
+        // (here b-a-b) arrive in, and the lookup counts two resident subjects.
         let parent_tm = TriplesMap::new("#Customer", "customers")
             .with_subject_template("http://ex/customer/{SID}");
         let schema = Arc::new(BatchSchema::new(vec![
@@ -4611,8 +4654,12 @@ mod tests {
         let batch = ColumnBatch::new(
             schema,
             vec![
-                Column::Int64(vec![Some(1), Some(1)]),
-                Column::String(vec![Some("a".to_string()), Some("b".to_string())]),
+                Column::Int64(vec![Some(1), Some(1), Some(1)]),
+                Column::String(vec![
+                    Some("b".to_string()),
+                    Some("a".to_string()),
+                    Some("b".to_string()),
+                ]),
             ],
         )
         .unwrap();
@@ -4622,10 +4669,18 @@ mod tests {
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let lookup = build_lookup(&ctx, &parent_tm, &["JK".to_string()], vec![batch]).unwrap();
         assert_eq!(
-            lookup.lookup().get(&["1".to_string()][..]),
-            Some(&RdfTerm::iri("http://ex/customer/a")),
-            "keep-min must bind the lexicographically smaller subject on a dup join key"
+            lookup
+                .lookup()
+                .get(&["1".to_string()][..])
+                .map(ParentSubjects::as_slice),
+            Some(
+                &[
+                    RdfTerm::iri("http://ex/customer/a"),
+                    RdfTerm::iri("http://ex/customer/b")
+                ][..]
+            ),
         );
+        assert_eq!(lookup.subjects(), 2);
     }
 
     /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
@@ -5146,9 +5201,10 @@ mod tests {
         use std::sync::Mutex;
 
         /// `orders` (OID, CUST_ID) referencing `customers` (ID, VID): every
-        /// customer `ID` has two rows (`VID` = 10·ID+1 and 10·ID+2, the larger
-        /// first), so a key's keep-min is the `VID` ending in 1. The provider
-        /// applies `Eq`/`In` key filters exactly, as the reader does.
+        /// customer `ID` has three rows, `VID` = 10·ID+2, 10·ID+1 and 10·ID+2
+        /// again, so a key matches two subjects (#1583), one of them minted
+        /// twice. The provider applies `Eq`/`In` key filters exactly, as the
+        /// reader does.
         #[derive(Debug)]
         struct Tables {
             cust_ids: Vec<i64>,
@@ -5254,7 +5310,7 @@ mod tests {
                     let mut ids = Vec::new();
                     let mut vids = Vec::new();
                     for &id in &self.customers {
-                        for vid in [10 * id + 2, 10 * id + 1] {
+                        for vid in [10 * id + 2, 10 * id + 1, 10 * id + 2] {
                             if keeps(filters, "ID", id) {
                                 ids.push(id);
                                 vids.push(vid);
@@ -5351,9 +5407,9 @@ mod tests {
         }
 
         /// A probed parent answers exactly as a parent read whole, under every
-        /// `LIMIT`: keep-min on a duplicate key is unchanged (each probe returns
-        /// every parent row of each key it keeps), and a dangling FK still
-        /// joins nothing.
+        /// `LIMIT`: a key joins each distinct subject its rows mint (each probe
+        /// returns every parent row of each key it keeps), and a dangling FK
+        /// still joins nothing.
         #[test]
         fn a_probed_parent_answers_as_a_parent_read_whole() {
             // Keys 1..=7 exist; 90 and 91 dangle.
@@ -5373,16 +5429,23 @@ mod tests {
                 assert_eq!(probed, whole, "LIMIT {budget:?}");
             }
             let whole = run(&Tables::new(cust_ids, customers), None, false);
-            assert_eq!(whole.len(), 9, "nine orders reference an existing customer");
-            assert!(
-                whole.iter().all(|(_, c)| c.ends_with('1')),
-                "keep-min binds the smaller subject: {whole:?}"
+            assert_eq!(
+                whole.len(),
+                18,
+                "nine orders reference an existing customer, each to two subjects"
             );
+            for pair in whole.chunks(2) {
+                let ids: Vec<&str> = pair.iter().map(|(_, c)| &c[c.len() - 1..]).collect();
+                assert!(
+                    pair[0].0 == pair[1].0 && ids == ["1", "2"],
+                    "each order joins both of its key's subjects, in order: {whole:?}"
+                );
+            }
         }
 
         /// Under `LIMIT 2` the parent is read for the keys of the first two
         /// referencing rows only, once; a window whose keys are all resolved
-        /// reads nothing more.
+        /// reads nothing more. The first order's key alone fills the limit.
         #[test]
         fn a_limit_reads_only_its_window_keys_from_the_parent() {
             let tables = Tables::new(vec![3, 5, 3, 6, 7], (1..=7).collect());
@@ -5395,8 +5458,8 @@ mod tests {
                         "http://ex/customer/31".to_string()
                     ),
                     (
-                        "http://ex/order/2".to_string(),
-                        "http://ex/customer/51".to_string()
+                        "http://ex/order/1".to_string(),
+                        "http://ex/customer/32".to_string()
                     ),
                 ]
             );
@@ -5412,7 +5475,7 @@ mod tests {
             let n = crate::r2rml::in_pushdown_max() as i64 + 1;
             let tables = Tables::new((1..=n).collect(), (1..=n).collect());
             let rows = run(&tables, None, true);
-            assert_eq!(rows.len(), n as usize);
+            assert_eq!(rows.len(), 2 * n as usize, "two subjects per key");
             let scans = customer_scans(&tables);
             assert_eq!(scans.len(), 1, "{scans:?}");
             assert!(scans[0].1.is_empty(), "read whole: {scans:?}");
@@ -5559,9 +5622,15 @@ mod tests {
         let lookup = |n: usize| -> std::sync::Arc<CompleteParentLookup> {
             let mut m = ParentLookup::new();
             for i in 0..n {
-                m.insert(vec![i.to_string()], RdfTerm::iri(format!("http://ex/{i}")));
+                m.insert(
+                    vec![i.to_string()],
+                    ParentSubjects::new(RdfTerm::iri(format!("http://ex/{i}"))),
+                );
             }
-            std::sync::Arc::new(CompleteParentLookup(m))
+            std::sync::Arc::new(CompleteParentLookup {
+                lookup: m,
+                subjects: n,
+            })
         };
         let key = |s: &str| -> R2rmlParentMemoKey {
             (
