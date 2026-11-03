@@ -19,6 +19,7 @@ Map an Iceberg table as a queryable graph source.
 
 ```bash
 fluree iceberg map <NAME> --r2rml <PATH> [OPTIONS]
+fluree iceberg map <NAME> --remote <REMOTE> --stored-mapping <ID> [OPTIONS]
 ```
 
 ### Arguments
@@ -63,8 +64,15 @@ fluree iceberg map <NAME> --r2rml <PATH> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--r2rml <PATH>` | R2RML mapping file (Turtle format, required). Defines how table rows become RDF triples. Table references come from the mapping's `rr:tableName` entries. |
+| `--r2rml <PATH>` | R2RML mapping file (Turtle format). Defines how table rows become RDF triples. Table references come from the mapping's `rr:tableName` entries. Required, unless `--stored-mapping` names a mapping the remote stores |
 | `--r2rml-type <TYPE>` | Mapping media type (e.g., `text/turtle`); inferred from extension if omitted |
+
+**Stored on the remote** (`--remote` only; see [Stored connections and mappings](#stored-connections-and-mappings)):
+
+| Option | Description |
+|--------|-------------|
+| `--stored-catalog <ID>` | A catalog connection the remote stores, by its id there. Replaces every connection, credential and storage option; needs a mapping (`--r2rml` or `--stored-mapping`) |
+| `--stored-mapping <ID>` | An R2RML mapping the remote stores, by its id there. Replaces `--r2rml` and implies its catalog connection; `--table` defaults to the mapping's first table |
 
 **Authentication:**
 
@@ -123,7 +131,7 @@ The default is the CLI's (Python's `map_iceberg` has the same one); the server s
 
 Maps an Apache Iceberg table as a graph source that can be queried using SPARQL or JSON-LD queries. The table is accessed read-only; Fluree does not modify the Iceberg table.
 
-An R2RML mapping (`--r2rml`) is required to define how Iceberg table rows are transformed into RDF triples.
+An R2RML mapping is required to define how Iceberg table rows are transformed into RDF triples: a file (`--r2rml`), or, on a remote that stores mappings, one of its own (`--stored-mapping`; see [Stored connections and mappings](#stored-connections-and-mappings)). Without either, `map` is refused before it registers anything or contacts a remote.
 
 Four catalog modes are supported:
 
@@ -133,6 +141,30 @@ Four catalog modes are supported:
 - **AWS S3 Tables mode** (`--mode s3tables`): Resolves the table's metadata file in an S3 Tables table bucket (`--table-bucket-arn`) with `GetTableMetadataLocation`.
 
 Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` loads each table the mapping names the way a query will: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata at the location (Direct). It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail `map`: it registers the source and reports `Connection: not verified: ` followed by why: the table that did not load and the catalog's or storage's reason, a catalog that did not answer, a catalog client that could not be built, or a check that ran past 10 s (in which case the tables may only be slow). Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`). A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+
+### Stored connections and mappings
+
+Some remotes store catalog connections and R2RML mappings themselves, under ids of their own. There, `map` can name them instead of restating them:
+
+```bash
+# A mapping the remote stores; it implies its catalog connection and first table
+fluree iceberg map orders --remote origin --stored-mapping <MAPPING-ID>
+
+# A connection the remote stores, read with a local mapping file
+fluree iceberg map orders --remote origin \
+  --stored-catalog <CATALOG-ID> \
+  --r2rml mappings/orders.ttl --table sales.orders
+```
+
+The request carries the ids (`stored_catalog_id`, `stored_mapping_id`) and the source's own options (`--table`, `--branch`, `--model`, `--default-allow`), plus the mapping file's text with `--stored-catalog`. It never carries a connection, so no credential is sent again. The CLI refuses before sending anything when:
+
+- a connection, credential or storage option (`--mode`, `--catalog-uri`, `--auth-*`, `--storage-*`, `--s3-*`, ...) is given beside either reference;
+- `--r2rml` or `--r2rml-type` is given beside `--stored-mapping`;
+- `--stored-catalog` is given with `--r2rml` but no `--table` (a stored connection is mapped one named table at a time);
+- an id is empty;
+- the map would run locally (no `--remote`, and no local server to route through): a local map has no stored connections or mappings.
+
+Both references together must name the mapping's own connection; the remote checks. A server that does not store connections or mappings, a Fluree server among them, refuses the request. The CLI then shows the server's message and adds `hint: this remote may not support stored catalog connections or mappings`.
 
 ### Examples
 

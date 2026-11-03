@@ -36,6 +36,14 @@ pub async fn run_iceberg_map(
     }
 
     // Local execution
+    if StoredRefs::from_args(&args)?.is_some() {
+        return Err(CliError::Usage(
+            "--stored-catalog and --stored-mapping name a catalog connection or mapping that a \
+             remote stores, and a local map has no such store. Map on the remote with \
+             --remote <NAME>, or give the connection options and --r2rml <FILE> here"
+                .into(),
+        ));
+    }
     run_iceberg_map_local(args, dirs).await
 }
 
@@ -252,8 +260,15 @@ async fn run_iceberg_map_remote(
     client: &crate::remote_client::RemoteLedgerClient,
     args: &IcebergMapArgs,
 ) -> CliResult<()> {
-    let body = args_to_json(args)?;
-    let result = client.iceberg_map(&body).await?;
+    let refs = StoredRefs::from_args(args)?;
+    let body = match &refs {
+        Some(refs) => refs.body(args)?,
+        None => inline_body(args)?,
+    };
+    let result = client
+        .iceberg_map(&body)
+        .await
+        .map_err(|e| map_refusal(e, refs.is_some()))?;
 
     // Print response
     let gs_id = result
@@ -391,12 +406,22 @@ pub(crate) fn model_warnings_of(result: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The `iceberg/map` body for a remote server: the source's connection as the
-/// structured `catalog` / `io` its stored config holds (built by the same
-/// conversion a local map uses, so remote and local store the same record),
-/// and the mapping's text rather than its path.
-#[cfg(feature = "iceberg")]
+/// The `iceberg/map` body for a remote server: by reference when the flags
+/// name a stored catalog connection or mapping ([`StoredRefs`]), otherwise the
+/// connection and mapping given inline.
 pub fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
+    match StoredRefs::from_args(args)? {
+        Some(refs) => refs.body(args),
+        None => inline_body(args),
+    }
+}
+
+/// An inline `iceberg/map` body: the source's connection as the structured
+/// `catalog` / `io` its stored config holds (built by the same conversion a
+/// local map uses, so remote and local store the same record), and the
+/// mapping's text rather than its path.
+#[cfg(feature = "iceberg")]
+fn inline_body(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     let stored = build_iceberg_config(args)?.to_iceberg_gs_config();
     let mut body = serde_json::json!({
         "name": args.name,
@@ -408,22 +433,10 @@ pub fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     if let Some(ref v) = args.table {
         obj.insert("table".into(), v.clone().into());
     }
-    // Read file content and send it (not the path)
-    let content = std::fs::read_to_string(&args.r2rml).map_err(|e| {
-        CliError::Input(format!(
-            "failed to read R2RML file {}: {e}",
-            args.r2rml.display()
-        ))
-    })?;
-    obj.insert("r2rml".into(), content.into());
-    // Explicit `--r2rml-type` wins; otherwise infer from the mapping file
-    // extension so the server records a concrete, self-describing media type
-    // (issue #1397).
-    let r2rml_type = args
-        .r2rml_type
-        .clone()
-        .or_else(|| infer_mapping_media_type(&args.r2rml));
-    if let Some(v) = r2rml_type {
+    // The mapping's text, not its path.
+    let (text, media_type) = read_mapping(inline_mapping(args)?, args.r2rml_type.as_deref())?;
+    obj.insert("r2rml".into(), text.into());
+    if let Some(v) = media_type {
         obj.insert("r2rml_type".into(), v.into());
     }
     if let Some(ref v) = args.branch {
@@ -440,12 +453,199 @@ pub fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
 }
 
 #[cfg(not(feature = "iceberg"))]
-pub fn args_to_json(_args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
+fn inline_body(_args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     Err(CliError::Usage(
         "Iceberg support not compiled; the request a server takes is built by it. Rebuild \
          with `--features iceberg`."
             .into(),
     ))
+}
+
+/// A mapping file's text, sent instead of its path, and its media type: an
+/// explicit `--r2rml-type` wins, otherwise the file extension's, so the
+/// server records a concrete, self-describing media type (issue #1397).
+fn read_mapping(
+    path: &std::path::Path,
+    r2rml_type: Option<&str>,
+) -> CliResult<(String, Option<String>)> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        CliError::Input(format!("failed to read R2RML file {}: {e}", path.display()))
+    })?;
+    let media_type = r2rml_type
+        .map(str::to_string)
+        .or_else(|| infer_mapping_media_type(path));
+    Ok((text, media_type))
+}
+
+/// The mapping file of a map that names its connection inline. Parsing
+/// requires `--r2rml` unless `--stored-mapping` is given, and a stored mapping
+/// never reaches an inline map, so this refuses only args built some other
+/// way: a graph source needs a mapping, and an inline map has no other.
+#[cfg(feature = "iceberg")]
+fn inline_mapping(args: &IcebergMapArgs) -> CliResult<&std::path::Path> {
+    args.r2rml.as_deref().ok_or_else(|| {
+        CliError::Usage(
+            "iceberg map needs a mapping: --r2rml <FILE>, or --stored-mapping <ID> on a remote \
+             that stores mappings"
+                .into(),
+        )
+    })
+}
+
+// =============================================================================
+// fluree iceberg map, by reference
+// =============================================================================
+
+/// A map request that names what a remote already stores instead of restating
+/// it: a catalog connection (`--stored-catalog`), a mapping
+/// (`--stored-mapping`), or both. Parsing has already refused every inline
+/// connection option beside a reference, and `--r2rml` beside a stored
+/// mapping; these variants are the combinations left. Neither carries a
+/// connection, so a by-reference body cannot carry a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoredRefs {
+    /// A stored connection, read with the mapping file given here and the
+    /// table the caller names. A connection alone maps nothing, so the
+    /// mapping is required, and the remote requires the table beside it.
+    Catalog {
+        catalog: String,
+        mapping: std::path::PathBuf,
+        table: String,
+    },
+    /// A stored mapping, which implies its connection and (unless `--table`
+    /// picks another) its first table. A connection named too must be the
+    /// mapping's own; the remote checks.
+    Mapping {
+        mapping: String,
+        catalog: Option<String>,
+    },
+}
+
+/// Every key a by-reference `iceberg/map` body may carry. A key outside it is
+/// refused before any request, naming its option, rather than dropped or
+/// sent; the remote refuses unknown keys beside a reference anyway. `r2rml` /
+/// `r2rml_type` only ever travel with `stored_catalog_id`, since
+/// [`StoredRefs::Mapping`] holds no mapping text.
+pub(crate) const BY_REFERENCE_KEYS: &[&str] = &[
+    "name",
+    "table",
+    "branch",
+    "model",
+    "default_allow",
+    "stored_catalog_id",
+    "stored_mapping_id",
+    "r2rml",
+    "r2rml_type",
+];
+
+impl StoredRefs {
+    /// The references `args` names, or `None` for an inline map.
+    pub(crate) fn from_args(args: &IcebergMapArgs) -> CliResult<Option<Self>> {
+        match (&args.stored_catalog, &args.stored_mapping, &args.r2rml) {
+            (None, None, _) => Ok(None),
+            (catalog, Some(mapping), None) => Ok(Some(Self::Mapping {
+                mapping: mapping.clone(),
+                catalog: catalog.clone(),
+            })),
+            // clap refuses the pair; refuse it here too rather than pick one.
+            (_, Some(_), Some(_)) => Err(CliError::Usage(
+                "--stored-mapping and --r2rml are two mappings; give one".into(),
+            )),
+            (Some(catalog), None, Some(path)) => match &args.table {
+                Some(table) => Ok(Some(Self::Catalog {
+                    catalog: catalog.clone(),
+                    mapping: path.clone(),
+                    table: table.clone(),
+                })),
+                None => Err(CliError::Usage(
+                    "--stored-catalog with --r2rml needs --table <namespace.table>: a stored \
+                     connection is mapped one named table at a time"
+                        .into(),
+                )),
+            },
+            (Some(_), None, None) => Err(CliError::Usage(
+                "--stored-catalog needs a mapping: --r2rml <FILE>, or --stored-mapping <ID> for \
+                 one the remote stores. A stored connection alone does not say how its tables \
+                 map to RDF"
+                    .into(),
+            )),
+        }
+    }
+
+    /// The `iceberg/map` body: the references, the mapping text for a stored
+    /// connection, and the source options. Never a connection.
+    pub(crate) fn body(&self, args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
+        use serde_json::Value;
+        let some = |v: &Option<String>| v.clone().map(Value::from);
+        let mut fields: Vec<(&str, &str, Option<Value>)> = vec![
+            ("name", "<NAME>", Some(args.name.clone().into())),
+            ("branch", "--branch", some(&args.branch)),
+            ("model", "--model", some(&args.model)),
+            (
+                "default_allow",
+                "--default-allow",
+                args.default_allow.map(Value::from),
+            ),
+        ];
+        match self {
+            Self::Catalog {
+                catalog,
+                mapping,
+                table,
+            } => {
+                let (text, media_type) = read_mapping(mapping, args.r2rml_type.as_deref())?;
+                fields.push(("table", "--table", Some(table.clone().into())));
+                fields.push((
+                    "stored_catalog_id",
+                    "--stored-catalog",
+                    Some(catalog.clone().into()),
+                ));
+                fields.push(("r2rml", "--r2rml", Some(text.into())));
+                fields.push(("r2rml_type", "--r2rml-type", media_type.map(Value::from)));
+            }
+            Self::Mapping { mapping, catalog } => {
+                // Optional: the mapping's first table unless one is named.
+                fields.push(("table", "--table", some(&args.table)));
+                fields.push((
+                    "stored_mapping_id",
+                    "--stored-mapping",
+                    Some(mapping.clone().into()),
+                ));
+                fields.push(("stored_catalog_id", "--stored-catalog", some(catalog)));
+            }
+        }
+
+        let mut body = serde_json::Map::new();
+        for (key, option, value) in fields {
+            let Some(value) = value else { continue };
+            if !BY_REFERENCE_KEYS.contains(&key) {
+                return Err(CliError::Usage(format!(
+                    "{option} cannot be given with --stored-catalog or --stored-mapping"
+                )));
+            }
+            body.insert(key.to_string(), value);
+        }
+        Ok(Value::Object(body))
+    }
+}
+
+/// What a by-reference request appends to the remote's refusal of it.
+pub(crate) const STORED_REFS_HINT: &str =
+    "this remote may not support stored catalog connections or mappings";
+
+/// A failed map request as a CLI error. A by-reference request the remote
+/// refused as malformed or naming nothing it has (400, 404, 422) keeps the
+/// remote's message and adds [`STORED_REFS_HINT`]: a server without stored
+/// references refuses the keys, or the missing connection they replace. An
+/// auth failure or a conflict says what it says.
+fn map_refusal(e: crate::remote_client::RemoteLedgerError, by_reference: bool) -> CliError {
+    use crate::remote_client::RemoteLedgerError as E;
+    let refused = matches!(e, E::BadRequest(_) | E::NotFound(_) | E::ValidationError(_));
+    if by_reference && refused {
+        CliError::Remote(format!("{e}\n  hint: {STORED_REFS_HINT}"))
+    } else {
+        e.into()
+    }
 }
 
 fn print_iceberg_list_remote(
@@ -570,24 +770,13 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
     let fluree = crate::context::build_fluree(dirs).await?;
     let iceberg_config = build_iceberg_config(&args)?;
 
-    let r2rml_path = &args.r2rml;
-    let mapping_content = std::fs::read_to_string(r2rml_path).map_err(|e| {
-        crate::error::CliError::Input(format!(
-            "Failed to read R2RML mapping file '{}': {}",
-            r2rml_path.display(),
-            e
-        ))
-    })?;
+    let (mapping_content, mapping_media_type) =
+        read_mapping(inline_mapping(&args)?, args.r2rml_type.as_deref())?;
 
     let config = fluree_db_api::R2rmlCreateConfig {
         iceberg: iceberg_config,
         mapping: fluree_db_api::R2rmlMappingInput::Content(mapping_content),
-        // Explicit `--r2rml-type` wins; otherwise infer from the file
-        // extension (issue #1397).
-        mapping_media_type: args
-            .r2rml_type
-            .clone()
-            .or_else(|| infer_mapping_media_type(r2rml_path)),
+        mapping_media_type,
     };
 
     let result = fluree.create_r2rml_graph_source(config).await?;
@@ -750,8 +939,8 @@ mod tests {
         use clap::Parser;
         let mut argv = vec!["fluree", "iceberg", "map", "gs"];
         argv.extend_from_slice(args);
-        // `--r2rml` is required; a test that does not name a mapping gets one.
-        if !args.contains(&"--r2rml") {
+        // A mapping is required; a test that does not name one gets a file.
+        if !args.contains(&"--r2rml") && !args.contains(&"--stored-mapping") {
             argv.extend(["--r2rml", test_mapping()]);
         }
         match crate::cli::Cli::try_parse_from(argv).unwrap().command {
@@ -1258,6 +1447,284 @@ mod tests {
             err.contains("--auth-google-metadata applies to rest mode only"),
             "{err}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // By reference: --stored-catalog / --stored-mapping
+    // -------------------------------------------------------------------------
+
+    /// `fluree iceberg map gs <args>` as clap parses it, or clap's refusal.
+    fn try_parse(args: &[&str]) -> Result<IcebergMapArgs, clap::Error> {
+        use clap::Parser;
+        let mut argv = vec!["fluree", "iceberg", "map", "gs"];
+        argv.extend_from_slice(args);
+        crate::cli::Cli::try_parse_from(argv).map(|cli| match cli.command {
+            crate::cli::Commands::Iceberg {
+                action: crate::cli::IcebergAction::Map(args),
+            } => *args,
+            _ => unreachable!(),
+        })
+    }
+
+    /// A mapping file on disk, and its path.
+    fn mapping_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orders.ttl");
+        std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
+        let path = path.to_str().unwrap().to_string();
+        (dir, path)
+    }
+
+    /// Every key of a by-reference body is one [`BY_REFERENCE_KEYS`] allows,
+    /// and none describes a connection. An older server reads a body with no
+    /// `catalog_uri` as a rest-mode map missing its catalog and refuses it, so
+    /// a body that never carries one can never register a source there.
+    fn assert_by_reference(body: &serde_json::Value) {
+        let obj = body.as_object().expect("an object");
+        for key in obj.keys() {
+            assert!(
+                BY_REFERENCE_KEYS.contains(&key.as_str()),
+                "{key} in a by-reference body: {body}"
+            );
+        }
+        for key in ["mode", "catalog_uri", "catalog", "io"] {
+            assert!(obj.get(key).is_none(), "{key} in {body}");
+        }
+    }
+
+    #[test]
+    fn a_stored_catalog_is_sent_with_the_mapping_text() {
+        let (_dir, path) = mapping_file();
+        let body = args_to_json(&parse(&[
+            "--stored-catalog",
+            "cat-1",
+            "--r2rml",
+            &path,
+            "--table",
+            "sales.orders",
+            "--branch",
+            "dev",
+            "--model",
+            "governance:main",
+            "--default-allow",
+            "false",
+        ]))
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "name": "gs",
+                "stored_catalog_id": "cat-1",
+                "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
+                "r2rml_type": "text/turtle",
+                "table": "sales.orders",
+                "branch": "dev",
+                "model": "governance:main",
+                "default_allow": false,
+            })
+        );
+        assert_by_reference(&body);
+    }
+
+    #[test]
+    fn a_stored_mapping_alone_is_sent_as_its_id() {
+        let body = args_to_json(&parse(&["--stored-mapping", "map-1"])).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"name": "gs", "stored_mapping_id": "map-1"})
+        );
+        // A table picks one of the mapping's tables; the remote checks it.
+        let body = args_to_json(&parse(&[
+            "--stored-mapping",
+            "map-1",
+            "--table",
+            "sales.orders",
+        ]))
+        .unwrap();
+        assert_eq!(body["table"], "sales.orders");
+        assert_by_reference(&body);
+    }
+
+    #[test]
+    fn both_references_are_sent_together() {
+        let body = args_to_json(&parse(&[
+            "--stored-catalog",
+            "cat-1",
+            "--stored-mapping",
+            "map-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "name": "gs",
+                "stored_catalog_id": "cat-1",
+                "stored_mapping_id": "map-1",
+            })
+        );
+        assert_by_reference(&body);
+    }
+
+    /// Every map needs a mapping, and parsing names both ways to give one. A
+    /// stored connection does not stand in for it.
+    #[test]
+    fn a_map_without_a_mapping_is_refused_by_parsing() {
+        for argv in [
+            &["--catalog-uri", "https://c", "--table", "sales.orders"][..],
+            &["--stored-catalog", "cat-1"][..],
+            &["--stored-catalog", "cat-1", "--table", "sales.orders"][..],
+        ] {
+            let e = try_parse(argv).expect_err("refused");
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{argv:?}: {e}"
+            );
+            let e = e.to_string();
+            assert!(e.contains("--r2rml <R2RML>"), "{e}");
+            assert!(e.contains("--stored-mapping <ID>"), "{e}");
+        }
+    }
+
+    /// Args built without parsing are refused too: a stored connection
+    /// alone, or an inline connection with no mapping file.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_map_without_a_mapping_is_refused_when_built_directly() {
+        let mut args = parse(&["--stored-catalog", "cat-1", "--table", "sales.orders"]);
+        args.r2rml = None;
+        let e = args_to_json(&args).unwrap_err().to_string();
+        assert!(e.contains("--stored-catalog needs a mapping"), "{e}");
+
+        let mut args = rest(&[]);
+        args.r2rml = None;
+        let e = args_to_json(&args).unwrap_err().to_string();
+        assert!(e.contains("iceberg map needs a mapping"), "{e}");
+    }
+
+    #[test]
+    fn a_stored_catalog_with_a_mapping_file_needs_a_table() {
+        let (_dir, path) = mapping_file();
+        let e = args_to_json(&parse(&["--stored-catalog", "cat-1", "--r2rml", &path]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("--stored-catalog with --r2rml needs --table"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_blank_stored_id_is_refused_by_parsing() {
+        for flag in ["--stored-catalog", "--stored-mapping"] {
+            for id in ["", "  "] {
+                let e = try_parse(&[flag, id]).expect_err("refused");
+                assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{e}");
+            }
+        }
+    }
+
+    /// The options a reference leaves the caller. Every other `iceberg map`
+    /// option describes the connection, so it must conflict with both
+    /// references: a new connection option that does not is caught here
+    /// rather than sent beside a reference.
+    const REFERENCE_COMPATIBLE: &[&str] = &[
+        "name",
+        "remote",
+        "table",
+        "branch",
+        "model",
+        "default_allow",
+        "r2rml",
+        "r2rml_type",
+        "stored_catalog",
+        "stored_mapping",
+    ];
+
+    /// The argv that gives `arg` once, with a value it accepts.
+    fn give(arg: &clap::Arg) -> Vec<String> {
+        let long = format!("--{}", arg.get_long().expect("a long option"));
+        if !arg.get_action().takes_values() {
+            return vec![long];
+        }
+        let value = arg
+            .get_possible_values()
+            .first()
+            .map(|v| v.get_name().to_string())
+            .unwrap_or_else(|| "x".to_string());
+        vec![long, value]
+    }
+
+    #[test]
+    fn every_connection_option_conflicts_with_a_reference() {
+        use clap::CommandFactory;
+        let cli = crate::cli::Cli::command();
+        let map = cli
+            .find_subcommand("iceberg")
+            .and_then(|c| c.find_subcommand("map"))
+            .expect("iceberg map");
+        let connection: Vec<&clap::Arg> = map
+            .get_arguments()
+            .filter(|a| !a.is_global_set() && !a.is_positional())
+            .filter(|a| !REFERENCE_COMPATIBLE.contains(&a.get_id().as_str()))
+            .collect();
+        // The sweep reaches the flattened auth and storage groups.
+        for id in ["mode", "catalog_uri", "auth_bearer", "auth_google_adc"] {
+            assert!(connection.iter().any(|a| a.get_id() == id), "{id}");
+        }
+        assert!(connection
+            .iter()
+            .any(|a| a.get_id() == "storage_google_metadata"));
+        for arg in connection {
+            for reference in [["--stored-catalog", "c"], ["--stored-mapping", "m"]] {
+                let mut argv: Vec<String> = reference.iter().map(ToString::to_string).collect();
+                argv.extend(give(arg));
+                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let e = try_parse(&argv)
+                    .err()
+                    .unwrap_or_else(|| panic!("{} accepted beside {}", arg.get_id(), reference[0]));
+                assert_eq!(
+                    e.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{argv:?}: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_mapping_refuses_an_inline_mapping() {
+        let (_dir, path) = mapping_file();
+        for extra in [["--r2rml", path.as_str()], ["--r2rml-type", "text/turtle"]] {
+            let mut argv = vec!["--stored-mapping", "m"];
+            argv.extend_from_slice(&extra);
+            let e = try_parse(&argv).expect_err("refused");
+            assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict, "{e}");
+        }
+        // A stored connection takes one.
+        assert!(try_parse(&["--stored-catalog", "c", "--r2rml", &path]).is_ok());
+    }
+
+    #[test]
+    fn a_refused_reference_carries_the_hint() {
+        use crate::remote_client::RemoteLedgerError as E;
+        let refused = || E::BadRequest("stored_catalog_id is not a field of this request".into());
+        let e = map_refusal(refused(), true).to_string();
+        assert!(e.contains("stored_catalog_id is not a field"), "{e}");
+        assert!(e.contains(STORED_REFS_HINT), "{e}");
+        for e in [
+            E::NotFound("no route".into()),
+            E::ValidationError("v".into()),
+        ] {
+            assert!(map_refusal(e, true).to_string().contains(STORED_REFS_HINT));
+        }
+        // An inline map, an auth failure and a conflict say only what they say.
+        assert!(!map_refusal(refused(), false)
+            .to_string()
+            .contains(STORED_REFS_HINT));
+        for e in [E::Unauthorized, E::Conflict("exists".into())] {
+            assert!(!map_refusal(e, true).to_string().contains(STORED_REFS_HINT));
+        }
     }
 
     #[test]
