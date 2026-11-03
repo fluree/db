@@ -2,18 +2,47 @@
 //!
 //! This module provides `SendScanPlanner` which mirrors `ScanPlanner` but uses
 //! `SendIcebergStorage` for AWS SDK integration where futures must be `Send`.
+//! Both planners share the read, sort and select steps in
+//! [`crate::scan::planner`].
 
-use std::sync::Arc;
+use std::borrow::Cow;
 
 use crate::error::{IcebergError, Result};
 use crate::io::SendIcebergStorage;
-use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes};
+use crate::manifest::{parse_manifest_list_with_deletes, send_read_manifests, DataFile};
 use crate::metadata::{Schema, Snapshot, TableMetadata};
 use crate::scan::planner::{
-    effective_sequence_number, FileScanTask, IncrementalScanPlan, ScanConfig, ScanPlan,
+    plan_schema, read_data_files, resolve_projection, select_files, sort_into_plan_order,
+    IncrementalScanPlan, KeptFiles, ScanConfig, ScanPlan,
 };
-use crate::scan::pruning::can_contain_file;
 use tracing::Instrument;
+
+/// The `iceberg.scan_plan` span every full plan runs in, whether it read the
+/// manifests or selected from a kept file list. Its counters are recorded
+/// once the plan is known ([`record_plan`]).
+fn scan_plan_span() -> tracing::Span {
+    tracing::debug_span!(
+        "iceberg.scan_plan",
+        files_selected = tracing::field::Empty,
+        files_pruned = tracing::field::Empty,
+        estimated_row_count = tracing::field::Empty,
+    )
+}
+
+fn record_plan(span: &tracing::Span, plan: &ScanPlan) {
+    span.record("files_selected", plan.files_selected);
+    span.record("files_pruned", plan.files_pruned);
+    span.record("estimated_row_count", plan.estimated_row_count);
+}
+
+/// A snapshot's live data files, read from its manifests, in plan order.
+struct SnapshotFiles {
+    /// Each file with its effective data sequence number.
+    files: Vec<(DataFile, i64)>,
+    /// Whether the snapshot carries merge-on-read deletes (only ever `true`
+    /// when the fail-closed guard was overridden).
+    has_delete_manifests: bool,
+}
 
 /// Send-safe scan planner for Iceberg tables.
 ///
@@ -52,44 +81,126 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
     /// in an `iceberg.scan_plan` timing span and records the selected/pruned file
     /// counts and estimated row count on the span once they are known.
     pub async fn plan_scan_for_snapshot(&self, snapshot: &Snapshot) -> Result<ScanPlan> {
-        let span = tracing::debug_span!(
-            "iceberg.scan_plan",
-            files_selected = tracing::field::Empty,
-            files_pruned = tracing::field::Empty,
-            estimated_row_count = tracing::field::Empty,
-        );
-        async move {
-            let plan = self.plan_scan_for_snapshot_inner(snapshot).await?;
-            let span = tracing::Span::current();
-            span.record("files_selected", plan.files_selected);
-            span.record("files_pruned", plan.files_pruned);
-            span.record("estimated_row_count", plan.estimated_row_count);
-            Ok(plan)
+        let span = scan_plan_span();
+        let plan = async {
+            let (schema, projected_field_ids, projected_columns) = self.projection(snapshot)?;
+            let read = self.read_snapshot_files(snapshot).await?;
+            // A full read carries each file's commit sequence too. This is the
+            // read a consumer falls back to when its watermark expired, so it
+            // is exactly the read that most needs to be resumable.
+            Ok::<_, IcebergError>(select_files(
+                read.files,
+                self.config.filter.as_ref(),
+                &schema,
+                projected_field_ids,
+                projected_columns,
+                read.has_delete_manifests,
+                None,
+            ))
         }
-        .instrument(span)
-        .await
+        .instrument(span.clone())
+        .await?;
+        record_plan(&span, &plan);
+        log_plan(&plan);
+        Ok(plan)
     }
 
-    /// Inner planning implementation (see [`Self::plan_scan_for_snapshot`]).
-    async fn plan_scan_for_snapshot_inner(&self, snapshot: &Snapshot) -> Result<ScanPlan> {
-        // Project against the schema in effect AT `snapshot` (its field ids and
-        // types), under current column names: for a historical snapshot under
-        // schema evolution the type interpretation must follow the pinned
-        // snapshot, while callers name columns as they are now, and a task's
-        // schema names the columns its batches carry. Identical for
-        // `snapshot` = current.
-        let schema = self
-            .metadata
-            .read_schema_for_snapshot(snapshot)
-            .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))?;
-        let schema: &Schema = &schema;
+    /// Plan a scan for `snapshot` as [`Self::plan_scan_for_snapshot`] does, and
+    /// also return every live data file of the snapshot, in plan order, so the
+    /// caller can keep the list and plan later scans of the snapshot from it
+    /// with [`Self::plan_from_files`].
+    ///
+    /// The manifests are read once; the plan selects from the list (cloning
+    /// only the files it selects) under one `iceberg.scan_plan` span, which
+    /// records the plan's counters (the filter's, when there is one).
+    pub async fn plan_scan_for_snapshot_retaining_files(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<(ScanPlan, Vec<DataFile>)> {
+        let span = scan_plan_span();
+        let (plan, files) = async {
+            let (schema, projected_field_ids, projected_columns) = self.projection(snapshot)?;
+            let read = self.read_snapshot_files(snapshot).await?;
+            let plan = select_files(
+                &read.files,
+                self.config.filter.as_ref(),
+                &schema,
+                projected_field_ids,
+                projected_columns,
+                read.has_delete_manifests,
+                None,
+            );
+            let files = read.files.into_iter().map(|(file, _)| file).collect();
+            Ok::<_, IcebergError>((plan, files))
+        }
+        .instrument(span.clone())
+        .await?;
+        record_plan(&span, &plan);
+        log_plan(&plan);
+        Ok((plan, files))
+    }
 
-        // Clone schema into Arc for sharing with tasks
-        let schema_arc = Arc::new(schema.clone());
+    /// Plan a scan for `snapshot` from its live data files as a caller kept
+    /// them (from [`Self::plan_scan_for_snapshot_retaining_files`]), reading
+    /// nothing.
+    ///
+    /// `kept` must describe the snapshot's complete live file list in plan
+    /// order, its record total and the delete flag the plan that read it
+    /// reported. The plan is the one [`Self::plan_scan_for_snapshot`] would build, with the
+    /// same files in the same order, the same residual filter, the same merge-
+    /// on-read refusal, and the same `iceberg.scan_plan` span and counters,
+    /// except that its tasks carry no data sequence number: a kept list does
+    /// not hold one (the full-scan reader never reads it; a reader that needs
+    /// commit order must plan from the manifests).
+    pub fn plan_from_files(&self, snapshot: &Snapshot, kept: KeptFiles<'_>) -> Result<ScanPlan> {
+        let span = scan_plan_span();
+        let plan = span.in_scope(|| {
+            let (schema, projected_field_ids, projected_columns) = self.projection(snapshot)?;
+            // The plan that read `files` refused a delete-bearing snapshot unless
+            // the override was on; re-decide now, so a list kept under the
+            // override is refused once it is off.
+            let allow_mor = crate::mor_guard::mor_deletes_allowed();
+            crate::mor_guard::ensure_no_summary_deletes(
+                snapshot,
+                &self.metadata.location,
+                allow_mor,
+            )?;
+            crate::mor_guard::ensure_no_delete_manifests(
+                usize::from(kept.has_delete_manifests),
+                &self.metadata.location,
+                allow_mor,
+            )?;
+            Ok::<_, IcebergError>(select_files(
+                kept.files,
+                self.config.filter.as_ref(),
+                &schema,
+                projected_field_ids,
+                projected_columns,
+                kept.has_delete_manifests,
+                Some(kept.record_count),
+            ))
+        })?;
+        record_plan(&span, &plan);
+        Ok(plan)
+    }
 
-        // Determine projection
-        let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;
+    /// The schema a plan of `snapshot` reads through, and the projection
+    /// resolved under it. Resolved before any read, so a bad projection is
+    /// reported without touching storage.
+    fn projection(&self, snapshot: &Snapshot) -> Result<(Cow<'a, Schema>, Vec<i32>, Vec<String>)> {
+        // Project against the schema in effect AT `snapshot` (its field ids
+        // and types), under current column names: for a historical snapshot
+        // under schema evolution the type interpretation must follow the
+        // pinned snapshot, while callers name columns as they are now (see
+        // `plan_schema`). Identical for `snapshot` = current.
+        let schema = plan_schema(self.metadata, snapshot)?;
+        let (ids, names) = resolve_projection(self.config.projection.as_deref(), &schema)?;
+        Ok((schema, ids, names))
+    }
 
+    /// Read `snapshot`'s manifest list and data manifests into its live data
+    /// files, in plan order, after the merge-on-read guards.
+    async fn read_snapshot_files(&self, snapshot: &Snapshot) -> Result<SnapshotFiles> {
         // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads
         // only live data files and never applies deletes, so a MoR snapshot
         // would silently return deleted rows. Cheap zero-I/O check first.
@@ -123,80 +234,20 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
             "Loaded manifest list"
         );
 
-        // Collect data files from manifests, applying pruning
-        let mut tasks = Vec::new();
-        let mut files_selected = 0;
-        let mut files_pruned = 0;
-        let mut estimated_row_count = 0i64;
-
-        for manifest_entry in &manifest_entries {
-            // Skip delete manifests. Under the guard's default they never reach
-            // here (refused above); under the override they are ignored (the
-            // documented, pre-guard behavior).
-            if manifest_entry.is_deletes() {
-                continue;
-            }
-
-            // Load and parse manifest file
-            let manifest_data = self.storage.read(&manifest_entry.manifest_path).await?;
-            let data_file_entries = parse_manifest(&manifest_data)?;
-
-            for entry in data_file_entries {
-                let data_file = entry.data_file;
-
-                // Apply file-level pruning
-                if let Some(filter) = &self.config.filter {
-                    if !can_contain_file(filter, &data_file, schema) {
-                        files_pruned += 1;
-                        continue;
-                    }
-                }
-
-                files_selected += 1;
-                estimated_row_count += data_file.record_count;
-
-                // Create file scan task with schema for correct field ID mapping
-                let eff_seq = effective_sequence_number(
-                    entry.sequence_number,
-                    manifest_entry.sequence_number,
-                );
-                let task = FileScanTask::for_whole_file_with_schema(
-                    data_file,
-                    projected_field_ids.clone(),
-                    self.config.filter.clone(),
-                    Arc::clone(&schema_arc),
-                )
-                // A full read carries it too. This is the read a consumer falls
-                // back to when its watermark expired, so it is exactly the read
-                // that most needs to be resumable.
-                .with_data_sequence_number(eff_seq);
-                tasks.push(task);
-            }
-        }
-
+        // Delete manifests are skipped. Under the guard's default they never
+        // reach here (refused above); under the override they are ignored (the
+        // documented, pre-guard behavior).
+        let mut files = read_data_files(send_read_manifests(
+            self.storage,
+            manifest_entries.iter().filter(|m| !m.is_deletes()),
+            self.config.manifest_read_concurrency,
+        ))
+        .await?;
         // Commit order, path as the tiebreak — see the same sort in
         // `plan_incremental` for why this is a contract rather than a nicety.
-        tasks.sort_by(|a, b| {
-            a.data_sequence_number
-                .cmp(&b.data_sequence_number)
-                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
-        });
-
-        tracing::info!(
-            files_selected,
-            files_pruned,
-            estimated_row_count,
-            "Scan planning complete"
-        );
-
-        Ok(ScanPlan {
-            tasks,
-            projected_columns,
-            projected_field_ids,
-            residual_filter: self.config.filter.clone(),
-            estimated_row_count,
-            files_selected,
-            files_pruned,
+        sort_into_plan_order(&mut files);
+        Ok(SnapshotFiles {
+            files,
             has_delete_manifests,
         })
     }
@@ -218,9 +269,10 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
     /// window `(from_snapshot_id, to_snapshot_id]`.
     ///
     /// A file is "added in the window" when its *effective data sequence number*
-    /// (see [`effective_sequence_number`]) is strictly greater than the `from`
-    /// snapshot's sequence number. `from_snapshot_id = None` means "since genesis"
-    /// (the full live state of `to`) — used for the initial materialization.
+    /// (see [`effective_sequence_number`](crate::scan::planner::effective_sequence_number))
+    /// is strictly greater than the `from` snapshot's sequence number.
+    /// `from_snapshot_id = None` means "since genesis" (the full live state of
+    /// `to`) — used for the initial materialization.
     ///
     /// This captures **additions only**. The caller MUST first verify the window
     /// is append-only via [`TableMetadata::window_is_append_only`](crate::metadata::TableMetadata::window_is_append_only)
@@ -247,19 +299,13 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         };
         let to_seq = to_snapshot.sequence_number;
 
-        // Schema at the `to` snapshot under current names — see the same
-        // choice in `plan_scan_for_snapshot_inner`. The whole window's files are read
-        // under `to`'s schema: files added earlier in the window were written
-        // under `to`'s schema or an ancestor of it, and Iceberg field ids are
-        // stable across evolution, so `to`'s name→id mapping is correct for
-        // every file the window can select.
-        let schema = self
-            .metadata
-            .read_schema_for_snapshot(to_snapshot)
-            .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))?;
-        let schema: &Schema = &schema;
-        let schema_arc = Arc::new(schema.clone());
-        let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;
+        // Schema at the `to` snapshot under current names — see the same choice
+        // in `projection`. The whole window's files are read under `to`'s schema:
+        // files added earlier in the window were written under `to`'s schema or
+        // an ancestor of it, and Iceberg field ids are stable across evolution,
+        // so `to`'s name→id mapping is correct for every file the window can
+        // select.
+        let (schema, projected_field_ids, projected_columns) = self.projection(to_snapshot)?;
 
         let manifest_list_path = to_snapshot.manifest_list.as_ref().ok_or_else(|| {
             IcebergError::Manifest(
@@ -291,9 +337,9 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         let manifest_list_data = self.storage.read(manifest_list_path).await?;
         // Parse WITH delete manifests so the backstop can SEE them. Previously this
         // used `parse_manifest_list`, which filters `content=1` entries out — which in
-        // turn made the `is_deletes()` skip inside the loop below DEAD CODE: it read as
-        // a delete-file safety check while being unreachable. Now the entries arrive,
-        // the guard counts them, and the skip does the job its name claims.
+        // turn made the `is_deletes()` skip below DEAD CODE: it read as a delete-file
+        // safety check while being unreachable. Now the entries arrive, the guard
+        // counts them, and the skip does the job its name claims.
         let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
         let delete_manifests = manifest_entries.iter().filter(|e| e.is_deletes()).count();
         crate::mor_guard::ensure_no_delete_manifests(
@@ -302,126 +348,76 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
             allow_mor,
         )?;
 
-        let mut added_tasks = Vec::new();
-        let mut files_selected = 0;
-        let mut estimated_row_count = 0i64;
-
-        for manifest_entry in &manifest_entries {
-            if manifest_entry.is_deletes() {
-                continue; // append-only: data manifests only
-            }
-            // A manifest written at or before `from` cannot hold files newer than
-            // `from` (every file it lists has data-seq <= the manifest's seq).
-            if manifest_entry.sequence_number <= from_seq {
-                continue;
-            }
-
-            let manifest_data = self.storage.read(&manifest_entry.manifest_path).await?;
-            let data_file_entries = parse_manifest(&manifest_data)?;
-
-            for entry in data_file_entries {
-                let eff_seq = effective_sequence_number(
-                    entry.sequence_number,
-                    manifest_entry.sequence_number,
-                );
-                if eff_seq <= from_seq {
-                    continue; // present at/before `from`
-                }
-
-                let data_file = entry.data_file;
-                if let Some(filter) = &self.config.filter {
-                    if !can_contain_file(filter, &data_file, schema) {
-                        continue;
-                    }
-                }
-
-                files_selected += 1;
-                estimated_row_count += data_file.record_count;
-                added_tasks.push(
-                    FileScanTask::for_whole_file_with_schema(
-                        data_file,
-                        projected_field_ids.clone(),
-                        self.config.filter.clone(),
-                        Arc::clone(&schema_arc),
-                    )
-                    // `eff_seq` is already the value this loop filters on; carrying
-                    // it lets a consumer order or checkpoint by commit without
-                    // re-deriving it from manifests it no longer holds.
-                    .with_data_sequence_number(eff_seq),
-                );
-            }
-        }
+        // Data manifests only (append-only). A manifest written at or before
+        // `from` cannot hold files newer than `from` (every file it lists has
+        // data-seq <= the manifest's seq), so it is not read at all.
+        let mut files = read_data_files(send_read_manifests(
+            self.storage,
+            manifest_entries
+                .iter()
+                .filter(move |m| !m.is_deletes() && m.sequence_number > from_seq),
+            self.config.manifest_read_concurrency,
+        ))
+        .await?;
+        // A file present at or before `from` is not an addition.
+        files.retain(|(_, seq)| *seq > from_seq);
 
         // Commit order, with the path as a deterministic tiebreak inside a commit.
         //
-        // Manifest traversal is already sequential, so this order is stable today
-        // — but only incidentally. A consumer that stops part-way through a
-        // backlog and resumes needs the order to be a CONTRACT, because resuming
-        // against a different order either repeats files or skips them. Sorting
-        // makes it one, and costs a sort over file metadata rather than data.
+        // Manifests are read concurrently but yielded in manifest-list order, so
+        // the pre-sort order is stable today — but only incidentally. A consumer
+        // that stops part-way through a backlog and resumes needs the order to be
+        // a CONTRACT, because resuming against a different order either repeats
+        // files or skips them. Sorting makes it one, and costs a sort over file
+        // metadata rather than data.
         //
         // Sequence number first, not path first: an older row overwriting a newer
         // one is the failure mode that matters here, and processing commits in
         // order is what prevents it.
-        added_tasks.sort_by(|a, b| {
-            a.data_sequence_number
-                .cmp(&b.data_sequence_number)
-                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
-        });
+        sort_into_plan_order(&mut files);
+        // Each task carries `eff_seq`, the value the window filters on, so a
+        // consumer can order or checkpoint by commit without re-deriving it
+        // from manifests it no longer holds.
+        let plan = select_files(
+            files,
+            self.config.filter.as_ref(),
+            &schema,
+            projected_field_ids,
+            projected_columns,
+            false,
+            None,
+        );
 
         tracing::info!(
             ?from_snapshot_id,
             to_snapshot_id,
             from_seq,
             to_seq,
-            files_selected,
-            estimated_row_count,
+            files_selected = plan.files_selected,
+            estimated_row_count = plan.estimated_row_count,
             "Incremental scan planning complete (append-only)"
         );
 
         Ok(IncrementalScanPlan {
-            added_tasks,
-            projected_columns,
-            projected_field_ids,
+            files_selected: plan.files_selected,
+            estimated_row_count: plan.estimated_row_count,
+            added_tasks: plan.tasks,
+            projected_columns: plan.projected_columns,
+            projected_field_ids: plan.projected_field_ids,
             from_sequence_number: from_seq,
             to_snapshot_id,
             to_sequence_number: to_seq,
-            files_selected,
-            estimated_row_count,
         })
     }
+}
 
-    /// Resolve projection to field IDs and column names.
-    fn resolve_projection(&self, schema: &Schema) -> Result<(Vec<i32>, Vec<String>)> {
-        match &self.config.projection {
-            Some(field_ids) => {
-                let mut names = Vec::with_capacity(field_ids.len());
-                for &id in field_ids {
-                    let field = schema.field(id).ok_or_else(|| {
-                        IcebergError::Scan(format!("Field ID {id} not found in schema"))
-                    })?;
-                    names.push(field.name.clone());
-                }
-                Ok((field_ids.clone(), names))
-            }
-            None => {
-                // Project all non-nested fields
-                let field_ids: Vec<i32> = schema
-                    .fields
-                    .iter()
-                    .filter(|f| !f.is_nested())
-                    .map(|f| f.id)
-                    .collect();
-                let names: Vec<String> = schema
-                    .fields
-                    .iter()
-                    .filter(|f| !f.is_nested())
-                    .map(|f| f.name.clone())
-                    .collect();
-                Ok((field_ids, names))
-            }
-        }
-    }
+fn log_plan(plan: &ScanPlan) {
+    tracing::info!(
+        files_selected = plan.files_selected,
+        files_pruned = plan.files_pruned,
+        estimated_row_count = plan.estimated_row_count,
+        "Scan planning complete"
+    );
 }
 
 /// The production COUNT/scan path routes through `SendScanPlanner` (r2rml
@@ -788,6 +784,438 @@ mod mor_guard_tests {
         assert!(
             matches!(err, IcebergError::MergeOnReadDeletes(_)),
             "{err:?}"
+        );
+    }
+}
+
+/// Planning from a kept file list (`plan_from_files`) against reading the
+/// manifests (`plan_scan_for_snapshot`, and the miss path that keeps the list),
+/// over a hand-built table whose files prune differently under each filter.
+#[cfg(test)]
+mod plan_from_files_tests {
+    use super::*;
+    use crate::manifest::TypedValue;
+    use crate::metadata::SchemaField;
+    use crate::scan::planner::ScanPlanner;
+    use crate::scan::predicate::{Expression, LiteralValue};
+    use crate::test_support::{manifest, manifest_list, FixedFiles, TestFile};
+    use std::collections::HashMap;
+
+    const LIST: &str = "mem://t/metadata/snap-3.avro";
+
+    fn field(id: i32, name: &str, ty: &str, required: bool) -> SchemaField {
+        SchemaField {
+            id,
+            name: name.to_string(),
+            required,
+            field_type: serde_json::json!(ty),
+            doc: None,
+        }
+    }
+
+    fn snapshot(id: i64, seq: i64, list: &str) -> Snapshot {
+        Snapshot {
+            snapshot_id: id,
+            parent_snapshot_id: None,
+            sequence_number: seq,
+            timestamp_ms: 1000 * seq,
+            manifest_list: Some(list.to_string()),
+            manifests: None,
+            summary: HashMap::new(),
+            schema_id: Some(0),
+        }
+    }
+
+    /// `id long`, `region string`, `status string` (nullable). Snapshot 10
+    /// (seq 1) and the current snapshot 30 (seq 3).
+    fn metadata() -> TableMetadata {
+        TableMetadata {
+            format_version: 2,
+            table_uuid: None,
+            location: "mem://t".to_string(),
+            last_sequence_number: 3,
+            last_updated_ms: 3000,
+            last_column_id: 3,
+            current_schema_id: 0,
+            schemas: vec![Schema {
+                schema_id: 0,
+                identifier_field_ids: vec![1],
+                fields: vec![
+                    field(1, "id", "long", true),
+                    field(2, "region", "string", true),
+                    field(3, "status", "string", false),
+                ],
+            }],
+            current_snapshot_id: Some(30),
+            snapshots: vec![
+                snapshot(10, 1, "mem://t/metadata/snap-1.avro"),
+                snapshot(30, 3, LIST),
+            ],
+            snapshot_log: vec![],
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            sort_orders: vec![],
+            default_sort_order_id: 0,
+            properties: HashMap::new(),
+        }
+    }
+
+    /// 100 rows with ids `lo..=lo+99` in `region`; `status` has `nulls` nulls
+    /// (and bounds unless every row is null).
+    fn file(path: &str, lo: i64, region: &str, nulls: i64, seq: Option<i64>) -> TestFile {
+        let mut bounds = vec![
+            (1, TypedValue::Int64(lo), TypedValue::Int64(lo + 99)),
+            (
+                2,
+                TypedValue::String(region.into()),
+                TypedValue::String(region.into()),
+            ),
+        ];
+        if nulls < 100 {
+            bounds.push((
+                3,
+                TypedValue::String("closed".into()),
+                TypedValue::String("open".into()),
+            ));
+        }
+        TestFile {
+            path: path.to_string(),
+            record_count: 100,
+            bounds,
+            nulls: vec![(3, nulls)],
+            sequence_number: seq,
+        }
+    }
+
+    /// Three manifests, listed out of commit order, each listing its files out
+    /// of path order; `c0` sits in the seq-3 manifest but carries its own seq
+    /// 1, so it sorts with commit 1. Plan order is therefore
+    /// a1 a2 a3 c0 | b1 b2 | c1.
+    fn table() -> (TableMetadata, FixedFiles) {
+        let mut files = HashMap::new();
+        files.insert(
+            LIST.to_string(),
+            manifest_list(&[
+                ("mem://t/metadata/m-b.avro", 2),
+                ("mem://t/metadata/m-a.avro", 1),
+                ("mem://t/metadata/m-c.avro", 3),
+            ]),
+        );
+        files.insert(
+            "mem://t/metadata/m-a.avro".to_string(),
+            manifest(&[
+                file("a2", 100, "EU", 0, None),
+                file("a1", 0, "US", 3, None),
+                file("a3", 200, "EU", 100, None),
+            ]),
+        );
+        files.insert(
+            "mem://t/metadata/m-b.avro".to_string(),
+            manifest(&[
+                file("b2", 400, "APAC", 0, None),
+                file("b1", 300, "US", 0, None),
+            ]),
+        );
+        files.insert(
+            "mem://t/metadata/m-c.avro".to_string(),
+            manifest(&[
+                file("c1", 500, "EU", 0, None),
+                file("c0", 600, "US", 0, Some(1)),
+            ]),
+        );
+        (
+            metadata(),
+            FixedFiles {
+                files,
+                ..Default::default()
+            },
+        )
+    }
+
+    const ALL: [&str; 7] = ["a1", "a2", "a3", "c0", "b1", "b2", "c1"];
+
+    fn kept_files(files: &[DataFile], has_delete_manifests: bool) -> KeptFiles<'_> {
+        KeptFiles {
+            files,
+            record_count: files.iter().map(|f| f.record_count).sum(),
+            has_delete_manifests,
+        }
+    }
+
+    fn long(v: i64) -> LiteralValue {
+        LiteralValue::Int64(v)
+    }
+
+    fn string(v: &str) -> LiteralValue {
+        LiteralValue::String(v.into())
+    }
+
+    /// Each filter with the files it must select, in plan order, worked out by
+    /// hand from the bounds and null counts above.
+    fn cases() -> Vec<(&'static str, Option<Expression>, Vec<&'static str>)> {
+        vec![
+            ("no filter", None, ALL.to_vec()),
+            (
+                "id = 150",
+                Some(Expression::eq(1, "id", long(150))),
+                vec!["a2"],
+            ),
+            (
+                "250 <= id < 450",
+                Some(Expression::and(vec![
+                    Expression::gt_eq(1, "id", long(250)),
+                    Expression::lt(1, "id", long(450)),
+                ])),
+                vec!["a3", "b1", "b2"],
+            ),
+            (
+                "id IN (50, 550, 650)",
+                Some(Expression::in_list(
+                    1,
+                    "id",
+                    vec![long(50), long(550), long(650)],
+                )),
+                vec!["a1", "c0", "c1"],
+            ),
+            (
+                "region = EU",
+                Some(Expression::eq(2, "region", string("EU"))),
+                vec!["a2", "a3", "c1"],
+            ),
+            (
+                "status IS NULL",
+                Some(Expression::is_null(3, "status")),
+                vec!["a1", "a3"],
+            ),
+            (
+                "status IS NOT NULL",
+                Some(Expression::is_not_null(3, "status")),
+                vec!["a1", "a2", "c0", "b1", "b2", "c1"],
+            ),
+            (
+                "region = APAC OR id < 50",
+                Some(Expression::or(vec![
+                    Expression::eq(2, "region", string("APAC")),
+                    Expression::lt(1, "id", long(50)),
+                ])),
+                vec!["a1", "b2"],
+            ),
+            (
+                "id > 10000",
+                Some(Expression::gt(1, "id", long(10_000))),
+                vec![],
+            ),
+        ]
+    }
+
+    fn paths(plan: &ScanPlan) -> Vec<&str> {
+        plan.tasks
+            .iter()
+            .map(|t| t.data_file.file_path.as_str())
+            .collect()
+    }
+
+    fn config(filter: &Option<Expression>) -> ScanConfig {
+        let config = ScanConfig::new().with_projection(vec![1, 2]);
+        match filter {
+            Some(f) => config.with_filter(f.clone()),
+            None => config,
+        }
+    }
+
+    /// A plan from the kept list equals the plan read from the manifests: the
+    /// same files in the same order, the filter as every task's residual, the
+    /// same counters and projection. Both equal the hand-worked selection, so
+    /// the comparison is not two copies of one mistake agreeing.
+    #[tokio::test]
+    async fn a_plan_from_the_kept_list_equals_a_plan_from_the_manifests() {
+        let (md, storage) = table();
+        let snap = md.current_snapshot().unwrap();
+        for (name, filter, want) in cases() {
+            let planner = SendScanPlanner::new(&storage, &md, config(&filter));
+            let fresh = planner.plan_scan_for_snapshot(snap).await.unwrap();
+            let (missed, kept) = planner
+                .plan_scan_for_snapshot_retaining_files(snap)
+                .await
+                .unwrap();
+            storage.clear_reads();
+            let hit = planner
+                .plan_from_files(snap, kept_files(&kept, false))
+                .unwrap();
+            assert_eq!(
+                storage.reads(),
+                Vec::<String>::new(),
+                "{name}: a hit reads nothing"
+            );
+
+            let kept_paths: Vec<_> = kept.iter().map(|f| f.file_path.as_str()).collect();
+            assert_eq!(
+                kept_paths, ALL,
+                "{name}: the kept list is every file, in plan order"
+            );
+            let residual = format!("{filter:?}");
+            for (lane, plan) in [("fresh", &fresh), ("miss", &missed), ("hit", &hit)] {
+                assert_eq!(paths(plan), want, "{name} ({lane}): files and order");
+                assert_eq!(plan.files_selected, want.len(), "{name} ({lane})");
+                assert_eq!(plan.files_pruned, ALL.len() - want.len(), "{name} ({lane})");
+                assert_eq!(
+                    plan.estimated_row_count,
+                    100 * want.len() as i64,
+                    "{name} ({lane})"
+                );
+                assert_eq!(
+                    format!("{:?}", plan.residual_filter),
+                    residual,
+                    "{name} ({lane})"
+                );
+                for task in &plan.tasks {
+                    assert_eq!(
+                        format!("{:?}", task.residual_filter),
+                        residual,
+                        "{name} ({lane}): every task carries the filter as its residual"
+                    );
+                    assert_eq!(task.projected_field_ids, vec![1, 2]);
+                    assert!(task.iceberg_schema.is_some());
+                }
+                assert_eq!(plan.projected_columns, vec!["id", "region"]);
+            }
+            // Sequence numbers: known when read from manifests, absent from a
+            // kept list (it holds none).
+            let seqs = |plan: &ScanPlan| {
+                plan.tasks
+                    .iter()
+                    .map(|t| t.data_sequence_number)
+                    .collect::<Vec<_>>()
+            };
+            assert!(seqs(&fresh).iter().all(Option::is_some), "{name}");
+            assert_eq!(seqs(&missed), seqs(&fresh), "{name}");
+            assert!(seqs(&hit).iter().all(Option::is_none), "{name}");
+        }
+    }
+
+    /// The runtime-agnostic planner builds the same plans through the same
+    /// steps.
+    #[tokio::test]
+    async fn the_runtime_agnostic_planner_plans_the_same_files() {
+        let (md, storage) = table();
+        let snap = md.current_snapshot().unwrap();
+        for (name, filter, want) in cases() {
+            let plan = ScanPlanner::new(&storage, &md, config(&filter))
+                .plan_scan_for_snapshot(snap)
+                .await
+                .unwrap();
+            assert_eq!(paths(&plan), want, "{name}");
+            assert_eq!(plan.files_pruned, ALL.len() - want.len(), "{name}");
+        }
+    }
+
+    /// Reading one manifest at a time or all at once gives the same plan.
+    #[tokio::test]
+    async fn manifest_read_concurrency_does_not_change_the_plan() {
+        let (md, storage) = table();
+        let snap = md.current_snapshot().unwrap();
+        for concurrency in [0, 1, 2, 16] {
+            let plan = SendScanPlanner::new(
+                &storage,
+                &md,
+                ScanConfig::new().with_manifest_read_concurrency(concurrency),
+            )
+            .plan_scan_for_snapshot(snap)
+            .await
+            .unwrap();
+            assert_eq!(paths(&plan), ALL, "concurrency {concurrency}");
+        }
+    }
+
+    /// A kept list flagged as delete-bearing (kept while the merge-on-read
+    /// override was on) is refused once it is off, as a fresh plan would be.
+    #[tokio::test]
+    async fn a_kept_delete_bearing_list_is_refused() {
+        let (md, storage) = table();
+        let snap = md.current_snapshot().unwrap();
+        let planner = SendScanPlanner::new(&storage, &md, ScanConfig::new());
+        let (_, kept) = planner
+            .plan_scan_for_snapshot_retaining_files(snap)
+            .await
+            .unwrap();
+        assert!(planner
+            .plan_from_files(snap, kept_files(&kept, false))
+            .is_ok());
+        let err = planner
+            .plan_from_files(snap, kept_files(&kept, true))
+            .expect_err("the guard is on by default");
+        assert!(
+            matches!(err, IcebergError::MergeOnReadDeletes(_)),
+            "{err:?}"
+        );
+    }
+
+    /// A plan of a snapshot written before a column was renamed names the
+    /// column as it is now, from the manifests and from the kept list alike:
+    /// a task's schema names its batches' columns, and callers use current
+    /// names. Pruning goes by field id, so it is unaffected.
+    #[tokio::test]
+    async fn a_pinned_plan_names_columns_as_they_are_now() {
+        let (mut md, storage) = table();
+        let mut then = md.schemas[0].clone();
+        then.schema_id = 7;
+        then.fields[1].name = "zone".to_string();
+        md.schemas.push(then);
+        md.snapshots[0].schema_id = Some(7);
+        md.snapshots[0].manifest_list = Some(LIST.to_string());
+        let snap = md.snapshot(10).unwrap();
+        let planner = SendScanPlanner::new(
+            &storage,
+            &md,
+            ScanConfig::new().with_filter(Expression::eq(2, "region", string("EU"))),
+        );
+        let fresh = planner.plan_scan_for_snapshot(snap).await.unwrap();
+        let (missed, kept) = planner
+            .plan_scan_for_snapshot_retaining_files(snap)
+            .await
+            .unwrap();
+        let hit = planner
+            .plan_from_files(snap, kept_files(&kept, false))
+            .unwrap();
+        for (lane, plan) in [("fresh", &fresh), ("miss", &missed), ("hit", &hit)] {
+            assert_eq!(plan.projected_columns, ["id", "region", "status"], "{lane}");
+            assert_eq!(paths(plan), ["a2", "a3", "c1"], "{lane}");
+            for task in &plan.tasks {
+                let names: Vec<_> = task
+                    .iceberg_schema
+                    .as_ref()
+                    .unwrap()
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect();
+                assert_eq!(names, ["id", "region", "status"], "{lane}");
+            }
+        }
+    }
+
+    /// The incremental plan reads only manifests newer than its window and
+    /// keeps only files added after it, in commit order.
+    #[tokio::test]
+    async fn an_incremental_plan_reads_only_newer_manifests() {
+        let (md, storage) = table();
+        let plan = SendScanPlanner::new(&storage, &md, ScanConfig::new())
+            .plan_incremental(Some(10), 30)
+            .await
+            .unwrap();
+        let got: Vec<_> = plan
+            .added_tasks
+            .iter()
+            .map(|t| (t.data_file.file_path.as_str(), t.data_sequence_number))
+            .collect();
+        // c0 is listed by the seq-3 manifest but was added at seq 1.
+        assert_eq!(got, vec![("b1", Some(2)), ("b2", Some(2)), ("c1", Some(3))]);
+        assert_eq!(plan.files_selected, 3);
+        assert!(
+            !storage.reads().iter().any(|p| p.ends_with("m-a.avro")),
+            "the seq-1 manifest cannot hold an addition: {:?}",
+            storage.reads()
         );
     }
 }
