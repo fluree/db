@@ -129,6 +129,10 @@ impl HistoricalLedgerView {
         //
         // `base_t` must be read from the index root itself (it isn't in the
         // nameservice record), so we load the root first and then decide.
+        // The drops the head knows, whatever `target_t`: a graph dropped after
+        // `target_t` is no more visible as of it than at the head. The index
+        // root carries those at or before its `index_t`; a genesis fallback
+        // replays every commit, and meets every drop that way.
         let (mut snapshot, index_t) = match record.index_head_id.as_ref() {
             Some(index_cid) => {
                 let root_bytes = store.get(index_cid).await?;
@@ -154,6 +158,11 @@ impl HistoricalLedgerView {
         // commits up to target_t (index_t=0), producing a correct time-travel snapshot
         // without relying on index history coverage.
         let overlay = if let Some(head_cid) = &record.commit_head_id {
+            if target_t <= index_t && record.commit_t > index_t {
+                // No replay, but the commits after the index may drop graphs.
+                let lifecycles = crate::window_lifecycles(&store, head_cid, index_t).await?;
+                crate::apply_commit_lifecycles(&mut snapshot, &lifecycles);
+            }
             if target_t > index_t {
                 tracing::trace!(target_t, index_t, "HistoricalLedgerView: loading novelty");
                 let novelty = Self::load_novelty_range(
@@ -236,6 +245,10 @@ impl HistoricalLedgerView {
         let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
 
+        // Every walked commit's graph lifecycle, those after `target_t`
+        // included: a drop after it takes what the graph held as of it.
+        let mut lifecycle: Vec<crate::CommitLifecycle> = Vec::new();
+
         let mut commit_count = 0;
         while let Some(result) = stream.next().await {
             let commit = result?;
@@ -246,6 +259,14 @@ impl HistoricalLedgerView {
                 flakes = commit.flakes.len(),
                 "load_novelty_range: processing commit"
             );
+
+            if !commit.graph_drops.is_empty() || !commit.graph_delta.is_empty() {
+                lifecycle.push((
+                    commit.t,
+                    commit.graph_drops.clone(),
+                    commit.graph_delta.values().cloned().collect(),
+                ));
+            }
 
             // Skip commits beyond target_t
             if commit.t > target_t {
@@ -292,6 +313,9 @@ impl HistoricalLedgerView {
 
         // Apply accumulated deltas to snapshot (ns codes + graph IRIs)
         snapshot.apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)?;
+        // A later commit's revival names a graph registered by then; one
+        // registered after `target_t` is not in this registry, so it stays out.
+        let floors = crate::apply_commit_lifecycles(snapshot, &lifecycle);
 
         // Resolve the txn-meta graph Sid now that namespace_codes are complete.
         // This produces the same Sid that build_reverse_graph() will map to g_id=1.
@@ -319,6 +343,7 @@ impl HistoricalLedgerView {
         // Replay oldest→newest (walk was HEAD→oldest)
         commit_batches.reverse();
         for (mut flakes, deferred_txn_meta, commit_t) in commit_batches {
+            crate::take_dropped_flakes(&mut flakes, commit_t, &floors, &reverse_graph);
             // Materialize deferred txn-meta flakes with the correct graph Sid
             if let Some(dtm) = deferred_txn_meta {
                 if let Some(ref txn_graph) = txn_meta_graph_sid {

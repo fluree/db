@@ -161,9 +161,13 @@ Supported:
 
 Differences from the specification:
 - Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op
-- Fluree has no empty named graph: `DROP` behaves like `CLEAR`, and `CREATE`
-  registers the graph without making it visible until it holds a triple, so
-  `CREATE` of an existing graph is not an error
+- `DROP` takes the graph's history with it: a query as of an earlier `t` that
+  names the graph is refused. `MOVE` drops its source the same way. Only an
+  identity without a restricting policy may drop. The commits keep the
+  dropped facts, so a branch from before the drop has them
+- `CREATE` registers the graph without making it visible until it holds a
+  triple, so `CREATE` of an existing graph is not an error, and `CLEAR` of a
+  graph that does not exist is not an error either
 - The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
   management operations
 - A list is written and deleted through its members: deleting a value deletes
@@ -184,7 +188,8 @@ transactions remain available as an alternative write surface.
 
 `GET`, `HEAD`, `PUT`, `POST` and `DELETE` on `/v1/fluree/data/{ledger}` with
 `?graph={iri}` or `?default`. `PUT` commits only the difference from the
-graph's current contents. `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML.
+graph's current contents. `DELETE` of a named graph is `DROP GRAPH`, which
+takes its history; of the default graph, `CLEAR DEFAULT`, which keeps it. `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML.
 Direct graph identification (the request URL as the graph IRI)
 is not supported. See [Graph Store Protocol](../api/graph-store.md).
 
@@ -360,6 +365,15 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 ### Behavior changes
 
 Changes within v1 that a client may need to account for.
+
+#### `DROP` drops a graph's history (breaking)
+
+SPARQL `DROP GRAPH`, `DROP DEFAULT`, `DROP NAMED` and `DROP ALL` used to retract the graph's facts, as `CLEAR` does. They now take the graph out of the ledger: what it held is no longer queryable at the head or as of any earlier `t`, and a query that names the graph as of a `t` before the drop is refused with a 404. The drop commits without retracting anything, so it costs the same for any size of graph and is not limited by `FLUREE_MAX_GRAPH_SCAN_FLAKES`. Writing to the graph again starts it afresh, under the same IRI. The commits that wrote the dropped facts keep them: a branch created at a `t` before the drop reads them. The same applies to `fluree graph drop`, `POST /v1/fluree/drop-graph`, the Graph Store Protocol's `DELETE` of a named graph, the Python `Ledger.drop_graph`, and the source graph of `MOVE`.
+
+- Dropping needs an identity without a restricting policy; others get a 403. `CLEAR` is unchanged and remains available under policy.
+- `DROP GRAPH` of a graph that does not exist, or that was dropped, is an error unless `SILENT` (it used to be a no-op).
+- A commit that drops a graph cannot be read by a release before this one, which refuses it rather than showing the dropped graph. A ledger that never drops a graph is unchanged and stays readable by them.
+- Merging, rebasing or reverting across a drop is supported only when the result keeps the drop as committed: a fast-forward merge or rebase. Pushing and pulling commits that drop graphs is not supported yet.
 
 #### Writing schema triples is checked by modify policy
 

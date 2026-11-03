@@ -896,6 +896,7 @@ impl ApiError {
             ApiError::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
             ApiError::Query(e) => match e {
                 QE::Cancelled { .. } => errors::QUERY_CANCELLED,
+                QE::GraphDropped { .. } => errors::GRAPH_NOT_FOUND,
                 QE::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
                 QE::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
                 QE::CatalogAccessDenied { .. } => errors::CATALOG_ACCESS_DENIED,
@@ -1014,6 +1015,8 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
     use fluree_db_query::QueryError as QE;
     match err {
         QE::Cancelled { .. } => 408,
+        // As a graph the ledger does not have.
+        QE::GraphDropped { .. } => 404,
         // The in-memory join/aggregate budget: distinct from the 408 timeout
         // so the caller degrades on it specifically (too memory-heavy, not
         // too slow).

@@ -116,6 +116,23 @@ pub struct MergeReport {
     pub strategy: Option<String>,
 }
 
+/// Refuse to merge histories either of which dropped a graph since they
+/// forked, unless the merge is a fast-forward, which adopts the source's
+/// commits as they are. A merge commit carries flakes; a drop is not one, and
+/// what the other side wrote to the graph means something else once it is
+/// gone. The same check guards the merge preview and a non-fast-forward
+/// rebase, so a refusal comes before anything is written.
+pub(crate) fn refuse_merging_graph_drops(diff: &fluree_db_core::BranchDiff) -> Result<()> {
+    if diff.source.drops_graphs || diff.target.drops_graphs {
+        return Err(ApiError::BranchConflict(
+            "a graph was dropped on one of the branches since they forked; merging or \
+             rebasing over a graph drop is supported only as a fast-forward"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl crate::Fluree {
     /// Merge a source branch into a target branch.
     ///
@@ -300,6 +317,11 @@ impl crate::Fluree {
         // first-parent line. The target then adopts a line that continues
         // its own, so its `t` keeps rising.
         let is_fast_forward = diff.as_ref().is_none_or(|d| d.fast_forward);
+        if !is_fast_forward {
+            if let Some(diff) = &diff {
+                refuse_merging_graph_drops(diff)?;
+            }
+        }
 
         // A fast-forward checks the adopted commits first, against the
         // target's configuration as it is before the merge, when that

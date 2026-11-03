@@ -1418,6 +1418,34 @@ impl Novelty {
         self.refresh_content_version();
     }
 
+    /// Forget every flake `g_ids` hold: a commit dropped those graphs, so
+    /// nothing they held before it is visible any more, here or as of an
+    /// earlier `t`. What the dropping commit and later ones write to them
+    /// arrives afterwards.
+    ///
+    /// The schema and SHACL epochs move as well, even when novelty held
+    /// nothing of the graphs: a dropped graph may have held, in the index
+    /// alone, the hierarchy or shapes those caches were built from.
+    pub fn drop_graphs(&mut self, g_ids: &[GraphId]) {
+        if g_ids.is_empty() {
+            return;
+        }
+        let mut dropped_any = false;
+        for &g_id in g_ids {
+            if let Some(slot) = self.graphs.get_mut(g_id as usize) {
+                dropped_any |= slot.take().is_some();
+            }
+            self.fact_state.forget_graph(g_id);
+        }
+        if dropped_any {
+            self.recompute_totals();
+        }
+        self.epoch += 1;
+        self.schema_epoch += 1;
+        self.shacl_epoch += 1;
+        self.refresh_content_version();
+    }
+
     /// Comparator-ordered k-way merge over one graph's segments for `index` and
     /// the given range. The single primitive all reads build on.
     fn graph_merge(
@@ -2486,6 +2514,45 @@ mod tests {
             vec![Some("fr".to_string())],
             "seeking strictly past `@en` at list position 0 must still yield its `@fr` sibling"
         );
+    }
+
+    #[test]
+    fn dropping_a_graph_forgets_its_flakes_and_lets_them_return() {
+        let g_sid = Sid::new(50, "g");
+        let mut rg = no_graphs();
+        rg.insert(g_sid.clone(), 3);
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(
+                vec![
+                    make_graph_flake(1, 1, 100, 1, g_sid.clone()),
+                    make_flake(2, 1, 100, 1, true),
+                ],
+                1,
+                &rg,
+            )
+            .unwrap();
+        let (epoch, schema_epoch) = (novelty.epoch, novelty.schema_epoch);
+
+        novelty.drop_graphs(&[3]);
+        assert_eq!(novelty.overlay_flake_count(3), Some(0));
+        assert_eq!(novelty.overlay_flake_count(0), Some(1));
+        assert_eq!(novelty.len(), 1);
+        assert!(novelty.epoch > epoch && novelty.schema_epoch > schema_epoch);
+
+        // The same fact written after the drop is new to the window, not a
+        // restatement of the forgotten one.
+        novelty
+            .apply_commit(vec![make_graph_flake(1, 1, 100, 2, g_sid)], 2, &rg)
+            .unwrap();
+        assert_eq!(novelty.overlay_flake_count(3), Some(1));
+
+        // Dropping a graph novelty never held leaves its flakes alone, but
+        // still moves the epochs: the index may have held the graph's shapes.
+        let (len, epoch, shacl_epoch) = (novelty.len(), novelty.epoch, novelty.shacl_epoch);
+        novelty.drop_graphs(&[9]);
+        assert_eq!(novelty.len(), len);
+        assert!(novelty.epoch > epoch && novelty.shacl_epoch > shacl_epoch);
     }
 
     #[test]

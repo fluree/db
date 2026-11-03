@@ -77,7 +77,24 @@ impl Fluree {
     }
 
     /// Re-scope a view to a graph id already resolved against its ledger.
+    ///
+    /// A graph dropped as of the view is not there to select: a 404, saying
+    /// so when the view is from before the drop, whose history it took.
     pub(crate) fn select_graph_id(mut view: GraphDb, g_id: GraphId) -> Result<GraphDb> {
+        let registry = &view.snapshot.graph_registry;
+        if g_id != DEFAULT_GRAPH_ID && !registry.visible_at(g_id, view.t) {
+            let iri = registry.iri_for_graph_id(g_id).unwrap_or_default();
+            return Err(ApiError::GraphNotFound(
+                match registry.drop_after(g_id, view.t) {
+                    Some(floor) => format!(
+                        "graph <{iri}> was dropped at t={floor}; what it held as of t={} is no \
+                         longer queryable",
+                        view.t
+                    ),
+                    None => format!("graph <{iri}> was dropped and does not exist"),
+                },
+            ));
+        }
         if g_id != DEFAULT_GRAPH_ID && view.binary_store.is_some() && view.dict_novelty.is_some() {
             let store = view.binary_store.clone().unwrap();
             let dict_novelty = view.dict_novelty.clone().unwrap();
@@ -426,6 +443,11 @@ impl Fluree {
                         .augment_namespace_codes(view.snapshot.namespaces())
                         .map_err(|e| ApiError::internal(format!("augment namespace codes: {e}")))?;
                     store.set_ns_split_mode(view.snapshot.ns_split_mode());
+                    // What the root still holds of a graph dropped after it.
+                    let store = fluree_db_transact::store_without_dropped_graphs(
+                        store,
+                        &view.snapshot.graph_registry,
+                    );
 
                     // Populate dict novelty safely (persisted dict wins).
                     populate_dict_novelty_from_view(

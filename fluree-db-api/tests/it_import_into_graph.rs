@@ -572,6 +572,78 @@ async fn an_import_needs_a_new_graph_and_default_graph_data() {
     .await;
 }
 
+/// A graph the ledger dropped is imported into afresh under its id: it
+/// holds only the new import, from the spliced root, after a restart and
+/// after a full rebuild from the commits.
+#[tokio::test]
+async fn an_import_refills_a_dropped_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    indexed_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    let first = import_into_graph(&fluree, &[("a.ttl", SOURCE_A)], GRAPH)
+        .await
+        .expect("first import");
+    fluree
+        .drop_named_graph(LEDGER, GRAPH)
+        .await
+        .expect("drop the graph");
+
+    let g_id = first.graph.as_ref().expect("the graph").g_id;
+    // SOURCE_A's decimal has an arena; SOURCE_B has nothing to put in one.
+    let arenas = |root: fluree_db_binary_index::format::index_root::IndexRoot| {
+        root.graph_arenas.iter().filter(|a| a.g_id == g_id).count()
+    };
+    assert_eq!(arenas(published_root(&fluree).await), 1);
+
+    let second = import_into_graph(&fluree, &[("b.ttl", SOURCE_B)], GRAPH)
+        .await
+        .expect("import into the dropped graph");
+    assert_eq!(
+        second.graph.as_ref().map(|g| g.g_id),
+        Some(g_id),
+        "the graph keeps its id"
+    );
+    assert_eq!(
+        arenas(published_root(&fluree).await),
+        0,
+        "nothing of the dropped graph's arenas is left"
+    );
+
+    let expected = reference(&[("b.ttl", SOURCE_B)]).await;
+    let refilled = |all: Vec<String>| -> Vec<String> {
+        all.into_iter().filter(|s| s.starts_with("g: ")).collect()
+    };
+    assert_eq!(refilled(statements(&fluree).await), expected);
+    let reopened = fluree_at(dir.path());
+    assert_eq!(refilled(statements(&reopened).await), expected, "reopened");
+    reopened
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("full rebuild");
+    assert_eq!(
+        refilled(statements(&fluree_at(dir.path())).await),
+        expected,
+        "after a full rebuild"
+    );
+}
+
+/// The ledger's published index root.
+async fn published_root(fluree: &Fluree) -> fluree_db_binary_index::format::index_root::IndexRoot {
+    let record = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .unwrap()
+        .expect("ledger record");
+    let bytes = fluree
+        .backend()
+        .content_store(&record.ledger_id)
+        .get(&record.index_head_id.expect("an index"))
+        .await
+        .unwrap();
+    fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap()
+}
+
 /// Without a background indexer, the import indexes the commits after the
 /// ledger's index itself before it splices the graph in.
 #[tokio::test]

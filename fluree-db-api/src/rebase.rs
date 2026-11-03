@@ -367,6 +367,9 @@ impl crate::Fluree {
 
         // Fast-forward: the branch has no commits of its own to replay.
         let is_fast_forward = diff.source.commits.is_empty();
+        if !is_fast_forward {
+            crate::merge::refuse_merging_graph_drops(&diff)?;
+        }
 
         if is_fast_forward {
             // Copy the source index into the branch namespace

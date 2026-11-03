@@ -81,6 +81,21 @@ pub enum QueryError {
         snapshot_id: i64,
     },
 
+    /// A query named a graph, as of `t`, that a later commit (at `floor`)
+    /// dropped: what it held as of `t` is no longer queryable.
+    #[error(
+        "graph <{graph}> was dropped at t={floor}; what it held as of t={t} is no longer \
+         queryable"
+    )]
+    GraphDropped {
+        /// The graph's IRI.
+        graph: String,
+        /// The `t` of the commit that dropped it.
+        floor: i64,
+        /// The `t` the query reads at.
+        t: i64,
+    },
+
     /// A time-pinned graph-source read (`@iso:` / `@recorded:`) names an
     /// instant before the table's oldest retained snapshot, so no snapshot can
     /// answer it. Typed, like [`Self::SnapshotNotFound`], and never satisfied

@@ -902,6 +902,22 @@ fn reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, Grap
         .collect()
 }
 
+/// Refuse a transferred commit that drops graphs: commit transfer validates
+/// each commit against the state the earlier ones leave, which does not yet
+/// apply a drop.
+fn refuse_graph_drops(
+    commit: &fluree_db_core::Commit,
+    which: &str,
+) -> std::result::Result<(), PushError> {
+    if commit.graph_drops.is_empty() {
+        return Ok(());
+    }
+    Err(PushError::Invalid(format!(
+        "{which} (t={}) drops graphs, which pushing and pulling commits does not support yet",
+        commit.t
+    )))
+}
+
 fn decode_and_validate_commit_chain(
     _ledger_id: &str,
     request: &PushCommitsRequest,
@@ -915,6 +931,7 @@ fn decode_and_validate_commit_chain(
         let bytes = b64.0.clone();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
+        refuse_graph_drops(&commit, &format!("commit[{idx}]"))?;
 
         // Reject empty commits (no flakes) - keep semantics clear. A merge
         // commit is exempt: it records the merge even when the strategy
@@ -992,6 +1009,7 @@ fn decode_merged_commits(
             let bytes = b64.0.clone();
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
+            refuse_graph_drops(&commit, &format!("merged_commits[{idx}]"))?;
             let digest_hex = fluree_db_core::sha256_hex(&bytes);
             Ok(PushCommitDecoded {
                 commit,
@@ -1398,6 +1416,14 @@ fn apply_pushed_commits_to_state(
         std::sync::Arc::make_mut(&mut base.snapshot)
             .apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)
             .map_err(|e| PushError::Internal(format!("apply_envelope_deltas failed: {e}")))?;
+        // A graph the ledger dropped exists again from the commit that writes
+        // it, as replay finds.
+        for c in decoded {
+            base.revive_graphs(
+                c.commit.graph_delta.values().map(String::as_str),
+                c.commit.t,
+            );
+        }
     }
 
     // Build reverse_graph now that namespace_codes and graph_registry are complete.

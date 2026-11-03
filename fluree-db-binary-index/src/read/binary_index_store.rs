@@ -359,8 +359,10 @@ pub struct BinaryIndexStore {
     /// Process-unique instance id (see [`NEXT_STORE_ID`]) — the identity of this
     /// store's frozen dictionary id-assignment, for the per-segment cache key.
     store_id: u64,
-    dicts: DictionarySet,
-    graph_indexes: HashMap<GraphId, GraphIndex>,
+    /// Shared with the stores [`Self::without_graphs`] derives.
+    dicts: Arc<DictionarySet>,
+    /// Shared per graph with the stores [`Self::without_graphs`] derives.
+    graph_indexes: HashMap<GraphId, Arc<GraphIndex>>,
     /// o_type table: full list (for iteration / serialization).
     o_type_table: Vec<OTypeTableEntry>,
     /// O(1) lookup: o_type value → index into o_type_table.
@@ -464,7 +466,7 @@ impl BinaryIndexStore {
     pub fn empty(cache_dir: PathBuf) -> Self {
         Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            dicts: DictionarySet {
+            dicts: Arc::new(DictionarySet {
                 predicates: PredicateDict::new(),
                 predicate_reverse: HashMap::new(),
                 graphs_reverse: HashMap::new(),
@@ -479,7 +481,7 @@ impl BinaryIndexStore {
                 prefix_trie: Arc::new(PrefixTrie::new()),
                 language_tags: LanguageTagDict::new(),
                 dt_sids: Vec::new(),
-            },
+            }),
             graph_indexes: HashMap::new(),
             o_type_table: Vec::new(),
             o_type_index: HashMap::new(),
@@ -558,7 +560,7 @@ impl BinaryIndexStore {
             root,
             cache_dir,
             leaflet_cache.as_ref(),
-            prev.map(|p| &p.dicts),
+            prev.map(|p| &*p.dicts),
         )
         .await?;
 
@@ -667,8 +669,11 @@ impl BinaryIndexStore {
         let disk_cache = super::artifact_cache::DiskArtifactCache::for_dir(cache_dir);
         Ok(Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            dicts,
-            graph_indexes,
+            dicts: Arc::new(dicts),
+            graph_indexes: graph_indexes
+                .into_iter()
+                .map(|(g_id, gi)| (g_id, Arc::new(gi)))
+                .collect(),
             o_type_table,
             o_type_index,
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
@@ -705,6 +710,12 @@ impl BinaryIndexStore {
         self.store_id
     }
 
+    /// The dictionaries, to write in a test's hand-built store.
+    #[cfg(test)]
+    fn dicts_mut(&mut self) -> &mut DictionarySet {
+        Arc::get_mut(&mut self.dicts).expect("a test store does not share its dictionaries")
+    }
+
     pub fn max_t(&self) -> i64 {
         self.max_t
     }
@@ -729,6 +740,61 @@ impl BinaryIndexStore {
     #[inline]
     pub fn lex_sorted_string_ids(&self) -> bool {
         self.lex_sorted_string_ids
+    }
+
+    /// This store less what it holds of `g_ids`: their branches, leaves and
+    /// arenas. Everything else — the dictionaries, the other graphs, the leaf
+    /// caches — is shared, so this costs a map clone, not a load.
+    ///
+    /// For a ledger that dropped those graphs after this store's `max_t`:
+    /// the index still holds their facts from before the drop, which no read
+    /// may return. Without an index of its own, a graph reads from novelty
+    /// alone, exactly as one created since the last index build does — so
+    /// every reader, scans, fast paths and arenas alike, sees what the drop
+    /// left without knowing about drops.
+    ///
+    /// The derived store gets its own id: a cache keyed by store id may hold
+    /// what this store read of the removed graphs.
+    pub fn without_graphs(&self, g_ids: &[GraphId]) -> Self {
+        Self {
+            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            dicts: Arc::clone(&self.dicts),
+            graph_indexes: self
+                .graph_indexes
+                .iter()
+                .filter(|(g_id, _)| !g_ids.contains(g_id))
+                .map(|(g_id, gi)| (*g_id, Arc::clone(gi)))
+                .collect(),
+            o_type_table: self.o_type_table.clone(),
+            o_type_index: self.o_type_index.clone(),
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: self.residency_mode,
+            cas: self.cas.clone(),
+            cache_dir: self.cache_dir.clone(),
+            _disk_cache: Arc::clone(&self._disk_cache),
+            leaflet_cache: self.leaflet_cache.clone(),
+            remote_leaf_metadata: RwLock::new(HashMap::new()),
+            remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            remote_leaf_fetch: self.remote_leaf_fetch,
+            max_t: self.max_t,
+            base_t: self.base_t,
+            language_tags: self.language_tags.clone(),
+            lex_sorted_string_ids: self.lex_sorted_string_ids,
+            ns_split_mode: self.ns_split_mode,
+            ns_split_mode_set: self.ns_split_mode_set,
+            p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
+            decimal_only_proofs: RwLock::new(HashMap::new()),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Whether this store holds an index (branches or arenas) for `g_id`.
+    pub fn has_graph_index(&self, g_id: GraphId) -> bool {
+        self.graph_indexes.contains_key(&g_id)
     }
 
     /// Get the branch manifest for a graph + sort order.
@@ -2912,9 +2978,14 @@ impl BinaryIndexStore {
         // be shared with the previous store; `make_mut` unshares only when
         // there is something to add.
         if !new_entries.is_empty() {
-            let codes = Arc::make_mut(&mut self.dicts.namespace_codes);
-            let trie = Arc::make_mut(&mut self.dicts.prefix_trie);
-            let reverse = Arc::make_mut(&mut self.dicts.namespace_reverse);
+            // A store shares its dictionaries only with the stores derived
+            // from it once it was loaded, and loading is where it is augmented.
+            let dicts = Arc::get_mut(&mut self.dicts).ok_or_else(|| {
+                io::Error::other("cannot augment the namespaces of a derived index store")
+            })?;
+            let codes = Arc::make_mut(&mut dicts.namespace_codes);
+            let trie = Arc::make_mut(&mut dicts.prefix_trie);
+            let reverse = Arc::make_mut(&mut dicts.namespace_reverse);
             for (code, prefix) in new_entries {
                 codes.insert(code, prefix.clone());
                 if !prefix.is_empty() {
@@ -4810,7 +4881,7 @@ pub(crate) mod tests {
 
         let cache_dir = temp_cache_dir();
         let mut binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
-        binary_store.dicts.subject_reverse_tree = Some(Arc::new(tree));
+        binary_store.dicts_mut().subject_reverse_tree = Some(Arc::new(tree));
         let binary_store = Arc::new(binary_store);
 
         // Cold: the translation lookup misses, typed and registered.
@@ -5155,7 +5226,7 @@ pub(crate) mod tests {
         binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
         binary_store.graph_indexes.insert(
             0,
-            GraphIndex {
+            Arc::new(GraphIndex {
                 orders: HashMap::from([(
                     RunSortOrder::Post,
                     Arc::new(crate::format::branch::BranchManifest { leaves }),
@@ -5165,7 +5236,7 @@ pub(crate) mod tests {
                 vectors: HashMap::new(),
                 spatial: HashMap::new(),
                 fulltext: HashMap::new(),
-            },
+            }),
         );
 
         let ids = binary_store.list_predicate_ids().expect("list predicates");
@@ -5220,7 +5291,7 @@ pub(crate) mod tests {
         };
         binary_store.graph_indexes.insert(
             0,
-            GraphIndex {
+            Arc::new(GraphIndex {
                 orders: HashMap::from([(
                     RunSortOrder::Spot,
                     Arc::new(crate::format::branch::BranchManifest { leaves: vec![leaf] }),
@@ -5230,7 +5301,7 @@ pub(crate) mod tests {
                 vectors: HashMap::new(),
                 spatial: HashMap::new(),
                 fulltext: HashMap::new(),
-            },
+            }),
         );
 
         let holds = |s_id| binary_store.subject_holds_lists(0, s_id).unwrap();
@@ -5696,7 +5767,7 @@ pub(crate) mod tests {
                 drop(view);
                 Arc::get_mut(&mut store)
                     .unwrap()
-                    .dicts
+                    .dicts_mut()
                     .subject_forward_packs
                     .insert(
                         ns_code,
@@ -5740,20 +5811,20 @@ pub(crate) mod tests {
         let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
         store.set_ns_split_mode(NsSplitMode::MostGranular);
         // Full-IRI namespaces have no prefix, as in a real store.
-        store.dicts.namespace_codes = Arc::new(HashMap::from([
+        store.dicts_mut().namespace_codes = Arc::new(HashMap::from([
             (EX, "https://example.org/".to_string()),
             (EX_A, "https://example.org/a/".to_string()),
             (DUP, "https://example.org/".to_string()),
             (EX_C, "https://example.org/c".to_string()),
         ]));
-        store.dicts.namespace_reverse = Arc::new(HashMap::from([
+        store.dicts_mut().namespace_reverse = Arc::new(HashMap::from([
             ("https://example.org/".to_string(), EX),
             ("https://example.org/a/".to_string(), EX_A),
             ("https://example.org/c/".to_string(), EX_C),
         ]));
         let mut reverse = Vec::new();
         for (ns_code, suffix) in subjects {
-            store.dicts.subject_forward_packs.insert(
+            store.dicts_mut().subject_forward_packs.insert(
                 ns_code,
                 ForwardPackReader::from_memory(vec![Arc::from(
                     make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
@@ -5767,7 +5838,7 @@ pub(crate) mod tests {
         }
         reverse.sort_by(|a, b| a.key.cmp(&b.key));
         let tree = Arc::new(build_reverse_reader(reverse));
-        store.dicts.subject_reverse_tree = Some(Arc::clone(&tree));
+        store.dicts_mut().subject_reverse_tree = Some(Arc::clone(&tree));
         let store = Arc::new(store);
         let view = BinaryGraphView::new(Arc::clone(&store), 0);
 
@@ -5812,14 +5883,14 @@ pub(crate) mod tests {
             let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
             store.set_ns_split_mode(NsSplitMode::MostGranular);
             if twin_ns == VENDORS {
-                store.dicts.namespace_codes =
+                store.dicts_mut().namespace_codes =
                     Arc::new(HashMap::from([(VENDORS, VENDORS_PREFIX.to_string())]));
-                store.dicts.namespace_reverse =
+                store.dicts_mut().namespace_reverse =
                     Arc::new(HashMap::from([(VENDORS_PREFIX.to_string(), VENDORS)]));
             }
             let mut reverse = Vec::new();
             for (ns_code, suffix) in [(twin_ns, twin_suffix), (namespaces::OVERFLOW, IRI)] {
-                store.dicts.subject_forward_packs.insert(
+                store.dicts_mut().subject_forward_packs.insert(
                     ns_code,
                     ForwardPackReader::from_memory(vec![Arc::from(
                         make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
@@ -5832,7 +5903,7 @@ pub(crate) mod tests {
                 });
             }
             reverse.sort_by(|a, b| a.key.cmp(&b.key));
-            store.dicts.subject_reverse_tree = Some(Arc::new(build_reverse_reader(reverse)));
+            store.dicts_mut().subject_reverse_tree = Some(Arc::new(build_reverse_reader(reverse)));
             let store = Arc::new(store);
             assert_eq!(
                 store.find_subject_sid(IRI).unwrap(),
@@ -5865,9 +5936,9 @@ pub(crate) mod tests {
 
         let cache_dir = temp_cache_dir();
         let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
-        store.dicts.namespace_codes =
+        store.dicts_mut().namespace_codes =
             Arc::new(HashMap::from([(100, "https://example.org/".to_string())]));
-        store.dicts.subject_forward_packs.insert(
+        store.dicts_mut().subject_forward_packs.insert(
             100,
             ForwardPackReader::from_memory(vec![Arc::from(
                 make_subject_pack_bytes(&[(1, b"product")]).into_boxed_slice(),
@@ -5911,7 +5982,7 @@ pub(crate) mod tests {
         for initialized in [true, false] {
             let cache_dir = temp_cache_dir();
             let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
-            store.dicts.namespace_codes = Arc::new(HashMap::from([
+            store.dicts_mut().namespace_codes = Arc::new(HashMap::from([
                 (100, "https://example.org/".to_string()),
                 (namespaces::BLANK_NODE, "_:".to_string()),
             ]));
@@ -5955,7 +6026,7 @@ pub(crate) mod tests {
         let full_iri = "https://dblp.org/streams/conf/IEEEpact";
         let s_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
 
-        store.dicts.subject_reverse_tree =
+        store.dicts_mut().subject_reverse_tree =
             Some(Arc::new(build_reverse_reader(vec![ReverseEntry {
                 key: crate::dict::reverse_leaf::subject_reverse_key(
                     namespaces::OVERFLOW,
@@ -5963,7 +6034,7 @@ pub(crate) mod tests {
                 ),
                 id: s_id,
             }])));
-        store.dicts.subject_forward_packs.insert(
+        store.dicts_mut().subject_forward_packs.insert(
             namespaces::OVERFLOW,
             ForwardPackReader::from_memory(vec![Arc::from(
                 make_subject_pack_bytes(&[(7, full_iri.as_bytes())]).into_boxed_slice(),

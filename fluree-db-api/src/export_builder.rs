@@ -175,6 +175,7 @@ impl<'a> ExportBuilder<'a> {
         registry
             .iter_entries()
             .filter(|(g_id, _)| self.system_graphs || !export::is_system_graph(*g_id))
+            .filter(|(g_id, _)| !registry.is_dropped(*g_id))
             .collect()
     }
 
@@ -199,13 +200,17 @@ impl<'a> ExportBuilder<'a> {
         registry
             .iter_entries()
             .filter(|(g_id, _)| !export::is_system_graph(*g_id) && Some(*g_id) != target)
+            .filter(|(g_id, _)| !registry.is_dropped(*g_id))
             .count() as u64
     }
 
     /// Resolve a graph IRI to a `(g_id, iri)` pair via the graph registry.
     fn resolve_graph_iri(&self, registry: &GraphRegistry) -> Result<(u16, String)> {
         let iri = self.graph_iri.as_deref().unwrap();
-        match registry.graph_id_for_iri(iri) {
+        match registry
+            .graph_id_for_iri(iri)
+            .filter(|g_id| !registry.is_dropped(*g_id))
+        {
             Some(g_id) => Ok((g_id, iri.to_string())),
             None => Err(ApiError::Config(format!(
                 "graph '{iri}' not found in ledger graph registry"

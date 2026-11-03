@@ -299,6 +299,15 @@ pub enum TransactError {
         graph_iri: String,
     },
 
+    /// A `DROP GRAPH` named a graph that does not exist: never registered, or
+    /// dropped already and not written since. An error unless `SILENT`, per
+    /// SPARQL 1.1 Update §3.2.2.
+    #[error("graph <{graph_iri}> does not exist; use DROP SILENT to ignore")]
+    GraphNotFound {
+        /// The graph IRI the drop named.
+        graph_iri: String,
+    },
+
     /// A request-time setting that the ledger config's `f:overrideControl`
     /// does not permit for this request, where applying less than the caller
     /// asked for would be unsafe: inline SHACL shapes (`opts.shapes`) the

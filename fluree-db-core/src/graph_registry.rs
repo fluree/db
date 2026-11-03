@@ -129,6 +129,85 @@ pub fn config_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#config")
 }
 
+/// What the latest drop of a graph left of it.
+///
+/// Every fact the graph held before `floor` (the `t` of the dropping commit)
+/// is gone, at the head and as of any earlier `t`. A named graph stays
+/// dropped until a commit writes it again (`revived`); the default graph is
+/// never without a graph, so its drop revives it at the same `t`. A graph
+/// keeps its g_id across drops: the floor, not a new id, separates what it
+/// holds now from what it held before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphDrop {
+    /// `t` of the commit that dropped the graph last.
+    pub floor: i64,
+    /// `t` of the first commit at or after `floor` that wrote the graph again,
+    /// if any.
+    pub revived: Option<i64>,
+}
+
+/// Wire form of a root's graph drops (`IndexRoot::graph_drops` in
+/// `fluree-db-binary-index`): `u32` count, then per graph
+/// `g_id: u16`, `floor: i64`, `revived: u8 presence + i64`, all little-endian.
+/// Shared by both FIR6 decoders.
+pub fn encode_graph_drops(drops: &[(GraphId, GraphDrop)], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(drops.len() as u32).to_le_bytes());
+    for (g_id, drop) in drops {
+        buf.extend_from_slice(&g_id.to_le_bytes());
+        buf.extend_from_slice(&drop.floor.to_le_bytes());
+        match drop.revived {
+            Some(t) => {
+                buf.push(1);
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
+            None => {
+                buf.push(0);
+                buf.extend_from_slice(&0i64.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Inverse of [`encode_graph_drops`], reading at `pos`.
+pub fn decode_graph_drops(
+    data: &[u8],
+    pos: &mut usize,
+) -> std::io::Result<Vec<(GraphId, GraphDrop)>> {
+    const ENTRY_LEN: usize = 2 + 8 + 1 + 8;
+    let bad = |msg: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("graph_drops: {msg}"),
+        )
+    };
+    let count_bytes = data
+        .get(*pos..*pos + 4)
+        .ok_or_else(|| bad("truncated count"))?;
+    let count = u32::from_le_bytes(count_bytes.try_into().expect("4 bytes")) as usize;
+    *pos += 4;
+    let body = data
+        .get(*pos..*pos + count.saturating_mul(ENTRY_LEN))
+        .ok_or_else(|| bad("truncated entries"))?;
+    let mut drops: Vec<(GraphId, GraphDrop)> = Vec::with_capacity(count);
+    for entry in body.chunks_exact(ENTRY_LEN) {
+        let g_id = u16::from_le_bytes([entry[0], entry[1]]);
+        let floor = i64::from_le_bytes(entry[2..10].try_into().expect("8 bytes"));
+        let revived = match entry[10] {
+            0 => None,
+            1 => Some(i64::from_le_bytes(
+                entry[11..19].try_into().expect("8 bytes"),
+            )),
+            other => return Err(bad(&format!("revived presence byte {other}"))),
+        };
+        if drops.last().is_some_and(|(last, _)| *last >= g_id) {
+            return Err(bad("entries must be ascending by g_id"));
+        }
+        drops.push((g_id, GraphDrop { floor, revived }));
+    }
+    *pos += body.len();
+    Ok(drops)
+}
+
 /// Ledger-level registry mapping graph IRIs to deterministic GraphIds.
 ///
 /// In production, use `new_for_ledger(ledger_id)` or `seed_from_root_iris()`
@@ -146,6 +225,9 @@ pub struct GraphRegistry {
     id_to_iri: Vec<Option<Arc<str>>>,
     /// Next available GraphId for assignment (always >= FIRST_USER_GRAPH_ID).
     next_id: GraphId,
+    /// The graphs a commit has dropped, with what each drop left. A registry
+    /// entry is never removed: a dropped graph keeps its IRI and id.
+    drops: std::collections::BTreeMap<GraphId, GraphDrop>,
 }
 
 impl Default for GraphRegistry {
@@ -159,6 +241,7 @@ impl Default for GraphRegistry {
             // slot 0 = default graph, slot 1 = txn-meta (empty), slot 2 = config (empty)
             id_to_iri: vec![None, None, None],
             next_id: FIRST_USER_GRAPH_ID,
+            drops: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -179,6 +262,7 @@ impl GraphRegistry {
             iri_to_id,
             id_to_iri: vec![None, Some(txn_meta), Some(config)],
             next_id: FIRST_USER_GRAPH_ID,
+            drops: std::collections::BTreeMap::new(),
         }
     }
 
@@ -238,6 +322,7 @@ impl GraphRegistry {
             iri_to_id,
             id_to_iri,
             next_id,
+            drops: std::collections::BTreeMap::new(),
         })
     }
 
@@ -285,6 +370,7 @@ impl GraphRegistry {
             iri_to_id,
             id_to_iri,
             next_id,
+            drops: std::collections::BTreeMap::new(),
         })
     }
 
@@ -368,16 +454,183 @@ impl GraphRegistry {
         result
     }
 
-    /// Forward lookup: IRI → GraphId.
+    /// Forward lookup: IRI → GraphId. A dropped graph keeps its id, so this
+    /// answers for it too; [`Self::is_dropped`] tells it apart.
     pub fn graph_id_for_iri(&self, iri: &str) -> Option<GraphId> {
         self.iri_to_id.get(iri).copied()
     }
 
-    /// Whether any of `iris` is not yet registered — that is, whether a
-    /// commit writing to them would register a graph.
+    /// Whether any of `iris` is not yet registered, or is dropped — that is,
+    /// whether a commit writing to them would register a graph, or bring a
+    /// dropped one back.
     pub fn has_unregistered<'a>(&self, iris: impl IntoIterator<Item = &'a str>) -> bool {
+        iris.into_iter().any(|iri| {
+            self.iri_to_id
+                .get(iri)
+                .is_none_or(|g_id| self.is_dropped(*g_id))
+        })
+    }
+
+    /// Record that a commit at `t` dropped `g_ids`: what they held before `t`
+    /// is gone. The default graph is revived at once, since there is always
+    /// a default graph; a named graph stays dropped until [`Self::revive`].
+    pub fn apply_drops(&mut self, g_ids: &[GraphId], t: i64) {
+        for &g_id in g_ids {
+            let revived = (g_id == DEFAULT_GRAPH_ID).then_some(t);
+            self.drops.insert(g_id, GraphDrop { floor: t, revived });
+        }
+    }
+
+    /// Record that a commit at `t` wrote `iris`, after its drops applied:
+    /// each of them that is dropped exists again from `t`.
+    pub fn revive<'a>(&mut self, iris: impl IntoIterator<Item = &'a str>, t: i64) {
+        if self.drops.is_empty() {
+            return;
+        }
+        for iri in iris {
+            let Some(g_id) = self.iri_to_id.get(iri) else {
+                continue;
+            };
+            if let Some(drop) = self.drops.get_mut(g_id) {
+                if drop.revived.is_none() && drop.floor <= t {
+                    drop.revived = Some(t);
+                }
+            }
+        }
+    }
+
+    /// Whether a commit writing `iris` would bring a dropped graph back.
+    pub fn would_revive<'a>(&self, iris: impl IntoIterator<Item = &'a str>) -> bool {
+        !self.drops.is_empty()
+            && iris
+                .into_iter()
+                .any(|iri| self.iri_to_id.get(iri).is_some_and(|g| self.is_dropped(*g)))
+    }
+
+    /// The ids of the graphs a commit's drop record names (`Commit::
+    /// graph_drops`): [`DEFAULT_GRAPH_IRI`] for the default graph, else a
+    /// registered IRI. An IRI the registry does not hold names nothing here.
+    pub fn graph_ids_of_drops<'a>(
+        &self,
+        iris: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<GraphId> {
         iris.into_iter()
-            .any(|iri| !self.iri_to_id.contains_key(iri))
+            .filter_map(|iri| {
+                if iri == DEFAULT_GRAPH_IRI {
+                    Some(DEFAULT_GRAPH_ID)
+                } else {
+                    self.graph_id_for_iri(iri)
+                }
+            })
+            .collect()
+    }
+
+    /// The drop record naming `g_ids`, as `Commit::graph_drops` holds it:
+    /// IRIs, ascending.
+    pub fn drop_record(&self, g_ids: &[GraphId]) -> Vec<String> {
+        let mut iris: Vec<String> = g_ids
+            .iter()
+            .filter_map(|g_id| {
+                if *g_id == DEFAULT_GRAPH_ID {
+                    Some(DEFAULT_GRAPH_IRI.to_string())
+                } else {
+                    self.iri_for_graph_id(*g_id).map(str::to_string)
+                }
+            })
+            .collect();
+        iris.sort_unstable();
+        iris.dedup();
+        iris
+    }
+
+    /// What the latest drop of `g_id` left, if it was ever dropped.
+    pub fn graph_drop(&self, g_id: GraphId) -> Option<GraphDrop> {
+        self.drops.get(&g_id).copied()
+    }
+
+    /// Every dropped graph with what its latest drop left, ascending by id.
+    pub fn graph_drops(&self) -> impl Iterator<Item = (GraphId, GraphDrop)> + '_ {
+        self.drops.iter().map(|(g_id, drop)| (*g_id, *drop))
+    }
+
+    /// Whether any graph was ever dropped.
+    pub fn has_drops(&self) -> bool {
+        !self.drops.is_empty()
+    }
+
+    /// Add `other`'s drop records for the same ledger, keeping for each graph
+    /// the later drop, and its revival when either knows of one.
+    pub fn merge_graph_drops(&mut self, other: impl IntoIterator<Item = (GraphId, GraphDrop)>) {
+        for (g_id, theirs) in other {
+            let entry = self.drops.entry(g_id).or_insert(theirs);
+            if theirs.floor > entry.floor {
+                *entry = theirs;
+            } else if theirs.floor == entry.floor && entry.revived.is_none() {
+                entry.revived = theirs.revived;
+            }
+        }
+    }
+
+    /// [`Self::merge_graph_drops`] for the drop records of `other`, which
+    /// may number the same ledger's graphs differently (a rebuild numbers
+    /// them as it meets them): each graph is matched by IRI. A graph `self`
+    /// does not register is left out.
+    pub fn merge_graph_drops_by_iri(&mut self, other: &GraphRegistry) {
+        let drops: Vec<(GraphId, GraphDrop)> = other
+            .graph_drops()
+            .filter_map(|(g_id, drop)| {
+                let ours = if g_id == DEFAULT_GRAPH_ID {
+                    DEFAULT_GRAPH_ID
+                } else {
+                    self.graph_id_for_iri(other.iri_for_graph_id(g_id)?)?
+                };
+                Some((ours, drop))
+            })
+            .collect();
+        self.merge_graph_drops(drops);
+    }
+
+    /// Replace the drop records, as an index root or another registry for the
+    /// same ledger carries them.
+    pub fn set_graph_drops(&mut self, drops: impl IntoIterator<Item = (GraphId, GraphDrop)>) {
+        self.drops = drops.into_iter().collect();
+    }
+
+    /// Whether `g_id` is dropped at the head and not written since.
+    pub fn is_dropped(&self, g_id: GraphId) -> bool {
+        self.drops
+            .get(&g_id)
+            .is_some_and(|drop| drop.revived.is_none())
+    }
+
+    /// Whether `g_id`'s state as of `t` is visible: false when a drop after
+    /// `t` took it, or when `t` falls between a drop and the graph's revival.
+    /// Says nothing of whether the graph was registered yet at `t`.
+    pub fn visible_at(&self, g_id: GraphId, t: i64) -> bool {
+        self.drops
+            .get(&g_id)
+            .is_none_or(|drop| drop.revived.is_some_and(|revived| revived <= t))
+    }
+
+    /// The `t` of `g_id`'s latest drop when that drop came after `t`: what the
+    /// graph held as of `t` is gone, which a read naming it as of `t` should
+    /// hear about rather than read as empty.
+    pub fn drop_after(&self, g_id: GraphId, t: i64) -> Option<i64> {
+        self.drops
+            .get(&g_id)
+            .map(|drop| drop.floor)
+            .filter(|floor| *floor > t)
+    }
+
+    /// The graphs whose facts before some `t` greater than `index_t` are
+    /// gone: what an index covering only `index_t` still holds of them must
+    /// not be read.
+    pub fn dropped_after(&self, index_t: i64) -> Vec<GraphId> {
+        self.drops
+            .iter()
+            .filter(|(_, drop)| drop.floor > index_t)
+            .map(|(g_id, _)| *g_id)
+            .collect()
     }
 
     /// Reverse lookup: GraphId → IRI.
@@ -387,12 +640,23 @@ impl GraphRegistry {
             .and_then(|opt| opt.as_deref())
     }
 
-    /// Iterate all registered (g_id, iri) pairs. Skips empty slots.
+    /// Iterate all registered (g_id, iri) pairs. Skips empty slots. Dropped
+    /// graphs are included: this is the id assignment, which routes writes and
+    /// keeps a dropped graph's id. What a query or a listing sees is
+    /// [`Self::iter_visible_entries`].
     pub fn iter_entries(&self) -> impl Iterator<Item = (GraphId, &str)> {
         self.id_to_iri
             .iter()
             .enumerate()
             .filter_map(|(idx, opt)| opt.as_deref().map(|iri| (idx as GraphId, iri)))
+    }
+
+    /// [`Self::iter_entries`] less the graphs not visible as of `t` (see
+    /// [`Self::visible_at`]): the graphs a dataset, a `GRAPH ?g` or a
+    /// listing at `t` names.
+    pub fn iter_visible_entries(&self, t: i64) -> impl Iterator<Item = (GraphId, &str)> {
+        self.iter_entries()
+            .filter(move |(g_id, _)| self.visible_at(*g_id, t))
     }
 
     /// Number of registered graphs (excluding default graph).
@@ -692,6 +956,120 @@ mod tests {
         assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
         assert_eq!(reg.graph_id_for_iri(&config), Some(2));
         assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
+    }
+
+    #[test]
+    fn a_dropped_graph_keeps_its_id_until_written_again() {
+        let mut reg = GraphRegistry::new_for_ledger("test:a");
+        reg.apply_delta(["http://example.org/g"]);
+        let g = reg.graph_id_for_iri("http://example.org/g").unwrap();
+        assert!(!reg.has_unregistered(["http://example.org/g"]));
+
+        reg.apply_drops(&[g], 5);
+        assert!(reg.is_dropped(g));
+        assert_eq!(reg.graph_id_for_iri("http://example.org/g"), Some(g));
+        // Writing it again would bring it back, as a new graph would register.
+        assert!(reg.has_unregistered(["http://example.org/g"]));
+        assert!(reg.would_revive(["http://example.org/g"]));
+        assert!(!reg.visible_at(g, 4));
+        assert!(!reg.visible_at(g, 5));
+        assert_eq!(
+            reg.iter_visible_entries(5)
+                .filter(|(id, _)| *id == g)
+                .count(),
+            0
+        );
+        assert_eq!(reg.dropped_after(4), vec![g]);
+        assert!(reg.dropped_after(5).is_empty());
+
+        reg.revive(["http://example.org/g"], 7);
+        assert!(!reg.is_dropped(g));
+        assert_eq!(
+            reg.graph_drop(g),
+            Some(GraphDrop {
+                floor: 5,
+                revived: Some(7)
+            })
+        );
+        assert!(!reg.visible_at(g, 6));
+        assert!(reg.visible_at(g, 7));
+        // Assignment is unchanged.
+        assert_eq!(reg.apply_delta(["http://example.org/g"]), vec![]);
+        assert_eq!(reg.next_id(), g + 1);
+    }
+
+    #[test]
+    fn a_commit_can_drop_a_graph_and_write_it_afresh() {
+        let mut reg = GraphRegistry::new_for_ledger("test:a");
+        reg.apply_delta(["http://example.org/g"]);
+        let g = reg.graph_id_for_iri("http://example.org/g").unwrap();
+        reg.apply_drops(&[g], 5);
+        reg.revive(["http://example.org/g"], 5);
+        assert_eq!(
+            reg.graph_drop(g),
+            Some(GraphDrop {
+                floor: 5,
+                revived: Some(5)
+            })
+        );
+        assert!(!reg.visible_at(g, 4));
+        assert!(reg.visible_at(g, 5));
+    }
+
+    #[test]
+    fn the_default_graph_survives_its_drop() {
+        let mut reg = GraphRegistry::new_for_ledger("test:a");
+        reg.apply_drops(&[DEFAULT_GRAPH_ID], 3);
+        assert!(!reg.is_dropped(DEFAULT_GRAPH_ID));
+        assert!(!reg.visible_at(DEFAULT_GRAPH_ID, 2));
+        assert!(reg.visible_at(DEFAULT_GRAPH_ID, 3));
+        assert_eq!(reg.dropped_after(2), vec![DEFAULT_GRAPH_ID]);
+    }
+
+    #[test]
+    fn a_later_drop_replaces_the_earlier_one() {
+        let mut reg = GraphRegistry::new_for_ledger("test:a");
+        reg.apply_delta(["http://example.org/g"]);
+        let g = reg.graph_id_for_iri("http://example.org/g").unwrap();
+        reg.apply_drops(&[g], 5);
+        reg.revive(["http://example.org/g"], 6);
+        reg.apply_drops(&[g], 9);
+        assert_eq!(
+            reg.graph_drop(g),
+            Some(GraphDrop {
+                floor: 9,
+                revived: None
+            })
+        );
+        // A write before the latest drop does not revive past it.
+        reg.revive(["http://example.org/g"], 8);
+        assert!(reg.is_dropped(g));
+        assert!(!reg.visible_at(g, 7));
+    }
+
+    #[test]
+    fn drops_merge_by_iri_across_numberings() {
+        let (a, z) = ("http://example.org/a", "http://example.org/z");
+        let mut head = GraphRegistry::new_for_ledger("test:a");
+        head.apply_delta([a, z]);
+        head.apply_drops(&[head.graph_id_for_iri(a).unwrap(), DEFAULT_GRAPH_ID], 5);
+
+        // A rebuild met z first.
+        let mut rebuilt = GraphRegistry::new_for_ledger("test:a");
+        rebuilt.apply_delta([z]);
+        rebuilt.apply_delta([a]);
+        assert_ne!(rebuilt.graph_id_for_iri(a), head.graph_id_for_iri(a));
+
+        rebuilt.merge_graph_drops_by_iri(&head);
+        assert!(rebuilt.is_dropped(rebuilt.graph_id_for_iri(a).unwrap()));
+        assert_eq!(
+            rebuilt.graph_drop(rebuilt.graph_id_for_iri(z).unwrap()),
+            None
+        );
+        assert_eq!(
+            rebuilt.graph_drop(DEFAULT_GRAPH_ID).map(|d| d.floor),
+            Some(5)
+        );
     }
 
     #[test]

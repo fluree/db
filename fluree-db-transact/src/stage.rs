@@ -1162,10 +1162,12 @@ pub async fn stage_with_graph_delta(
         let mut graph_delta = ledger_graph_delta(&ledger, &txn.write_graphs);
         // A new graph that only a DELETE names is not registered when no
         // staged fact lands in it, so a delete of facts the graph cannot hold
-        // commits nothing, as it does in the default graph. A graph an INSERT
-        // template names stays registered even when the WHERE matched
+        // commits nothing, as it does in the default graph. A dropped graph is
+        // no more there, and a delete does not bring it back. A graph an
+        // INSERT template names stays registered even when the WHERE matched
         // nothing; CREATE GRAPH and a sync target register one on purpose.
         if !txn.delete_templates.is_empty() && txn.sync_graph.is_none() {
+            let registry = &ledger.snapshot.graph_registry;
             let landed: HashSet<&Sid> = flakes.iter().filter_map(|f| f.g.as_ref()).collect();
             let inserted: HashSet<&str> = txn
                 .insert_templates
@@ -1176,11 +1178,9 @@ pub async fn stage_with_graph_delta(
                 })
                 .collect();
             graph_delta.retain(|_, iri| {
-                ledger
-                    .snapshot
-                    .graph_registry
+                registry
                     .graph_id_for_iri(iri)
-                    .is_some()
+                    .is_some_and(|g_id| !registry.is_dropped(g_id))
                     || inserted.contains(iri.as_str())
                     || graph_sids
                         .get(iri.as_str())
@@ -1481,19 +1481,29 @@ async fn whole_graph_facts(
 }
 
 /// Resolve the ledger `GraphId` and graph `Sid` for a named graph IRI, if it
-/// is registered (populated) in the ledger. Returns `None` for a graph that
-/// does not exist — which, in Fluree's model, is indistinguishable from an
-/// empty one (roadmap D-6), so callers treat "no g_id" as "no flakes".
+/// exists in the ledger: registered, and not dropped since it was last
+/// written. Returns `None` for a graph that does not exist, which holds no
+/// flakes.
 fn resolve_named_graph(
     ledger: &LedgerState,
     ns_registry: &mut NamespaceRegistry,
     iri: &str,
 ) -> Option<(GraphId, Sid)> {
-    ledger
-        .snapshot
-        .graph_registry
+    let registry = &ledger.snapshot.graph_registry;
+    registry
         .graph_id_for_iri(iri)
+        .filter(|g_id| !registry.is_dropped(*g_id))
         .map(|g_id| (g_id, ns_registry.sid_for_iri(iri)))
+}
+
+/// The refusal a policed (non-root) identity gets for an operation that
+/// drops a graph: the drop takes facts and history the identity's policy may
+/// not let it see, let alone modify.
+fn drop_needs_unrestricted_identity(verb: &str) -> TransactError {
+    TransactError::PolicyViolation(fluree_db_policy::PolicyError::modify_denied(format!(
+        "{verb} drops a graph with its history, which only an identity without a \
+         restricting policy may do; CLEAR retracts what a graph holds, under policy"
+    )))
 }
 
 /// Execute a SPARQL graph-management operation (CLEAR/DROP/COPY/MOVE/ADD).
@@ -1532,7 +1542,13 @@ async fn stage_graph_mgmt(
             }
         };
         match &mut txn.graph_mgmt {
-            Some(GraphMgmtOp::Clear(GraphTarget::Graph(iri))) => registry_iri(iri),
+            Some(
+                GraphMgmtOp::Clear(GraphTarget::Graph(iri))
+                | GraphMgmtOp::Drop {
+                    target: GraphTarget::Graph(iri),
+                    ..
+                },
+            ) => registry_iri(iri),
             Some(GraphMgmtOp::Transfer { from, to, .. }) => {
                 for sel in [from, to] {
                     if let GraphSel::Graph(iri) = sel {
@@ -1569,8 +1585,12 @@ async fn stage_graph_mgmt(
         // These verbs reach the default graph as DEFAULT; `urn:default` as a
         // named-graph operand is refused rather than read or created.
         match op {
-            GraphMgmtOp::Clear(GraphTarget::Graph(iri)) => refuse_default_graph_name(iri)?,
-            GraphMgmtOp::Clear(_) => {}
+            GraphMgmtOp::Clear(GraphTarget::Graph(iri))
+            | GraphMgmtOp::Drop {
+                target: GraphTarget::Graph(iri),
+                ..
+            } => refuse_default_graph_name(iri)?,
+            GraphMgmtOp::Clear(_) | GraphMgmtOp::Drop { .. } => {}
             GraphMgmtOp::Transfer { from, to, .. } => {
                 for sel in [from, to] {
                     if let GraphSel::Graph(iri) = sel {
@@ -1590,6 +1610,9 @@ async fn stage_graph_mgmt(
         // (`hidden_restatements`): (the stored fact's retraction, the assertion).
         let policed = options.policy_ctx.is_some_and(|p| !p.wrapper().is_root());
         let mut restated: Vec<(Flake, Flake)> = Vec::new();
+        // The graphs the operation drops (DROP, and MOVE's source): recorded
+        // on the commit, which retracts nothing of them.
+        let mut drops: Vec<GraphId> = Vec::new();
 
         match op {
             GraphMgmtOp::Clear(target) => {
@@ -1634,7 +1657,7 @@ async fn stage_graph_mgmt(
                         let user_graphs: Vec<(GraphId, String)> = ledger
                             .snapshot
                             .graph_registry
-                            .iter_entries()
+                            .iter_visible_entries(ledger.t())
                             .filter(|(g_id, _)| *g_id >= FIRST_USER_GRAPH_ID)
                             .map(|(g_id, iri)| (g_id, iri.to_string()))
                             .collect();
@@ -1655,11 +1678,51 @@ async fn stage_graph_mgmt(
                 }
             }
 
+            GraphMgmtOp::Drop { target, silent } => {
+                if policed {
+                    return Err(drop_needs_unrestricted_identity("DROP"));
+                }
+                match target {
+                    GraphTarget::Default => drops.push(0),
+                    GraphTarget::Graph(iri) => {
+                        match resolve_named_graph(&ledger, &mut ns_registry, iri) {
+                            // B2: the reserved system graphs are never dropped.
+                            Some((g_id, _)) if g_id < FIRST_USER_GRAPH_ID => {
+                                return Err(TransactError::ReservedGraphTarget {
+                                    graph_iri: iri.clone(),
+                                });
+                            }
+                            Some((g_id, _)) => drops.push(g_id),
+                            None if *silent => {}
+                            None => {
+                                return Err(TransactError::GraphNotFound {
+                                    graph_iri: iri.clone(),
+                                });
+                            }
+                        }
+                    }
+                    GraphTarget::Named | GraphTarget::All => {
+                        if matches!(target, GraphTarget::All) {
+                            drops.push(0);
+                        }
+                        let registry = &ledger.snapshot.graph_registry;
+                        drops.extend(
+                            registry
+                                .iter_entries()
+                                .map(|(g_id, _)| g_id)
+                                .filter(|g_id| {
+                                    *g_id >= FIRST_USER_GRAPH_ID && !registry.is_dropped(*g_id)
+                                }),
+                        );
+                    }
+                }
+            }
+
             GraphMgmtOp::Transfer {
                 from,
                 to,
                 clear_dest,
-                clear_src,
+                drop_src,
                 silent,
             } => {
                 // B2: a reserved system graph is refused even when `from ==
@@ -1683,6 +1746,9 @@ async fn stage_graph_mgmt(
                 }
                 // `from == to` is a spec no-op for ADD/COPY/MOVE.
                 if from != to {
+                    if *drop_src && policed {
+                        return Err(drop_needs_unrestricted_identity("MOVE"));
+                    }
                     // Resolve the source (existing only) and destination.
                     let (src_g_id, src_sid): (Option<GraphId>, Option<Sid>) = match from {
                         GraphSel::Default => (Some(0), None),
@@ -2009,17 +2075,12 @@ async fn stage_graph_mgmt(
                         }
                     }
 
-                    // MOVE: clear the source afterward (retract all of it). The
-                    // source flakes live in a different graph than the
-                    // destination assertions, so there is no cancellation.
-                    if *clear_src {
+                    // MOVE: the source is dropped afterward. The destination's
+                    // assertions live in another graph, so the drop takes none
+                    // of them.
+                    if *drop_src {
                         if let Some(src_g) = src_g_id {
-                            for fact in src_facts {
-                                if let Some(g_sid) = &fact.flake().g {
-                                    graph_sids.entry(src_g).or_insert_with(|| g_sid.clone());
-                                }
-                                flakes.push(fact.retract(new_t).into_flake());
-                            }
+                            drops.push(src_g);
                         }
                     }
                 }
@@ -2066,7 +2127,7 @@ async fn stage_graph_mgmt(
         );
 
         // Every named graph the operation writes: the (possibly new)
-        // destination, plus each registered graph it clears or moves from.
+        // destination, plus each registered graph it clears.
         let mut graph_delta = ledger_graph_delta(&ledger, &txn.write_graphs);
         for g_id in graph_sids.keys() {
             if let Some(iri) = ledger.snapshot.graph_registry.iri_for_graph_id(*g_id) {
@@ -2074,8 +2135,15 @@ async fn stage_graph_mgmt(
             }
         }
 
+        // The staged view reads as the commit will: without what the dropped
+        // graphs held.
+        let mut ledger = ledger;
+        if !drops.is_empty() {
+            ledger.apply_graph_drops(&drops, new_t);
+            crate::staged_dicts::hide_dropped_graphs(&mut ledger);
+        }
         Ok((
-            StagedLedger::new(ledger, flakes, &reverse_graph)?,
+            StagedLedger::new(ledger, flakes, &reverse_graph)?.with_graph_drops(drops),
             ns_registry,
             graph_delta,
         ))
@@ -3276,11 +3344,11 @@ async fn stream_where_into_accumulator(
             .map(|store| store.graph_entries())
             .unwrap_or_default();
         let target = TargetLedger::new(target_ledger, &graph_names);
-        for (g_id, iri) in ledger
-            .snapshot
-            .graph_registry
+        let registry = &ledger.snapshot.graph_registry;
+        for (g_id, iri) in registry
             .iter_entries()
             .chain(binary_entries)
+            .filter(|(g_id, _)| !registry.is_dropped(*g_id))
         {
             // A graph no name reads back is not listed.
             let Some(name) = target.enumeration_name(iri, g_id) else {

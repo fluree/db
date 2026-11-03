@@ -438,6 +438,9 @@ impl crate::Fluree {
             (Some(s), Some(t)) => Some(diff_branches(&union_store, s, t).await?),
             _ => None,
         };
+        if let Some(diff) = diff.as_ref().filter(|diff| !diff.fast_forward) {
+            crate::merge::refuse_merging_graph_drops(diff)?;
+        }
 
         // The commit both branches last shared, for the response. It can sit
         // on either branch's line, so it is read through the union.
