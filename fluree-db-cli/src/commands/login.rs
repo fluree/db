@@ -26,11 +26,35 @@ fn http_client() -> CliResult<reqwest::Client> {
         .map_err(|e| CliError::Remote(format!("failed to build HTTP client: {e}")))
 }
 
+/// Whether `url` may carry a sign-in: https, or http to this machine only
+/// (a local test service), so a device grant and tokens never cross the
+/// network in cleartext.
+fn secure_enough(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => parsed.host_str().is_some_and(|h| {
+            h.eq_ignore_ascii_case("localhost")
+                || h.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
 pub async fn run_login(url: Option<String>, open_browser: bool) -> CliResult<()> {
     let url = url
         .unwrap_or_else(|| DEFAULT_ACCOUNT_URL.to_string())
         .trim_end_matches('/')
         .to_string();
+    if !secure_enough(&url) {
+        return Err(CliError::Usage(format!(
+            "--url {url}: a sign-in needs https (plain http only to localhost)"
+        )));
+    }
     let http = http_client()?;
 
     let discovered = match super::remote::discover_remote(&url).await {
@@ -144,9 +168,24 @@ pub async fn run_login(url: Option<String>, open_browser: bool) -> CliResult<()>
 }
 
 pub async fn run_logout() -> CliResult<()> {
-    let Some(mut stored) = account::load()? else {
-        println!("Not signed in");
-        return Ok(());
+    let mut stored = match account::load() {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            println!("Not signed in");
+            return Ok(());
+        }
+        // An unreadable file can't be signed out on the server (its token
+        // can't be read), but it can be removed, so logout isn't stuck.
+        Err(e) => {
+            let path = account::account_path()?;
+            account::remove()?;
+            println!("Removed {}", path.display());
+            eprintln!(
+                "  {} it could not be read ({e}), so the server was not told;                  if this machine was signed in, disconnect it from your account's dashboard",
+                "warn:".yellow().bold()
+            );
+            return Ok(());
+        }
     };
     let http = http_client()?;
     let server = sign_out_on_server(&http, &mut stored).await;

@@ -166,6 +166,8 @@ fluree auth token [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--remote <NAME>` | Remote name (defaults to the only configured remote) |
+| `--account` | The machine's [`fluree login`](login.md) sign-in instead of a remote: an access token with time left, renewed first if it is about to expire. Needs no project |
+| `--refresh` | With `--account`: renew the token even if it has time left. A service answers `401 config_stale` when the account's configuration changed after the token was issued; a renewed token carries the new configuration |
 
 ### Examples
 
@@ -175,6 +177,9 @@ echo "FLUREE_TOKEN=$(fluree auth token --remote prod)" >> .env
 
 # Use it inline
 curl -H "Authorization: Bearer $(fluree auth token)" https://db.example.com/v1/fluree/...
+
+# The fluree.ai sign-in's token, for a call to the account's API
+curl -H "Authorization: Bearer $(fluree auth token --account)" https://fluree.ai/v1/...
 ```
 
 ---

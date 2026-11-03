@@ -187,7 +187,7 @@ pub(crate) fn map_iceberg<'py>(
         rest_only: &[],
     };
     let mut iceberg =
-        IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref(), true)
+        IcebergCreateConfig::from_mode(&common.name, mode_args, spec.table.as_deref())
             .map_err(|e| invalid_request(e.message(str::to_string)))?;
     // Through the builders, which refuse at registration what this catalog
     // mode would ignore (REST-only auth, warehouse, a request to vend).
@@ -255,6 +255,9 @@ pub(crate) fn map_iceberg<'py>(
     }
     iceberg.model = common.model;
     iceberg.default_allow = common.default_allow;
+    // Registration loads each mapped table the way a query does: through the
+    // catalog, or at a Direct table's location.
+    let direct = iceberg.is_direct();
     let config = R2rmlCreateConfig {
         iceberg,
         mapping: R2rmlMappingInput::Content(common.mapping),
@@ -262,14 +265,61 @@ pub(crate) fn map_iceberg<'py>(
     };
     let created = block_on(py, fluree.create_r2rml_graph_source(config))?.map_err(api_error)?;
     let mut warnings = created.model_warnings;
-    if rest && !created.connection_tested {
-        warnings.push(format!(
-            "could not reach the catalog at {}; the source is registered, and queries will \
-             fail until it can be reached",
-            created.catalog_uri
-        ));
-    }
+    warnings.extend(connection_warning(
+        &created.connection_check,
+        direct,
+        &created.catalog_uri,
+    ));
     registered(py, &created.graph_source_id, &created.table_names, warnings)
+}
+
+/// The warning a registration whose tables were not verified raises, saying
+/// why. A catalog that did not answer (its client could not be built, or a
+/// table load failed with no answer from it) keeps the released wording,
+/// "could not reach the catalog at", which callers match on. A table the
+/// catalog answered for, as missing or refused, is named with the catalog's
+/// reason, and a check that ran out of time says the tables may only be slow.
+/// `None` when every table loaded.
+fn connection_warning(
+    check: &fluree_db_api::ConnectionCheck,
+    direct: bool,
+    location: &str,
+) -> Option<String> {
+    use fluree_db_api::ConnectionCheck as C;
+    const REGISTERED: &str = "the source is registered";
+    Some(match check {
+        C::Verified => return None,
+        C::NoTables => format!(
+            "the mapping could not be read, so no table at {location} was loaded; \
+             {REGISTERED}, and its tables are not verified"
+        ),
+        C::ClientFailed { error } if direct => format!(
+            "could not build the storage client for {location} ({error}); {REGISTERED}, \
+             and queries will fail until it can be built"
+        ),
+        // The released wording, unchanged.
+        C::ClientFailed { .. } | C::CatalogUnreachable { .. } => format!(
+            "could not reach the catalog at {location}; {REGISTERED}, and queries will \
+             fail until it can be reached"
+        ),
+        C::TableFailed { table, error } if direct => format!(
+            "could not read the metadata of table '{table}' at {location} ({error}); \
+             {REGISTERED}, and queries that read it will fail until it can be read"
+        ),
+        C::TableFailed { table, error } => format!(
+            "could not load table '{table}' through the catalog at {location} ({error}); \
+             {REGISTERED}, and queries that read it will fail until it loads"
+        ),
+        C::TimedOut {
+            loaded,
+            total,
+            budget_secs,
+        } => format!(
+            "the check of the tables at {location} ran past {budget_secs} s ({loaded} of \
+             {total} loaded), so they are not verified; {REGISTERED}, and the tables may \
+             only be slow"
+        ),
+    })
 }
 
 pub(crate) fn map_delta<'py>(

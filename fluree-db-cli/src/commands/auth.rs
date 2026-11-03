@@ -32,13 +32,21 @@ pub async fn run(action: AuthAction, dirs: Option<&FlureeDir>) -> CliResult<()> 
     if let AuthAction::Status { remote } = &action {
         return run_status(store.as_ref(), remote.as_deref()).await;
     }
+    if let AuthAction::Token {
+        account: true,
+        refresh,
+        ..
+    } = &action
+    {
+        return run_account_token(*refresh).await;
+    }
     let store = store.ok_or(CliError::NoFlureeDir)?;
 
     match action {
         AuthAction::Status { .. } => unreachable!("handled above"),
         AuthAction::Login { remote, token } => run_login(&store, remote.as_deref(), token).await,
         AuthAction::Logout { remote } => run_logout(&store, remote.as_deref()).await,
-        AuthAction::Token { remote } => run_token(&store, remote.as_deref()).await,
+        AuthAction::Token { remote, .. } => run_token(&store, remote.as_deref()).await,
     }
 }
 
@@ -90,7 +98,22 @@ async fn run_status(store: Option<&TomlSyncConfigStore>, remote: Option<&str>) -
                 }
                 run_remote_status(store, &name).await
             }
-            Err(_) if signed_in => Ok(()),
+            // Signed in with no remote configured: the account is the status.
+            Err(CliError::Config(_)) if signed_in => Ok(()),
+            // Several remotes: say how to see one rather than hiding them.
+            Err(CliError::Usage(_)) if signed_in => {
+                println!();
+                println!(
+                    "  {} several remotes are configured; `fluree auth status --remote <name>` shows one",
+                    "hint:".cyan().bold()
+                );
+                Ok(())
+            }
+            Err(e) if signed_in => {
+                println!();
+                eprintln!("  {} remotes: {e}", "warn:".yellow().bold());
+                Ok(())
+            }
             Err(e) => Err(e),
         },
         None if signed_in => Ok(()),
@@ -103,10 +126,18 @@ async fn run_status(store: Option<&TomlSyncConfigStore>, remote: Option<&str>) -
 }
 
 /// Print the machine's fluree.ai sign-in, if any. Local only: reads
-/// `account.toml` and the token's claims, never calls the server.
+/// `account.toml` and the token's claims, never calls the server. An
+/// unreadable file is reported, not an error, so the project's remotes
+/// still show.
 fn print_account_status() -> CliResult<bool> {
-    let Some(stored) = crate::account::load()? else {
-        return Ok(false);
+    let stored = match crate::account::load() {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            println!("{}", "Account:".bold());
+            println!("  {} {e}", "warn:".yellow().bold());
+            return Ok(true);
+        }
     };
     let tier = stored.account.as_ref().and_then(|a| a.tier.clone());
     println!("{}", "Account:".bold());
@@ -1237,6 +1268,21 @@ async fn run_logout(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliRes
 /// hatch (`FLUREE_TOKEN=$(fluree auth token)` in .env workflows). Exactly
 /// the token goes to stdout; diagnostics (expiry warning) go to stderr.
 /// The refresh token is never printed.
+/// `fluree auth token --account [--refresh]`: the sign-in's access token,
+/// alone on stdout.
+async fn run_account_token(force: bool) -> CliResult<()> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(crate::USER_AGENT)
+        .build()
+        .map_err(|e| CliError::Remote(format!("failed to build HTTP client: {e}")))?;
+    let session = crate::account::session(&http, force)
+        .await?
+        .ok_or_else(|| CliError::NotFound("not signed in; run `fluree login`".into()))?;
+    println!("{}", session.access_token);
+    Ok(())
+}
+
 async fn run_token(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliResult<()> {
     let name = resolve_remote_name(store, remote).await?;
     let remote_name = RemoteName::new(&name);

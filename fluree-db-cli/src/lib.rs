@@ -658,7 +658,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             match config::require_fluree_dir(config_path) {
                 Ok(fluree_dir) => commands::auth::run(action, Some(&fluree_dir)).await,
                 Err(error::CliError::NoFlureeDir)
-                    if matches!(action, cli::AuthAction::Status { remote: None }) =>
+                    if matches!(
+                        action,
+                        cli::AuthAction::Status { remote: None }
+                            | cli::AuthAction::Token { account: true, .. }
+                    ) =>
                 {
                     commands::auth::run(action, None).await
                 }

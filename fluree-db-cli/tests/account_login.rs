@@ -23,6 +23,10 @@ struct Seen {
     disconnects: Vec<String>,
     /// Signed out server-side already (e.g. from the dashboard).
     revoked: bool,
+    /// `Authorization` of each call to `/v1/whoami`.
+    whoami: Vec<String>,
+    /// How many `/v1/whoami` calls answer 401 `config_stale` first.
+    stale: u32,
 }
 
 #[derive(Clone)]
@@ -169,6 +173,28 @@ async fn disconnect(
     Json(json!({ "status": "disconnected" })).into_response()
 }
 
+/// A call made with the account's token: 401 `config_stale` while `stale`
+/// lasts, as fluree.ai answers after the account's configuration changed.
+async fn whoami(State(f): State<Fake>, headers: axum::http::HeaderMap) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let mut seen = f.seen.lock().unwrap();
+    seen.whoami.push(auth);
+    if seen.stale > 0 {
+        seen.stale -= 1;
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": { "message": "Configuration updated, please refresh token", "status": 401, "error": "config_stale" } })),
+        )
+            .into_response();
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
 async fn start_fake() -> Fake {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -183,6 +209,7 @@ async fn start_fake() -> Fake {
         .route("/v1/oauth/token", post(token))
         .route("/v1/oauth/exchange", post(exchange))
         .route("/v1/auth/disconnect", post(disconnect))
+        .route("/v1/whoami", get(whoami))
         .with_state(fake.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     fake
@@ -248,14 +275,25 @@ async fn login_status_logout_without_a_project() {
         .stdout(predicate::str::contains("Tier: free"))
         .stdout(predicate::str::contains("Access token: valid until"));
 
-    // Signing in again replaces the sign-in and signs the old one out.
+    // Signing in again replaces the sign-in and signs the old one out:
+    // the old one, by its own token, not the new one.
+    let first = fluree_db_cli::account::load_from(&home.path().join("account.toml"))
+        .unwrap()
+        .unwrap();
     fluree(home.path(), &["login", "--url", &fake.base, "--no-browser"])
         .await
         .success();
+    let second = fluree_db_cli::account::load_from(&home.path().join("account.toml"))
+        .unwrap()
+        .unwrap();
     {
         let seen = fake.seen.lock().unwrap();
         assert_eq!(seen.exchanges, 2);
-        assert_eq!(seen.disconnects.len(), 1);
+        assert_eq!(
+            seen.disconnects,
+            vec![format!("Bearer {}", first.access_token)]
+        );
+        assert_ne!(first.access_token, second.access_token);
     }
     assert!(std::fs::read_to_string(home.path().join("account.toml"))
         .unwrap()
@@ -345,4 +383,143 @@ async fn logout_after_the_server_already_signed_the_machine_out() {
         ))
         .stderr(predicate::str::contains("did not confirm").not());
     assert!(!home.path().join("account.toml").exists());
+}
+
+/// A stored sign-in at `path` whose access token has `secs` left.
+fn stored_at(fake: &Fake, path: &std::path::Path, secs: i64) {
+    let stored = fluree_db_cli::account::StoredAccount {
+        url: fake.base.clone(),
+        service: Some("fluree.ai".into()),
+        api_base_url: format!("{}/v1", fake.base),
+        dashboard_url: None,
+        exchange_url: format!("{}/v1/oauth/exchange", fake.base),
+        access_token: jwt(secs, "stored"),
+        refresh_token: "flk_key1_secret".into(),
+        deployment_id: None,
+        account: None,
+    };
+    fluree_db_cli::account::save_to(path, &stored).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_sign_in_can_still_be_removed() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("account.toml"), "not = [toml").unwrap();
+
+    // Status reports it instead of failing.
+    fluree(home.path(), &["auth", "status"])
+        .await
+        .success()
+        .stdout(predicate::str::contains("is unreadable"))
+        .stdout(predicate::str::contains("fluree login"));
+    // Logout removes it, and says the server wasn't told.
+    fluree(home.path(), &["logout"])
+        .await
+        .success()
+        .stdout(predicate::str::contains("Removed"))
+        .stderr(predicate::str::contains(
+            "disconnect it from your account's dashboard",
+        ));
+    assert!(!home.path().join("account.toml").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_token_account_prints_the_sign_ins_token_and_refresh_forces_one() {
+    let fake = start_fake().await;
+    let home = tempfile::tempdir().unwrap();
+    stored_at(&fake, &home.path().join("account.toml"), 3600);
+
+    let out = fluree(home.path(), &["auth", "token", "--account"])
+        .await
+        .success();
+    let printed = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(printed.trim().split('.').count(), 3, "{printed}");
+    assert_eq!(
+        fake.seen.lock().unwrap().refreshes,
+        0,
+        "time left: no refresh"
+    );
+
+    let out = fluree(home.path(), &["auth", "token", "--account", "--refresh"])
+        .await
+        .success();
+    let refreshed = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(fake.seen.lock().unwrap().refreshes, 1);
+    assert_ne!(printed, refreshed);
+    assert!(std::fs::read_to_string(home.path().join("account.toml"))
+        .unwrap()
+        .contains(refreshed.trim()));
+
+    fluree(home.path(), &["auth", "token", "--refresh"])
+        .await
+        .failure()
+        .stderr(predicate::str::contains("--account"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_stale_answer_refreshes_and_sends_once_more() {
+    let fake = start_fake().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.toml");
+    stored_at(&fake, &path, 3600);
+    fake.seen.lock().unwrap().stale = 1;
+
+    let http = reqwest::Client::new();
+    let url = format!("{}/v1/whoami", fake.base);
+    let resp = fluree_db_cli::account::send_at(&http, &path, |s| {
+        http.get(&url).bearer_auth(&s.access_token)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(resp.status().is_success());
+    {
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.refreshes, 1);
+        assert_eq!(seen.whoami.len(), 2);
+        assert_ne!(
+            seen.whoami[0], seen.whoami[1],
+            "sent again with the new token"
+        );
+    }
+
+    // Stale again after the refresh: not retried a second time.
+    fake.seen.lock().unwrap().stale = 2;
+    let resp = fluree_db_cli::account::send_at(&http, &path, |s| {
+        http.get(&url).bearer_auth(&s.access_token)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(fake.seen.lock().unwrap().whoami.len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_refreshes_at_once_spend_the_refresh_token_once() {
+    let fake = start_fake().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.toml");
+    stored_at(&fake, &path, -10);
+
+    let http = reqwest::Client::new();
+    let (a, b) = tokio::join!(
+        fluree_db_cli::account::session_at(&http, &path, false),
+        fluree_db_cli::account::session_at(&http, &path, false),
+    );
+    let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+    assert_eq!(fake.seen.lock().unwrap().refreshes, 1);
+    assert_eq!(a.access_token, b.access_token);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_needs_https_except_to_this_machine() {
+    let home = tempfile::tempdir().unwrap();
+    fluree(
+        home.path(),
+        &["login", "--url", "http://fluree.example", "--no-browser"],
+    )
+    .await
+    .failure()
+    .stderr(predicate::str::contains("needs https"));
 }
