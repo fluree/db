@@ -1603,7 +1603,39 @@ pub struct FlureeR2rmlProvider<'a> {
     /// consulted by every scan and count of the source. See
     /// [`R2rmlTableProvider::pin_source_time`].
     source_times: std::sync::Mutex<std::collections::HashMap<String, SourceTime>>,
+    /// Tables this provider resolved moments ago, by `(graph source, table)`:
+    /// the next touch of a table in the same query (a scan after its key
+    /// check, a count after its plan) reuses the resolution instead of
+    /// repeating it. See [`Self::load_table_context`].
+    recent_contexts: std::sync::Mutex<std::collections::HashMap<(String, String), RecentContext>>,
 }
+
+/// A [`TableContext`] a provider resolved, when, and under which pin.
+struct RecentContext {
+    at: std::time::Instant,
+    pin: Option<SourceTime>,
+    context: TableContext,
+}
+
+/// Whether a resolution made at `at` under `resolved_pin` serves a touch now
+/// under `pin`: only the same pin (a pin set after an unpinned resolution
+/// must resolve again), and only within [`RECENT_CONTEXT_REUSE`].
+fn recent_context_serves(
+    at: std::time::Instant,
+    resolved_pin: Option<SourceTime>,
+    pin: Option<SourceTime>,
+    now: std::time::Instant,
+) -> bool {
+    resolved_pin == pin && now.saturating_duration_since(at) < RECENT_CONTEXT_REUSE
+}
+
+/// How long a resolved table is reused by later touches through the same
+/// provider. A query's touches of one table come within milliseconds of each
+/// other; the bound keeps a provider that lives longer than a query (a bulk
+/// build) resolving afresh, so it sees new commits, and stays well inside the
+/// session's refresh margin for expiring vended credentials (a context is
+/// never served past a point the session would itself have reloaded it).
+const RECENT_CONTEXT_REUSE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The snapshot a query reads for one table, and whether it is the table's
 /// current snapshot — the one the `metadata_location`-keyed caches describe.
@@ -1694,6 +1726,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             fluree,
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
             source_times: std::sync::Mutex::new(std::collections::HashMap::new()),
+            recent_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3663,6 +3696,7 @@ async fn resolve_catalog_load_and_storage(
 /// A table resolved for one query: its store (built only when a read misses
 /// every cache, on the pointer rung), the snapshot-pinned metadata and its
 /// location, and the storage scope every cache of the table is keyed by.
+#[derive(Clone)]
 struct TableContext {
     storage: Arc<LazyS3Storage<'static>>,
     metadata: Arc<TableMetadata>,
@@ -3981,7 +4015,50 @@ impl FlureeR2rmlProvider<'_> {
         Ok(plan)
     }
 
+    /// Resolve `table_name` of `graph_source_id`: its metadata, the snapshot
+    /// pin, and its store. A table this provider resolved under the same pin
+    /// within [`RECENT_CONTEXT_REUSE`] is served from that resolution: within
+    /// one query every touch of a table reads one snapshot anyway, and
+    /// resolving repeats the catalog bookkeeping (a pointer write to the disk
+    /// cache, local path checks) for each scan, count, file count and key
+    /// check of the table.
     async fn load_table_context(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<TableContext> {
+        let key = (graph_source_id.to_string(), table_name.to_string());
+        let pin = self.source_time(graph_source_id);
+        {
+            let recent = self
+                .recent_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(r) = recent.get(&key) {
+                if recent_context_serves(r.at, r.pin, pin, std::time::Instant::now()) {
+                    return Ok(r.context.clone());
+                }
+            }
+        }
+        let context = self
+            .resolve_table_context(graph_source_id, table_name)
+            .await?;
+        self.recent_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                RecentContext {
+                    at: std::time::Instant::now(),
+                    pin,
+                    context: context.clone(),
+                },
+            );
+        Ok(context)
+    }
+
+    /// [`Self::load_table_context`] without the reuse: resolve the table now.
+    async fn resolve_table_context(
         &self,
         graph_source_id: &str,
         table_name: &str,
@@ -5203,6 +5280,42 @@ fn listing_is_single_table(listing: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_recent_table_resolution_serves_only_its_own_pin_and_window() {
+        use std::time::{Duration, Instant};
+        let at = Instant::now();
+        let pin = Some(SourceTime::SnapshotId(7));
+        assert!(recent_context_serves(at, None, None, at));
+        assert!(recent_context_serves(
+            at,
+            pin,
+            pin,
+            at + Duration::from_secs(9)
+        ));
+        // A pin set after an unpinned resolution, or a different pin, resolves again.
+        assert!(!recent_context_serves(at, None, pin, at));
+        assert!(!recent_context_serves(at, pin, None, at));
+        assert!(!recent_context_serves(
+            at,
+            pin,
+            Some(SourceTime::SnapshotId(8)),
+            at
+        ));
+        // Past the window a provider that outlives a query resolves afresh.
+        assert!(!recent_context_serves(
+            at,
+            None,
+            None,
+            at + RECENT_CONTEXT_REUSE
+        ));
+        assert!(!recent_context_serves(
+            at,
+            None,
+            None,
+            at + Duration::from_secs(60)
+        ));
+    }
+
     use super::*;
     use fluree_db_iceberg::config::IoConfig;
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
