@@ -1242,6 +1242,7 @@ async fn incremental_index_with(
     // window's pooled events.
     let mut delta_orders: Vec<RunSortOrder> = Vec::new();
     let mut delta_window: Vec<(RunRecordV2, u8)> = Vec::new();
+    let mut pool_drop = None;
     let mut phase2_tasks = Vec::with_capacity(
         graph_order.len().saturating_mul(all_orders.len())
             + RunSortOrder::pool_build_orders().len(),
@@ -1365,6 +1366,9 @@ async fn incremental_index_with(
     // identity rides along as an `OP_PURGE` marker so the update touches
     // every leaflet that holds it.
     if !pool_writes.is_empty() || !promote.is_empty() {
+        pool_drop = novelty
+            .shared
+            .pool_history_drop(&config.history_suppression);
         let pooled_write = |rec: &RunRecordV2| pool_writes.binary_search(&rec.g_id).is_ok();
         let mut records: Vec<(RunRecordV2, u8)> = novelty
             .records
@@ -1489,11 +1493,10 @@ async fn incremental_index_with(
                 sorted_ops: sorted.iter().map(|&(_, op)| op).collect(),
                 sorted_superseded: sorted_superseded.iter().map(|&(rec, _)| rec).collect(),
                 sorted_superseded_ops: sorted_superseded.iter().map(|&(_, op)| op).collect(),
-                // Erasing a pooled graph goes to a full rebuild; retention's
-                // history drop is per graph, and the pool holds many.
+                // Erasing a pooled graph goes to a full rebuild.
                 sorted_erase: Vec::new(),
                 kind,
-                history_drop: None,
+                history_drop: pool_drop.clone(),
             });
         }
     }
@@ -1602,9 +1605,14 @@ async fn incremental_index_with(
     // each fact's presence at the window's start, so the secondary orders
     // read every `t` as GSPO does.
     if !delta_orders.is_empty() {
-        let resolved = resolved_window_events(&delta_window, |rec| {
+        let mut resolved = resolved_window_events(&delta_window, |rec| {
             base_matched.contains(&fact_identity_key(rec))
         });
+        // What GSPO leaves out of the window's history. A span the window
+        // does not close stays until a compaction folds it into the base.
+        if let Some(drop) = &pool_drop {
+            drop.retain_spans(&mut resolved, |&(rec, op)| hist_entry(rec, op));
+        }
         for &order in delta_orders.iter().filter(|_| !resolved.is_empty()) {
             let run = write_delta_run(content_store.as_ref(), order, &resolved).await?;
             root_builder.append_pool_delta_run(order, run);
@@ -4737,6 +4745,14 @@ pub async fn compact_pool_deltas(
         .filter(|(_, runs)| !runs.is_empty())
         .map(|(order, runs)| (*order, runs.as_slice()))
         .collect();
+    let history_drop = match config.history_suppression.is_empty() || deltas.is_empty() {
+        true => None,
+        false => crate::run_index::resolve::resolver::SharedResolverState::from_index_root(
+            &base_root, ledger_id,
+        )
+        .map_err(|e| IndexerError::StorageRead(format!("pool compaction: {e}")))?
+        .pool_history_drop(&config.history_suppression),
+    };
     let mut tasks = Vec::new();
     for (order, events) in delta_run_events(content_store.as_ref(), &deltas, &[]).await? {
         let branch_cid = pool
@@ -4762,7 +4778,7 @@ pub async fn compact_pool_deltas(
             sorted_superseded_ops: superseded.iter().map(|&(_, op)| op).collect(),
             sorted_erase: Vec::new(),
             kind: Phase2TaskKind::NamedExisting { branch_cid },
-            history_drop: None,
+            history_drop: history_drop.clone(),
         });
     }
     if tasks.is_empty() {
@@ -5860,6 +5876,23 @@ fn compact_delta(
     let events: u64 = runs.iter().map(|r| u64::from(r.events)).sum::<u64>() + window_events as u64;
     let limit = (base_rows / DELTA_BASE_SHARE).clamp(DELTA_MIN_EVENTS, DELTA_MAX_EVENTS);
     promoting || runs.len() + 1 > DELTA_MAX_RUNS || events > limit
+}
+
+/// A window event as a history entry.
+fn hist_entry(
+    rec: RunRecordV2,
+    op: u8,
+) -> fluree_db_binary_index::format::history_sidecar::HistEntryV2 {
+    fluree_db_binary_index::format::history_sidecar::HistEntryV2 {
+        s_id: rec.s_id,
+        p_id: rec.p_id,
+        o_type: rec.o_type,
+        o_key: rec.o_key,
+        o_i: rec.o_i,
+        t: rec.t,
+        op,
+        g_id: rec.g_id,
+    }
 }
 
 /// A window event as a delta run event.

@@ -422,6 +422,69 @@ mod tests {
     }
 
     #[test]
+    fn a_pooled_drop_covers_only_its_graphs() {
+        let span = |g_id| {
+            [(1, 1), (3, 0)].map(|(t, op)| HistEntryV2 {
+                g_id,
+                ..make_entry(1, 7, 3, 10, t, op)
+            })
+        };
+        let entries = [span(3), span(4), span(5)].concat();
+        let graphs = |drop: &HistoryDrop| {
+            let mut entries = entries.clone();
+            drop.retain(&mut entries);
+            let mut graphs: Vec<_> = entries.iter().map(|e| e.g_id).collect();
+            graphs.dedup();
+            graphs
+        };
+        let mut all_but_4 = HistoryDrop::pooled();
+        all_but_4.insert_in(Graphs::AllBut(vec![4]), 7, 0, None);
+        assert_eq!(graphs(&all_but_4), vec![4]);
+        let mut only_4 = HistoryDrop::pooled();
+        only_4.insert_in(Graphs::One(4), 7, 0, None);
+        assert_eq!(graphs(&only_4), vec![3, 5]);
+        // One graph's span ends where another's straddles the range's end.
+        let mut until_4 = HistoryDrop::pooled();
+        until_4.insert_in(Graphs::AllBut(Vec::new()), 7, 0, Some(4));
+        let mut mixed = span(3).to_vec();
+        mixed.push(HistEntryV2 {
+            g_id: 4,
+            ..make_entry(1, 7, 3, 10, 2, 1)
+        });
+        mixed.push(HistEntryV2 {
+            g_id: 4,
+            ..make_entry(1, 7, 3, 10, 4, 0)
+        });
+        assert_eq!(kept(&until_4, mixed), vec![(10, 2, 1), (10, 4, 0)]);
+    }
+
+    #[test]
+    fn retain_spans_keeps_what_its_window_does_not_close() {
+        let mut drop = HistoryDrop::default();
+        drop.insert(7, 0, None);
+        // The fact was present: the window retracts it, asserts and retracts
+        // it again, and asserts it for good.
+        let mut events = vec![
+            make_entry(1, 7, 3, 10, 2, 0),
+            make_entry(1, 7, 3, 10, 3, 1),
+            make_entry(1, 7, 3, 10, 4, 0),
+            make_entry(1, 7, 3, 10, 5, 1),
+        ];
+        drop.retain_spans(&mut events, |e| *e);
+        let kept: Vec<_> = events.iter().map(|e| (e.t, e.op)).collect();
+        assert_eq!(kept, vec![(2, 0), (5, 1)]);
+    }
+
+    #[test]
+    fn a_span_across_two_ranges_is_kept() {
+        let mut drop = HistoryDrop::default();
+        drop.insert(7, 0, Some(3));
+        drop.insert(7, 5, None);
+        let span = vec![make_entry(1, 7, 3, 10, 2, 1), make_entry(1, 7, 3, 10, 6, 0)];
+        assert_eq!(kept(&drop, span), vec![(10, 2, 1), (10, 6, 0)]);
+    }
+
+    #[test]
     fn a_straddling_span_does_not_keep_an_erased_event() {
         let entries = vec![make_entry(1, 7, 3, 10, 3, 1), make_entry(1, 7, 3, 10, 5, 0)];
         let mut drop = HistoryDrop::default();
@@ -579,12 +642,47 @@ mod tests {
 ///
 /// Both leave out whole spans of one fact, an assertion with the retraction
 /// that ended it, so what is left replays consistently at every point. A
-/// range leaves a span out only when both its ends fall in one (see
+/// range leaves a span out only when both its ends fall in it (see
 /// [`HistoryDrop::retain`]).
+///
+/// A pooled tree's drop ([`HistoryDrop::pooled`]) covers some of the graphs
+/// the tree holds, and tells facts apart by graph, which its entries name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HistoryDrop {
-    by_p_id: std::collections::HashMap<u32, Vec<(i64, i64)>>,
+    by_p_id: std::collections::HashMap<u32, Vec<Range>>,
     events: std::collections::HashSet<EventKey>,
+    pooled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Range {
+    from: i64,
+    until: i64,
+    /// Only a pooled tree's drop reads it.
+    graphs: Graphs,
+}
+
+impl Range {
+    #[inline]
+    fn holds(&self, t: u32) -> bool {
+        self.from <= i64::from(t) && i64::from(t) < self.until
+    }
+}
+
+/// The graphs a range of a pooled tree's drop covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Graphs {
+    One(fluree_db_core::GraphId),
+    AllBut(Vec<fluree_db_core::GraphId>),
+}
+
+impl Graphs {
+    fn covers(&self, g_id: fluree_db_core::GraphId) -> bool {
+        match self {
+            Graphs::One(g) => *g == g_id,
+            Graphs::AllBut(except) => !except.contains(&g_id),
+        }
+    }
 }
 
 /// An event's identity: `(s_id, p_id, o_type, o_key, o_i, t, op)`.
@@ -603,12 +701,26 @@ fn event_key(entry: &HistEntryV2) -> EventKey {
 }
 
 impl HistoryDrop {
+    /// An empty drop for a pooled tree.
+    pub fn pooled() -> Self {
+        Self {
+            pooled: true,
+            ..Self::default()
+        }
+    }
+
     /// Leave out `p_id`'s history entries with `from_t <= t < until_t`.
     pub fn insert(&mut self, p_id: u32, from_t: i64, until_t: Option<i64>) {
-        self.by_p_id
-            .entry(p_id)
-            .or_default()
-            .push((from_t, until_t.unwrap_or(i64::MAX)));
+        self.insert_in(Graphs::AllBut(Vec::new()), p_id, from_t, until_t);
+    }
+
+    /// [`Self::insert`], in `graphs` of a pooled tree.
+    pub fn insert_in(&mut self, graphs: Graphs, p_id: u32, from_t: i64, until_t: Option<i64>) {
+        self.by_p_id.entry(p_id).or_default().push(Range {
+            from: from_t,
+            until: until_t.unwrap_or(i64::MAX),
+            graphs,
+        });
     }
 
     /// Leave out the single event `entry`.
@@ -620,19 +732,59 @@ impl HistoryDrop {
         self.by_p_id.is_empty() && self.events.is_empty()
     }
 
-    /// Whether `entry` falls in one of its predicate's ranges.
+    /// The ranges that cover `entry`'s predicate, in its graph.
+    fn ranges<'a>(&'a self, entry: &'a HistEntryV2) -> impl Iterator<Item = &'a Range> {
+        self.by_p_id
+            .get(&entry.p_id)
+            .into_iter()
+            .flatten()
+            .filter(move |r| !self.pooled || r.graphs.covers(entry.g_id))
+    }
+
     #[inline]
     fn in_range(&self, entry: &HistEntryV2) -> bool {
-        self.by_p_id.get(&entry.p_id).is_some_and(|ranges| {
-            ranges
-                .iter()
-                .any(|(from, until)| *from <= i64::from(entry.t) && i64::from(entry.t) < *until)
-        })
+        self.ranges(entry).any(|r| r.holds(entry.t))
+    }
+
+    #[inline]
+    fn holds_span(&self, assert: &HistEntryV2, retract: &HistEntryV2) -> bool {
+        self.ranges(assert)
+            .any(|r| r.holds(assert.t) && r.holds(retract.t))
     }
 
     #[inline]
     fn erases(&self, entry: &HistEntryV2) -> bool {
         !self.events.is_empty() && self.events.contains(&event_key(entry))
+    }
+
+    /// The spans in `entries` of the predicates this drop covers: each
+    /// assertion and the retraction that follows it, by index.
+    fn spans(&self, entries: &[HistEntryV2]) -> Vec<(usize, usize)> {
+        type Fact = (u64, u32, u16, u64, u32, fluree_db_core::GraphId);
+        let mut facts: std::collections::HashMap<Fact, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            if self.by_p_id.contains_key(&e.p_id) {
+                // A dedicated tree holds one graph, and an entry decoded
+                // from its sidecar says 0 where one derived from novelty
+                // names it.
+                let g_id = if self.pooled { e.g_id } else { 0 };
+                let fact = (e.s_id.as_u64(), e.p_id, e.o_type, e.o_key, e.o_i, g_id);
+                facts.entry(fact).or_default().push(i);
+            }
+        }
+        let mut spans = Vec::new();
+        for mut transitions in facts.into_values() {
+            transitions.sort_unstable_by_key(|&i| {
+                fluree_db_core::same_t::op_order(entries[i].t, entries[i].op == 1)
+            });
+            for pair in transitions.windows(2) {
+                if entries[pair[0]].op == 1 && entries[pair[1]].op == 0 {
+                    spans.push((pair[0], pair[1]));
+                }
+            }
+        }
+        spans
     }
 
     /// Leave out of `entries`, which hold every transition of the facts they
@@ -641,42 +793,45 @@ impl HistoryDrop {
     /// force and retracted after it ended still reads as present between the
     /// two, and never before its assertion.
     pub fn retain(&self, entries: &mut Vec<HistEntryV2>) {
-        let mut ranged: Vec<bool> = entries.iter().map(|e| self.in_range(e)).collect();
-        let any_ranged = ranged.contains(&true);
+        let mut dropped: Vec<bool> = entries.iter().map(|e| self.in_range(e)).collect();
+        let any_ranged = dropped.contains(&true);
         if !any_ranged && self.events.is_empty() {
             return;
         }
         if any_ranged {
-            // Not by graph: a tree holds one, and an entry decoded from a
-            // sidecar says 0 where one derived from novelty names it.
-            type Fact = (u64, u32, u16, u64, u32);
-            let mut facts: std::collections::HashMap<Fact, Vec<usize>> =
-                std::collections::HashMap::new();
-            for (i, e) in entries.iter().enumerate() {
-                if self.by_p_id.contains_key(&e.p_id) {
-                    let fact = (e.s_id.as_u64(), e.p_id, e.o_type, e.o_key, e.o_i);
-                    facts.entry(fact).or_default().push(i);
-                }
-            }
-            for mut transitions in facts.into_values() {
-                transitions.sort_unstable_by_key(|&i| {
-                    fluree_db_core::same_t::op_order(entries[i].t, entries[i].op == 1)
-                });
-                for span in transitions.windows(2) {
-                    let (assert, retract) = (span[0], span[1]);
-                    if entries[assert].op == 1
-                        && entries[retract].op == 0
-                        && ranged[assert] != ranged[retract]
-                    {
-                        ranged[assert] = false;
-                        ranged[retract] = false;
-                    }
-                }
+            for (assert, retract) in self.spans(entries) {
+                let whole = self.holds_span(&entries[assert], &entries[retract]);
+                dropped[assert] = whole;
+                dropped[retract] = whole;
             }
         }
         let mut i = 0;
         entries.retain(|e| {
-            let keep = !ranged[i] && !self.erases(e);
+            let keep = !dropped[i] && !self.erases(e);
+            i += 1;
+            keep
+        });
+    }
+
+    /// Leave out of `events`, a window's transitions of the facts they name,
+    /// the spans a range holds whole. Unlike [`Self::retain`], it keeps an
+    /// event whose span the window does not close: that event changes what
+    /// is current.
+    pub fn retain_spans<T>(&self, events: &mut Vec<T>, entry: impl Fn(&T) -> HistEntryV2) {
+        if self.by_p_id.is_empty() {
+            return;
+        }
+        let entries: Vec<HistEntryV2> = events.iter().map(entry).collect();
+        let mut dropped = vec![false; entries.len()];
+        for (assert, retract) in self.spans(&entries) {
+            if self.holds_span(&entries[assert], &entries[retract]) {
+                dropped[assert] = true;
+                dropped[retract] = true;
+            }
+        }
+        let mut i = 0;
+        events.retain(|_| {
+            let keep = !dropped[i];
             i += 1;
             keep
         });

@@ -995,10 +995,8 @@ where
                     build_progress: None,
                     stage_marker: None,
                     term_builder: None,
-                    // Retention's history drop is per graph, and the pool
-                    // holds many.
                     history_drop: match build_pool {
-                        Some(_) => None,
+                        Some(_) => shared.pool_history_drop(&config.history_suppression),
                         None => shared.history_drop_for(&config.history_suppression, g_id),
                     },
                     pool: build_pool.clone(),

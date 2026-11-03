@@ -266,7 +266,11 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
     // Assemble processed leaflets into leaf blob(s).
     let mut output = assemble_output_leaves(processed, input)?;
     output.matched = matched;
-    output.graph_deltas = graph_deltas;
+    for (g_id, delta) in graph_deltas {
+        let net = output.graph_deltas.entry(g_id).or_default();
+        net.rows += delta.rows;
+        net.history += delta.history;
+    }
     Ok(output)
 }
 
@@ -792,9 +796,15 @@ fn assemble_output_leaves(
     // Build each leaf blob.
     let mut output = Vec::with_capacity(leaves.len());
     let mut origins = origins.into_iter();
+    let mut dropped = GraphDeltas::new();
     for group in leaves {
         let leaflet_origins = origins.by_ref().take(group.len()).collect();
-        let leaf_info = build_leaf_from_group(group, input.order, input.history_drop.as_deref())?;
+        let leaf_info = build_leaf_from_group(
+            group,
+            input.order,
+            input.history_drop.as_deref(),
+            input.pool.tally.then_some(&mut dropped),
+        )?;
         output.push(NewLeafBlob {
             info: leaf_info,
             leaflet_origins,
@@ -805,11 +815,13 @@ fn assemble_output_leaves(
     Ok(LeafUpdateOutput {
         leaves: output,
         matched: Vec::new(),
-        graph_deltas: GraphDeltas::new(),
+        graph_deltas: dropped,
     })
 }
 
 /// Build a single leaf blob from a group of (EncodedLeaflet, history, was_re_encoded) triples.
+/// `dropped`, when given, takes each graph's history entries that retention
+/// leaves out.
 fn build_leaf_from_group(
     mut group: Vec<(
         fluree_db_binary_index::format::leaflet::EncodedLeaflet,
@@ -818,6 +830,7 @@ fn build_leaf_from_group(
     )>,
     order: RunSortOrder,
     history_drop: Option<&fluree_db_binary_index::format::history_sidecar::HistoryDrop>,
+    mut dropped: Option<&mut GraphDeltas>,
 ) -> io::Result<LeafInfo> {
     use fluree_db_binary_index::format::leaflet::EncodedLeaflet;
 
@@ -826,7 +839,18 @@ fn build_leaf_from_group(
     let mut sidecar_builder = HistSidecarBuilder::for_order(order);
     for (_, history, _) in &mut group {
         if let Some(drop) = history_drop {
+            let tally = |deltas: &mut GraphDeltas, history: &[HistEntryV2], by: i64| {
+                for e in history {
+                    deltas.entry(e.g_id).or_default().history += by;
+                }
+            };
+            if let Some(deltas) = dropped.as_deref_mut() {
+                tally(deltas, history, -1);
+            }
             drop.retain(history);
+            if let Some(deltas) = dropped.as_deref_mut() {
+                tally(deltas, history, 1);
+            }
         }
         sidecar_builder.start_leaflet();
         for entry in history.iter() {

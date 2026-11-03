@@ -824,6 +824,255 @@ async fn incremental_builds_keep_a_span_that_outlives_the_rule_in_a_dedicated_gr
     }
 }
 
+/// A file-backed instance whose background indexer builds each commit, and
+/// whose retention passes run only when called.
+fn indexing_without_background_passes(dir: &std::path::Path) -> std::sync::Arc<Fluree> {
+    use std::time::Duration;
+    let fluree = std::sync::Arc::new(
+        FlureeBuilder::file(dir.to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_secs(3600))
+            .build()
+            .unwrap(),
+    );
+    fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_secs(3600),
+            ..Default::default()
+        }),
+    );
+    fluree
+}
+
+async fn transact_turtle(fluree: &Fluree, ledger_id: &str, turtle: &str) -> i64 {
+    transact_turtle_with(fluree, ledger_id, turtle, true).await
+}
+
+/// `turtle` committed, with an index build triggered when `index`.
+async fn transact_turtle_with(fluree: &Fluree, ledger_id: &str, turtle: &str, index: bool) -> i64 {
+    let graph = fluree.graph(ledger_id);
+    let turtle = format!(
+        "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+         {turtle}"
+    );
+    let mut txn = graph.transact().upsert_turtle(&turtle);
+    if !index {
+        txn = txn.index_config(fluree_db_api::IndexConfig {
+            reindex_min_bytes: usize::MAX,
+            reindex_max_bytes: usize::MAX,
+        });
+    }
+    txn.commit().await.expect("transact").receipt.t
+}
+
+/// `ex:count` keeps no history, except in `ex:g2`.
+async fn no_history_except_in_g2(fluree: &Fluree, ledger_id: &str) {
+    transact_turtle(
+        fluree,
+        ledger_id,
+        &format!(
+            "GRAPH <urn:fluree:{ledger_id}#config> {{
+               <urn:fluree:{ledger_id}:config:ledger> a f:LedgerConfig ;
+                 f:retentionDefaults <urn:cfg:retention> ;
+                 f:graphOverrides <urn:cfg:g2> .
+               <urn:cfg:retention> a f:RetentionDefaults ; f:property <urn:cfg:p> .
+               <urn:cfg:p> a f:RetentionProperty ; f:target ex:count ; f:noHistory true .
+               <urn:cfg:g2> a f:GraphConfig ; f:targetGraph ex:g2 ;
+                 f:retentionDefaults [ f:property [
+                   a f:RetentionProperty ; f:target ex:count ; f:noHistory false ] ] .
+             }}"
+        ),
+    )
+    .await;
+}
+
+/// `ex:c ex:count v` in `ex:g1` and `ex:g2`, both small enough to pool.
+async fn count_in_both(fluree: &Fluree, ledger_id: &str, v: i64) -> i64 {
+    count_in_both_with(fluree, ledger_id, v, true).await
+}
+
+async fn count_in_both_with(fluree: &Fluree, ledger_id: &str, v: i64, index: bool) -> i64 {
+    transact_turtle_with(
+        fluree,
+        ledger_id,
+        &format!("GRAPH ex:g1 {{ ex:c ex:count {v} . }} GRAPH ex:g2 {{ ex:c ex:count {v} . }}"),
+        index,
+    )
+    .await
+}
+
+/// `(rows, history)` the index records for pooled `ex:{graph}`; `None` when
+/// it has trees of its own.
+async fn pool_member(fluree: &Fluree, ledger_id: &str, graph: &str) -> Option<(u32, u32)> {
+    use fluree_db_core::ContentStore;
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .expect("record");
+    let store = fluree.content_store(&record.storage_namespace());
+    let bytes = store
+        .get(&record.index_head_id.expect("indexed"))
+        .await
+        .unwrap();
+    let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();
+    let iri = format!("http://example.org/{graph}");
+    let g_id = root.graph_iris.iter().position(|g| *g == iri)? as u32 + 1;
+    root.pool?.member(g_id).map(|m| (m.rows, m.history))
+}
+
+/// `ex:c`'s counts as of `t` in `ex:g1` and in `ex:g2`.
+async fn counts_at(fluree: &Fluree, ledger_id: &str, t: i64) -> (Vec<JsonValue>, Vec<JsonValue>) {
+    let at = |graph: &str| json!({"@id": ledger_id, "t": t, "graph": format!("http://example.org/{graph}")});
+    (
+        read(fluree, ledger_id, at("g1"), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        read(fluree, ledger_id, at("g2"), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+    )
+}
+
+/// `[subject, count]` rows as of `t` in `ex:g1` and in `ex:g2`, by a range
+/// on the count: a pooled graph reads it from the pool's POST order, where
+/// GSPO serves [`counts_at`].
+async fn count_range_at(
+    fluree: &Fluree,
+    ledger_id: &str,
+    t: i64,
+) -> (Vec<JsonValue>, Vec<JsonValue>) {
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let rows = |graph: &str| {
+        let query = json!({
+            "@context": ctx(),
+            "from": {"@id": ledger_id, "t": t, "graph": format!("http://example.org/{graph}")},
+            "select": ["?s", "?o"],
+            "where": [{"@id": "?s", "ex:count": "?o"}, ["filter", "(>= ?o 0)"]]
+        });
+        let ledger = &ledger;
+        async move {
+            let result = fluree.query_connection(&query).await.unwrap();
+            result
+                .to_jsonld(&ledger.snapshot)
+                .unwrap()
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    (rows("g1").await, rows("g2").await)
+}
+
+/// Pooled graphs share their trees, and a rule leaves out history only in
+/// the graphs it covers: from GSPO at each build, from a delta run the spans
+/// its window closes, and from the other orders' base when the delta folds
+/// into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_builds_leave_out_only_the_covered_graphs_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = indexing_without_background_passes(dir.path());
+    let id = ledger(&fluree, "it/nohist-pool").await;
+    no_history_except_in_g2(&fluree, &id).await;
+    let t1 = count_in_both(&fluree, &id, 1).await;
+    fluree.run_retention(&id).await.expect("pass");
+    caught_up(&fluree, &id).await;
+    // One build, after a pass has covered both changes.
+    let t2 = count_in_both_with(&fluree, &id, 2, false).await;
+    let t3 = count_in_both_with(&fluree, &id, 3, false).await;
+    fluree.run_retention(&id).await.expect("pass");
+    let built = fluree_db_api::admin::MaintainIndexOptions {
+        compact: false,
+        ..Default::default()
+    };
+    fluree.maintain_index(&id, built).await.expect("build");
+
+    assert_eq!(pool_member(&fluree, &id, "g1").await.map(|m| m.1), Some(0));
+    assert_eq!(pool_member(&fluree, &id, "g2").await.map(|m| m.1), Some(4));
+    assert_eq!(counts_at(&fluree, &id, t1).await, (vec![], vec![json!(1)]));
+    assert_eq!(
+        counts_at(&fluree, &id, t3).await,
+        (vec![json!(3)], vec![json!(3)])
+    );
+    // The delta run holds `ex:g1`'s value 2 neither asserted nor retracted.
+    assert_eq!(
+        count_range_at(&fluree, &id, t2).await,
+        (vec![], vec![json!(["ex:c", 2])])
+    );
+
+    let maintained = fluree
+        .maintain_index(&id, Default::default())
+        .await
+        .expect("maintain");
+    assert!(maintained.compacted);
+    assert_eq!(
+        count_range_at(&fluree, &id, t1).await,
+        (vec![], vec![json!(["ex:c", 1])])
+    );
+}
+
+/// A graph leaving the pool takes its pooled history to trees of its own,
+/// less what its rule covers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_graph_leaving_the_pool_leaves_out_what_its_rule_covers() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = indexing_without_background_passes(dir.path());
+    let id = ledger(&fluree, "it/nohist-promote").await;
+    no_history_except_in_g2(&fluree, &id).await;
+    let t1 = count_in_both(&fluree, &id, 1).await;
+    fluree.run_retention(&id).await.expect("pass");
+    caught_up(&fluree, &id).await;
+    count_in_both(&fluree, &id, 2).await;
+    let t3 = count_in_both(&fluree, &id, 3).await;
+    caught_up(&fluree, &id).await;
+    // Built ahead of a pass, the pool still holds `ex:g1`'s history.
+    assert_eq!(pool_member(&fluree, &id, "g1").await.map(|m| m.1), Some(4));
+
+    fluree.run_retention(&id).await.expect("pass");
+    transact_turtle(
+        &fluree,
+        &id,
+        &format!(
+            "GRAPH <urn:fluree:{id}#config> {{
+               <urn:fluree:{id}:config:ledger>
+                 f:indexingDefaults [ f:graphPlacement f:PlacementDedicated ] .
+             }}"
+        ),
+    )
+    .await;
+    caught_up(&fluree, &id).await;
+    assert_eq!(pool_member(&fluree, &id, "g1").await, None);
+    assert_eq!(pool_member(&fluree, &id, "g2").await, None);
+    assert_eq!(counts_at(&fluree, &id, t1).await, (vec![], vec![json!(1)]));
+    assert_eq!(
+        counts_at(&fluree, &id, t3).await,
+        (vec![json!(3)], vec![json!(3)])
+    );
+}
+
+/// A rebuild pools the graphs, and leaves out history only in the ones the
+/// rule covers.
+#[tokio::test]
+async fn a_rebuild_leaves_out_only_the_covered_pooled_graphs_history() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/nohist-pool-rebuild").await;
+    no_history_except_in_g2(&fluree, &id).await;
+    let t1 = count_in_both(&fluree, &id, 1).await;
+    count_in_both(&fluree, &id, 2).await;
+    count_in_both(&fluree, &id, 3).await;
+    fluree.run_retention(&id).await.expect("pass");
+    reindex(&fluree, &id).await;
+
+    assert_eq!(pool_member(&fluree, &id, "g1").await.map(|m| m.1), Some(0));
+    assert_eq!(pool_member(&fluree, &id, "g2").await.map(|m| m.1), Some(4));
+    assert_eq!(counts_at(&fluree, &id, t1).await, (vec![], vec![json!(1)]));
+    assert_eq!(
+        count_range_at(&fluree, &id, t1).await,
+        (vec![], vec![json!(["ex:c", 1])])
+    );
+}
+
 /// As `a_rebuild_ahead_of_the_worker_keeps_history_written_after_a_rule_ended`,
 /// for incremental builds. Passes run only when called, so the background
 /// indexer builds before the pass that ends the rule.

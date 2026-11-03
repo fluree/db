@@ -1443,6 +1443,42 @@ impl SharedResolverState {
         (!drop.is_empty()).then(|| std::sync::Arc::new(drop))
     }
 
+    /// [`Self::history_drop_for`] the pooled tree, for whichever graphs it
+    /// holds.
+    pub fn pool_history_drop(
+        &self,
+        suppressed: &[crate::config::SuppressedHistory],
+    ) -> Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>> {
+        use fluree_db_binary_index::format::history_sidecar::{Graphs, HistoryDrop};
+        if suppressed.is_empty() {
+            return None;
+        }
+        let graph_id = |iri: &str| -> Option<fluree_db_core::GraphId> {
+            self.graphs
+                .graph_dict_id(iri)
+                .and_then(|raw| raw.checked_add(1))
+        };
+        let mut drop = HistoryDrop::pooled();
+        for rule in suppressed {
+            let graphs = match &rule.graph_iri {
+                Some(iri) => match graph_id(iri) {
+                    Some(g_id) => Graphs::One(g_id),
+                    None => continue,
+                },
+                None => Graphs::AllBut(
+                    rule.except_graph_iris
+                        .iter()
+                        .filter_map(|iri| graph_id(iri))
+                        .collect(),
+                ),
+            };
+            if let Some(p_id) = self.predicates.get(&rule.predicate_iri) {
+                drop.insert_in(graphs, p_id, rule.from_t, rule.until_t);
+            }
+        }
+        (!drop.is_empty()).then(|| std::sync::Arc::new(drop))
+    }
+
     pub fn configure_fulltext_properties(
         &mut self,
         properties: &[crate::config::ConfiguredFulltextProperty],

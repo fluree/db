@@ -459,8 +459,9 @@ Entries merge by `f:target`, and each field merges on its own: an absent field i
 **Group predicate**: `f:indexingDefaults`
 
 Controls how the indexer lays out named graphs. It changes storage layout and
-performance, never query results, except for a read as of an earlier point of
-an [`f:noHistory`](../transactions/history-retention.md#the-index) predicate.
+performance, never query results, except how soon a read as of an earlier point
+stops seeing an [`f:noHistory`](../transactions/history-retention.md#the-index)
+predicate's superseded values.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

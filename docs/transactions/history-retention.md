@@ -56,9 +56,9 @@ An index build applies each rule only through the last commit the worker has sav
 
 ### The index
 
-The background indexer leaves the covered history out of the index, in incremental builds as well as full rebuilds. History indexed before the rule was recorded stays in the index until a build rewrites the leaf that holds it, and reads as of an earlier point can see it until then. A [reindex](../indexing-and-search/reindex.md) drops all of it at once.
+The background indexer leaves the covered history out of the index, in incremental builds as well as full rebuilds, and for graphs with index trees of their own as well as small graphs that share them (see [graph placement](../ledger-config/setting-groups.md#indexing-defaults)). History indexed before the rule was recorded stays in the index until a build rewrites the leaf that holds it, and reads as of an earlier point can see it until then. In shared trees, some reads can see it until the trees fold in their pending changes. A [reindex](../indexing-and-search/reindex.md) drops it at once, through the last commit the worker has saved as processed.
 
-Small named graphs that share one set of index trees (see [graph placement](../ledger-config/setting-groups.md#indexing-defaults)) keep the predicate's history. A graph that outgrows them, past 16,384 history entries by default, moves to trees of its own, where the rule applies.
+The [geospatial](../indexing-and-search/geospatial.md#s2-spatial-index-complex-geometries) index of polygons and lines keeps the predicate's history: a spatial search as of an earlier point can match a geometry the predicate has since replaced.
 
 ## Targeted removal
 

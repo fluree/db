@@ -2793,8 +2793,9 @@ impl crate::Fluree {
             return Ok(PoolCompaction::Deferred);
         }
         let content_store = self.branched_content_store(id.as_str()).await?;
-        let config = fluree_db_indexer::IndexerConfig::default()
+        let mut config = fluree_db_indexer::IndexerConfig::default()
             .with_ledger_config_provider(self.ledger_config_provider());
+        config.history_suppression = self.suppressed_history_for_index(id.as_str()).await?;
         let Some(result) = fluree_db_indexer::compact_pool_deltas_for_record(
             content_store.clone(),
             &record,
