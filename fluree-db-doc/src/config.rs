@@ -157,13 +157,40 @@ pub struct ReaderEndpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
     /// The model ids this endpoint serves, as `--model` names them. Sent
-    /// with each request as `X-Fluree-Model`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// with each request as `X-Fluree-Model`. A list, or one string of
+    /// comma-separated ids (what `fluree config set` writes, and what
+    /// `FLUREE_DOC_READER_MODELS` takes).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_list"
+    )]
     pub models: Vec<String>,
     /// What the endpoint may keep between requests that share a prefix
     /// (`ontology`, `catalog`), sent as `X-Fluree-Cache`; `--cache` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<String>,
+}
+
+/// `["a", "b"]` or `"a, b"`, as a list of trimmed, non-empty ids.
+fn string_or_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Models {
+        One(String),
+        Many(Vec<String>),
+    }
+    let split = |s: &str| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    Ok(match Models::deserialize(d)? {
+        Models::One(s) => split(&s),
+        Models::Many(v) => v.iter().flat_map(|s| split(s)).collect(),
+    })
 }
 
 /// Hand-written for the same reason as [`ModelEndpoint`]'s.
@@ -417,6 +444,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn reader_models_take_a_list_or_a_comma_separated_string() {
+        let list: ReaderEndpoint =
+            serde_json::from_str(r#"{"url":"u","models":["a"," b "]}"#).unwrap();
+        assert_eq!(list.models, vec!["a", "b"]);
+        let one: ReaderEndpoint = serde_json::from_str(r#"{"url":"u","models":"a, b,"}"#).unwrap();
+        assert_eq!(one.models, vec!["a", "b"]);
     }
 
     #[test]

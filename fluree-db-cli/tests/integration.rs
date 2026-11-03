@@ -7217,3 +7217,40 @@ fn doc_ingest_reader_sends_a_scoped_catalog_with_types_and_language_tags() {
     assert!(instances.contains("\"Acme Corporation\"@en"), "{instances}");
     assert!(!instances.contains("jane"), "{instances}");
 }
+
+/// The reader is configured with `fluree config set`, as the docs say: a
+/// `models` written as a string (what `config set` writes) is a list of one.
+#[test]
+fn doc_reader_configured_with_config_set_reads() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, seen) = spawn_stub_reader(vec![stub_reading(0.9, true)]);
+    for (key, value) in [
+        ("doc.reader.url", url.as_str()),
+        ("doc.reader.models", "stub-reader, other"),
+    ] {
+        fluree_cmd(&tmp)
+            .args(["config", "set", key, value])
+            .assert()
+            .success();
+    }
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--no-embed",
+            "--ontology",
+            "ont/model.ttl",
+        ])
+        .args(["--model", "stub-reader"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "extraction stub-reader via http://",
+        ));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
