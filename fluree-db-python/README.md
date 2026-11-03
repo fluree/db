@@ -13,9 +13,9 @@ pip install fluree                # or "fluree[pandas]", "fluree[polars]"
 ```
 
 Wheels are published for Linux (x86-64 and arm64, glibc 2.28 or later),
-macOS on Apple silicon, and Windows (x86-64), for CPython 3.10 and later —
-the platforms the Fluree CLI ships on. The package version is the version of
-the Fluree engine inside it.
+macOS 14 or later on Apple silicon, and Windows (x86-64), for CPython 3.10
+and later — the platforms the Fluree CLI ships on. The package version is
+the version of the Fluree engine inside it.
 
 ```python
 import fluree
