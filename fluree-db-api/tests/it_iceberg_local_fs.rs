@@ -3990,7 +3990,7 @@ async fn a_declared_key_the_table_cannot_hold_is_refused() {
         r#"rr:logicalTable [ rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "score" ) ]"#,
     );
     assert_ne!(mapping, PEOPLE_R2RML, "the key was spliced in");
-    let config = R2rmlCreateConfig::new_direct("people-float-key", &table_location(), &mapping)
+    let config = R2rmlCreateConfig::new_direct("people-float-key", table_location(), &mapping)
         .with_mapping_media_type("text/turtle");
     fluree
         .create_r2rml_graph_source(config)
