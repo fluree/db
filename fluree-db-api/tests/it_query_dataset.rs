@@ -2909,6 +2909,19 @@ async fn sparql_reserved_graphs_stay_unreachable_when_not_named_in_full() {
             "expected the within-ledger rejection for FROM <{iri}>, got: {err}"
         );
     }
+    // The JSON-LD twin: a `from` member's graph naming another ledger's
+    // config graph is not this ledger's config graph.
+    let err = fluree
+        .query_from()
+        .jsonld(&json!({
+            "from": {"@id": "wl-reserved-neg:main", "graph": foreign_config},
+            "select": "?s",
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .execute_formatted()
+        .await
+        .expect_err("a from graph naming another ledger's config graph must be rejected");
+    assert!(err.to_string().contains(&foreign_config), "{err}");
 
     // 2. `GRAPH <reserved>` with no FROM NAMED resolves to nothing. The
     //    reserved graphs hold data here (txn-meta always does), so an empty

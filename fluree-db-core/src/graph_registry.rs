@@ -134,22 +134,26 @@ pub fn config_graph_iri(ledger_id: &str) -> String {
 /// written in, so a branch replaying its source's history, or a copy under
 /// another name, reads the source's config graph as its own.
 pub fn names_config_graph(iri: &str) -> bool {
-    names_system_graph(iri, "config")
+    config_graph_ledger(iri).is_some()
+}
+
+/// The ledger whose config graph IRI ([`config_graph_iri`]) `iri` is.
+pub fn config_graph_ledger(iri: &str) -> Option<crate::LedgerId> {
+    system_graph_ledger(iri, "config")
 }
 
 /// Whether `iri` is a ledger's txn-meta graph IRI ([`txn_meta_graph_iri`]),
 /// whichever ledger it names.
 pub fn names_txn_meta_graph(iri: &str) -> bool {
-    names_system_graph(iri, "txn-meta")
+    system_graph_ledger(iri, "txn-meta").is_some()
 }
 
-fn names_system_graph(iri: &str, graph: &str) -> bool {
+fn system_graph_ledger(iri: &str, graph: &str) -> Option<crate::LedgerId> {
     // The last `#`: names from before the ledger-id grammar may hold one.
     iri.strip_prefix("urn:fluree:")
         .and_then(|rest| rest.rsplit_once('#'))
-        .is_some_and(|(ledger, name)| {
-            name == graph && crate::LedgerId::parse_persisted(ledger).is_ok()
-        })
+        .filter(|(_, name)| *name == graph)
+        .and_then(|(ledger, _)| crate::LedgerId::parse_persisted(ledger).ok())
 }
 
 /// Ledger-level registry mapping graph IRIs to deterministic GraphIds.
