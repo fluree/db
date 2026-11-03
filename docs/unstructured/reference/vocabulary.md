@@ -45,6 +45,7 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `doc:mentionCount` | integer | Mentions written. |
 | `doc:entityCount` | integer | Distinct entities mentioned, known and new. |
 | `doc:relationCount` | integer | Relations written, every verdict included. |
+| `doc:readerPredicate` | IRI | A predicate a reader wrote outside the pipeline's own; a re-ingest retracts these from the nodes the reader minted, and nothing else there. |
 
 ## Mention properties
 
