@@ -248,6 +248,22 @@ pub trait SecretResolver: Send + Sync + std::fmt::Debug {
         &self,
         secret_ref: &str,
     ) -> std::result::Result<String, SecretResolveError>;
+
+    /// A stable, non-secret name for whose secrets this resolver resolves
+    /// (e.g. a tenant id), or `None` when every resolver this process builds
+    /// resolves a given reference to the same secret.
+    ///
+    /// Caches that hold what a secret built (catalog clients and their tokens,
+    /// Delta table handles, storage scopes and the bytes read under them) are
+    /// keyed by the stored configuration, which carries the *reference*, not
+    /// the secret. **An embedder whose resolver maps the same reference name
+    /// to different secrets per tenant MUST return an id that differs per
+    /// tenant**, or one tenant's cached client or data can serve another that
+    /// stored the same reference. It is part of
+    /// [`IdentityContext::cache_scope`](crate::auth::IdentityContext::cache_scope).
+    fn scope_id(&self) -> Option<String> {
+        None
+    }
 }
 
 impl From<String> for ConfigValue {

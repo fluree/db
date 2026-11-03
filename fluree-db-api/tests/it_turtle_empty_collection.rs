@@ -99,11 +99,10 @@ async fn empty_collection_object_stores_rdf_nil() {
         "`?s ex:items ()` must find ex:s2: {by_nil_pattern:?}"
     );
 
-    // The whole graph, as SPARQL reads it: the list's owner edge and its
-    // three cells' `rdf:first`/`rdf:rest`, and the nil edge. Before the fix
+    // The whole graph: 3 indexed list items + the nil edge. Before the fix
     // this document committed 3 flakes and ex:s2 did not exist at all.
     let all = rows(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
-    assert_eq!(all.len(), 1 + 3 * 2 + 1, "expected 8 statements: {all:?}");
+    assert_eq!(all.len(), 4, "expected 4 stored statements: {all:?}");
 }
 
 /// `()` and a literally-written `rdf:nil` must produce identical graphs —
@@ -122,10 +121,11 @@ async fn empty_collection_matches_literal_rdf_nil() {
     );
 }
 
-/// A non-empty collection is, to SPARQL, the RDF it denotes: one owner edge
-/// to the list's head, and an `rdf:first`/`rdf:rest` cell per member.
+/// Non-empty collections keep the `list_index` storage shape: members are
+/// direct objects of the enclosing predicate and NO rdf:first/rest spine is
+/// materialized. This is the D-13 decision left exactly where it was.
 #[tokio::test]
-async fn non_empty_collections_read_as_rdf_lists() {
+async fn non_empty_collections_unchanged_no_spine() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_turtle(&fluree, "tx/turtle-empty-coll:nospine", REPRO_TTL).await;
 
@@ -136,7 +136,11 @@ async fn non_empty_collections_read_as_rdf_lists() {
           SELECT ?o WHERE { ex:s ex:items ?o }",
     )
     .await;
-    assert_eq!(items.len(), 1, "one owner edge, to the head: {items:?}");
+    assert_eq!(
+        items.len(),
+        3,
+        "list members stay direct objects: {items:?}"
+    );
 
     let spine = rows(
         &fluree,
@@ -145,7 +149,7 @@ async fn non_empty_collections_read_as_rdf_lists() {
           SELECT ?l ?x WHERE { ?l rdf:first ?x }",
     )
     .await;
-    assert_eq!(spine.len(), 3, "a cell per member: {spine:?}");
+    assert!(spine.is_empty(), "no spine must be materialized: {spine:?}");
 }
 
 /// `()` in SUBJECT position (`() ex:p ex:o .`) already parsed as the IRI

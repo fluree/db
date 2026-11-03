@@ -227,7 +227,9 @@ people.query("""
 - `fluree.Vector` holds an embedding (stored as float32); a one-dimensional
   numpy array works anywhere a `Vector` does, as a value or a parameter.
   Vectors come back from queries as `Vector`, and `numpy.asarray(v)` gives
-  a float32 array.
+  a float32 array. In each graph, all the vectors of one property have the
+  length of the first one it received, even after they are retracted; a
+  write that breaks that raises `InvalidRequestError`.
 - `cosineSimilarity`, `dotProduct` and `euclideanDistance` score vectors;
   `dotProduct` over normalized embeddings is the fastest.
 
@@ -263,6 +265,14 @@ people.select("PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name 
   to any Trino-protocol endpoint.
 - Secrets can be `fluree.EnvVar("NAME")`, read where the tables are read,
   rather than stored with the source.
+- A Google catalog (BigLake) or SQL endpoint authenticates with
+  `auth=fluree.Google(...)`: the metadata server (the default),
+  `"application_default"`, a service-account key in an `EnvVar` (never a
+  literal key), or a Workload Identity Federation configuration (a dict or its
+  file). `storage=` says which identity reads an Iceberg table's files:
+  `"vended"`, `"ambient"`, `"catalog"` (the catalog's own Google identity, the
+  default for a `bq://` warehouse) or a `fluree.Google(...)` of the source's
+  own.
 - `conn.graph_sources()` lists them, `conn.graph_source(name)` finds one, and
   `source.drop()` removes it (the tables are untouched).
 - To join a source with a ledger, name the source with `FROM NAMED` and read it

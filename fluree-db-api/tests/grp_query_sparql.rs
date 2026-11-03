@@ -78,5 +78,7 @@ mod it_sparql_params;
 #[path = "it_query_sparql_vector_constant.rs"]
 mod it_query_sparql_vector_constant;
 
+#[path = "it_sparql_list_members.rs"]
+mod it_sparql_list_members;
 #[path = "it_sparql_lists.rs"]
 mod it_sparql_lists;

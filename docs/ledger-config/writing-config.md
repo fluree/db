@@ -95,7 +95,7 @@ Give the config node an `@graph` naming the config graph:
 }
 ```
 
-A node's `@graph` scopes the node and everything nested in it, so the `f:shaclDefaults` group above lands in the config graph with its parent. (Before this release the nested group's fields landed in the default graph, where the config reader never looks; see [Repairing a config split across graphs](#repairing-a-config-split-across-graphs).)
+A node's `@graph` scopes the node and everything nested in it, so the `f:shaclDefaults` group above lands in the config graph with its parent. (In Fluree 4.2.3 and earlier the nested group's fields landed in the default graph, where the config reader never looks; see [Repairing a config split across graphs](#repairing-a-config-split-across-graphs).)
 
 `"@graph": "config"` names the ledger's own config graph without spelling out its IRI:
 
@@ -240,9 +240,9 @@ A transaction that writes only the config graph is never validated against SHACL
 
 ## Repairing a config split across graphs
 
-Before this release, a JSON-LD config written with nested setting groups (the form in [Writing via JSON-LD](#writing-via-json-ld)) put the groups' fields in the default graph, where the config reader never looks. The group reads as empty, so the setting it held is off: for a policy group, `f:defaultAllow false` is lost and anonymous reads and writes are open; for a SHACL group, validation is off. The same holds for fields written on the config subject itself without the config graph (a `f:shaclDefaults` link, say), and for a per-graph override whose `f:targetGraph` and groups were written there. Ledger info reports such configs as `empty-group` and `stranded-fields` diagnostics.
+In Fluree 4.2.3 and earlier, a JSON-LD config written with nested setting groups (the form in [Writing via JSON-LD](#writing-via-json-ld)) put the groups' fields in the default graph, where the config reader never looks. The group reads as empty, so the setting it held is off: for a policy group, `f:defaultAllow false` is lost and anonymous reads and writes are open; for a SHACL group, validation is off. The same holds for fields written on the config subject itself without the config graph (a `f:shaclDefaults` link, say), and for a per-graph override whose `f:targetGraph` and groups were written there. Ledger info reports such configs as `empty-group` and `stranded-fields` diagnostics.
 
-This SPARQL moves the stranded fields into the config graph in one transaction, restoring exactly what was written. It starts from the config subject and from every node a config edge in the config graph points at, and follows config edges (and the RDF lists `f:reasoningModes` may hold) through the default graph. Run it with `SELECT ?n ?p ?o` in place of the `DELETE`/`INSERT` first to see what it will move. It covers fields in the default graph; for another graph, wrap the last two patterns in `GRAPH <g> { }`.
+This SPARQL moves the stranded fields into the config graph in one transaction, restoring the settings that were written. It starts from the config subject and from every node a config edge in the config graph points at, and follows config edges (and an `f:reasoningModes` list stored as `rdf:first`/`rdf:rest` triples) through the default graph. A compact `f:reasoningModes` list moves as plain values, which the config reader accepts. Run it with `SELECT ?n ?p ?o` in place of the `DELETE`/`INSERT` first to see what it will move. It covers fields in the default graph; for another graph, wrap the last two patterns in `GRAPH <g> { }`.
 
 ```sparql
 PREFIX f: <https://ns.flur.ee/db#>
