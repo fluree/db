@@ -90,6 +90,11 @@ impl CompleteParentLookup {
     fn subjects(&self) -> usize {
         self.subjects
     }
+
+    /// Whether some key's rows mint more than one subject (#1583).
+    fn fans_out(&self) -> bool {
+        self.subjects > self.lookup.len()
+    }
 }
 
 /// How one RefObjectMap's parent is resolved for the rows of a scan.
@@ -108,6 +113,15 @@ impl ParentIndex {
             Self::Partial(partial) => &partial.lookup,
         }
     }
+
+    /// Whether a referencing row can join more than one subject through this
+    /// index, so a window's produced rows can outnumber its child rows.
+    fn fans_out(&self) -> bool {
+        match self {
+            Self::Complete(complete) => complete.fans_out(),
+            Self::Partial(partial) => partial.subjects > partial.lookup.len(),
+        }
+    }
 }
 
 /// A parent index built by semi-join probes (#2239): for a window of
@@ -120,6 +134,8 @@ impl ParentIndex {
 struct PartialParentIndex {
     /// The resolved keys present in the parent.
     lookup: ParentLookup,
+    /// The subjects `lookup` holds, over all its keys.
+    subjects: usize,
     /// Every resolved key: in `lookup`, or absent from the parent.
     resolved: HashSet<Vec<String>>,
     /// Key-filtered parent reads so far.
@@ -172,6 +188,7 @@ impl PartialParentIndex {
     fn new(source: ParentSource) -> Self {
         Self {
             lookup: ParentLookup::new(),
+            subjects: 0,
             resolved: HashSet::new(),
             probes: 0,
             files_probed: 0,
@@ -274,7 +291,7 @@ impl PartialParentIndex {
                 ctx.record_alloc(batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES));
                 ctx.checkpoint()?;
             }
-            fold_parent_batch(
+            self.subjects += fold_parent_batch(
                 &mut self.lookup,
                 parent_tm,
                 &self.source.parent_cols,
@@ -575,10 +592,15 @@ struct TmStream {
     /// so a lookup memoized on the operator's `parent_lookup_cache` (PR-4) is
     /// reused across child batches without a re-scan or a clone.
     parent_lookups: HashMap<LookupCacheKey, ParentIndex>,
-    /// Rows pulled past a window's size, read first by the next window (a
-    /// window is cut to its size while a parent is resolved by probes, so the
-    /// keys it probes are its own).
-    pending: Option<ColumnBatch>,
+    /// Rows pulled past a window's size, in scan order, read first by the next
+    /// window (a window is cut to its size while a parent is resolved by
+    /// probes, so the keys it probes are its own, and to the rows it may
+    /// produce when a parent fans out).
+    pending: VecDeque<ColumnBatch>,
+    /// Produced rows per child row in the last window that fanned out (at
+    /// least 1): a window pulls `window_rows / fan_out` child rows, so its cut
+    /// by produced rows leaves little behind.
+    fan_out: usize,
     /// Child-templated ref shortcuts for RefObjectMap POMs whose parent scan was
     /// skipped (trusted browse crawl only). Keyed identically to `parent_lookups`;
     /// a given `LookupCacheKey` populates exactly one of the two maps.
@@ -813,6 +835,9 @@ pub struct R2rmlScanOperator {
     /// Parent indexes resolved by probes, kept from one child window's scan to
     /// the next so a resolved key is not probed again.
     partial_parents: HashMap<LookupCacheKey, Box<PartialParentIndex>>,
+    /// The most rows one window has produced (tests read it).
+    #[cfg(test)]
+    max_window_produced: usize,
     /// Per `(table, projection)`: what pushing child keys into its scan has
     /// taught this operator (see [`KeyPushSeen`]).
     key_push_seen: HashMap<(String, Vec<String>), KeyPushSeen>,
@@ -931,6 +956,8 @@ impl R2rmlScanOperator {
             parent_lookup_cache: HashMap::new(),
             key_push_seen: HashMap::new(),
             partial_parents: HashMap::new(),
+            #[cfg(test)]
+            max_window_produced: 0,
             key_pushdown: key_pushdown_enabled(),
             parent_memo: parent_memo_enabled(),
             row_budget: None,
@@ -1871,7 +1898,8 @@ impl R2rmlScanOperator {
                 stream,
                 exhausted: false,
                 parent_lookups,
-                pending: None,
+                pending: VecDeque::new(),
+                fan_out: 1,
                 ref_shortcuts,
                 join,
                 dedupe: true,
@@ -2192,22 +2220,25 @@ impl R2rmlScanOperator {
 
         while progress.tm_idx < progress.tms.len() {
             let i = progress.tm_idx;
-            if progress.tms[i].exhausted && progress.tms[i].pending.is_none() {
+            if progress.tms[i].exhausted && progress.tms[i].pending.is_empty() {
                 progress.tm_idx += 1;
                 continue;
             }
 
             // Pull a window of batches from the stream: at least one, then up to
             // the row budget. The stream itself bounds in-flight file decodes.
+            // `window_rows` bounds the rows a window PRODUCES; where a parent
+            // fans out, each child row produces about `fan_out` of them.
+            let child_rows = (progress.window_rows / progress.tms[i].fan_out).max(1);
             let mut window: Vec<ColumnBatch> = Vec::new();
             let mut rows = 0usize;
-            while rows < progress.window_rows {
+            while rows < child_rows {
                 // Cancellation checkpoint at row-group granularity: stop before
                 // pulling (and decoding) the next Parquet batch. This is the
                 // load-bearing poll for a runaway streaming scan of a large fact
                 // table — a pure relaxed-atomic flag read, unmeasurable here.
                 ctx.check_cancelled()?;
-                if let Some(batch) = progress.tms[i].pending.take() {
+                if let Some(batch) = progress.tms[i].pending.pop_front() {
                     rows += batch.num_rows;
                     window.push(batch);
                     continue;
@@ -2235,12 +2266,14 @@ impl R2rmlScanOperator {
                 .parent_lookups
                 .values()
                 .any(|index| matches!(index, ParentIndex::Partial(_)));
-            if probing && rows > progress.window_rows {
+            if probing && rows > child_rows {
                 if let Some(last) = window.pop() {
-                    let keep = last.num_rows - (rows - progress.window_rows);
+                    let keep = last.num_rows - (rows - child_rows);
                     let head: Vec<usize> = (0..keep).collect();
                     let tail: Vec<usize> = (keep..last.num_rows).collect();
-                    progress.tms[i].pending = Some(last.filter_by_indices(&tail));
+                    progress.tms[i]
+                        .pending
+                        .push_front(last.filter_by_indices(&tail));
                     if keep > 0 {
                         window.push(last.filter_by_indices(&head));
                     }
@@ -2263,6 +2296,59 @@ impl R2rmlScanOperator {
                     progress.tms[i].tm_iri
                 ))
             })?;
+
+            // #1583: where a parent key matches several subjects, a child row
+            // produces one row per subject, so a window of `window_rows` child
+            // rows could produce many times that. Cut the window by an upper
+            // bound on what each row produces (the rest goes back to `pending`)
+            // and charge that bound BEFORE materializing, so a window whose rows
+            // the budget cannot hold (a single row's fan-out included) fails
+            // typed without allocating them. A scan whose parents all map a key
+            // to one subject skips this and stays as it was.
+            let mut window_est = 0usize;
+            let mut window_bound = None;
+            if progress.tms[i]
+                .parent_lookups
+                .values()
+                .any(ParentIndex::fans_out)
+            {
+                use rayon::prelude::*;
+                let tm = &progress.tms[i];
+                let bounds: Vec<Vec<usize>> = window
+                    .par_iter()
+                    .map(|batch| {
+                        (0..batch.num_rows)
+                            .map(|row| {
+                                row_output_bound(
+                                    &self.pattern,
+                                    triples_map,
+                                    batch,
+                                    row,
+                                    &tm.parent_lookups,
+                                    &tm.ref_shortcuts,
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let bound = cut_window_by_output(
+                    &mut window,
+                    &bounds,
+                    progress.window_rows,
+                    &mut progress.tms[i].pending,
+                );
+                let kept_rows: usize = window.iter().map(|b| b.num_rows).sum();
+                progress.tms[i].fan_out = bound.div_ceil(kept_rows.max(1)).max(1);
+                if scan_mem_accounting_enabled() {
+                    window_est = bound
+                        .saturating_mul(num_cols)
+                        .saturating_mul(crate::context::BINDING_EST_BYTES);
+                    ctx.record_alloc(window_est);
+                    ctx.checkpoint()?;
+                }
+                window_bound = Some(bound);
+            }
+
             let MaterializedRows {
                 rows: produced,
                 classes: row_classes,
@@ -2282,6 +2368,15 @@ impl R2rmlScanOperator {
                 None => produced,
             };
 
+            debug_assert!(
+                window_bound.is_none_or(|bound| produced.len() <= bound),
+                "a window produced more rows than its bound"
+            );
+            #[cfg(test)]
+            {
+                self.max_window_produced = self.max_window_produced.max(produced.len());
+            }
+
             // F-AUD-3 site A1: account the materialized window against the query
             // memory budget so a wide non-aggregate crawl (the previously-blind scan
             // path) trips a typed `MemoryBudgetExceeded` instead of OOMing. Charge the
@@ -2293,17 +2388,14 @@ impl R2rmlScanOperator {
             // their all-time sum. Without the release, ~70 freed 512K-row windows of a
             // long un-fused-COUNT scan (q038) SUM past the budget and false-abort a
             // query whose per-window resident memory is bounded and fine.
-            let window_est = if scan_mem_accounting_enabled() {
-                let est = produced
+            if window_bound.is_none() && scan_mem_accounting_enabled() {
+                window_est = produced
                     .len()
                     .saturating_mul(num_cols)
                     .saturating_mul(crate::context::BINDING_EST_BYTES);
-                ctx.record_alloc(est);
+                ctx.record_alloc(window_est);
                 ctx.checkpoint()?;
-                est
-            } else {
-                0
-            };
+            }
 
             if !produced.is_empty() {
                 let seen = if progress.tms[i].dedupe {
@@ -3417,6 +3509,114 @@ fn derived_row_classes(
     Ok(classes)
 }
 
+/// An upper bound on the rows [`materialize_row`] produces for one table row: a
+/// referencing object map counts each parent subject its key matches, any other
+/// object map one, multiplied out as `materialize_row` multiplies them (a star's
+/// members, a projected type's classes). Above the real count where a null cell,
+/// a constant or a constraint drops a row, never below it. A scan whose parent
+/// lookup fans out cuts its windows by this bound (#1583), so a window never
+/// produces more rows than its size allows.
+fn row_output_bound(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+    batch: &ColumnBatch,
+    row: usize,
+    parent_lookups: &HashMap<LookupCacheKey, ParentIndex>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
+) -> usize {
+    let objects = |pom: &PredicateObjectMap| -> usize {
+        match pom.object_map {
+            ObjectMap::RefObjectMap(_) => {
+                materialize_pom_object(pom, batch, row, parent_lookups, ref_shortcuts)
+                    .map_or(1, |objects| objects.as_slice().len())
+            }
+            _ => 1,
+        }
+    };
+    let objects_of = |pred: &str| -> usize {
+        triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|pom| pom.predicate_map.as_constant() == Some(pred))
+            .map(objects)
+            .sum()
+    };
+    let classes = triples_map.classes().len();
+    if pattern.predicate_var.is_none()
+        && (!pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty())
+    {
+        let base = match (pattern.object_var, pattern.predicate_filter.as_deref()) {
+            (Some(_), Some(pred)) => objects_of(pred),
+            _ => 1,
+        };
+        return pattern
+            .star_bindings
+            .iter()
+            .fold(base, |n, (pred, _)| n.saturating_mul(objects_of(pred)));
+    }
+    if pattern.object_var.is_none() {
+        // A constant object, a bare subject, or one row per projected class.
+        return classes.max(1);
+    }
+    let per_object = if pattern.type_var.is_some() {
+        classes.max(1)
+    } else {
+        1
+    };
+    let mut n = triples_map
+        .predicate_object_maps
+        .iter()
+        .filter(|pom| {
+            pattern
+                .predicate_filter
+                .as_deref()
+                .is_none_or(|pf| pom.predicate_map.as_constant() == Some(pf))
+        })
+        .map(objects)
+        .sum::<usize>()
+        .saturating_mul(per_object);
+    if pattern.predicate_filter.is_none()
+        && pattern.type_var.is_none()
+        && pattern.predicate_var.is_some()
+    {
+        n = n.saturating_add(classes);
+    }
+    n
+}
+
+/// Cut `window` after the last row whose running bound (`bounds`, one per row
+/// in scan order) stays within `limit`, keeping at least one row, and put the
+/// rows cut off back at the front of `pending`, in order. Returns the kept
+/// rows' bound.
+fn cut_window_by_output(
+    window: &mut Vec<ColumnBatch>,
+    bounds: &[Vec<usize>],
+    limit: usize,
+    pending: &mut VecDeque<ColumnBatch>,
+) -> usize {
+    let mut kept = 0usize;
+    for (b, batch_bounds) in bounds.iter().enumerate() {
+        for (row, &bound) in batch_bounds.iter().enumerate() {
+            if kept > 0 && kept.saturating_add(bound) > limit {
+                let mut rest = window.split_off(b);
+                let batch = rest.remove(0);
+                for later in rest.into_iter().rev() {
+                    pending.push_front(later);
+                }
+                pending.push_front(
+                    batch.filter_by_indices(&(row..batch.num_rows).collect::<Vec<_>>()),
+                );
+                if row > 0 {
+                    window.push(batch.filter_by_indices(&(0..row).collect::<Vec<_>>()));
+                }
+                return kept;
+            }
+            kept = kept.saturating_add(bound);
+        }
+    }
+    kept
+}
+
 /// Materialize one table row of `triples_map` into produced assignments,
 /// appending to `produced`. Split out of the batch loop so callers can attribute
 /// the rows a table row produced (e.g. to pair them with that row's classes).
@@ -3790,6 +3990,14 @@ async fn build_parent_lookup(
             ctx.checkpoint()?;
         }
         subjects += fold_parent_batch(&mut lookup, parent_tm, parent_columns, &batch, None);
+    }
+
+    // A key's subject list grows ahead of its rows, which leaves free slots
+    // in it; the lookup is read-only from here on, so release them.
+    if subjects > lookup.len() {
+        for subjects in lookup.values_mut() {
+            subjects.shrink_to_fit();
+        }
     }
 
     tracing::debug!(
@@ -5213,6 +5421,9 @@ mod tests {
             /// provider reports scan file counts: a file is read when a key
             /// falls within its bounds, as min/max pruning decides.
             files: Option<Vec<(i64, i64)>>,
+            /// When set, every customer `ID` has this many rows with distinct
+            /// `VID`s (1000·ID + 0, 1, …) instead of the two-plus-a-repeat above.
+            fan: Option<i64>,
             scans: Mutex<Vec<(String, Vec<ScanFilter>)>>,
         }
         impl Tables {
@@ -5221,8 +5432,13 @@ mod tests {
                     cust_ids,
                     customers,
                     files: None,
+                    fan: None,
                     scans: Mutex::new(Vec::new()),
                 }
+            }
+            fn with_fan(mut self, fan: i64) -> Self {
+                self.fan = Some(fan);
+                self
             }
             fn with_files(mut self, files: Vec<(i64, i64)>) -> Self {
                 self.files = Some(files);
@@ -5310,7 +5526,11 @@ mod tests {
                     let mut ids = Vec::new();
                     let mut vids = Vec::new();
                     for &id in &self.customers {
-                        for vid in [10 * id + 2, 10 * id + 1, 10 * id + 2] {
+                        let id_vids: Vec<i64> = match self.fan {
+                            Some(fan) => (0..fan).map(|j| 1000 * id + j).collect(),
+                            None => vec![10 * id + 2, 10 * id + 1, 10 * id + 2],
+                        };
+                        for vid in id_vids {
                             if keeps(filters, "ID", id) {
                                 ids.push(id);
                                 vids.push(vid);
@@ -5580,6 +5800,156 @@ mod tests {
             let scans = customer_scans(&tables);
             assert_eq!(scans.len(), 1, "{scans:?}");
             assert!(scans[0].1.is_empty(), "read whole: {scans:?}");
+        }
+
+        /// `?o ex:customer ?c` driven one window at a time, each window allowed
+        /// `window` produced rows: the `(?o, ?c)` rows in output order and the
+        /// most rows a window produced.
+        async fn run_windows(
+            ctx: &ExecutionContext<'_>,
+            window: usize,
+            key_pushdown: bool,
+        ) -> Result<(Vec<(String, String)>, usize)> {
+            let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                .with_predicate("http://ex/customer");
+            let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+            op.mapping = Some(mapping());
+            op.key_pushdown = key_pushdown;
+            let mut progress = op
+                .build_progress(ctx, Batch::single_empty())
+                .await?
+                .expect("the orders map answers the pattern");
+            let num_cols = op.schema().len();
+            let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            loop {
+                progress.window_rows = window;
+                let more = op
+                    .advance_one_window(ctx, &mut progress, num_cols, &mut columns)
+                    .await?;
+                while let Some(row) = op.pending.pop_front() {
+                    for (col, binding) in row.into_iter().enumerate() {
+                        columns[col].push(binding);
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+            let pos = |v: VarId| op.schema().iter().position(|&s| s == v).unwrap();
+            let iri = |b: &Binding| match b {
+                Binding::Iri(iri) => iri.to_string(),
+                other => panic!("{other:?}"),
+            };
+            let rows = (0..columns[0].len())
+                .map(|r| {
+                    (
+                        iri(&columns[pos(VarId(0))][r]),
+                        iri(&columns[pos(VarId(1))][r]),
+                    )
+                })
+                .collect();
+            Ok((rows, op.max_window_produced))
+        }
+
+        fn test_ctx<'a>(
+            tables: &'a Tables,
+            snapshot: &'a fluree_db_core::LedgerSnapshot,
+            vars: &'a VarRegistry,
+            limit: Option<usize>,
+        ) -> ExecutionContext<'a> {
+            let cancel = fluree_db_core::QueryCancellation::new();
+            if let Some(limit) = limit {
+                cancel.set_memory_limit(limit);
+            }
+            let mut ctx = ExecutionContext::new(snapshot, vars).with_cancellation(cancel);
+            ctx.r2rml_table_provider = Some(tables);
+            ctx
+        }
+
+        /// A window is sized in the rows it PRODUCES (#1583): where each order's
+        /// key matches two customers, a window allowed `w` rows takes as many
+        /// orders as fit (one at least, whose own fan-out may exceed `w`), the
+        /// rest wait in order for the next, and the answer is the unwindowed
+        /// one, row for row, whether the parent is read whole or probed.
+        #[tokio::test]
+        async fn a_window_produces_no_more_rows_than_its_size_where_a_parent_fans_out() {
+            let cust_ids = vec![90, 3, 3, 91, 7, 1, 2, 90, 5, 6, 4, 1];
+            let whole = run(
+                &Tables::new(cust_ids.clone(), (1..=7).collect()),
+                None,
+                false,
+            );
+            assert_eq!(whole.len(), 18);
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            for key_pushdown in [false, true] {
+                for window in [1, 2, 3, 5, 7, 100] {
+                    let tables = Tables::new(cust_ids.clone(), (1..=7).collect());
+                    let ctx = test_ctx(&tables, &snapshot, &vars, None);
+                    let (rows, most) = run_windows(&ctx, window, key_pushdown)
+                        .await
+                        .expect("no budget is set");
+                    assert_eq!(rows, whole, "window {window}, key pushdown {key_pushdown}");
+                    assert!(
+                        most <= window.max(2),
+                        "window {window}: a window produced {most} rows"
+                    );
+                }
+            }
+        }
+
+        /// A window's produced rows are charged before they are materialized:
+        /// one order whose key matches 1,000 customers, under a budget that
+        /// holds the parent's charge but not that order's 1,000 rows, fails
+        /// typed with nothing materialized. A larger budget answers.
+        #[tokio::test]
+        async fn a_fan_out_the_budget_cannot_hold_fails_typed_before_it_is_materialized() {
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let parent_charge = 1000 * PARENT_ENTRY_EST_BYTES;
+            let rows_charge = 1000 * 2 * crate::context::BINDING_EST_BYTES;
+            let tables = Tables::new(vec![1], vec![1]).with_fan(1000);
+            let ctx = test_ctx(
+                &tables,
+                &snapshot,
+                &vars,
+                Some(parent_charge + rows_charge / 2),
+            );
+            let pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)))
+                .with_predicate("http://ex/customer");
+            let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+            op.mapping = Some(mapping());
+            op.key_pushdown = false;
+            let mut progress = op
+                .build_progress(&ctx, Batch::single_empty())
+                .await
+                .expect("the parent's charge fits")
+                .expect("the orders map answers the pattern");
+            let num_cols = op.schema().len();
+            let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            progress.window_rows = 10;
+            let err = op
+                .advance_one_window(&ctx, &mut progress, num_cols, &mut columns)
+                .await
+                .expect_err("the order's 1,000 rows do not fit");
+            assert!(
+                matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                "{err:?}"
+            );
+            assert_eq!(op.max_window_produced, 0, "nothing was materialized");
+
+            let tables = Tables::new(vec![1], vec![1]).with_fan(1000);
+            let ctx = test_ctx(
+                &tables,
+                &snapshot,
+                &vars,
+                Some(parent_charge + rows_charge * 2),
+            );
+            let (rows, most) = run_windows(&ctx, 10, false)
+                .await
+                .expect("a budget that holds them answers");
+            assert_eq!(rows.len(), 1000);
+            assert_eq!(most, 1000, "one order's fan-out is one window");
         }
     }
 

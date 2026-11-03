@@ -668,6 +668,28 @@ async fn a_referencing_map_joins_every_parent_its_key_matches() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// A scan whose parent fans out cuts its windows by the rows they produce, and
+/// puts the rest back in scan order: with windows of two produced rows, every
+/// shape still answers as the native ledger does.
+#[tokio::test]
+async fn windows_cut_by_produced_rows_keep_every_answer() {
+    let _serial = SERIAL.lock().await;
+    allow_fixture_roots();
+    struct Window;
+    impl Drop for Window {
+        fn drop(&mut self) {
+            std::env::remove_var("FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS");
+        }
+    }
+    // SAFETY: read per scan, and every test in this binary holds `SERIAL`.
+    std::env::set_var("FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS", "2");
+    let _window = Window;
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+    let failures = check(&fluree, &pattern_cases(), SOURCE).await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A `LIMIT` reads the parent by its first rows' keys, and answers rows of the
 /// whole answer.
 #[tokio::test]

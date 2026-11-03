@@ -281,6 +281,12 @@ impl ParentSubjects {
             Subjects::Many(all) => match all.binary_search_by(|t| subject_order(t, &subject)) {
                 Ok(_) => false,
                 Err(at) => {
+                    // Grow by half rather than doubling: a key's list is
+                    // resident for the whole join, and its last growth would
+                    // otherwise leave up to as many free slots as used ones.
+                    if all.len() == all.capacity() {
+                        all.reserve_exact(all.len() / 2 + 1);
+                    }
                     all.insert(at, subject);
                     true
                 }
@@ -304,6 +310,25 @@ impl ParentSubjects {
     /// Always `false`: a key is recorded only with the subject of one of its rows.
     pub fn is_empty(&self) -> bool {
         false
+    }
+
+    /// The bytes held on the heap for the subjects: each term's text, plus the
+    /// spilled list's slots (its capacity, not its length) when there are
+    /// several.
+    pub fn heap_bytes(&self) -> usize {
+        let text: usize = self.as_slice().iter().map(rdf_term_bytes).sum();
+        match &self.0 {
+            Subjects::One(_) => text,
+            Subjects::Many(all) => text + all.capacity() * std::mem::size_of::<RdfTerm>(),
+        }
+    }
+
+    /// Release the spilled list's spare capacity, once no more subjects will
+    /// be added (growth leaves up to half as many free slots as used ones).
+    pub fn shrink_to_fit(&mut self) {
+        if let Subjects::Many(all) = &mut self.0 {
+            all.shrink_to_fit();
+        }
     }
 }
 
@@ -468,15 +493,7 @@ impl ParentIndexSet {
                 for (key, subjects) in key_to_subjects {
                     total += ENTRY_OVERHEAD;
                     total += key.iter().map(String::len).sum::<usize>();
-                    total += subjects
-                        .as_slice()
-                        .iter()
-                        .map(rdf_term_bytes)
-                        .sum::<usize>();
-                    if subjects.len() > 1 {
-                        // The spilled subject list: one term slot per subject.
-                        total += subjects.len() * std::mem::size_of::<RdfTerm>();
-                    }
+                    total += subjects.heap_bytes();
                 }
             }
         }
@@ -1076,6 +1093,30 @@ mod tests {
         assert!(subjects.insert(RdfTerm::blank_node("x")));
         assert!(!subjects.insert(RdfTerm::iri("x")));
         assert_eq!(subjects.len(), 2);
+    }
+
+    #[test]
+    fn a_spilled_subject_list_counts_its_capacity_until_shrunk() {
+        let slot = std::mem::size_of::<RdfTerm>();
+        let mut subjects = ParentSubjects::new(RdfTerm::iri("s0"));
+        assert_eq!(subjects.heap_bytes(), 2, "one inline term: its text only");
+        for i in 1..9 {
+            subjects.insert(RdfTerm::iri(format!("s{i}")));
+        }
+        for i in 9..14 {
+            subjects.insert(RdfTerm::iri(format!("s{i}")));
+        }
+        let text = 14 * 3 - 10;
+        // Grown one insert at a time, the list holds more slots than
+        // subjects, and the heap estimate counts every slot.
+        assert!(
+            subjects.heap_bytes() > text + 14 * slot,
+            "{}",
+            subjects.heap_bytes()
+        );
+        subjects.shrink_to_fit();
+        assert_eq!(subjects.heap_bytes(), text + 14 * slot);
+        assert_eq!(subjects.len(), 14);
     }
 
     fn field(name: &str, ty: FieldType, nullable: bool, id: i32) -> FieldInfo {
