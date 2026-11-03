@@ -2201,10 +2201,14 @@ impl NestedLoopJoinOperator {
     ///
     /// Returns `None` if the predicate is not in the binary index (no results
     /// possible), and refuses when the lane merges its novelty
-    /// ([`p_id_or_none`]).
+    /// ([`p_id_or_none`]): one graph's, or any union member's.
     fn resolve_batched_predicate(&self, store: &BinaryIndexStore) -> Result<Option<u32>> {
         let pred_sid = self.batched_predicate.as_ref().unwrap();
-        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        let merges = |plan: &ProbeLanePlan| matches!(plan, ProbeLanePlan::Merge(_));
+        let merging = match self.union_plans() {
+            Some(union) => union.plans.iter().any(merges),
+            None => merges(&self.batched_overlay_mode),
+        };
         p_id_or_none(store, pred_sid, || Ok(merging))
     }
 
@@ -2351,9 +2355,11 @@ impl NestedLoopJoinOperator {
         let mut matches: Vec<UnionMatch> = Vec::new();
         for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
             let member_ctx = ctx.with_graph_ref(graph);
-            // A member with no branch holds nothing for the probe: its plan
-            // would have declined had its novelty held the predicate.
-            let Some(branch) = store.branch_for_order(member_ctx.binary_g_id, RunSortOrder::Psot)
+            // A member with no branch holds nothing for the probe, and a merge
+            // over one is refused ([`branch_or_none`]), as on one graph.
+            let merging = matches!(plan, ProbeLanePlan::Merge(_));
+            let Some(branch) =
+                branch_or_none(store, member_ctx.binary_g_id, RunSortOrder::Psot, merging)?
             else {
                 continue;
             };
@@ -3184,7 +3190,9 @@ impl NestedLoopJoinOperator {
         let mut matches: Vec<UnionMatch> = Vec::new();
         for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
             let member_ctx = ctx.with_graph_ref(graph);
-            let Some(branch) = store.branch_for_order(member_ctx.binary_g_id, RunSortOrder::Opst)
+            let merging = matches!(plan, ProbeLanePlan::Merge(_));
+            let Some(branch) =
+                branch_or_none(store, member_ctx.binary_g_id, RunSortOrder::Opst, merging)?
             else {
                 continue;
             };
