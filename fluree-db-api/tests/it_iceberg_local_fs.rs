@@ -2175,7 +2175,12 @@ async fn sparql_construct_over_a_graph_source_keeps_the_ordered_page() {
         .execute_formatted()
         .await
         .expect_err("DESCRIBE over a graph source is refused");
-    assert!(err.to_string().contains("subquery"), "DESCRIBE: {err}");
+    // DESCRIBE's expansion follows `rdf:rest*`, a path no graph source evaluates.
+    let err = err.to_string();
+    assert!(
+        err.contains("cannot be evaluated over a virtual dataset"),
+        "DESCRIBE: {err}"
+    );
 }
 
 /// The people table mapped twice over disjoint subject templates: persons
