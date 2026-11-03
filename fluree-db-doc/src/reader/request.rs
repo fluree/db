@@ -33,6 +33,9 @@ pub struct Limits {
     pub windows: usize,
     /// Prompt tokens one window may take, ontology and catalog included.
     pub window_tokens: usize,
+    /// Bytes one request body may take: the document part, the ontology
+    /// and the catalog together (the catalog travels whole in every call).
+    pub request_bytes: usize,
 }
 
 impl Default for Limits {
@@ -41,6 +44,7 @@ impl Default for Limits {
             request_chars: 48_000,
             windows: 16,
             window_tokens: 200_000,
+            request_bytes: 2_000_000,
         }
     }
 }
@@ -122,6 +126,9 @@ pub struct Structure {
     graph: Graph,
     spans: BTreeMap<String, Span>,
     chars: usize,
+    /// Positions just after whitespace: where a text with no elements is
+    /// cut (nothing to split there, so cut between words).
+    breaks: Vec<usize>,
 }
 
 impl Structure {
@@ -181,10 +188,21 @@ impl Structure {
                 }
             }
         }
+        let breaks = if spans.is_empty() {
+            doc.text
+                .chars()
+                .enumerate()
+                .filter(|(_, c)| c.is_whitespace())
+                .map(|(i, _)| i + 1)
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             graph,
             spans,
             chars,
+            breaks,
         })
     }
 
@@ -213,6 +231,58 @@ impl Structure {
             });
         }
         Ok(parts)
+    }
+
+    /// The calls a document takes, each with its request body, every body
+    /// within `limits.request_bytes`. When a body is over, the parts are cut
+    /// smaller in proportion to the document's share of it; when the
+    /// ontology and catalog alone leave too little room, nothing is sent and
+    /// the error says how large each is.
+    pub fn requests(
+        &self,
+        doc: &Document<'_>,
+        ontology: &Graph,
+        catalog: &Graph,
+        limits: &Limits,
+        size: &PromptSize,
+    ) -> Result<Vec<(Part, String)>> {
+        let shared = shared_bytes(ontology, catalog)?;
+        let mut limits = *limits;
+        for _ in 0..6 {
+            let mut requests = Vec::new();
+            for part in self.plan(&limits, size)? {
+                let body = body(&self.document_graph(doc, &part), ontology, catalog, &part)?;
+                requests.push((part, body));
+            }
+            let largest = requests.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
+            if largest <= limits.request_bytes {
+                return Ok(requests);
+            }
+            // Leave at least a tenth of a call to the document itself.
+            if shared > limits.request_bytes - limits.request_bytes / 10 {
+                break;
+            }
+            let room = limits.request_bytes - shared;
+            let scaled = limits.request_chars as u128 * room as u128 * 9
+                / ((largest - shared).max(1) as u128 * 10);
+            let next = (scaled as usize).max(1_000);
+            if next >= limits.request_chars {
+                break;
+            }
+            limits.request_chars = next;
+        }
+        let ontology_bytes = shared_bytes(ontology, &Graph::new())?;
+        Err(DocError::Config(format!(
+            "{}: a request would exceed the reader's {} bytes: the ontology is {} bytes \
+             and the catalog {} bytes ({} records), and both are sent with every call. \
+             Scope the catalog to the classes this document needs (`FILE#Class`, \
+             `ledger#Class`), or split it",
+            doc.name,
+            limits.request_bytes,
+            ontology_bytes,
+            shared - ontology_bytes,
+            catalog_records(catalog),
+        )))
     }
 
     /// `[from, to)` cut into runs of at most `max` characters. A cut falls
@@ -254,6 +324,16 @@ impl Structure {
     }
 
     fn last_cut(&self, after: usize, at_most: usize, leaves_only: bool) -> Option<usize> {
+        // No elements at all: any cut splits nothing; prefer one between words.
+        if self.spans.is_empty() {
+            let word = self
+                .breaks
+                .iter()
+                .rev()
+                .find(|&&c| c > after && c <= at_most)
+                .copied();
+            return Some(word.unwrap_or(at_most));
+        }
         let splits = |c: usize| {
             self.spans
                 .values()
@@ -429,12 +509,25 @@ fn push_graph(out: &mut String, role: &str, graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Bytes the ontology and catalog take in every request body.
+fn shared_bytes(ontology: &Graph, catalog: &Graph) -> Result<usize> {
+    let mut out = String::new();
+    for (role, graph) in [("ontology", ontology), ("instances", catalog)] {
+        if !graph.is_empty() {
+            push_graph(&mut out, role, graph)?;
+        }
+    }
+    Ok(out.len())
+}
+
 /// A graph as sorted N-Triples, for hashing what a request was built from.
-pub fn canonical_ntriples(graph: &Graph) -> String {
+/// An error rather than an empty string, so two graphs that can't be
+/// written never hash alike.
+pub fn canonical_ntriples(graph: &Graph) -> Result<String> {
     let mut g = graph.clone();
     g.sort();
     g.dedupe();
-    fluree_graph_format::format_ntriples(&g).unwrap_or_default()
+    fluree_graph_format::format_ntriples(&g).map_err(|e| DocError::Parse(format!("graph: {e}")))
 }
 
 /// A JSON-LD document read into a graph.
@@ -444,13 +537,23 @@ pub fn canonical_ntriples(graph: &Graph) -> String {
 /// adapter keeps the native value but labels it `xsd:string`, which a
 /// reader then refuses (`doc:columnIndex must be an xsd:integer`).
 pub fn parse_jsonld(json: &str) -> std::result::Result<Graph, String> {
-    use fluree_graph_ir::LiteralValue;
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
     let expanded = fluree_graph_json_ld::expand(&value).map_err(|e| e.to_string())?;
     let mut sink = GraphCollectorSink::new();
     fluree_graph_json_ld::adapter::to_graph_events(&expanded, &mut sink)
         .map_err(|e| e.to_string())?;
     let mut graph = sink.into_graph();
+    retype_native_literals(&mut graph);
+    Ok(graph)
+}
+
+/// A native JSON number or boolean (`{"@value": 0}`) comes out of the
+/// JSON-LD adapter typed `xsd:string`; give it the datatype JSON-LD says it
+/// has (`xsd:integer`, `xsd:double`, `xsd:boolean`). Every graph read from
+/// JSON-LD here goes through this, so one document never prints one offset
+/// two ways.
+pub fn retype_native_literals(graph: &mut Graph) {
+    use fluree_graph_ir::LiteralValue;
     for t in graph.iter_mut() {
         let retyped = match t.object() {
             Term::Literal {
@@ -469,7 +572,6 @@ pub fn parse_jsonld(json: &str) -> std::result::Result<Graph, String> {
             *t = fluree_graph_ir::Triple::new(t.subject().clone(), t.predicate().clone(), object);
         }
     }
-    Ok(graph)
 }
 
 /// Turtle or N-Triples read into a graph.
@@ -658,6 +760,28 @@ mod tests {
         assert_eq!(runs, vec![(0, 5), (5, 10), (10, 14)]);
     }
 
+    /// A cut that would clip a container is refused while a clean one
+    /// exists: two 10-character sections of two leaves each, 15 at most a
+    /// call, cut at 10 (between the sections), not at 15 (inside the second).
+    #[test]
+    fn a_cut_backs_off_to_a_container_boundary_when_there_is_one() {
+        let text = "aaaabbbbbbccccdddddd";
+        let s = structure(
+            text,
+            &[
+                ("s1", 0, 10, &["a", "b"]),
+                ("a", 0, 4, &[]),
+                ("b", 4, 10, &[]),
+                ("s2", 10, 20, &["c", "d"]),
+                ("c", 10, 14, &[]),
+                ("d", 14, 20, &[]),
+            ],
+        );
+        let parts = s.plan(&limits(15), &PromptSize::default()).unwrap();
+        let runs: Vec<_> = parts.iter().map(|p| (p.begin, p.end)).collect();
+        assert_eq!(runs, vec![(0, 10), (10, 20)]);
+    }
+
     #[test]
     fn a_container_too_long_for_one_call_is_cut_between_its_leaves_and_clipped() {
         let text = "aaaa bbbb";
@@ -699,6 +823,88 @@ mod tests {
         assert_eq!(s.element_at(6, 8), Some("urn:d-b"));
         assert_eq!(s.element_at(3, 6), Some("urn:d-t"));
         assert_eq!(s.element_at(3, 12), None);
+    }
+
+    fn graph_of(subjects: usize, label_len: usize) -> Graph {
+        let mut g = Graph::new();
+        for i in 0..subjects {
+            g.add_triple(
+                Term::iri(format!("http://example.org/r/{i}")),
+                Term::iri("http://www.w3.org/2000/01/rdf-schema#label"),
+                Term::string("x".repeat(label_len)),
+            );
+        }
+        g
+    }
+
+    #[test]
+    fn a_request_over_the_byte_limit_is_cut_smaller() {
+        let text = "word ".repeat(2_000);
+        let doc = Document {
+            iri: "urn:t",
+            name: "t.txt",
+            text: &text,
+            doco: "[]",
+        };
+        let s = Structure::new(&doc).unwrap();
+        let catalog = graph_of(10, 100);
+        let limits = Limits {
+            request_bytes: 6_000,
+            ..Limits::default()
+        };
+        let requests = s
+            .requests(
+                &doc,
+                &Graph::new(),
+                &catalog,
+                &limits,
+                &PromptSize::default(),
+            )
+            .unwrap();
+        assert!(requests.len() > 1, "{}", requests.len());
+        assert!(requests.iter().all(|(_, b)| b.len() <= 6_000));
+        assert_eq!(requests.last().unwrap().0.end, text.chars().count());
+    }
+
+    #[test]
+    fn a_catalog_too_large_for_any_request_is_refused_with_its_size() {
+        let doc = Document {
+            iri: "urn:t",
+            name: "t.txt",
+            text: "short text",
+            doco: "[]",
+        };
+        let s = Structure::new(&doc).unwrap();
+        let limits = Limits {
+            request_bytes: 6_000,
+            ..Limits::default()
+        };
+        let err = s
+            .requests(
+                &doc,
+                &Graph::new(),
+                &graph_of(60, 100),
+                &limits,
+                &PromptSize::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("t.txt: a request would exceed the reader's 6000 bytes"),
+            "{err}"
+        );
+        assert!(err.contains("(60 records)"), "{err}");
+        assert!(err.contains("#Class"), "{err}");
+    }
+
+    #[test]
+    fn a_long_text_with_no_elements_is_cut_between_words() {
+        let text = "one two three four five six";
+        let s = structure(text, &[]);
+        let parts = s.plan(&limits(10), &PromptSize::default()).unwrap();
+        let runs: Vec<_> = parts.iter().map(|p| (p.begin, p.end)).collect();
+        // Each part ends just after a space, as late as the limit allows.
+        assert_eq!(runs, vec![(0, 8), (8, 14), (14, 24), (24, 27)]);
     }
 
     #[test]

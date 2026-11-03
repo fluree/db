@@ -397,24 +397,22 @@ pub async fn load_catalog(
                 "select": ["?s", "?v"]
             });
             for row in opened.rows(&query).await? {
-                let (Some(s), Some(v)) = (row_cell(&row, 0), row_cell(&row, 1)) else {
+                let (Some(s), Some(v)) = (row_cell(&row, 0), row_literal(&row, 1)) else {
                     continue;
                 };
-                if s.starts_with("_:") || v.trim().is_empty() {
+                if s.starts_with("_:") {
                     continue;
                 }
                 let s = expand_compact(&s);
-                graph.add_triple(
-                    Term::iri(&s),
-                    Term::iri(expand_compact(predicate)),
-                    Term::string(v.trim()),
-                );
+                graph.add_triple(Term::iri(&s), Term::iri(expand_compact(predicate)), v);
                 subjects.insert(s);
             }
         }
+        // Unscoped: the label queries already chose the subjects (and a
+        // `#Class` scope written into this pattern would replace `?t`).
         let query = serde_json::json!({
             "@context": fluree_db_doc::model::query_context(),
-            "where": [anchor(("@type", "?t"))],
+            "where": [{ "@id": "?s", "@type": "?t" }],
             "select": ["?s", "?t"]
         });
         for row in opened.rows(&query).await? {
@@ -447,6 +445,35 @@ fn row_cell(row: &Value, i: usize) -> Option<String> {
             .map(str::to_string),
         _ => None,
     }
+}
+
+/// A label from a query row as a literal, keeping its language tag or
+/// datatype when the row carries one; `None` for an empty one.
+fn row_literal(row: &Value, i: usize) -> Option<fluree_graph_ir::Term> {
+    use fluree_graph_ir::{Datatype, Term};
+    let cell = row.get(i)?;
+    let (value, lang, datatype) = match cell {
+        Value::String(s) => (s.as_str(), None, None),
+        Value::Object(o) => (
+            o.get("@value").and_then(Value::as_str)?,
+            o.get("@language").and_then(Value::as_str),
+            o.get("@type").and_then(Value::as_str),
+        ),
+        _ => return None,
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(match (lang, datatype) {
+        (Some(l), _) => Term::lang_string(value, l),
+        (None, Some(dt))
+            if expand_compact(dt) != format!("{}string", fluree_db_doc::vocab::XSD_NS) =>
+        {
+            Term::typed(value, Datatype::from_iri(expand_compact(dt)))
+        }
+        _ => Term::string(value),
+    })
 }
 
 /// A compact IRI from a query row, with the prefixes the queries bind.
