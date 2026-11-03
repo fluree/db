@@ -1214,18 +1214,8 @@ impl SharedResolverState {
             )));
         }
         // An index built before config graphs were read across ledgers may
-        // hold another ledger's config graph as a user graph. A full rebuild
-        // reads it as the config graph.
-        if let Some(iri) = root
-            .graph_iris
-            .iter()
-            .skip(2)
-            .find(|iri| names_config_graph(iri))
-        {
-            return Err(ResolverError::Resolve(format!(
-                "graph_iris lists the config graph {iri} as a user graph"
-            )));
-        }
+        // hold another ledger's config graph as a user graph. It keeps that
+        // graph, as the query side reads it, until a rebuild from the commits.
         // The system graphs under this ledger's own IRIs, which the root this
         // build writes then carries.
         //

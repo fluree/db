@@ -8695,20 +8695,28 @@ async fn a_revert_across_two_config_graph_iris_restores_the_setting() {
 }
 
 /// An index from before every ledger's config graph IRI named the config
-/// graph can hold one as an ordinary graph, with its rows under that graph's
-/// id, where the config graph is not read. Its config cannot be read, so
-/// queries and transactions are refused rather than run without it, until a
-/// reindex rebuilds the index from the commits.
+/// graph can hold one as an ordinary graph, its rows under that graph's id: a
+/// copy whose source's config commits named the source's config graph, indexed
+/// before this change. The copy is served as that index reads it, with no
+/// config, and an incremental build keeps it so. A reindex rebuilds the index
+/// from the commits, which name the config graph: its settings apply, its
+/// full-text property among them.
+#[cfg(feature = "native")]
 #[tokio::test]
-async fn an_index_holding_a_config_graph_as_an_ordinary_graph_serves_nothing_until_rebuilt() {
+async fn an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it_until_reindexed() {
     use fluree_db_binary_index::format::index_root::IndexRoot;
     use fluree_db_core::ContentKind;
 
-    let fluree = FlureeBuilder::memory().build_memory();
-    let id = "it-legacy-config:main";
-    fluree.create_ledger(id).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let source = "it/legacy-source:main";
+    let source_config = config_graph_iri(source);
+    fluree.create_ledger("it/legacy-source").await.unwrap();
     fluree
-        .graph(id)
+        .graph(source)
         .transact()
         .upsert_turtle(
             "@prefix ex: <http://example.org/> . ex:seed ex:p 1 .
@@ -8718,59 +8726,235 @@ async fn an_index_holding_a_config_graph_as_an_ordinary_graph_serves_nothing_unt
         .await
         .unwrap();
     fluree
-        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .reindex(source, fluree_db_api::ReindexOptions::default())
         .await
         .unwrap();
+    for trig in [
+        uniqueness_in(&source_config, true),
+        full_text_title_in(&source_config),
+        r#"@prefix ex: <http://example.org/> . ex:doc1 ex:title "Advanced Rust systems" ."#
+            .to_string(),
+    ] {
+        fluree
+            .graph(source)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+            .unwrap();
+    }
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(source, true, &mut archive)
+        .await
+        .unwrap();
+    let id = fluree
+        .restore_ledger("it/legacy-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
 
-    // The root as such an index lists the graph: under another ledger's
-    // config graph IRI.
-    let store = fluree.content_store(id);
-    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
-    let mut root = IndexRoot::decode(
-        &store
+    // The root as such an index lists the graphs: the copy's own config graph
+    // at the config graph's slot, and the source's config graph as an
+    // ordinary graph, which the source's later config commits write.
+    let store = fluree.content_store(&id);
+    let root_iris = || async {
+        let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+        let bytes = store
             .get(record.index_head_id.as_ref().unwrap())
             .await
-            .unwrap(),
-    )
-    .unwrap();
+            .unwrap();
+        (record, IndexRoot::decode(&bytes).unwrap())
+    };
+    let (record, mut root) = root_iris().await;
     let slot = root
         .graph_iris
         .iter()
         .position(|iri| iri == "urn:legacy:holder")
         .unwrap();
     assert!(slot >= 2, "{:?}", root.graph_iris);
-    root.graph_iris[slot] = config_graph_iri("it-legacy-source:main");
-    let legacy = store
+    root.graph_iris[1] = config_graph_iri(&id);
+    root.graph_iris[slot] = source_config.clone();
+    let root_id = store
         .put(ContentKind::IndexRoot, &root.encode())
         .await
         .unwrap();
-    support::publish_built_index(&fluree, id, record.index_t, &legacy).await;
+    support::publish_built_index(&fluree, &id, record.index_t, &root_id).await;
+    fluree.disconnect_ledger(&id).await;
 
-    let query = json!({
-        "from": id,
-        "select": "?o",
-        "where": {"@id": "http://example.org/seed", "http://example.org/p": "?o"}
-    });
-    let refused = fluree
-        .query_connection(&query)
-        .await
-        .expect_err("a query is refused");
-    assert!(refused.to_string().contains("fluree reindex"), "{refused}");
-    let ledger = fluree.ledger(id).await.unwrap();
-    fluree
-        .insert(
-            ledger,
-            &json!({"@id": "http://example.org/b", "http://example.org/p": 2}),
-        )
-        .await
-        .expect_err("a transaction is refused");
+    let a_in_source_config = || async {
+        let result = fluree
+            .graph(&id)
+            .query()
+            .sparql(&format!(
+                "SELECT ?o WHERE {{ GRAPH <{source_config}> {{ <http://example.org/a> <http://example.org/p> ?o }} }}"
+            ))
+            .execute_formatted()
+            .await
+            .expect("query the graph");
+        result["results"]["bindings"].as_array().map(Vec::len)
+    };
+    for build in ["as published", "built incrementally"] {
+        if build == "built incrementally" {
+            support::build_incrementally_and_publish_index(&fluree, &id).await;
+            fluree.disconnect_ledger(&id).await;
+            assert_eq!(root_iris().await.1.graph_iris[slot], source_config);
+        }
+        assert_eq!(a_in_source_config().await, Some(1), "{build}");
+        assert_eq!(unique_enabled(&fluree, &id).await, None, "{build}");
+        assert!(title_hits(&fluree, &id, "Rust").await.is_empty(), "{build}");
+    }
 
     fluree
-        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .reindex(&id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(unique_enabled(&fluree, &id).await, Some(true));
+    assert_eq!(title_hits(&fluree, &id, "Rust").await, ["ex:doc1"]);
+}
+
+/// A branch whose index holds its source's config graph as an ordinary graph
+/// (made before its source's first index build, indexed before this change)
+/// takes a merge from its source as that index reads it: the source's config
+/// changes land in that ordinary graph, not as the branch's config. A rebuild
+/// from the commits reads them as config.
+#[tokio::test]
+async fn a_merge_into_an_index_holding_a_config_graph_as_an_ordinary_graph_keeps_it() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+    use fluree_db_core::ContentKind;
+
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let name = "it/legacy-merge";
+    let main = format!("{name}:main");
+    let main_config = config_graph_iri(&main);
+    fluree.create_ledger(name).await.unwrap();
+    // The source writes its config graph before the fork, as the history of
+    // such a branch does, which registers that graph's namespace. Its later
+    // config names no namespace new since the fork, which a merge would
+    // refuse as a conflict with the branch's.
+    fluree
+        .graph(&main)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix ex: <http://example.org/> .
+             GRAPH <urn:legacy:holder> {{ ex:a ex:p 1 . <urn:config:seed> ex:p 1 . }}
+             GRAPH <{main_config}> {{ ex:note ex:p 1 . }}"
+        ))
+        .commit()
+        .await
+        .unwrap();
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = format!("{name}:dev");
+    support::rebuild_and_publish_index(&fluree, &dev).await;
+
+    // The root as such an index lists the graph: under the source's config
+    // graph IRI.
+    let store = fluree.branched_content_store(&dev).await.unwrap();
+    let record = fluree.nameservice().lookup(&dev).await.unwrap().unwrap();
+    let bytes = store
+        .get(record.index_head_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let mut root = IndexRoot::decode(&bytes).unwrap();
+    let slot = root
+        .graph_iris
+        .iter()
+        .position(|iri| iri == "urn:legacy:holder")
+        .unwrap();
+    assert!(slot >= 2, "{:?}", root.graph_iris);
+    root.graph_iris[slot] = main_config.clone();
+    let root_id = store
+        .put(ContentKind::IndexRoot, &root.encode())
+        .await
+        .unwrap();
+    support::publish_built_index(&fluree, &dev, record.index_t, &root_id).await;
+    fluree.disconnect_ledger(&dev).await;
+
+    let main_ledger = fluree.ledger(&main).await.unwrap();
+    fluree.insert(main_ledger, &uniqueness_on()).await.unwrap();
+    // The branch writes its own config graph.
+    fluree
+        .graph(&dev)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix ex: <http://example.org/> . GRAPH <{}> {{ ex:note ex:p 2 . }}",
+            config_graph_iri(&dev)
+        ))
+        .commit()
         .await
         .unwrap();
     fluree
+        .merge_branch(
+            name,
+            "main",
+            Some("dev"),
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("merge main into dev");
+
+    assert_eq!(unique_enabled(&fluree, &dev).await, None);
+    let rows = fluree
+        .graph(&dev)
+        .query()
+        .sparql(&format!(
+            "SELECT ?on WHERE {{ GRAPH <{main_config}> {{ <urn:config:transact> <https://ns.flur.ee/db#uniqueEnabled> ?on }} }}"
+        ))
+        .execute_formatted()
+        .await
+        .expect("query the graph");
+    assert_eq!(
+        rows["results"]["bindings"].as_array().map(Vec::len),
+        Some(1),
+        "{rows}"
+    );
+
+    support::rebuild_and_publish_index(&fluree, &dev).await;
+    fluree.disconnect_ledger(&dev).await;
+    assert_eq!(unique_enabled(&fluree, &dev).await, Some(true));
+}
+
+/// TriG naming `ex:title` a full-text property, in the graph `graph`.
+fn full_text_title_in(graph: &str) -> String {
+    format!(
+        "@prefix f: <https://ns.flur.ee/db#> .
+         @prefix ex: <http://example.org/> .
+         GRAPH <{graph}> {{
+             <urn:config:main> a f:LedgerConfig ;
+                 f:fullTextDefaults <urn:config:ft> .
+             <urn:config:ft> a f:FullTextDefaults ;
+                 f:property <urn:config:ft:title> .
+             <urn:config:ft:title> a f:FullTextProperty ;
+                 f:target ex:title .
+         }}"
+    )
+}
+
+/// The subjects whose `ex:title` scores for `text` in `ledger_id`, sorted.
+async fn title_hits(fluree: &fluree_db_api::Fluree, ledger_id: &str, text: &str) -> Vec<String> {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ledger_id,
+        "select": "?id",
+        "where": [
+            {"@id": "?id", "ex:title": "?title"},
+            ["bind", "?score", format!("(fulltext ?title \"{text}\")")],
+            ["filter", "(> ?score 0)"]
+        ]
+    });
+    let result = fluree
         .query_connection(&query)
         .await
-        .expect("served once rebuilt");
+        .expect("full-text query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let mut hits: Vec<String> = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld")
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    hits.sort();
+    hits
 }

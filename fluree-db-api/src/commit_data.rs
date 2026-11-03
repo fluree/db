@@ -9,7 +9,7 @@
 //! then restored folds to nothing. The netting contract is
 //! [`NetChangeAccumulator`]'s.
 
-use fluree_db_core::graph_registry::{names_config_graph, CONFIG_GRAPH_ID};
+use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
 use fluree_db_core::{Commit, ConflictKey, ContentId, Flake, Sid};
 use fluree_db_novelty::NetChangeAccumulator;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -193,6 +193,7 @@ where
 /// its state resolves.
 pub(crate) struct ConfigGraphs {
     ns: fluree_db_transact::NamespaceRegistry,
+    registry: fluree_db_core::GraphRegistry,
     canonical: Option<Sid>,
     known: FxHashMap<Sid, bool>,
 }
@@ -209,6 +210,7 @@ impl ConfigGraphs {
             .find_map(|iri| ns.lookup_sid_for_iri(iri));
         Self {
             ns,
+            registry: registry.clone(),
             canonical,
             known: FxHashMap::default(),
         }
@@ -246,8 +248,13 @@ impl ConfigGraphs {
         let config = match self.known.get(g) {
             Some(config) => *config,
             None => {
+                // As the target's registry reads it: an index built before
+                // config graphs were read across ledgers holds one as an
+                // ordinary graph.
                 let config = self.ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
-                    names_config_graph(&format!("{prefix}{}", g.name.as_ref()))
+                    self.registry
+                        .graph_id_for_iri(&format!("{prefix}{}", g.name.as_ref()))
+                        == Some(CONFIG_GRAPH_ID)
                 });
                 self.known.insert(g.clone(), config);
                 config

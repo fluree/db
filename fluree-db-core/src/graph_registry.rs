@@ -170,10 +170,6 @@ pub struct GraphRegistry {
     /// Other ledgers' config graph IRIs the commits carry, each the config
     /// graph here ([`names_config_graph`]); also in `iri_to_id`.
     aliases: Vec<Arc<str>>,
-    /// A config graph IRI the index root holds as an ordinary graph, its
-    /// rows under that graph's id: a root built before any ledger's config
-    /// graph IRI named the config graph.
-    config_in_user_slot: Option<Arc<str>>,
     /// Next available GraphId for assignment (always >= FIRST_USER_GRAPH_ID).
     next_id: GraphId,
 }
@@ -189,7 +185,6 @@ impl Default for GraphRegistry {
             // slot 0 = default graph, slot 1 = txn-meta (empty), slot 2 = config (empty)
             id_to_iri: vec![None, None, None],
             aliases: Vec::new(),
-            config_in_user_slot: None,
             next_id: FIRST_USER_GRAPH_ID,
         }
     }
@@ -211,7 +206,6 @@ impl GraphRegistry {
             iri_to_id,
             id_to_iri: vec![None, Some(txn_meta), Some(config)],
             aliases: Vec::new(),
-            config_in_user_slot: None,
             next_id: FIRST_USER_GRAPH_ID,
         }
     }
@@ -232,10 +226,9 @@ impl GraphRegistry {
     /// write if absent.
     ///
     /// A root from before config graphs were read across ledgers may list
-    /// another ledger's config graph as a user graph. It is the config graph
-    /// here, and its user slot stays empty; the rows the index holds under
-    /// that slot are not read as config, so config reads refuse until the
-    /// index is rebuilt ([`Self::config_in_user_slot`]).
+    /// another ledger's config graph as a user graph, its rows under that
+    /// graph's id. It stays the ordinary graph the index holds until a
+    /// rebuild from the commits ([`Self::has_config_in_user_slot`]).
     ///
     /// # Errors
     ///
@@ -253,8 +246,6 @@ impl GraphRegistry {
         // Capacity: slot 0 (default) + iris.len() slots
         let mut id_to_iri: Vec<Option<Arc<str>>> = Vec::with_capacity(iris.len() + 1);
         id_to_iri.push(None); // slot 0 = default graph
-        let mut aliases = Vec::new();
-        let mut config_in_user_slot = None;
 
         for (root_idx, iri_str) in iris.iter().enumerate() {
             let g_id = (root_idx as GraphId) + 1; // root index 0 → g_id 1
@@ -269,13 +260,6 @@ impl GraphRegistry {
                     "GraphRegistry: duplicate IRI '{iri_str}' at g_id={g_id} (already at g_id={existing_id})"
                 )));
             }
-            if g_id >= FIRST_USER_GRAPH_ID && names_config_graph(&arc) {
-                iri_to_id.insert(arc.clone(), CONFIG_GRAPH_ID);
-                config_in_user_slot.get_or_insert_with(|| arc.clone());
-                aliases.push(arc);
-                id_to_iri.push(None);
-                continue;
-            }
             iri_to_id.insert(arc.clone(), g_id);
             id_to_iri.push(Some(arc));
         }
@@ -286,8 +270,7 @@ impl GraphRegistry {
         Ok(Self {
             iri_to_id,
             id_to_iri,
-            aliases,
-            config_in_user_slot,
+            aliases: Vec::new(),
             next_id,
         })
     }
@@ -307,8 +290,6 @@ impl GraphRegistry {
         let capacity = (max_id as usize) + 1;
         let mut id_to_iri: Vec<Option<Arc<str>>> = vec![None; capacity];
         let mut iri_to_id: HashMap<Arc<str>, GraphId> = HashMap::with_capacity(entries.len());
-        let mut aliases = Vec::new();
-        let mut config_in_user_slot = None;
 
         for &(g_id, iri) in entries {
             if g_id == 0 {
@@ -327,13 +308,6 @@ impl GraphRegistry {
                     "GraphRegistry: duplicate g_id={g_id} with different IRIs"
                 )));
             }
-            // As in `seed_from_root_iris`.
-            if g_id >= FIRST_USER_GRAPH_ID && names_config_graph(iri) {
-                iri_to_id.insert(arc.clone(), CONFIG_GRAPH_ID);
-                config_in_user_slot.get_or_insert_with(|| arc.clone());
-                aliases.push(arc);
-                continue;
-            }
             iri_to_id.insert(arc.clone(), g_id);
             id_to_iri[g_id as usize] = Some(arc);
         }
@@ -344,8 +318,7 @@ impl GraphRegistry {
         Ok(Self {
             iri_to_id,
             id_to_iri,
-            aliases,
-            config_in_user_slot,
+            aliases: Vec::new(),
             next_id,
         })
     }
@@ -470,15 +443,17 @@ impl GraphRegistry {
             .filter_map(|(idx, opt)| opt.as_deref().map(|iri| (idx as GraphId, iri)))
     }
 
-    /// Other ledgers' config graph IRIs the commits carry, each the config
-    /// graph here. Not in [`Self::iter_entries`].
-    /// A config graph IRI the index root holds as an ordinary graph, if any:
-    /// its rows sit under a user graph's id, where the config graph is not
-    /// read, so the config cannot be read until the index is rebuilt.
-    pub fn config_in_user_slot(&self) -> Option<&str> {
-        self.config_in_user_slot.as_deref()
+    /// Whether the index root holds a config graph IRI as an ordinary graph:
+    /// a root built before any ledger's config graph IRI named the config
+    /// graph. That config is read only once the index is rebuilt from the
+    /// commits.
+    pub fn has_config_in_user_slot(&self) -> bool {
+        self.iter_entries()
+            .any(|(g_id, iri)| g_id >= FIRST_USER_GRAPH_ID && names_config_graph(iri))
     }
 
+    /// Other ledgers' config graph IRIs the commits carry, each the config
+    /// graph here. Not in [`Self::iter_entries`].
     pub fn iter_aliases(&self) -> impl Iterator<Item = (GraphId, &str)> {
         self.aliases
             .iter()
@@ -835,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn a_root_listing_another_ledgers_config_graph_as_a_user_graph_reads_it_as_config() {
+    fn a_root_listing_another_ledgers_config_graph_as_a_user_graph_keeps_it() {
         let source = config_graph_iri("a:main");
         let iris = vec![
             txn_meta_graph_iri("b:main"),
@@ -843,21 +818,29 @@ mod tests {
             source.clone(),
             "http://example.org/g".to_string(),
         ];
-        let reg = GraphRegistry::seed_from_root_iris(&iris).unwrap();
-        assert_eq!(reg.graph_id_for_iri(&source), Some(CONFIG_GRAPH_ID));
-        assert_eq!(reg.iri_for_graph_id(3), None);
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g"), Some(4));
-        assert_eq!(reg.next_id(), 5);
-
         let entries: Vec<(GraphId, &str)> = iris
             .iter()
             .enumerate()
             .map(|(i, iri)| (i as GraphId + 1, iri.as_str()))
             .collect();
-        let reg = GraphRegistry::seed_from_entries(&entries).unwrap();
-        assert_eq!(reg.graph_id_for_iri(&source), Some(CONFIG_GRAPH_ID));
-        assert_eq!(reg.iri_for_graph_id(3), None);
-        assert_eq!(reg.next_id(), 5);
+        for mut reg in [
+            GraphRegistry::seed_from_root_iris(&iris).unwrap(),
+            GraphRegistry::seed_from_entries(&entries).unwrap(),
+        ] {
+            assert!(reg.has_config_in_user_slot());
+            assert_eq!(reg.graph_id_for_iri(&source), Some(3));
+            assert_eq!(reg.iri_for_graph_id(3), Some(source.as_str()));
+            assert_eq!(reg.next_id(), 5);
+            // Commits replayed over the index route to it as the index does.
+            assert!(reg.apply_delta([source.as_str()]).is_empty());
+            assert_eq!(reg.graph_id_for_iri(&source), Some(3));
+            // Another ledger's config graph IRI the root does not list is
+            // still the config graph.
+            let other = config_graph_iri("c:main");
+            reg.apply_delta([other.as_str()]);
+            assert_eq!(reg.graph_id_for_iri(&other), Some(CONFIG_GRAPH_ID));
+        }
+        assert!(!GraphRegistry::new_for_ledger("b:main").has_config_in_user_slot());
     }
 
     #[test]
