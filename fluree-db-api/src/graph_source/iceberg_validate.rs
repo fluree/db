@@ -133,6 +133,7 @@ const ICEBERG_WORDING: Wording = Wording {
 pub(crate) enum QueryTables {
     /// The query's alias, as a table name: a source that refuses queries
     /// reports the alias as a table it cannot find.
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
     Alias,
     /// The `FROM` table of a query in the restricted subset an Iceberg source
     /// evaluates (see [`super::row_filter`]); a query outside it is an error.

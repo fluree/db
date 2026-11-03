@@ -195,12 +195,14 @@ pub(crate) fn source_resolved_config(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SqlQueryPolicy {
     /// The source's engine runs the query (a SQL graph source).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     Execute,
     /// The source evaluates the restricted subset itself (Iceberg): one table
     /// narrowed by a conjunction of column comparisons; see
     /// [`super::row_filter`].
     RestrictedSubset,
     /// The source reads tables only (Delta).
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
     Refuse,
 }
 
