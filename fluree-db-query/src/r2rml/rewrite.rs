@@ -1713,27 +1713,10 @@ fn wildcard_class_fusion_is_safe(mapping: &CompiledR2rmlMapping, class_iri: &str
     true
 }
 
-/// The constant prefix of an `rr:template` — everything before the first `{`
-/// placeholder (the whole string when there is no placeholder). Emitted verbatim
-/// by `expand_template`, so every IRI a template can produce starts with it —
-/// which is what makes the operator's bound-subject TriplesMap prune sound.
-pub(crate) fn constant_prefix(template: &str) -> &str {
-    match template.find('{') {
-        Some(i) => &template[..i],
-        None => template,
-    }
-}
-
-/// Whether two subject templates provably generate disjoint IRI sets: neither
-/// constant prefix is a string-prefix of the other, so every generated IRI of
-/// one differs from every generated IRI of the other within the constant region
-/// (before any placeholder value can matter). Equal prefixes are treated as
-/// overlapping (not disjoint) — conservative.
-fn templates_provably_disjoint(a: &str, b: &str) -> bool {
-    let pa = constant_prefix(a);
-    let pb = constant_prefix(b);
-    !pa.starts_with(pb) && !pb.starts_with(pa)
-}
+// The constant prefix of a template (every IRI it mints starts with it, which
+// makes the operator's bound-subject TriplesMap prune sound) and prefix
+// disjointness, shared with the uniqueness checks in `fluree_db_r2rml`.
+pub(crate) use fluree_db_r2rml::mapping::{constant_prefix, templates_provably_disjoint};
 
 /// Convert a triple pattern to an R2RML pattern.
 ///

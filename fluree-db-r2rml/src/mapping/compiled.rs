@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::TriplesMap;
+use super::{TableKeys, TriplesMap};
 
 /// Complete compiled R2RML mapping
 ///
@@ -106,6 +106,23 @@ impl CompiledR2rmlMapping {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The keys the mapping declares (`f:key`) on the logical table named
+    /// `table_name` ([`TriplesMap::table_name`]): the union over every map
+    /// that reads it, since a key is a fact about the table's rows, not about
+    /// one map. A query-backed logical table is named by its query text, so
+    /// a key declared on one query never applies to another (or to the base
+    /// table the query reads).
+    ///
+    /// Callers add what the source reports ([`TableKeys::with_reported`])
+    /// before asking [`TriplesMap::subject_unique_under`].
+    pub fn declared_keys(&self, table_name: &str) -> TableKeys {
+        self.find_maps_for_table(table_name)
+            .into_iter()
+            .fold(TableKeys::none(), |keys, tm| {
+                keys.union(tm.declared_keys.iter().map(<[String]>::to_vec))
+            })
     }
 
     /// Find TriplesMap(s) that produce subjects of a given class
@@ -350,6 +367,37 @@ mod tests {
 
         let no_refs = mapping.find_maps_referencing("<#RouteMapping>");
         assert!(no_refs.is_empty());
+    }
+
+    #[test]
+    fn declared_keys_unite_every_map_over_the_table() {
+        use crate::mapping::{LogicalTable, TableKeys};
+        let history = |iri: &str| {
+            TriplesMap::new(iri, "sets.customers_history")
+                .with_subject_template("http://example.org/customer/{customer_id}")
+        };
+        let mut current_rows = TriplesMap::new("<#Current>", "unused")
+            .with_subject_template("http://example.org/customer/{customer_id}")
+            .with_declared_key(["customer_id"]);
+        current_rows.logical_table =
+            LogicalTable::sql_query("SELECT * FROM sets.customers_history WHERE is_current = 1");
+        let alias = current_rows.table_name().unwrap().to_string();
+        let mapping = CompiledR2rmlMapping::new(vec![
+            history("<#A>").with_declared_key(["customer_id", "valid_from"]),
+            history("<#B>").with_declared_key(["row_id"]),
+            history("<#C>"),
+            current_rows,
+        ]);
+        assert_eq!(
+            mapping.declared_keys("sets.customers_history"),
+            TableKeys::new([vec!["customer_id", "valid_from"], vec!["row_id"]])
+        );
+        // A key declared on a query holds for the query's rows only.
+        assert_eq!(
+            mapping.declared_keys(&alias),
+            TableKeys::new([vec!["customer_id"]])
+        );
+        assert!(mapping.declared_keys("sets.orders").is_empty());
     }
 
     #[test]

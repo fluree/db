@@ -26,6 +26,9 @@
   `id`, `name`; then `name` renamed to `full_name`; then two more rows. A
   read pinned to the first snapshot must find its rows under the current
   name.
+- `sets.customers_history`, `sets.customers_current`, `sets.orders`: tables
+  whose rows mint duplicate triples, for R2RML set semantics (their own
+  namespace; see the block's comment).
 """
 import shutil, sys
 from datetime import date, datetime, timezone
@@ -273,3 +276,114 @@ print("renamed snapshots:", [
     (s.snapshot_id, s.sequence_number, s.schema_id)
     for s in sorted(renamed.snapshots(), key=lambda s: s.sequence_number)
 ])
+
+# ---------------------------------------------------------------------------
+# sets.*: rows that mint the same triple more than once.
+#
+# An R2RML graph source answers over a SET of triples, and these tables are
+# bags whose rows collide, in two files each so a duplicate can straddle them.
+# Their own namespace keeps them apart from the silver.* tables other suites
+# own.
+#
+# - customers_history(customer_id, name, city, valid_from, is_current): no key
+#   covers customer_id alone. Customer 1 has three versions, two of them with
+#   the same name and city; customer 2 bob, then robert twice with the same
+#   values; customer 5 two versions differing in BOTH name and city, so a
+#   per-subject cross product (erin x Tampa) differs from the row-correlated
+#   pairs; customer 4 a NULL city; one row a NULL customer_id (no subject).
+#   Exactly one row per customer has is_current = 1.
+# - customers_current(customer_id, name): one row per customer, customer_id an
+#   Iceberg identifier field; minted with the same template and class as the
+#   history table, plus customer 6 the history lacks.
+# - orders(order_id, customer_id, amount): references the history table on
+#   customer_id (a parent key holding several rows that mint ONE subject);
+#   order 101 is an exact duplicate row, one copy in each file; order 104's
+#   customer dangles; order 105's is NULL.
+# ---------------------------------------------------------------------------
+from pyiceberg.schema import Schema
+from pyiceberg.types import LongType, NestedField, StringType
+
+catalog.create_namespace("sets")
+
+sets_history_schema = pa.schema([
+    pa.field("customer_id", pa.int64()),
+    pa.field("name", pa.string()),
+    pa.field("city", pa.string()),
+    pa.field("valid_from", pa.date32()),
+    pa.field("is_current", pa.int32()),
+])
+sets_history = catalog.create_table("sets.customers_history", schema=sets_history_schema)
+sets_history_rows = [
+    # customer_id, name, city, valid_from, is_current
+    (1, "alice", "Boston", date(2024, 1, 1), 0),
+    (2, "bob", "Austin", date(2024, 1, 1), 0),
+    (3, "carol", "Chicago", date(2024, 2, 1), 1),
+    (1, "alice", "Denver", date(2024, 6, 1), 0),
+    (5, "erin", "Miami", date(2024, 1, 1), 0),
+    # second file
+    (2, "robert", "Austin", date(2024, 5, 1), 0),
+    (2, "robert", "Austin", date(2024, 9, 1), 1),
+    (4, "dave", None, date(2024, 3, 1), 1),
+    (1, "alice", "Denver", date(2024, 11, 1), 1),
+    (5, "erin-m", "Tampa", date(2024, 7, 1), 1),
+    (None, "ghost", "Nowhere", date(2024, 1, 1), 0),
+]
+
+def sets_history_batch(rows):
+    col = lambda i: [r[i] for r in rows]
+    return pa.table({
+        "customer_id": pa.array(col(0), pa.int64()),
+        "name": pa.array(col(1)),
+        "city": pa.array(col(2)),
+        "valid_from": pa.array(col(3), pa.date32()),
+        "is_current": pa.array(col(4), pa.int32()),
+    }, schema=sets_history_schema)
+
+sets_history.append(sets_history_batch(sets_history_rows[:5]))
+sets_history.append(sets_history_batch(sets_history_rows[5:]))
+sets_history = catalog.load_table("sets.customers_history")
+print("sets.customers_history table_location:", sets_history.location())
+
+sets_current = catalog.create_table("sets.customers_current", schema=Schema(
+    NestedField(1, "customer_id", LongType(), required=True),
+    NestedField(2, "name", StringType(), required=False),
+    identifier_field_ids=[1],
+))
+sets_current_arrow = pa.schema([
+    pa.field("customer_id", pa.int64(), nullable=False),
+    pa.field("name", pa.string()),
+])
+sets_current.append(pa.table({
+    "customer_id": pa.array([1, 2, 3], pa.int64()),
+    "name": pa.array(["alice", "robert", "carol"]),
+}, schema=sets_current_arrow))
+sets_current.append(pa.table({
+    "customer_id": pa.array([4, 5, 6], pa.int64()),
+    "name": pa.array(["dave", "erin-m", "frank"]),
+}, schema=sets_current_arrow))
+sets_current = catalog.load_table("sets.customers_current")
+print("sets.customers_current table_location:", sets_current.location())
+print("sets.customers_current identifier fields:", sets_current.schema().identifier_field_names())
+
+sets_orders_schema = pa.schema([
+    pa.field("order_id", pa.int64()),
+    pa.field("customer_id", pa.int64()),
+    pa.field("amount", pa.decimal128(10, 2)),
+])
+sets_orders = catalog.create_table("sets.orders", schema=sets_orders_schema)
+
+def sets_orders_batch(rows):
+    return pa.table({
+        "order_id": pa.array([r[0] for r in rows], pa.int64()),
+        "customer_id": pa.array([r[1] for r in rows], pa.int64()),
+        "amount": pa.array([Decimal(r[2]) for r in rows], pa.decimal128(10, 2)),
+    }, schema=sets_orders_schema)
+
+sets_orders.append(sets_orders_batch([
+    (100, 1, "10.00"), (101, 2, "20.00"), (102, 3, "5.50"), (103, 5, "7.25"),
+]))
+sets_orders.append(sets_orders_batch([
+    (101, 2, "20.00"), (104, 99, "1.00"), (105, None, "3.00"), (106, 1, "2.00"),
+]))
+sets_orders = catalog.load_table("sets.orders")
+print("sets.orders table_location:", sets_orders.location())

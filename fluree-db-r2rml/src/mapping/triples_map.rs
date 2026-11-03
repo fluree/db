@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{PredicateObjectMap, TermType};
+use super::{PredicateObjectMap, TableKeys, TermType};
 
 /// A compiled R2RML TriplesMap
 ///
@@ -38,6 +38,13 @@ pub struct TriplesMap {
     pub subject_map: SubjectMap,
     /// Zero or more predicate-object maps
     pub predicate_object_maps: Vec<PredicateObjectMap>,
+    /// The keys the mapping declares on this map's logical table (`f:key`).
+    ///
+    /// Skipped when empty, so a mapping that declares none serializes, and
+    /// hashes for its materialized twin, exactly as it did before keys could be
+    /// declared.
+    #[serde(default, skip_serializing_if = "TableKeys::is_empty")]
+    pub declared_keys: TableKeys,
 }
 
 impl TriplesMap {
@@ -48,7 +55,18 @@ impl TriplesMap {
             logical_table: LogicalTable::TableName(table_name.into()),
             subject_map: SubjectMap::default(),
             predicate_object_maps: Vec::new(),
+            declared_keys: TableKeys::none(),
         }
+    }
+
+    /// Declare a key of the logical table: columns no two rows agree on.
+    pub fn with_declared_key<S: Into<String>>(
+        mut self,
+        columns: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.declared_keys = std::mem::take(&mut self.declared_keys)
+            .union([columns.into_iter().map(Into::into).collect::<Vec<String>>()]);
+        self
     }
 
     /// Set the subject map template

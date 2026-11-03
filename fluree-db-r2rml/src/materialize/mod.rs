@@ -30,6 +30,9 @@ pub use term::{expand_template, materialize_object, materialize_subject, RdfTerm
 // bound-subject predicate down to the Iceberg scan.
 pub use term::{reverse_subject_template, TemplateReverser};
 
+// Whether a template's expansion can map two value tuples to one string.
+pub use term::template_is_injective;
+
 // ColumnBatch-based API (for production efficiency)
 pub use term::{
     batch_has_column, column_is_orderable, column_sort_key, column_string,

@@ -2395,6 +2395,111 @@ mod tests {
         );
     }
 
+    /// A mapping exercising every term-map form the compiled mapping carries:
+    /// an `rr:sqlQuery` logical table, a per-row graph map, `rr:column` and
+    /// constant subjects, a blank-node subject, two classes, constant IRI and
+    /// language-tagged objects, a typed column, an IRI template object, and a
+    /// referencing object map with a composite join.
+    const FEATURE_WIDE_MAPPING: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+        <http://example.org/m#Orders> a rr:TriplesMap ;
+            rr:logicalTable [ rr:sqlQuery """SELECT order_id, region, amount FROM sales.orders""" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/order/{region}/{order_id}" ;
+                rr:class ex:Order ; rr:class ex:Document ;
+                rr:graphMap [ rr:template "http://example.org/graph/{region}" ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:amount ;
+                rr:objectMap [ rr:column "amount" ; rr:datatype xsd:decimal ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:status ;
+                rr:objectMap [ rr:constant ex:Open ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:label ;
+                rr:objectMap [ rr:constant "order"@en ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:region ;
+                rr:objectMap [ rr:template "http://example.org/region/{region}" ; rr:termType rr:IRI ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:customer ;
+                rr:objectMap [
+                    rr:parentTriplesMap <http://example.org/m#Customers> ;
+                    rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ;
+                    rr:joinCondition [ rr:child "region" ; rr:parent "region" ]
+                ]
+            ] .
+
+        <http://example.org/m#Customers> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales/customers" ] ;
+            rr:subjectMap [ rr:column "customer_iri" ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:name ;
+                rr:objectMap [ rr:column "name" ; rr:language "en" ]
+            ] .
+
+        <http://example.org/m#Notes> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales.notes" ] ;
+            rr:subjectMap [ rr:template "note{note_id}" ; rr:termType rr:BlankNode ] ;
+            rr:predicateObjectMap [ rr:predicate ex:text ; rr:objectMap [ rr:column "text" ] ] .
+
+        <http://example.org/m#Catalog> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales.catalog" ] ;
+            rr:subject ex:TheCatalog ;
+            rr:predicateObjectMap [ rr:predicate ex:item ; rr:objectMap [ rr:column "item" ] ] .
+    "#;
+
+    /// `mapping_hash` stamps every twin, so a change to how an EXISTING mapping
+    /// serializes would invalidate every twin built from it. These hashes were
+    /// taken from mappings compiled before the mapping types grew any field for
+    /// declared table keys; a mapping that declares none must keep them.
+    #[test]
+    fn mapping_hash_of_existing_mappings_is_pinned() {
+        let hash = |ttl: &str| {
+            let compiled = fluree_db_r2rml::loader::R2rmlLoader::from_turtle(ttl)
+                .expect("parse")
+                .compile()
+                .expect("compile");
+            super::mapping_hash(&compiled)
+        };
+        let cases = [
+            (
+                "customers_orders",
+                include_str!("../../scripts/glue-local/mappings/customers_orders.ttl"),
+                "053f6aa4b39179daa92a30becff49db2ec187adf638384b60d720058d1f0bdcc",
+            ),
+            (
+                "customers_hinted",
+                include_str!("../../scripts/glue-local/mappings/customers_hinted.ttl"),
+                "27d95e201e53275f886b323f0ed5a0700a3c955b24fd895715c9d9cf54a2672a",
+            ),
+            (
+                "enterprise_default",
+                include_str!("../../fluree-db-r2rml/src/emit/testdata/enterprise_default.ttl"),
+                "3bf4da6638205f263084c8d745d3b9abaec9afe1b3d246baba0b82371814dc91",
+            ),
+            (
+                "feature_wide",
+                FEATURE_WIDE_MAPPING,
+                "ab81c83439de463c4e7d86d2257037fdfea5e9b68ec063cae6d26ee226bab9a6",
+            ),
+        ];
+        let got: Vec<(&str, String)> = cases
+            .iter()
+            .map(|(name, ttl, _)| (*name, hash(ttl)))
+            .collect();
+        for ((name, _, want), (_, actual)) in cases.iter().zip(&got) {
+            assert_eq!(actual, want, "{name}: the mapping hash moved; all: {got:?}");
+        }
+    }
+
     #[test]
     fn watermark_guard_rejects_empty_for_nonempty_tables() {
         use fluree_db_query::r2rml::TableWatermark;

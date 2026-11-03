@@ -383,6 +383,29 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         Ok(None)
     }
 
+    /// The keys the source itself reports for `table_name`: each a list of
+    /// column names, by their current names, no two of the table's live rows
+    /// agree on (rows with a NULL in any of them aside). A caller unites them
+    /// with the keys the mapping declares
+    /// ([`fluree_db_r2rml::TableKeys::with_reported`]) to decide whether a
+    /// map's subjects are unique and its rows can skip deduplication
+    /// ([`fluree_db_r2rml::TriplesMap::subject_unique_under`]).
+    ///
+    /// Report only what the source guarantees for the snapshot `as_of_t`
+    /// selects; a key that may not hold makes queries return duplicate
+    /// solutions. `Ok(None)` reports none (the default): every map over the
+    /// table is then deduplicated unless the mapping declares a key, which is
+    /// always correct.
+    async fn table_keys(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Option<Vec<Vec<String>>>> {
+        let _ = (graph_source_id, table_name, as_of_t);
+        Ok(None)
+    }
+
     /// The table's row count when the provider already holds it (a cached scan
     /// plan, say), without reading anything to learn it. A caller deciding
     /// whether a table is small enough to cache whole asks first. `Ok(None)`
