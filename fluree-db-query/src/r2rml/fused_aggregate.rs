@@ -2105,8 +2105,7 @@ impl Operator for FusedR2rmlAggregateOperator {
         // (exact: `FoldDedupe`), each charged to the query budget. A column of
         // a type whose raw bytes do not tell its terms apart hands the query to
         // the generic pipeline, like an overflow.
-        let mut fold_seen: crate::r2rml::set_semantics::ChargedTable<Box<[u8]>> =
-            crate::r2rml::set_semantics::ChargedTable::new();
+        let mut fold_seen = crate::r2rml::set_semantics::ArenaSet::new();
         let fold_hasher = rustc_hash::FxBuildHasher;
         let mut fold_scratch: Vec<u8> = Vec::new();
         'scan: while let Some(batch) = stream.next().await {
@@ -2240,16 +2239,16 @@ impl Operator for FusedR2rmlAggregateOperator {
                         put_raw_value(col, row, &mut fold_scratch);
                     }
                     let hash = fold_hasher.hash_one(fold_scratch.as_slice());
-                    if fold_seen.contains(hash, |seen| **seen == *fold_scratch) {
-                        continue;
+                    match fold_seen.insert_new(&fold_scratch, hash, &fold_hasher, ctx)? {
+                        Some(true) => {}
+                        Some(false) => continue,
+                        // A key longer than the set holds: the generic
+                        // pipeline answers.
+                        None => {
+                            overflowed = true;
+                            break 'scan;
+                        }
                     }
-                    fold_seen.insert(
-                        hash,
-                        fold_scratch.as_slice().into(),
-                        crate::r2rml::set_semantics::alloc_size_class(fold_scratch.len()),
-                        |seen| fold_hasher.hash_one(&**seen),
-                        ctx,
-                    )?;
                 }
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit

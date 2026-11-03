@@ -411,18 +411,175 @@ impl<K> ChargedTable<K> {
     }
 }
 
-/// One remembered solution.
+/// Longest key an [`ArenaSet`] holds (bytes): a longer one is the caller's to
+/// keep another way.
+const ARENA_MAX_KEY: usize = (1 << 20) - 1;
+/// The first arena chunk's size; each next chunk doubles, up to
+/// [`ARENA_MAX_CHUNK`].
+const ARENA_FIRST_CHUNK: usize = 4 << 10;
+const ARENA_MAX_CHUNK: usize = 16 << 20;
+
+/// A set of byte keys kept in one arena, charged to the query's memory budget
+/// for exactly what it holds.
 ///
-/// `Compact` is a byte encoding of the solution ([`encode_solution`]) that two
-/// solutions share exactly when the engine's term equality makes them equal;
-/// a solution holding a term it cannot encode that way is kept as its terms.
-/// Whether a solution encodes depends only on which terms it holds, and equal
-/// terms are of one encodable kind or neither, so two equal solutions always
-/// take the same form: the two forms never need comparing.
-#[derive(PartialEq, Eq)]
-enum SeenKey {
-    Compact(Box<[u8]>),
-    Terms(Box<[(VarId, Binding)]>),
+/// Keys are appended to chunks (4 KiB doubling to 16 MiB; a key never spans
+/// two), so a key costs its bytes and nothing per key beyond them, and adding
+/// a chunk copies nothing. The table holds one `u64` per key locating it
+/// (chunk, offset, length). The charge is the table's allocation, as hashbrown
+/// reports it, plus every chunk's capacity: what the set holds, not an
+/// estimate. A new chunk, and a table growth (the old buckets and the new ones
+/// are live at once), are charged and the budget checked before they allocate,
+/// so a set the budget cannot hold fails the query with the typed
+/// `MemoryBudgetExceeded` before it grows.
+pub(crate) struct ArenaSet {
+    chunks: Vec<Vec<u8>>,
+    table: hashbrown::HashTable<u64>,
+    /// Bytes recorded against the budget and not yet released.
+    charged: usize,
+    /// The part of `charged` that is the table's own allocation.
+    table_bytes: usize,
+    /// The most this set has held at once, growth transients included.
+    peak: usize,
+    since_checkpoint: usize,
+}
+
+impl ArenaSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            table: hashbrown::HashTable::new(),
+            charged: 0,
+            table_bytes: 0,
+            peak: 0,
+            since_checkpoint: 0,
+        }
+    }
+
+    fn slot(chunk: usize, offset: usize, len: usize) -> u64 {
+        ((chunk as u64) << 44) | ((offset as u64) << 20) | len as u64
+    }
+
+    fn key_at(chunks: &[Vec<u8>], slot: u64) -> &[u8] {
+        let chunk = (slot >> 44) as usize;
+        let offset = ((slot >> 20) & ((1 << 24) - 1)) as usize;
+        let len = (slot & ((1 << 20) - 1)) as usize;
+        &chunks[chunk][offset..offset + len]
+    }
+
+    fn charge(&mut self, bytes: usize, ctx: &ExecutionContext<'_>) {
+        ctx.record_alloc(bytes);
+        self.charged += bytes;
+        self.peak = self.peak.max(self.charged);
+    }
+
+    /// Hold `key` unless it is held already: `Some(true)` when it is new,
+    /// `Some(false)` when it was held, `None` when it is longer than this set
+    /// holds (it is not held then; a caller keeps such a key another way, or
+    /// not at all). `hash` is `hasher` over the key's bytes.
+    pub(crate) fn insert_new(
+        &mut self,
+        key: &[u8],
+        hash: u64,
+        hasher: &impl BuildHasher,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<bool>> {
+        let chunks = &self.chunks;
+        if self
+            .table
+            .find(hash, |&slot| Self::key_at(chunks, slot) == key)
+            .is_some()
+        {
+            return Ok(Some(false));
+        }
+        if key.len() > ARENA_MAX_KEY {
+            return Ok(None);
+        }
+        if self.table.len() == self.table.capacity() {
+            let old = self.table_bytes;
+            // The new allocation is about twice the old one, live beside it.
+            let estimate = (2 * old).max(64);
+            self.charge(estimate, ctx);
+            ctx.checkpoint()?;
+            let chunks = &self.chunks;
+            self.table
+                .reserve(1, |&slot| hasher.hash_one(Self::key_at(chunks, slot)));
+            let new = self.table.allocation_size();
+            self.peak = self.peak.max(self.charged - estimate + new);
+            // The old allocation is freed: the table's charge is the new one.
+            let target = self.charged - estimate - old + new;
+            if self.charged > target {
+                ctx.release(self.charged - target);
+            } else {
+                ctx.record_alloc(target - self.charged);
+            }
+            self.charged = target;
+            self.table_bytes = new;
+        }
+        let fits = self
+            .chunks
+            .last()
+            .is_some_and(|c| c.capacity() - c.len() >= key.len());
+        if !fits {
+            let size = self
+                .chunks
+                .last()
+                .map_or(ARENA_FIRST_CHUNK, |c| {
+                    (2 * c.capacity()).min(ARENA_MAX_CHUNK)
+                })
+                .max(key.len());
+            // A slot's offset field holds up to 16 MiB, and its chunk field
+            // 2^20 chunks: 16 TiB, far past any budget.
+            self.charge(size + std::mem::size_of::<Vec<u8>>(), ctx);
+            ctx.checkpoint()?;
+            self.chunks.push(Vec::with_capacity(size));
+        }
+        let chunk = self.chunks.len() - 1;
+        let last = &mut self.chunks[chunk];
+        let offset = last.len();
+        last.extend_from_slice(key);
+        let chunks = &self.chunks;
+        self.table
+            .insert_unique(hash, Self::slot(chunk, offset, key.len()), |&slot| {
+                hasher.hash_one(Self::key_at(chunks, slot))
+            });
+        self.since_checkpoint += 1;
+        if self.since_checkpoint >= CHARGED_TABLE_CHECKPOINT_EVERY {
+            self.since_checkpoint = 0;
+            ctx.checkpoint()?;
+        }
+        Ok(Some(true))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Bytes charged now.
+    pub(crate) fn charged(&self) -> usize {
+        self.charged
+    }
+
+    /// The most this set has held at once.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak
+    }
+
+    /// What the set holds now, by its own accounts: the table's allocation
+    /// and every chunk's capacity.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.table.allocation_size()
+            + self
+                .chunks
+                .iter()
+                .map(|c| c.capacity() + std::mem::size_of::<Vec<u8>>())
+                .sum::<usize>()
+    }
+
+    /// Return the set's charge to the query budget (it is about to drop).
+    pub(crate) fn release(self, ctx: &ExecutionContext<'_>) {
+        ctx.release(self.charged);
+    }
 }
 
 /// The solutions one scan pass has emitted, for a pass whose maps can yield a
@@ -430,13 +587,19 @@ enum SeenKey {
 ///
 /// Streaming and first-seen: a solution passes the first time it is seen, in
 /// the scan's order, so a `LIMIT` above the scan still stops it early. Exact:
-/// entries identify the solutions themselves (never a hash alone), compactly
-/// where the encoding is exact. The set is charged to the query's memory
-/// budget for what it holds ([`ChargedTable`]); a set that outgrows the
-/// budget fails the query with the typed `MemoryBudgetExceeded`, and
-/// [`Self::release`] returns the charge when the pass ends.
+/// entries identify the solutions themselves (never a hash alone). A solution
+/// is kept as its byte encoding ([`encode_solution`]) in an [`ArenaSet`], or,
+/// when one of its terms has no exact encoding (or the encoding is longer than
+/// the arena holds), as its terms. Whether a solution takes the first form
+/// depends only on which terms it holds, and equal terms are of one kind, so
+/// two equal solutions always take the same form and the two sets never need
+/// comparing. Both are charged to the query's memory budget for what they
+/// hold; a set that outgrows the budget fails the query with the typed
+/// `MemoryBudgetExceeded`, and [`Self::release`] returns the charge when the
+/// pass ends.
 pub(crate) struct SeenSolutions {
-    table: ChargedTable<SeenKey>,
+    compact: ArenaSet,
+    terms: ChargedTable<Box<[(VarId, Binding)]>>,
     hasher: FxBuildHasher,
     /// A prefix every subject the pass's maps mint starts with; IRIs that
     /// start with it are remembered without it.
@@ -451,7 +614,8 @@ impl SeenSolutions {
     /// longer one only saves more).
     pub(crate) fn new(strip: impl Into<String>) -> Self {
         Self {
-            table: ChargedTable::new(),
+            compact: ArenaSet::new(),
+            terms: ChargedTable::new(),
             hasher: FxBuildHasher,
             strip: strip.into(),
             dtcs: Vec::new(),
@@ -469,37 +633,26 @@ impl SeenSolutions {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         let compact = encode_solution(solution, &self.strip, &mut self.dtcs, &mut scratch);
-        let hasher = &self.hasher;
-        let hash = if compact {
-            hasher.hash_one((0u8, scratch.as_slice()))
+        let held = if compact {
+            let hash = self.hasher.hash_one(scratch.as_slice());
+            self.compact.insert_new(&scratch, hash, &self.hasher, ctx)?
         } else {
-            hasher.hash_one((1u8, solution))
-        };
-        let seen = self.table.contains(hash, |entry| match entry {
-            SeenKey::Compact(bytes) => compact && **bytes == *scratch,
-            SeenKey::Terms(terms) => !compact && **terms == *solution,
-        });
-        if seen {
-            self.scratch = scratch;
-            return Ok(false);
-        }
-        let (key, key_heap) = if compact {
-            (
-                SeenKey::Compact(scratch.as_slice().into()),
-                alloc_size_class(scratch.len()),
-            )
-        } else {
-            (SeenKey::Terms(solution.into()), terms_heap_bytes(solution))
+            None
         };
         self.scratch = scratch;
-        self.table.insert(
+        if let Some(new) = held {
+            return Ok(new);
+        }
+        let hasher = &self.hasher;
+        let hash = hasher.hash_one(solution);
+        if self.terms.contains(hash, |terms| **terms == *solution) {
+            return Ok(false);
+        }
+        self.terms.insert(
             hash,
-            key,
-            key_heap,
-            |entry| match entry {
-                SeenKey::Compact(bytes) => hasher.hash_one((0u8, &**bytes)),
-                SeenKey::Terms(terms) => hasher.hash_one((1u8, &**terms)),
-            },
+            solution.into(),
+            terms_heap_bytes(solution),
+            |terms| hasher.hash_one(&**terms),
             ctx,
         )?;
         Ok(true)
@@ -508,24 +661,25 @@ impl SeenSolutions {
     /// Return this set's charge to the query budget (it is about to drop).
     pub(crate) fn release(self, ctx: &ExecutionContext<'_>) {
         tracing::debug!(
-            solutions = self.table.len(),
-            charged_bytes = self.table.charged(),
-            peak_bytes = self.table.peak(),
+            solutions = self.compact.len() + self.terms.len(),
+            charged_bytes = self.compact.charged() + self.terms.charged(),
+            peak_bytes = self.compact.peak() + self.terms.peak(),
             "R2RML scan: deduplication set released"
         );
-        self.table.release(ctx);
+        self.compact.release(ctx);
+        self.terms.release(ctx);
     }
 
     /// Bytes charged now.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
-        self.table.charged()
+        self.compact.charged() + self.terms.charged()
     }
 
     /// Distinct solutions held.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.table.len()
+        self.compact.len() + self.terms.len()
     }
 }
 
@@ -766,16 +920,10 @@ mod tests {
         assert!(seen.first_sight(&swapped, &ctx).unwrap());
         assert_eq!(seen.len(), 4);
         assert_eq!(ctx.mem_used() - before, seen.charged());
-        // The table's own allocation is charged, and each key on top of it,
-        // remembered compactly: well under the solutions' term form.
-        let table = seen.table.allocation_size();
-        assert!(table > 0 && seen.charged() > table);
-        let as_terms = 4 * terms_heap_bytes(&row("ex:1", "alice"));
-        assert!(
-            (seen.charged() - table) * 2 < as_terms,
-            "{} vs {as_terms}",
-            seen.charged() - table
-        );
+        // All four encode: they are held in the arena, charged for exactly
+        // what it holds.
+        assert_eq!(seen.compact.len(), 4);
+        assert_eq!(seen.charged(), seen.compact.held());
         seen.release(&ctx);
         assert_eq!(ctx.mem_used(), before);
     }
@@ -974,5 +1122,85 @@ mod tests {
             "{err:?}"
         );
         assert!(results.len() < 5000);
+    }
+
+    fn arena_fill(
+        ctx: &ExecutionContext<'_>,
+        keys: impl Iterator<Item = Vec<u8>>,
+    ) -> (Vec<Result<Option<bool>>>, ArenaSet) {
+        let mut set = ArenaSet::new();
+        let hasher = FxBuildHasher;
+        let mut results = Vec::new();
+        for key in keys {
+            let r = set.insert_new(&key, hasher.hash_one(key.as_slice()), &hasher, ctx);
+            let failed = r.is_err();
+            results.push(r);
+            if failed {
+                break;
+            }
+        }
+        (results, set)
+    }
+
+    fn key(i: u64) -> Vec<u8> {
+        // Varying lengths: a key and a longer one sharing its prefix.
+        let mut k = i.to_le_bytes().to_vec();
+        k.truncate(1 + (i % 8) as usize);
+        k.extend(std::iter::repeat_n(b'x', (i % 37) as usize));
+        k
+    }
+
+    #[test]
+    fn an_arena_set_holds_each_key_once_and_charges_exactly_what_it_holds() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("set-semantics:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(budgeted(None));
+        let (results, mut set) = arena_fill(&ctx, (0..20_000).map(key));
+        let distinct: std::collections::HashSet<Vec<u8>> = (0..20_000).map(key).collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Ok(Some(true))))
+                .count(),
+            distinct.len()
+        );
+        assert_eq!(set.len(), distinct.len());
+        assert_eq!(set.charged(), set.held());
+        assert_eq!(ctx.mem_used(), set.charged());
+        assert!(set.peak() > set.charged(), "a growth held both tables");
+        // Held keys are found, by their bytes (lengths included).
+        let hasher = FxBuildHasher;
+        for k in [key(3), key(3 + 37 * 8), vec![1u8], vec![1u8, b'x']] {
+            let r = set.insert_new(&k, hasher.hash_one(k.as_slice()), &hasher, &ctx);
+            assert_eq!(r.unwrap(), Some(!distinct.contains(&k)), "{k:?}");
+        }
+        // A key longer than the arena holds is not held.
+        let long = vec![7u8; ARENA_MAX_KEY + 1];
+        let r = set.insert_new(&long, hasher.hash_one(long.as_slice()), &hasher, &ctx);
+        assert_eq!(r.unwrap(), None);
+        set.release(&ctx);
+        assert_eq!(ctx.mem_used(), 0);
+    }
+
+    #[test]
+    fn an_arena_growth_the_budget_cannot_hold_fails_typed_before_it_allocates() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("set-semantics:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let free = ExecutionContext::new(&snapshot, &vars).with_cancellation(budgeted(None));
+        let (_, set) = arena_fill(&free, (0..20_000).map(key));
+        let (fin, peak) = (set.held(), set.peak());
+        assert!(peak > fin);
+        let limit = fin + (peak - fin) / 2;
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(budgeted(Some(limit)));
+        let (results, _) = arena_fill(&ctx, (0..20_000).map(key));
+        let err = results
+            .last()
+            .unwrap()
+            .as_ref()
+            .expect_err("the growth must fail");
+        assert!(
+            matches!(err, crate::error::QueryError::MemoryBudgetExceeded { .. }),
+            "{err:?}"
+        );
     }
 }
