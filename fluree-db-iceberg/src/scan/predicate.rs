@@ -155,6 +155,59 @@ impl std::fmt::Display for LiteralValue {
     }
 }
 
+/// The members of an `IN`, with the ordered view file and row-group pruning
+/// searches built once from them (see
+/// [`OrderedMembers`](crate::scan::pruning::OrderedMembers)), so the two can
+/// never disagree. Both are shared: a scan plan clones its filter into every
+/// file's task, and a clone of a set copies a pointer, not its members.
+/// Derefs to the members.
+#[derive(Debug, Clone)]
+pub struct InSet {
+    values: std::sync::Arc<[LiteralValue]>,
+    ordered: std::sync::Arc<crate::scan::pruning::OrderedMembers>,
+}
+
+impl InSet {
+    /// The set of `values`.
+    pub fn new(values: Vec<LiteralValue>) -> Self {
+        let ordered = std::sync::Arc::new(crate::scan::pruning::OrderedMembers::of(&values));
+        Self {
+            values: values.into(),
+            ordered,
+        }
+    }
+
+    /// The members, as given.
+    pub fn values(&self) -> &[LiteralValue] {
+        &self.values
+    }
+
+    pub(crate) fn ordered(&self) -> &crate::scan::pruning::OrderedMembers {
+        &self.ordered
+    }
+}
+
+impl std::ops::Deref for InSet {
+    type Target = [LiteralValue];
+
+    fn deref(&self) -> &[LiteralValue] {
+        &self.values
+    }
+}
+
+/// Sets are equal when their members are, in order.
+impl PartialEq for InSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl PartialEq<Vec<LiteralValue>> for InSet {
+    fn eq(&self, other: &Vec<LiteralValue>) -> bool {
+        *self.values == **other
+    }
+}
+
 /// Filter expression for predicate pushdown.
 ///
 /// # Design
@@ -206,7 +259,7 @@ pub enum Expression {
         /// Column name (debug/UX only)
         column: String,
         /// Values to check membership in
-        values: Vec<LiteralValue>,
+        values: InSet,
     },
     /// NOT IN list check
     NotIn {
@@ -301,7 +354,7 @@ impl Expression {
         Self::In {
             field_id,
             column: column.into(),
-            values,
+            values: InSet::new(values),
         }
     }
 

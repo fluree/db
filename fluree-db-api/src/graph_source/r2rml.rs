@@ -886,11 +886,7 @@ fn build_iceberg_filter(
         if f.op == ScanCmpOp::In {
             if let ScanValue::Set(members) = &f.value {
                 if let Some(values) = set_members_to_literals(field.type_string(), members, true) {
-                    comparisons.push(Expression::In {
-                        field_id: field.id,
-                        column: f.column.clone(),
-                        values,
-                    });
+                    comparisons.push(Expression::in_list(field.id, f.column.clone(), values));
                 }
             }
             continue;
@@ -5411,7 +5407,7 @@ mod tests {
         assert!(matches!(
             build_iceberg_filter(&[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "10"]))], &s),
             Some(Expression::In { values, .. })
-                if values == [LiteralValue::Int64(9), LiteralValue::Int64(10)]
+                if values.values() == [LiteralValue::Int64(9), LiteralValue::Int64(10)]
         ));
         assert!(build_iceberg_filter(
             &[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "09"]))],
