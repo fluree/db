@@ -244,7 +244,7 @@ async fn run_update_branch(
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let leaf_map: HashMap<ContentId, Vec<u8>> = leaf_pairs.into_iter().collect();
+    let leaf_map = Prefetched::new(leaf_pairs, touched.iter().map(|(leaf, _)| leaf));
 
     // Sidecars: NotFound => absent (None); other errors abort (preserved).
     let sidecar_pairs: Vec<(ContentId, Option<Vec<u8>>)> = stream::iter(sidecar_cids)
@@ -288,10 +288,12 @@ async fn run_update_branch(
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let sidecar_map: HashMap<ContentId, Vec<u8>> = sidecar_pairs
-        .into_iter()
-        .filter_map(|(cid, opt)| opt.map(|b| (cid, b)))
-        .collect();
+    let sidecar_map = Prefetched::new(
+        sidecar_pairs
+            .into_iter()
+            .filter_map(|(cid, opt)| opt.map(|b| (cid, b))),
+        touched.iter().filter_map(|(_, sidecar)| sidecar.as_ref()),
+    );
 
     // Bounded channel from the blocking CoW to the async uploader. The bound
     // gives backpressure: the CoW parks on `blocking_send` (it's already on a
@@ -299,7 +301,7 @@ async fn run_update_branch(
     // uploader is behind, capping resident blobs to the channel depth + the
     // in-flight puts. Depth tracks the upload budget so the CoW can run a few
     // leaves ahead without unbounded buffering.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<NewLeafBlob>(upload_buffer.max(1));
+    let (tx, rx) = tokio::sync::mpsc::channel::<NewLeafBlob>(upload_buffer.max(1));
 
     // CPU-bound CoW update on a blocking thread. The fetch closures read the
     // prefetched in-memory maps — no `block_on`, no S3 inside the closure. Each
@@ -315,11 +317,11 @@ async fn run_update_branch(
             &branch_config,
             &|cid| {
                 leaf_map
-                    .get(cid)
-                    .cloned()
+                    .take(cid)?
                     .ok_or_else(|| std::io::Error::other(format!("leaf {cid} not prefetched")))
             },
-            &|cid| Ok(sidecar_map.get(cid).cloned()),
+            // A sidecar storage did not hold was never prefetched: absent.
+            &|cid| sidecar_map.take(cid),
             &mut |blob| {
                 tx.blocking_send(blob)
                     .map_err(|_| std::io::Error::other("leaf upload channel closed"))
@@ -327,32 +329,37 @@ async fn run_update_branch(
         )
     });
 
-    // Async uploader: drain the channel, uploading each blob under the global
-    // budget and freeing its bytes. Runs concurrently with the CoW.
+    // Async uploader: drain the channel, uploading up to `upload_buffer` blobs
+    // at once under the global budget and freeing each one's bytes as its put
+    // completes. Runs concurrently with the CoW. Upload order is free: the
+    // branch records each leaf's CID from the CoW, not from the put.
     let upload_budget_ref = upload_budget.as_ref();
     let uploader = {
         let content_store = content_store.as_ref();
         let tracker = &tracker;
         let cache_dir = &cache_dir;
         let warm_cache = warm_cache.as_ref();
-        async move {
-            let mut totals = LeafUploadCounts::default();
-            while let Some(blob) = rx.recv().await {
-                let c = upload_one_leaf_blob(
-                    content_store,
-                    tracker,
-                    upload_budget_ref,
-                    cache_dir,
-                    blob,
-                    warm_cache,
-                )
-                .await?;
-                totals.leaf_bytes += c.leaf_bytes;
-                totals.sidecar_bytes += c.sidecar_bytes;
-                totals.sidecar_count += c.sidecar_count;
-            }
-            Ok::<LeafUploadCounts, IndexerError>(totals)
-        }
+        // The stream owns `rx`, so a failed put drops it (see the join below).
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|blob| (blob, rx))
+        })
+        .map(move |blob| {
+            upload_one_leaf_blob(
+                content_store,
+                tracker,
+                upload_budget_ref,
+                cache_dir,
+                blob,
+                warm_cache,
+            )
+        })
+        .buffer_unordered(upload_buffer.max(1))
+        .try_fold(LeafUploadCounts::default(), |mut totals, c| async move {
+            totals.leaf_bytes += c.leaf_bytes;
+            totals.sidecar_bytes += c.sidecar_bytes;
+            totals.sidecar_count += c.sidecar_count;
+            Ok(totals)
+        })
     };
 
     // Drive both to completion. If the uploader fails it drops `rx`, so the
@@ -373,6 +380,106 @@ async fn run_update_branch(
     );
 
     Ok((meta, stats.snapshot()))
+}
+
+/// A batch re-typing more than this fraction (1/n) of the base index's typed
+/// subjects defers class stats to a full rebuild; see
+/// `IndexerConfig::incremental_retype_max_subjects` for the floor.
+const RETYPE_REBUILD_SHARE: u64 = 8;
+
+/// Run a batched base-index lookup over `ids` on the rayon pool.
+///
+/// The batched lookups answer per requested id, and each slice here is a
+/// contiguous run of the sorted ids, so slices scan disjoint key ranges and
+/// their answers union without overlap. Scattered ids (hash-named subjects)
+/// make each lookup sweep most of a predicate's or order's leaflets, which
+/// one thread did serially for every build.
+fn par_batched_lookup<V: Send>(
+    ids: &[u64],
+    lookup: impl Fn(&[u64]) -> std::io::Result<HashMap<u64, V>> + Sync,
+) -> std::io::Result<HashMap<u64, V>> {
+    use rayon::prelude::*;
+
+    // Below this a slice's cursor descents cost more than they save.
+    const MIN_SLICE: usize = 512;
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let slices = (sorted.len() / MIN_SLICE).clamp(1, rayon::current_num_threads() * 4);
+    if slices == 1 {
+        return lookup(&sorted);
+    }
+    sorted
+        .par_chunks(sorted.len().div_ceil(slices))
+        .map(&lookup)
+        .try_reduce(HashMap::new, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            a.extend(b);
+            Ok(a)
+        })
+}
+
+/// Prefetched blobs for one branch's copy-on-write, each handed over on its
+/// last read: the CoW owns what it reads, so a blob it reads once is moved,
+/// not copied, and leaves memory as its leaf is rewritten instead of when the
+/// whole order finishes.
+struct Prefetched {
+    blobs: std::sync::Mutex<HashMap<ContentId, PrefetchSlot>>,
+}
+
+/// A prefetched blob (`None` once handed over) and the reads still expected.
+type PrefetchSlot = (Option<Vec<u8>>, usize);
+
+impl Prefetched {
+    /// `blobs` as fetched, and the CID of every read the CoW will make, one
+    /// per touched leaf (two leaves can share a CID).
+    fn new<'a>(
+        blobs: impl IntoIterator<Item = (ContentId, Vec<u8>)>,
+        reads: impl IntoIterator<Item = &'a ContentId>,
+    ) -> Self {
+        let mut expected: HashMap<&ContentId, usize> = HashMap::new();
+        for cid in reads {
+            *expected.entry(cid).or_insert(0) += 1;
+        }
+        let blobs = blobs
+            .into_iter()
+            .map(|(cid, bytes)| {
+                let reads = expected.get(&cid).copied().unwrap_or(1);
+                (cid, (Some(bytes), reads))
+            })
+            .collect();
+        Self {
+            blobs: std::sync::Mutex::new(blobs),
+        }
+    }
+
+    /// The blob at `cid`, `None` if it was not prefetched. A read past the
+    /// last expected one is an error, never `None`: for a sidecar `None`
+    /// means "this leaf has no history".
+    fn take(&self, cid: &ContentId) -> std::io::Result<Option<Vec<u8>>> {
+        let mut blobs = self
+            .blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((bytes, reads)) = blobs.get_mut(cid) else {
+            return Ok(None);
+        };
+        match (*reads, bytes.as_ref()) {
+            (_, None) => Err(std::io::Error::other(format!(
+                "{cid} read more often than prefetched"
+            ))),
+            (1, Some(_)) => {
+                *reads = 0;
+                Ok(bytes.take())
+            }
+            (_, Some(b)) => {
+                *reads -= 1;
+                Ok(Some(b.clone()))
+            }
+        }
+    }
 }
 
 enum Phase2TaskKind {
@@ -2579,13 +2686,15 @@ pub async fn incremental_index(
                             "Phase 3b: starting batched PSOT rdf:type lookup"
                         );
                         let started = Instant::now();
-                        match fluree_db_binary_index::batched_lookup_predicate_refs(
-                            store,
-                            scan_g_id,
-                            rdf_type_p_id,
-                            scan_sids,
-                            base_root.index_t,
-                        ) {
+                        match par_batched_lookup(scan_sids, |part| {
+                            fluree_db_binary_index::batched_lookup_predicate_refs(
+                                store,
+                                scan_g_id,
+                                rdf_type_p_id,
+                                part,
+                                base_root.index_t,
+                            )
+                        }) {
                             Ok(base_map) => {
                                 tracing::debug!(
                                     g_id = scan_g_id,
@@ -2667,22 +2776,63 @@ pub async fn incremental_index(
                 // let the caller fall back to rebuild. Only count subjects that existed in
                 // the base index (those drive the re-scan work); brand-new typed subjects
                 // are free. An IncrementalAbort is caught in lib.rs and routed to rebuild.
+                //
+                // The rebuild re-reads the whole index, so the cap scales with
+                // it: the configured count is the floor, and a ledger with more
+                // typed subjects aborts only once a share of them changed type.
+                // A fixed count sent every large batch of entity deletes on a
+                // large ledger (each retracts its subject's types) to a rebuild
+                // costing minutes where the re-scan costs seconds.
                 let retype_workload = changed_membership
                     .iter()
                     .filter(|key| base_subject_classes.contains_key(*key))
                     .count();
-                if retype_workload > config.incremental_retype_max_subjects {
+                // Subjects, as the workload counts them: per graph, the
+                // distinct subjects of rdf:type, or with no estimate for it the
+                // largest class (a lower bound, which only defers sooner).
+                // Summing class counts would count a subject once per type.
+                let base_typed_subjects: u64 = base_root
+                    .stats
+                    .as_ref()
+                    .and_then(|stats| stats.graphs.as_ref())
+                    .map(|graphs| {
+                        graphs
+                            .iter()
+                            .map(|graph| {
+                                graph
+                                    .properties
+                                    .iter()
+                                    .find(|p| p.p_id == rdf_type_p_id)
+                                    .map(|p| p.ndv_subjects)
+                                    .filter(|&n| n > 0)
+                                    .unwrap_or_else(|| {
+                                        graph
+                                            .classes
+                                            .iter()
+                                            .flatten()
+                                            .map(|class| class.count)
+                                            .max()
+                                            .unwrap_or(0)
+                                    })
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let retype_threshold = config.incremental_retype_max_subjects.max(
+                    usize::try_from(base_typed_subjects / RETYPE_REBUILD_SHARE)
+                        .unwrap_or(usize::MAX),
+                );
+                if retype_workload > retype_threshold {
                     tracing::warn!(
                         retype_workload,
-                        threshold = config.incremental_retype_max_subjects,
+                        threshold = retype_threshold,
                         "Phase 3b: existing-subject rdf:type changes exceed threshold; \
                          aborting incremental for full rebuild (class stats recomputed \
                          from the SPOT pass)"
                     );
                     return Err(IndexerError::IncrementalAbort(format!(
-                        "re-type workload {retype_workload} exceeds threshold {} \
-                         (deferring class-stat recompute to full rebuild)",
-                        config.incremental_retype_max_subjects
+                        "re-type workload {retype_workload} exceeds threshold {retype_threshold} \
+                         (deferring class-stat recompute to full rebuild)"
                     )));
                 }
 
@@ -2851,30 +3001,31 @@ pub async fn incremental_index(
                             changed_by_graph.entry(g_id).or_default().push(s_id);
                         }
                         for (&g_id, sids) in &changed_by_graph {
-                            let base_props =
-                                match fluree_db_binary_index::batched_lookup_subject_properties(
+                            let base_props = match par_batched_lookup(sids, |part| {
+                                fluree_db_binary_index::batched_lookup_subject_properties(
                                     store,
                                     g_id,
-                                    sids,
+                                    part,
                                     base_root.index_t,
-                                ) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        // This scan drives the datatype/language
-                                        // re-attribution that makes the now-ungated
-                                        // class-stat folds current-state-exact. A
-                                        // warn-and-continue here would silently leave
-                                        // re-typed subjects with stale per-(class,
-                                        // property) stats, so abort to a full rebuild
-                                        // (which recomputes class stats from the SPOT
-                                        // pass). Caught in lib.rs and routed to rebuild.
-                                        return Err(IndexerError::IncrementalAbort(format!(
-                                            "Phase 3b base subject-property scan failed \
+                                )
+                            }) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    // This scan drives the datatype/language
+                                    // re-attribution that makes the now-ungated
+                                    // class-stat folds current-state-exact. A
+                                    // warn-and-continue here would silently leave
+                                    // re-typed subjects with stale per-(class,
+                                    // property) stats, so abort to a full rebuild
+                                    // (which recomputes class stats from the SPOT
+                                    // pass). Caught in lib.rs and routed to rebuild.
+                                    return Err(IndexerError::IncrementalAbort(format!(
+                                        "Phase 3b base subject-property scan failed \
                                              for graph {g_id}: {e} (deferring class-stat \
                                              recompute to full rebuild)"
-                                        )));
-                                    }
-                                };
+                                    )));
+                                }
+                            };
                             for &s_id in sids {
                                 let base_cls = base_subject_classes
                                     .get(&(g_id, s_id))
@@ -3039,12 +3190,14 @@ pub async fn incremental_index(
                             }
                             // Case B: inbound edges of re-typed objects (reverse OPST). Skip
                             // edges whose subject also changed — Case A already owns those.
-                            match fluree_db_binary_index::batched_lookup_inbound_refs(
-                                store,
-                                g_id,
-                                sids,
-                                base_root.index_t,
-                            ) {
+                            match par_batched_lookup(sids, |part| {
+                                fluree_db_binary_index::batched_lookup_inbound_refs(
+                                    store,
+                                    g_id,
+                                    part,
+                                    base_root.index_t,
+                                )
+                            }) {
                                 Ok(inbound) => {
                                     for (&obj, ins) in &inbound {
                                         for &(p, subj) in ins {
@@ -3106,13 +3259,15 @@ pub async fn incremental_index(
                                 // would mis-attribute (or drop) ref-class edges; abort to a
                                 // full rebuild rather than `unwrap_or_default()` (which would
                                 // silently treat every endpoint as class-less).
-                                match fluree_db_binary_index::batched_lookup_predicate_refs(
-                                    store,
-                                    g_id,
-                                    rdf_type_p_id,
-                                    &external_sids,
-                                    base_root.index_t,
-                                ) {
+                                match par_batched_lookup(&external_sids, |part| {
+                                    fluree_db_binary_index::batched_lookup_predicate_refs(
+                                        store,
+                                        g_id,
+                                        rdf_type_p_id,
+                                        part,
+                                        base_root.index_t,
+                                    )
+                                }) {
                                     Ok(m) => m,
                                     Err(e) => {
                                         return Err(IndexerError::IncrementalAbort(format!(
@@ -5610,5 +5765,101 @@ mod warm_tests {
                 "leaflet {idx} holds the new leaf's rows"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod par_batched_lookup_tests {
+    use super::par_batched_lookup;
+    use std::collections::HashMap;
+
+    /// Answers like a batched lookup: every even id it is asked about, with
+    /// the slice it was asked in recorded, so a test can see slices formed.
+    fn lookup(part: &[u64]) -> std::io::Result<HashMap<u64, Vec<u64>>> {
+        assert!(
+            part.windows(2).all(|w| w[0] < w[1]),
+            "slices are sorted, deduped runs"
+        );
+        Ok(part
+            .iter()
+            .filter(|id| *id % 2 == 0)
+            .map(|&id| (id, vec![id * 3, part[0]]))
+            .collect())
+    }
+
+    #[test]
+    fn parallel_slices_answer_as_one_lookup_does() {
+        // Scattered, shuffled, with duplicates: as Phase 3b hands them over.
+        let mut ids: Vec<u64> = (0..50_000u64)
+            .map(|i| i.wrapping_mul(2_654_435_761) % 1_000_003)
+            .collect();
+        ids.extend_from_within(..1_000);
+
+        let got = par_batched_lookup(&ids, lookup).unwrap();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let want = lookup(&sorted).unwrap();
+
+        assert_eq!(got.len(), want.len());
+        for (id, classes) in &want {
+            assert_eq!(got[id][0], classes[0], "answer for {id}");
+        }
+        let slice_starts: std::collections::HashSet<u64> = got.values().map(|v| v[1]).collect();
+        assert!(
+            slice_starts.len() > 1,
+            "the lookup ran in more than one slice"
+        );
+    }
+
+    #[test]
+    fn a_failed_slice_fails_the_lookup() {
+        let ids: Vec<u64> = (0..10_000).collect();
+        let err = par_batched_lookup(&ids, |part| {
+            if part.contains(&7_777) {
+                Err(std::io::Error::other("leaf unreadable"))
+            } else {
+                lookup(part)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "leaf unreadable");
+    }
+}
+
+#[cfg(test)]
+mod prefetched_tests {
+    use super::Prefetched;
+    use fluree_db_core::{ContentId, ContentKind};
+
+    #[test]
+    fn each_expected_read_gets_the_blob_and_an_extra_read_fails() {
+        let shared = ContentId::new(ContentKind::IndexLeaf, b"empty leaf");
+        let once = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+        let prefetched = Prefetched::new(
+            [
+                (shared.clone(), b"empty leaf".to_vec()),
+                (once.clone(), b"leaf".to_vec()),
+            ],
+            [&shared, &once, &shared],
+        );
+        assert_eq!(
+            prefetched.take(&shared).unwrap().as_deref(),
+            Some(&b"empty leaf"[..])
+        );
+        assert_eq!(
+            prefetched.take(&once).unwrap().as_deref(),
+            Some(&b"leaf"[..])
+        );
+        assert_eq!(
+            prefetched.take(&shared).unwrap().as_deref(),
+            Some(&b"empty leaf"[..])
+        );
+        assert!(
+            prefetched.take(&shared).is_err(),
+            "a read past the expected ones must not read as an absent blob"
+        );
+        let never = ContentId::new(ContentKind::HistorySidecar, b"absent");
+        assert_eq!(prefetched.take(&never).unwrap(), None);
     }
 }

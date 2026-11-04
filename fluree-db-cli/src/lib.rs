@@ -5,6 +5,11 @@
 //! directly to build alternative interfaces (web UI, TUI, etc.) on top
 //! of the same command logic.
 
+/// `User-Agent` for the CLI's own HTTP calls. Some fronts (the AWS WAF
+/// common rule set among them) refuse requests that carry none.
+pub const USER_AGENT: &str = concat!("fluree/", env!("CARGO_PKG_VERSION"));
+
+pub mod account;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -648,9 +653,28 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         }
 
         Commands::Auth { action } => {
-            let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::auth::run(action, &fluree_dir).await
+            // `auth status` also reports the machine's fluree.ai sign-in,
+            // which needs no project.
+            match config::require_fluree_dir(config_path) {
+                Ok(fluree_dir) => commands::auth::run(action, Some(&fluree_dir)).await,
+                Err(error::CliError::NoFlureeDir)
+                    if matches!(
+                        action,
+                        cli::AuthAction::Status { remote: None }
+                            | cli::AuthAction::Token { account: true, .. }
+                    ) =>
+                {
+                    commands::auth::run(action, None).await
+                }
+                Err(e) => Err(e),
+            }
         }
+
+        Commands::Login { url, no_browser } => {
+            commands::login::run_login(Some(url), !no_browser).await
+        }
+
+        Commands::Logout => commands::login::run_logout().await,
 
         Commands::Upstream { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
@@ -993,6 +1017,15 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 None => config::find_or_global_fluree_dir(),
             };
             commands::doc::run_parse(args, fluree_dir.as_ref()).await
+        }
+        Commands::Doc {
+            action: cli::DocAction::Read(args),
+        } => {
+            let fluree_dir = match config_path {
+                Some(_) => Some(config::require_fluree_dir_or_global(config_path)?),
+                None => config::find_or_global_fluree_dir(),
+            };
+            commands::doc::run_read(args, fluree_dir.as_ref()).await
         }
         Commands::Doc { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;

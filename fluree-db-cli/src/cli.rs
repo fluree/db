@@ -1240,6 +1240,24 @@ pub enum Commands {
         action: AuthAction,
     },
 
+    /// Sign this machine in to a fluree.ai account
+    ///
+    /// Opens the account's approval page in a browser and waits while you
+    /// approve the code it shows. The sign-in is kept once per machine (not
+    /// per project) and refreshes itself; `fluree auth status` shows it.
+    Login {
+        /// Account service to sign in to
+        #[arg(long, value_name = "URL", default_value = crate::account::DEFAULT_ACCOUNT_URL)]
+        url: String,
+
+        /// Print the approval link instead of opening a browser (e.g. over SSH)
+        #[arg(long)]
+        no_browser: bool,
+    },
+
+    /// Sign this machine out of its fluree.ai account
+    Logout,
+
     /// Manage upstream tracking configuration
     Upstream {
         #[command(subcommand)]
@@ -2650,8 +2668,14 @@ pub enum DocsAction {
 pub enum OntologyAction {
     /// Write an ontology in the shape an extraction model reads well
     ///
-    /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), or
-    /// SQL DDL (.sql). Tables become classes and columns properties, labelled
+    /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), SQL
+    /// DDL (.sql), a Snowflake semantic view (.yaml), a Databricks Genie space
+    /// export (.json, with --comments for Unity Catalog's descriptions), a dbt
+    /// project's semantic models and model properties (.yml, or the project's
+    /// directory), an Apache Ossie semantic model (.yaml, .json), or a Neo4j
+    /// schema export (.json, from apoc.meta.schema() or db.schema.visualization()).
+    /// An Ossie ontology is written as it is, keeping its IRIs.
+    /// Tables become classes and columns properties, labelled
     /// in words (`employer_id` reads "employer"); foreign keys become
     /// relations; enumerated columns become a class with a catalog record per
     /// value; primary keys are left out.
@@ -2666,6 +2690,8 @@ pub enum OntologyAction {
     ///
     /// Examples:
     ///   fluree ontology from schema.sql > ontology.ttl
+    ///   fluree ontology from sales_view.yaml > ontology.ttl
+    ///   fluree ontology from ./models --base https://example.com/shop/ > ontology.ttl
     ///   fluree ontology from accounts.csv --base https://example.com/crm/ > ontology.ttl
     ///   fluree ontology from schemaorg.jsonld --seed schema:Person,schema:Organization > ontology.ttl
     #[command(verbatim_doc_comment)]
@@ -2706,7 +2732,7 @@ pub enum OntologyOutputFormat {
 
 #[derive(Args, Debug)]
 pub struct OntologyFromArgs {
-    /// The ontology to convert (`-` reads stdin)
+    /// The file to convert (`-` reads stdin), or a dbt project's directory
     #[arg(value_name = "FILE")]
     pub file: PathBuf,
 
@@ -2742,9 +2768,34 @@ pub struct OntologyFromArgs {
     #[arg(long, default_value_t = 12, value_name = "N")]
     pub enum_max: usize,
 
+    /// Unity Catalog table and column comments for a Genie export, as JSON:
+    /// {"table": {"": "table comment", "column": "column comment"}}
+    #[arg(long, value_name = "FILE")]
+    pub comments: Option<PathBuf>,
+
     /// The input's format, when its extension doesn't say
     #[arg(long, value_enum)]
-    pub input_format: Option<OntologyInputFormat>,
+    pub input_format: Option<OntologyFromFormat>,
+}
+
+/// What `fluree ontology from` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OntologyFromFormat {
+    Turtle,
+    Jsonld,
+    Csv,
+    Xlsx,
+    Sql,
+    /// A Snowflake semantic view or Cortex Analyst semantic model (YAML)
+    Snowflake,
+    /// A Databricks Genie space export (JSON)
+    Genie,
+    /// A dbt project's semantic models and model properties (YAML, or a directory of them)
+    Dbt,
+    /// An Apache Ossie semantic model or ontology (YAML or JSON)
+    Ossie,
+    /// A Neo4j schema export: apoc.meta.schema() or db.schema.visualization() (JSON)
+    Neo4j,
 }
 
 /// `fluree catalog` subcommands.
@@ -3362,7 +3413,7 @@ pub enum RemoteAction {
 
 #[derive(Subcommand)]
 pub enum AuthAction {
-    /// Show authentication status for a remote
+    /// Show this machine's fluree.ai sign-in and a remote's authentication status
     Status {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]
@@ -3396,8 +3447,20 @@ pub enum AuthAction {
     /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "account")]
         remote: Option<String>,
+
+        /// The machine's fluree.ai sign-in (`fluree login`) instead of a
+        /// remote: an access token with time left, refreshed first if it
+        /// is about to expire. Needs no project.
+        #[arg(long)]
+        account: bool,
+
+        /// With `--account`: refresh the token even if it has time left,
+        /// e.g. after the account's configuration changed and the service
+        /// answers `config_stale`.
+        #[arg(long, requires = "account")]
+        refresh: bool,
     },
 }
 
@@ -3440,11 +3503,10 @@ pub enum IcebergAction {
     /// Map an Iceberg table as a graph source
     ///
     /// Examples:
-    ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --table openflights.airlines
-    ///   fluree iceberg map my-gs --catalog-uri https://... --r2rml mappings/airlines.ttl
-    ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table
+    ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --r2rml mappings/airlines.ttl
+    ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table --r2rml mappings/table.ttl
     ///   fluree iceberg map my-gs --mode glue --region us-east-1 --r2rml mappings/sales.ttl
-    ///   fluree iceberg map my-gs --mode s3tables --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --table sales.orders
+    ///   fluree iceberg map my-gs --mode s3tables --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --r2rml mappings/sales.ttl
     #[command(verbatim_doc_comment)]
     Map(Box<IcebergMapArgs>),
 
@@ -3938,8 +4000,7 @@ pub struct IcebergMapArgs {
     pub catalog_uri: Option<String>,
 
     /// Table identifier in namespace.table format (e.g., "openflights.airlines").
-    /// Required for rest, glue and s3tables modes without --r2rml. When using
-    /// --r2rml, tables are defined in the mapping file (for glue, each
+    /// Optional: tables are defined in the --r2rml mapping file (for glue, each
     /// rr:tableName is a Glue `<database>.<table>`).
     #[arg(long)]
     pub table: Option<String>,
@@ -3977,11 +4038,11 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub table_bucket_arn: Option<String>,
 
-    /// R2RML mapping file (Turtle format). Defines how Iceberg table rows
-    /// are mapped to RDF triples. When provided, table references come from
-    /// the mapping's rr:tableName entries.
+    /// R2RML mapping file (Turtle format, required). Defines how Iceberg table
+    /// rows are mapped to RDF triples; table references come from the mapping's
+    /// rr:tableName entries.
     #[arg(long)]
-    pub r2rml: Option<PathBuf>,
+    pub r2rml: PathBuf,
 
     /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
     #[arg(long)]
@@ -4296,6 +4357,24 @@ pub enum DocAction {
     #[command(verbatim_doc_comment)]
     Parse(DocParseArgs),
 
+    /// Read one document with an extraction model and print the reading,
+    /// without writing to a ledger
+    ///
+    /// Parses the file as `fluree doc parse` does, sends its text and
+    /// structure with the ontology and catalog to the HTTP reader that
+    /// serves `--model` (`[doc.reader]`), and prints what it read: mentions
+    /// linked to catalog records, entities, and claims, each anchored to the
+    /// text's offsets. Needs no project; where there is one (or a global
+    /// config), its `[doc]` settings and caches are used. What the read was
+    /// billed goes to stderr.
+    ///
+    /// Examples:
+    ///   fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small
+    ///   fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
+    ///   fluree doc read call.vtt --ontology onto.ttl -o call.trig --format trig
+    #[command(verbatim_doc_comment)]
+    Read(DocReadArgs),
+
     /// Search a ledger's chunks by meaning (vector) or by words (full-text)
     ///
     /// Examples:
@@ -4358,6 +4437,19 @@ pub struct DocIngestArgs {
     /// `.ttl` / `.jsonld` file. Needs `[doc.llm]` (or a Fluree AI account)
     #[arg(long, value_name = "LEDGER|FILE")]
     pub ontology: Option<String>,
+
+    /// The extraction model: one a `[doc.reader]` serves (its `models`),
+    /// which reads each document whole against `--ontology` and `--catalog`,
+    /// or a language model name for `[doc.llm]`. Default: `doc.model`, else
+    /// `[doc.llm] model`
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+
+    /// What the reader may keep for the next request sharing it: `ontology`,
+    /// `catalog` (the ontology and catalog), or `off` (nothing, overriding
+    /// `doc.reader.cache`). Config: `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog|off")]
+    pub cache: Option<String>,
 
     /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
     /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
@@ -4450,6 +4542,71 @@ pub struct DocParseArgs {
     /// Neither read nor write the parse and reading caches
     #[arg(long)]
     pub no_cache: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DocReadArgs {
+    /// The document to read
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Ontology to read against: a `.ttl` / `.nt` / `.jsonld` / `.json`
+    /// file, or a ledger in the project
+    #[arg(long, value_name = "FILE|LEDGER")]
+    pub ontology: String,
+
+    /// Known entities, a catalog, to link mentions to: a file, a ledger,
+    /// or a graph source mapped over a table, optionally scoped to one
+    /// class with `#Class`. Repeatable
+    #[arg(long, visible_alias = "catalog", value_name = "FILE|LEDGER[#CLASS]", action = clap::ArgAction::Append)]
+    pub entities: Vec<String>,
+
+    /// The extraction model, one a `[doc.reader]` serves. Default: `doc.model`
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+
+    /// What the reader may keep for the next request sharing it: `ontology`,
+    /// `catalog`, or `off` (nothing, overriding `doc.reader.cache`). Config:
+    /// `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog|off")]
+    pub cache: Option<String>,
+
+    /// `jsonld` prints the reading; `turtle` the same as Turtle; `trig` the
+    /// structure graph and the reading, each in a named graph
+    #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
+    pub format: DocReadFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// IRI prefix the file name is appended to, forming the document IRI,
+    /// as `doc ingest` does
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// The document IRI in full, in place of `--base-iri` and the file name
+    #[arg(long, value_name = "IRI", conflicts_with = "base_iri")]
+    pub doc_iri: Option<String>,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Most crops the document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocReadFormat {
+    Jsonld,
+    Turtle,
+    Trig,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

@@ -504,34 +504,15 @@ impl RemoteLedgerClient {
             );
         }
 
-        let body = serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token
-        });
-
-        let resp = match self.client.post(&exchange_url).json(&body).send().await {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-
-        if !resp.status().is_success() {
+        let answer =
+            match crate::account::post_refresh(&self.client, &exchange_url, &refresh_token).await {
+                Ok(a) if a.status.is_success() => a,
+                _ => return false,
+            };
+        let Some(new_access) = answer.access_token().map(str::to_string) else {
             return false;
-        }
-
-        let resp_body: serde_json::Value = match resp.json().await {
-            Ok(b) => b,
-            Err(_) => return false,
         };
-
-        let new_access = match resp_body.get("access_token").and_then(|v| v.as_str()) {
-            Some(t) => t.to_string(),
-            None => return false,
-        };
-
-        let new_refresh = resp_body
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let new_refresh = answer.refresh_token().map(String::from);
 
         // Update the token
         *self.token.lock() = Some(new_access.clone());

@@ -2354,8 +2354,12 @@ impl crate::Fluree {
             track_fuel: true,
             ..Default::default()
         });
+        // Branch-aware: a branch's history runs through its source's commits.
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &ledger_id)
+            .await?;
         let index_result = rebuild_index_from_commits_with_tracker(
-            self.content_store(&ledger_id),
+            store,
             reindex_tracker,
             &ledger_id,
             &record,

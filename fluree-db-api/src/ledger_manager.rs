@@ -96,6 +96,17 @@ impl LedgerWriteGuard {
         self.guard.clone()
     }
 
+    /// Clone current state to stage a transaction on, after the tiered
+    /// compaction a query [`LedgerHandle::snapshot`] runs. Staging reads
+    /// novelty — a DELETE's WHERE, an upsert's prior values — and each read
+    /// searches every segment, so a writer that never queries would stage
+    /// against one segment per commit since the last index.
+    pub fn clone_state_for_staging(&mut self) -> LedgerState {
+        let tier_width = self.ledger.inner.tier_width.load(Ordering::Relaxed);
+        compact_novelty(&mut self.guard, tier_width, "staging");
+        self.guard.clone()
+    }
+
     /// Get mutable reference to current state for in-place updates
     pub fn state_mut(&mut self) -> &mut LedgerState {
         &mut self.guard
@@ -105,6 +116,27 @@ impl LedgerWriteGuard {
     pub fn replace(&mut self, new_state: LedgerState) {
         *self.guard = new_state;
     }
+}
+
+/// Merge `state`'s full novelty size classes: bounded, incremental merges that
+/// keep segment fan-out logarithmic in the commits since the index. Does
+/// nothing unless a class is full or `tier_width < 2`.
+fn compact_novelty(state: &mut LedgerState, tier_width: usize, trigger: &'static str) {
+    if tier_width < 2 || !state.novelty.needs_tier_compaction(tier_width) {
+        return;
+    }
+    let pre = state.novelty.max_segment_count();
+    let started = Instant::now();
+    let merges = Arc::make_mut(&mut state.novelty).tier_compact(tier_width);
+    tracing::debug!(
+        merges,
+        pre_max_segments = pre,
+        post_max_segments = state.novelty.max_segment_count(),
+        tier_width,
+        trigger,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "novelty tier compaction"
+    );
 }
 
 // ============================================================================
@@ -249,10 +281,10 @@ struct LedgerHandleInner {
     /// taken, if any graph has a full size class (>= this many same-class
     /// segments) novelty is tier-compacted first — bounded incremental merges
     /// that cap read fan-out without a full rewrite. `0`/`1` disables. Policy:
-    /// query nodes and long-lived servers keep the default; an insert-only
-    /// transactor (which never takes a query snapshot) is unaffected; a
-    /// latency-sensitive transactor can disable it. Never fires on the commit
-    /// path (commits use `LedgerWriteGuard`, not `snapshot`).
+    /// query nodes and long-lived servers keep the default; a latency-sensitive
+    /// transactor can disable it. Lock-held staging compacts too
+    /// ([`LedgerWriteGuard::clone_state_for_staging`]): a transaction's reads
+    /// fan out across segments as a query's do.
     tier_width: AtomicUsize,
     /// Resolved-config cache, invalidated by the novelty config-write marker.
     /// Independent of `state` (see the lock-ordering note above).
@@ -536,9 +568,10 @@ impl LedgerHandle {
         *entry = ConfigCacheEntry::default();
     }
 
-    /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
-    /// Policy hook: long-lived servers / query nodes keep the default; an
-    /// insert-only or latency-sensitive transactor can disable it.
+    /// Set the novelty tier width that query snapshots and lock-held staging
+    /// compact to (`0`/`1` disables compaction). Policy hook: long-lived
+    /// servers / query nodes keep the default; a latency-sensitive transactor
+    /// can disable it.
     pub fn set_tier_width(&self, tier_width: usize) {
         self.inner.tier_width.store(tier_width, Ordering::Relaxed);
     }
@@ -547,8 +580,7 @@ impl LedgerHandle {
     /// run bounded incremental merges (under the write lock) before serving so
     /// this and subsequent reads avoid segment fan-out — no full rewrite, no
     /// growing cliff. Idempotent and amortized over the request. Common case (no
-    /// full class) only pays a brief shared read-lock check. Never invoked on the
-    /// insert-only write path.
+    /// full class) only pays a brief shared read-lock check.
     async fn compact_if_needed(&self) {
         let tier_width = self.inner.tier_width.load(Ordering::Relaxed);
         if tier_width < 2 {
@@ -568,20 +600,8 @@ impl LedgerHandle {
             return;
         }
         let mut state = self.inner.state.write().await;
-        // Re-check: another query may have compacted between the locks.
-        if state.novelty.needs_tier_compaction(tier_width) {
-            let pre = state.novelty.max_segment_count();
-            let started = Instant::now();
-            let merges = Arc::make_mut(&mut state.novelty).tier_compact(tier_width);
-            tracing::debug!(
-                merges,
-                pre_max_segments = pre,
-                post_max_segments = state.novelty.max_segment_count(),
-                tier_width,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "novelty read-triggered tier compaction"
-            );
-        }
+        // Re-checked inside: another query may have compacted between the locks.
+        compact_novelty(&mut state, tier_width, "snapshot");
     }
 
     /// Create an ephemeral handle (for when caching is disabled)
@@ -598,7 +618,6 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
-        // Read-side compaction trigger (policy: query/maintenance path only).
         self.compact_if_needed().await;
         let state = self.inner.state.read().await;
         let binary_store = self.inner.binary_store.read().await.clone();
@@ -1318,6 +1337,9 @@ pub(crate) async fn load_and_attach_binary_store(
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
+    // Populated from all of novelty, so it covers novelty.
+    let novelty_t = state.novelty.t;
+    Arc::make_mut(&mut state.dict_novelty).mark_covered_through(novelty_t);
 
     let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
@@ -2781,8 +2803,7 @@ mod tests {
     /// The read-side tiered-compaction trigger: a long-lived handle accumulates
     /// one segment per incremental commit; taking a query `snapshot()` runs
     /// tiered compaction, keeping segment count ~logarithmic (not linear in
-    /// commits) without losing any flake. Commit-only activity (no snapshot)
-    /// would let it grow unbounded; the trigger lives only on the snapshot path.
+    /// commits) without losing any flake.
     #[tokio::test]
     async fn snapshot_triggers_tier_compaction() {
         use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
@@ -2888,6 +2909,52 @@ mod tests {
             .novelty
             .max_segment_count();
         assert_eq!(k, 12, "tier width 0 must disable read-triggered compaction");
+    }
+
+    /// A writer that never takes a snapshot: staging on the locked state
+    /// compacts as a snapshot does, and stages on the compacted novelty.
+    #[tokio::test]
+    async fn staging_on_the_locked_state_compacts_novelty() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/stage-compact:main"),
+            Novelty::new(0),
+        );
+        let handle = LedgerHandle::new(id("test/stage-compact:main"), state, None);
+        let tier_width = 4;
+        handle.set_tier_width(tier_width);
+        let rg = std::collections::HashMap::new();
+
+        let commits = 50u16;
+        for i in 0..commits {
+            let mut g = handle.lock_for_write().await;
+            let staged = g.clone_state_for_staging();
+            assert!(
+                staged.novelty.max_segment_count() <= tier_width * 4,
+                "staging must see compacted novelty; got {} segments before commit {i}",
+                staged.novelty.max_segment_count()
+            );
+            Arc::make_mut(&mut g.state_mut().novelty)
+                .apply_commit(
+                    vec![Flake::new(
+                        Sid::new(i + 1, format!("s{i}")),
+                        Sid::new(1, "p"),
+                        FlakeValue::Long(i64::from(i)),
+                        Sid::new(2, "long"),
+                        i64::from(i) + 1,
+                        true,
+                        None,
+                    )],
+                    i64::from(i) + 1,
+                    &rg,
+                )
+                .expect("apply_commit");
+        }
+        let g = handle.lock_for_write().await;
+        assert_eq!(g.state().novelty.len(), commits as usize, "no flake lost");
     }
 
     // ========================================================================

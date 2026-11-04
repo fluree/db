@@ -194,6 +194,22 @@ class Transaction:
 
 def sparql_form(sparql: str) -> str | None: ...
 def set_log_level(level: int) -> None: ...
+def read_document(
+    path: str,
+    *,
+    ontology: str,
+    catalog: list[tuple[str, str | None]],
+    model: str,
+    url: str | None = ...,
+    api_key: str | None = ...,
+    auth_header: str | None = ...,
+    cache: str | None = ...,
+    doc_iri: str | None = ...,
+    base_iri: str = ...,
+    cache_dir: str | None = ...,
+) -> dict[str, Any]: ...
+def reading_turtle(nodes: str) -> str: ...
+def reading_context() -> str: ...
 
 class Canceller:
     def __init__(self) -> None: ...
