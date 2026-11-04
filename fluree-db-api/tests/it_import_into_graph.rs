@@ -998,6 +998,64 @@ async fn a_ledger_indexed_before_links_is_reindexed_first() {
     );
 }
 
+/// One reifier with two links, the first to a term new to the ledger and the
+/// second to one it holds: the new term's handle is the higher, so the links
+/// read in the opposite order to the source's. Each is found by a lookup
+/// bound to it, as by a scan.
+#[tokio::test]
+async fn a_reifier_whose_links_reorder_reads_each_one() {
+    let dir = tempfile::tempdir().unwrap();
+    annotated_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    let source = "@prefix ex: <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+ex:r rdf:reifies <<( ex:carol ex:knows ex:dave )>> , <<( ex:alice ex:knows ex:bob )>> .
+";
+    import_into_graph(&fluree, &[("links.ttl", source)], GRAPH)
+        .await
+        .expect("graph import");
+    for label in ["spliced", "rebuilt"] {
+        if label == "rebuilt" {
+            fluree_at(dir.path())
+                .reindex(LEDGER, ReindexOptions::default())
+                .await
+                .expect("full rebuild");
+        }
+        let fluree = fluree_at(dir.path());
+        let graph = |pattern: &str| format!("WHERE {{ GRAPH <{LEDGER}#{GRAPH}> {{ {pattern} }} }}");
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?s",
+                &graph("ex:r rdf:reifies ?t BIND(SUBJECT(?t) AS ?s)")
+            )
+            .await,
+            ["ex:alice", "ex:carol"],
+            "[{label}] a scan"
+        );
+        for (term, s) in [
+            ("<<( ex:alice ex:knows ex:bob )>>", "ex:alice"),
+            ("<<( ex:carol ex:knows ex:dave )>>", "ex:carol"),
+        ] {
+            assert_eq!(
+                sparql_rows(&fluree, "?r", &graph(&format!("?r rdf:reifies {term}"))).await,
+                ["ex:r"],
+                "[{label}] by object, {s}"
+            );
+            assert_eq!(
+                sparql_rows(
+                    &fluree,
+                    "?n",
+                    &graph(&format!("ex:r rdf:reifies {term} BIND(1 AS ?n)"))
+                )
+                .await,
+                ["1"],
+                "[{label}] bound, {s}"
+            );
+        }
+    }
+}
+
 /// A ledger without a triple-term dictionary gets one from a graph import
 /// that brings annotations, and an unannotated ledger is annotated after.
 #[tokio::test]

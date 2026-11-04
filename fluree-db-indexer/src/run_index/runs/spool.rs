@@ -978,6 +978,12 @@ impl Iterator for SortedCommitReaderV2 {
 
 /// Merge source that streams V2 sorted-commit records, applies global remaps,
 /// and exposes the result through the standard V2 merge interface.
+///
+/// Subject and string remaps are monotone, so remapped records stay in the
+/// commit's order. A triple term's handle is not monotone in its ordinal (a
+/// term interned by an earlier chunk, or held by the ledger, has the lower
+/// handle), so the records that differ only in their term are re-sorted as a
+/// group before they are handed out.
 pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     reader: SortedCommitReaderV2,
     subject_remap: S,
@@ -986,6 +992,10 @@ pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     scope: GraphScope,
     term_ctx: Option<Arc<TermRemapCtx>>,
     current: Option<RunRecordV2>,
+    /// The rest of a re-sorted group, in order.
+    pending: std::collections::VecDeque<RunRecordV2>,
+    /// The remapped record that ended a group.
+    lookahead: Option<RunRecordV2>,
 }
 
 impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
@@ -1006,13 +1016,55 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
             scope,
             term_ctx,
             current: None,
+            pending: std::collections::VecDeque::new(),
+            lookahead: None,
         };
         reader.advance_to_next()?;
         Ok(reader)
     }
 
     fn advance_to_next(&mut self) -> io::Result<()> {
-        self.current = None;
+        use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
+        use fluree_db_core::o_type::{DecodeKind, OType};
+
+        if let Some(record) = self.pending.pop_front() {
+            self.current = Some(record);
+            return Ok(());
+        }
+        self.current = self.next_remapped()?;
+        let Some(first) = self.current else {
+            return Ok(());
+        };
+        if OType::from_u16(first.o_type).decode_kind() != DecodeKind::TripleTermDict {
+            return Ok(());
+        }
+        let same_group = |r: &RunRecordV2| {
+            (r.g_id, r.s_id, r.p_id, r.o_type) == (first.g_id, first.s_id, first.p_id, first.o_type)
+        };
+        let mut group = vec![first];
+        while let Some(record) = self.next_remapped()? {
+            if same_group(&record) {
+                group.push(record);
+            } else {
+                self.lookahead = Some(record);
+                break;
+            }
+        }
+        if group.len() > 1 {
+            // Stable, so a term's ops keep the commit's order. Within the
+            // group every merge order compares as this one does.
+            group.sort_by(cmp_v2_g_spot);
+            self.pending = group.into();
+            self.current = self.pending.pop_front();
+        }
+        Ok(())
+    }
+
+    /// The next record the scope accepts, remapped.
+    fn next_remapped(&mut self) -> io::Result<Option<RunRecordV2>> {
+        if let Some(record) = self.lookahead.take() {
+            return Ok(Some(record));
+        }
         while let Some(mut record) = self.reader.next_record()? {
             if !self.scope.accepts(record.g_id) {
                 continue;
@@ -1029,10 +1081,9 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
                 lang_remap,
                 self.term_ctx.as_deref(),
             )?;
-            self.current = Some(record);
-            return Ok(());
+            return Ok(Some(record));
         }
-        Ok(())
+        Ok(None)
     }
 }
 
