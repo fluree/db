@@ -5255,7 +5255,8 @@ async fn a_config_write_pushed_or_pulled_reaches_the_same_ledger_elsewhere() {
 /// A commit record forged into the blob of that config write never becomes
 /// a commit, whichever Sid it names the txn-meta graph by. Under the Sid the
 /// graph has once the commits apply, it is screened out, as a reload screens
-/// it; under the one from before, it has no route and the push is refused.
+/// it; under the one from before, it has no route and the transfer is refused
+/// before the head moves.
 #[tokio::test]
 async fn a_config_write_pushed_or_pulled_lands_no_forged_commit_record() {
     use fluree_db_api::Base64Bytes;
@@ -5282,7 +5283,8 @@ async fn a_config_write_pushed_or_pulled_lands_no_forged_commit_record() {
     for (graph, pull, lands) in [
         (after.clone(), false, true),
         (after, true, true),
-        (before, false, false),
+        (before.clone(), false, false),
+        (before, true, false),
     ] {
         let mut commit = config_write.clone();
         let mut forged = commit.flakes[0].clone();
@@ -5310,10 +5312,10 @@ async fn a_config_write_pushed_or_pulled_lands_no_forged_commit_record() {
                 );
             }
         } else {
-            assert!(taken.is_err(), "{graph}: the push must be refused");
+            assert!(taken.is_err(), "{graph}, pull: {pull}: must be refused");
             target.disconnect_ledger(ledger_id).await;
             let ledger = target.ledger(ledger_id).await.expect("reload");
-            assert_eq!(ledger.t(), 0, "{graph}");
+            assert_eq!(ledger.t(), 0, "{graph}, pull: {pull}");
         }
     }
 }

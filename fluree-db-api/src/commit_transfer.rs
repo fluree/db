@@ -1412,21 +1412,13 @@ fn apply_pushed_commits_to_state(
             .map_err(|e| PushError::Internal(format!("apply_envelope_deltas failed: {e}")))?;
     }
 
-    // Build reverse_graph now that namespace_codes and graph_registry are complete.
-    // NOTE: We fallback to an empty map on failure because commits are already
-    // persisted at this point.  An empty reverse_graph means graph-scoped flake
-    // routing in novelty will be incomplete until the server restarts and rebuilds
-    // state from the stored commits.  Propagating an error here would mislead the
-    // caller into thinking the commit failed when it was actually stored.
-    let mut reverse_graph = base.snapshot.build_reverse_graph().unwrap_or_else(|e| {
-        error!(
-            error = ?e,
-            "post-CAS build_reverse_graph failed; in-memory graph routing will be \
-             incomplete until server restart — commits are already persisted and will \
-             be correct after reload"
-        );
-        HashMap::new()
-    });
+    // Build reverse_graph now that namespace_codes and graph_registry are
+    // complete. Callers run this before the head moves, and the loader
+    // refuses a registry it cannot route, so this does too.
+    let mut reverse_graph = base
+        .snapshot
+        .build_reverse_graph()
+        .map_err(|e| PushError::Internal(format!("build_reverse_graph failed: {e}")))?;
     // Ensure txn-meta graph is always routable for commit metadata flakes.
     reverse_graph
         .entry(txn_meta_g.clone())
@@ -2523,30 +2515,9 @@ impl Fluree {
             t: final_head.t,
         };
 
-        // 7) CAS update CommitHead.
-        match self
-            .publisher()?
-            .compare_and_set_ref(
-                base_state.ledger_id(),
-                RefKind::CommitHead,
-                Some(&current_ref),
-                &new_ref,
-            )
-            .await?
-        {
-            CasResult::Updated => {}
-            CasResult::Conflict { actual } => {
-                return Err(ApiError::http(
-                    409,
-                    format!(
-                        "commit head changed during import (expected t={}, actual={:?})",
-                        current_ref.t, actual
-                    ),
-                ));
-            }
-        }
-
-        // 8) Update in-memory state (novelty + dict novelty + namespace deltas).
+        // 7) Derive the post-pull state (novelty + dict novelty + namespace
+        //    deltas) before the head moves: commits it cannot apply would
+        //    leave a head the ledger cannot load.
         let all_flakes: Vec<(i64, Vec<Flake>)> = decoded
             .iter()
             .map(|c| {
@@ -2572,6 +2543,29 @@ impl Fluree {
             &txn_meta_g,
         )
         .map_err(PushError::into_api_error)?;
+
+        // 8) CAS update CommitHead.
+        match self
+            .publisher()?
+            .compare_and_set_ref(
+                new_state.ledger_id(),
+                RefKind::CommitHead,
+                Some(&current_ref),
+                &new_ref,
+            )
+            .await?
+        {
+            CasResult::Updated => {}
+            CasResult::Conflict { actual } => {
+                return Err(ApiError::http(
+                    409,
+                    format!(
+                        "commit head changed during import (expected t={}, actual={:?})",
+                        current_ref.t, actual
+                    ),
+                ));
+            }
+        }
 
         // 9) Compute indexing status from the updated state.
         let index_config = self.default_index_config();
