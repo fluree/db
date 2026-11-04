@@ -356,7 +356,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         ledger_id,
         &record,
         fluree_db_indexer::IndexerConfig::default(),
@@ -378,7 +378,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::build_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
@@ -406,7 +406,7 @@ pub async fn build_incrementally_and_publish_index(
         "an incremental build needs a published index"
     );
     let result = fluree_db_indexer::build_incremental_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )

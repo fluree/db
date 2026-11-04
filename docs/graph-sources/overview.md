@@ -4,7 +4,7 @@ Graph sources enable querying specialized indexes and external data sources usin
 
 ## Concept
 
-A **graph source** is anything you can address by a graph name/IRI and query as part of a single execution. Some graph sources are ledger-backed RDF graphs; others are backed by different systems optimized for specific query patterns.
+A **graph source** is a non-ledger source a query can read as part of a single execution. A mapped source (Iceberg, R2RML, SQL, Delta) is a graph: you address it by its graph name/IRI, like a ledger. A search index (BM25, vector) is not a graph: a search pattern in the query names it, and the dataset is its source ledger.
 
 **Regular Ledger:**
 - Stored as RDF triples
@@ -211,6 +211,8 @@ Graph sources come in two flavors with different query models:
 - **Iceberg sources** — queried transparently using standard SPARQL/JSON-LD patterns (FROM, GRAPH, or as a direct query target)
 - **Search indexes** (BM25, Vector) — queried using the `f:graphSource` / `f:searchText` pattern
 
+An index source is **not a dataset member**. It has no triples, and its search pattern finds it by the `f:graphSource` id, so a dataset never needs it. Naming one where a graph is read (the query target, `FROM`, `FROM NAMED`, or `GRAPH`) answers **HTTP 400 `err:db/GraphSourceNotAGraph`**, which names the form to use: an `f:graphSource` pattern, with the index's source ledger as the dataset.
+
 ### Iceberg (Transparent)
 
 Iceberg graph sources are queried just like ledgers. No special syntax is needed:
@@ -273,6 +275,15 @@ SELECT ?boss FROM <warehouse-hr:main> WHERE {
 Pick that maximum depth deliberately and state it wherever the query is documented: results are silently incomplete beyond the depth you enumerate, and nothing in the response marks the truncation.
 
 For genuinely unbounded traversal, materialize the graph source into a native ledger first — see [Materializing a Native Twin](iceberg.md#materializing-a-native-twin). A native ledger evaluates all of these patterns normally.
+
+**JSON-LD subgraph selections.** A JSON-LD subgraph selection over a graph source (`"select": {"?s": ["*"]}`, an explicit property list, or `["@id"]`) is answered by rewriting it into a flat table scan and grouping the rows per subject. Some query keys have no place in that rewrite, so a subgraph selection that carries one is refused with **HTTP 400 `err:r2rml/UnsupportedPattern`** instead of being answered without it:
+
+- **A top-level `values`** — dropping it would return every subject the `where` matches, not the ones `values` names. Put the constraint in the `where` clause instead.
+- **`groupBy` / `having`** — dropping them would return subjects whose groups `having` rejects. Select the grouped variables with a flat `select` instead.
+- **A positive `depth`** on a selection that reads properties (`["*"]` or a property list) — on a native ledger `depth` expands each reference into the referenced node's own properties, but the rewrite renders a reference as its `@id` and expands none, so it would answer as `depth: 0`. Select each referenced subject with its own `"select": {"<iri>": ["*"]}` instead. `["@id"]` and `["@type"]` read no reference, so they take any `depth`.
+- **An `offset` past 10,000 subjects** — each page reads every subject before it again, so paging that deep is refused. Narrow the `where` clause instead.
+
+A flat `select` (`"select": ["?s", "?name"]`) is not a subgraph selection: it takes `values`, `groupBy` and `having` as usual.
 
 ### Patterns Must Be Inside the GRAPH Block
 

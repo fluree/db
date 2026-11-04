@@ -84,10 +84,10 @@ pub enum LiteralValue {
     /// Only ever compared against a physically-`timestamptz` column (item 10) — the
     /// frame (naive vs UTC) is matched at emit time so the micros are comparable.
     TimestampTz(i64),
-    /// Decimal: (unscaled_value, precision, scale)
+    /// Decimal: `unscaled × 10^-scale`. A literal has no precision of its own;
+    /// a comparison is evaluated against the COLUMN's `decimal(p, s)`.
     Decimal {
         unscaled: i128,
-        precision: u8,
         scale: i8,
     },
 }
@@ -106,13 +106,8 @@ impl LiteralValue {
             Self::Date(v) => TypedValue::Date(*v),
             Self::Timestamp(v) => TypedValue::Timestamp(*v),
             Self::TimestampTz(v) => TypedValue::TimestampTz(*v),
-            Self::Decimal {
-                unscaled,
-                precision,
-                scale,
-            } => TypedValue::Decimal {
+            Self::Decimal { unscaled, scale } => TypedValue::Decimal {
                 unscaled: *unscaled,
-                precision: *precision,
                 scale: *scale,
             },
         }
@@ -132,13 +127,8 @@ impl LiteralValue {
             TypedValue::Timestamp(v) => Self::Timestamp(*v),
             TypedValue::TimestampTz(v) => Self::TimestampTz(*v),
             TypedValue::Uuid(v) => Self::Bytes(v.to_vec()),
-            TypedValue::Decimal {
-                unscaled,
-                precision,
-                scale,
-            } => Self::Decimal {
+            TypedValue::Decimal { unscaled, scale } => Self::Decimal {
                 unscaled: *unscaled,
-                precision: *precision,
                 scale: *scale,
             },
         }
@@ -158,9 +148,7 @@ impl std::fmt::Display for LiteralValue {
             Self::Date(v) => write!(f, "date({v})"),
             Self::Timestamp(v) => write!(f, "ts({v})"),
             Self::TimestampTz(v) => write!(f, "tstz({v})"),
-            Self::Decimal {
-                unscaled, scale, ..
-            } => {
+            Self::Decimal { unscaled, scale } => {
                 write!(f, "decimal({unscaled}, {scale})")
             }
         }

@@ -72,6 +72,7 @@ fn monotonic_secs() -> u64 {
 pub struct LedgerWriteGuard {
     ledger: LedgerHandle,
     guard: tokio::sync::OwnedRwLockWriteGuard<LedgerState>,
+    _writer: tokio::sync::OwnedMutexGuard<()>,
     acquired: Instant,
 }
 
@@ -96,6 +97,17 @@ impl LedgerWriteGuard {
         self.guard.clone()
     }
 
+    /// Clone current state to stage a transaction on, after the tiered
+    /// compaction a query [`LedgerHandle::snapshot`] runs. Staging reads
+    /// novelty — a DELETE's WHERE, an upsert's prior values — and each read
+    /// searches every segment, so a writer that never queries would stage
+    /// against one segment per commit since the last index.
+    pub fn clone_state_for_staging(&mut self) -> LedgerState {
+        let tier_width = self.ledger.inner.tier_width.load(Ordering::Relaxed);
+        compact_novelty(&mut self.guard, tier_width, "staging");
+        self.guard.clone()
+    }
+
     /// Get mutable reference to current state for in-place updates
     pub fn state_mut(&mut self) -> &mut LedgerState {
         &mut self.guard
@@ -105,6 +117,46 @@ impl LedgerWriteGuard {
     pub fn replace(&mut self, new_state: LedgerState) {
         *self.guard = new_state;
     }
+}
+
+/// Holds a ledger's writers off while its state stays readable; see
+/// [`LedgerHandle::exclude_writers`].
+pub struct WriterExclusion {
+    ledger: LedgerHandle,
+    writer: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl WriterExclusion {
+    /// Take the state lock as well, to install a new state.
+    pub async fn lock_state(self) -> LedgerWriteGuard {
+        LedgerWriteGuard {
+            guard: Arc::clone(&self.ledger.inner.state).write_owned().await,
+            ledger: self.ledger,
+            _writer: self.writer,
+            acquired: Instant::now(),
+        }
+    }
+}
+
+/// Merge `state`'s full novelty size classes: bounded, incremental merges that
+/// keep segment fan-out logarithmic in the commits since the index. Does
+/// nothing unless a class is full or `tier_width < 2`.
+fn compact_novelty(state: &mut LedgerState, tier_width: usize, trigger: &'static str) {
+    if tier_width < 2 || !state.novelty.needs_tier_compaction(tier_width) {
+        return;
+    }
+    let pre = state.novelty.max_segment_count();
+    let started = Instant::now();
+    let merges = Arc::make_mut(&mut state.novelty).tier_compact(tier_width);
+    tracing::debug!(
+        merges,
+        pre_max_segments = pre,
+        post_max_segments = state.novelty.max_segment_count(),
+        tier_width,
+        trigger,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "novelty tier compaction"
+    );
 }
 
 // ============================================================================
@@ -222,6 +274,8 @@ async fn warn_if_shapes_unenforced(
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
 ///
+/// `writer` is taken before `state`, and only by writers.
+///
 /// `config_cache` has its own lock and is never held while acquiring `state`;
 /// `reload`'s swap takes it briefly *while holding* `state`, so the one
 /// permitted order is `state` → `config_cache`, never the reverse.
@@ -236,6 +290,11 @@ struct LedgerHandleInner {
     /// callers don't have to keep a borrow of the handle alive to use the
     /// guard.
     state: Arc<RwLock<LedgerState>>,
+    /// Held by whoever writes the ledger. A transaction holds it with
+    /// `state`; an operation that builds a new head outside the transaction
+    /// path holds it alone until it installs that head, so queries go on
+    /// reading `state` meanwhile ([`LedgerHandle::exclude_writers`]).
+    writer: Arc<tokio::sync::Mutex<()>>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: LedgerId,
     /// Last access time (monotonic secs since process start)
@@ -249,10 +308,10 @@ struct LedgerHandleInner {
     /// taken, if any graph has a full size class (>= this many same-class
     /// segments) novelty is tier-compacted first — bounded incremental merges
     /// that cap read fan-out without a full rewrite. `0`/`1` disables. Policy:
-    /// query nodes and long-lived servers keep the default; an insert-only
-    /// transactor (which never takes a query snapshot) is unaffected; a
-    /// latency-sensitive transactor can disable it. Never fires on the commit
-    /// path (commits use `LedgerWriteGuard`, not `snapshot`).
+    /// query nodes and long-lived servers keep the default; a latency-sensitive
+    /// transactor can disable it. Lock-held staging compacts too
+    /// ([`LedgerWriteGuard::clone_state_for_staging`]): a transaction's reads
+    /// fan out across segments as a query's do.
     tier_width: AtomicUsize,
     /// Resolved-config cache, invalidated by the novelty config-write marker.
     /// Independent of `state` (see the lock-ordering note above).
@@ -271,10 +330,14 @@ struct LedgerHandleInner {
     /// staging and before taking the lock (see
     /// [`LedgerHandle::gate_next_optimistic_stage_for_test`]).
     stage_gate: parking_lot::Mutex<Option<StageGate>>,
+    /// Test hook: the next [`LedgerHandle::exclude_writers`] parks here once
+    /// it holds the writers (see
+    /// [`LedgerHandle::gate_next_writer_exclusion_for_test`]).
+    exclusion_gate: parking_lot::Mutex<Option<StageGate>>,
 }
 
-/// A parked optimistic stage: tells the test it is parked, then waits to be
-/// released.
+/// A parked optimistic stage or writer exclusion: tells the test it is
+/// parked, then waits to be released.
 pub(crate) struct StageGate {
     parked: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::watch::Receiver<bool>,
@@ -407,6 +470,7 @@ impl LedgerHandle {
         Self {
             inner: Arc::new(LedgerHandleInner {
                 state: Arc::new(RwLock::new(state)),
+                writer: Arc::new(tokio::sync::Mutex::new(())),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
@@ -416,6 +480,7 @@ impl LedgerHandle {
                 committed_t: std::sync::atomic::AtomicI64::new(0),
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
+                exclusion_gate: parking_lot::Mutex::new(None),
             }),
         }
     }
@@ -443,6 +508,25 @@ impl LedgerHandle {
 
     pub(crate) fn take_stage_gate(&self) -> Option<StageGate> {
         self.inner.stage_gate.lock().take()
+    }
+
+    /// Park the next [`Self::exclude_writers`] on this handle once it holds
+    /// the writers, so a test can read the ledger meanwhile. Same channels and
+    /// one-shot use as [`Self::gate_next_optimistic_stage_for_test`].
+    #[doc(hidden)]
+    pub fn gate_next_writer_exclusion_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        *self.inner.exclusion_gate.lock() = Some(StageGate {
+            parked: parked_tx,
+            release: release_rx,
+        });
+        (parked_rx, release_tx)
     }
 
     /// How writes through this handle reached their commits so far.
@@ -536,9 +620,10 @@ impl LedgerHandle {
         *entry = ConfigCacheEntry::default();
     }
 
-    /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
-    /// Policy hook: long-lived servers / query nodes keep the default; an
-    /// insert-only or latency-sensitive transactor can disable it.
+    /// Set the novelty tier width that query snapshots and lock-held staging
+    /// compact to (`0`/`1` disables compaction). Policy hook: long-lived
+    /// servers / query nodes keep the default; a latency-sensitive transactor
+    /// can disable it.
     pub fn set_tier_width(&self, tier_width: usize) {
         self.inner.tier_width.store(tier_width, Ordering::Relaxed);
     }
@@ -547,8 +632,7 @@ impl LedgerHandle {
     /// run bounded incremental merges (under the write lock) before serving so
     /// this and subsequent reads avoid segment fan-out — no full rewrite, no
     /// growing cliff. Idempotent and amortized over the request. Common case (no
-    /// full class) only pays a brief shared read-lock check. Never invoked on the
-    /// insert-only write path.
+    /// full class) only pays a brief shared read-lock check.
     async fn compact_if_needed(&self) {
         let tier_width = self.inner.tier_width.load(Ordering::Relaxed);
         if tier_width < 2 {
@@ -568,20 +652,8 @@ impl LedgerHandle {
             return;
         }
         let mut state = self.inner.state.write().await;
-        // Re-check: another query may have compacted between the locks.
-        if state.novelty.needs_tier_compaction(tier_width) {
-            let pre = state.novelty.max_segment_count();
-            let started = Instant::now();
-            let merges = Arc::make_mut(&mut state.novelty).tier_compact(tier_width);
-            tracing::debug!(
-                merges,
-                pre_max_segments = pre,
-                post_max_segments = state.novelty.max_segment_count(),
-                tier_width,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "novelty read-triggered tier compaction"
-            );
-        }
+        // Re-checked inside: another query may have compacted between the locks.
+        compact_novelty(&mut state, tier_width, "snapshot");
     }
 
     /// Create an ephemeral handle (for when caching is disabled)
@@ -598,7 +670,6 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
-        // Read-side compaction trigger (policy: query/maintenance path only).
         self.compact_if_needed().await;
         let state = self.inner.state.read().await;
         let binary_store = self.inner.binary_store.read().await.clone();
@@ -630,10 +701,29 @@ impl LedgerHandle {
     /// Acquire exclusive access for transaction (hold lock for stage+commit)
     pub async fn lock_for_write(&self) -> LedgerWriteGuard {
         self.touch();
+        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
         LedgerWriteGuard {
             ledger: self.clone(),
             guard: Arc::clone(&self.inner.state).write_owned().await,
+            _writer: writer,
             acquired: Instant::now(),
+        }
+    }
+
+    /// Hold off this ledger's writers without blocking its readers:
+    /// transactions wait, queries go on against the current state. For an
+    /// operation that builds a new head outside the transaction path and
+    /// installs it at the end ([`WriterExclusion::lock_state`]).
+    pub async fn exclude_writers(&self) -> WriterExclusion {
+        self.touch();
+        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
+        let gate = self.inner.exclusion_gate.lock().take();
+        if let Some(gate) = gate {
+            gate.park().await;
+        }
+        WriterExclusion {
+            ledger: self.clone(),
+            writer,
         }
     }
 
@@ -672,7 +762,7 @@ impl LedgerHandle {
 
     /// Check if currently locked (for eviction - skip if in use)
     pub fn is_locked(&self) -> bool {
-        self.inner.state.try_write().is_err()
+        self.inner.writer.try_lock().is_err() || self.inner.state.try_write().is_err()
     }
 
     /// Get current index_t (brief lock to read)
@@ -800,6 +890,7 @@ impl LedgerHandle {
             annotation_index: root.annotation_index.clone(),
             had_annotation_arena: root.had_annotation_arena,
             has_list_meta: root.has_list_meta,
+            index_root_id: Some(index_id.clone()),
         };
         tracing::Span::current().record("index_t", meta.t);
         let db = LedgerSnapshot::new_meta(meta)
@@ -1287,7 +1378,7 @@ pub(crate) async fn load_and_attach_binary_store(
         snap.subject_watermarks = root.subject_watermarks;
         snap.string_watermark = root.string_watermark;
         if root.stats.is_some() && snap.stats.is_none() {
-            snap.stats = root.stats.map(Arc::new);
+            snap.set_index_root_stats(root.stats.map(Arc::new), index_cid.clone());
             tracing::debug!("loaded stats from FIR6 root");
         }
         if root.schema.is_some() && snap.schema.is_none() {
@@ -1317,6 +1408,9 @@ pub(crate) async fn load_and_attach_binary_store(
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
+    // Populated from all of novelty, so it covers novelty.
+    let novelty_t = state.novelty.t;
+    Arc::make_mut(&mut state.dict_novelty).mark_covered_through(novelty_t);
 
     let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
@@ -2780,8 +2874,7 @@ mod tests {
     /// The read-side tiered-compaction trigger: a long-lived handle accumulates
     /// one segment per incremental commit; taking a query `snapshot()` runs
     /// tiered compaction, keeping segment count ~logarithmic (not linear in
-    /// commits) without losing any flake. Commit-only activity (no snapshot)
-    /// would let it grow unbounded; the trigger lives only on the snapshot path.
+    /// commits) without losing any flake.
     #[tokio::test]
     async fn snapshot_triggers_tier_compaction() {
         use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
@@ -2887,6 +2980,52 @@ mod tests {
             .novelty
             .max_segment_count();
         assert_eq!(k, 12, "tier width 0 must disable read-triggered compaction");
+    }
+
+    /// A writer that never takes a snapshot: staging on the locked state
+    /// compacts as a snapshot does, and stages on the compacted novelty.
+    #[tokio::test]
+    async fn staging_on_the_locked_state_compacts_novelty() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/stage-compact:main"),
+            Novelty::new(0),
+        );
+        let handle = LedgerHandle::new(id("test/stage-compact:main"), state, None);
+        let tier_width = 4;
+        handle.set_tier_width(tier_width);
+        let rg = std::collections::HashMap::new();
+
+        let commits = 50u16;
+        for i in 0..commits {
+            let mut g = handle.lock_for_write().await;
+            let staged = g.clone_state_for_staging();
+            assert!(
+                staged.novelty.max_segment_count() <= tier_width * 4,
+                "staging must see compacted novelty; got {} segments before commit {i}",
+                staged.novelty.max_segment_count()
+            );
+            Arc::make_mut(&mut g.state_mut().novelty)
+                .apply_commit(
+                    vec![Flake::new(
+                        Sid::new(i + 1, format!("s{i}")),
+                        Sid::new(1, "p"),
+                        FlakeValue::Long(i64::from(i)),
+                        Sid::new(2, "long"),
+                        i64::from(i) + 1,
+                        true,
+                        None,
+                    )],
+                    i64::from(i) + 1,
+                    &rg,
+                )
+                .expect("apply_commit");
+        }
+        let g = handle.lock_for_write().await;
+        assert_eq!(g.state().novelty.len(), commits as usize, "no flake lost");
     }
 
     // ========================================================================

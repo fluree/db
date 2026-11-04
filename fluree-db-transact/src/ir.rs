@@ -203,13 +203,6 @@ pub struct Txn {
     /// leave this empty.
     pub namespace_delta: std::collections::HashMap<u16, String>,
 
-    /// The transaction reads and writes lists as RDF does, as a SPARQL UPDATE
-    /// does: a list is its owner's edge to a head cell and a chain of
-    /// `rdf:first`/`rdf:rest` cells, not values of its property
-    /// (`fluree_db_query::list_view`). JSON-LD and Cypher writes keep
-    /// Fluree's view, where the members are the values.
-    pub rdf_list_view: bool,
-
     /// SPARQL graph-management directive (CLEAR/DROP/COPY/MOVE/ADD).
     ///
     /// When `Some`, this transaction retracts and/or re-homes whole graphs by
@@ -319,7 +312,6 @@ impl Txn {
             txn_meta: Vec::new(),
             write_graphs: BTreeSet::new(),
             namespace_delta: std::collections::HashMap::new(),
-            rdf_list_view: false,
             graph_mgmt: None,
             sync_graph: None,
         }
@@ -829,6 +821,17 @@ impl InlineValues {
     }
 }
 
+/// A Cypher relationship variable's `DELETE`: the delete template that
+/// retracts the edge the relationship was matched on (see
+/// [`TxnOpts::relationship_deletes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipDelete {
+    /// The relationship variable, which a refusal names.
+    pub var: String,
+    /// The template's index in [`Txn::delete_templates`].
+    pub template: usize,
+}
+
 /// Transaction options
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TxnOpts {
@@ -884,6 +887,19 @@ pub struct TxnOpts {
     /// (camelCase) when `None` here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
+
+    /// The delete templates of a Cypher `DELETE r` (or several), each of which
+    /// retracts the edge relationship `r` was matched on. An edge one of them
+    /// retracts must carry at most one relationship: retracting the edge takes
+    /// every relationship on it with it (the `f:reifies*` cascade), so staging
+    /// refuses an edge that carries others, naming the variable. Deleting one
+    /// of several parallel relationships isn't supported.
+    ///
+    /// An edge another delete template retracts too is exempt: that is a
+    /// `DETACH DELETE` of an endpoint, which takes every relationship on the
+    /// node. Edges no relationship's DELETE retracts aren't checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_deletes: Option<Vec<RelationshipDelete>>,
 
     /// Skolemization id override for blank-node minting in this transaction.
     ///

@@ -568,6 +568,16 @@ impl DepsWalker {
         {
             self.flag("`depth` auto-expands references into other subjects");
         }
+        match query
+            .as_object()
+            .map(crate::parse::options::parse_reasoning)
+        {
+            Some(Ok(Some(modes))) if modes.has_any_enabled() || modes.has_rules() => {
+                self.flag("reasoning infers facts from properties the patterns do not name");
+            }
+            Some(Err(e)) => self.flag(format!("its reasoning options do not parse: {e}")),
+            _ => {}
+        }
     }
 
     /// Returns the document variable when the select names one.
@@ -2494,6 +2504,30 @@ mod tests {
             .unwrap()
             .insert("depth".into(), serde_json::json!(0));
         assert!(analyze(q).is_complete(), "depth 0 expands nothing");
+    }
+
+    #[test]
+    fn analyze_flags_reasoning() {
+        let base = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Doc"}],
+            "select": {"?x": ["@id", "ex:bio"]}
+        });
+        let with = |key: &str, value: serde_json::Value| {
+            let mut q = base.clone();
+            q.as_object_mut().unwrap().insert(key.to_string(), value);
+            analyze(q)
+        };
+        for (key, value) in [
+            ("reasoning", serde_json::json!("owl2rl")),
+            ("reasoning", serde_json::json!(["rdfs"])),
+            ("opts", serde_json::json!({"reasoning": "rdfs"})),
+        ] {
+            let a = with(key, value.clone());
+            assert!(reason(&a).contains("reasoning"), "{key} {value}");
+        }
+        assert!(with("reasoning", serde_json::json!("none")).is_complete());
+        assert!(analyze(base).is_complete());
     }
 
     #[test]

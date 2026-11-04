@@ -10,6 +10,7 @@ pub mod context_cmd;
 pub mod create;
 pub mod delta;
 pub mod doc;
+pub mod doc_reader;
 pub mod doc_sources;
 pub mod docs;
 pub mod drop;
@@ -28,6 +29,7 @@ pub mod insert;
 pub mod list;
 pub mod load;
 pub mod log;
+pub mod login;
 pub mod manifest;
 /// `fluree materialize` — build a native twin from a virtual graph source.
 /// The module self-gates on the `iceberg` feature (empty without it).
@@ -44,6 +46,8 @@ pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod show;
+#[cfg(feature = "iceberg")]
+pub mod source_auth;
 pub mod sql;
 pub mod sweep;
 pub mod sync;
