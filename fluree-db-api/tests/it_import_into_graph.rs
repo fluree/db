@@ -297,8 +297,19 @@ async fn import_fills_a_new_graph_of_an_indexed_ledger() {
 }
 
 async fn sparql_cells(fluree: &Fluree, body: &str) -> Vec<String> {
-    let query =
-        format!("PREFIX ex: <{EX}> SELECT * FROM <{LEDGER}> FROM NAMED <{LEDGER}#{GRAPH}> {body}");
+    sparql_rows(fluree, "*", body).await
+}
+
+/// [`sparql_cells`] for the variables `projection` names, in that order.
+async fn sparql_rows(fluree: &Fluree, projection: &str, body: &str) -> Vec<String> {
+    let query = format!(
+        "PREFIX ex: <{EX}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+         SELECT {projection} FROM <{LEDGER}> FROM NAMED <{LEDGER}#{GRAPH}> {body}"
+    );
+    let vars: Vec<&str> = projection
+        .split_whitespace()
+        .filter_map(|v| v.strip_prefix('?'))
+        .collect();
     let rows = fluree
         .query_from()
         .sparql(&query)
@@ -308,12 +319,16 @@ async fn sparql_cells(fluree: &Fluree, body: &str) -> Vec<String> {
     let mut cells: Vec<String> = support::normalize_sparql_bindings(&rows)
         .iter()
         .map(|row| {
-            row.as_object()
-                .expect("binding")
-                .values()
-                .map(|v| v["value"].as_str().unwrap_or_default().replace(EX, "ex:"))
-                .collect::<Vec<_>>()
-                .join(" ")
+            let row = row.as_object().expect("binding");
+            let cell = |v: &Value| v["value"].as_str().unwrap_or_default().replace(EX, "ex:");
+            match vars.as_slice() {
+                [] => row.values().map(cell).collect::<Vec<_>>().join(" "),
+                vars => vars
+                    .iter()
+                    .map(|v| row.get(*v).map(cell).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }
         })
         .collect();
     cells.sort();
@@ -626,10 +641,6 @@ const CLAIMS: &str = "@prefix ex: <http://example.org/> .
 ex:alice ex:knows ex:bob {| ex:confidence 0.9 |} .
 ";
 
-const MORE_CLAIMS: &str = "@prefix ex: <http://example.org/> .
-ex:erin ex:knows ex:frank {| ex:confidence 0.5 |} .
-";
-
 /// `(subject, object, confidence)` for every annotated `ex:knows` edge in
 /// the default graph, or in `graph`.
 async fn claims(fluree: &Fluree, graph: Option<&str>) -> Vec<String> {
@@ -661,15 +672,24 @@ async fn claims(fluree: &Fluree, graph: Option<&str>) -> Vec<String> {
     out
 }
 
-/// An annotated ledger takes a graph without annotations, and its own
-/// annotations read as before. A graph that carries annotations is refused:
-/// the splice merges no triple-term dictionary yet.
-#[tokio::test]
-async fn an_annotated_ledger_takes_only_an_unannotated_graph() {
-    let dir = tempfile::tempdir().unwrap();
-    let fluree = fluree_at(dir.path());
+/// [`CLAIMS`]'s edge annotated again, and an edge the ledger never reified.
+const GRAPH_CLAIMS: &str = "@prefix ex: <http://example.org/> .
+ex:alice ex:knows ex:bob {| ex:confidence 0.7 |} .
+ex:carol ex:knows ex:dave {| ex:confidence 0.1 |} .
+";
+
+/// Triple terms as values: [`CLAIMS`]'s edge, a term nesting it, and one
+/// with a language-tagged object.
+const GRAPH_TERMS: &str = "@prefix ex: <http://example.org/> .
+ex:doc ex:mentions <<( ex:alice ex:knows ex:bob )>> .
+ex:doc ex:cites <<( ex:erin ex:says <<( ex:alice ex:knows ex:bob )>> )>> .
+ex:doc ex:quotes <<( ex:erin ex:says \"chat\"@fr )>> .
+";
+
+/// A ledger whose default graph holds [`CLAIMS`], bulk-imported and indexed.
+async fn annotated_ledger(dir: &Path) {
     let source = source_dir(&[("claims.ttl", CLAIMS)]);
-    fluree
+    fluree_at(dir)
         .create(LEDGER)
         .import(source.path())
         .threads(1)
@@ -677,24 +697,343 @@ async fn an_annotated_ledger_takes_only_an_unannotated_graph() {
         .execute()
         .await
         .expect("annotated ledger");
+}
+
+/// Distinct terms in the published index's triple-term dictionary.
+async fn term_count(fluree: &Fluree) -> u64 {
+    let record = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .unwrap()
+        .expect("ledger");
+    let bytes = fluree
+        .content_store(&record.storage_namespace())
+        .get(&record.index_head_id.expect("index"))
+        .await
+        .unwrap();
+    fluree_db_binary_index::IndexRoot::decode(&bytes)
+        .unwrap()
+        .term_dict
+        .map_or(0, |terms| terms.term_count)
+}
+
+/// The live links on `ex:knows` edges the ledger's stats count.
+async fn knows_links(fluree: &Fluree) -> Option<u64> {
+    let ledger = fluree.ledger(LEDGER).await.unwrap();
+    let links = ledger.snapshot.stats.as_ref()?.links.clone()?;
+    Some(
+        links
+            .iter()
+            .filter(|l| l.sid.1 == "knows")
+            .map(|l| l.count)
+            .sum(),
+    )
+}
+
+/// A graph's annotations import with it. An edge the ledger already reifies
+/// keeps its term, so a join on the term crosses the graphs; an edge new to
+/// the ledger adds one. The same holds from the root the import spliced and
+/// from a rebuild of the ledger's commits.
+#[tokio::test]
+async fn annotations_import_into_a_graph_and_keep_the_ledgers_terms() {
+    let dir = tempfile::tempdir().unwrap();
+    annotated_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
     let base_claims = vec!["ex:alice ex:bob 0.9".to_string()];
     assert_eq!(claims(&fluree, None).await, base_claims);
+    assert_eq!(term_count(&fluree).await, 1);
 
-    let plain = import_into_graph(&fluree, &[("a.ttl", SOURCE_A)], GRAPH)
+    let files = [("claims.ttl", GRAPH_CLAIMS)];
+    let result = import_into_graph(&fluree, &files, GRAPH)
         .await
-        .expect("plain graph import");
-    assert!(!plain.has_annotations);
-    let fluree = fluree_at(dir.path());
-    assert_eq!(claims(&fluree, None).await, base_claims);
+        .expect("annotated graph import");
+    assert!(result.has_annotations);
+    let imported = |statements: Vec<String>| -> Vec<String> {
+        statements
+            .into_iter()
+            .filter(|s| s.starts_with("g: "))
+            .collect()
+    };
+    let reference = reference(&files).await;
 
+    for label in ["spliced", "rebuilt"] {
+        if label == "rebuilt" {
+            fluree_at(dir.path())
+                .reindex(LEDGER, ReindexOptions::default())
+                .await
+                .expect("full rebuild");
+        }
+        let fluree = fluree_at(dir.path());
+        assert_eq!(term_count(&fluree).await, 2, "[{label}] one new term");
+        assert_eq!(
+            knows_links(&fluree).await,
+            Some(3),
+            "[{label}] the ledger's link and the graph's two"
+        );
+        assert_eq!(claims(&fluree, None).await, base_claims, "[{label}]");
+        assert_eq!(
+            claims(&fluree, Some(GRAPH)).await,
+            ["ex:alice ex:bob 0.7", "ex:carol ex:dave 0.1"],
+            "[{label}]"
+        );
+        assert_eq!(imported(statements(&fluree).await), reference, "[{label}]");
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?c1 ?c2",
+                &format!(
+                    "WHERE {{ ?r1 rdf:reifies ?t ; ex:confidence ?c1 . \
+                     GRAPH <{LEDGER}#{GRAPH}> {{ ?r2 rdf:reifies ?t ; ex:confidence ?c2 }} }}"
+                ),
+            )
+            .await,
+            ["0.9 0.7"],
+            "[{label}] the shared edge is one term"
+        );
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?c",
+                &format!(
+                    "WHERE {{ {{ ?r rdf:reifies <<( ex:alice ex:knows ex:bob )>> ; \
+                     ex:confidence ?c }} UNION {{ GRAPH <{LEDGER}#{GRAPH}> {{ ?r rdf:reifies \
+                     <<( ex:alice ex:knows ex:bob )>> ; ex:confidence ?c }} }} }}"
+                ),
+            )
+            .await,
+            ["0.7", "0.9"],
+            "[{label}] a constant term finds both graphs' links"
+        );
+    }
+}
+
+/// Triple terms import as values into a graph, nested ones and one the
+/// ledger already holds included, and read as they do after a fresh import.
+#[tokio::test]
+async fn triple_term_values_import_into_a_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    annotated_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    let files = [("terms.ttl", GRAPH_TERMS)];
+    import_into_graph(&fluree, &files, GRAPH)
+        .await
+        .expect("graph import");
+    let reference = reference(&files).await;
+
+    for label in ["spliced", "rebuilt"] {
+        if label == "rebuilt" {
+            fluree_at(dir.path())
+                .reindex(LEDGER, ReindexOptions::default())
+                .await
+                .expect("full rebuild");
+        }
+        let fluree = fluree_at(dir.path());
+        // The ledger's term, the nesting one, and the tagged one.
+        assert_eq!(term_count(&fluree).await, 3, "[{label}]");
+        let imported: Vec<String> = statements(&fluree)
+            .await
+            .into_iter()
+            .filter(|s| s.starts_with("g: "))
+            .collect();
+        assert_eq!(imported, reference, "[{label}]");
+        let graph = |pattern: &str| format!("WHERE {{ GRAPH <{LEDGER}#{GRAPH}> {{ {pattern} }} }}");
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?d",
+                &graph("?d ex:mentions <<( ex:alice ex:knows ex:bob )>>")
+            )
+            .await,
+            ["ex:doc"],
+            "[{label}] a constant term matches"
+        );
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?who ?o",
+                &graph("ex:doc ex:cites <<( ?who ex:says <<( ex:alice ex:knows ?o )>> )>>")
+            )
+            .await,
+            ["ex:erin ex:bob"],
+            "[{label}] a nested term"
+        );
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?o",
+                &graph("ex:doc ex:quotes ?t BIND(OBJECT(?t) AS ?o) FILTER(LANG(?o) = \"fr\")")
+            )
+            .await,
+            ["chat"],
+            "[{label}] the term keeps its tag"
+        );
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?c",
+                &format!(
+                    "WHERE {{ ?r rdf:reifies ?t ; ex:confidence ?c . \
+                     GRAPH <{LEDGER}#{GRAPH}> {{ ex:doc ex:mentions ?t }} }}"
+                ),
+            )
+            .await,
+            ["0.9"],
+            "[{label}] the mention is the default graph's reified edge"
+        );
+    }
+}
+
+/// Annotations written after a graph import index incrementally over the
+/// spliced dictionary: an edge it holds keeps its term, a new one adds one,
+/// and a rebuild from the commits agrees.
+#[tokio::test]
+async fn later_annotations_index_incrementally_over_the_spliced_terms() {
+    let dir = tempfile::tempdir().unwrap();
+    annotated_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    import_into_graph(&fluree, &[("claims.ttl", GRAPH_CLAIMS)], GRAPH)
+        .await
+        .expect("graph import");
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH <{GRAPH}> {{ \
+             ex:alice ex:knows ex:bob {{| ex:confidence 0.5 |}} . \
+             ex:erin ex:knows ex:frank {{| ex:confidence 0.3 |}} }} }}"
+        ))
+        .commit()
+        .await
+        .expect("annotate");
+    support::build_incrementally_and_publish_index(&fluree, LEDGER).await;
+
+    let want = [
+        "ex:alice ex:bob 0.5",
+        "ex:alice ex:bob 0.7",
+        "ex:carol ex:dave 0.1",
+        "ex:erin ex:frank 0.3",
+    ];
+    for label in ["incremental", "rebuilt"] {
+        if label == "rebuilt" {
+            fluree_at(dir.path())
+                .reindex(LEDGER, ReindexOptions::default())
+                .await
+                .expect("full rebuild");
+        }
+        let fluree = fluree_at(dir.path());
+        assert_eq!(term_count(&fluree).await, 3, "[{label}]");
+        assert_eq!(claims(&fluree, Some(GRAPH)).await, want, "[{label}]");
+        assert_eq!(
+            sparql_rows(
+                &fluree,
+                "?c",
+                &format!(
+                    "WHERE {{ GRAPH <{LEDGER}#{GRAPH}> {{ ?r rdf:reifies \
+                     <<( ex:alice ex:knows ex:bob )>> ; ex:confidence ?c }} }}"
+                ),
+            )
+            .await,
+            ["0.5", "0.7"],
+            "[{label}]"
+        );
+    }
+}
+
+/// A ledger whose index holds annotations from before links has no term
+/// dictionary to extend: the import is refused before it reads the source,
+/// and goes through once a reindex writes the links.
+#[tokio::test]
+async fn a_ledger_indexed_before_links_is_reindexed_first() {
+    let dir = tempfile::tempdir().unwrap();
+    annotated_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    let record = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .unwrap()
+        .expect("ledger");
+    let cs = fluree.content_store(&record.storage_namespace());
+    let bytes = cs
+        .get(record.index_head_id.as_ref().expect("index"))
+        .await
+        .unwrap();
+    let mut root = fluree_db_binary_index::IndexRoot::decode(&bytes).unwrap();
+    assert!(root.has_annotations && root.term_dict.is_some());
+    root.term_dict = None;
+    let cid = cs
+        .put(fluree_db_core::ContentKind::IndexRoot, &root.encode())
+        .await
+        .unwrap();
+    fluree
+        .publisher()
+        .unwrap()
+        .publish_index_allow_equal_fenced(LEDGER, record.fence, record.index_t, &cid)
+        .await
+        .unwrap();
+
+    let fluree = fluree_at(dir.path());
     assert_refused(
         &fluree,
-        &[("more.ttl", MORE_CLAIMS)],
-        "http://example.org/graph/claims",
-        "does not support triple terms or edge annotations yet",
+        &[("claims.ttl", GRAPH_CLAIMS)],
+        GRAPH,
+        "reindex it before importing",
     )
     .await;
-    assert_eq!(claims(&fluree_at(dir.path()), None).await, base_claims);
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    import_into_graph(
+        &fluree_at(dir.path()),
+        &[("claims.ttl", GRAPH_CLAIMS)],
+        GRAPH,
+    )
+    .await
+    .expect("graph import after the reindex");
+    assert_eq!(
+        claims(&fluree_at(dir.path()), Some(GRAPH)).await,
+        ["ex:alice ex:bob 0.7", "ex:carol ex:dave 0.1"]
+    );
+}
+
+/// A ledger without a triple-term dictionary gets one from a graph import
+/// that brings annotations, and an unannotated ledger is annotated after.
+#[tokio::test]
+async fn annotations_import_into_a_graph_of_an_unannotated_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    indexed_ledger(dir.path()).await;
+    let fluree = fluree_at(dir.path());
+    assert_eq!(term_count(&fluree).await, 0);
+    assert!(
+        !fluree
+            .ledger(LEDGER)
+            .await
+            .unwrap()
+            .snapshot
+            .has_annotations
+    );
+
+    let result = import_into_graph(&fluree, &[("claims.ttl", GRAPH_CLAIMS)], GRAPH)
+        .await
+        .expect("graph import");
+    assert!(result.has_annotations);
+    let fluree = fluree_at(dir.path());
+    assert_eq!(term_count(&fluree).await, 2);
+    assert!(
+        fluree
+            .ledger(LEDGER)
+            .await
+            .unwrap()
+            .snapshot
+            .has_annotations
+    );
+    assert!(claims(&fluree, None).await.is_empty());
+    assert_eq!(
+        claims(&fluree, Some(GRAPH)).await,
+        ["ex:alice ex:bob 0.7", "ex:carol ex:dave 0.1"]
+    );
 }
 
 /// A memory-backed connection whose nameservice can hold or fail an index
