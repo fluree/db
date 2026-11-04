@@ -1995,10 +1995,20 @@ The same handshake optionally accepts **raw source data** — the formats `flure
 
 - **Discovery:** add `"source-upload"` to `import.modes` and advertise `import.source_formats` (the reference server lists `ttl/nt/nq/trig/jsonld/json/jsonl/ndjson` — each optionally `.gz`/`.zst` — plus `csv/cypher/cyp/cql`). The CLI checks `source-upload` before attempting; absent it, `--remote --from <non-flpack>` errors with a `.flpack` fallback hint.
 - **Mint:** `"source_kind": "source"` (default `"flpack"`) plus `"filename"` (its extension drives format detection; the staged object must keep it). CSV/Cypher uploads may also send `"edge_properties": "annotated"|"plain"|"nary"` and `"base_iri"`; the CLI forwards its corresponding create flags. Reject unsupported extensions, option values, and missing filenames with `400`.
+- **Blank nodes:** a single-file import mints blank-node ids from a salt (the ledger id by default) and the file's name. Import the staged file under the last component of `"filename"` so the ids match a direct import of the same file. A mint may carry `"skolem_namespace"` to replace the salt, as `--skolem-namespace` does; advertise `"source-upload-skolem"` when you honor it. The CLI refuses to send the option to a server without that mode, since an ignored salt changes every blank node's id.
 - **Complete:** run the bulk-import pipeline over the staged file (converting CSV/Cypher to JSON-LD shards first) in the same async worker slot as a restore. On success, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`.
 - **Raft caveat:** the pipeline publishes nameservice heads directly and repeatedly, outside any replicated write log — do not offer `source-upload` on consensus-replicated deployments (the reference server omits the mode and 400s the mint).
 
-Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::run_remote_source_import`.
+#### Into a new graph of an existing ledger
+
+A source upload may instead fill a new named graph of an existing ledger, which backs `fluree graph import <iri> --from <file>` against a server.
+
+- **Discovery:** add `"source-upload-graph"` to `import.modes` alongside `"source-upload"`. The CLI checks it before uploading: a server that ignores an unknown `"graph"` field would create a ledger instead.
+- **Mint:** `"graph": "<iri>"` with `"source_kind": "source"`; `"ledger"` names the existing ledger. Reject `"graph"` on a `.flpack` mint, the default graph and the ledger's system graphs with `400`, and a ledger that does not exist with `404`, before the upload.
+- **Complete:** run `Fluree::import_into_graph(ledger, graph).import(path)` rather than `create`. On success, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`, where the import's commits run from `base_t + 1` to `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written. One failure leaves the import in the ledger: `ImportError::PublishedWithoutIndex`, an index publish that failed after the import's commits were published. Its message says so; report it as is, not as an import that wrote nothing.
+- No reindex follows an annotated graph: it would rebuild the whole ledger's index. `has_annotations: true` tells the client the ledger's annotation index waits for one.
+
+Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::upload_source_import`, called by `run_remote_source_import` and `fluree-db-cli/src/commands/graph.rs`.
 
 ## Storage Proxy Contract
 

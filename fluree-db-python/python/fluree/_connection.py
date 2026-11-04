@@ -1165,6 +1165,22 @@ class Ledger:
         self._require_unrestricted("drop_graph")
         return Commit(**self._connection._native.drop_graph(self._id, graph))
 
+    def import_graph(self, graph: str, source: str | os.PathLike[str]) -> Commit:
+        """Bulk-load ``source`` into ``graph``, a named graph (its full IRI)
+        the ledger does not have yet, as :meth:`Connection.create` loads a new
+        ledger. Returns the import's last commit, with every fact it added as
+        ``asserts``.
+
+        ``source`` is a file or a directory of Turtle, N-Triples, or JSON-LD
+        files; TriG and N-Quads name graphs of their own and are refused.
+        IRIs and strings the ledger already holds keep their identity, so the
+        graph joins with the rest of the ledger. Commits the ledger has not
+        indexed yet are indexed first, and writes to the ledger wait while the
+        import runs. Raises :class:`InvalidRequestError` when the ledger
+        already has ``graph``."""
+        self._require_unrestricted("import_graph")
+        return Commit(**self._connection._native.import_graph(self._id, graph, Path(source)))
+
     def set_full_text(
         self, properties: Iterable[str], *, language: str = "en", reindex: bool = True
     ) -> None:

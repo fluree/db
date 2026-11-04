@@ -1181,6 +1181,35 @@ impl Connection {
         Ok(commit)
     }
 
+    /// Bulk-import `source` into the new named graph `graph`; the dict
+    /// `fluree.Commit` is built from, naming the import's last commit and
+    /// every flake it added.
+    fn import_graph<'py>(
+        &self,
+        py: Python<'py>,
+        ledger: &str,
+        graph: &str,
+        source: PathBuf,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let id = canonical(ledger)?;
+        let fluree = self.fluree.get()?;
+        let result = block_on(py, async {
+            fluree
+                .import_into_graph(&id, graph)
+                .import(&source)
+                .execute()
+                .await
+        })?
+        .map_err(import_error)?;
+        let commit = PyDict::new(py);
+        commit.set_item("t", result.t)?;
+        commit.set_item("id", result.commit_head_id.to_string())?;
+        commit.set_item("digest", result.commit_head_id.digest_hex())?;
+        commit.set_item("asserts", result.flake_count)?;
+        commit.set_item("retracts", 0)?;
+        Ok(commit)
+    }
+
     fn info<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Bound<'py, PyAny>> {
         let id = canonical(ledger)?;
         let info =

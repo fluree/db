@@ -100,20 +100,8 @@ impl IncrementalRootBuilder {
 
     /// Replace dictionary references.
     pub fn set_dict_refs(&mut self, refs: DictRefs) {
-        // Record old dict CIDs as replaced **only if** they are not referenced by the new refs.
-        //
-        // This is critical for correctness when dictionaries are unchanged: callers may rebuild
-        // `DictRefs` from the base root even when novelty has no new subjects/strings. In that
-        // case, the new root still references the same dict CIDs, and GC must not delete them.
-        let old_cids: HashSet<ContentId> = collect_dict_cids(&self.root.dict_refs)
-            .into_iter()
-            .collect();
-        let new_cids: HashSet<ContentId> = collect_dict_cids(&refs).into_iter().collect();
-
-        let mut replaced: Vec<ContentId> = old_cids.difference(&new_cids).cloned().collect();
-        // Keep ordering deterministic for garbage manifest stability.
-        replaced.sort_by_key(std::string::ToString::to_string);
-        self.replaced_cids.extend(replaced);
+        self.replaced_cids
+            .extend(replaced_dict_cids(&self.root.dict_refs, &refs));
         self.root.dict_refs = refs;
     }
 
@@ -324,6 +312,21 @@ impl IncrementalRootBuilder {
         }
         (self.root, self.replaced_cids)
     }
+}
+
+/// The dictionary artifacts `old` references that `new` no longer does, in a
+/// deterministic order.
+///
+/// Only these are garbage: callers may rebuild `DictRefs` from the base root
+/// when nothing changed, and the new root then still references every old
+/// CID, which GC must not delete.
+pub fn replaced_dict_cids(old: &DictRefs, new: &DictRefs) -> Vec<ContentId> {
+    let old_cids: HashSet<ContentId> = collect_dict_cids(old).into_iter().collect();
+    let new_cids: HashSet<ContentId> = collect_dict_cids(new).into_iter().collect();
+    let mut replaced: Vec<ContentId> = old_cids.difference(&new_cids).cloned().collect();
+    // Keep ordering deterministic for garbage manifest stability.
+    replaced.sort_by_key(std::string::ToString::to_string);
+    replaced
 }
 
 fn collect_dict_cids(refs: &DictRefs) -> Vec<ContentId> {

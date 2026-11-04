@@ -23,6 +23,11 @@ impl MemoryServer {
     /// Start in `cwd`, with HOME, TMPDIR and the log under `outside`, and wait
     /// for `/health`.
     async fn start(cwd: &Path, outside: &Path) -> Self {
+        Self::start_with(cwd, outside, &[]).await
+    }
+
+    /// [`start`](Self::start) with `env` set on the server process.
+    async fn start_with(cwd: &Path, outside: &Path, env: &[(&str, &str)]) -> Self {
         let addr = {
             let probe = TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap()
@@ -44,6 +49,7 @@ impl MemoryServer {
                 cmd.env_remove(&var);
             }
         }
+        cmd.envs(env.iter().copied());
         let mut server = Self {
             child: cmd.spawn().unwrap(),
             base: format!("http://{addr}"),
@@ -547,4 +553,175 @@ async fn remote_at_falls_back_on_a_server_without_path_pins() {
     assert_eq!(queries[0].0, "/v1/fluree/query/pin:main@t:1");
     assert_eq!(queries[1].0, "/v1/fluree/query/pin:main");
     assert!(queries[1].1.contains("FROM <pin:main@t:1>"), "{queries:?}");
+}
+
+/// `fluree graph import --remote` uploads the file to a server that offers
+/// imports into a graph, which fills a new graph of the existing ledger. A
+/// server that does not is refused before anything is uploaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_import_runs_on_a_remote_server() {
+    const GRAPH: &str = "http://example.org/graph/products";
+    let outside = TempDir::new().unwrap();
+    let serve_dir = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let home = outside.path();
+    let client = reqwest::Client::new();
+    let server = MemoryServer::start_with(
+        serve_dir.path(),
+        outside.path(),
+        &[("FLUREE_IMPORT_PRESIGN_ENABLED", "true")],
+    )
+    .await;
+
+    let resp = client
+        .post(server.url("/create"))
+        .json(&json!({ "ledger": LEDGER }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = client
+        .post(server.url("/insert"))
+        .header("fluree-ledger", LEDGER)
+        .json(&json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "ex:name": "Alice"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    assert!(cli(project.path(), home, &["init"]).status.success());
+    assert!(cli(
+        project.path(),
+        home,
+        &["remote", "add", "origin", &server.base]
+    )
+    .status
+    .success());
+    let source = project.path().join("products.ttl");
+    std::fs::write(
+        &source,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:widget ex:maker ex:alice ; ex:name \"Widget\" ; ex:part [ ex:name \"Bolt\" ] .\n",
+    )
+    .unwrap();
+    const SALT: &str = "urn:test:products";
+    let import = |remote: &str| {
+        cli(
+            project.path(),
+            home,
+            &[
+                "graph",
+                "import",
+                GRAPH,
+                "--from",
+                source.to_str().unwrap(),
+                "-l",
+                LEDGER,
+                "--remote",
+                remote,
+                "--skolem-namespace",
+                SALT,
+            ],
+        )
+    };
+    let blank_node = |text: &str| {
+        text.split(|c: char| c.is_whitespace() || "\"[]{},".contains(c))
+            .find(|tok| tok.starts_with("_:fdb-"))
+            .unwrap_or_else(|| panic!("no minted blank-node id in {text}"))
+            .to_string()
+    };
+    let part_query = json!({
+        "select": ["?part"],
+        "where": {"@id": "http://example.org/widget", "http://example.org/part": "?part"}
+    });
+
+    let out = import("origin");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}\n{}", server.output());
+    assert!(
+        stdout.contains(&format!("into graph <{GRAPH}> of '{LEDGER}' on 'origin'")),
+        "{stdout}"
+    );
+
+    // The graph is on the server, joined to its ledger's ex:alice.
+    let resp = client
+        .post(server.url(&format!("/query/{LEDGER}")))
+        .header("content-type", "application/sparql-query")
+        .body(format!(
+            "SELECT ?who WHERE {{ GRAPH <{GRAPH}> {{ ?w <http://example.org/maker> ?m }} \
+             ?m <http://example.org/name> ?who }}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let answer: Value = resp.json().await.unwrap();
+    assert!(answer.to_string().contains("Alice"), "{answer}");
+
+    // Its blank node is named as a direct import of the file under the same
+    // namespace names it.
+    let mut on_server = part_query.clone();
+    on_server["from"] = json!(format!("{LEDGER}#{GRAPH}"));
+    let resp = client
+        .post(server.url("/query"))
+        .json(&on_server)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let remote_part = blank_node(&resp.text().await.unwrap());
+    let created = cli(
+        project.path(),
+        home,
+        &[
+            "create",
+            "parts-direct",
+            "--from",
+            source.to_str().unwrap(),
+            "--skolem-namespace",
+            SALT,
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let local = cli(
+        project.path(),
+        home,
+        &["query", "-l", "parts-direct", "-e", &part_query.to_string()],
+    );
+    assert!(
+        local.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    assert_eq!(
+        blank_node(&String::from_utf8_lossy(&local.stdout)),
+        remote_part
+    );
+    server.stop().await;
+
+    // Without source uploads, the server is refused before any upload.
+    let plain = MemoryServer::start(serve_dir.path(), outside.path()).await;
+    assert!(cli(
+        project.path(),
+        home,
+        &["remote", "add", "plain", &plain.base]
+    )
+    .status
+    .success());
+    let out = import("plain");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("source-upload-graph"), "{stderr}");
+    plain.stop().await;
 }
