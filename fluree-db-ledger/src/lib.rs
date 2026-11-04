@@ -210,7 +210,18 @@ impl LedgerState {
             // eviction lands.
             .filter(|r| !r.retracted)
             .ok_or_else(|| LedgerError::not_found(ledger_id))?;
+        Self::load_record(ns, record, backend).await
+    }
 
+    /// Load the ledger at the heads `record` names, which need not be the
+    /// ones the nameservice holds yet: a writer can build the state it will
+    /// install before publishing the heads that state is at. `ns` is read
+    /// only for a branch's ancestry.
+    pub async fn load_record(
+        ns: &dyn NameServiceLookup,
+        record: NsRecord,
+        backend: &StorageBackend,
+    ) -> Result<Self> {
         // For branched ledgers, build a recursive content store that falls
         // back through the branch ancestry DAG. This avoids copying the
         // commit chain when creating a branch — reads fall through to
@@ -316,6 +327,8 @@ impl LedgerState {
 
         let head_index_id = record.index_head_id.clone();
         let novelty_t = snapshot.t;
+        // Nothing after the index: the empty novelty is covered.
+        dict_novelty.mark_covered_through(novelty_t);
         Ok(Self {
             snapshot: Arc::new(snapshot),
             novelty: Arc::new(Novelty::new(novelty_t)),
@@ -470,16 +483,21 @@ impl LedgerState {
         // identity-key sort + linear set-semantics dedup + four index
         // sorts, totaling `O(N log N)` regardless of M.
         novelty.bulk_apply_commits(commit_batches, &reverse_graph)?;
+        // Every commit after the index was populated above, oldest first.
+        dict_novelty.mark_covered_through(novelty.t);
 
         Ok((novelty, Some(head_cid.clone()), head_temporal))
     }
 
     /// Create a new ledger state from components
     pub fn new(snapshot: LedgerSnapshot, novelty: Novelty) -> Self {
-        let dict_novelty = DictNovelty::with_watermarks(
+        let mut dict_novelty = DictNovelty::with_watermarks(
             snapshot.subject_watermarks.clone(),
             snapshot.string_watermark,
         );
+        dict_novelty
+            .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
+        dict_novelty.mark_covered_through(novelty.t);
         let mut runtime_small_dicts = RuntimeSmallDicts::new();
         runtime_small_dicts
             .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
@@ -642,6 +660,7 @@ impl LedgerState {
                 new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
+        new_dict_novelty.mark_covered_through(new_novelty.t);
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
         if has_remaining_novelty {
@@ -652,7 +671,7 @@ impl LedgerState {
 
         // Update state
         self.snapshot = Arc::new(new_snapshot);
-        self.novelty = Arc::new(new_novelty);
+        drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
         self.dict_novelty = Arc::new(new_dict_novelty);
         self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
         self.head_index_id = Some(index_id.clone());
@@ -761,7 +780,10 @@ impl LedgerState {
         // dictionary novelty, and while it lives the retire below would copy
         // the whole dictionary instead of trimming it in place.
         self.snapshot = Arc::new(merged_snapshot);
-        self.novelty = Arc::new(new_novelty);
+        // Freeing the flakes the trim dropped, often most of novelty, is the
+        // costliest part of an install when nothing else holds them, and it
+        // needs no lock: let a background thread do it.
+        drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
         let merge_us = phase.elapsed().as_micros() as u64;
         let phase = fluree_db_core::clock::Instant::now();
 
@@ -793,6 +815,7 @@ impl LedgerState {
                         self.novelty.iter_flakes(fluree_db_core::IndexType::Post),
                     );
                 }
+                rebuilt.mark_covered_through(self.novelty.t);
                 self.dict_novelty = Arc::new(rebuilt);
                 Arc::new(runtime)
             }
@@ -866,9 +889,13 @@ impl LedgerState {
         // shape `apply_single_commit` provides.
         self.novelty.can_apply(&flakes, &reverse_graph)?;
 
+        let covered = self.dict_novelty.covers(self.novelty.t);
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&flakes);
         Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+        if covered {
+            Arc::make_mut(&mut self.dict_novelty).mark_covered_through(self.novelty.t);
+        }
 
         Ok(())
     }
@@ -996,9 +1023,13 @@ impl LedgerState {
         // uniquely owns them (Arc::make_mut), copy-on-write only when a reader or
         // cache still holds the prior Arc. Matches the snapshot handling above and
         // avoids the unconditional deep clone the previous clone-then-swap forced.
+        let covered = self.dict_novelty.covers(self.novelty.t);
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&all_flakes);
         Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&all_flakes);
         Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        if covered {
+            Arc::make_mut(&mut self.dict_novelty).mark_covered_through(self.novelty.t);
+        }
 
         // Update state
         self.head_commit_id = Some(commit_id.clone());
@@ -1094,6 +1125,21 @@ impl LedgerState {
             None
         }
     }
+}
+
+/// Drop `value` on a short-lived thread, so the caller (holding a ledger
+/// lock) does not pay for freeing it. Dropped in place where threads are
+/// unavailable or cannot be spawned.
+fn drop_off_thread<T: Send + 'static>(value: T) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // A failed spawn hands the closure, and so `value`, back to be dropped.
+        let _ = std::thread::Builder::new()
+            .name("fluree-drop".into())
+            .spawn(move || drop(value));
+    }
+    #[cfg(target_arch = "wasm32")]
+    drop(value);
 }
 
 #[cfg(test)]

@@ -906,11 +906,11 @@ impl crate::Fluree {
     ///
     /// 1. Normalizes the ledger id (`":main"` default).
     /// 2. Resolves `graph_iri` against the snapshot's `GraphRegistry`.
-    /// 3. Builds a `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { ... }`
-    ///    transaction and stages it through the same pipeline used by user
-    ///    SPARQL updates.
-    /// 4. If the WHERE matches zero flakes (graph already empty), no commit
-    ///    is produced and `committed = false` is reported.
+    /// 3. Stages SPARQL `DROP GRAPH <iri>` ([`fluree_db_transact::Txn::drop_graph`]):
+    ///    one commit retracting every fact the graph holds, read by the
+    ///    whole-graph scan.
+    /// 4. If the graph is already empty, no commit is produced and
+    ///    `committed = false` is reported.
     ///
     /// # Errors
     ///
@@ -918,6 +918,9 @@ impl crate::Fluree {
     ///   protected system graph.
     /// - `ApiError::NotFound` — the ledger does not exist, or `graph_iri` is
     ///   not registered in this ledger's graph registry.
+    /// - `TransactError::WholeGraphScanTooLarge` — the graph holds more facts
+    ///   than the whole-graph scan's memory backstop
+    ///   (`FLUREE_MAX_GRAPH_SCAN_FLAKES`), refused before they are read.
     pub async fn drop_named_graph(
         &self,
         ledger_id: &str,
@@ -927,7 +930,6 @@ impl crate::Fluree {
             config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
             TXN_META_GRAPH_ID,
         };
-        use fluree_db_transact::{NamespaceRegistry, TxnOpts};
 
         let bad_request = |msg: String| ApiError::Http {
             status: 400,
@@ -987,34 +989,13 @@ impl crate::Fluree {
             )));
         }
 
-        // Build and lower the SPARQL DELETE. We use the explicit
-        // `DELETE { GRAPH <g> { ... } } WHERE { GRAPH <g> { ... } }` form
-        // because `DELETE WHERE` does not yet support GRAPH blocks.
-        let sparql = format!(
-            "DELETE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o }} }} \
-             WHERE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o }} }}"
-        );
-        let parsed = fluree_db_sparql::parse_sparql(&sparql);
-        if parsed.has_errors() {
-            return Err(ApiError::internal(format!(
-                "drop_named_graph: SPARQL parse failed for graph IRI '{graph_iri}': {:?}",
-                parsed.diagnostics
-            )));
-        }
-        let ast = parsed.ast.ok_or_else(|| {
-            ApiError::internal("drop_named_graph: SPARQL parser returned no AST".to_string())
-        })?;
-
-        let mut ns_registry = NamespaceRegistry::from_db(snapshot);
-        let txn =
-            fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns_registry, TxnOpts::default())
-                .map_err(|e| {
-                    ApiError::internal(format!(
-                        "drop_named_graph: failed to lower SPARQL update: {e}"
-                    ))
-                })?;
         drop(view);
 
+        // `DROP GRAPH`, not `DELETE { GRAPH <g> { ?s ?p ?o } } WHERE { … }`:
+        // the WHERE form matches every fact with no ceiling before the commit
+        // refuses an oversized delta, while the whole-graph scan refuses a
+        // graph past its backstop before reading it.
+        let txn = fluree_db_transact::Txn::drop_graph(graph_iri);
         let result = self.stage(&handle).txn(txn).execute().await?;
         let retracted = result.receipt.flake_count;
         let committed = retracted > 0;
@@ -2354,8 +2335,12 @@ impl crate::Fluree {
             track_fuel: true,
             ..Default::default()
         });
+        // Branch-aware: a branch's history runs through its source's commits.
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &ledger_id)
+            .await?;
         let index_result = rebuild_index_from_commits_with_tracker(
-            self.content_store(&ledger_id),
+            store,
             reindex_tracker,
             &ledger_id,
             &record,
