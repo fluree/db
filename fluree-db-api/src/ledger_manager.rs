@@ -72,6 +72,7 @@ fn monotonic_secs() -> u64 {
 pub struct LedgerWriteGuard {
     ledger: LedgerHandle,
     guard: tokio::sync::OwnedRwLockWriteGuard<LedgerState>,
+    _writer: tokio::sync::OwnedMutexGuard<()>,
     acquired: Instant,
 }
 
@@ -115,6 +116,25 @@ impl LedgerWriteGuard {
     /// Replace state with new state after successful commit
     pub fn replace(&mut self, new_state: LedgerState) {
         *self.guard = new_state;
+    }
+}
+
+/// Holds a ledger's writers off while its state stays readable; see
+/// [`LedgerHandle::exclude_writers`].
+pub struct WriterExclusion {
+    ledger: LedgerHandle,
+    writer: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl WriterExclusion {
+    /// Take the state lock as well, to install a new state.
+    pub async fn lock_state(self) -> LedgerWriteGuard {
+        LedgerWriteGuard {
+            guard: Arc::clone(&self.ledger.inner.state).write_owned().await,
+            ledger: self.ledger,
+            _writer: self.writer,
+            acquired: Instant::now(),
+        }
     }
 }
 
@@ -254,6 +274,8 @@ async fn warn_if_shapes_unenforced(
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
 ///
+/// `writer` is taken before `state`, and only by writers.
+///
 /// `config_cache` has its own lock and is never held while acquiring `state`;
 /// `reload`'s swap takes it briefly *while holding* `state`, so the one
 /// permitted order is `state` → `config_cache`, never the reverse.
@@ -268,6 +290,11 @@ struct LedgerHandleInner {
     /// callers don't have to keep a borrow of the handle alive to use the
     /// guard.
     state: Arc<RwLock<LedgerState>>,
+    /// Held by whoever writes the ledger. A transaction holds it with
+    /// `state`; an operation that builds a new head outside the transaction
+    /// path holds it alone until it installs that head, so queries go on
+    /// reading `state` meanwhile ([`LedgerHandle::exclude_writers`]).
+    writer: Arc<tokio::sync::Mutex<()>>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: LedgerId,
     /// Last access time (monotonic secs since process start)
@@ -303,10 +330,14 @@ struct LedgerHandleInner {
     /// staging and before taking the lock (see
     /// [`LedgerHandle::gate_next_optimistic_stage_for_test`]).
     stage_gate: parking_lot::Mutex<Option<StageGate>>,
+    /// Test hook: the next [`LedgerHandle::exclude_writers`] parks here once
+    /// it holds the writers (see
+    /// [`LedgerHandle::gate_next_writer_exclusion_for_test`]).
+    exclusion_gate: parking_lot::Mutex<Option<StageGate>>,
 }
 
-/// A parked optimistic stage: tells the test it is parked, then waits to be
-/// released.
+/// A parked optimistic stage or writer exclusion: tells the test it is
+/// parked, then waits to be released.
 pub(crate) struct StageGate {
     parked: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::watch::Receiver<bool>,
@@ -439,6 +470,7 @@ impl LedgerHandle {
         Self {
             inner: Arc::new(LedgerHandleInner {
                 state: Arc::new(RwLock::new(state)),
+                writer: Arc::new(tokio::sync::Mutex::new(())),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
@@ -448,6 +480,7 @@ impl LedgerHandle {
                 committed_t: std::sync::atomic::AtomicI64::new(0),
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
+                exclusion_gate: parking_lot::Mutex::new(None),
             }),
         }
     }
@@ -475,6 +508,25 @@ impl LedgerHandle {
 
     pub(crate) fn take_stage_gate(&self) -> Option<StageGate> {
         self.inner.stage_gate.lock().take()
+    }
+
+    /// Park the next [`Self::exclude_writers`] on this handle once it holds
+    /// the writers, so a test can read the ledger meanwhile. Same channels and
+    /// one-shot use as [`Self::gate_next_optimistic_stage_for_test`].
+    #[doc(hidden)]
+    pub fn gate_next_writer_exclusion_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        *self.inner.exclusion_gate.lock() = Some(StageGate {
+            parked: parked_tx,
+            release: release_rx,
+        });
+        (parked_rx, release_tx)
     }
 
     /// How writes through this handle reached their commits so far.
@@ -649,10 +701,29 @@ impl LedgerHandle {
     /// Acquire exclusive access for transaction (hold lock for stage+commit)
     pub async fn lock_for_write(&self) -> LedgerWriteGuard {
         self.touch();
+        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
         LedgerWriteGuard {
             ledger: self.clone(),
             guard: Arc::clone(&self.inner.state).write_owned().await,
+            _writer: writer,
             acquired: Instant::now(),
+        }
+    }
+
+    /// Hold off this ledger's writers without blocking its readers:
+    /// transactions wait, queries go on against the current state. For an
+    /// operation that builds a new head outside the transaction path and
+    /// installs it at the end ([`WriterExclusion::lock_state`]).
+    pub async fn exclude_writers(&self) -> WriterExclusion {
+        self.touch();
+        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
+        let gate = self.inner.exclusion_gate.lock().take();
+        if let Some(gate) = gate {
+            gate.park().await;
+        }
+        WriterExclusion {
+            ledger: self.clone(),
+            writer,
         }
     }
 
@@ -691,7 +762,7 @@ impl LedgerHandle {
 
     /// Check if currently locked (for eviction - skip if in use)
     pub fn is_locked(&self) -> bool {
-        self.inner.state.try_write().is_err()
+        self.inner.writer.try_lock().is_err() || self.inner.state.try_write().is_err()
     }
 
     /// Get current index_t (brief lock to read)

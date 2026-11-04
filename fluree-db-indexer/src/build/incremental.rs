@@ -35,7 +35,8 @@ use crate::run_index::build::incremental_branch::{
 };
 use crate::run_index::build::incremental_leaf::NewLeafBlob;
 use crate::run_index::build::incremental_resolve::{
-    resolve_incremental_commits_v6, IncrementalResolveConfig, IncrementalResolveError,
+    resolve_incremental_commits_v6, IncrementalNovelty, IncrementalResolveConfig,
+    IncrementalResolveError,
 };
 use crate::run_index::build::incremental_root::IncrementalRootBuilder;
 use crate::{IndexResult, IndexStats, IndexerConfig};
@@ -822,10 +823,10 @@ pub async fn incremental_index(
     let cache_dir = config.artifact_cache_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
 
-    // Single global S3 budget shared across the whole fold: the reconcile
-    // leaf prefetch (Phase 1), and the Phase 2 leaf prefetch + leaf/sidecar
-    // uploads all acquire from this one semaphore, so total in-flight S3 reads
-    // and writes are capped here regardless of phase.
+    // S3 budget for the reconcile leaf prefetch (Phase 1). `index_novelty`
+    // caps the Phase 2 leaf prefetch and leaf/sidecar uploads with one of the
+    // same size; the phases run one after the other, so total in-flight S3
+    // reads and writes stay under this cap throughout the fold.
     let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
     let upload_budget = Arc::new(Semaphore::new(upload_buffer));
 
@@ -840,7 +841,7 @@ pub async fn incremental_index(
         pending_commit_cids: config.pending_commit_cids.clone(),
         commit_fetch_concurrency: config.incremental_max_concurrency.max(1),
     };
-    let mut novelty = resolve_incremental_commits_v6(
+    let novelty = resolve_incremental_commits_v6(
         content_store.clone(),
         resolve_config,
         Arc::clone(&upload_budget),
@@ -873,6 +874,38 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
+    index_novelty(
+        content_store,
+        tracker,
+        ledger_id,
+        base_root_id,
+        novelty,
+        config,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Phases 2–4 of an incremental build: merge resolved `novelty` into its
+/// `novelty.base_root` (whose id is `base_root_id`) and write the new root.
+///
+/// `replaced_cids` are artifacts of `base_root_id` that a caller already
+/// superseded before handing over a base root it built itself, so the new
+/// root's garbage manifest retires them too.
+pub(crate) async fn index_novelty(
+    content_store: Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    base_root_id: ContentId,
+    mut novelty: IncrementalNovelty,
+    config: IndexerConfig,
+    replaced_cids: Vec<ContentId>,
+) -> Result<IndexResult> {
+    let cache_dir = config.artifact_cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
+    let upload_budget = Arc::new(Semaphore::new(upload_buffer));
+
     // ---- Phase 2: Per-(graph, order) branch updates ----
     check_order_sets(
         &novelty.base_root.default_graph_orders,
@@ -900,6 +933,7 @@ pub async fn incremental_index(
     let base_root = &novelty.base_root;
     let mut root_builder =
         IncrementalRootBuilder::from_old_root(novelty.base_root.clone(), ledger_id);
+    root_builder.add_replaced_cids(replaced_cids);
     root_builder.set_index_t(novelty.max_t);
     root_builder.add_commit_stats(
         novelty.delta_commit_size,
@@ -1070,11 +1104,6 @@ pub async fn incremental_index(
     );
 
     // ---- Phase 3: Dict updates ----
-    // Incremental dict tree updates.
-    use super::dicts::{
-        upload_incremental_reverse_tree_async, upload_incremental_reverse_tree_async_strings,
-    };
-    let mut new_dict_refs = base_root.dict_refs.clone();
     // Resolve the warm-on-write cache once (co-located only); seeds the
     // reverse-dict leaves we rewrite so a reader resolving a just-added
     // IRI/string hits the cache instead of a cold read.
@@ -1082,324 +1111,17 @@ pub async fn incremental_index(
         .warm_cache_source
         .as_ref()
         .and_then(|s| s.warm_cache());
-
-    if !novelty.new_subjects.is_empty() {
-        tracing::debug!(
-            count = novelty.new_subjects.len(),
-            "V6 Phase 3: updating subject reverse tree"
-        );
-        let updated = upload_incremental_reverse_tree_async(
-            content_store.as_ref(),
-            fluree_db_core::DictKind::SubjectReverse,
-            &base_root.dict_refs.subject_reverse,
-            novelty.new_subjects.clone(),
-            warm_cache.as_deref(),
-        )
-        .await?;
-        root_builder.add_replaced_cids(updated.replaced_cids);
-        new_dict_refs.subject_reverse = updated.tree_refs;
-    }
-
-    if !novelty.new_strings.is_empty() {
-        tracing::debug!(
-            count = novelty.new_strings.len(),
-            "V6 Phase 3: updating string reverse tree"
-        );
-        let updated = upload_incremental_reverse_tree_async_strings(
-            content_store.as_ref(),
-            fluree_db_core::DictKind::StringReverse,
-            &base_root.dict_refs.string_reverse,
-            novelty.new_strings.clone(),
-            warm_cache.as_deref(),
-        )
-        .await?;
-        root_builder.add_replaced_cids(updated.replaced_cids);
-        new_dict_refs.string_reverse = updated.tree_refs;
-    }
-
-    // Forward pack updates (FPK1): append new pack artifacts for new subjects/strings,
-    // then compact the tail of each stream that was touched. Appending alone adds a
-    // routing entry per build forever; compaction is what bounds the table by data size.
-    {
-        use fluree_db_binary_index::dict::incremental::{
-            build_incremental_string_packs, build_incremental_subject_packs_for_ns,
-        };
-        use fluree_db_binary_index::PackBranchEntry;
-
-        let mut compaction_budget = if compaction_enabled() {
-            CompactionBudget::new()
-        } else {
-            CompactionBudget::disabled()
-        };
-        let mut pack_sizes = PackSizeCache::new();
-        // Every pack CID this cycle uploads, so any that compaction consumes
-        // before publication can be garbaged explicitly.
-        let mut uploaded_pack_cids: Vec<ContentId> = Vec::new();
-        // Streams compacted alongside their own novelty; the rest are swept
-        // afterwards with whatever budget survives.
-        let mut compacted_streams: std::collections::HashSet<Option<u16>> =
-            std::collections::HashSet::new();
-
-        // String forward packs.
-        // Invariant: new_strings is sorted by string_id ascending (enforced by resolver).
-        if !novelty.new_strings.is_empty() {
-            debug_assert!(
-                novelty.new_strings.windows(2).all(|w| w[0].0 < w[1].0),
-                "new_strings must be sorted by string_id ascending"
-            );
-
-            let existing_refs = &base_root.dict_refs.forward_packs.string_fwd_packs;
-            let entries: Vec<(u32, &[u8])> = novelty
-                .new_strings
-                .iter()
-                .map(|(id, val)| (*id, val.as_slice()))
-                .collect();
-
-            let pack_result = build_incremental_string_packs(existing_refs, &entries)
-                .map_err(|e| IndexerError::StorageWrite(format!("string fwd pack build: {e}")))?;
-
-            // Upload new pack artifacts and build updated refs.
-            let mut updated_refs = existing_refs.clone();
-            let kind = ContentKind::DictBlob {
-                dict: fluree_db_core::DictKind::StringForward,
-            };
-            for pack in &pack_result.new_packs {
-                let pack_cid = content_store
-                    .put(kind, &pack.bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
-                uploaded_pack_cids.push(pack_cid.clone());
-                updated_refs.push(PackBranchEntry {
-                    first_id: pack.first_id,
-                    last_id: pack.last_id,
-                    pack_cid,
-                });
-            }
-
-            uploaded_pack_cids.extend(
-                compact_forward_packs(
-                    content_store.as_ref(),
-                    kind,
-                    &mut updated_refs,
-                    &mut pack_sizes,
-                    &mut compaction_budget,
-                    CompactionSpans::default(),
-                    "string",
-                )
-                .await?,
-            );
-            compacted_streams.insert(None);
-
-            let total_packs = updated_refs.len();
-            new_dict_refs.forward_packs.string_fwd_packs = updated_refs;
-
-            tracing::debug!(
-                new_packs = pack_result.new_packs.len(),
-                new_strings = novelty.new_strings.len(),
-                total_packs,
-                "V6 Phase 3: string forward packs updated"
-            );
-        }
-
-        // Subject forward packs (per namespace).
-        // Invariant: new_subjects is sorted by (ns_code, local_id) ascending (enforced by resolver).
-        if !novelty.new_subjects.is_empty() {
-            debug_assert!(
-                novelty
-                    .new_subjects
-                    .windows(2)
-                    .all(|w| (w[0].0, w[0].1) <= (w[1].0, w[1].1)),
-                "new_subjects must be sorted by (ns_code, local_id) ascending"
-            );
-
-            // Group by namespace. BTreeMap preserves ns_code order;
-            // within each namespace, local_ids are already sorted.
-            let mut by_ns: std::collections::BTreeMap<u16, Vec<(u64, Vec<u8>)>> =
-                std::collections::BTreeMap::new();
-            for (ns_code, local_id, suffix) in &novelty.new_subjects {
-                by_ns
-                    .entry(*ns_code)
-                    .or_default()
-                    .push((*local_id, suffix.clone()));
-            }
-
-            let kind = ContentKind::DictBlob {
-                dict: fluree_db_core::DictKind::SubjectForward,
-            };
-
-            for (ns_code, entries) in &by_ns {
-                // Find existing refs for this namespace.
-                let existing_ns_refs: Vec<PackBranchEntry> = new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter()
-                    .find(|(ns, _)| ns == ns_code)
-                    .map(|(_, refs)| refs.clone())
-                    .unwrap_or_default();
-
-                let entry_refs: Vec<(u64, &[u8])> = entries
-                    .iter()
-                    .map(|(id, val)| (*id, val.as_slice()))
-                    .collect();
-
-                let pack_result = build_incremental_subject_packs_for_ns(
-                    *ns_code,
-                    &existing_ns_refs,
-                    &entry_refs,
-                )
-                .map_err(|e| {
-                    IndexerError::StorageWrite(format!("subject fwd pack build ns={ns_code}: {e}"))
-                })?;
-
-                // Upload new packs and build updated refs.
-                let mut updated_refs = existing_ns_refs;
-                for pack in &pack_result.new_packs {
-                    let pack_cid = content_store
-                        .put(kind, &pack.bytes)
-                        .await
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
-                    uploaded_pack_cids.push(pack_cid.clone());
-                    updated_refs.push(PackBranchEntry {
-                        first_id: pack.first_id,
-                        last_id: pack.last_id,
-                        pack_cid,
-                    });
-                }
-
-                uploaded_pack_cids.extend(
-                    compact_forward_packs(
-                        content_store.as_ref(),
-                        kind,
-                        &mut updated_refs,
-                        &mut pack_sizes,
-                        &mut compaction_budget,
-                        CompactionSpans::default(),
-                        &format!("subject ns={ns_code}"),
-                    )
-                    .await?,
-                );
-                compacted_streams.insert(Some(*ns_code));
-
-                let total_packs = updated_refs.len();
-
-                // Update or insert namespace entry.
-                if let Some(entry) = new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter_mut()
-                    .find(|(ns, _)| ns == ns_code)
-                {
-                    entry.1 = updated_refs;
-                } else {
-                    new_dict_refs
-                        .forward_packs
-                        .subject_fwd_ns_packs
-                        .push((*ns_code, updated_refs));
-                }
-
-                tracing::debug!(
-                    ns_code,
-                    new_packs = pack_result.new_packs.len(),
-                    new_subjects = entries.len(),
-                    total_packs,
-                    "V6 Phase 3: subject forward packs updated"
-                );
-            }
-        }
-
-        // Maintenance: a stream that received no novelty this cycle still
-        // carries whatever fragmentation it accumulated, and its packs are
-        // still loaded and mapped with the index. A namespace that goes quiet
-        // would otherwise keep its tiny packs forever. Sweep those with the
-        // leftover budget.
-        //
-        // Coverage rotates with `index_t` so that a ledger with more streams
-        // than one cycle's budget can service still reaches all of them over
-        // time, without persisting a cursor anywhere.
-        {
-            let mut pending: Vec<Option<u16>> = Vec::new();
-            if !compacted_streams.contains(&None) {
-                pending.push(None);
-            }
-            pending.extend(
-                new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter()
-                    .map(|(ns, _)| Some(*ns))
-                    .filter(|key| !compacted_streams.contains(key)),
-            );
-
-            if !pending.is_empty() {
-                let offset = (base_root.index_t.unsigned_abs() as usize) % pending.len();
-                pending.rotate_left(offset);
-            }
-
-            for key in pending {
-                if compaction_budget.exhausted() {
-                    break;
-                }
-                let (kind, label, refs) = match key {
-                    None => (
-                        ContentKind::DictBlob {
-                            dict: fluree_db_core::DictKind::StringForward,
-                        },
-                        "string (maintenance)".to_string(),
-                        &mut new_dict_refs.forward_packs.string_fwd_packs,
-                    ),
-                    Some(ns_code) => {
-                        let Some(entry) = new_dict_refs
-                            .forward_packs
-                            .subject_fwd_ns_packs
-                            .iter_mut()
-                            .find(|(ns, _)| *ns == ns_code)
-                        else {
-                            continue;
-                        };
-                        (
-                            ContentKind::DictBlob {
-                                dict: fluree_db_core::DictKind::SubjectForward,
-                            },
-                            format!("subject ns={ns_code} (maintenance)"),
-                            &mut entry.1,
-                        )
-                    }
-                };
-
-                uploaded_pack_cids.extend(
-                    compact_forward_packs(
-                        content_store.as_ref(),
-                        kind,
-                        refs,
-                        &mut pack_sizes,
-                        &mut compaction_budget,
-                        CompactionSpans::default(),
-                        &label,
-                    )
-                    .await?,
-                );
-            }
-        }
-
-        // Packs created and consumed within this cycle are referenced by no
-        // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
-        let transient = unreferenced_uploads(
-            &uploaded_pack_cids,
-            &new_dict_refs.forward_packs,
-            &base_root.dict_refs.forward_packs,
-        );
-        if !transient.is_empty() {
-            tracing::debug!(
-                count = transient.len(),
-                "V6 Phase 3: forward packs created and compacted within one cycle"
-            );
-            root_builder.add_replaced_cids(transient);
-        }
-    }
-
-    root_builder.set_dict_refs(new_dict_refs);
+    let dict_update = apply_dict_novelty(
+        content_store.as_ref(),
+        &base_root.dict_refs,
+        base_root.index_t,
+        &novelty.new_subjects,
+        &novelty.new_strings,
+        warm_cache.as_deref(),
+    )
+    .await?;
+    root_builder.add_replaced_cids(dict_update.replaced_cids);
+    root_builder.set_dict_refs(dict_update.dict_refs);
 
     // Update metadata from resolver state.
     let new_ns_codes: std::collections::BTreeMap<u16, String> = novelty
@@ -4007,10 +3729,10 @@ pub async fn incremental_index(
     //   Unknown / None        → defensive drop when base has arena;
     //                            no-op when base has none.
     //
-    // Events are clipped to `t <= record.commit_t` so a concurrent
-    // commit's events can't leak into a root whose `index_t` is still
-    // `commit_t`. Keeps `AnnotationIndexRoot.max_t <= IndexRoot.index_t`.
-    let job_t = record.commit_t;
+    // Events are clipped to the new root's `index_t` so a concurrent
+    // commit's events can't leak into it. Keeps
+    // `AnnotationIndexRoot.max_t <= IndexRoot.index_t`.
+    let job_t = novelty.max_t;
     use crate::config::AttachmentEventCoverage;
     let coverage = config.attachment_events.clone();
     let prev_arena = base_root.annotation_index.as_ref();
@@ -4237,6 +3959,380 @@ pub async fn incremental_index(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Dictionary trees and forward packs after [`apply_dict_novelty`].
+pub struct DictNoveltyUpdate {
+    pub dict_refs: fluree_db_binary_index::DictRefs,
+    /// Artifacts the update superseded that a base-vs-new diff of `dict_refs`
+    /// cannot see: rewritten reverse-tree leaves, and packs created and
+    /// compacted away within this update.
+    pub replaced_cids: Vec<ContentId>,
+}
+
+/// Add new subjects and strings to the dictionaries `base_dict_refs` names:
+/// update both reverse trees and append (then compact) forward packs.
+///
+/// `new_subjects` must be sorted by `(ns_code, local_id)` and `new_strings`
+/// by id, each id above the base watermark, as an
+/// [`IncrementalNovelty`] holds them. `base_index_t` rotates which untouched
+/// streams this cycle's leftover compaction budget sweeps.
+pub async fn apply_dict_novelty(
+    content_store: &dyn ContentStore,
+    base_dict_refs: &fluree_db_binary_index::DictRefs,
+    base_index_t: i64,
+    new_subjects: &[(u16, u64, Vec<u8>)],
+    new_strings: &[(u32, Vec<u8>)],
+    warm_cache: Option<&LeafletCache>,
+) -> Result<DictNoveltyUpdate> {
+    let mut replaced_cids: Vec<ContentId> = Vec::new();
+    // Incremental dict tree updates.
+    use super::dicts::{
+        upload_incremental_reverse_tree_async, upload_incremental_reverse_tree_async_strings,
+    };
+    let mut new_dict_refs = base_dict_refs.clone();
+
+    if !new_subjects.is_empty() {
+        tracing::debug!(
+            count = new_subjects.len(),
+            "V6 Phase 3: updating subject reverse tree"
+        );
+        let updated = upload_incremental_reverse_tree_async(
+            content_store,
+            fluree_db_core::DictKind::SubjectReverse,
+            &base_dict_refs.subject_reverse,
+            new_subjects.to_vec(),
+            warm_cache,
+        )
+        .await?;
+        replaced_cids.extend(updated.replaced_cids);
+        new_dict_refs.subject_reverse = updated.tree_refs;
+    }
+
+    if !new_strings.is_empty() {
+        tracing::debug!(
+            count = new_strings.len(),
+            "V6 Phase 3: updating string reverse tree"
+        );
+        let updated = upload_incremental_reverse_tree_async_strings(
+            content_store,
+            fluree_db_core::DictKind::StringReverse,
+            &base_dict_refs.string_reverse,
+            new_strings.to_vec(),
+            warm_cache,
+        )
+        .await?;
+        replaced_cids.extend(updated.replaced_cids);
+        new_dict_refs.string_reverse = updated.tree_refs;
+    }
+
+    // Forward pack updates (FPK1): append new pack artifacts for new subjects/strings,
+    // then compact the tail of each stream that was touched. Appending alone adds a
+    // routing entry per build forever; compaction is what bounds the table by data size.
+    {
+        use fluree_db_binary_index::dict::incremental::{
+            build_incremental_string_packs, build_incremental_subject_packs_for_ns,
+        };
+        use fluree_db_binary_index::PackBranchEntry;
+
+        let mut appends = ForwardPackAppends::default();
+
+        // String forward packs.
+        // Invariant: new_strings is sorted by string_id ascending (enforced by resolver).
+        if !new_strings.is_empty() {
+            debug_assert!(
+                new_strings.windows(2).all(|w| w[0].0 < w[1].0),
+                "new_strings must be sorted by string_id ascending"
+            );
+
+            let existing_refs = &base_dict_refs.forward_packs.string_fwd_packs;
+            let entries: Vec<(u32, &[u8])> = new_strings
+                .iter()
+                .map(|(id, val)| (*id, val.as_slice()))
+                .collect();
+
+            let pack_result = build_incremental_string_packs(existing_refs, &entries)
+                .map_err(|e| IndexerError::StorageWrite(format!("string fwd pack build: {e}")))?;
+
+            // Upload new pack artifacts and build updated refs.
+            let mut updated_refs = existing_refs.clone();
+            let kind = ContentKind::DictBlob {
+                dict: fluree_db_core::DictKind::StringForward,
+            };
+            for pack in &pack_result.new_packs {
+                let pack_cid = content_store
+                    .put(kind, &pack.bytes)
+                    .await
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                appends.record(&pack_cid, pack.bytes.len());
+                updated_refs.push(PackBranchEntry {
+                    first_id: pack.first_id,
+                    last_id: pack.last_id,
+                    pack_cid,
+                });
+            }
+            new_dict_refs.forward_packs.string_fwd_packs = updated_refs;
+            appends.streams.push(None);
+
+            tracing::debug!(
+                new_packs = pack_result.new_packs.len(),
+                new_strings = new_strings.len(),
+                "V6 Phase 3: string forward packs appended"
+            );
+        }
+
+        // Subject forward packs (per namespace).
+        // Invariant: new_subjects is sorted by (ns_code, local_id) ascending (enforced by resolver).
+        if !new_subjects.is_empty() {
+            debug_assert!(
+                new_subjects
+                    .windows(2)
+                    .all(|w| (w[0].0, w[0].1) <= (w[1].0, w[1].1)),
+                "new_subjects must be sorted by (ns_code, local_id) ascending"
+            );
+
+            // Group by namespace. BTreeMap preserves ns_code order;
+            // within each namespace, local_ids are already sorted.
+            let mut by_ns: std::collections::BTreeMap<u16, Vec<(u64, Vec<u8>)>> =
+                std::collections::BTreeMap::new();
+            for (ns_code, local_id, suffix) in new_subjects {
+                by_ns
+                    .entry(*ns_code)
+                    .or_default()
+                    .push((*local_id, suffix.clone()));
+            }
+
+            let kind = ContentKind::DictBlob {
+                dict: fluree_db_core::DictKind::SubjectForward,
+            };
+
+            for (ns_code, entries) in &by_ns {
+                let refs = subject_ns_packs_mut(&mut new_dict_refs, *ns_code);
+
+                let entry_refs: Vec<(u64, &[u8])> = entries
+                    .iter()
+                    .map(|(id, val)| (*id, val.as_slice()))
+                    .collect();
+
+                let pack_result = build_incremental_subject_packs_for_ns(
+                    *ns_code,
+                    refs,
+                    &entry_refs,
+                )
+                .map_err(|e| {
+                    IndexerError::StorageWrite(format!("subject fwd pack build ns={ns_code}: {e}"))
+                })?;
+
+                // Upload new packs and append their refs.
+                for pack in &pack_result.new_packs {
+                    let pack_cid = content_store
+                        .put(kind, &pack.bytes)
+                        .await
+                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                    appends.record(&pack_cid, pack.bytes.len());
+                    refs.push(PackBranchEntry {
+                        first_id: pack.first_id,
+                        last_id: pack.last_id,
+                        pack_cid,
+                    });
+                }
+                appends.streams.push(Some(*ns_code));
+
+                tracing::debug!(
+                    ns_code,
+                    new_packs = pack_result.new_packs.len(),
+                    new_subjects = entries.len(),
+                    "V6 Phase 3: subject forward packs appended"
+                );
+            }
+        }
+
+        replaced_cids.extend(
+            compact_forward_streams(
+                content_store,
+                &mut new_dict_refs,
+                &base_dict_refs.forward_packs,
+                base_index_t,
+                appends,
+            )
+            .await?,
+        );
+    }
+
+    Ok(DictNoveltyUpdate {
+        dict_refs: new_dict_refs,
+        replaced_cids,
+    })
+}
+
+/// Forward packs one cycle appended, awaiting [`compact_forward_streams`].
+#[derive(Default)]
+pub(super) struct ForwardPackAppends {
+    /// Every pack uploaded, so any that compaction consumes before
+    /// publication can be garbaged explicitly.
+    uploaded: Vec<ContentId>,
+    sizes: PackSizeCache,
+    /// The streams appended to, in the order they are compacted: `None`
+    /// for strings, `Some(ns_code)` for a subject namespace.
+    pub(super) streams: Vec<Option<u16>>,
+}
+
+impl ForwardPackAppends {
+    pub(super) fn record(&mut self, cid: &ContentId, encoded_len: usize) {
+        self.sizes.insert(cid.clone(), encoded_len as u64);
+        self.uploaded.push(cid.clone());
+    }
+}
+
+/// The subject forward pack routing for `ns_code`, created empty if the
+/// namespace has none yet.
+pub(super) fn subject_ns_packs_mut(
+    dict_refs: &mut fluree_db_binary_index::DictRefs,
+    ns_code: u16,
+) -> &mut Vec<fluree_db_binary_index::PackBranchEntry> {
+    let streams = &mut dict_refs.forward_packs.subject_fwd_ns_packs;
+    let at = match streams.iter().position(|(ns, _)| *ns == ns_code) {
+        Some(at) => at,
+        None => {
+            streams.push((ns_code, Vec::new()));
+            streams.len() - 1
+        }
+    };
+    &mut streams[at].1
+}
+
+/// Compact the forward-pack streams a cycle appended to, then sweep the
+/// rest with whatever budget survives. Returns the packs created and
+/// consumed within the cycle, which no root references.
+pub(super) async fn compact_forward_streams(
+    content_store: &dyn ContentStore,
+    dict_refs: &mut fluree_db_binary_index::DictRefs,
+    base: &fluree_db_binary_index::DictPackRefs,
+    base_index_t: i64,
+    appends: ForwardPackAppends,
+) -> Result<Vec<ContentId>> {
+    let ForwardPackAppends {
+        mut uploaded,
+        sizes: mut pack_sizes,
+        streams,
+    } = appends;
+    let mut compaction_budget = if compaction_enabled() {
+        CompactionBudget::new()
+    } else {
+        CompactionBudget::disabled()
+    };
+
+    fn stream_refs(
+        dict_refs: &mut fluree_db_binary_index::DictRefs,
+        key: Option<u16>,
+    ) -> Option<(
+        ContentKind,
+        &mut Vec<fluree_db_binary_index::PackBranchEntry>,
+    )> {
+        match key {
+            None => Some((
+                ContentKind::DictBlob {
+                    dict: fluree_db_core::DictKind::StringForward,
+                },
+                &mut dict_refs.forward_packs.string_fwd_packs,
+            )),
+            Some(ns_code) => dict_refs
+                .forward_packs
+                .subject_fwd_ns_packs
+                .iter_mut()
+                .find(|(ns, _)| *ns == ns_code)
+                .map(|(_, refs)| {
+                    (
+                        ContentKind::DictBlob {
+                            dict: fluree_db_core::DictKind::SubjectForward,
+                        },
+                        refs,
+                    )
+                }),
+        }
+    }
+    fn stream_label(key: Option<u16>) -> String {
+        match key {
+            None => "string".to_string(),
+            Some(ns_code) => format!("subject ns={ns_code}"),
+        }
+    }
+
+    // Streams compacted alongside their own novelty.
+    for &key in &streams {
+        let Some((kind, refs)) = stream_refs(dict_refs, key) else {
+            continue;
+        };
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind,
+                refs,
+                &mut pack_sizes,
+                &mut compaction_budget,
+                CompactionSpans::default(),
+                &stream_label(key),
+            )
+            .await?,
+        );
+    }
+
+    // Maintenance: a stream that received no novelty this cycle still
+    // carries whatever fragmentation it accumulated, and its packs are
+    // still loaded and mapped with the index. A namespace that goes quiet
+    // would otherwise keep its tiny packs forever. Sweep those with the
+    // leftover budget.
+    //
+    // Coverage rotates with `index_t` so that a ledger with more streams
+    // than one cycle's budget can service still reaches all of them over
+    // time, without persisting a cursor anywhere.
+    let mut pending: Vec<Option<u16>> = Vec::new();
+    if !streams.contains(&None) {
+        pending.push(None);
+    }
+    pending.extend(
+        dict_refs
+            .forward_packs
+            .subject_fwd_ns_packs
+            .iter()
+            .map(|(ns, _)| Some(*ns))
+            .filter(|key| !streams.contains(key)),
+    );
+    if !pending.is_empty() {
+        let offset = (base_index_t.unsigned_abs() as usize) % pending.len();
+        pending.rotate_left(offset);
+    }
+    for key in pending {
+        if compaction_budget.exhausted() {
+            break;
+        }
+        let Some((kind, refs)) = stream_refs(dict_refs, key) else {
+            continue;
+        };
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind,
+                refs,
+                &mut pack_sizes,
+                &mut compaction_budget,
+                CompactionSpans::default(),
+                &format!("{} (maintenance)", stream_label(key)),
+            )
+            .await?,
+        );
+    }
+
+    // Packs created and consumed within this cycle are referenced by no
+    // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
+    let transient = unreferenced_uploads(&uploaded, &dict_refs.forward_packs, base);
+    if !transient.is_empty() {
+        tracing::debug!(
+            count = transient.len(),
+            "V6 Phase 3: forward packs created and compacted within one cycle"
+        );
+    }
+    Ok(transient)
+}
 
 /// Byte/object counts from a single leaf-blob upload, accumulated for tracing.
 #[derive(Default, Clone, Copy)]
@@ -5120,6 +5216,19 @@ fn build_predicate_sids(
     shared: &crate::run_index::resolve::resolver::SharedResolverState,
     namespace_codes: &std::collections::BTreeMap<u16, String>,
 ) -> Vec<(u16, String)> {
+    predicate_sids(
+        (0..shared.predicates.len()).map(|p_id| shared.predicates.resolve(p_id).unwrap_or("")),
+        namespace_codes,
+    )
+}
+
+/// An index root's `predicate_sids`: each predicate IRI, in p_id order,
+/// split at its longest namespace prefix (whole, under code 0, when none
+/// matches).
+pub fn predicate_sids<'a>(
+    iris: impl IntoIterator<Item = &'a str>,
+    namespace_codes: &std::collections::BTreeMap<u16, String>,
+) -> Vec<(u16, String)> {
     use fluree_db_core::PrefixTrie;
 
     let ns_map: std::collections::HashMap<u16, String> = namespace_codes
@@ -5128,9 +5237,8 @@ fn build_predicate_sids(
         .collect();
     let trie = PrefixTrie::from_namespace_codes(&ns_map);
 
-    (0..shared.predicates.len())
-        .map(|p_id| {
-            let iri = shared.predicates.resolve(p_id).unwrap_or("");
+    iris.into_iter()
+        .map(|iri| {
             if let Some((ns_code, prefix_len)) = trie.longest_match(iri) {
                 let suffix = &iri[prefix_len..];
                 (ns_code, suffix.to_string())

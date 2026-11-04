@@ -210,7 +210,18 @@ impl LedgerState {
             // eviction lands.
             .filter(|r| !r.retracted)
             .ok_or_else(|| LedgerError::not_found(ledger_id))?;
+        Self::load_record(ns, record, backend).await
+    }
 
+    /// Load the ledger at the heads `record` names, which need not be the
+    /// ones the nameservice holds yet: a writer can build the state it will
+    /// install before publishing the heads that state is at. `ns` is read
+    /// only for a branch's ancestry.
+    pub async fn load_record(
+        ns: &dyn NameServiceLookup,
+        record: NsRecord,
+        backend: &StorageBackend,
+    ) -> Result<Self> {
         // For branched ledgers, build a recursive content store that falls
         // back through the branch ancestry DAG. This avoids copying the
         // commit chain when creating a branch — reads fall through to
