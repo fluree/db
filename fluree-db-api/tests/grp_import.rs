@@ -1,3 +1,5 @@
+#[path = "support/merge_race.rs"]
+mod race_nameservice;
 #[path = "support/mod.rs"]
 mod support;
 

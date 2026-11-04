@@ -754,6 +754,12 @@ pub enum ImportError {
     /// during an import phase with a per-chunk descriptor cost, such as the
     /// dictionary merge. Carries the observed limit and the remedy.
     FdLimit(String),
+    /// An import into a graph of an existing ledger published its commits,
+    /// through `t`, and then failed to publish its index. Unlike every other
+    /// error, the import is in the ledger: it reads from the commits until an
+    /// index covers them, which the next index build or `fluree reindex`
+    /// writes.
+    PublishedWithoutIndex { t: i64, reason: String },
 }
 
 /// A TriG or N-Quads source names graphs of its own, so it cannot be imported
@@ -805,6 +811,12 @@ impl std::fmt::Display for ImportError {
             ),
             Self::UnsupportedRuntime(msg) => write!(f, "unsupported runtime: {msg}"),
             Self::FdLimit(msg) => write!(f, "open-file limit: {msg}"),
+            Self::PublishedWithoutIndex { t, reason } => write!(
+                f,
+                "the import is published through t={t}, but publishing its index failed \
+                 ({reason}); the ledger reads the import from its commits until an index \
+                 covers them, which `fluree reindex` builds"
+            ),
         }
     }
 }
