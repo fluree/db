@@ -12,12 +12,12 @@ use crate::index_schema::IndexSchema;
 use crate::index_stats::IndexStats;
 use crate::ledger_id::{IntoLedgerId, LedgerId};
 use crate::namespaces::default_namespace_codes;
-use crate::ns_encoding::{canonical_split, NsSplitMode};
+use crate::ns_encoding::{encode_registered, NsSplitMode};
 use crate::range_provider::RangeProvider;
 use crate::schema_hierarchy::SchemaHierarchy;
 use crate::sid::Sid;
 use crate::storage::StorageRead;
-use fluree_vocab::namespaces::{is_full_iri, EMPTY, OVERFLOW};
+use fluree_vocab::namespaces::{is_full_iri, OVERFLOW};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,6 +75,9 @@ pub struct LedgerSnapshotMetadata {
     pub has_list_meta: Option<bool>,
     /// The root this index's root replaced, by its `prev_index` link.
     pub prev_index: Option<ContentId>,
+    /// Content id of the index root this metadata was decoded from; `None`
+    /// when the caller doesn't have it.
+    pub index_root_id: Option<ContentId>,
 }
 
 /// Database value at a specific point in time.
@@ -177,6 +180,11 @@ pub struct LedgerSnapshot {
     pub has_list_meta: Option<bool>,
     /// The root this index's root replaced, by its `prev_index` link.
     pub prev_index: Option<ContentId>,
+    /// Content id of the index root the stats and schema came from. Two loads of one root agree and roots with different stats
+    /// don't, which makes it the stats' identity for caches derived from
+    /// them. `None` when the snapshot wasn't loaded from a root, or was
+    /// decoded by [`Self::from_root_bytes`] without one.
+    index_root_id: Option<ContentId>,
 }
 
 impl Clone for LedgerSnapshot {
@@ -200,6 +208,7 @@ impl Clone for LedgerSnapshot {
             needs_link_reindex: self.needs_link_reindex,
             has_list_meta: self.has_list_meta,
             prev_index: self.prev_index.clone(),
+            index_root_id: self.index_root_id.clone(),
         }
     }
 }
@@ -259,6 +268,7 @@ impl LedgerSnapshot {
             // exact — everything lives in novelty, which tracks its own bit.
             has_list_meta: Some(false),
             prev_index: None,
+            index_root_id: None,
         }
     }
 
@@ -298,6 +308,7 @@ impl LedgerSnapshot {
             needs_link_reindex: meta.needs_link_reindex,
             has_list_meta: meta.has_list_meta,
             prev_index: meta.prev_index,
+            index_root_id: meta.index_root_id,
         })
     }
 
@@ -314,7 +325,27 @@ impl LedgerSnapshot {
         Self::new_meta(meta)
     }
 
+    /// [`Self::from_root_bytes`] for the root `root_id` names, which then
+    /// identifies the snapshot's stats.
+    pub fn from_root(root_id: &ContentId, bytes: &[u8]) -> Result<Self> {
+        let mut snapshot = Self::from_root_bytes(bytes)?;
+        snapshot.index_root_id = Some(root_id.clone());
+        Ok(snapshot)
+    }
+
     // FIR6 decoding lives in `decode_fir6_metadata` below.
+
+    /// Content id of the index root this snapshot's stats and schema came
+    /// from.
+    pub fn index_root_id(&self) -> Option<&ContentId> {
+        self.index_root_id.as_ref()
+    }
+
+    /// Take the stats of the index root `root_id`, keeping the two together.
+    pub fn set_index_root_stats(&mut self, stats: Option<Arc<IndexStats>>, root_id: ContentId) {
+        self.stats = stats;
+        self.index_root_id = Some(root_id);
+    }
 
     /// Attach a range provider for binary index queries.
     pub fn with_range_provider(mut self, provider: Arc<dyn RangeProvider>) -> Self {
@@ -364,11 +395,9 @@ impl LedgerSnapshot {
     /// canonical prefix is not registered, falls back to `Sid(EMPTY, iri)`.
     /// No longest-prefix-match — canonical encoding prohibits `starts_with` matching.
     fn encode_iri_inner(&self, iri: &str) -> Sid {
-        let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
-        if let Some(&code) = self.namespace_reverse.get(canonical_prefix) {
-            return Sid::new(code, canonical_suffix);
-        }
-        Sid::new(EMPTY, iri)
+        encode_registered(iri, self.ns_split_mode, |prefix| {
+            self.namespace_reverse.get(prefix).copied()
+        })
     }
 
     /// Build a reverse lookup from graph Sid → GraphId.
@@ -1056,6 +1085,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         needs_link_reindex: has_annotations && !has_term_dict_section,
         has_list_meta,
         prev_index,
+        index_root_id: None,
     })
 }
 
@@ -1079,12 +1109,13 @@ pub async fn load_ledger_snapshot(
         &root_id.digest_hex(),
     );
     let bytes = storage.read_bytes(&root_address).await?;
-    LedgerSnapshot::from_root_bytes(&bytes)
+    LedgerSnapshot::from_root(root_id, &bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_vocab::namespaces::EMPTY;
 
     #[test]
     fn test_from_root_bytes_rejects_non_fir6() {
@@ -1119,6 +1150,7 @@ mod tests {
             needs_link_reindex: false,
             has_list_meta: None,
             prev_index: None,
+            index_root_id: None,
         })
         .unwrap();
 

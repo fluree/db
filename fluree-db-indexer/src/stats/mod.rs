@@ -24,7 +24,8 @@ pub use class_property::{
     ClassPropertyStatsResult,
 };
 pub use class_stats::{
-    build_class_stat_entries, build_class_stats_json, SpotClassStats, DT_REF_ID,
+    build_class_stat_entries, build_class_stat_entries_with, build_class_stats_json,
+    SpotClassStats, DT_REF_ID,
 };
 pub use hashing::{subject_hash, value_hash, value_hash_v2};
 pub use id_hook::{

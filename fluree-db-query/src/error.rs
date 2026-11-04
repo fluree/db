@@ -2,6 +2,7 @@
 
 use crate::binding::BatchError;
 use crate::eval::{ArithmeticError, ComparisonError};
+use std::borrow::Cow;
 use thiserror::Error;
 
 /// Query execution errors
@@ -150,6 +151,57 @@ pub enum QueryError {
     )]
     R2rmlUnsupportedPattern { detail: String },
 
+    /// A registered mapped graph source (Iceberg / R2RML) whose R2RML mapping
+    /// defines no triples: it has none (`empty_mapping: false`), or the one it
+    /// has compiles to no `rr:TriplesMap` (`true`). Only a record stored before
+    /// registration refused both can be in this state.
+    ///
+    /// Typed, and raised wherever the query names the source, so the query
+    /// fails with its cause rather than reading the source as a ledger that is
+    /// not there or as an empty graph.
+    #[error("graph source '{graph_source_id}' {}", unmapped_cause(.empty_mapping))]
+    GraphSourceUnmapped {
+        graph_source_id: String,
+        empty_mapping: bool,
+    },
+
+    /// An index graph source (BM25, vector, geo) named where a graph is read:
+    /// the query target, `FROM` / `FROM NAMED`, or `GRAPH`. An index has no
+    /// triples; its searches find it by the `f:graphSource` id in their own
+    /// pattern, with the source ledger as the dataset.
+    ///
+    /// Typed so the query fails naming the documented form, rather than
+    /// reading the index as an empty graph.
+    #[error("graph source '{graph_source_id}' is {index}, not a graph: {remedy}")]
+    GraphSourceNotAGraph {
+        graph_source_id: String,
+        /// The index kind, with its article ("a BM25 index").
+        index: String,
+        /// How a query reaches it instead.
+        remedy: &'static str,
+    },
+
+    /// A registered graph source no reader in this build exists for: a family
+    /// it was compiled without (an Iceberg / R2RML source without the
+    /// `iceberg` feature, SQL without `sql`, Delta without `delta`), or a type
+    /// it does not recognize (one a newer build registered).
+    ///
+    /// Typed so the query fails naming what the build lacks, rather than
+    /// reading the source as an empty graph.
+    #[error(
+        "graph source '{graph_source_id}' is {family} graph source, which this build cannot \
+         read: {cause}"
+    )]
+    GraphSourceUnsupported {
+        graph_source_id: String,
+        /// The family, with its article ("an Iceberg"), or the unrecognized
+        /// type ("a 'f:FutureSource'").
+        family: Cow<'static, str>,
+        /// Why: the cargo feature it was compiled without, or that it does
+        /// not recognize the type.
+        cause: Cow<'static, str>,
+    },
+
     /// Object storage denied a read of an external table's data (S3 403 /
     /// `AccessDenied`).
     ///
@@ -159,10 +211,12 @@ pub enum QueryError {
     /// `AccessDenied` for a missing object without `s3:ListBucket`, this means
     /// the credentials lack access **or** the object was moved/removed.
     #[error(
-        "Storage access denied for s3://{bucket}/{key}{region_suffix}: {message}",
+        "Storage access denied for {scheme}://{bucket}/{key}{region_suffix}: {message}",
         region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
     )]
     StorageAccessDenied {
+        /// The object path's scheme as written (`s3`, `s3a`, `gs`).
+        scheme: &'static str,
         /// Bucket parsed from the object path.
         bucket: String,
         /// Object key parsed from the object path.
@@ -170,6 +224,17 @@ pub enum QueryError {
         /// Configured/resolved region, if known.
         region: Option<String>,
         /// The underlying storage error detail.
+        message: String,
+    },
+
+    /// The source's storage identity does not serve this path's scheme (an
+    /// AWS identity asked for `gs://` without a GCS interop endpoint, a Google
+    /// identity asked for `s3://`). Refused, never re-routed.
+    #[error("{message}")]
+    StorageSchemeNotServed {
+        /// The refused path's scheme (`s3`, `gs`, `file`, …).
+        scheme: String,
+        /// The rendered refusal, naming the path and the identity.
         message: String,
     },
 
@@ -201,6 +266,56 @@ pub enum QueryError {
         /// The table as the catalog names it.
         table: String,
         /// The catalog's refusal.
+        message: String,
+    },
+
+    /// A Google catalog refused the request because it names no quota project.
+    #[error("{message}")]
+    CatalogQuotaProjectRequired {
+        /// The table the refused request was for.
+        table: String,
+        /// The rendered refusal, naming the fix.
+        message: String,
+    },
+
+    /// A Google token exchange for a graph source's identity was refused or
+    /// failed. Carries Google's status and error code, never a response body.
+    #[error("{message}")]
+    GoogleTokenExchange {
+        /// Which exchange (`sts`, `impersonation`, `jwt`, `refresh`, `metadata`).
+        stage: String,
+        /// Google's HTTP status, or `None` when no response arrived.
+        status: Option<u16>,
+        /// Google's error code, or a fixed Fluree code.
+        reason: Option<String>,
+        /// The rendered refusal.
+        message: String,
+    },
+
+    /// A graph source's Google credential configuration was refused. Names
+    /// the field, never its value.
+    #[error("Invalid Google credentials: {0}")]
+    GoogleCredentialsInvalid(String),
+
+    /// A host-derived identity was refused by the instance's host-identity
+    /// policy.
+    #[error("{message}")]
+    HostIdentityRefused {
+        /// The refused kind (`aws`, `google-metadata`, `google-adc`, `google-wif`).
+        kind: String,
+        /// The rendered refusal, naming the setting that governs it.
+        message: String,
+    },
+
+    /// A token from a host identity was not sent to a host that is not one of
+    /// Google's APIs (the source's catalog or endpoint pointed elsewhere).
+    #[error("{message}")]
+    GoogleTokenHostRefused {
+        /// The host identity the token is from (`google-metadata`, …).
+        kind: String,
+        /// The host the request was for.
+        host: String,
+        /// The rendered refusal, naming the setting that governs it.
         message: String,
     },
 
@@ -253,6 +368,16 @@ pub enum QueryError {
     Comparison(#[from] ComparisonError),
 }
 
+/// The tail of a [`QueryError::GraphSourceUnmapped`] message.
+fn unmapped_cause(empty_mapping: &bool) -> &'static str {
+    if *empty_mapping {
+        "has an R2RML mapping that defines no rr:TriplesMap; register it again with a mapping \
+         that defines one"
+    } else {
+        "has no R2RML mapping; register it again with a mapping"
+    }
+}
+
 impl QueryError {
     /// Create a dictionary lookup failure with debug context.
     pub fn dictionary_lookup(msg: impl Into<String>) -> Self {
@@ -300,6 +425,20 @@ impl QueryError {
             Self::UngroupedRead(read) => Self::InvalidQuery(read.named_message(vars)),
             other => other,
         }
+    }
+
+    /// A refusal naming a graph source no query reads as a graph: one with no
+    /// mapping or an empty one, an index, or one this build has no reader for.
+    /// A query that names the source fails with it; a `GRAPH ?g` whose `?g`
+    /// took the source's IRI from data reads it instead as a graph outside the
+    /// dataset, which yields no rows for that binding.
+    pub fn is_unreadable_graph_source(&self) -> bool {
+        matches!(
+            self,
+            Self::GraphSourceUnmapped { .. }
+                | Self::GraphSourceNotAGraph { .. }
+                | Self::GraphSourceUnsupported { .. }
+        )
     }
 
     /// Create an [`Self::R2rmlUnsupportedPattern`] refusal with an actionable
@@ -369,6 +508,7 @@ mod tests {
     #[test]
     fn storage_access_denied_display_names_object_and_region() {
         let e = QueryError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".to_string(),
             key: "warehouse/t/data/f.parquet".to_string(),
             region: Some("us-east-2".to_string()),
@@ -383,6 +523,7 @@ mod tests {
 
         // Region is omitted cleanly when unknown.
         let no_region = QueryError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".to_string(),
             key: "k".to_string(),
             region: None,
@@ -392,6 +533,16 @@ mod tests {
             no_region.to_string(),
             "Storage access denied for s3://b/k: m"
         );
+
+        // A GCS object is named by its own scheme.
+        let gcs = QueryError::StorageAccessDenied {
+            scheme: "gs",
+            bucket: "lake".to_string(),
+            key: "k".to_string(),
+            region: None,
+            message: "m".to_string(),
+        };
+        assert_eq!(gcs.to_string(), "Storage access denied for gs://lake/k: m");
     }
 
     #[test]

@@ -46,12 +46,14 @@ from fluree._sources import (
     Bearer,
     EnvVar,
     Glue,
+    Google,
     GraphSource,
     MaterializeResult,
     OAuth2,
     S3Tables,
     Unity,
 )
+from fluree import doc
 from fluree._rdf import RdfFormat, parse, serialize
 from fluree._terms import IRI, BlankNode, LangString, Literal, Quad, Triple, Vector
 from fluree.errors import (
@@ -71,6 +73,7 @@ from fluree.errors import (
 __version__ = _version("fluree")
 
 __all__ = [
+    "doc",
     "AzureServicePrincipal",
     "Bearer",
     "BlankNode",
@@ -85,6 +88,7 @@ __all__ = [
     "FlureeError",
     "FullText",
     "Glue",
+    "Google",
     "GraphSource",
     "IRI",
     "IndexStatus",

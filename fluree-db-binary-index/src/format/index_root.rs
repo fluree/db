@@ -985,9 +985,10 @@ impl IndexRoot {
     /// The snapshot metadata this root carries, so a caller holding the
     /// decoded root does not decode the bytes a second time for the snapshot.
     /// The large sections (stats and schema) move out; everything the binary
-    /// index store reads stays in place.
+    /// index store reads stays in place. `root_id` is this root's content id.
     pub fn take_snapshot_metadata(
         &mut self,
+        root_id: &ContentId,
     ) -> io::Result<fluree_db_core::db::LedgerSnapshotMetadata> {
         let ledger_id = fluree_db_core::LedgerId::parse(&self.ledger_id).map_err(|e| {
             io::Error::new(
@@ -1014,6 +1015,7 @@ impl IndexRoot {
             needs_link_reindex: self.has_annotations && self.term_dict.is_none(),
             has_list_meta: self.has_list_meta,
             prev_index: self.prev_index.as_ref().map(|prev| prev.id.clone()),
+            index_root_id: Some(root_id.clone()),
         })
     }
 
@@ -1915,10 +1917,13 @@ mod tests {
                 )
             )
         };
-        let from_bytes = LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        let root_id = ContentId::new(fluree_db_core::ContentKind::IndexRoot, &bytes);
+        let from_bytes = LedgerSnapshot::from_root(&root_id, &bytes).unwrap();
         let mut decoded = IndexRoot::decode(&bytes).unwrap();
         let from_root =
-            LedgerSnapshot::new_meta(decoded.take_snapshot_metadata().unwrap()).unwrap();
+            LedgerSnapshot::new_meta(decoded.take_snapshot_metadata(&root_id).unwrap()).unwrap();
+        assert_eq!(from_root.index_root_id(), Some(&root_id));
+        assert_eq!(from_root.index_root_id(), from_bytes.index_root_id());
         assert_eq!(view(&from_root), view(&from_bytes));
         assert!(from_root.stats.is_some() && from_root.schema.is_some());
         let replaced = root.prev_index.map(|prev| prev.id);

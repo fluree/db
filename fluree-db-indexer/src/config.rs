@@ -288,7 +288,9 @@ pub struct IndexerConfig {
     /// base-index re-scan to move its class-scoped property/ref stats (issue
     /// #1266); above this count, recomputing class stats from scratch via the
     /// rebuild SPOT pass is cheaper and simpler. Counts only subjects that
-    /// existed in the base index (new-subject inserts are free). Default
+    /// existed in the base index (new-subject inserts are free). A floor: a
+    /// base index with more typed subjects raises it to an eighth of them,
+    /// since the rebuild's cost grows with the index. Default
     /// [`DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS`].
     pub incremental_retype_max_subjects: usize,
 

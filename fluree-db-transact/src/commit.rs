@@ -1241,15 +1241,18 @@ fn finalize_state_with_base(
         "commit_txn dict ownership before make_mut"
     );
 
-    // 10.1 Populate DictNovelty with subjects/strings from this commit.
+    // 10.1 Populate DictNovelty with subjects/strings from this commit. It
+    // still covers novelty after the commit if it did before
+    // (`DictNovelty::covers`).
     {
         let span = tracing::debug_span!("commit_populate_dict_novelty");
         let _g = span.enter();
-        populate_dict_novelty(
-            Arc::make_mut(&mut dict_novelty),
-            store.as_deref(),
-            &all_flakes,
-        )?;
+        let covered = dict_novelty.covers(base.novelty.t);
+        let dict = Arc::make_mut(&mut dict_novelty);
+        populate_dict_novelty(dict, store.as_deref(), &all_flakes)?;
+        if covered {
+            dict.mark_covered_through(new_t);
+        }
     }
 
     Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(&all_flakes);

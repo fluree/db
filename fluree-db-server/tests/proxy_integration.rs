@@ -4122,3 +4122,47 @@ async fn test_proxy_peer_ledger_route_resolves_the_dataset_in_its_registry() {
 
     server_handle.abort();
 }
+
+/// A peer forwards a write to the transaction server under the path it was
+/// sent to. The nested `/v1/fluree` router strips its prefix from the URI a
+/// handler sees, and forwarding that URI reached a path the transaction
+/// server does not serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_forwards_a_write() {
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    state.fluree.create_ledger("peerfw").await.expect("create");
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let resp = build_router(peer)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/peerfw:main")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"@id": "http://example.org/a", "http://example.org/name": "A"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ledger = state.fluree.ledger("peerfw:main").await.expect("ledger");
+    assert_eq!(ledger.t(), 1);
+    server_handle.abort();
+}

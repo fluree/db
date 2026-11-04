@@ -45,6 +45,11 @@ use imbl::OrdMap;
 /// component-wise (s, p, o, dt, m), which equals `same_identity`'s ordering.
 type FactKey = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
 
+#[cfg(test)]
+pub(crate) fn fact_state_key(f: &Flake) -> FactKey {
+    key_of(f)
+}
+
 fn key_of(f: &Flake) -> FactKey {
     (
         f.s.clone(),
@@ -59,10 +64,22 @@ fn key_of(f: &Flake) -> FactKey {
 /// window." The stored value is `(t, op)`: the resolved transaction time and
 /// op (`true` = currently asserted, `false` = currently retracted tombstone).
 /// Cheap to clone (persistent map).
+///
+/// Trimming the window ([`Self::trim_through`]) moves a cutoff instead of
+/// rebuilding the maps: an entry at or below it names an op the index now
+/// holds, so it reads as absent, which is what a rebuild from the surviving
+/// flakes would make it. Any op recorded after the trim has a higher `t`, so
+/// it supersedes a stale entry under the same rule. Stale entries are
+/// removed a bounded number at a time by [`Self::sweep`].
 #[derive(Clone, Default)]
 pub(crate) struct NoveltyFactState {
     /// By graph; absent for graphs with no novelty yet.
-    graphs: OrdMap<GraphId, OrdMap<FactKey, (i64, bool)>>,
+    pub(crate) graphs: OrdMap<GraphId, OrdMap<FactKey, (i64, bool)>>,
+    /// Entries at or below this `t` are stale.
+    cutoff: i64,
+    /// By graph, where the sweep of stale entries resumes: absent when there
+    /// is nothing left to sweep, `None` from the first key.
+    sweep: OrdMap<GraphId, Option<FactKey>>,
 }
 
 impl NoveltyFactState {
@@ -75,8 +92,84 @@ impl NoveltyFactState {
     pub(crate) fn is_asserted(&self, g: GraphId, flake: &Flake) -> bool {
         self.graphs
             .get(&g)
-            .and_then(|m| m.get(&key_of(flake)).map(|&(_, op)| op))
-            .unwrap_or(false)
+            .and_then(|m| m.get(&key_of(flake)))
+            .is_some_and(|&(t, op)| op && t > self.cutoff)
+    }
+
+    /// Drop the ops at or below `cutoff_t` from the window, as trimming
+    /// novelty through it does. A graph whose remaining flakes `survivors`
+    /// hands over is rebuilt from them now, so a trim that leaves few, or none,
+    /// keeps none of the trimmed window resident on a ledger that goes idle;
+    /// the rest move the cutoff and are swept by later commits (see
+    /// [`NoveltyFactState`]).
+    pub(crate) fn trim_through<'a, I>(
+        &mut self,
+        cutoff_t: i64,
+        mut survivors: impl FnMut(GraphId) -> Option<I>,
+    ) where
+        I: Iterator<Item = &'a Flake>,
+    {
+        self.cutoff = self.cutoff.max(cutoff_t);
+        let mut sweep = OrdMap::new();
+        let graphs: Vec<GraphId> = self.graphs.keys().copied().collect();
+        for g in graphs {
+            let Some(flakes) = survivors(g) else {
+                sweep.insert(g, None);
+                continue;
+            };
+            self.graphs.remove(&g);
+            for flake in flakes {
+                self.record(g, flake);
+            }
+        }
+        self.sweep = sweep;
+    }
+
+    /// Remove up to `budget` stale entries' worth of the maps, examining at
+    /// most `budget` entries, so the cost of trimming spreads over the
+    /// commits that follow it.
+    pub(crate) fn sweep(&mut self, budget: usize) {
+        let mut left = budget;
+        while left > 0 {
+            let Some((g, start)) = self.sweep.iter().next().map(|(g, k)| (*g, k.clone())) else {
+                return;
+            };
+            let Some(m) = self.graphs.get_mut(&g) else {
+                self.sweep.remove(&g);
+                continue;
+            };
+            let lower = match start {
+                Some(key) => std::ops::Bound::Excluded(key),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut stale: Vec<FactKey> = Vec::new();
+            let mut last: Option<&FactKey> = None;
+            let mut examined = 0usize;
+            for (key, &(t, _)) in m.range((lower, std::ops::Bound::Unbounded)) {
+                if examined == left {
+                    break;
+                }
+                examined += 1;
+                if t <= self.cutoff {
+                    stale.push(key.clone());
+                }
+                last = Some(key);
+            }
+            let last = last.cloned();
+            for key in &stale {
+                m.remove(key);
+            }
+            if m.is_empty() {
+                self.graphs.remove(&g);
+            }
+            left -= examined;
+            if examined == 0 || left > 0 {
+                // Reached the end of this graph's map.
+                self.sweep.remove(&g);
+            } else {
+                self.sweep.insert(g, last);
+            }
+        }
     }
 
     /// Record `flake` as an op for its identity in graph `g`. Lifecycle
@@ -113,6 +206,35 @@ mod tests {
             op,
             lang.map(FlakeMeta::with_lang),
         )
+    }
+
+    /// A bounded sweep removes stale entries only, across calls, and none
+    /// of it changes an answer.
+    #[test]
+    fn sweep_removes_only_stale_entries_in_bounded_steps() {
+        let mut fs = NoveltyFactState::new();
+        for s in 0..100u16 {
+            fs.record(0, &mk(s, i64::from(s % 10) + 1, true, None));
+        }
+        fs.trim_through(5, |_| None::<std::iter::Empty<&Flake>>);
+        let live = |fs: &NoveltyFactState| {
+            (0..100u16)
+                .filter(|&s| fs.is_asserted(0, &mk(s, 0, true, None)))
+                .count()
+        };
+        assert_eq!(live(&fs), 50);
+        let mut steps = 0;
+        while !fs.sweep.is_empty() {
+            fs.sweep(7);
+            assert_eq!(live(&fs), 50);
+            steps += 1;
+        }
+        assert!(steps > 10, "the sweep took bounded steps ({steps})");
+        assert_eq!(
+            fs.graphs.get(&0).unwrap().len(),
+            50,
+            "only stale entries removed"
+        );
     }
 
     #[test]

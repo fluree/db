@@ -29,10 +29,10 @@ docker run -p 8090:8090 fluree/server:latest
 **Homebrew, shell installer, or Windows PowerShell** — installs the `fluree` binary that bundles both the CLI and the embedded server (`fluree server run`).
 
 ```bash
-# Homebrew (macOS / Linux)
+# Homebrew (macOS 14 or later / Linux)
 brew install fluree/tap/fluree
 
-# Shell installer (macOS / Linux)
+# Shell installer (macOS 14 or later / Linux)
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh
 ```
 

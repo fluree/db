@@ -1929,6 +1929,132 @@ pub fn sort_remap_and_write_sorted_commit(
     })
 }
 
+/// Renumber a sorted commit's chunk-local ids in the order of the global ids
+/// they remap to.
+///
+/// The import's k-way merges remap chunk streams on the fly and need them
+/// to stay sorted, which holds only while every local→global remap is
+/// monotone. A merge over an existing dictionary breaks that: existing terms
+/// keep their ids and new ones are numbered above the watermark. Renumbering
+/// each id by the rank of its global id restores it. Rewrites the commit
+/// (re-sorted), its types-map sidecar, and both remap files in place, and
+/// returns the commit's info and language remap to use from then on.
+pub fn relocalize_sorted_commit(
+    info: &SortedCommitInfo,
+    subject_remap_path: &Path,
+    string_remap_path: &Path,
+    lang_remap: &[u16],
+) -> io::Result<(SortedCommitInfo, Vec<u16>)> {
+    use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
+
+    // Relocalizing renumbers subjects and strings only; a chunk's triple
+    // terms would keep ids that no longer name their components.
+    if info.term_table.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "an import into a graph of an existing ledger does not support triple terms \
+             or edge annotations yet",
+        ));
+    }
+
+    /// `remap` reordered by value, and each old index's rank in that order.
+    fn by_rank<T: Copy + Ord>(remap: &[T]) -> (Vec<T>, Vec<u64>) {
+        let mut order: Vec<usize> = (0..remap.len()).collect();
+        order.sort_unstable_by_key(|&i| remap[i]);
+        let mut rank = vec![0u64; remap.len()];
+        for (r, &old) in order.iter().enumerate() {
+            rank[old] = r as u64;
+        }
+        (order.iter().map(|&i| remap[i]).collect(), rank)
+    }
+
+    fn read_le<const N: usize>(path: &Path) -> io::Result<Vec<[u8; N]>> {
+        let bytes = std::fs::read(path)?;
+        Ok(bytes
+            .chunks_exact(N)
+            .map(|c| c.try_into().expect("chunks_exact yields N bytes"))
+            .collect())
+    }
+
+    let subject_remap: Vec<u64> = read_le::<8>(subject_remap_path)?
+        .into_iter()
+        .map(u64::from_le_bytes)
+        .collect();
+    let string_remap: Vec<u32> = read_le::<4>(string_remap_path)?
+        .into_iter()
+        .map(u32::from_le_bytes)
+        .collect();
+    let lang_monotone = lang_remap.get(1..).unwrap_or(&[]).is_sorted();
+    if subject_remap.is_sorted() && string_remap.is_sorted() && lang_monotone {
+        return Ok((info.clone(), lang_remap.to_vec()));
+    }
+
+    let (subjects_by_rank, subject_rank) = by_rank(&subject_remap);
+    let (strings_by_rank, string_rank) = by_rank(&string_remap);
+    let string_rank: Vec<u32> = string_rank.into_iter().map(|r| r as u32).collect();
+    // Index 0 is the "no tag" sentinel on both sides.
+    let (langs_by_rank, lang_rank) = by_rank(lang_remap.get(1..).unwrap_or(&[]));
+    let lang_rank: Vec<u16> = std::iter::once(0)
+        .chain(lang_rank.into_iter().map(|r| r as u16 + 1))
+        .collect();
+    let new_lang_remap: Vec<u16> = std::iter::once(0).chain(langs_by_rank).collect();
+
+    let mut records: Vec<RunRecordV2> = Vec::with_capacity(info.record_count as usize);
+    for record in SortedCommitReaderV2::open(&info.path, info.record_count)? {
+        let mut record = record?;
+        remap_v2_record(
+            &mut record,
+            &subject_rank,
+            &string_rank,
+            Some(lang_rank.as_slice()),
+            None,
+        )?;
+        records.push(record);
+    }
+    records.sort_unstable_by(cmp_v2_g_spot);
+
+    let tmp_path = info.path.with_extension("relocalized");
+    let mut writer = SortedCommitWriterV2::new(&tmp_path, info.chunk_idx)?;
+    for record in &records {
+        writer.push(record)?;
+    }
+    let written = writer.finish()?;
+    std::fs::rename(&tmp_path, &info.path)?;
+
+    if let Some(types_path) = &info.types_map_path {
+        use crate::run_index::build::build_from_commits::TYPES_RECORD_BYTES;
+        let mut bytes = std::fs::read(types_path)?;
+        // `[g_id: u32][subject: u64][class: u64]`: both ids are subjects.
+        for entry in bytes.chunks_exact_mut(TYPES_RECORD_BYTES) {
+            for field in [4..12, 12..20] {
+                let local = u64::from_le_bytes(entry[field.clone()].try_into().unwrap());
+                let rank = subject_rank.get(local as usize)?;
+                entry[field].copy_from_slice(&rank.to_le_bytes());
+            }
+        }
+        std::fs::write(types_path, bytes)?;
+    }
+
+    let subject_bytes: Vec<u8> = subjects_by_rank
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    std::fs::write(subject_remap_path, subject_bytes)?;
+    let string_bytes: Vec<u8> = strings_by_rank
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    std::fs::write(string_remap_path, string_bytes)?;
+
+    Ok((
+        SortedCommitInfo {
+            byte_len: written.byte_len,
+            ..info.clone()
+        },
+        new_lang_remap,
+    ))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2541,6 +2667,125 @@ mod tests {
         // Verify SPOT order: records must be sorted by s_id ascending
         assert!(read[0].s_id.as_u64() <= read[1].s_id.as_u64());
         assert!(read[1].s_id.as_u64() <= read[2].s_id.as_u64());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk remapped through non-monotone remaps (a merge over an
+    /// existing dictionary) streams out of order; relocalized, it streams in
+    /// global SPOT order and still remaps to the same records.
+    #[test]
+    fn relocalized_commit_streams_in_global_order() {
+        use crate::run_index::resolve::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
+        use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
+
+        let dir = std::env::temp_dir().join("fluree_test_relocalize_commit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut subj_dict = ChunkSubjectDict::new();
+        let alice = subj_dict.get_or_insert(5, b"Alice");
+        let bob = subj_dict.get_or_insert(5, b"Bob");
+        let carol = subj_dict.get_or_insert(5, b"Carol");
+        let mut str_dict = ChunkStringDict::new();
+        let a = u64::from(str_dict.get_or_insert(b"a"));
+        let b = u64::from(str_dict.get_or_insert(b"b"));
+        let mut lang_map = rustc_hash::FxHashMap::default();
+        lang_map.insert("de".to_string(), 1u16);
+        lang_map.insert("fr".to_string(), 2u16);
+
+        const RDF_TYPE: u32 = 1;
+        let lex = |s: u64, p: u32, str_id: u64, lang_id: u16| {
+            let mut r = make_record(s, p, ObjKind::LEX_ID, str_id, 1);
+            if lang_id != 0 {
+                r.dt = DatatypeDictId::LANG_STRING.as_u16();
+                r.lang_id = lang_id;
+            }
+            r
+        };
+        let records = vec![
+            make_record(alice, 10, ObjKind::REF_ID, carol, 1),
+            lex(bob, 10, a, 0),
+            lex(carol, 10, b, 0),
+            lex(alice, 20, a, 1),
+            lex(alice, 20, a, 2),
+            make_record(bob, RDF_TYPE, ObjKind::REF_ID, alice, 1),
+        ];
+        let registry = OTypeRegistry::builtin_only();
+        let info = sort_remap_and_write_sorted_commit(
+            records,
+            Vec::new(),
+            subj_dict,
+            str_dict,
+            &dir.join("subjects.voc"),
+            &dir.join("strings.voc"),
+            &dir.join("commit_0.fsv2"),
+            0,
+            Some((&lang_map, &dir.join("languages.voc"))),
+            Some(TypesMapConfig {
+                rdf_type_p_id: RDF_TYPE,
+                output_dir: &dir,
+            }),
+            &registry,
+        )
+        .unwrap();
+
+        // Sorted-local ids are Alice, Bob, Carol / "a", "b" / de, fr; the
+        // global ids an existing dictionary gave them are in no such order.
+        let subject_remap: Vec<u64> = vec![900, 100, 500];
+        let string_remap: Vec<u32> = vec![7, 3];
+        let lang_remap: Vec<u16> = vec![0, 5, 2];
+        let subject_path = dir.join("subjects.rmp");
+        let string_path = dir.join("strings.rmp");
+        let write_remaps = |subjects: &[u64], strings: &[u32]| {
+            let bytes: Vec<u8> = subjects.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(&subject_path, bytes).unwrap();
+            let bytes: Vec<u8> = strings.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(&string_path, bytes).unwrap();
+        };
+        write_remaps(&subject_remap, &string_remap);
+
+        let globalize = |info: &SortedCommitInfo, lang_remap: &[u16]| -> Vec<RunRecordV2> {
+            let s_remap = MmapSubjectRemap::open(&subject_path).unwrap();
+            let str_remap = MmapStringRemap::open(&string_path).unwrap();
+            SortedCommitReaderV2::open(&info.path, info.record_count)
+                .unwrap()
+                .map(|r| {
+                    let mut r = r.unwrap();
+                    remap_v2_record(&mut r, &s_remap, &str_remap, Some(lang_remap), None).unwrap();
+                    r
+                })
+                .collect()
+        };
+        let mut expected = globalize(&info, &lang_remap);
+        assert!(
+            !expected.is_sorted_by(|x, y| cmp_v2_g_spot(x, y).is_le()),
+            "the fixture must stream out of global order before relocalizing"
+        );
+        expected.sort_unstable_by(cmp_v2_g_spot);
+
+        let (info, lang_remap) =
+            relocalize_sorted_commit(&info, &subject_path, &string_path, &lang_remap).unwrap();
+
+        assert_eq!(lang_remap, vec![0, 2, 5]);
+        let streamed = globalize(&info, &lang_remap);
+        assert_eq!(streamed, expected);
+
+        // The types-map sidecar names the same edge through the new remap.
+        let s_remap = MmapSubjectRemap::open(&subject_path).unwrap();
+        let types = std::fs::read(info.types_map_path.as_ref().unwrap()).unwrap();
+        let edges: Vec<(u64, u64)> = types
+            .chunks_exact(20)
+            .map(|e| {
+                let s = u64::from_le_bytes(e[4..12].try_into().unwrap());
+                let c = u64::from_le_bytes(e[12..20].try_into().unwrap());
+                (
+                    s_remap.get(s as usize).unwrap(),
+                    s_remap.get(c as usize).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(edges, vec![(100, 900)]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

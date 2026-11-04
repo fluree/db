@@ -73,7 +73,9 @@ A list — a JSON-LD `@list`, or a Turtle `( … )` in object position — is st
 | `jsonld` | `{"@id": "ex:s", "ex:items": {"@list": ["c", "a", "b"]}}` |
 | `ntriples`, `nquads` | `<ex:s> <ex:items> _:l0-0 .`, then `rdf:first`/`rdf:rest` triples ending in `rdf:nil` |
 
-Turtle, TriG and JSON-LD insert back as the same list. N-Triples and N-Quads have no list syntax, so they write the `rdf:first`/`rdf:rest` chain that a Turtle `( … )` stands for, which other RDF tools read as the same list. Inserted into Fluree, that chain is stored as the blank nodes and triples it spells out rather than as a list, so use Turtle, TriG or JSON-LD to copy lists between ledgers.
+Turtle, TriG and JSON-LD insert back as the same list. N-Triples and N-Quads have no list syntax, so they write the `rdf:first`/`rdf:rest` chain that a Turtle `( … )` stands for, which other RDF tools read as the same list. Inserted or upserted into Fluree, that chain is stored as a list again. A bulk import (`fluree create --from`) stores it as the blank nodes and triples it spells out, so use Turtle, TriG or JSON-LD to copy lists between ledgers that way.
+
+A second list on one subject and property is stored as its triples (see [Writing lists](../query/sparql.md#writing-lists)), and export writes those triples.
 
 ### Edge annotations (RDF 1.2)
 

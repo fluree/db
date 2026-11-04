@@ -371,7 +371,9 @@ impl VectorCreateConfig {
 // Iceberg Configuration
 // =============================================================================
 
-/// Configuration for creating an Iceberg graph source.
+/// The Iceberg half of an Iceberg graph source's configuration: the table and
+/// how to reach it. A source is registered from an [`R2rmlCreateConfig`], which
+/// pairs this with the R2RML mapping its queries are answered from.
 ///
 /// Iceberg graph sources provide access to Apache Iceberg tables stored in data lakes
 /// (S3, GCS, etc.) via REST catalogs like Apache Polaris.
@@ -379,9 +381,9 @@ impl VectorCreateConfig {
 /// # Example
 ///
 /// ```ignore
-/// use fluree_db_api::IcebergCreateConfig;
+/// use fluree_db_api::{IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput};
 ///
-/// let config = IcebergCreateConfig::new(
+/// let iceberg = IcebergCreateConfig::new(
 ///     "openflights-gs",
 ///     "https://polaris.example.com",
 ///     "openflights.airlines",
@@ -389,7 +391,12 @@ impl VectorCreateConfig {
 /// .with_auth_bearer("my-token")
 /// .with_warehouse("my-warehouse");
 ///
-/// let result = fluree.create_iceberg_graph_source(config).await?;
+/// let config = R2rmlCreateConfig {
+///     iceberg,
+///     mapping: R2rmlMappingInput::Content(mapping_ttl),
+///     mapping_media_type: None,
+/// };
+/// let result = fluree.create_r2rml_graph_source(config).await?;
 /// ```
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone)]
@@ -440,6 +447,10 @@ pub struct IcebergConnectionConfig {
 
     /// Storage / IO configuration (vended credentials + S3 region/endpoint/path-style).
     pub io: fluree_db_iceberg::config::IoConfig,
+
+    /// Settings a builder method was given that this catalog mode cannot
+    /// honor, refused by [`Self::validate`] rather than silently ignored.
+    refused: Vec<crate::graph_source::GraphSourceInputError>,
 }
 
 /// How the Iceberg catalog is accessed.
@@ -528,15 +539,14 @@ pub struct CatalogModeArgs<'a> {
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogModeError {
-    /// `mode` is not a catalog mode.
+    /// `mode` is not a catalog mode. The message does not repeat it, since a
+    /// refusal names fields, never the values given.
     UnknownMode(String),
     /// The mode needs `field`.
     MissingField {
         mode: &'static str,
         field: &'static str,
     },
-    /// A catalog mode with no R2RML mapping needs the source's own `table`.
-    MissingTable { mode: &'static str },
     /// `field` is a REST catalog setting, which this mode would ignore.
     NotForMode {
         mode: &'static str,
@@ -549,17 +559,12 @@ impl CatalogModeError {
     /// The error message, with each field name rendered by `spell`.
     pub fn message(&self, spell: impl Fn(&str) -> String) -> String {
         match self {
-            CatalogModeError::UnknownMode(mode) => format!(
-                "unknown catalog mode '{mode}'. Use 'rest', 'direct', 'glue', or 's3tables'."
-            ),
+            CatalogModeError::UnknownMode(_) => {
+                "unknown catalog mode. Use 'rest', 'direct', 'glue', or 's3tables'.".to_string()
+            }
             CatalogModeError::MissingField { mode, field } => {
                 format!("{} is required for {mode} mode", spell(field))
             }
-            CatalogModeError::MissingTable { mode } => format!(
-                "{} is required for {mode} mode (or provide {} to define tables via mapping)",
-                spell("table"),
-                spell("r2rml")
-            ),
             CatalogModeError::NotForMode { mode, field } => format!(
                 "{} applies to rest mode only; {mode} mode would ignore it",
                 spell(field)
@@ -619,6 +624,7 @@ impl IcebergConnectionConfig {
                 auth: fluree_db_iceberg::auth::AuthConfig::None,
             })),
             io: fluree_db_iceberg::config::IoConfig::default(),
+            refused: Vec::new(),
         }
     }
 
@@ -633,6 +639,7 @@ impl IcebergConnectionConfig {
                 vended_credentials: false,
                 ..Default::default()
             },
+            refused: Vec::new(),
         }
     }
 
@@ -646,6 +653,7 @@ impl IcebergConnectionConfig {
                 vended_credentials: false,
                 ..Default::default()
             },
+            refused: Vec::new(),
         }
     }
 
@@ -662,6 +670,7 @@ impl IcebergConnectionConfig {
                 vended_credentials: false,
                 ..Default::default()
             },
+            refused: Vec::new(),
         }
     }
 
@@ -688,13 +697,8 @@ impl IcebergConnectionConfig {
     /// the process that reads the tables
     /// ([`ConfigValue::from_env`](fluree_db_iceberg::ConfigValue::from_env)).
     /// Only a literal is stored as the token itself.
-    pub fn with_auth_bearer_value(mut self, token: fluree_db_iceberg::ConfigValue) -> Self {
-        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
-            rest.auth = fluree_db_iceberg::auth::AuthConfig::Bearer { token };
-        } else {
-            tracing::warn!("bearer auth has no effect in Direct catalog mode");
-        }
-        self
+    pub fn with_auth_bearer_value(self, token: fluree_db_iceberg::ConfigValue) -> Self {
+        self.with_auth(fluree_db_iceberg::auth::AuthConfig::Bearer { token })
     }
 
     /// Set Google metadata-server authentication (REST mode only).
@@ -702,16 +706,34 @@ impl IcebergConnectionConfig {
     /// Mints and refreshes short-lived Google OAuth tokens from the GCE/GKE
     /// metadata server (Workload Identity) — for Google Iceberg REST catalogs
     /// (BigLake), where a static bearer expires after ~1h. `scopes` is optional
-    /// (defaults to cloud-platform).
-    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
-        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
-            rest.auth = fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
-                scopes,
-                metadata_url: None,
-            };
-        } else {
-            tracing::warn!("with_auth_google_metadata has no effect in Direct catalog mode");
+    /// (defaults to cloud-platform). Any other Google identity is
+    /// [`Self::with_auth`] with [`AuthConfig::Google`](fluree_db_iceberg::auth::AuthConfig::Google).
+    pub fn with_auth_google_metadata(self, scopes: Option<String>) -> Self {
+        self.with_auth(fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+            scopes,
+            metadata_url: None,
+        })
+    }
+
+    /// Set the catalog's auth (REST mode only), in its stored shape. Every
+    /// other auth builder is this one. Any other mode refuses a catalog auth
+    /// at [`Self::validate`]; `AuthConfig::None` agrees with every mode.
+    pub fn with_auth(mut self, auth: fluree_db_iceberg::auth::AuthConfig) -> Self {
+        match &mut self.catalog_mode {
+            CatalogMode::Rest(rest) => rest.auth = auth,
+            _ if auth == fluree_db_iceberg::auth::AuthConfig::None => {}
+            _ => self.refuse_for_mode("auth"),
         }
+        self
+    }
+
+    /// Set which identity reads the source's files, in its stored shape (see
+    /// [`StorageAuth`](fluree_db_iceberg::StorageAuth)). Also sets
+    /// `io.vended_credentials` to agree with it (true exactly for `vended`),
+    /// which the stored config requires and older readers consult. Whether the
+    /// catalog mode can serve it is checked at [`Self::validate`].
+    pub fn with_storage_auth(mut self, storage_auth: fluree_db_iceberg::StorageAuth) -> Self {
+        self.io = self.io.with_storage_auth(storage_auth);
         self
     }
 
@@ -758,54 +780,32 @@ impl IcebergConnectionConfig {
     /// variable of the process that reads the tables. Scope and audience are
     /// set afterwards, as for [`Self::with_auth_oauth2`].
     pub fn with_auth_oauth2_secret_value(
-        mut self,
+        self,
         token_url: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: fluree_db_iceberg::ConfigValue,
     ) -> Self {
-        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
-            rest.auth = fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+        self.with_auth(
+            fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
                 token_url: token_url.into(),
                 client_id: fluree_db_iceberg::ConfigValue::literal(client_id.into()),
                 client_secret,
                 scope: None,
                 audience: None,
-            };
-        } else {
-            tracing::warn!("OAuth2 auth has no effect in Direct catalog mode");
-        }
-        self
+            },
+        )
     }
 
     /// Set the OAuth2 `scope` for client-credentials auth (REST + OAuth2 only).
     ///
     /// Mutates the existing OAuth2 auth config in place, so call this AFTER
-    /// [`Self::with_auth_oauth2`]. It has no effect (and warns) if OAuth2
-    /// client-credentials auth has not been configured. Required for
-    /// scope-gated REST catalogs such as Snowflake Horizon / Apache Polaris,
-    /// where the catalog session role is selected via
-    /// `scope=session:role:<ROLE>`.
+    /// [`Self::with_auth_oauth2`]. Without OAuth2 client-credentials auth it
+    /// is refused at [`Self::validate`]. Required for scope-gated REST
+    /// catalogs such as Snowflake Horizon / Apache Polaris, where the catalog
+    /// session role is selected via `scope=session:role:<ROLE>`.
     pub fn with_oauth2_scope(mut self, scope: impl Into<String>) -> Self {
-        match &mut self.catalog_mode {
-            CatalogMode::Rest(rest) => {
-                if let fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
-                    scope: slot,
-                    ..
-                } = &mut rest.auth
-                {
-                    *slot = Some(scope.into());
-                } else {
-                    tracing::warn!(
-                        "with_oauth2_scope has no effect unless OAuth2 client-credentials auth is set first (call with_auth_oauth2)"
-                    );
-                }
-            }
-            CatalogMode::Direct { .. } => {
-                tracing::warn!("with_oauth2_scope has no effect in Direct catalog mode");
-            }
-            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
-                tracing::warn!("with_oauth2_scope has no effect in Glue/S3Tables catalog mode");
-            }
+        if let Some((slot, _)) = self.oauth2_slot("oauth2_scope") {
+            *slot = Some(scope.into());
         }
         self
     }
@@ -813,31 +813,51 @@ impl IcebergConnectionConfig {
     /// Set the OAuth2 `audience` for client-credentials auth (REST + OAuth2 only).
     ///
     /// Mutates the existing OAuth2 auth config in place, so call this AFTER
-    /// [`Self::with_auth_oauth2`]. It has no effect (and warns) if OAuth2
-    /// client-credentials auth has not been configured.
+    /// [`Self::with_auth_oauth2`]. Without OAuth2 client-credentials auth it
+    /// is refused at [`Self::validate`].
     pub fn with_oauth2_audience(mut self, audience: impl Into<String>) -> Self {
-        match &mut self.catalog_mode {
-            CatalogMode::Rest(rest) => {
-                if let fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
-                    audience: slot,
-                    ..
-                } = &mut rest.auth
-                {
-                    *slot = Some(audience.into());
-                } else {
-                    tracing::warn!(
-                        "with_oauth2_audience has no effect unless OAuth2 client-credentials auth is set first (call with_auth_oauth2)"
-                    );
-                }
-            }
-            CatalogMode::Direct { .. } => {
-                tracing::warn!("with_oauth2_audience has no effect in Direct catalog mode");
-            }
-            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
-                tracing::warn!("with_oauth2_audience has no effect in Glue/S3Tables catalog mode");
-            }
+        if let Some((_, slot)) = self.oauth2_slot("oauth2_audience") {
+            *slot = Some(audience.into());
         }
         self
+    }
+
+    /// The OAuth2 auth's scope and audience, or `None` (recording `field` as
+    /// refused) when the catalog has no OAuth2 client-credentials auth.
+    fn oauth2_slot(
+        &mut self,
+        field: &'static str,
+    ) -> Option<(&mut Option<String>, &mut Option<String>)> {
+        let mode = self.mode_name();
+        match &mut self.catalog_mode {
+            CatalogMode::Rest(rest) => match &mut rest.auth {
+                fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                    scope,
+                    audience,
+                    ..
+                } => Some((scope, audience)),
+                _ => {
+                    self.refused
+                        .push(crate::graph_source::GraphSourceInputError::incomplete(
+                            field,
+                            &["OAuth2 client-credentials auth (set it first)"],
+                        ));
+                    None
+                }
+            },
+            _ => {
+                self.refused
+                    .push(CatalogModeError::NotForMode { mode, field }.into());
+                None
+            }
+        }
+    }
+
+    /// Record `field` as a REST-only setting this mode cannot honor.
+    fn refuse_for_mode(&mut self, field: &'static str) {
+        let mode = self.mode_name();
+        self.refused
+            .push(CatalogModeError::NotForMode { mode, field }.into());
     }
 
     /// Set the warehouse identifier (REST mode only).
@@ -845,17 +865,19 @@ impl IcebergConnectionConfig {
         if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
             rest.warehouse = Some(warehouse.into());
         } else {
-            tracing::warn!("with_warehouse has no effect in Direct catalog mode");
+            self.refuse_for_mode("warehouse");
         }
         self
     }
 
-    /// Enable or disable vended credentials (REST mode only).
+    /// Enable or disable vended credentials (REST mode only; turning them off
+    /// agrees with every other mode, which never vends). Prefer
+    /// [`Self::with_storage_auth`], which says which identity reads instead.
     pub fn with_vended_credentials(mut self, enabled: bool) -> Self {
         if self.is_rest() {
             self.io.vended_credentials = enabled;
-        } else {
-            tracing::warn!("with_vended_credentials has no effect in Direct catalog mode");
+        } else if enabled {
+            self.refuse_for_mode("vended_credentials");
         }
         self
     }
@@ -958,7 +980,83 @@ impl IcebergConnectionConfig {
     pub fn is_s3tables(&self) -> bool {
         matches!(self.catalog_mode, CatalogMode::S3Tables { .. })
     }
+
+    /// The catalog mode's name, as every surface spells it.
+    pub fn mode_name(&self) -> &'static str {
+        match self.catalog_mode {
+            CatalogMode::Rest(_) => "rest",
+            CatalogMode::Direct { .. } => "direct",
+            CatalogMode::Glue { .. } => "glue",
+            CatalogMode::S3Tables { .. } => "s3tables",
+        }
+    }
+
+    /// A connection to a catalog given in its stored shape, with default IO.
+    ///
+    /// A REST catalog's `catalog_type` is a display label every registration
+    /// stores as `polaris`; any other value is refused rather than dropped.
+    pub fn from_catalog(
+        catalog: fluree_db_iceberg::config::CatalogConfig,
+    ) -> std::result::Result<Self, crate::graph_source::GraphSourceInputError> {
+        use fluree_db_iceberg::config::CatalogConfig;
+        Ok(match catalog {
+            CatalogConfig::Rest {
+                catalog_type,
+                uri,
+                auth,
+                warehouse,
+            } => {
+                if catalog_type != REST_CATALOG_TYPE {
+                    return Err(crate::graph_source::GraphSourceInputError::invalid(
+                        "catalog.catalog_type",
+                        format!(
+                            "a display label every source stores as `{REST_CATALOG_TYPE}`; omit it"
+                        ),
+                    ));
+                }
+                let mut conn = Self::rest(uri).with_auth(auth);
+                if let Some(warehouse) = warehouse {
+                    conn = conn.with_warehouse(warehouse);
+                }
+                conn
+            }
+            CatalogConfig::Direct { table_location } => Self::direct(table_location),
+            CatalogConfig::Glue { region, catalog_id } => Self::glue(region, catalog_id),
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => Self::s3_tables(region, table_bucket_arn),
+        })
+    }
+
+    /// Refuse what this connection cannot be used as: a setting a builder
+    /// method was given that the catalog mode cannot honor, a Google catalog
+    /// identity malformed before any secret resolves, and an
+    /// `io.storage_auth` the catalog cannot serve (the engine's own
+    /// [`validate_storage_auth`](IcebergGsConfig::validate_storage_auth)).
+    /// Registration and every catalog read (browse, preview, verify,
+    /// generate, validate) call this first.
+    pub fn validate(&self) -> crate::Result<()> {
+        if let Some(refused) = self.refused.first() {
+            return Err(refused.clone().into());
+        }
+        if let CatalogMode::Rest(rest) = &self.catalog_mode {
+            rest.auth.validate_static()?;
+        }
+        IcebergCreateConfig::from_connection(
+            "",
+            self.clone(),
+            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+        )
+        .to_iceberg_gs_config()
+        .validate_storage_auth()?;
+        Ok(())
+    }
 }
+
+/// The `catalog_type` every registration stores for a REST catalog.
+#[cfg(feature = "iceberg")]
+const REST_CATALOG_TYPE: &str = "polaris";
 
 #[cfg(feature = "iceberg")]
 impl IcebergCreateConfig {
@@ -1007,31 +1105,36 @@ impl IcebergCreateConfig {
 
     /// Parse a catalog mode, its fields, and the source's own `table` into a
     /// create config — the one dispatch every surface goes through (see
-    /// [`CatalogModeArgs`]). A catalog mode (rest, glue, s3tables) needs `table`
-    /// unless the source's tables come from an R2RML mapping (`has_mapping`), in
-    /// which case each `rr:tableName` names its table; Direct ignores `table`.
+    /// [`CatalogModeArgs`]). The source's tables come from its R2RML mapping,
+    /// each `rr:tableName` naming one, so a catalog mode (rest, glue, s3tables)
+    /// needs no `table`; registration's table check loads the mapped tables,
+    /// never this one. Direct ignores `table`.
     pub fn from_mode(
         name: impl Into<String>,
         args: CatalogModeArgs<'_>,
         table: Option<&str>,
-        has_mapping: bool,
     ) -> std::result::Result<Self, CatalogModeError> {
         let connection = IcebergConnectionConfig::from_mode(args)?;
-        let mode = match &connection.catalog_mode {
-            CatalogMode::Direct { .. } => {
-                return Ok(Self::from_connection(name, connection, String::new()));
-            }
-            CatalogMode::Rest(_) => "rest",
-            CatalogMode::Glue { .. } => "glue",
-            CatalogMode::S3Tables { .. } => "s3tables",
-        };
-        let table = match table.map(str::trim).filter(|t| !t.is_empty()) {
-            Some(table) => table,
-            // A mapping-defined source has no table of its own; the placeholder
-            // only satisfies the identifier shape and is never loaded.
-            None if has_mapping => fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
-            None => return Err(CatalogModeError::MissingTable { mode }),
-        };
+        Self::from_connection_for(name, connection, table)
+    }
+
+    /// [`Self::from_connection`] with the source's own `table` taken as
+    /// [`Self::from_mode`] takes it: a catalog mode's tables come from the
+    /// source's R2RML mapping, so without a `table` it gets the placeholder
+    /// that only satisfies the identifier shape and is never loaded. Direct
+    /// takes its table from its location.
+    pub fn from_connection_for(
+        name: impl Into<String>,
+        connection: IcebergConnectionConfig,
+        table: Option<&str>,
+    ) -> std::result::Result<Self, CatalogModeError> {
+        if connection.is_direct() {
+            return Ok(Self::from_connection(name, connection, String::new()));
+        }
+        let table = table
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(fluree_db_iceberg::config::MAPPING_DEFINED_TABLE);
         Ok(Self::from_connection(name, connection, table))
     }
 
@@ -1051,6 +1154,20 @@ impl IcebergCreateConfig {
     /// (REST mode only). See [`IcebergConnectionConfig::with_auth_google_metadata`].
     pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
         self.connection = self.connection.with_auth_google_metadata(scopes);
+        self
+    }
+
+    /// Set the catalog's auth (REST mode only). See
+    /// [`IcebergConnectionConfig::with_auth`].
+    pub fn with_auth(mut self, auth: fluree_db_iceberg::auth::AuthConfig) -> Self {
+        self.connection = self.connection.with_auth(auth);
+        self
+    }
+
+    /// Set which identity reads the source's files. See
+    /// [`IcebergConnectionConfig::with_storage_auth`].
+    pub fn with_storage_auth(mut self, storage_auth: fluree_db_iceberg::StorageAuth) -> Self {
+        self.connection = self.connection.with_storage_auth(storage_auth);
         self
     }
 
@@ -1238,7 +1355,7 @@ impl IcebergCreateConfig {
         let (catalog, table) = match &self.connection.catalog_mode {
             CatalogMode::Rest(rest) => (
                 CatalogConfig::Rest {
-                    catalog_type: "polaris".to_string(),
+                    catalog_type: REST_CATALOG_TYPE.to_string(),
                     uri: rest.catalog_uri.clone(),
                     auth: rest.auth.clone(),
                     warehouse: rest.warehouse.clone(),
@@ -1284,8 +1401,16 @@ impl IcebergCreateConfig {
         }
     }
 
-    /// Validate the configuration.
+    /// Validate the configuration: everything [`IcebergConnectionConfig::validate`]
+    /// refuses, and the stored config the engine's own rules refuse
+    /// ([`IcebergGsConfig::validate`], storage identity included).
     pub fn validate(&self) -> crate::Result<()> {
+        self.validate_source(false)
+    }
+
+    /// [`Self::validate`] for a source whose tables a mapping names
+    /// (`has_mapping`), which a Direct warehouse root needs.
+    fn validate_source(&self, has_mapping: bool) -> crate::Result<()> {
         if self.name.trim().is_empty() {
             return Err(crate::ApiError::config("Graph source name cannot be empty"));
         }
@@ -1318,24 +1443,11 @@ impl IcebergCreateConfig {
                         "Table location cannot be empty for direct catalog mode",
                     ));
                 }
-                let is_object_store =
-                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
-                // Local catalog-less tables: `file://` URIs (incl. the
-                // `file:/abs` single-slash variant) or bare absolute paths.
-                // Mirrors `fluree_db_iceberg::config`'s Direct validation.
-                let is_local = fluree_db_iceberg::is_local_location(table_location);
-                if !is_object_store && !is_local {
-                    return Err(crate::ApiError::config(format!(
-                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
-                         file:// URI, or an absolute local path, got: {table_location}"
-                    )));
-                }
-                // Local locations are fail-closed behind the operator allowlist
-                // (`FLUREE_ICEBERG_LOCAL_ROOTS`). Both validation gates enforce
-                // it — this one and `fluree_db_iceberg::config` — because a
-                // config can reach either first.
-                fluree_db_iceberg::ensure_local_location_allowed(table_location)
-                    .map_err(|e| crate::ApiError::config(e.to_string()))?;
+                // Which locations a Direct source may name (s3://, gs:// read
+                // by an identity that serves it, a local path under the
+                // operator's FLUREE_ICEBERG_LOCAL_ROOTS) is the engine's rule,
+                // checked below on the stored config, not restated here: a
+                // second copy had drifted and refused every gs:// table.
             }
             CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
                 if self.table_identifier.trim().is_empty() {
@@ -1344,12 +1456,6 @@ impl IcebergCreateConfig {
                          (use namespace.table, or an R2RML mapping)",
                     ));
                 }
-                // Region shape, table bucket ARN, table identifier, vended flag:
-                // one set of rules, owned by `fluree_db_iceberg::config`, so this
-                // gate and the query-time gate cannot disagree.
-                self.to_iceberg_gs_config()
-                    .validate()
-                    .map_err(|e| crate::ApiError::config(e.to_string()))?;
             }
         }
 
@@ -1361,6 +1467,18 @@ impl IcebergCreateConfig {
                 .map_err(|e| crate::ApiError::config(format!("Invalid delete convention: {e}")))?;
         }
 
+        self.connection.validate()?;
+        // The stored config, by the engine's own rules (region shape, table
+        // bucket ARN, table identifier, vended flag, storage identity), so this
+        // gate and the query-time gate cannot disagree.
+        let mut stored = self.to_iceberg_gs_config();
+        if has_mapping {
+            stored.mapping = Some(fluree_db_iceberg::config::MappingSource {
+                source: String::new(),
+                media_type: None,
+            });
+        }
+        stored.validate()?;
         Ok(())
     }
 
@@ -1492,6 +1610,39 @@ impl R2rmlCreateConfig {
     /// automatic token refresh. See [`IcebergCreateConfig::with_auth_google_metadata`].
     pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
         self.iceberg = self.iceberg.with_auth_google_metadata(scopes);
+        self
+    }
+
+    /// Set the catalog's auth (REST mode only). See
+    /// [`IcebergConnectionConfig::with_auth`].
+    pub fn with_auth(mut self, auth: fluree_db_iceberg::auth::AuthConfig) -> Self {
+        self.iceberg = self.iceberg.with_auth(auth);
+        self
+    }
+
+    /// Set which identity reads the source's files. See
+    /// [`IcebergConnectionConfig::with_storage_auth`].
+    pub fn with_storage_auth(mut self, storage_auth: fluree_db_iceberg::StorageAuth) -> Self {
+        self.iceberg = self.iceberg.with_storage_auth(storage_auth);
+        self
+    }
+
+    /// See [`IcebergConnectionConfig::with_auth_bearer_value`].
+    pub fn with_auth_bearer_value(mut self, token: fluree_db_iceberg::ConfigValue) -> Self {
+        self.iceberg = self.iceberg.with_auth_bearer_value(token);
+        self
+    }
+
+    /// See [`IcebergConnectionConfig::with_auth_oauth2_secret_value`].
+    pub fn with_auth_oauth2_secret_value(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: fluree_db_iceberg::ConfigValue,
+    ) -> Self {
+        self.iceberg =
+            self.iceberg
+                .with_auth_oauth2_secret_value(token_url, client_id, client_secret);
         self
     }
 
@@ -1646,10 +1797,11 @@ impl R2rmlCreateConfig {
         }
     }
 
-    /// Validate the configuration.
+    /// Validate the configuration (see [`IcebergCreateConfig::validate`]),
+    /// and that it has a mapping.
     pub fn validate(&self) -> crate::Result<()> {
-        // Validate the underlying Iceberg config
-        self.iceberg.validate()?;
+        // The tables come from the mapping's `rr:tableName`s.
+        self.iceberg.validate_source(true)?;
 
         // Validate mapping
         match &self.mapping {
@@ -2136,23 +2288,19 @@ mod tests {
 
     #[cfg(feature = "iceberg")]
     #[test]
-    fn create_from_mode_needs_a_table_unless_a_mapping_defines_them() {
+    fn create_from_mode_takes_its_tables_from_the_mapping() {
         let glue = || mode_args("glue");
         // A mapping-defined source has no table of its own (each rr:tableName is
         // one), for glue and s3tables exactly as for rest.
-        let mapped = IcebergCreateConfig::from_mode("gs", glue(), None, true).unwrap();
-        assert_eq!(
-            mapped.table_identifier,
-            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE
-        );
-        let named =
-            IcebergCreateConfig::from_mode("gs", glue(), Some("sales.orders"), true).unwrap();
+        for table in [None, Some(" ")] {
+            let mapped = IcebergCreateConfig::from_mode("gs", glue(), table).unwrap();
+            assert_eq!(
+                mapped.table_identifier,
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE
+            );
+        }
+        let named = IcebergCreateConfig::from_mode("gs", glue(), Some("sales.orders")).unwrap();
         assert_eq!(named.table_identifier, "sales.orders");
-        let err = IcebergCreateConfig::from_mode("gs", glue(), Some(" "), false).unwrap_err();
-        assert_eq!(
-            err.message(str::to_string),
-            "table is required for glue mode (or provide r2rml to define tables via mapping)"
-        );
         // Direct takes its table from the location.
         let direct = IcebergCreateConfig::from_mode(
             "gs",
@@ -2161,7 +2309,6 @@ mod tests {
                 ..mode_args("direct")
             },
             Some("ignored.table"),
-            false,
         )
         .unwrap();
         assert_eq!(direct.table_identifier, "");
