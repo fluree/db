@@ -8,8 +8,8 @@
 //! commits, and after later writes indexed incrementally over that root.
 
 use fluree_db_api::{
-    Fluree, FlureeBuilder, ImportError, LedgerId, NameServiceMode, NotifyResult, NsNotify,
-    ReindexOptions,
+    ApiError, Fluree, FlureeBuilder, ImportError, LedgerId, NameServiceMode, NotifyResult,
+    NsNotify, ReindexOptions,
 };
 use fluree_db_core::MemoryStorage;
 use fluree_db_nameservice::memory::MemoryNameService;
@@ -57,7 +57,8 @@ ex:carol a ex:Person .
 "#;
 
 /// `graph s p o` for every statement in the default graph and in `GRAPH`,
-/// sorted, IRIs under `ex:` written `ex:` and blank nodes `_:`.
+/// sorted, IRIs under `ex:` written `ex:` and blank nodes `_:`. A ledger
+/// without `GRAPH` reads only the default graph; any other error fails.
 async fn statements(fluree: &Fluree) -> Vec<String> {
     let ledger = fluree.ledger(LEDGER).await.expect("load");
     let mut out = Vec::new();
@@ -72,7 +73,7 @@ async fn statements(fluree: &Fluree) -> Vec<String> {
         });
         let rows = match fluree.query_connection(&query).await {
             Ok(rows) => rows.to_jsonld(&ledger.snapshot).expect("jsonld"),
-            Err(e) if e.to_string().contains("not found") => continue,
+            Err(ApiError::GraphNotFound(_)) if label == "g" => continue,
             Err(e) => panic!("{label}: {e}"),
         };
         for row in rows.as_array().expect("rows") {
