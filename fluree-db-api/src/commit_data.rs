@@ -201,8 +201,13 @@ pub(crate) struct ConfigGraphs {
 impl ConfigGraphs {
     /// For a change staged on `target`.
     pub(crate) fn for_target(target: &fluree_db_ledger::LedgerState) -> Self {
-        let ns = fluree_db_transact::NamespaceRegistry::from_db(&target.snapshot);
-        let registry = &target.snapshot.graph_registry;
+        Self::for_snapshot(&target.snapshot)
+    }
+
+    /// For a change staged on a target whose head is `snapshot`.
+    pub(crate) fn for_snapshot(snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+        let ns = fluree_db_transact::NamespaceRegistry::from_db(snapshot);
+        let registry = &snapshot.graph_registry;
         let canonical = registry
             .iri_for_graph_id(CONFIG_GRAPH_ID)
             .into_iter()

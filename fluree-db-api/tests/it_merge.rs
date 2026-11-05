@@ -401,6 +401,72 @@ async fn merge_diverged_target_general_merge() {
     );
 }
 
+/// A commit that lands on the target after a general merge reads the target's
+/// head is in neither the merge's diff nor its conflicts. The merge is refused,
+/// as a fast-forward that loses the race is, rather than staged over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn general_merge_loses_race_to_a_target_commit_during_its_preparation() {
+    use fluree_db_api::{ApiError, LedgerManagerConfig, NameServiceMode};
+    use fluree_db_core::MemoryStorage;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use std::{sync::Arc, time::Duration};
+
+    let storage = MemoryStorage::new();
+    let inner = Arc::new(MemoryNameService::new());
+    let fluree = FlureeBuilder::memory()
+        .build_with(storage.clone(), NameServiceMode::ReadWrite(inner.clone()));
+    let named = |id: &str, name: &str| json!({"@id": format!("http://example.org/ns/{id}"), "http://example.org/ns/name": name});
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(ledger, &named("alice", "Base"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree.upsert(dev, &named("alice", "Dev")).await.unwrap();
+    // Main diverges, so the merge is not a fast-forward.
+    fluree.insert(main, &named("carol", "Carol")).await.unwrap();
+
+    // The merging connection serializes with the target's writers through
+    // its cached handle's write lock.
+    let pause = Arc::new(race_nameservice::PausingNameService::new(inner));
+    pause.pause_after_next_lookup();
+    let merger = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_with(storage, NameServiceMode::ReadWrite(pause.clone()));
+    let merging = tokio::spawn(async move {
+        merger
+            .merge_branch("mydb", "dev", None, ConflictStrategy::Abort)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(60), pause.entered.notified())
+        .await
+        .expect("the merge must read the target's head");
+
+    // Changes what dev changed: a conflict the merge's diff does not hold.
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    fluree.upsert(main, &named("alice", "Main")).await.unwrap();
+    pause.resume.notify_one();
+
+    let error = tokio::time::timeout(Duration::from_secs(60), merging)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(&error, ApiError::BranchConflict(msg) if msg.contains("lost a race")),
+        "{error:?}"
+    );
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["Carol", "Main"]
+    );
+}
+
 #[tokio::test]
 async fn merge_take_source_works_after_binary_index_reload() {
     let fluree = FlureeBuilder::memory().build_memory();

@@ -612,18 +612,27 @@ impl crate::Fluree {
 
         let target_delta = delta_keys_of(&target_store, &diff.target.own).await?;
 
-        // Acquire target state under the write lock when a manager is
-        // available, serializing with regular transactions on the target
-        // branch. Without a manager (embedded use, no shared cache), fall
-        // back to a fresh storage load — there's nothing to protect.
-        let (write_guard, target_state) = self
-            .lock_or_load(&target_id, target_store, target_record.clone())
-            .await?;
+        // The target's names for the config graph, read without its write
+        // lock: its namespace table and graph registry only grow, and the
+        // lock held across the fold below would stall the target's writers
+        // for the whole read. Without a manager there is no lock, and the
+        // state loaded here is the one the merge stages on.
+        let (mut config, loaded_target) = match self.ledger_manager.as_ref() {
+            Some(mgr) => {
+                let head = mgr.get_or_load(&target_id).await?.graph_names().await;
+                (ConfigGraphs::for_snapshot(&head.snapshot), None)
+            }
+            None => {
+                let state = self
+                    .load_queryable_state_with_store(target_store.clone(), target_record.clone())
+                    .await?;
+                (ConfigGraphs::for_target(&state), Some(state))
+            }
+        };
 
         // Fold the source's commits, and collect the keys its own changes
         // touched, in one pass, both sides naming the config graph as the
         // target does.
-        let mut config = ConfigGraphs::for_target(&target_state);
         let (source_data, source_delta) = collect_commit_data(
             source_store,
             &diff.source.commits,
@@ -646,6 +655,30 @@ impl crate::Fluree {
                 conflicts.len(),
                 source_branch,
                 resolved_target,
+            )));
+        }
+
+        // Acquire target state under the write lock when a manager is
+        // available, serializing with regular transactions on the target
+        // branch. Without a manager (embedded use, no shared cache), the
+        // state loaded above serves — there's nothing to protect.
+        let (write_guard, target_state) = match loaded_target {
+            Some(state) => (None, state),
+            None => {
+                self.lock_or_load(&target_id, target_store, target_record.clone())
+                    .await?
+            }
+        };
+        // The diff and the conflicts are the target's as of `target_head`. A
+        // commit that landed since is in neither, so the source's changes
+        // would be staged over it unchecked.
+        if target_state.head_commit_id != target_head {
+            return Err(ApiError::BranchConflict(format!(
+                "merge into {target_id} lost a race: the head moved from t={} to t={} \
+                 while the merge was being prepared — re-run the merge so it \
+                 recomputes against the new head",
+                target_record.commit_t,
+                target_state.t(),
             )));
         }
 
