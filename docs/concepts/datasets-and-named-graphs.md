@@ -388,6 +388,8 @@ WHERE {
 }
 ```
 
+SHACL checks a record against the graph it is written to. When its shapes need data kept in another graph, such as a shared catalog, see [SHACL across named graphs](../guides/cookbook-shacl-across-graphs.md).
+
 ### Access Control
 
 Different graphs can have different permissions:

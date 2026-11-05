@@ -729,7 +729,10 @@ fn stored_shacl_policy(
     view: &StagedLedger,
     config: &LedgerConfig,
     ctx: &StagedShaclContext<'_>,
-) -> Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>> {
+) -> std::result::Result<
+    Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>>,
+    fluree_db_transact::TransactError,
+> {
     let mut map = HashMap::new();
     for g_id in written_user_graphs(view) {
         let graph_iri = if g_id == fluree_db_core::DEFAULT_GRAPH_ID {
@@ -752,12 +755,17 @@ fn stored_shacl_policy(
                     g_id,
                     fluree_db_transact::ShaclGraphPolicy {
                         mode: shacl.validation_mode,
+                        additional_data_g_ids: resolve_additional_data_g_ids(
+                            resolved.shacl.as_ref(),
+                            &view.base().snapshot,
+                            ctx.graph_delta,
+                        )?,
                     },
                 );
             }
         }
     }
-    (!map.is_empty()).then_some(map)
+    Ok((!map.is_empty()).then_some(map))
 }
 
 /// The IRI of a named graph a staged flake landed in: the transaction's own
@@ -1130,44 +1138,116 @@ pub(crate) fn resolve_shapes_source_g_ids(
     let Some(source) = source else {
         return Ok(vec![0]);
     };
+    Ok(vec![resolve_shacl_graph_source(
+        source,
+        snapshot,
+        "f:shapesSource",
+    )?])
+}
 
-    // Temporal / trust / rollback / cross-ledger dimensions of GraphSourceRef
-    // aren't yet supported for SHACL — reject early rather than silently
-    // ignoring them. Matches the policy resolver's shape.
-    if source.ledger.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with cross-ledger f:ledger reference is not yet supported".into(),
-        ));
+/// Resolve a graph's `f:additionalDataSource` graphs: the graphs read with
+/// it when its nodes are checked. A graph this transaction creates resolves
+/// through its routing, so the write that creates a source graph is checked
+/// against it. A graph neither the ledger nor the transaction knows is an
+/// error, as are the txn-meta and config graphs, which hold no data to check
+/// against.
+#[cfg(feature = "shacl")]
+pub(crate) fn resolve_additional_data_g_ids(
+    shacl: Option<&fluree_db_core::ledger_config::ShaclDefaults>,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    graph_delta: Option<&FxHashMap<u16, String>>,
+) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
+    const SETTING: &str = "f:additionalDataSource";
+    let sources = shacl
+        .map(|s| s.additional_data_sources.as_slice())
+        .unwrap_or_default();
+    let mut g_ids = Vec::with_capacity(sources.len());
+    for source in sources {
+        reject_unsupported_graph_ref(source, SETTING)?;
+        let g_id = match source.graph_selector.as_deref() {
+            None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
+            Some(iri) if iri == config_iris::DEFAULT_GRAPH => {
+                Some(fluree_db_core::DEFAULT_GRAPH_ID)
+            }
+            Some(iri) if iri == config_iris::TXN_META_GRAPH => {
+                Some(fluree_db_core::TXN_META_GRAPH_ID)
+            }
+            Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri).or_else(|| {
+                graph_delta?
+                    .iter()
+                    .find(|(_, routed)| routed.as_str() == iri)
+                    .map(|(g_id, _)| *g_id)
+            }),
+        }
+        .ok_or_else(|| graph_not_found(source, SETTING))?;
+        let system_graph = match g_id {
+            fluree_db_core::TXN_META_GRAPH_ID => Some("txn-meta"),
+            fluree_db_core::CONFIG_GRAPH_ID => Some("config"),
+            _ => None,
+        };
+        if let Some(name) = system_graph {
+            return Err(fluree_db_transact::TransactError::Parse(format!(
+                "{SETTING} cannot name the {name} graph"
+            )));
+        }
+        g_ids.push(g_id);
     }
-    if source.at_t.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:atT (temporal pinning) is not yet supported".into(),
-        ));
-    }
-    if source.trust_policy.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:trustPolicy is not yet supported".into(),
-        ));
-    }
-    if source.rollback_guard.is_some() {
-        return Err(fluree_db_transact::TransactError::Parse(
-            "f:shapesSource with f:rollbackGuard is not yet supported".into(),
-        ));
-    }
+    Ok(g_ids)
+}
 
-    let g_id = match source.graph_selector.as_deref() {
+/// Resolve one same-ledger SHACL `GraphSourceRef` against `snapshot`'s
+/// registry; `setting` names it in errors.
+#[cfg(feature = "shacl")]
+fn resolve_shacl_graph_source(
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    setting: &str,
+) -> std::result::Result<GraphId, fluree_db_transact::TransactError> {
+    reject_unsupported_graph_ref(source, setting)?;
+    match source.graph_selector.as_deref() {
         Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
         Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
         None => Some(0u16),
-    };
-
-    match g_id {
-        Some(id) => Ok(vec![id]),
-        None => Err(fluree_db_transact::TransactError::Parse(format!(
-            "f:shapesSource graph '{}' not found in this ledger's graph registry",
-            source.graph_selector.as_deref().unwrap_or("<none>"),
-        ))),
     }
+    .ok_or_else(|| graph_not_found(source, setting))
+}
+
+/// Temporal / trust / rollback / cross-ledger dimensions of `GraphSourceRef`
+/// aren't yet supported for SHACL sources — reject early rather than
+/// silently ignoring them. Matches the policy resolver's shape.
+#[cfg(feature = "shacl")]
+fn reject_unsupported_graph_ref(
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    setting: &str,
+) -> std::result::Result<(), fluree_db_transact::TransactError> {
+    let unsupported = if source.ledger.is_some() {
+        Some("cross-ledger f:ledger reference")
+    } else if source.at_t.is_some() {
+        Some("f:atT (temporal pinning)")
+    } else if source.trust_policy.is_some() {
+        Some("f:trustPolicy")
+    } else if source.rollback_guard.is_some() {
+        Some("f:rollbackGuard")
+    } else {
+        None
+    };
+    match unsupported {
+        Some(option) => Err(fluree_db_transact::TransactError::Parse(format!(
+            "{setting} with {option} is not yet supported"
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(feature = "shacl")]
+fn graph_not_found(
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    setting: &str,
+) -> fluree_db_transact::TransactError {
+    fluree_db_transact::TransactError::Parse(format!(
+        "{setting} graph '{}' not found in this ledger's graph registry",
+        source.graph_selector.as_deref().unwrap_or("<none>"),
+    ))
 }
 
 /// Apply SHACL policy to an already-staged [`StagedLedger`].
@@ -1217,7 +1297,10 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
 
     // 1. Stored shapes: each written graph's own enabled/mode from config.
     //    Graphs absent from the map are not validated.
-    let mut stored_policy = config.and_then(|c| stored_shacl_policy(view, c, &ctx));
+    let mut stored_policy = match config {
+        Some(config) => stored_shacl_policy(view, config, &ctx)?,
+        None => None,
+    };
 
     // Commit replay (which has no resolver) with a cross-ledger source skips
     // stored-shape re-validation: the origin already validated against M,
@@ -1623,13 +1706,12 @@ fn inline_shapes_policy(
 > {
     use fluree_db_core::ledger_config::{OverrideControl, ValidationMode};
 
-    let policy = fluree_db_transact::ShaclGraphPolicy {
-        mode: ctx
-            .requested_validation_mode
-            .unwrap_or(ValidationMode::Reject),
-    };
+    let mode = ctx
+        .requested_validation_mode
+        .unwrap_or(ValidationMode::Reject);
     let mut map = HashMap::new();
     for g_id in written_user_graphs(view) {
+        let mut additional_data_g_ids = Vec::new();
         if let Some(config) = config {
             // The default graph, or a named graph whose IRI nothing records,
             // reads the ledger-wide group.
@@ -1657,8 +1739,19 @@ fn inline_shapes_policy(
                     });
                 }
             }
+            additional_data_g_ids = resolve_additional_data_g_ids(
+                resolved.shacl.as_ref(),
+                &view.base().snapshot,
+                ctx.graph_delta,
+            )?;
         }
-        map.insert(g_id, policy);
+        map.insert(
+            g_id,
+            fluree_db_transact::ShaclGraphPolicy {
+                mode,
+                additional_data_g_ids,
+            },
+        );
     }
     Ok((!map.is_empty()).then_some(map))
 }
