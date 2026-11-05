@@ -278,7 +278,7 @@ fn from_sql_ddl() {
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "3 classes, 4 properties; 1 enumerated column made a class, with 2 catalog records; 2 primary key columns left out",
+            "3 classes, 4 properties; 1 enumeration made a class, with 2 catalog records; 2 primary key columns left out",
         ));
     let ttl = std::fs::read_to_string(tmp.path().join("crm.ttl")).unwrap();
     // a foreign key is a relation labelled without `_id`
@@ -477,7 +477,7 @@ fn from_a_snowflake_semantic_view() {
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "3 classes, 4 properties; 1 enumerated column made a class, with 3 catalog records; 2 primary key columns left out",
+            "3 classes, 4 properties; 1 enumeration made a class, with 3 catalog records; 2 primary key columns left out",
         ));
     let ttl = std::fs::read_to_string(tmp.path().join("shop.ttl")).unwrap();
     assert!(
@@ -493,15 +493,6 @@ fn from_a_snowflake_semantic_view() {
     );
     let (report, code) = check_json(&tmp, &["shop.ttl"]);
     assert_eq!(code, 0, "{report:#}");
-
-    write(&tmp, "dbt.yml", "semantic_models:\n  - name: orders\n");
-    fluree_cmd(&tmp)
-        .args(["ontology", "from", "dbt.yml"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "dbt semantic models aren't read yet",
-        ));
 }
 
 #[test]
@@ -556,4 +547,256 @@ fn from_a_genie_export_with_comments() {
         "{ttl}"
     );
     assert!(ttl.contains("rdfs:range shop:Customer"), "{ttl}");
+}
+
+#[test]
+fn from_a_dbt_project_directory() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("shop/models/marts")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("shop/target")).unwrap();
+    write(
+        &tmp,
+        "shop/models/marts/schema.yml",
+        "models:\n  - name: stg_orders\n    description: Orders as the shop system records them.\n    columns:\n      - name: status\n        description: Where the order is.\n        data_tests:\n          - accepted_values:\n              arguments:\n                values: [placed, shipped, returned]\n",
+    );
+    write(
+        &tmp,
+        "shop/models/marts/semantic.yml",
+        "semantic_models:\n  - name: orders\n    model: ref('stg_orders')\n    entities:\n      - {name: order, type: primary, expr: order_id}\n      - {name: customer, type: foreign, expr: customer_id}\n    dimensions:\n      - {name: status, type: categorical}\n      - name: ordered_at\n        type: time\n        type_params: {time_granularity: day}\n    measures:\n      - {name: order_total, agg: sum, description: The order's total in pounds.}\n      - {name: order_count, agg: count, expr: 1}\n  - name: customers\n    description: People who buy from the shops.\n    entities:\n      - {name: customer, type: primary, expr: customer_id}\n",
+    );
+    // build output is passed over
+    write(
+        &tmp,
+        "shop/target/semantic_manifest.yml",
+        "semantic_models: [{name: broken}]\n",
+    );
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "shop",
+            "--base",
+            "https://example.com/shop/",
+            "-o",
+            "shop.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "3 classes, 4 properties; 1 enumeration made a class, with 3 catalog records",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("shop.ttl")).unwrap();
+    assert!(
+        ttl.contains("rdfs:comment \"Orders as the shop system records them.\""),
+        "{ttl}"
+    );
+    assert!(ttl.contains("shop:customer a rdf:Property"), "{ttl}");
+    assert!(ttl.contains("rdfs:range shop:Customer"), "{ttl}");
+    assert!(
+        ttl.contains("rdfs:comment \"Where the order is.\""),
+        "{ttl}"
+    );
+    assert!(!ttl.contains("orderCount"), "counts are left out: {ttl}");
+    assert!(!ttl.contains("broken"), "target/ is passed over: {ttl}");
+}
+
+#[test]
+fn from_an_ossie_ontology_keeps_its_iris() {
+    let tmp = TempDir::new().unwrap();
+    write(
+        &tmp,
+        "flights.ossie.yaml",
+        r"version: 0.2.0.dev0
+name: Flights
+prefixes:
+  schema: https://schema.org/
+ontology:
+- concept: Airport
+  type: EntityType
+  iri: schema:Airport
+  description: An airport identified by its IATA code.
+- concept: Flight
+  type: EntityType
+  relationships:
+  - name: departs_from
+    roles:
+    - concept: Airport
+    verbalizes: [ '{Flight} departs from {Airport}' ]
+    multiplicity: ManyToOne
+  - name: diverted
+    verbalizes: [ '{Flight} was diverted' ]
+",
+    );
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "flights.ossie.yaml",
+            "--base",
+            "https://example.com/flights/",
+            "-o",
+            "flights.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("2 classes, 2 properties"));
+    let ttl = std::fs::read_to_string(tmp.path().join("flights.ttl")).unwrap();
+    assert!(
+        ttl.contains("<https://schema.org/Airport> a rdfs:Class"),
+        "{ttl}"
+    );
+    assert!(
+        ttl.contains("rdfs:comment \"A flight departs from an airport.\""),
+        "{ttl}"
+    );
+    assert!(
+        ttl.contains("rdfs:range xsd:boolean"),
+        "a unary relationship is a boolean: {ttl}"
+    );
+    let (report, code) = check_json(&tmp, &["flights.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+}
+
+#[test]
+fn from_an_ossie_semantic_model_in_json() {
+    let tmp = TempDir::new().unwrap();
+    let doc = serde_json::json!({
+        "version": "0.2.0.dev0",
+        "name": "sales",
+        "datasets": [
+            {"name": "customers", "source": "sales.public.customers", "primary_key": ["id"],
+             "description": "People who buy.", "ai_context": {"synonyms": ["buyers"]},
+             "fields": [{"name": "id", "expression": {"dialects": []}},
+                        {"name": "signup_date", "datatype": "Date", "expression": {"dialects": []}}]},
+            {"name": "orders", "source": "sales.public.orders",
+             "fields": [{"name": "customer_id", "expression": {"dialects": []}}]}
+        ],
+        "relationships": [{"name": "orders_to_customers", "from": "orders", "to": "customers",
+                           "from_columns": ["customer_id"], "to_columns": ["id"]}]
+    });
+    write(&tmp, "sales.json", &doc.to_string());
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "sales.json",
+            "--base",
+            "https://example.com/sales/",
+            "-o",
+            "sales.ttl",
+        ])
+        .assert()
+        .success();
+    let ttl = std::fs::read_to_string(tmp.path().join("sales.ttl")).unwrap();
+    assert!(
+        ttl.contains("rdfs:comment \"People who buy. Also called: buyers.\""),
+        "{ttl}"
+    );
+    assert!(ttl.contains("rdfs:range sales:Customer"), "{ttl}");
+}
+
+#[test]
+fn a_dbt_project_resolves_doc_blocks_and_names_files_it_cannot_read() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("proj/models")).unwrap();
+    write(
+        &tmp,
+        "proj/models/docs.md",
+        "{% docs orders_desc %}\nOne row per order.\n{% enddocs %}\n",
+    );
+    write(
+        &tmp,
+        "proj/models/schema.yml",
+        "models:\n  - name: orders\n    description: \"{{ doc('orders_desc') }}\"\n    columns:\n      - {name: id, data_tests: [unique, not_null]}\n      - {name: total}\n",
+    );
+    write(&tmp, "proj/models/broken.yml", "models: [unclosed\n");
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "proj",
+            "--base",
+            "https://example.com/p/",
+            "-o",
+            "p.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "broken.yml: skipped, not valid YAML",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("p.ttl")).unwrap();
+    assert!(ttl.contains("rdfs:comment \"One row per order.\""), "{ttl}");
+    assert!(!ttl.contains("{{"), "{ttl}");
+}
+
+/// `CALL apoc.meta.schema() YIELD value RETURN value`, exported as JSON, for a
+/// small movies graph.
+const NEO4J_SCHEMA: &str = r#"[{"value": {
+  "Person": {"type": "node", "count": 133, "labels": [], "properties": {
+      "name": {"type": "STRING", "indexed": true, "unique": false, "existence": false},
+      "born": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "out", "count": 172, "labels": ["Movie"],
+                   "properties": {"roles": {"type": "LIST", "array": true}}},
+      "DIRECTED": {"direction": "out", "count": 44, "labels": ["Movie"], "properties": {}},
+      "REVIEWED": {"direction": "out", "count": 9, "labels": ["Movie"],
+                   "properties": {"summary": {"type": "STRING"}, "rating": {"type": "INTEGER"}}},
+      "FOLLOWS": {"direction": "out", "count": 3, "labels": ["Person"], "properties": {}}}},
+  "Movie": {"type": "node", "count": 38, "labels": [], "properties": {
+      "title": {"type": "STRING", "indexed": true, "unique": true, "existence": false},
+      "released": {"type": "INTEGER", "indexed": false, "unique": false, "existence": false},
+      "tagline": {"type": "STRING", "indexed": false, "unique": false, "existence": false}},
+    "relationships": {
+      "ACTED_IN": {"direction": "in", "count": 172, "labels": ["Person"], "properties": {}}}},
+  "ACTED_IN": {"type": "relationship", "count": 172, "properties": {"roles": {"type": "LIST", "array": true}}}
+}}]"#;
+
+#[test]
+fn from_a_neo4j_schema() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp, "movies-schema.json", NEO4J_SCHEMA);
+    fluree_cmd(&tmp)
+        .args([
+            "ontology",
+            "from",
+            "movies-schema.json",
+            "--base",
+            "https://example.com/movies/",
+            "-o",
+            "movies.ttl",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("2 classes, 9 properties"))
+        .stderr(predicate::str::contains(
+            "3 relationship propert(ies) left out",
+        ));
+    let ttl = std::fs::read_to_string(tmp.path().join("movies.ttl")).unwrap();
+    assert!(ttl.contains("movies:actedIn a rdf:Property"), "{ttl}");
+    assert!(
+        ttl.contains("rdfs:comment \"A person acted in a movie.\""),
+        "{ttl}"
+    );
+    assert!(ttl.contains("rdfs:label \"acted in\""), "{ttl}");
+    assert!(ttl.contains("rdfs:range movies:Movie"), "{ttl}");
+    let (report, code) = check_json(&tmp, &["movies.ttl"]);
+    assert_eq!(code, 0, "{report:#}");
+}
+
+#[test]
+fn json_ld_is_never_read_as_another_source() {
+    let tmp = TempDir::new().unwrap();
+    // JSON-LD whose keys a converter might mistake for its own
+    write(
+        &tmp,
+        "data.json",
+        r#"{"@context": {"ex": "https://example.com/"}, "nodes": [], "relationships": [],
+            "datasets": [], "@graph": [{"@id": "ex:acme", "ex:name": "Acme"}]}"#,
+    );
+    fluree_cmd(&tmp)
+        .args(["ontology", "from", "data.json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no classes found"));
 }

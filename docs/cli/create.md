@@ -211,3 +211,4 @@ Query with time travel:
 - [list](list.md) - List all ledgers
 - [use](use.md) - Switch active ledger
 - [drop](drop.md) - Delete a ledger
+- [graph import](graph.md#fluree-graph-import) - Bulk-load files into a new named graph of an existing ledger

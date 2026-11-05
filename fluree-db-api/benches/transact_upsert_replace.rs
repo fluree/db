@@ -28,6 +28,10 @@
 //!    per call (the #1722 floor) turns into a slope here.
 //! 8. `new_subjects` — the payload names N subjects the ledger has never
 //!    seen: the #1549 absence skip, which must stay flat.
+//! 9. `new_subjects_novelty_heavy` — (8) over the novelty of (7). The skip
+//!    must stay flat in the novelty too: a check that seeks or walks
+//!    novelty per subject turns into a slope here, where (8) has none to
+//!    walk and (7) names subjects the base already holds.
 //!
 //! Every scenario asserts in setup that it reached the lane it names
 //! (indexed or not, graph registered, novelty size), and after each
@@ -100,10 +104,11 @@ enum Scenario {
     WidePredicates,
     NoveltyHeavy,
     NewSubjects,
+    NewSubjectsNoveltyHeavy,
 }
 
 impl Scenario {
-    const ALL: [Scenario; 8] = [
+    const ALL: [Scenario; 9] = [
         Scenario::DefaultNovelty,
         Scenario::DefaultIndexed,
         Scenario::NamedNovelty,
@@ -112,6 +117,7 @@ impl Scenario {
         Scenario::WidePredicates,
         Scenario::NoveltyHeavy,
         Scenario::NewSubjects,
+        Scenario::NewSubjectsNoveltyHeavy,
     ];
 
     fn name(self) -> &'static str {
@@ -124,6 +130,7 @@ impl Scenario {
             Scenario::WidePredicates => "wide_predicates",
             Scenario::NoveltyHeavy => "novelty_heavy",
             Scenario::NewSubjects => "new_subjects",
+            Scenario::NewSubjectsNoveltyHeavy => "new_subjects_novelty_heavy",
         }
     }
 
@@ -138,7 +145,8 @@ impl Scenario {
         }
     }
 
-    /// Subjects in the base (and, except for `new_subjects`, in the upsert).
+    /// Subjects in the base (and, except for the `new_subjects` scenarios, in
+    /// the upsert).
     fn subjects(self, n: usize) -> usize {
         match self {
             Scenario::WidePredicates => (n / 4).max(1),
@@ -153,7 +161,7 @@ impl Scenario {
             // Two tagged values + two list entries out, one of each in.
             Scenario::LangList => (4 * subjects, 2 * subjects),
             Scenario::WidePredicates => (WIDE * subjects, WIDE * subjects),
-            Scenario::NewSubjects => (0, subjects),
+            Scenario::NewSubjects | Scenario::NewSubjectsNoveltyHeavy => (0, subjects),
             _ => (subjects, subjects),
         }
     }
@@ -161,7 +169,11 @@ impl Scenario {
 
 /// One node of the base load or of the measured upsert.
 fn node(scenario: Scenario, i: usize, replacement: bool) -> JsonValue {
-    let id = if scenario == Scenario::NewSubjects && replacement {
+    let new_subjects = matches!(
+        scenario,
+        Scenario::NewSubjects | Scenario::NewSubjectsNoveltyHeavy
+    );
+    let id = if new_subjects && replacement {
         format!("ex:new{i}")
     } else {
         format!("ex:s{i}")
@@ -250,7 +262,8 @@ async fn insert_batches(
 }
 
 /// Load the base, index it when the scenario says so, and add the
-/// unrelated novelty of `novelty_heavy`. Asserts the lane on the way out.
+/// unrelated novelty of the `novelty_heavy` scenarios. Asserts the lane on
+/// the way out.
 fn build_fixture(rt: &tokio::runtime::Runtime, scenario: Scenario, n: usize) -> Fixture {
     rt.block_on(async {
         let db_dir = tempfile::tempdir().expect("db tmpdir");
@@ -285,7 +298,10 @@ fn build_fixture(rt: &tokio::runtime::Runtime, scenario: Scenario, n: usize) -> 
             );
         }
 
-        if scenario == Scenario::NoveltyHeavy {
+        if matches!(
+            scenario,
+            Scenario::NoveltyHeavy | Scenario::NewSubjectsNoveltyHeavy
+        ) {
             ledger = insert_batches(
                 &fluree,
                 ledger,
@@ -295,7 +311,8 @@ fn build_fixture(rt: &tokio::runtime::Runtime, scenario: Scenario, n: usize) -> 
             .await;
             assert!(
                 ledger.novelty.len() >= 4 * n,
-                "novelty_heavy: the unrelated novelty must survive the fixture"
+                "{}: the unrelated novelty must survive the fixture",
+                scenario.name()
             );
         }
 

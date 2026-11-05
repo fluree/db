@@ -66,6 +66,8 @@ pub mod export_builder;
 pub mod format;
 pub mod graph;
 pub mod graph_commit_builder;
+#[cfg(not(target_arch = "wasm32"))]
+mod graph_import;
 pub mod graph_query_builder;
 pub mod graph_snapshot;
 pub mod graph_source;
@@ -180,6 +182,8 @@ pub use format::{
 };
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
+#[cfg(not(target_arch = "wasm32"))]
+pub use graph_import::graph_import_target;
 pub use graph_query_builder::{GraphQueryBuilder, GraphSnapshotQueryBuilder};
 pub use graph_snapshot::GraphSnapshot;
 pub use graph_source::{
@@ -190,8 +194,8 @@ pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 #[cfg(not(target_arch = "wasm32"))]
 pub use import::{
     is_bulk_import_file, scan_directory_format, CreateBuilder, DirectoryFormat,
-    EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
-    ImportSummary, RemoteSource,
+    EffectiveImportSettings, GraphImportTarget, ImportBuilder, ImportConfig, ImportError,
+    ImportPhase, ImportResult, ImportSummary, ImportedGraph, RemoteSource,
 };
 pub use ledger_info::{
     redact_graph_source_config, redact_graph_source_record_config, LedgerInfoBuilder,
@@ -200,7 +204,7 @@ pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
-    UpdatePlan, WritePathStats,
+    UpdatePlan, WritePathStats, WriterExclusion,
 };
 pub use ledger_view::{CommitRef, GraphNames, LedgerView, COMMIT_PREFIX_MIN_LEN};
 pub use merge::{MergeReport, StagedMerge};
@@ -250,6 +254,9 @@ pub use view::{
 
 #[cfg(feature = "sql")]
 pub use graph_source::sql_auth_from_json;
+/// A graph source's connection check, as a server reports it. Plain data, so
+/// a client built without `iceberg` can still read a server's outcome.
+pub use graph_source::ConnectionCheck;
 #[cfg(feature = "delta")]
 pub use graph_source::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
 /// The one codec every surface turns its graph-source input into the
@@ -265,11 +272,11 @@ pub use graph_source::{
     guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
     CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider,
     GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
-    IcebergCreateConfig, IcebergCreateResult, MaterializeResult, PartitionFieldInfo,
-    PersistedMaterializeJob, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput,
-    ResolvedStorage, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    StorageAccessReport, StorageDecision, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
-    TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    IcebergCreateConfig, MaterializeResult, PartitionFieldInfo, PersistedMaterializeJob,
+    R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, ResolvedStorage, RestCatalogMode,
+    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StorageDecision,
+    StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride, TablePreview,
+    TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 #[cfg(feature = "delta")]
@@ -4260,6 +4267,30 @@ impl Fluree {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(&self, ledger_id: &str) -> import::CreateBuilder<'_> {
         import::CreateBuilder::new(self, ledger_id.to_string())
+    }
+
+    /// Bulk-import into a new named graph of an existing ledger.
+    ///
+    /// The same pipeline as [`Fluree::create`]`(..).import(..)`, continuing
+    /// the ledger's commits and extending its index rather than building
+    /// one: see [`import::GraphImportTarget`] for what it requires and how it
+    /// holds the ledger.
+    ///
+    /// ```ignore
+    /// let result = fluree
+    ///     .import_into_graph("mydb", "http://example.org/graph/products")
+    ///     .import("/data/products/")
+    ///     .threads(8)
+    ///     .execute()
+    ///     .await?;
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn import_into_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+    ) -> import::GraphImportTarget<'_> {
+        import::GraphImportTarget::new(self, ledger_id.to_string(), graph_iri.to_string())
     }
 
     /// Create a lazy graph handle for a ledger at the latest head.

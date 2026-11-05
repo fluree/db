@@ -12,12 +12,12 @@ use crate::index_schema::IndexSchema;
 use crate::index_stats::IndexStats;
 use crate::ledger_id::{IntoLedgerId, LedgerId};
 use crate::namespaces::default_namespace_codes;
-use crate::ns_encoding::{canonical_split, NsSplitMode};
+use crate::ns_encoding::{encode_registered, NsSplitMode};
 use crate::range_provider::RangeProvider;
 use crate::schema_hierarchy::SchemaHierarchy;
 use crate::sid::Sid;
 use crate::storage::StorageRead;
-use fluree_vocab::namespaces::{is_full_iri, EMPTY, OVERFLOW};
+use fluree_vocab::namespaces::{is_full_iri, OVERFLOW};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -491,11 +491,9 @@ impl LedgerSnapshot {
     /// canonical prefix is not registered, falls back to `Sid(EMPTY, iri)`.
     /// No longest-prefix-match — canonical encoding prohibits `starts_with` matching.
     fn encode_iri_inner(&self, iri: &str) -> Sid {
-        let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
-        if let Some(&code) = self.namespace_reverse.get(canonical_prefix) {
-            return Sid::new(code, canonical_suffix);
-        }
-        Sid::new(EMPTY, iri)
+        encode_registered(iri, self.ns_split_mode, |prefix| {
+            self.namespace_reverse.get(prefix).copied()
+        })
     }
 
     /// Build a reverse lookup from graph Sid → GraphId.
@@ -1159,6 +1157,7 @@ pub async fn load_ledger_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_vocab::namespaces::EMPTY;
 
     #[test]
     fn test_from_root_bytes_rejects_non_fir6() {

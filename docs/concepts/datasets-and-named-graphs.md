@@ -353,6 +353,8 @@ WHERE {
 
 There is no "create graph" operation. The first transaction that targets a new graph IRI — via TriG, JSON-LD with `@graph`, or SPARQL `INSERT … GRAPH <iri> …` — registers it and assigns a stable `g_id` (3+ for user graphs). Subsequent inserts into the same IRI land in the same registered slot.
 
+To load a large new graph into an existing ledger, bulk-import it instead: [`fluree graph import <iri> --from <path>`](../cli/graph.md#fluree-graph-import) (Rust: `Fluree::import_into_graph`, Python: `Ledger.import_graph`) runs the bulk-import pipeline into a graph the ledger does not have yet. Its commits continue the ledger's history and its terms are shared with the rest of the ledger.
+
 ### Listing and dropping graphs
 
 Two CLI commands cover the rest of the lifecycle:

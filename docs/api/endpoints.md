@@ -893,12 +893,27 @@ POST /import-upload
   "source_kind": "source",       // default "flpack"
   "filename": "dump.cypher",     // extension drives format detection
   "edge_properties": "plain",    // CSV/Cypher only; default "annotated"
-  "base_iri": "https://kb.example/" } // CSV/Cypher only; format default if omitted
+  "base_iri": "https://kb.example/", // CSV/Cypher only; format default if omitted
+  "skolem_namespace": "urn:kb" } // blank-node salt; needs "source-upload-skolem"
 ```
+
+The file is imported under its own name, so its blank nodes get the ids a direct import of that file would mint. Servers that honor `"skolem_namespace"` (the salt `--skolem-namespace` sets, in place of the ledger id) advertise `"source-upload-skolem"` in `import.modes`.
 
 Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.
 
 This is the transport behind `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` — the CLI checks the capability and errors with a `.flpack` fallback hint when the server doesn't offer it.
+
+A source upload can also fill a **new named graph of an existing ledger**, as [`fluree graph import`](../cli/graph.md#fluree-graph-import) does. Servers that support it add `"source-upload-graph"` to `import.modes`; mint with `"graph"` naming the new graph and `"ledger"` the existing ledger:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",
+  "filename": "products.ttl",
+  "graph": "http://example.org/graph/products" }
+```
+
+Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written.
 
 ## Storage Proxy Endpoints
 
@@ -2450,11 +2465,12 @@ POST /drop-graph
 - **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
 - **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
 - **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
+- **Bounded.** The drop is one commit holding every retraction. A graph with more facts than `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default 10,000,000; `0` disables) is refused (400) before it is read. A drop larger than the novelty limit (`--reindex-max-bytes`) is refused at commit (413); one that fits only once earlier writes are indexed gets 503.
 
 **Status codes:**
 
 - `200 OK` - Drop succeeded (commit produced or no-op)
-- `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
+- `400 Bad Request` - Malformed IRI, empty IRI, system-graph IRI, or a graph past `FLUREE_MAX_GRAPH_SCAN_FLAKES`
 - `401`/`403` - Admin token required and absent/invalid
 - `404 Not Found` - Ledger or graph IRI not found
 - `500 Internal Server Error` - Server error
@@ -3067,8 +3083,8 @@ The source's own fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Graph source name (required) |
-| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
-| `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle (required). A request without it is a 400 and registers nothing. |
 | `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
 | `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
@@ -3191,20 +3207,34 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
   "table_identifier": "sales.orders",
   "catalog_uri": "https://polaris.example.com/api/catalog",
   "connection_tested": true,
+  "connection_check": {"outcome": "verified"},
   "mapping_source": "r2rml-inline",
   "triples_map_count": 3,
+  "table_count": 1,
+  "table_names": ["sales.orders"],
   "mapping_validated": true
 }
 ```
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — a [connection](#iceberg-connection) the server refuses, missing required fields, or an `r2rml` that does not parse or compile
+- `400 Bad Request` — a [connection](#iceberg-connection) the server refuses, missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`)
 - `401/403` — admin auth required
 - `403 Forbidden` (`err:auth/HostIdentityRefused`) — a host identity the operator's policy refuses
 - `500 Internal Server Error` — the graph source could not be published
 
-A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
+`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
+
+`connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
+
+| `outcome` | Meaning | Other fields |
+|---|---|---|
+| `verified` | Every mapped table loaded | |
+| `table_failed` | `table` did not load: the catalog answered that it has no such table, refused it, or answered with another error status; in `direct` mode, its metadata could not be read. `error` is the reason | `table`, `error` |
+| `catalog_unreachable` | The catalog did not answer for `table`: a refused connection, a timeout, a DNS or TLS failure, or a failure that carries no answer from the catalog. Catalog modes only | `table`, `error` |
+| `client_failed` | The client every load goes through could not be built (for example, a catalog credential that does not resolve), so no table was loaded | `error` |
+| `timed_out` | The check ran past `budget_secs` with `loaded` of `total` tables loaded. The tables may only be slow | `loaded`, `total`, `budget_secs` |
+| `no_tables` | The mapping could not be read, so it named no table to load | |
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
@@ -3558,7 +3588,7 @@ So that one body can be sent to each route in turn, each Delta route ignores the
 
 An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
 
-**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
 
 See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
 

@@ -1228,6 +1228,190 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
         .await;
 }
 
+/// #1266 — the rebuild gate scales with the index: a batch re-typing a small
+/// share of a ledger's typed subjects stays incremental even when it exceeds
+/// the configured floor, and a batch re-typing a large share still defers to a
+/// rebuild. Both stay current-state-correct.
+#[tokio::test(flavor = "current_thread")]
+async fn retype_gate_scales_with_typed_subjects() {
+    let (spans, _guard) = crate::support::span_capture::init_test_tracing();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    // Floor of 1, over 41 typed subjects: the gate opens past 41 / 8 = 5.
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small().with_incremental_retype_max_subjects(1),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    const FALLBACK: &str = "incremental indexing failed, falling back to full rebuild";
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/retype-gate-scales:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let mut people: Vec<JsonValue> = (0..40)
+                .map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Person", "ex:worksFor": {"@id": "ex:org1"}}))
+                .collect();
+            people.push(json!({"@id": "ex:org1", "@type": "ex:Organization"}));
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@graph": people}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert people");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            let retype = |ids: std::ops::Range<usize>| {
+                let ids: Vec<usize> = ids.collect();
+                json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "delete": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Person"})).collect::<Vec<_>>(),
+                    "insert": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Employee"})).collect::<Vec<_>>(),
+                })
+            };
+            let mut ledger = r1.ledger;
+            for (ids, falls_back, people, employees) in [(0..2, false, 38, 2), (2..9, true, 31, 9)] {
+                let before = spans.find_events(FALLBACK).len();
+                let r = fluree
+                    .update_with_opts(
+                        ledger,
+                        &retype(ids.clone()),
+                        TxnOpts::default(),
+                        CommitOpts::default(),
+                        &index_cfg,
+                    )
+                    .await
+                    .expect("retype");
+                let outcome =
+                    trigger_index_and_wait_outcome(&handle, r.ledger.ledger_id(), r.receipt.t)
+                        .await;
+                let fluree_db_api::IndexOutcome::Completed { root_id, .. } = outcome else {
+                    unreachable!("helper only returns Completed")
+                };
+                assert_eq!(
+                    spans.find_events(FALLBACK).len() > before,
+                    falls_back,
+                    "re-typing {} of 41 typed subjects: rebuild fallback expected = {falls_back}",
+                    ids.len()
+                );
+                let loaded = load_ledger_snapshot(&storage, &root_id.expect("root"), ledger_id)
+                    .await
+                    .expect("load snapshot");
+                assert_eq!(class_count(&loaded, "http://example.org/Person"), Some(people));
+                assert_eq!(class_count(&loaded, "http://example.org/Employee"), Some(employees));
+                assert_eq!(
+                    ref_class_total(
+                        &loaded,
+                        "http://example.org/Employee",
+                        "http://example.org/worksFor",
+                        "http://example.org/Organization"
+                    ),
+                    Some(employees),
+                    "re-typed subjects' edges move to Employee"
+                );
+                ledger = r.ledger;
+            }
+        })
+        .await;
+}
+
+/// #1266 — the rebuild gate's share counts typed subjects, not class
+/// memberships: with nine types per subject, re-typing 6 of 41 subjects
+/// passes an eighth of the subjects and defers to a rebuild.
+#[tokio::test(flavor = "current_thread")]
+async fn retype_gate_counts_subjects_not_class_memberships() {
+    let (spans, _guard) = crate::support::span_capture::init_test_tracing();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small().with_incremental_retype_max_subjects(1),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    const FALLBACK: &str = "incremental indexing failed, falling back to full rebuild";
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/retype-gate-subjects:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let types: Vec<String> = std::iter::once("ex:Person".to_string())
+                .chain((0..8).map(|k| format!("ex:Tag{k}")))
+                .collect();
+            let people: Vec<JsonValue> = (0..41)
+                .map(|i| json!({"@id": format!("ex:p{i}"), "@type": types, "ex:worksFor": {"@id": "ex:org1"}}))
+                .collect();
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@graph": people}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert people");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            let ids: Vec<usize> = (0..6).collect();
+            let retype = json!({
+                "@context": {"ex": "http://example.org/"},
+                "delete": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Person"})).collect::<Vec<_>>(),
+                "insert": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Employee"})).collect::<Vec<_>>(),
+            });
+            let before = spans.find_events(FALLBACK).len();
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("retype");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            assert!(
+                spans.find_events(FALLBACK).len() > before,
+                "re-typing 6 of 41 subjects (9 types each) must defer to a rebuild"
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn property_and_class_statistics_persist_in_db_root() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
