@@ -178,7 +178,7 @@ pub(crate) fn is_retryable_commit_conflict(e: &ApiError) -> bool {
 /// duration of one commit.
 ///
 /// A cached-handle commit stages against a *clone* of the cached
-/// [`LedgerState`] — `clone_state()` on the lock-held path, `snapshot()` plus
+/// [`LedgerState`] — `clone_state_for_staging()` on the lock-held path, `snapshot()` plus
 /// `to_ledger_state()` on the optimistic path. So while the commit runs, the
 /// cache co-holds an `Arc` clone of every structure the commit is about to
 /// `Arc::make_mut`: the subject/string dictionaries, the runtime small dicts,
@@ -1375,11 +1375,13 @@ impl Fluree {
                 .await?;
             // Answer the trailing RETURN against the final virtual state
             // (identical content to the state the commit publishes).
-            let cypher_return = match outcome.return_result {
-                Some(qr) => {
-                    let view = crate::GraphDb::from_ledger_state(&outcome.final_state);
+            let cypher_return = match outcome.returned {
+                Some(answered) => {
+                    let view = crate::GraphDb::from_ledger_state(&answered.final_state);
                     Some(
-                        qr.to_cypher_json_async(view.as_graph_db_ref())
+                        answered
+                            .result
+                            .to_cypher_json_async(view.as_graph_db_ref())
                             .await
                             .map_err(|e| {
                                 ApiError::internal(format!(
@@ -2196,13 +2198,13 @@ impl Fluree {
         let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
         let tracker = core.tracker();
 
-        let write_guard = ledger.lock_for_write().await;
+        let mut write_guard = ledger.lock_for_write().await;
         // The dry-run/consensus path has no response channel for a trailing
         // Cypher RETURN — callers reject RETURN-carrying sequential
         // statements before submission.
         let (stage_result, txn_type, commit_opts, _cypher_return) = self
             .stage_core(
-                write_guard.clone_state(),
+                write_guard.clone_state_for_staging(),
                 core,
                 &tracker,
                 &index_config,
@@ -2332,10 +2334,10 @@ impl Fluree {
             || core.pre_built_cypher_seq.is_some()
             || core.policy.is_some()
         {
-            let write_guard = ledger.lock_for_write().await;
+            let mut write_guard = ledger.lock_for_write().await;
             let (stage_result, txn_type, commit_opts, cypher_return) = self
                 .stage_core(
-                    write_guard.clone_state(),
+                    write_guard.clone_state_for_staging(),
                     core,
                     &tracker,
                     &index_config,
@@ -2431,7 +2433,7 @@ impl Fluree {
                     }
 
                     let lock_started = fluree_db_core::clock::Instant::now();
-                    let write_guard = ledger.lock_for_write().await;
+                    let mut write_guard = ledger.lock_for_write().await;
                     tracing::debug!(
                         target: "fluree::write_path",
                         ledger = %ledger.id(),
@@ -2460,7 +2462,7 @@ impl Fluree {
                         let (stage_result, txn_type, commit_opts) = self
                             .stage_plan(
                                 &op_plan,
-                                write_guard.clone_state(),
+                                write_guard.clone_state_for_staging(),
                                 txn_opts.clone(),
                                 &commit_opts_base,
                                 tracker_ref,
@@ -2472,11 +2474,11 @@ impl Fluree {
                         (write_guard, stage_result, txn_type, commit_opts)
                     }
                 } else {
-                    let write_guard = ledger.lock_for_write().await;
+                    let mut write_guard = ledger.lock_for_write().await;
                     let (stage_result, txn_type, commit_opts) = self
                         .stage_plan(
                             &op_plan,
-                            write_guard.clone_state(),
+                            write_guard.clone_state_for_staging(),
                             txn_opts.clone(),
                             &commit_opts_base,
                             tracker_ref,

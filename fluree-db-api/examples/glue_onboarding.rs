@@ -8,17 +8,21 @@
 //! ```
 
 use fluree_db_api::{
-    browse_iceberg_catalog, preview_iceberg_table, BrowseDepth, IcebergConnectionConfig, StatsTier,
-    TableIdentifier,
+    BrowseDepth, FlureeBuilder, IcebergConnectionConfig, StatsTier, TableIdentifier,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
     let conn = IcebergConnectionConfig::glue(Some(region), None);
+    // Browse and preview run under an instance's identity context (its
+    // host-identity policy governs the ambient AWS chain Glue is called with).
+    let fluree = FlureeBuilder::memory().build_memory();
 
     println!("=== browse_iceberg_catalog (Glue, depth=Tables) ===");
-    let browse = browse_iceberg_catalog(conn.clone(), BrowseDepth::Tables).await?;
+    let browse = fluree
+        .browse_iceberg_catalog(conn.clone(), BrowseDepth::Tables)
+        .await?;
     println!("namespaces: {:?}", browse.namespaces);
     println!("tables ({}):", browse.tables.len());
     for t in browse.tables.iter().take(12) {
@@ -30,7 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         namespace: "enterprise_dw".into(),
         name: "dim_store".into(),
     };
-    let preview = preview_iceberg_table(conn, table, StatsTier::Schema).await?;
+    let preview = fluree
+        .preview_iceberg_table(conn, table, StatsTier::Schema)
+        .await?;
     println!("{preview:#?}");
 
     println!("\nONBOARDING OK");

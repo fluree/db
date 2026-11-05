@@ -2,7 +2,7 @@
 
 Manage **named graphs** within a single branch of a ledger.
 
-Named graphs are created implicitly: the first time you transact a triple under a new graph IRI (via TriG `GRAPH <iri> { ... }`, JSON-LD `@graph` with an `@id`, or SPARQL `INSERT DATA { GRAPH <iri> { ... } }`), the graph is registered and assigned a deterministic `g_id`. There is no separate "create graph" command — `fluree graph` only exposes the operations that don't fall out of `insert` / `upsert` / `update` for free.
+Named graphs are created implicitly: the first time you transact a triple under a new graph IRI (via TriG `GRAPH <iri> { ... }`, JSON-LD `@graph` with an `@id`, or SPARQL `INSERT DATA { GRAPH <iri> { ... } }`), the graph is registered and assigned a deterministic `g_id`. There is no separate "create graph" command — `fluree graph` only exposes the operations that don't fall out of `insert` / `upsert` / `update` for free: listing graphs, dropping one, and bulk-loading a new one from files with `fluree graph import`.
 
 ## Subcommands
 
@@ -49,6 +49,71 @@ fluree graph list --ledger mydb --remote origin
 fluree graph list --ledger mydb --include-system --json
 ```
 
+### fluree graph import
+
+Bulk-import files into a new named graph of an existing ledger.
+
+**Usage:**
+
+```bash
+fluree graph import <IRI> --from <PATH> [OPTIONS]
+```
+
+**Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<IRI>` | Full absolute IRI of the new named graph (e.g. `http://example.org/graph/products`). |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--from <PATH>` | File or directory to import. |
+| `-l, --ledger <LEDGER>` | Ledger identifier (e.g. `mydb` or `mydb:feature-x`). Defaults to the active ledger. |
+| `--remote <REMOTE>` | Run the import on a remote server by remote name. `--from` must be a single file. |
+| `--memory-budget-mb`, `--parallelism`, `--chunk-size-mb`, `--skolem-namespace`, `--leaflet-rows`, `--leaflets-per-leaf` | Bulk-import tuning, as for [`fluree create --from`](create.md). |
+| `--edge-properties`, `--base-iri` | CSV/Cypher conversion, as for [`fluree create --from`](create.md#property-graph-imports-csv--cypher). |
+
+**Description:**
+
+`fluree graph import` runs the bulk-import pipeline of `fluree create --from` over a ledger that already exists:
+
+- **The graph must be new.** Every statement in the source lands in `<IRI>`, which the ledger must not have registered. A graph that holds data is refused, and so is one emptied by `fluree graph drop`, which keeps its registration; import into a new IRI instead.
+- **The ledger's history continues.** The import writes commits after the ledger's head, `t = head + 1` onward, so a query `as-of` an earlier `t` does not see the graph, and a full reindex from the commits rebuilds it.
+- **Terms are shared.** An IRI or string the ledger already holds keeps its identity, so the graph joins with the default graph and other graphs through the subjects they have in common.
+- **The index is extended, not rebuilt.** The new graph's index is built in bulk and added to the ledger's existing index; the rest of the index is reused as it is. A ledger with commits after its index is indexed first.
+- **Writes wait.** Transactions that go through the connection running the import (the server the CLI routes it to, or the program that embeds Fluree) wait until it finishes; queries go on against the head the import started from. A writer that does not share that connection, such as a second process over the same storage, is not held: if it commits during the import, the import fails at the end with nothing published.
+
+The source holds default-graph data: Turtle, N-Triples, JSON-LD, or JSONL/NDJSON files (optionally `.gz`/`.zst`), or CSV / Cypher inputs, as a single file or a directory. TriG, N-Quads, and JSON-LD that names graphs of its own are refused, since their statements belong to other graphs. Blank nodes are minted from the ledger id and the graph IRI unless `--skolem-namespace` is given, so importing one file into two graphs gives each its own blank nodes.
+
+If the source holds statement annotations (RDF 1.2 / `f:reifies`), the ledger's annotation index is set aside: annotation queries stay correct but read by scan until [`fluree reindex`](reindex.md) seals it again. The CLI prints a note when this happens.
+
+The following are refused with nothing written: a graph the ledger already has registered, the default graph (`urn:default`), the system `txn-meta` / `config` graphs, a ledger that does not exist, and the source formats above.
+
+**If an import fails.** Until its last step an import publishes nothing, so a failure leaves the ledger as it was, including when another writer moved the ledger's head during the import. The last step publishes the import's commits and then its index. If the index does not publish, because publishing it fails or the process stops in between, the import is in the ledger all the same: the error says it is published through `t=…`, and queries see the graph, read from the import's commits until an index covers them. Every load of the ledger reads those commits into memory until then, so after a large import run [`fluree reindex`](reindex.md). The log records each import's commit head and index root (`publishing graph import`) before it publishes them.
+
+**Routing:** with `--remote <name>`, or when the active ledger is tracked, the file is uploaded to the server and imported there; the server must advertise the `source-upload-graph` import mode, and `source-upload-skolem` when `--skolem-namespace` is given (see [server-integration](server-integration.md#into-a-new-graph-of-an-existing-ledger)). With a local `fluree server` running against the same storage, the import is routed through it in the same way, as a single file. Pass `--direct` only when no server holds the storage.
+
+**Examples:**
+
+```bash
+# A directory of Turtle files into a new graph of the active ledger
+fluree graph import http://example.org/graph/products --from products/
+
+# A compressed file into a specific ledger
+fluree graph import urn:example:payroll --from payroll.ttl.gz --ledger mydb
+
+# On a remote server
+fluree graph import urn:example:payroll --from payroll.ttl --ledger mydb --remote origin
+```
+
+**Output:**
+
+```
+Imported 1.2M flakes into graph <http://example.org/graph/products> of 'mydb:main' in 14.20s (0.08 M flakes/s) across 3 commits (t=18..20)
+```
+
 ### fluree graph drop
 
 Drop a single named graph from one branch by transactionally retracting every triple currently asserted in it.
@@ -81,6 +146,7 @@ fluree graph drop <IRI> [OPTIONS]
 - The graph IRI keeps its `g_id`; a subsequent insert into the same IRI lands in the same logical graph rather than a new slot.
 - Drops are per-branch — sibling branches that share the same graph IRI are not touched.
 - Idempotent: re-running the drop on an already-empty graph reports `committed: false`, `retracted: 0` and produces no new commit.
+- **One commit, sized by the graph.** Every retraction lands in that commit, so a graph holding more facts than `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default 10,000,000; `0` disables) is refused before it is read. A drop that fits that limit but not the ledger's novelty limit (`--reindex-max-bytes`) is refused at commit. Drop a larger graph in batches, e.g. `DELETE { GRAPH <g> { ?s ?p ?o } } WHERE { GRAPH <g> { VALUES ?s { … } ?s ?p ?o } }`.
 
 The following are rejected with a clear error (no commit is produced):
 
@@ -118,6 +184,7 @@ Graph <urn:example:org/payroll> in 'mydb:main' was already empty — no commit p
 
 ## See Also
 
+- [create](create.md) — create a ledger, optionally bulk-loading it from files
 - [drop](drop.md) — drop a whole ledger or graph source
 - [branch](branch.md) — branch management (drop, list, rebase, merge, diff)
 - [info](info.md) — full ledger info, including the underlying `named-graphs` payload

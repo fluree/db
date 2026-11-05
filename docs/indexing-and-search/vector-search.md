@@ -421,7 +421,7 @@ Vector indexes are implemented using embedded [usearch](https://github.com/unum-
 
 ### Creating Vector Indexes
 
-> **HTTP/Docker users:** there is no HTTP endpoint for creating vector indexes today. Index creation is Rust-API-only. To use HNSW vector search from an HTTP-only deployment, create the index using a Rust program (or the Rust API embedded in your application) against the same storage path your Fluree server reads, then run queries normally via `POST /v1/fluree/query`.
+> **HTTP/Docker users:** there is no HTTP endpoint for creating vector indexes today. Index creation is Rust-API-only. To use HNSW vector search from an HTTP-only deployment, create the index using a Rust program (or the Rust API embedded in your application) against the storage your Fluree server reads, then run queries normally via `POST /v1/fluree/query`. On file storage, a directory is used by one process at a time and the server locks it ([One process per directory](../operations/storage.md#one-process-per-directory)), so stop the server while the Rust program creates the index, then start it again.
 
 #### Rust API
 

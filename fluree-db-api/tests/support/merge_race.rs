@@ -1,6 +1,11 @@
 //! A deterministic pause immediately before the merge's ref CAS, an opt-in
-//! listing failure, and an opt-in loss of every commit-head race. All other
-//! operations use the real nameservice, including rollback.
+//! listing failure, an opt-in loss of every commit-head race, and an opt-in
+//! pause before, or failure of, an index publish. All other operations use
+//! the real nameservice, including rollback.
+
+// Compiled into more than one test group, each using some of it; `allow`,
+// not `expect`, for the reason `support/mod.rs` gives.
+#![allow(dead_code)]
 
 use async_trait::async_trait;
 use fluree_db_core::ContentId;
@@ -24,8 +29,12 @@ pub(super) struct PausingNameService {
     armed: AtomicBool,
     failing_listings: AtomicBool,
     losing_commits: AtomicBool,
+    pausing_index: AtomicBool,
+    failing_index: AtomicBool,
     pub(super) entered: Notify,
     pub(super) resume: Notify,
+    pub(super) index_entered: Notify,
+    pub(super) index_resume: Notify,
 }
 
 impl PausingNameService {
@@ -35,9 +44,24 @@ impl PausingNameService {
             armed: AtomicBool::new(true),
             failing_listings: AtomicBool::new(false),
             losing_commits: AtomicBool::new(false),
+            pausing_index: AtomicBool::new(false),
+            failing_index: AtomicBool::new(false),
             entered: Notify::new(),
             resume: Notify::new(),
+            index_entered: Notify::new(),
+            index_resume: Notify::new(),
         }
+    }
+
+    /// Hold the next index publish until `index_resume`, signalling
+    /// `index_entered` once it is held.
+    pub(super) fn pause_next_index_publish(&self) {
+        self.pausing_index.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every index publish fail from now on.
+    pub(super) fn fail_index_publishes(&self) {
+        self.failing_index.store(true, Ordering::SeqCst);
     }
 
     /// Make every listing of records, bindings or dropped ledgers fail from
@@ -173,6 +197,15 @@ impl IndexPublisher for PausingNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        if self.pausing_index.swap(false, Ordering::SeqCst) {
+            self.index_entered.notify_one();
+            self.index_resume.notified().await;
+        }
+        if self.failing_index.load(Ordering::SeqCst) {
+            return Err(NameServiceError::Storage(
+                "index publish failed (test)".into(),
+            ));
+        }
         self.inner
             .publish_index_fenced(ledger_id, fence, index_t, index_id)
             .await

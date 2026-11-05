@@ -79,6 +79,7 @@ async fn cascade_attachment_retracts(
     reverse_graph: &HashMap<Sid, GraphId>,
     new_t: i64,
     lpg_edge_lifecycle: bool,
+    relationship_edges: &HashMap<EdgeId, Vec<String>>,
 ) -> Result<Vec<Flake>> {
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
@@ -164,6 +165,23 @@ async fn cascade_attachment_retracts(
                     .with_object(term.clone()),
             )
             .await?;
+            // A Cypher `DELETE r` means one relationship, but retracting the
+            // edge takes every relationship on it: refuse an edge that
+            // carries others, whatever the statement's MATCH kept.
+            if let Some(rels) = relationship_edges.get(&edge_id(flake)) {
+                let on_edge = links
+                    .iter()
+                    .filter(|l| !txn_link_retracts.contains(&(g_id, l.s.clone(), term.clone())))
+                    .count();
+                if on_edge > 1 {
+                    return Err(TransactError::UnsupportedFeature(format!(
+                        "DELETE of relationship `{}` failed: parallel relationships share its \
+                         underlying edge, so deleting one would affect the others. \
+                         Per-occurrence DELETE of a parallel relationship is not yet supported.",
+                        rels.join("`, `")
+                    )));
+                }
+            }
             for link in links {
                 if txn_link_retracts.contains(&(g_id, link.s.clone(), term.clone())) {
                     continue;
@@ -759,6 +777,7 @@ pub async fn stage_with_graph_delta(
             &reverse_graph,
             new_t,
             lpg_edge_lifecycle,
+            &stream_stats.relationship_edges,
         )
         .await?;
         if !cascade.is_empty() {
@@ -1698,6 +1717,44 @@ async fn stage_graph_mgmt(
     .await
 }
 
+/// Whether the dictionary novelty settles that no novelty flake has subject
+/// `subject`, with no read of novelty.
+///
+/// A dictionary novelty that covers the ledger's novelty
+/// ([`DictNovelty::covers`](fluree_db_core::DictNovelty::covers)) holds every
+/// subject of a novelty flake that the persisted dictionary does not, so a
+/// subject in neither is in no novelty flake.
+fn dictionary_rules_out(ledger: &LedgerState, subject: &Sid) -> bool {
+    let dict = &ledger.dict_novelty;
+    dict.covers(ledger.novelty.t)
+        && dict
+            .subjects
+            .find_subject(subject.namespace_code, &subject.name)
+            .is_none()
+}
+
+/// Whether a seek bounded to `subject` finds a flake of it in graph `g_id`'s
+/// novelty: what decides when the dictionary doesn't (no coverage, or a hit,
+/// since the dictionary novelty spans every graph and names ref objects too),
+/// never a walk of the graph's novelty.
+fn novelty_seek_finds_subject(ledger: &LedgerState, g_id: GraphId, subject: &Sid) -> bool {
+    use fluree_db_core::comparator::IndexType;
+
+    let lo = Flake::min_for_subject(subject.clone());
+    let hi = Flake::max_for_subject(subject.clone());
+    let mut found = false;
+    ledger.novelty.for_each_overlay_flake(
+        g_id,
+        IndexType::Spot,
+        Some(&lo),
+        Some(&hi),
+        false,
+        ledger.t(),
+        &mut |_| found = true,
+    );
+    found
+}
+
 /// Stage pre-built flakes against a ledger (bypass WHERE/template pipeline).
 ///
 /// This is the fast path for bulk INSERT from Turtle where flakes are already
@@ -2267,6 +2324,88 @@ struct WhereStreamStats {
     unmatched_intents: Vec<Flake>,
     /// The list cells the templates edit, when the WHERE reads lists as RDF.
     cells: Option<crate::cell_edits::CellEdits>,
+    /// The edges only a Cypher relationship's DELETE retracts, by edge, with
+    /// the relationship variables that named it (see
+    /// [`RelationshipEdges`]). Empty unless the transaction carries
+    /// [`crate::ir::TxnOpts::relationship_deletes`].
+    relationship_edges: HashMap<EdgeId, Vec<String>>,
+}
+
+/// An edge as a retraction names it: graph, subject, predicate, object.
+type EdgeId = (Option<Sid>, Sid, Sid, FlakeValue);
+
+fn edge_id(flake: &Flake) -> EdgeId {
+    (
+        flake.g.clone(),
+        flake.s.clone(),
+        flake.p.clone(),
+        flake.o.clone(),
+    )
+}
+
+/// The edges a Cypher relationship's DELETE retracts (see
+/// [`crate::ir::TxnOpts::relationship_deletes`]), noted as the delete
+/// templates are instantiated, so the parallel-relationship check covers
+/// those edges and no others.
+///
+/// An edge another delete template retracts as well is left out: that is a
+/// `DETACH DELETE` of one of its endpoints, which takes every relationship on
+/// the node, so the edge's other relationships go as the statement asks.
+struct RelationshipEdges {
+    /// Each delete template's relationship variable, when it is a
+    /// relationship's DELETE.
+    vars: Vec<Option<String>>,
+    /// The predicates those templates retract: another template's retraction
+    /// can only name one of their edges with one of these.
+    predicates: HashSet<Sid>,
+    deleted: HashMap<EdgeId, Vec<String>>,
+    also: HashSet<EdgeId>,
+}
+
+impl RelationshipEdges {
+    fn new(txn: &Txn) -> Option<Self> {
+        let deletes = txn.opts.relationship_deletes.as_ref()?;
+        let mut vars = vec![None; txn.delete_templates.len()];
+        let mut predicates = HashSet::new();
+        for d in deletes {
+            let Some(template) = txn.delete_templates.get(d.template) else {
+                continue;
+            };
+            vars[d.template] = Some(d.var.clone());
+            if let TemplateTerm::Sid(p) = &template.predicate {
+                predicates.insert(p.clone());
+            }
+        }
+        Some(Self {
+            vars,
+            predicates,
+            deleted: HashMap::new(),
+            also: HashSet::new(),
+        })
+    }
+
+    /// Note one retraction intent, from delete template `template`.
+    fn note(&mut self, template: usize, flake: &Flake) {
+        match self.vars.get(template) {
+            Some(Some(var)) => {
+                let vars = self.deleted.entry(edge_id(flake)).or_default();
+                if !vars.contains(var) {
+                    vars.push(var.clone());
+                }
+            }
+            _ => {
+                if matches!(flake.o, FlakeValue::Ref(_)) && self.predicates.contains(&flake.p) {
+                    self.also.insert(edge_id(flake));
+                }
+            }
+        }
+    }
+
+    /// The edges only a relationship's DELETE retracts.
+    fn finish(mut self) -> HashMap<EdgeId, Vec<String>> {
+        self.deleted.retain(|edge, _| !self.also.contains(edge));
+        self.deleted
+    }
 }
 
 /// Stream the WHERE result into `acc`, projecting → materializing encoded
@@ -2720,6 +2859,7 @@ async fn stream_where_into_accumulator(
     let mut total_binding_rows: u64 = 0;
     let mut retraction_count: usize = 0;
     let mut assertion_count: usize = 0;
+    let mut relationship_edges = RelationshipEdges::new(txn);
 
     while let Some(batch) = cursor.next_batch().await.map_err(TransactError::Query)? {
         // Blank nodes in INSERT templates are fresh per WHERE solution
@@ -2743,8 +2883,17 @@ async fn stream_where_into_accumulator(
         );
         let intents = {
             let _g = delete_span.enter();
-            let intents =
-                generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?;
+            let intents = match relationship_edges.as_mut() {
+                Some(edges) => generator.generate_retract_intents_noting(
+                    &txn.delete_templates,
+                    &witnessed,
+                    &batch,
+                    |template, flake| edges.note(template, flake),
+                )?,
+                None => {
+                    generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?
+                }
+            };
             route_var_graphs(
                 ledger,
                 generator.written_graphs(),
@@ -2824,6 +2973,9 @@ async fn stream_where_into_accumulator(
         assertion_count,
         unmatched_intents,
         cells,
+        relationship_edges: relationship_edges
+            .map(RelationshipEdges::finish)
+            .unwrap_or_default(),
     })
 }
 
@@ -3142,7 +3294,7 @@ fn upsert_replacement_slots(
 /// Subjects absent from both the persisted subject dictionary and novelty
 /// are skipped without any read: they cannot have values. Bulk upserts of
 /// new entities are exactly that shape, and the check is two dictionary
-/// probes per subject plus at most one novelty walk per graph (#1549).
+/// probes per subject plus a dictionary-novelty probe (#1549).
 ///
 /// Retractions carry the graph Sid of the payload's graph, so they cancel
 /// the payload's assertions in that graph.
@@ -3153,7 +3305,6 @@ async fn generate_upsert_deletions(
     graph_sids: &HashMap<String, Sid>,
     generator: &mut FlakeGenerator<'_>,
 ) -> Result<Vec<Retraction>> {
-    use fluree_db_core::IndexType;
     use fluree_db_query::BinaryRangeProvider;
 
     let subject_groups = upsert_replacement_slots(txn, generator);
@@ -3186,14 +3337,9 @@ async fn generate_upsert_deletions(
             })
             .collect();
 
-    // Novelty presence, resolved lazily: the per-graph set is built by a
-    // filtered overlay walk only when a subject misses the base dictionary
-    // (see the skip below), so upserts whose subjects all resolve in the
-    // persisted dictionary never pay it. The walk is O(novelty flakes in the
-    // graph), and novelty is bounded by `reindex_max_bytes` — up to 20% of
-    // system RAM when indexing lags — which is why it runs at most once per
-    // graph, and only on demand. It is authoritative in Sid space, needing
-    // no dictionary translation.
+    // Novelty presence is decided per subject, and only for a subject that
+    // misses the base dictionary (see the skip below): see
+    // [`dictionary_rules_out`] and [`novelty_seek_finds_subject`].
     //
     // Genesis, or nothing indexed yet: novelty is the only place a subject
     // can exist, so the presence check below is authoritative on its own.
@@ -3208,16 +3354,6 @@ async fn generate_upsert_deletions(
     // failure instead of silently skipping every retraction.
     let base_index_absent = ledger.snapshot.range_provider.is_none() && ledger.snapshot.t == 0;
     let can_decide_absence = binary_store.is_some() || base_index_absent;
-
-    let mut per_g_subjects: HashMap<fluree_db_core::GraphId, HashSet<&Sid>> = HashMap::new();
-    if can_decide_absence {
-        for (subject, txn_g) in subject_groups.keys() {
-            if let Some(Some(ledger_g)) = ledger_g_for_txn_g.get(txn_g) {
-                per_g_subjects.entry(*ledger_g).or_default().insert(subject);
-            }
-        }
-    }
-    let mut novelty_present: HashMap<fluree_db_core::GraphId, HashSet<Sid>> = HashMap::new();
 
     // Persisted presence: the subject reverse dictionary is authoritative
     // under canonical namespace encoding (see `fluree_db_core::ns_encoding`)
@@ -3262,6 +3398,9 @@ async fn generate_upsert_deletions(
 
     let mut slots: Vec<Slot> = Vec::new();
     let mut skipped_subjects = 0usize;
+    // Skipped with no read of novelty: what keeps an upsert of new subjects
+    // flat in the novelty a ledger holds.
+    let mut ruled_out_by_dictionary = 0usize;
 
     for ((subject, graph_id), predicates) in &subject_groups {
         let ledger_g_id: Option<fluree_db_core::GraphId> =
@@ -3286,29 +3425,14 @@ async fn generate_upsert_deletions(
         let effective_g_id = ledger_g_id.unwrap_or(0);
 
         // Skip subjects with no persisted or novelty presence entirely. The
-        // base dictionary is a point probe, so it is consulted first; the
-        // per-graph novelty set is built on the first dictionary miss only.
+        // base dictionary is a point probe, so it is consulted first.
         if can_decide_absence && !subject_in_base(subject) {
-            let present = novelty_present.entry(effective_g_id).or_insert_with(|| {
-                let mut set = HashSet::new();
-                if let Some(subjects) = per_g_subjects.get(&effective_g_id) {
-                    ledger.novelty.for_each_overlay_flake(
-                        effective_g_id,
-                        IndexType::Spot,
-                        None,
-                        None,
-                        true,
-                        ledger.t(),
-                        &mut |flake| {
-                            if subjects.contains(&flake.s) && !set.contains(&flake.s) {
-                                set.insert(flake.s.clone());
-                            }
-                        },
-                    );
-                }
-                set
-            });
-            if !present.contains(subject) {
+            if dictionary_rules_out(ledger, subject) {
+                ruled_out_by_dictionary += 1;
+                skipped_subjects += 1;
+                continue;
+            }
+            if !novelty_seek_finds_subject(ledger, effective_g_id, subject) {
                 skipped_subjects += 1;
                 continue;
             }
@@ -3326,6 +3450,7 @@ async fn generate_upsert_deletions(
     tracing::debug!(
         subject_count = subject_groups.len(),
         skipped_subjects,
+        ruled_out_by_dictionary,
         pattern_queries = slots.len(),
         "upsert deletion subject pre-check"
     );

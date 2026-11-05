@@ -284,6 +284,7 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 
 ```text
 /var/lib/fluree/
+├── .fluree-lock                  # Held by the server or Python process that has the directory open
 ├── ns@v3/                        # Nameservice records
 │   ├── @format.json              # Nameservice format
 │   ├── @dropped/                 # Dropped ledgers, by instance id

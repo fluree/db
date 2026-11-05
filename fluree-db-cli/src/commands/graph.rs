@@ -1,13 +1,25 @@
 use crate::cli::GraphAction;
+use crate::commands::create::{self, ImportOpts, ImportTarget};
 use crate::context::{self, LedgerMode};
 use crate::error::{CliError, CliResult};
+use crate::remote_client::RemoteLedgerClient;
 use comfy_table::{ContentArrangement, Table};
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_core::graph_registry::{
     config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID,
 };
 
-pub async fn run(action: GraphAction, dirs: &FlureeDir) -> CliResult<()> {
+/// Global flags a graph subcommand reads.
+pub struct GlobalFlags {
+    pub verbose: bool,
+    pub quiet: bool,
+    /// The global `--memory-budget-mb` and `--parallelism`, for an import
+    /// that leaves its own at 0.
+    pub memory_budget_mb: usize,
+    pub parallelism: usize,
+}
+
+pub async fn run(action: GraphAction, dirs: &FlureeDir, globals: GlobalFlags) -> CliResult<()> {
     match action {
         GraphAction::List {
             ledger,
@@ -29,7 +41,146 @@ pub async fn run(action: GraphAction, dirs: &FlureeDir) -> CliResult<()> {
             ledger,
             remote,
         } => run_drop(&iri, ledger.as_deref(), dirs, remote.as_deref()).await,
+        GraphAction::Import {
+            iri,
+            from,
+            ledger,
+            remote,
+            import,
+        } => {
+            let opts = import.opts(globals.memory_budget_mb, globals.parallelism);
+            run_import(
+                &iri,
+                &from,
+                ledger.as_deref(),
+                dirs,
+                remote.as_deref(),
+                &globals,
+                &opts,
+            )
+            .await
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_import(
+    iri: &str,
+    from: &std::path::Path,
+    ledger: Option<&str>,
+    dirs: &FlureeDir,
+    remote_flag: Option<&str>,
+    globals: &GlobalFlags,
+    opts: &ImportOpts,
+) -> CliResult<()> {
+    if iri.is_empty() {
+        return Err(CliError::Usage(
+            "graph IRI must not be empty (an import fills a new named graph)".to_string(),
+        ));
+    }
+    if !from.exists() {
+        return Err(CliError::Input(format!(
+            "{} does not exist",
+            from.display()
+        )));
+    }
+
+    if let Some(remote_name) = remote_flag {
+        let alias = context::resolve_ledger(ledger, dirs)?;
+        let client = context::build_remote_client(remote_name, dirs).await?;
+        let ledger_id = context::to_ledger_id(&alias)?;
+        import_on_server(&client, &ledger_id, remote_name, iri, from, opts).await?;
+        context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+        return Ok(());
+    }
+
+    let mode = context::resolve_ledger_mode(ledger, dirs).await?;
+    match mode {
+        LedgerMode::Tracked {
+            client,
+            remote_alias,
+            remote_name,
+            ..
+        } => {
+            import_on_server(&client, &remote_alias, &remote_name, iri, from, opts).await?;
+            context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
+            Ok(())
+        }
+        LedgerMode::Local { fluree, alias } => {
+            create::run_graph_import(
+                &fluree,
+                &alias,
+                iri,
+                from,
+                dirs,
+                globals.verbose,
+                globals.quiet,
+                opts,
+            )
+            .await
+        }
+    }
+}
+
+/// Run the import on the server behind `client`, uploading `from` to it.
+async fn import_on_server(
+    client: &RemoteLedgerClient,
+    ledger_id: &str,
+    server_label: &str,
+    iri: &str,
+    from: &std::path::Path,
+    opts: &ImportOpts,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    let cap = client.fetch_import_capability().await;
+    if !cap.supports_graph_source_upload() {
+        return Err(CliError::Usage(format!(
+            "'{server_label}' does not offer server-side import into a graph \
+             (source-upload-graph); stop the server and run `fluree graph import` \
+             locally, or upgrade it"
+        )));
+    }
+    if !from.is_file() {
+        return Err(CliError::Usage(format!(
+            "an import on a server takes a single file ({} is a directory); \
+             concatenate it, or stop the server and import locally",
+            from.display()
+        )));
+    }
+    let result = create::upload_source_import(
+        client,
+        &cap,
+        ledger_id,
+        server_label,
+        from,
+        opts,
+        ImportTarget::Graph(iri),
+    )
+    .await?;
+
+    let resolved = result["ledger_id"].as_str().unwrap_or(ledger_id);
+    let base_t = result["graph"]["base_t"].as_i64().unwrap_or(0);
+    let t = result["t"].as_i64().unwrap_or(0);
+    let flakes = result["flake_count"].as_u64().unwrap_or(0);
+    println!(
+        "{} Imported {} flakes into graph <{}> of '{}' on '{}' (t={}..{})",
+        "✓".green(),
+        flakes,
+        iri,
+        resolved,
+        server_label,
+        base_t + 1,
+        t,
+    );
+    if result["has_annotations"].as_bool() == Some(true) {
+        eprintln!(
+            "{} The graph holds statement annotations, so the ledger's annotation arena \
+             was set aside; quoted-triple queries read by scan until the ledger is reindexed.",
+            "info:".cyan().bold()
+        );
+    }
+    Ok(())
 }
 
 async fn run_list(

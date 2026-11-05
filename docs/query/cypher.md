@@ -481,7 +481,13 @@ error listing the supported set.
   and relationship sidecar metadata.
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
-  removes a node together with its relationships.
+  removes a node together with its relationships. `DELETE r` retracts the
+  edge `r` was matched on, so it is refused when that edge carries another
+  relationship too (a parallel relationship between the same endpoints, with
+  the same type), whether or not the `MATCH` filters that one out. A
+  `DETACH DELETE` of one of the edge's endpoints in the same clause
+  (`DETACH DELETE a, r`) takes every relationship on that node, so that edge
+  isn't refused.
 - **`FOREACH`** — unroll a write over a **constant** list (inline literal,
   constant `range()`, or a `$param` array), running a `CREATE` / `SET` /
   `REMOVE` body per element:
@@ -546,8 +552,9 @@ error listing the supported set.
   the edge is inserted — idempotent in RDF, but redundant.
 - **Multi-clause write composition** — a statement may chain multiple write
   clauses (`MERGE` chains, `CREATE`+`MERGE` mixes, interleaved `SET` /
-  `REMOVE`), with each clause observing the writes of the clauses before it
-  and rows piping downstream — the standard Cypher loading idioms:
+  `REMOVE` / `DETACH DELETE` / a relationship's `DELETE`), with each clause
+  observing the writes of the clauses before it and rows piping downstream —
+  the standard Cypher loading idioms:
 
   ```cypher
   UNWIND $rows AS row
@@ -571,8 +578,22 @@ error listing the supported set.
   `ON MATCH SET`). Property accessors are valid `MERGE`-key and `SET` values
   (`MERGE (t:Team {name: p.team})`).
 
-  Deferred in a multi-clause statement (clear errors): `DELETE` / `FOREACH`
-  members, `OPTIONAL MATCH` / `CALL { … }` in the read prefix. See
+  The last write to a property or label holds, as in Cypher:
+  `SET n.name = "y" SET n.name = "w"` leaves `"w"`, `REMOVE n.name SET n.name =
+  "x"` leaves `"x"`, and `SET n.name = "y", n.name = "w"` (one clause) leaves
+  `"w"`. A write that ends where the stored value was commits nothing. A
+  `CREATE` after a `SET`, `REMOVE` or `DETACH DELETE` creates once per matched
+  row. A relationship's `DELETE` takes the properties earlier clauses set on
+  it, and a `CREATE` of the same edge after it creates the one new
+  relationship; it is refused when the edge carries another relationship in
+  the state the clauses before it leave. A row an `OPTIONAL MATCH` leaves
+  unbound skips a clause's writes to the unbound variable and keeps its
+  writes to the others.
+
+  Deferred in a multi-clause statement (clear errors): a bare node `DELETE`
+  and `FOREACH` members, `CALL { … }` in the read prefix, and
+  `OPTIONAL MATCH` in the read prefix of a statement with a `CREATE` or
+  `MERGE`. See
   `docs/design/cypher-sequential-writes.md` for the execution model.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
@@ -588,9 +609,11 @@ error listing the supported set.
   post-projection `WHERE` that gates which rows are written
   (`WITH p, p.age AS age WHERE age >= 30 SET p.adult = true`). `WITH` applies
   Cypher scoping — only projected names are visible to the write. Works before
-  `CREATE` / `SET` / `REMOVE`; `WITH` before `DELETE` is rejected (delete
-  resolution keys off the raw MATCH variables and can't honor a rename/horizon —
-  `DELETE` directly off the MATCH variables). Aggregation, `DISTINCT`, and
+  `CREATE` / `SET` / `REMOVE`; `WITH` before a lone `DELETE` is rejected
+  (delete resolution keys off the raw MATCH variables and can't honor a
+  rename/horizon — `DELETE` directly off the MATCH variables). A multi-clause
+  statement whose clauses meet stages a `DELETE` after a `WITH` in the
+  sequential driver, which honors the `WITH`'s scope. Aggregation, `DISTINCT`, and
   `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are deferred.
 - **`… RETURN <created>`** — a trailing `RETURN` of *created* entities:
   `CREATE (n:Person {name: "Alice"}) RETURN n`,
