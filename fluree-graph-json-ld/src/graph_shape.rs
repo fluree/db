@@ -188,6 +188,19 @@ pub enum NodeGraph<'a> {
 /// expansion unwraps). The caller still resolves the name, and checks that
 /// it is an absolute IRI. The error is suitable for a message.
 pub fn node_graph(node: &Map<String, Value>) -> std::result::Result<NodeGraph<'_>, String> {
+    node_graph_of(node, false)
+}
+
+/// [`node_graph`] for a reader of RDF datasets, where a blank node may also
+/// name a graph.
+pub fn dataset_node_graph(node: &Map<String, Value>) -> std::result::Result<NodeGraph<'_>, String> {
+    node_graph_of(node, true)
+}
+
+fn node_graph_of(
+    node: &Map<String, Value>,
+    blank_names: bool,
+) -> std::result::Result<NodeGraph<'_>, String> {
     match node.get("@graph").map(classify_graph_value) {
         None => Ok(NodeGraph::Enclosing),
         Some(GraphValue::Selector(raw)) => Ok(NodeGraph::Selector(raw)),
@@ -199,7 +212,7 @@ pub fn node_graph(node: &Map<String, Value>) -> std::result::Result<NodeGraph<'_
                         .to_string(),
                 );
             };
-            if name.starts_with("_:") || name.starts_with('?') {
+            if (name.starts_with("_:") && !blank_names) || name.starts_with('?') {
                 return Err(format!(
                     "a JSON-LD named graph must be named by an IRI, not {name:?}"
                 ));
