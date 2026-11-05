@@ -1957,6 +1957,25 @@ ex:g2 { ex:t ex:items ( 3 ) . }
             "g=http://example.org/g2 o=3"
         ]
     );
+    let rdf = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n";
+    let walked = select(
+        &fluree,
+        &ledger,
+        &format!(
+            "{PREFIXES}{rdf}SELECT ?o WHERE {{ GRAPH ex:g1 {{ ex:s ex:items/rdf:rest*/rdf:first ?o }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(walked, ["o=1", "o=2"]);
+    let walked = select(
+        &fluree,
+        &ledger,
+        &format!(
+            "{PREFIXES}{rdf}SELECT ?g ?o WHERE {{ GRAPH ?g {{ ?s ex:items/rdf:rest*/rdf:first ?o }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(walked, by_graph);
     let written = support::query_sparql(
         &fluree,
         &ledger,

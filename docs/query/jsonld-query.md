@@ -1130,7 +1130,7 @@ Multiple alternative steps are supported: `"(ex:a|ex:b)/(ex:c|ex:d)"` expands to
 
 Each step may be a simple predicate (`ex:p`), an inverse simple predicate (`^ex:p`), an alternative of simple predicates (`(ex:a|ex:b)`), or a modifier applied to a simple predicate (`ex:p+`, `ex:p*`, `ex:p?`). Nested sequences are not allowed inside sequence steps.
 
-`"ex:items/rdf:rest*/rdf:first"` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would. A plain value of `ex:items` is not a member. No other path reaches into a list's `rdf:first`/`rdf:rest` cells, unless the query reads lists as RDF (`opts.rdfLists`).
+`"ex:items/rdf:rest*/rdf:first"` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would. A plain value of `ex:items` is not a member. No other path reaches into a list's `rdf:first`/`rdf:rest` cells, unless the query reads lists as RDF (`opts.rdfLists`). Over a dataset the walk reads each graph's lists in that graph's ledger and time, a `from` spanning ledgers is refused as for any path, and so is a history range over a compact list.
 
 **Rules:**
 
