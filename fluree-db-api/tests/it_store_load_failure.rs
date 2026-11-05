@@ -42,8 +42,19 @@ impl BrokenStore {
             .await
             .unwrap()
             .unwrap();
-        let store = fluree.content_store(&record.storage_namespace());
-        let bytes = store.get(&record.index_head_id.unwrap()).await.unwrap();
+        Self::hide_root(fluree, db, ledger_id, &record.index_head_id.unwrap()).await
+    }
+
+    /// [`Self::hide`] for the root `root_id`, published or not.
+    async fn hide_root(
+        fluree: &fluree_db_api::Fluree,
+        db: &Path,
+        ledger_id: &str,
+        root_id: &fluree_db_core::ContentId,
+    ) -> Self {
+        let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
+        let store = fluree.content_store(&namespace);
+        let bytes = store.get(root_id).await.unwrap();
         let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();
         let digest = root.dict_refs.subject_reverse.branch.digest_hex();
         let file = file_named(db, &digest).expect("the branch's file");
@@ -201,8 +212,20 @@ async fn a_reload_that_cannot_load_the_store_keeps_the_ledger_it_has() {
     let handle = fluree.ledger_cached(id).await.unwrap();
     assert!(handle.snapshot().await.binary_store.is_some());
 
-    support::rebuild_and_publish_index(&fluree, id).await;
-    let broken = BrokenStore::hide(&fluree, db.path(), id).await;
+    // The rebuilt root's store breaks before the root is published. This
+    // connection's cache listener applies a published root by itself, and
+    // a root it had already applied would leave the reload nothing to read.
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let rebuilt = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.branched_content_store(id).await.unwrap(),
+        id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .unwrap();
+    let broken = BrokenStore::hide_root(&fluree, db.path(), id, &rebuilt.root_id).await;
+    support::publish_built_index(&fluree, id, rebuilt.index_t, &rebuilt.root_id).await;
     let manager = fluree.ledger_manager().expect("caching enabled");
     load_failure(
         manager

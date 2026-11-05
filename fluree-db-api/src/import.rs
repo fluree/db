@@ -6763,6 +6763,11 @@ where
         // an import into an existing ledger fills. Only a fresh ledger's
         // txn-meta is built here; an existing one's is merged into its index.
         let v3_primary_g_id = seed.map_or(0, |seed| seed.g_id);
+        let v3_base_terms = seed.and_then(|seed| seed.base_terms.clone());
+        let v3_base_term_watermarks = seed
+            .and_then(|seed| seed.base_root.term_dict.as_ref())
+            .map(|terms| terms.watermarks.clone())
+            .unwrap_or_default();
         let v3_build_txn_meta = seed.is_none();
         let commits: Vec<fluree_db_indexer::CommitInput> = v3_sorted_commit_infos
             .iter()
@@ -6856,9 +6861,18 @@ where
                 let fd_budget = fluree_db_core::fd_limit::FdBudget::detect();
 
                 // Build-wide triple-term interner shared by every graph's build.
-                let term_builder = std::sync::Arc::new(std::sync::Mutex::new(
-                    fluree_db_binary_index::dict::TermDictBuilder::new(),
-                ));
+                // Over an existing ledger it continues the ledger's dictionary:
+                // a term the ledger holds keeps its handle, found before the
+                // build so the build's lookups are all hits.
+                let mut builder =
+                    fluree_db_binary_index::dict::TermDictBuilder::above_watermarks(
+                        &v3_base_term_watermarks,
+                    );
+                if let Some(base) = &v3_base_terms {
+                    fluree_db_indexer::intern_term_tables_over(&commits, base, &mut builder)
+                        .map_err(|e| index_build_error(&e))?;
+                }
+                let term_builder = std::sync::Arc::new(std::sync::Mutex::new(builder));
                 let cfg_g0 = fluree_db_indexer::BuildConfig {
                     run_dir: v3_runs_g0,
                     index_dir: v3_index_dir.clone(),
@@ -7157,18 +7171,12 @@ where
         };
 
         if let Some(seed) = seed {
-            // The splice merges no triple-term dictionary, so terms the build
-            // interned would be lost.
-            let interned = term_dict_builder
-                .lock()
-                .map_err(|_| ImportError::IndexBuild("term dictionary lock poisoned".into()))?
-                .len();
-            if interned > 0 {
-                return Err(ImportError::Refused(format!(
-                    "an import into a graph of an existing ledger does not support triple \
-                     terms or edge annotations yet; the source holds {interned}"
-                )));
-            }
+            let (new_terms, term_watermarks) = {
+                let builder = term_dict_builder
+                    .lock()
+                    .map_err(|_| ImportError::IndexBuild("term dictionary lock poisoned".into()))?;
+                (builder.new_term_entries(), builder.watermarks())
+            };
             config.emit_progress(ImportPhase::PreparingIndex {
                 stage: "Merging into the ledger's index",
             });
@@ -7193,6 +7201,8 @@ where
                     stats: stats_output
                         .map(|((id_stats, ..), class_stats)| (id_stats, class_stats)),
                     dicts,
+                    new_terms,
+                    term_watermarks,
                     namespace_codes: input.namespace_codes,
                     language_tags: language_tags.into_iter().map(|(_, tag)| tag).collect(),
                     txn_meta,

@@ -22,7 +22,8 @@ use crate::run_index::runs::run_writer::{
 };
 use crate::run_index::runs::spool::{
     link_chunk_run_files_to_flat, remap_commit_to_runs_with_op, remap_sorted_commit_v2_to_runs,
-    MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap, TermRemapCtx,
+    remap_term_entry, term_key_of, MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2,
+    SortedCommitReaderV2, SubjectRemap, TermRemapCtx,
 };
 use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
@@ -33,6 +34,7 @@ use fluree_db_binary_index::format::run_record_v2::{
 use fluree_db_core::fd_limit::FdBudget;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::triple_term::TermKey;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1614,6 +1616,84 @@ fn term_ctx_for(commit: &CommitInput, config: &BuildConfig) -> io::Result<Option
         )),
         (None, _) => Ok(None),
     }
+}
+
+/// Intern every chunk's term table into `builder` over the existing
+/// dictionary `base`: a term it holds keeps its handle
+/// ([`TermDictBuilder::keep`]), a new one is allocated above the builder's
+/// watermarks. Inner terms go first, a chunk's nesting level per
+/// batched lookup, so a build that then resolves the chunks' links finds
+/// every term already in `builder`.
+///
+/// [`TermDictBuilder::keep`]: fluree_db_binary_index::dict::TermDictBuilder::keep
+pub fn intern_term_tables_over(
+    commits: &[CommitInput],
+    base: &fluree_db_binary_index::dict::TermDictReader,
+    builder: &mut fluree_db_binary_index::dict::TermDictBuilder,
+) -> io::Result<()> {
+    for commit in commits {
+        let Some((path, count)) = &commit.term_table else {
+            continue;
+        };
+        let subject_remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
+        let string_remap = MmapStringRemap::open(&commit.string_remap_path)?;
+        let lang_remap = (!commit.lang_remap.is_empty()).then_some(commit.lang_remap.as_slice());
+        let terms = SortedCommitReaderV2::open(path, *count)?.collect::<io::Result<Vec<_>>>()?;
+
+        // An entry whose object is a triple term holds that term's ordinal,
+        // always a lower one.
+        let mut depth: Vec<usize> = Vec::with_capacity(terms.len());
+        for (i, term) in terms.iter().enumerate() {
+            let level = if OType::from_u16(term.o_type) == OType::TRIPLE_TERM {
+                let inner = term.o_key as usize;
+                if inner >= i {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("term {i} names term {inner}, which does not precede it"),
+                    ));
+                }
+                depth[inner] + 1
+            } else {
+                0
+            };
+            depth.push(level);
+        }
+
+        let mut handles = vec![0u64; terms.len()];
+        let levels = depth.iter().max().map_or(0, |max| max + 1);
+        for level in 0..levels {
+            let mut keys = Vec::new();
+            for (i, term) in terms.iter().enumerate() {
+                if depth[i] != level {
+                    continue;
+                }
+                let mut term = *term;
+                remap_term_entry(
+                    &mut term,
+                    &subject_remap,
+                    &string_remap,
+                    lang_remap,
+                    &mut |inner| Ok(handles[inner as usize]),
+                )?;
+                let key = term_key_of(&term);
+                match builder.get(&key) {
+                    Some(handle) => handles[i] = handle,
+                    None => keys.push((i, key)),
+                }
+            }
+            let batch: Vec<TermKey> = keys.iter().map(|(_, key)| *key).collect();
+            for ((i, key), found) in keys.into_iter().zip(base.find_handles(&batch)?) {
+                handles[i] = match found {
+                    Some(handle) => {
+                        builder.keep(key, handle);
+                        handle
+                    }
+                    None => builder.get_or_insert(key)?,
+                };
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Drain a SPOT merge into the leaf writer (and class-stats collector),

@@ -1459,6 +1459,50 @@ fn graph_import_fills_a_new_graph_of_an_existing_ledger() {
         .stderr(predicate::str::contains("already has the graph"));
 }
 
+/// A Cypher dump's relationship properties import into a graph as
+/// annotations, under the default `--edge-properties annotated`.
+#[test]
+fn graph_import_keeps_cypher_edge_properties() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "peopledb");
+    let source = tmp.path().join("social.cypher");
+    std::fs::write(
+        &source,
+        r#"CREATE (:User {id: 1, name: "a"});
+CREATE (:User {id: 2, name: "b"});
+MATCH (n:User {id: 1}), (m:User {id: 2}) CREATE (n)-[:Friend {since: 2020}]->(m);
+"#,
+    )
+    .unwrap();
+    let graph = "urn:example:social";
+
+    fluree_cmd(&tmp)
+        .args([
+            "graph",
+            "import",
+            graph,
+            "--from",
+            source.to_str().unwrap(),
+            "--base-iri",
+            "http://example.org/",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            &format!(
+                "PREFIX ex: <http://example.org/> SELECT ?since WHERE {{ GRAPH <{graph}> \
+                 {{ ?a ex:Friend ?b {{| ex:since ?since |}} }} }}"
+            ),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2020"));
+}
+
 #[test]
 fn create_from_nt_file() {
     let tmp = TempDir::new().unwrap();
