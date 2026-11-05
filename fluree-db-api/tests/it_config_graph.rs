@@ -9315,6 +9315,13 @@ async fn a_sources_policy_governs_its_branch_and_copy() {
                     "f:action": {"@id": "f:view"},
                     "f:onProperty": [{"@id": "ex:name"}],
                     "f:allow": true
+                },
+                {
+                    "@id": "ex:modifyNames",
+                    "@type": ["f:AccessPolicy", "ex:UserPolicy"],
+                    "f:action": {"@id": "f:modify"},
+                    "f:onProperty": [{"@id": "ex:name"}],
+                    "f:allow": true
                 }
             ]
         }))
@@ -9361,8 +9368,8 @@ async fn a_sources_policy_governs_its_branch_and_copy() {
 }
 
 /// Under `ledger_id`'s config policy, a request with no policy of its own
-/// reads `ex:alice`'s name but not her SSN, and its writes to the config and to
-/// the policy rules are refused.
+/// reads `ex:alice`'s name but not her SSN, and writes a name but not the
+/// config, under any ledger's config graph IRI, nor the policy rules.
 async fn assert_policy_confines(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let alice = |property: &str| {
         let mut query = json!({
@@ -9396,15 +9403,32 @@ async fn assert_policy_confines(fluree: &fluree_db_api::Fluree, ledger_id: &str)
     .await
     .unwrap()
     .expect("the config's policy governs writes");
+    // The policy lets the request modify `ex:name`, so the refusals below are
+    // of the config and the rules, not of every write.
+    fluree
+        .stage_owned(ledger.clone())
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:bob",
+            "ex:name": "Bob"
+        }))
+        .policy(policy.clone())
+        .stage()
+        .await
+        .unwrap_or_else(|e| panic!("{ledger_id}: write a name: {e}"));
+    let open_config = |graph: &str| {
+        json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": "urn:config:policy",
+            "@graph": graph,
+            "f:defaultAllow": true
+        })
+    };
     for (what, doc) in [
+        ("open the config", open_config("config")),
         (
-            "open the config",
-            json!({
-                "@context": {"f": "https://ns.flur.ee/db#"},
-                "@id": "urn:config:policy",
-                "@graph": "config",
-                "f:defaultAllow": true
-            }),
+            "open the config under another ledger's config graph IRI",
+            open_config(&config_graph_iri("it/elsewhere:main")),
         ),
         (
             "grant itself access",
@@ -9421,8 +9445,9 @@ async fn assert_policy_confines(fluree: &fluree_db_api::Fluree, ledger_id: &str)
             .stage_owned(ledger.clone())
             .insert(&doc)
             .policy(policy.clone())
-            .execute()
+            .stage()
             .await
+            .map(|_| ())
             .expect_err(what);
         assert_eq!(err.status_code(), 403, "{ledger_id}: {what}: {err}");
     }
