@@ -940,6 +940,71 @@ async fn later_annotations_index_incrementally_over_the_spliced_terms() {
     }
 }
 
+/// [`GRAPH_CLAIMS`] as JSON-LD `@annotation`s.
+const GRAPH_CLAIMS_JSONLD: &str = r#"{
+  "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+  "@graph": [
+    {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob",
+      "@annotation": {"ex:confidence": {"@value": "0.7", "@type": "xsd:decimal"}}}},
+    {"@id": "ex:carol", "ex:knows": {"@id": "ex:dave",
+      "@annotation": {"ex:confidence": {"@value": "0.1", "@type": "xsd:decimal"}}}}
+  ]
+}"#;
+
+/// One graph's annotations three ways, each into a ledger annotated alike:
+/// a Turtle import, a JSON-LD import, and the Turtle's statements
+/// transacted. All three read the same, through the same terms.
+#[tokio::test]
+async fn a_graph_import_reads_as_its_json_ld_twin_and_its_transaction() {
+    let ledger = |label: &'static str| async move {
+        let dir = tempfile::tempdir().unwrap();
+        annotated_ledger(dir.path()).await;
+        let fluree = fluree_at(dir.path());
+        match label {
+            "turtle" => {
+                import_into_graph(&fluree, &[("claims.ttl", GRAPH_CLAIMS)], GRAPH)
+                    .await
+                    .expect("Turtle import");
+            }
+            "json-ld" => {
+                import_into_graph(&fluree, &[("claims.jsonld", GRAPH_CLAIMS_JSONLD)], GRAPH)
+                    .await
+                    .expect("JSON-LD import");
+            }
+            _ => {
+                let body = GRAPH_CLAIMS.replace("@prefix ex: <http://example.org/> .", "");
+                fluree
+                    .graph(LEDGER)
+                    .transact()
+                    .sparql_update(&format!(
+                        "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH <{GRAPH}> {{ {body} }} }}"
+                    ))
+                    .commit()
+                    .await
+                    .expect("transaction");
+                support::build_incrementally_and_publish_index(&fluree, LEDGER).await;
+            }
+        }
+        let fluree = fluree_at(dir.path());
+        let read = (
+            statements(&fluree).await,
+            claims(&fluree, Some(GRAPH)).await,
+            term_count(&fluree).await,
+        );
+        drop(dir);
+        read
+    };
+    let turtle = ledger("turtle").await;
+    assert_eq!(
+        turtle.1,
+        ["ex:alice ex:bob 0.7", "ex:carol ex:dave 0.1"],
+        "the Turtle import"
+    );
+    assert_eq!(turtle.2, 2);
+    assert_eq!(ledger("json-ld").await, turtle, "the JSON-LD import");
+    assert_eq!(ledger("transacted").await, turtle, "the transaction");
+}
+
 /// A ledger whose index holds annotations from before links has no term
 /// dictionary to extend: the import is refused before it reads the source,
 /// and goes through once a reindex writes the links.
