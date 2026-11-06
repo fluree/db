@@ -181,7 +181,7 @@ impl Fluree {
         // let a typo or premature feature use silently disable
         // governance the operator believed to be in effect.
         let rules_source_g_id =
-            resolve_local_rules_source_g_id(resolved.datalog.as_ref(), &view.snapshot)?;
+            resolve_local_rules_source_g_id(resolved.datalog.as_ref(), &view.snapshot, view.t)?;
 
         Ok(view
             .with_ledger_config(config)
@@ -1115,7 +1115,7 @@ impl Fluree {
                 .policy
                 .as_ref()
                 .and_then(|p| p.policy_source.as_ref());
-            crate::policy_builder::resolve_policy_source_g_ids(source, &view.snapshot)?
+            crate::policy_builder::resolve_policy_source_g_ids(source, &view.snapshot, view.t)?
         } else {
             vec![0]
         };
@@ -1363,6 +1363,7 @@ impl Fluree {
 fn resolve_local_rules_source_g_id(
     datalog: Option<&fluree_db_core::ledger_config::DatalogDefaults>,
     snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
 ) -> Result<Option<fluree_db_core::GraphId>> {
     let Some(src) = datalog.and_then(|d| d.rules_source.as_ref()) else {
         return Ok(None);
@@ -1388,7 +1389,12 @@ fn resolve_local_rules_source_g_id(
     }
     let g_id = match src.graph_selector.as_deref() {
         Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.assigned_graph_id(iri),
+        Some(iri) => snapshot
+            .graph_registry
+            .existing_graph_id(iri, t)
+            .map_err(|floor| {
+                crate::policy_builder::dropped_source("f:rulesSource", iri, floor, t)
+            })?,
         None => Some(0u16),
     };
     match g_id {

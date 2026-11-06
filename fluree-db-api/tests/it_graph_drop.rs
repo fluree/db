@@ -1032,6 +1032,56 @@ async fn a_read_below_the_index_takes_later_drops_from_the_head() {
     );
 }
 
+/// An export as of a `t` before a drop reads the graph as a query as of that
+/// `t` does: naming it is refused, and an export that leaves it out does not
+/// count it as a graph it omitted.
+#[tokio::test]
+async fn an_export_as_of_a_t_before_a_drop_reads_the_graph_as_a_query_does() {
+    use fluree_db_api::export::ExportFormat;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-drop/export:main";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let insert = |graph: &str, facts: &str| {
+        format!("PREFIX ex: <http://example.org/> INSERT DATA {{ GRAPH <{graph}> {{ {facts} }} }}")
+    };
+    update(&fluree, ledger_id, &insert(H, "ex:h ex:v \"h\" ."))
+        .await
+        .unwrap();
+    let written = update(&fluree, ledger_id, &insert(G, "ex:a ex:v \"a\" ."))
+        .await
+        .unwrap();
+    let dropped = update(&fluree, ledger_id, &format!("DROP GRAPH <{G}>"))
+        .await
+        .unwrap();
+    let recreated = update(&fluree, ledger_id, &insert(G, "ex:b ex:v \"b\" ."))
+        .await
+        .unwrap();
+
+    let err = fluree
+        .export(ledger_id)
+        .format(ExportFormat::NQuads)
+        .graph(G)
+        .as_of(TimeSpec::AtT(written))
+        .write_to(&mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("dropped at t={dropped}")),
+        "{err}"
+    );
+    for (t, omitted) in [(written, 1), (dropped, 1), (recreated, 2)] {
+        let stats = fluree
+            .export(ledger_id)
+            .format(ExportFormat::NQuads)
+            .as_of(TimeSpec::AtT(t))
+            .write_to(&mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(stats.named_graphs_omitted, omitted, "t={t}");
+    }
+}
+
 /// Remove every commit blob under `dir`.
 fn remove_commit_blobs(dir: &std::path::Path) {
     for entry in std::fs::read_dir(dir).unwrap() {

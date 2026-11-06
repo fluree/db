@@ -1077,20 +1077,23 @@ pub(crate) async fn open_cross_ledger_shapes_model(
     // and open. Error loudly rather than dropping membership — a silent
     // `None` would make every M-only value read as "not a member" and
     // reject writes with spurious `sh:class` violations.
-    let model_g_id =
-        crate::cross_ledger::resolve_selector_g_id(&model_db.snapshot, &resolved.graph_iri)
-            .map_err(|e| {
-                fluree_db_transact::TransactError::Parse(format!(
-                    "cross-ledger value-set graph resolution failed: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                fluree_db_transact::TransactError::Parse(format!(
-                    "cross-ledger value-set graph {} not present in model ledger {} at t={} \
+    let model_g_id = crate::cross_ledger::resolve_selector_g_id(
+        &model_db.snapshot,
+        &resolved.graph_iri,
+        model_db.t,
+    )
+    .map_err(|e| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "cross-ledger value-set graph resolution failed: {e}"
+        ))
+    })?
+    .ok_or_else(|| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "cross-ledger value-set graph {} not present in model ledger {} at t={} \
                      (shapes resolved but vocabulary graph missing)",
-                    resolved.graph_iri, resolved.model_ledger_id, resolved.resolved_t
-                ))
-            })?;
+            resolved.graph_iri, resolved.model_ledger_id, resolved.resolved_t
+        ))
+    })?;
     Ok(Some(CrossLedgerShapesModel {
         resolved,
         model_db,
@@ -1207,6 +1210,7 @@ fn probe_shacl_compile_cache(
 pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     let source = config
         .and_then(|c| c.shacl.as_ref())
@@ -1242,7 +1246,7 @@ pub(crate) fn resolve_shapes_source_g_ids(
 
     let g_id = match source.graph_selector.as_deref() {
         Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.assigned_graph_id(iri),
+        Some(iri) => existing_source_graph(snapshot, iri, t)?,
         None => Some(0u16),
     };
 
@@ -1253,6 +1257,26 @@ pub(crate) fn resolve_shapes_source_g_ids(
             source.graph_selector.as_deref().unwrap_or("<none>"),
         ))),
     }
+}
+
+/// The graph a configured source names by `iri` as of `t`, `None` when it
+/// does not exist then. One a drop after `t` took is refused, as a query
+/// naming it as of `t` is.
+fn existing_source_graph(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    iri: &str,
+    t: i64,
+) -> std::result::Result<Option<GraphId>, fluree_db_transact::TransactError> {
+    snapshot
+        .graph_registry
+        .existing_graph_id(iri, t)
+        .map_err(|floor| {
+            fluree_db_transact::TransactError::Query(fluree_db_query::QueryError::GraphDropped {
+                graph: iri.to_string(),
+                floor,
+                t,
+            })
+        })
 }
 
 /// Apply SHACL policy to an already-staged [`StagedLedger`].
@@ -1480,7 +1504,8 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                 } else {
                     // Same-ledger path. Resolve `f:shapesSource` into concrete
                     // graph IDs; default to `[0]` when unset.
-                    let shapes_g_ids = resolve_shapes_source_g_ids(config, &base.snapshot)?;
+                    let base_t = base.t();
+                    let shapes_g_ids = resolve_shapes_source_g_ids(config, &base.snapshot, base_t)?;
                     membership_g_ids = shapes_g_ids.clone();
                     cache_source = Some(CachedShapeSource::Local(shapes_g_ids.clone()));
                     shapes_g_ids
@@ -2294,7 +2319,11 @@ async fn resolve_per_graph_unique_sids(
 
             // Local: resolve to g_ids and scan.
             if !local_sources.is_empty() {
-                let local_g_ids = resolve_constraint_source_g_ids_for(&local_sources, snapshot)?;
+                let local_g_ids = resolve_constraint_source_g_ids_for(
+                    &local_sources,
+                    snapshot,
+                    annotations_from.t(),
+                )?;
                 for source_g_id in local_g_ids {
                     let annotations =
                         read_enforce_unique_from_graph(annotations_from, source_g_id).await?;
@@ -2366,6 +2395,7 @@ async fn resolve_per_graph_unique_sids(
 fn resolve_constraint_source_g_ids_for(
     sources: &[&fluree_db_core::ledger_config::GraphSourceRef],
     snapshot: &fluree_db_core::LedgerSnapshot,
+    t: i64,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     let mut g_ids = Vec::new();
     for source in sources {
@@ -2394,7 +2424,7 @@ fn resolve_constraint_source_g_ids_for(
 
         let g_id = match source.graph_selector.as_deref() {
             Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-            Some(iri) => snapshot.graph_registry.assigned_graph_id(iri),
+            Some(iri) => existing_source_graph(snapshot, iri, t)?,
             None => Some(0u16), // no selector → default graph
         };
         match g_id {

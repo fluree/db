@@ -42,14 +42,18 @@ use fluree_vocab::{config_iris, fluree, policy_iris};
 // Public API
 // ============================================================================
 
-/// Resolve a `GraphSourceRef` from config into concrete graph IDs for policy loading.
+/// Resolve a `GraphSourceRef` from config into concrete graph IDs for policy
+/// loading as of `to_t`.
 ///
 /// Returns `Err` if the source specifies unsupported features (`at_t`, `trust_policy`,
-/// `rollback_guard`, cross-ledger `ledger`). Returns the default graph `[0]` when
-/// `source` is `None`.
+/// `rollback_guard`, cross-ledger `ledger`), or names a graph that does not
+/// exist as of `to_t`, or that a drop after `to_t` took: the policy it held
+/// then is no longer readable, and reading it as empty would govern with no
+/// policy. Returns the default graph `[0]` when `source` is `None`.
 pub fn resolve_policy_source_g_ids(
     source: Option<&fluree_db_core::ledger_config::GraphSourceRef>,
     snapshot: &LedgerSnapshot,
+    to_t: i64,
 ) -> Result<Vec<fluree_db_core::GraphId>> {
     let source = match source {
         None => return Ok(DEFAULT_POLICY_GRAPHS.to_vec()),
@@ -79,7 +83,10 @@ pub fn resolve_policy_source_g_ids(
 
     let g_id = match source.graph_selector.as_deref() {
         Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.assigned_graph_id(iri),
+        Some(iri) => snapshot
+            .graph_registry
+            .existing_graph_id(iri, to_t)
+            .map_err(|floor| dropped_source("f:policySource", iri, floor, to_t))?,
         None => Some(0u16),
     };
 
@@ -90,6 +97,21 @@ pub fn resolve_policy_source_g_ids(
             source.graph_selector.as_deref().unwrap_or("<none>"),
         ))),
     }
+}
+
+/// The refusal of a configured source (`kind`, e.g. `f:policySource`) naming
+/// the graph `iri`, which a drop at `floor`, after `t`, took: what it held as
+/// of `t` is no longer readable.
+pub(crate) fn dropped_source(kind: &str, iri: &str, floor: i64, t: i64) -> ApiError {
+    ApiError::GraphNotFound(dropped_source_message(kind, iri, floor, t))
+}
+
+/// The message of [`dropped_source`].
+pub(crate) fn dropped_source_message(kind: &str, iri: &str, floor: i64, t: i64) -> String {
+    format!(
+        "{kind} graph <{iri}> was dropped at t={floor}; what it held as of t={t} is no longer \
+         readable"
+    )
 }
 
 /// Build a `PolicyContext` from `GovernanceOptions`.

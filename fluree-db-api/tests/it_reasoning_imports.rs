@@ -1013,7 +1013,8 @@ const PREFIXES: &str = r"
 
 /// Reasoning as of a `t` before the drop of its schema graph is refused, as a
 /// `GRAPH` naming the graph as of that `t` is, even after a query as of that
-/// `t` from before the drop cached the schema.
+/// `t` from before the drop cached the schema. At the head the dropped graph
+/// does not exist, which fails closed as a schema source never written does.
 #[tokio::test]
 async fn reasoning_as_of_before_a_schema_graph_drop_is_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1040,5 +1041,9 @@ async fn reasoning_as_of_before_a_schema_graph_drop_is_refused() {
         matches!(err, ApiError::GraphNotFound(ref msg) if msg.contains("was dropped")),
         "{err}"
     );
-    assert!(persons(&fluree, ledger_id, None).await.unwrap().is_empty());
+    let err = persons(&fluree, ledger_id, None).await.unwrap_err();
+    assert!(
+        matches!(err, ApiError::OntologyImport(ref msg) if msg.contains("not a named graph")),
+        "{err}"
+    );
 }

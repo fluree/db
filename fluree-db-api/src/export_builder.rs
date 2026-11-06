@@ -171,11 +171,15 @@ impl<'a> ExportBuilder<'a> {
     /// excluded from dataset exports" and then never called from anywhere, so
     /// `--all-graphs` shipped emitting `#txn-meta` and `#config` from the v4
     /// baseline onward. This is the call site it was missing.
-    fn selected_named_graphs<'r>(&self, registry: &'r GraphRegistry) -> Vec<(u16, &'r str)> {
+    fn selected_named_graphs<'r>(
+        &self,
+        registry: &'r GraphRegistry,
+        to_t: i64,
+    ) -> Vec<(u16, &'r str)> {
         registry
             .iter_entries()
             .filter(|(g_id, _)| self.system_graphs || !export::is_system_graph(*g_id))
-            .filter(|(g_id, _)| !registry.is_dropped(*g_id))
+            .filter(|(g_id, _)| registry.visible_at(*g_id, to_t))
             .collect()
     }
 
@@ -184,7 +188,12 @@ impl<'a> ExportBuilder<'a> {
     /// Zero under `all_graphs()`. Under a single-graph or default-graph-only
     /// export it is every other user graph in the registry — the number the
     /// caller needs to say so out loud.
-    fn omitted_named_graph_count(&self, registry: &GraphRegistry, target: Option<u16>) -> u64 {
+    fn omitted_named_graph_count(
+        &self,
+        registry: &GraphRegistry,
+        target: Option<u16>,
+        to_t: i64,
+    ) -> u64 {
         // Zero whenever the caller chose which graphs it wanted — either all
         // of them, or one by IRI. The count answers "your request lost data
         // you did not ask to drop", so a *targeted* export has nothing to
@@ -200,17 +209,23 @@ impl<'a> ExportBuilder<'a> {
         registry
             .iter_entries()
             .filter(|(g_id, _)| !export::is_system_graph(*g_id) && Some(*g_id) != target)
-            .filter(|(g_id, _)| !registry.is_dropped(*g_id))
+            .filter(|(g_id, _)| registry.visible_at(*g_id, to_t))
             .count() as u64
     }
 
-    /// Resolve a graph IRI to a `(g_id, iri)` pair via the graph registry.
-    fn resolve_graph_iri(&self, registry: &GraphRegistry) -> Result<(u16, String)> {
+    /// Resolve a graph IRI to a `(g_id, iri)` pair via the graph registry, as
+    /// of `to_t`: a graph a drop after `to_t` took is refused, as a query
+    /// naming it as of `to_t` is.
+    fn resolve_graph_iri(&self, registry: &GraphRegistry, to_t: i64) -> Result<(u16, String)> {
         let iri = self.graph_iri.as_deref().unwrap();
-        match registry
-            .assigned_graph_id(iri)
-            .filter(|g_id| !registry.is_dropped(*g_id))
-        {
+        let existing = registry.existing_graph_id(iri, to_t).map_err(|floor| {
+            ApiError::Query(fluree_db_query::QueryError::GraphDropped {
+                graph: iri.to_string(),
+                floor,
+                t: to_t,
+            })
+        })?;
+        match existing {
             Some(g_id) => Ok((g_id, iri.to_string())),
             None => Err(ApiError::Config(format!(
                 "graph '{iri}' not found in ledger graph registry"
@@ -251,17 +266,17 @@ impl<'a> ExportBuilder<'a> {
             }
         };
 
-        // Resolve the target graph if a specific graph was requested
-        let target_graph = if self.graph_iri.is_some() {
-            Some(self.resolve_graph_iri(&ledger.snapshot.graph_registry)?)
-        } else {
-            None
-        };
-
         // Resolve time-travel bound: explicit TimeSpec, or current ledger time
         let to_t = match &self.time_spec {
             Some(spec) => time_resolve::resolve_time_spec(&ledger, spec).await?,
             None => ledger.t(),
+        };
+
+        // Resolve the target graph if a specific graph was requested
+        let target_graph = if self.graph_iri.is_some() {
+            Some(self.resolve_graph_iri(&ledger.snapshot.graph_registry, to_t)?)
+        } else {
+            None
         };
 
         // Novelty overlay — always include so export sees committed-but-not-yet-indexed data
@@ -374,7 +389,7 @@ impl<'a> ExportBuilder<'a> {
 
                     if self.all_graphs {
                         for (g_id, iri) in
-                            self.selected_named_graphs(&ledger.snapshot.graph_registry)
+                            self.selected_named_graphs(&ledger.snapshot.graph_registry, to_t)
                         {
                             let config = ExportConfig {
                                 g_id,
@@ -441,7 +456,7 @@ impl<'a> ExportBuilder<'a> {
                     // Named graphs in GRAPH { } blocks
                     if self.all_graphs {
                         for (g_id, iri) in
-                            self.selected_named_graphs(&ledger.snapshot.graph_registry)
+                            self.selected_named_graphs(&ledger.snapshot.graph_registry, to_t)
                         {
                             write!(writer, "\nGRAPH ").map_err(io_err)?;
                             prefixes.write_iri(writer, iri).map_err(io_err)?;
@@ -502,6 +517,7 @@ impl<'a> ExportBuilder<'a> {
         total_stats.named_graphs_omitted = self.omitted_named_graph_count(
             &ledger.snapshot.graph_registry,
             target_graph.as_ref().map(|(g_id, _)| *g_id),
+            to_t,
         );
         Ok(total_stats)
     }

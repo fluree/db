@@ -6666,6 +6666,96 @@ async fn policy_source_unknown_graph_fails_closed() {
     );
 }
 
+/// A governed read as of a `t` before the drop of the `f:policySource` graph
+/// is refused: the policy in force then is gone, and governing with none
+/// would show what it hid. As of a `t` after the drop, before the graph is
+/// written again, the source does not exist, which fails closed as an
+/// unknown one does. At the head the rewritten policy governs.
+#[tokio::test]
+async fn a_read_before_the_drop_of_its_policy_source_is_refused() {
+    use fluree_db_api::TimeSpec;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-source-dropped:main";
+    fluree.create_ledger(ledger_id).await.unwrap();
+    let config_iri = config_graph_iri(ledger_id);
+    let deny_ssn = r"@prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/> .
+        GRAPH <http://example.org/policies> {
+            ex:denySsn a f:AccessPolicy ; f:action f:view ;
+                f:onProperty ex:ssn ; f:allow false .
+        }";
+    for trig in [
+        r#"@prefix ex: <http://example.org/> . ex:alice ex:ssn "111-11-1111" ."#.to_string(),
+        deny_ssn.to_string(),
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{config_iri}> {{
+                 <urn:config:main> a f:LedgerConfig ; f:policyDefaults <urn:config:policy> .
+                 <urn:config:policy> f:defaultAllow true ; f:policyClass f:AccessPolicy ;
+                     f:policySource <urn:config:policy-ref> .
+                 <urn:config:policy-ref> a f:GraphRef ;
+                     f:graphSource <urn:config:policy-source> .
+                 <urn:config:policy-source> f:graphSelector <http://example.org/policies> .
+             }}"
+        ),
+    ] {
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+            .unwrap();
+    }
+    let governed_at = fluree.ledger(ledger_id).await.unwrap().t();
+    let ssn = |spec: TimeSpec| {
+        let fluree = &fluree;
+        async move {
+            let view = fluree.db_at(ledger_id, spec).await?;
+            let view = fluree.wrap_policy_defaults(view).await?;
+            let result = fluree
+                .query(
+                    &view,
+                    "SELECT ?ssn WHERE { <http://example.org/alice> <http://example.org/ssn> ?ssn }",
+                )
+                .await?;
+            Ok::<_, fluree_db_api::ApiError>(result.to_jsonld(&view.snapshot)?)
+        }
+    };
+    assert_eq!(ssn(TimeSpec::AtT(governed_at)).await.unwrap(), json!([]));
+
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    let dropped = fluree
+        .stage(&handle)
+        .sparql_update("DROP GRAPH <http://example.org/policies>")
+        .execute()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(deny_ssn)
+        .commit()
+        .await
+        .unwrap();
+
+    let head = fluree.ledger(ledger_id).await.unwrap().t();
+    assert_eq!(ssn(TimeSpec::AtT(head)).await.unwrap(), json!([]));
+    let err = ssn(TimeSpec::AtT(governed_at)).await.unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("dropped at t={dropped}")),
+        "{err}"
+    );
+    let err = ssn(TimeSpec::AtT(dropped)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("policySource") && err.to_string().contains("not found"),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn policy_source_cross_ledger_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();

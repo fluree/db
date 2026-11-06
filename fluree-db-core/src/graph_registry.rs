@@ -517,14 +517,33 @@ impl GraphRegistry {
         result
     }
 
-    /// Forward lookup: IRI → GraphId. Any ledger's config graph IRI is the
-    /// config graph. A dropped graph keeps its id, so this answers for it
-    /// too; [`Self::is_dropped`] tells it apart.
+    /// The id assigned to `iri`, which routes a write to it: any ledger's
+    /// config graph IRI is the config graph. A dropped graph keeps its id, so
+    /// this answers for it too. A reader that needs the graph to exist (a
+    /// configured source, say) asks [`Self::existing_graph_id`].
     pub fn assigned_graph_id(&self, iri: &str) -> Option<GraphId> {
         self.iri_to_id
             .get(iri)
             .copied()
             .or_else(|| names_config_graph(iri).then_some(CONFIG_GRAPH_ID))
+    }
+
+    /// The graph `iri` names as of `t`, for a reader that needs it to exist
+    /// then: `Ok(None)` when it does not (never assigned, or dropped and not
+    /// written since), and `Err(floor)` when a drop at `floor`, after `t`,
+    /// took what it held as of `t`.
+    pub fn existing_graph_id(
+        &self,
+        iri: &str,
+        t: i64,
+    ) -> std::result::Result<Option<GraphId>, i64> {
+        let Some(g_id) = self.assigned_graph_id(iri) else {
+            return Ok(None);
+        };
+        if let Some(floor) = self.drop_after(g_id, t) {
+            return Err(floor);
+        }
+        Ok(self.visible_at(g_id, t).then_some(g_id))
     }
 
     /// Whether any of `iris` is not yet registered, or is dropped — that is,
@@ -1082,6 +1101,32 @@ mod tests {
         // Assignment is unchanged.
         assert_eq!(reg.apply_delta(["http://example.org/g"]), vec![]);
         assert_eq!(reg.next_id(), g + 1);
+    }
+
+    /// A graph exists as of `t` when written by then and not dropped since;
+    /// a drop after `t` took what it held then.
+    #[test]
+    fn an_existing_graph_is_one_no_drop_took_as_of_t() {
+        let g = "http://example.org/g";
+        let mut reg = GraphRegistry::new_for_ledger("test:a");
+        assert_eq!(reg.existing_graph_id(g, 1), Ok(None));
+        reg.apply_delta([g]);
+        let g_id = reg.assigned_graph_id(g).unwrap();
+        assert_eq!(reg.existing_graph_id(g, 1), Ok(Some(g_id)));
+
+        reg.apply_drops(&[g_id], 5);
+        assert_eq!(reg.existing_graph_id(g, 4), Err(5));
+        assert_eq!(reg.existing_graph_id(g, 5), Ok(None));
+        assert_eq!(reg.existing_graph_id(g, 9), Ok(None));
+
+        reg.revive([g], 7);
+        assert_eq!(reg.existing_graph_id(g, 4), Err(5));
+        assert_eq!(reg.existing_graph_id(g, 6), Ok(None));
+        assert_eq!(reg.existing_graph_id(g, 7), Ok(Some(g_id)));
+        assert_eq!(
+            reg.existing_graph_id(&config_graph_iri("test:a"), 4),
+            Ok(Some(CONFIG_GRAPH_ID))
+        );
     }
 
     #[test]
