@@ -50,6 +50,38 @@ pub const fn drop_may_take(g_id: GraphId) -> bool {
     g_id == DEFAULT_GRAPH_ID || g_id >= FIRST_USER_GRAPH_ID
 }
 
+/// Record in `drops`, a drop table (a registry's, or an index root's), that a
+/// commit at `t` dropped `g_ids`: what they held before `t` is gone. The
+/// default graph is revived at once, since there is always a default graph;
+/// a named graph stays dropped until a later write ([`record_graph_writes`]).
+/// A system graph is never dropped ([`drop_may_take`]).
+pub fn record_graph_drops(
+    drops: &mut std::collections::BTreeMap<GraphId, GraphDrop>,
+    g_ids: impl IntoIterator<Item = GraphId>,
+    t: i64,
+) {
+    for g_id in g_ids.into_iter().filter(|g_id| drop_may_take(*g_id)) {
+        let revived = (g_id == DEFAULT_GRAPH_ID).then_some(t);
+        drops.insert(g_id, GraphDrop { floor: t, revived });
+    }
+}
+
+/// Record in `drops` that a commit at `t` wrote `g_ids`, after its drops
+/// applied: each of them that is dropped exists again from `t`.
+pub fn record_graph_writes(
+    drops: &mut std::collections::BTreeMap<GraphId, GraphDrop>,
+    g_ids: impl IntoIterator<Item = GraphId>,
+    t: i64,
+) {
+    for g_id in g_ids {
+        if let Some(drop) = drops.get_mut(&g_id) {
+            if drop.revived.is_none() && drop.floor <= t {
+                drop.revived = Some(t);
+            }
+        }
+    }
+}
+
 /// The name ledger info gives the default graph, which has no IRI of its own.
 ///
 /// It names the default graph wherever a graph is read or chosen as a default
@@ -557,32 +589,23 @@ impl GraphRegistry {
         })
     }
 
-    /// Record that a commit at `t` dropped `g_ids`: what they held before `t`
-    /// is gone. The default graph is revived at once, since there is always
-    /// a default graph; a named graph stays dropped until [`Self::revive`].
+    /// Record that a commit at `t` dropped `g_ids` ([`record_graph_drops`]):
+    /// a named graph stays dropped until [`Self::revive`].
     pub fn apply_drops(&mut self, g_ids: &[GraphId], t: i64) {
-        for &g_id in g_ids {
-            let revived = (g_id == DEFAULT_GRAPH_ID).then_some(t);
-            self.drops.insert(g_id, GraphDrop { floor: t, revived });
-        }
+        record_graph_drops(&mut self.drops, g_ids.iter().copied(), t);
     }
 
-    /// Record that a commit at `t` wrote `iris`, after its drops applied:
-    /// each of them that is dropped exists again from `t`.
+    /// Record that a commit at `t` wrote `iris`, after its drops applied
+    /// ([`record_graph_writes`]).
     pub fn revive<'a>(&mut self, iris: impl IntoIterator<Item = &'a str>, t: i64) {
         if self.drops.is_empty() {
             return;
         }
-        for iri in iris {
-            let Some(g_id) = self.iri_to_id.get(iri) else {
-                continue;
-            };
-            if let Some(drop) = self.drops.get_mut(g_id) {
-                if drop.revived.is_none() && drop.floor <= t {
-                    drop.revived = Some(t);
-                }
-            }
-        }
+        let g_ids: Vec<GraphId> = iris
+            .into_iter()
+            .filter_map(|iri| self.iri_to_id.get(iri).copied())
+            .collect();
+        record_graph_writes(&mut self.drops, g_ids, t);
     }
 
     /// Whether a commit writing `iris` would bring a dropped graph back.

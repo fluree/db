@@ -293,7 +293,7 @@ impl HistoricalLedgerView {
 
         // Every walked commit's graph lifecycle, those after `target_t`
         // included: a drop after it takes what the graph held as of it.
-        let mut lifecycle: Vec<crate::CommitLifecycle> = Vec::new();
+        let mut lifecycle: Vec<fluree_db_core::CommitGraphLifecycle> = Vec::new();
 
         let mut commit_count = 0;
         while let Some(result) = stream.next().await {
@@ -307,11 +307,11 @@ impl HistoricalLedgerView {
             );
 
             if !commit.graph_drops.is_empty() || !commit.graph_delta.is_empty() {
-                lifecycle.push((
-                    commit.t,
-                    commit.graph_drops.clone(),
-                    commit.graph_delta.values().cloned().collect(),
-                ));
+                lifecycle.push(fluree_db_core::CommitGraphLifecycle {
+                    t: commit.t,
+                    drops: commit.graph_drops.clone(),
+                    written: commit.graph_delta.values().cloned().collect(),
+                });
             }
 
             // Skip commits beyond target_t

@@ -235,12 +235,8 @@ where
                 // Sorted by t descending; reverse for chronological (genesis-first).
                 let cids: Vec<ContentId> = dag.into_iter().rev().map(|(_, cid)| cid).collect();
                 // Graph lifecycles, likewise oldest first.
-                let lifecycles: Vec<crate::run_index::build::incremental_resolve::CommitLifecycle> =
-                    lifecycles
-                        .into_iter()
-                        .rev()
-                        .map(|l| (l.t, l.drops, l.written))
-                        .collect();
+                let lifecycles: Vec<fluree_db_core::CommitGraphLifecycle> =
+                    lifecycles.into_iter().rev().collect();
                 (cids, split_mode, lifecycles)
             };
             _span_a.record("commits", commit_cids.len());

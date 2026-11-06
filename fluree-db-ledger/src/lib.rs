@@ -34,8 +34,8 @@ pub use historical::{HeadDrops, HistoricalLedgerView};
 pub use staged::StagedLedger;
 
 use fluree_db_core::{
-    BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake, GraphDbRef, GraphId,
-    LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
+    BranchedContentStore, CommitGraphLifecycle, ContentId, ContentStore, DictNovelty, Flake,
+    GraphDbRef, GraphId, LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
 };
 use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use fluree_db_novelty::{
@@ -188,26 +188,21 @@ pub struct LedgerState {
     pub head_temporal: Option<HeadTemporal>,
 }
 
-/// One commit's graph lifecycle, as a commit walk reads it: its `t`, the
-/// graphs it drops (`Commit::graph_drops`, by IRI), and the graphs its
-/// `graph_delta` writes.
-pub(crate) type CommitLifecycle = (i64, Vec<String>, Vec<String>);
-
 /// Apply walked commits' graph lifecycles to `snapshot` in commit order — each
 /// commit's drops, then its revivals — given newest first, as walks yield
 /// them, after `apply_envelope_deltas` registered every graph they write.
 /// Returns each dropped graph's latest floor.
 pub(crate) fn apply_commit_lifecycles(
     snapshot: &mut LedgerSnapshot,
-    newest_first: &[CommitLifecycle],
+    newest_first: &[CommitGraphLifecycle],
 ) -> std::collections::HashMap<fluree_db_core::GraphId, i64> {
     let mut floors = std::collections::HashMap::new();
-    for (t, drops, graph_iris) in newest_first.iter().rev() {
-        let g_ids = snapshot.graph_registry.graph_ids_of_drops(drops);
-        snapshot.apply_graph_drops(&g_ids, *t);
-        snapshot.revive_graphs(graph_iris.iter().map(String::as_str), *t);
+    for lifecycle in newest_first.iter().rev() {
+        let g_ids = snapshot.graph_registry.graph_ids_of_drops(&lifecycle.drops);
+        snapshot.apply_graph_drops(&g_ids, lifecycle.t);
+        snapshot.revive_graphs(lifecycle.written.iter().map(String::as_str), lifecycle.t);
         for g_id in g_ids {
-            floors.insert(g_id, *t);
+            floors.insert(g_id, lifecycle.t);
         }
     }
     floors
@@ -264,7 +259,7 @@ pub(crate) async fn window_lifecycles<C: ContentStore + ?Sized>(
     store: &C,
     head_cid: &ContentId,
     index_t: i64,
-) -> Result<Vec<CommitLifecycle>> {
+) -> Result<Vec<CommitGraphLifecycle>> {
     let mut lifecycles = Vec::new();
     let mut next = Some(head_cid.clone());
     while let Some(cid) = next {
@@ -273,11 +268,11 @@ pub(crate) async fn window_lifecycles<C: ContentStore + ?Sized>(
             break;
         }
         if !envelope.graph_drops.is_empty() || !envelope.graph_delta.is_empty() {
-            lifecycles.push((
-                envelope.t,
-                envelope.graph_drops,
-                envelope.graph_delta.into_values().collect(),
-            ));
+            lifecycles.push(CommitGraphLifecycle {
+                t: envelope.t,
+                drops: envelope.graph_drops,
+                written: envelope.graph_delta.into_values().collect(),
+            });
         }
         next = envelope.parents.into_iter().next();
     }
@@ -483,7 +478,7 @@ impl LedgerState {
         let mut commit_batches: Vec<(Vec<Flake>, i64)> = Vec::new();
         // Each commit's drops and the graphs it wrote, newest first like the
         // walk: applied oldest first once the registry knows every graph.
-        let mut lifecycle: Vec<CommitLifecycle> = Vec::new();
+        let mut lifecycle: Vec<CommitGraphLifecycle> = Vec::new();
 
         let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
@@ -512,11 +507,11 @@ impl LedgerState {
 
             // Collect graph IRIs from graph_delta values
             if !commit.graph_drops.is_empty() || !commit.graph_delta.is_empty() {
-                lifecycle.push((
-                    commit.t,
-                    commit.graph_drops,
-                    commit.graph_delta.values().cloned().collect(),
-                ));
+                lifecycle.push(CommitGraphLifecycle {
+                    t: commit.t,
+                    drops: commit.graph_drops,
+                    written: commit.graph_delta.values().cloned().collect(),
+                });
             }
             for iri in commit.graph_delta.into_values() {
                 all_graph_iris.insert(iri);

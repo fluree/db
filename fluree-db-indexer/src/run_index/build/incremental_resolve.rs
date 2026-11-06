@@ -974,22 +974,10 @@ fn dedup_group(
 }
 
 // ============================================================================
-// Internal: Vector-op pre-scan
+// Internal: Graph lifecycles (`Commit::graph_drops`)
 // ============================================================================
 
-/// Detect whether any commit in the new chunk asserts or retracts a vector
-/// flake. Used to gate the expensive vector arena pre-load and SPOT-scan
-/// fact-handle seeding on incremental publish — when the chunk doesn't
-/// touch vectors, both are wasted work, scaling with base size rather
-/// than chunk size.
-///
-/// Stops scanning at the first commit that contains a vector op. Within a
-/// commit, `for_each_op` is a single linear pass over the ops buffer, so
-/// finishing one commit's iteration after the flag is set is essentially
-/// free relative to the work we save.
-/// One commit's graph lifecycle: its `t`, the graphs it drops
-/// (`Commit::graph_drops`, by IRI) and the graphs its `graph_delta` writes.
-pub(crate) type CommitLifecycle = (i64, Vec<String>, Vec<String>);
+use fluree_db_core::CommitGraphLifecycle as CommitLifecycle;
 
 /// The graph lifecycles of `walked_commits`, read from their envelopes, in
 /// their order (oldest first).
@@ -1004,11 +992,11 @@ fn window_lifecycles(
             let envelope = read_commit_envelope(&walked.bytes).map_err(|e| {
                 IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", walked.cid))
             })?;
-            Ok((
-                walked.t,
-                envelope.graph_drops,
-                envelope.graph_delta.into_values().collect(),
-            ))
+            Ok(CommitLifecycle {
+                t: walked.t,
+                drops: envelope.graph_drops,
+                written: envelope.graph_delta.into_values().collect(),
+            })
         })
         .collect()
 }
@@ -1021,10 +1009,15 @@ pub(crate) fn graph_floors(
     shared: &SharedResolverState,
 ) -> HashMap<String, i64> {
     let mut floors = HashMap::new();
-    for (t, drops, _) in lifecycles {
-        for iri in drops.iter().filter(|iri| !names_system_graph(iri, shared)) {
-            let floor = floors.entry(iri.clone()).or_insert(*t);
-            *floor = (*floor).max(*t);
+    for lifecycle in lifecycles {
+        let t = lifecycle.t;
+        for iri in lifecycle
+            .drops
+            .iter()
+            .filter(|iri| !names_system_graph(iri, shared))
+        {
+            let floor = floors.entry(iri.clone()).or_insert(t);
+            *floor = (*floor).max(t);
         }
     }
     floors
@@ -1044,9 +1037,9 @@ fn names_system_graph(iri: &str, shared: &SharedResolverState) -> bool {
 }
 
 /// The drop records `drops` (by this run's graph ids) become once
-/// `lifecycles` apply, oldest first: each commit's drops, then the dropped
-/// graphs it writes again. The default graph is revived by its own drop. A
-/// record naming a system graph drops nothing.
+/// `lifecycles` apply, oldest first, by the rule a registry applies them by
+/// ([`fluree_db_core::graph_registry::record_graph_drops`]): each commit's
+/// drops, then the dropped graphs it writes again.
 pub(crate) fn apply_lifecycles(
     drops: &mut std::collections::BTreeMap<u16, fluree_db_core::GraphDrop>,
     lifecycles: &[CommitLifecycle],
@@ -1060,21 +1053,13 @@ pub(crate) fn apply_lifecycles(
                 .graphs
                 .graph_dict_id(iri)
                 .and_then(|id| u16::try_from(id + 1).ok())
-                .filter(|g_id| fluree_db_core::graph_registry::drop_may_take(*g_id))
         }
     };
-    for (t, dropped, written) in lifecycles {
-        for g_id in dropped.iter().filter_map(|iri| graph_of(iri)) {
-            let revived = (g_id == 0).then_some(*t);
-            drops.insert(g_id, fluree_db_core::GraphDrop { floor: *t, revived });
-        }
-        for g_id in written.iter().filter_map(|iri| graph_of(iri)) {
-            if let Some(drop) = drops.get_mut(&g_id) {
-                if drop.revived.is_none() && drop.floor <= *t {
-                    drop.revived = Some(*t);
-                }
-            }
-        }
+    for lifecycle in lifecycles {
+        let dropped = lifecycle.drops.iter().filter_map(|iri| graph_of(iri));
+        fluree_db_core::graph_registry::record_graph_drops(drops, dropped, lifecycle.t);
+        let written = lifecycle.written.iter().filter_map(|iri| graph_of(iri));
+        fluree_db_core::graph_registry::record_graph_writes(drops, written, lifecycle.t);
     }
 }
 
@@ -1097,7 +1082,11 @@ fn purge_dropped_graphs(
     root: &mut IndexRoot,
     shared: &SharedResolverState,
 ) -> Result<Vec<u16>, IncrementalResolveError> {
-    if root.graph_drops.is_empty() && lifecycles.iter().all(|(_, drops, _)| drops.is_empty()) {
+    if root.graph_drops.is_empty()
+        && lifecycles
+            .iter()
+            .all(|lifecycle| lifecycle.drops.is_empty())
+    {
         return Ok(Vec::new());
     }
     let mut drops: std::collections::BTreeMap<u16, fluree_db_core::GraphDrop> =
@@ -1197,6 +1186,20 @@ fn graph_may_hold_schema(root: &IndexRoot, g_id: u16) -> bool {
     }
 }
 
+// ============================================================================
+// Internal: Vector-op pre-scan
+// ============================================================================
+
+/// Detect whether any commit in the new chunk asserts or retracts a vector
+/// flake. Used to gate the expensive vector arena pre-load and SPOT-scan
+/// fact-handle seeding on incremental publish — when the chunk doesn't
+/// touch vectors, both are wasted work, scaling with base size rather
+/// than chunk size.
+///
+/// Stops scanning at the first commit that contains a vector op. Within a
+/// commit, `for_each_op` is a single linear pass over the ops buffer, so
+/// finishing one commit's iteration after the flag is set is essentially
+/// free relative to the work we save.
 fn chunk_has_vector_ops(walked_commits: &[WalkedCommit]) -> Result<bool, IncrementalResolveError> {
     use fluree_db_core::commit::codec::load_commit_ops;
     use fluree_db_core::commit::codec::raw_reader::RawObject;
@@ -1894,17 +1897,17 @@ mod tests {
 
         let g = "http://example.org/g";
         let source = config_graph_iri("a:main");
-        let lifecycles: Vec<CommitLifecycle> = vec![(
-            5,
-            vec![
+        let lifecycles = vec![CommitLifecycle {
+            t: 5,
+            drops: vec![
                 DEFAULT_GRAPH_IRI.to_string(),
                 source.clone(),
                 config_graph_iri("b:main"),
                 txn_meta_graph_iri("b:main"),
                 g.to_string(),
             ],
-            Vec::new(),
-        )];
+            written: Vec::new(),
+        }];
         let dropped = |shared: &SharedResolverState| {
             let mut floors: Vec<String> = graph_floors(&lifecycles, shared).into_keys().collect();
             floors.sort();
